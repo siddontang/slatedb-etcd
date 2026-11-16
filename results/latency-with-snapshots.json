@@ -1,0 +1,117 @@
+{
+  "mode": "bench",
+  "host": "macOS-27.2.1-arm64-arm-64bit",
+  "machine": "arm64",
+  "created_at": "2026-11-15T07:03:13.589302+00:00",
+  "logical_cpus": 10,
+  "binary_sha256": "933c21d5a44ccb9150c6cd4bdaac765a830af598da92123bdbb7eb9c94460456",
+  "python": "3.9.6 (default, Apr 30 2025, 02:07:17) \n[Clang 17.0.0 (clang-1700.0.13.5)]",
+  "run_directory": "<tmp>/slatedb-raft-poc-ir7lgs8p",
+  "binary": "<home>/eng/slatedb/target/release/slatedb-raft-poc",
+  "deployment": "three processes on one host and disk; loopback HTTP; local object store",
+  "durability": "raft-engine synchronous writes; process crashes tested, power loss not tested",
+  "benchmarks": [
+    {
+      "concurrency": 1,
+      "requests": 20000,
+      "successful": 20000,
+      "failed": 0,
+      "errors": [],
+      "value_bytes": 256,
+      "elapsed_seconds": 5.723449791,
+      "successful_requests_per_second": 3494.395990238189,
+      "latency_ms": {
+        "mean": 0.28547592825,
+        "p50": 0.258,
+        "p95": 0.347875,
+        "p99": 0.461709,
+        "max": 14.011084
+      },
+      "snapshot_every": 1000,
+      "sync_writes_delta": {
+        "1": 40012,
+        "2": 40012,
+        "3": 40012
+      }
+    },
+    {
+      "concurrency": 16,
+      "requests": 20000,
+      "successful": 20000,
+      "failed": 0,
+      "errors": [],
+      "value_bytes": 256,
+      "elapsed_seconds": 4.768122957999999,
+      "successful_requests_per_second": 4194.522703413892,
+      "latency_ms": {
+        "mean": 3.8088237008,
+        "p50": 3.387292,
+        "p95": 6.811959,
+        "p99": 9.918792,
+        "max": 18.517875
+      },
+      "snapshot_every": 1000,
+      "sync_writes_delta": {
+        "1": 39972,
+        "2": 37619,
+        "3": 39939
+      }
+    }
+  ],
+  "passed": true,
+  "node_log_summary": {
+    "node-1": {
+      "completed_snapshots": 16,
+      "last_snapshot_index": 31571,
+      "raft_state_changes": [
+        {
+          "role": "Follower",
+          "term": 1,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 1,
+          "leader_id": 2
+        }
+      ]
+    },
+    "node-2": {
+      "completed_snapshots": 16,
+      "last_snapshot_index": 23964,
+      "raft_state_changes": [
+        {
+          "role": "PreCandidate",
+          "term": 0,
+          "leader_id": 0
+        },
+        {
+          "role": "Candidate",
+          "term": 1,
+          "leader_id": 0
+        },
+        {
+          "role": "Leader",
+          "term": 1,
+          "leader_id": 2
+        }
+      ]
+    },
+    "node-3": {
+      "completed_snapshots": 17,
+      "last_snapshot_index": 28104,
+      "raft_state_changes": [
+        {
+          "role": "Follower",
+          "term": 1,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 1,
+          "leader_id": 2
+        }
+      ]
+    }
+  }
+}

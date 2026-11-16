@@ -1,0 +1,105 @@
+{
+  "mode": "bench",
+  "host": "macOS-27.2.1-arm64-arm-64bit",
+  "machine": "arm64",
+  "created_at": "2026-11-15T06:55:30.077841+00:00",
+  "logical_cpus": 10,
+  "binary_sha256": "9eeacc8193aef1765b16af566030c2676f407e01b0b858a0f928dd456eba0d9a",
+  "python": "3.9.6 (default, Apr 30 2025, 02:07:17) \n[Clang 17.0.0 (clang-1700.0.13.5)]",
+  "run_directory": "<tmp>/slatedb-raft-poc-cu1f2ysy",
+  "binary": "<home>/eng/slatedb/target/release/slatedb-raft-poc",
+  "deployment": "three processes on one host and disk; loopback HTTP; local object store",
+  "durability": "raft-engine synchronous writes; process crashes tested, power loss not tested",
+  "passed": false,
+  "error": "Benchmark had 11101 failures",
+  "node_log_summary": {
+    "node-1": {
+      "completed_snapshots": 9,
+      "last_snapshot_index": 9000,
+      "raft_state_changes": [
+        {
+          "role": "PreCandidate",
+          "term": 0,
+          "leader_id": 0
+        },
+        {
+          "role": "Candidate",
+          "term": 1,
+          "leader_id": 0
+        },
+        {
+          "role": "Leader",
+          "term": 1,
+          "leader_id": 1
+        },
+        {
+          "role": "Follower",
+          "term": 2,
+          "leader_id": 2
+        }
+      ]
+    },
+    "node-2": {
+      "completed_snapshots": 9,
+      "last_snapshot_index": 9000,
+      "raft_state_changes": [
+        {
+          "role": "Follower",
+          "term": 1,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 1,
+          "leader_id": 1
+        },
+        {
+          "role": "PreCandidate",
+          "term": 1,
+          "leader_id": 0
+        },
+        {
+          "role": "Candidate",
+          "term": 2,
+          "leader_id": 0
+        },
+        {
+          "role": "Leader",
+          "term": 2,
+          "leader_id": 2
+        }
+      ]
+    },
+    "node-3": {
+      "completed_snapshots": 9,
+      "last_snapshot_index": 9000,
+      "raft_state_changes": [
+        {
+          "role": "Follower",
+          "term": 1,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 1,
+          "leader_id": 1
+        },
+        {
+          "role": "PreCandidate",
+          "term": 1,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 2,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 2,
+          "leader_id": 2
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,7 @@
+This project started as a three-replica service experiment in the SlateDB checkout.
+It uses SlateDB under the Apache License 2.0.
+Upstream: https://github.com/slatedb/slatedb
+Pinned revision: 8b68800252064164397ca6ce53e5883dcfbc37b9
+
+The files under results/ record the original PoC runs before repository extraction.
+Their original paths and binary hashes remain unchanged for traceability.
