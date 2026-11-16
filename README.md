@@ -8,6 +8,8 @@ The original JSON API remains available in a separate diagnostic keyspace.
 All endpoints bind to loopback. There is no authentication or dynamic membership.
 
 See [compatibility results](COMPATIBILITY.md) for the etcd checks.
+See [test commands](tests/README.md) for upstream tests, fault checks, Jepsen, fuzzing, and DST.
+The [upstream audit](tests/upstream/README.md) maps the source suites and lists coverage gaps.
 The [original PoC results](RESULTS.md) describe measurements before this repository was extracted.
 
 ## etcd v3 KV API
@@ -23,6 +25,7 @@ Supported behavior:
 - Put: create and modification revisions, key version, previous value, and ignore flags.
 - DeleteRange: exact keys, ranges, previous values, tombstones, and no-op deletion.
 - Txn: comparisons, success and failure branches, nested transactions, and atomic multi-key writes.
+- Compact: a replicated history boundary, removal of older versions, and recovery of that boundary.
 
 A mutating transaction advances the global revision once. Reads and empty deletes do not advance it.
 The initial revision is 1. Invalid transactions leave the keyspace and revision unchanged.
@@ -38,7 +41,8 @@ etcdctl --endpoints=http://127.0.0.1:7003 del hello --prev-kv
 ```
 
 The official Go client integration tests also exercise Txn and historical reads.
-Watch, Lease, Auth, Cluster, Maintenance, and MVCC Compact are not implemented.
+Watch, Lease, Auth, Cluster, and Maintenance are not implemented.
+Compact supports the default `physical=false` option. `physical=true` returns Unimplemented.
 A Put with a nonzero lease returns the standard lease-not-found error.
 This service is not yet a complete etcd replacement or a supported Kubernetes backend.
 
@@ -81,6 +85,11 @@ The fault suite checks:
 Rust tests also cover persistent terms, votes, conflicting log suffixes, node identity checks, and
 recovery when a snapshot was saved before the state machine could install it.
 They also check that a background snapshot excludes writes after its pinned apply position.
+
+The imported etcd common suite runs through a real cluster adapter. Unsupported capabilities produce
+explicit skips. Process fault histories use the original etcd model, plus Jepsen and Elle checks.
+The DST harness drives real node storage through seeded message delivery and logical Raft ticks.
+It repeats each schedule and compares traces. It does not simulate the operating system or disk.
 
 ## Measure write latency
 
@@ -199,14 +208,26 @@ Historical point reads scan one key's versions. Historical range reads currently
 Range responses collect matching keys in memory before sorting or applying a limit.
 These choices favor compatibility testing. Large data sets need bounded scans and a history index.
 
-History compaction is not implemented. Raft log GC removes covered log entries, but retains MVCC
-history in SlateDB and in the recovery snapshot. It does not implement the etcd Compact RPC.
+Compact runs through Raft and writes history deletions, the compaction boundary, and the apply marker
+in one SlateDB batch. It does not advance the KV revision. Reads below the boundary return the
+standard compacted-revision error. Reads at the boundary remain valid.
+
+Compaction keeps the latest version at or before the boundary for each key, including tombstones.
+It keeps all newer versions. Current keys and their revision metadata remain unchanged.
+Restart and snapshot installation restore the boundary with the retained history.
+Raft log GC remains separate from MVCC compaction.
+
+Compaction scans all history and builds one deletion batch on the node loop. Large histories can
+delay heartbeats and requests. SlateDB reclaims old SST data in the background; pinned snapshots can
+retain older data. The service rejects `physical=true` because it cannot yet wait for that reclamation.
+Do not downgrade to an older binary after compaction; older binaries do not enforce its boundary.
+
 The diagnostic JSON keyspace is separate from the etcd keyspace and does not affect etcd revisions.
 
 ## Next steps
 
 1. Add ReadIndex-based linearizable reads and separate state-apply workers.
-2. Add MVCC history compaction, bounded range scans, and checkpoint references for large snapshots.
+2. Bound compaction work and range scans, and use checkpoint references for large snapshots.
 3. Add Watch history replay, live delivery, compaction errors, and progress notifications.
 4. Add leases with replicated revocation and deletion. Do not use local SlateDB TTL for leases.
 5. Add membership changes, TLS, authentication, quotas, maintenance APIs, and operational metrics.

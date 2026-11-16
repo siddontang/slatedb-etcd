@@ -9,10 +9,13 @@ use raft::{Config, RawNode, SnapshotStatus, StateRole, Storage};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::proto::etcdserverpb::RequestOp;
+use crate::proto::etcdserverpb::{CompactionRequest, RequestOp, ResponseHeader};
 use crate::state::StateMachine;
 use crate::storage::RaftStorage;
 use crate::{ApiError, Command, RaftCommand, Request};
+
+#[cfg(test)]
+mod dst;
 
 pub type Response = oneshot::Sender<Result<Value, ApiError>>;
 
@@ -20,6 +23,7 @@ pub enum Event {
     Propose(Request, Response),
     EtcdPropose(RequestOp, Response),
     EtcdRead(RequestOp, Response),
+    EtcdCompact(CompactionRequest, Response),
     Step(Message, Response),
     Status(Response),
     Checkpoint(Response),
@@ -68,6 +72,14 @@ pub struct Node {
 
 impl Node {
     pub async fn open(options: NodeOptions, events: mpsc::Sender<Event>) -> Result<Self> {
+        Self::open_with_transport(options, events, None).await
+    }
+
+    async fn open_with_transport(
+        options: NodeOptions,
+        events: mpsc::Sender<Event>,
+        transport_override: Option<BTreeMap<u64, mpsc::Sender<Message>>>,
+    ) -> Result<Self> {
         ensure!(
             options.peers.len() == 3,
             "this PoC requires exactly three fixed voters"
@@ -110,21 +122,26 @@ impl Node {
         config.validate()?;
         let logger = slog::Logger::root(slog::Discard, slog::o!());
         let raw = RawNode::new(&config, storage, &logger)?;
-        let mut senders = BTreeMap::new();
-        for (&peer, address) in &options.peers {
-            if peer == options.id {
-                continue;
+        let senders = if let Some(senders) = transport_override {
+            senders
+        } else {
+            let mut senders = BTreeMap::new();
+            for (&peer, address) in &options.peers {
+                if peer == options.id {
+                    continue;
+                }
+                let (tx, rx) = mpsc::channel(256);
+                senders.insert(peer, tx);
+                tokio::spawn(transport(
+                    peer,
+                    address.clone(),
+                    options.cluster_id.clone(),
+                    rx,
+                    events.clone(),
+                ));
             }
-            let (tx, rx) = mpsc::channel(256);
-            senders.insert(peer, tx);
-            tokio::spawn(transport(
-                peer,
-                address.clone(),
-                options.cluster_id.clone(),
-                rx,
-                events.clone(),
-            ));
-        }
+            senders
+        };
         Ok(Self {
             raw,
             state,
@@ -218,6 +235,15 @@ impl Node {
                 let mut outcome = self.state.read_etcd(&request).await?;
                 self.fill_etcd_header(&mut outcome);
                 let _ = response.send(Ok(serde_json::to_value(outcome)?));
+            }
+            Event::EtcdCompact(compact, response) => {
+                self.propose(
+                    RaftCommand::Compact {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        compact,
+                    },
+                    response,
+                )?;
             }
             Event::Step(message, response) => {
                 if message.to != self.options.id
@@ -352,6 +378,13 @@ impl Node {
                     self.fill_etcd_header(&mut outcome);
                     serde_json::to_value(outcome)?
                 }
+                RaftCommand::Compact { compact, .. } => {
+                    let mut outcome = self.state.apply_compaction(entry.index, compact).await?;
+                    if let Ok(response) = &mut outcome.result {
+                        self.fill_header(response.header.as_mut());
+                    }
+                    serde_json::to_value(outcome)?
+                }
             };
             if let Some(pending) = self.pending.remove(command.id()) {
                 let _ = pending.response.send(Ok(reply));
@@ -386,14 +419,21 @@ impl Node {
 
     fn fill_etcd_header(&self, outcome: &mut crate::mvcc::Outcome) {
         if let Ok(response) = &mut outcome.result {
-            let cluster = self
+            self.fill_header(crate::mvcc::response_header(response));
+        }
+    }
+
+    fn fill_header(&self, header: Option<&mut ResponseHeader>) {
+        if let Some(header) = header {
+            header.cluster_id = self
                 .options
                 .cluster_id
                 .bytes()
                 .fold(0xcbf29ce484222325u64, |hash, byte| {
                     (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
                 });
-            crate::mvcc::fill_header(response, cluster, self.options.id, self.raw.raft.term);
+            header.member_id = self.options.id;
+            header.raft_term = self.raw.raft.term;
         }
     }
 
@@ -493,6 +533,7 @@ impl Node {
             "checkpoint_running": self.checkpoint_running,
             "snapshot_delay_ms": self.snapshot_delay_ms,
             "revision": self.state.revision,
+            "compact_revision": self.state.compact_revision,
         }))
     }
 }

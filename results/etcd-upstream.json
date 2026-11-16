@@ -1,0 +1,1439 @@
+{
+  "created_at": "2026-11-16T07:48:38.244448+00:00",
+  "binary_sha256": "23e223e90be4074912ff0b1e01b08e5473857a4e0eaec2274dccf84a60a1f92e",
+  "reference_etcd": "3.6.5",
+  "client": "go.etcd.io/etcd/client/v3 v3.6.5",
+  "go": "go version go1.25.6 darwin/arm64",
+  "deployment": "three local service processes; one embedded reference etcd",
+  "command": [
+    "go",
+    "test",
+    "-mod=readonly",
+    "-json",
+    "-count=1",
+    "-timeout=10m",
+    "-tags",
+    "upstream",
+    "./..."
+  ],
+  "profile": "supported-capabilities",
+  "log": "<repo>/tmp/test-results/etcd-upstream.jsonl",
+  "tests": [
+    {
+      "name": "TestDifferentialCompaction/negative_revision",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/initial_boundary",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/zero_revision",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/repeated_zero",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/empty_store",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialCompaction/empty_boundary_read",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/stable_key",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/first_version",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/second_version",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/delete",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/recreate",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/newer_key",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/future_revision",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/future_compact_keeps_history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/compact_middle",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/compacted_point",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/compacted_missing_key",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/compacted_count",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/boundary_point",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/boundary_range",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/stable_anchor",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/delete_history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/recreated_history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/current",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/negative_direct_read",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/negative_txn_read",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/txn_rollback",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/rollback_absent",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/inactive_compacted_branch",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/nested_boundary_read",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/repeat_boundary",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/older_boundary",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/compact_deleted_version",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/deleted_boundary_range",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/physical_rejection_keeps_boundary",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/compact_current",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/current_boundary",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/write_after_compact",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/read_after_compact",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction",
+      "result": "pass",
+      "seconds": 2.23
+    },
+    {
+      "name": "TestCompactionRecovery",
+      "result": "pass",
+      "seconds": 6.08
+    },
+    {
+      "name": "TestDifferentialKV/initial_revision",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/create",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/same_value_increments_version",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/update_prev_kv",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/negative_revision_reads_latest",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/future_revision",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/binary_put",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/binary_get",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/empty_value",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/prefix_a",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/prefix_b",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/prefix_c",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/prefix_limit_more",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/sort_value",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/sort_key_desc",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/sort_mod",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/keys_only",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/count_only",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/revision_filter_count",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/create_revision_filters",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/all_keys",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/range_end",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/ignore_value",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/ignore_lease",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/missing_ignore_value",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/invalid_ignore_value",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/missing_lease",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/invalid_ignore_lease",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_one_revision",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_else",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_read_before_write",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_read_only",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_empty",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/missing_value_compare",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/range_compare",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/nested_base_predicates",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/nested_mutually_exclusive_writes",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/nested_negative_revision",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_rollback",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/rollback_absent",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_future_revision_rollback",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/duplicate_put",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/overlapping_put_delete",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/unselected_invalid_branch",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/delete_previous",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/deleted_history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/deleted_latest",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/delete_missing_no_revision",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/recreate_resets_version",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/recreated_metadata",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/overlapping_deletes",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/empty_key",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/too_many_operations",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/final_state",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV",
+      "result": "pass",
+      "seconds": 2.26
+    },
+    {
+      "name": "TestFailoverAndSnapshotRecovery",
+      "result": "pass",
+      "seconds": 5.8
+    },
+    {
+      "name": "TestConcurrentCompareAndSwap",
+      "result": "pass",
+      "seconds": 1.33
+    },
+    {
+      "name": "TestPartitionReadModes",
+      "result": "pass",
+      "seconds": 4.67
+    },
+    {
+      "name": "TestAlarm",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAlarm",
+        "upstream_adapter_test.go:38: unsupported capability: TestAlarm; see tests/upstream/README.md",
+        "--- SKIP: TestAlarm (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAlarmlistOnMemberRestart",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAlarmlistOnMemberRestart",
+        "upstream_adapter_test.go:38: unsupported capability: TestAlarmlistOnMemberRestart; see tests/upstream/README.md",
+        "--- SKIP: TestAlarmlistOnMemberRestart (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthEnable",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthEnable",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthEnable; see tests/upstream/README.md",
+        "--- SKIP: TestAuthEnable (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthDisable",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthDisable",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthDisable; see tests/upstream/README.md",
+        "--- SKIP: TestAuthDisable (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthGracefulDisable",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthGracefulDisable",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthGracefulDisable; see tests/upstream/README.md",
+        "--- SKIP: TestAuthGracefulDisable (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthStatus",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthStatus",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthStatus; see tests/upstream/README.md",
+        "--- SKIP: TestAuthStatus (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthRoleUpdate",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthRoleUpdate",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthRoleUpdate; see tests/upstream/README.md",
+        "--- SKIP: TestAuthRoleUpdate (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthUserDeleteDuringOps",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthUserDeleteDuringOps",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthUserDeleteDuringOps; see tests/upstream/README.md",
+        "--- SKIP: TestAuthUserDeleteDuringOps (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthRoleRevokeDuringOps",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthRoleRevokeDuringOps",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthRoleRevokeDuringOps; see tests/upstream/README.md",
+        "--- SKIP: TestAuthRoleRevokeDuringOps (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthWriteKey",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthWriteKey",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthWriteKey; see tests/upstream/README.md",
+        "--- SKIP: TestAuthWriteKey (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthTxn/NoJWT",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthTxn/NoJWT",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthTxn; see tests/upstream/README.md",
+        "--- SKIP: TestAuthTxn/NoJWT (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthTxn/JWT",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthTxn/JWT",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthTxn; see tests/upstream/README.md",
+        "--- SKIP: TestAuthTxn/JWT (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthTxn",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestAuthPrefixPerm",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthPrefixPerm",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthPrefixPerm; see tests/upstream/README.md",
+        "--- SKIP: TestAuthPrefixPerm (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthLeaseKeepAlive",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthLeaseKeepAlive",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthLeaseKeepAlive; see tests/upstream/README.md",
+        "--- SKIP: TestAuthLeaseKeepAlive (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthRevokeWithDelete",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthRevokeWithDelete",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthRevokeWithDelete; see tests/upstream/README.md",
+        "--- SKIP: TestAuthRevokeWithDelete (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthLeaseTimeToLiveExpired",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthLeaseTimeToLiveExpired",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthLeaseTimeToLiveExpired; see tests/upstream/README.md",
+        "--- SKIP: TestAuthLeaseTimeToLiveExpired (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthLeaseGrantLeases",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthLeaseGrantLeases",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthLeaseGrantLeases; see tests/upstream/README.md",
+        "--- SKIP: TestAuthLeaseGrantLeases (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthMemberAdd",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthMemberAdd",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthMemberAdd; see tests/upstream/README.md",
+        "--- SKIP: TestAuthMemberAdd (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthMemberRemove",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthMemberRemove",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthMemberRemove; see tests/upstream/README.md",
+        "--- SKIP: TestAuthMemberRemove (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthTestInvalidMgmt",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthTestInvalidMgmt",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthTestInvalidMgmt; see tests/upstream/README.md",
+        "--- SKIP: TestAuthTestInvalidMgmt (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthLeaseRevoke",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthLeaseRevoke",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthLeaseRevoke; see tests/upstream/README.md",
+        "--- SKIP: TestAuthLeaseRevoke (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthRoleGet",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthRoleGet",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthRoleGet; see tests/upstream/README.md",
+        "--- SKIP: TestAuthRoleGet (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthUserGet",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthUserGet",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthUserGet; see tests/upstream/README.md",
+        "--- SKIP: TestAuthUserGet (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthRoleList",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthRoleList",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthRoleList; see tests/upstream/README.md",
+        "--- SKIP: TestAuthRoleList (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthJWTExpire",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthJWTExpire",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthJWTExpire; see tests/upstream/README.md",
+        "--- SKIP: TestAuthJWTExpire (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthRevisionConsistency",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthRevisionConsistency",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthRevisionConsistency; see tests/upstream/README.md",
+        "--- SKIP: TestAuthRevisionConsistency (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthTestCacheReload",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthTestCacheReload",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthTestCacheReload; see tests/upstream/README.md",
+        "--- SKIP: TestAuthTestCacheReload (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthLeaseTimeToLive",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthLeaseTimeToLive",
+        "upstream_adapter_test.go:38: unsupported capability: TestAuthLeaseTimeToLive; see tests/upstream/README.md",
+        "--- SKIP: TestAuthLeaseTimeToLive (0.00s)"
+      ]
+    },
+    {
+      "name": "TestCompact/NoPhysical",
+      "result": "pass",
+      "seconds": 0.95
+    },
+    {
+      "name": "TestCompact/Physical",
+      "result": "skip",
+      "seconds": 1.7,
+      "details": [
+        "=== RUN   TestCompact/Physical",
+        "upstream_adapter_test.go:52: Process logs and data: <tmp>/slatedb-etcd-compat-4050801093",
+        "upstream_client_test.go:100: unsupported capability: physical compaction",
+        "--- SKIP: TestCompact/Physical (1.70s)"
+      ]
+    },
+    {
+      "name": "TestCompact",
+      "result": "pass",
+      "seconds": 2.65
+    },
+    {
+      "name": "TestDefragOnline",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestDefragOnline",
+        "upstream_adapter_test.go:38: unsupported capability: TestDefragOnline; see tests/upstream/README.md",
+        "--- SKIP: TestDefragOnline (0.00s)"
+      ]
+    },
+    {
+      "name": "TestEndpointStatus",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestEndpointStatus",
+        "upstream_adapter_test.go:38: unsupported capability: TestEndpointStatus; see tests/upstream/README.md",
+        "--- SKIP: TestEndpointStatus (0.00s)"
+      ]
+    },
+    {
+      "name": "TestEndpointHashKV",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestEndpointHashKV",
+        "upstream_adapter_test.go:38: unsupported capability: TestEndpointHashKV; see tests/upstream/README.md",
+        "--- SKIP: TestEndpointHashKV (0.00s)"
+      ]
+    },
+    {
+      "name": "TestEndpointHealth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestEndpointHealth",
+        "upstream_adapter_test.go:38: unsupported capability: TestEndpointHealth; see tests/upstream/README.md",
+        "--- SKIP: TestEndpointHealth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestKVPut/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.27
+    },
+    {
+      "name": "TestKVPut",
+      "result": "pass",
+      "seconds": 1.27
+    },
+    {
+      "name": "TestKVGet/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.39
+    },
+    {
+      "name": "TestKVGet",
+      "result": "pass",
+      "seconds": 1.39
+    },
+    {
+      "name": "TestKVDelete/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.08
+    },
+    {
+      "name": "TestKVDelete",
+      "result": "pass",
+      "seconds": 1.08
+    },
+    {
+      "name": "TestKVGetNoQuorum/Serializable",
+      "result": "pass",
+      "seconds": 1.59
+    },
+    {
+      "name": "TestKVGetNoQuorum/Linearizable",
+      "result": "pass",
+      "seconds": 2.26
+    },
+    {
+      "name": "TestKVGetNoQuorum",
+      "result": "pass",
+      "seconds": 3.85
+    },
+    {
+      "name": "TestLeaseGrantTimeToLive",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestLeaseGrantTimeToLive",
+        "upstream_adapter_test.go:38: unsupported capability: TestLeaseGrantTimeToLive; see tests/upstream/README.md",
+        "--- SKIP: TestLeaseGrantTimeToLive (0.00s)"
+      ]
+    },
+    {
+      "name": "TestLeaseGrantAndList",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestLeaseGrantAndList",
+        "upstream_adapter_test.go:38: unsupported capability: TestLeaseGrantAndList; see tests/upstream/README.md",
+        "--- SKIP: TestLeaseGrantAndList (0.00s)"
+      ]
+    },
+    {
+      "name": "TestLeaseGrantTimeToLiveExpired",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestLeaseGrantTimeToLiveExpired",
+        "upstream_adapter_test.go:38: unsupported capability: TestLeaseGrantTimeToLiveExpired; see tests/upstream/README.md",
+        "--- SKIP: TestLeaseGrantTimeToLiveExpired (0.00s)"
+      ]
+    },
+    {
+      "name": "TestLeaseGrantKeepAliveOnce",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestLeaseGrantKeepAliveOnce",
+        "upstream_adapter_test.go:38: unsupported capability: TestLeaseGrantKeepAliveOnce; see tests/upstream/README.md",
+        "--- SKIP: TestLeaseGrantKeepAliveOnce (0.00s)"
+      ]
+    },
+    {
+      "name": "TestLeaseGrantRevoke",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestLeaseGrantRevoke",
+        "upstream_adapter_test.go:38: unsupported capability: TestLeaseGrantRevoke; see tests/upstream/README.md",
+        "--- SKIP: TestLeaseGrantRevoke (0.00s)"
+      ]
+    },
+    {
+      "name": "TestDefragmentWithNoAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestDefragmentWithNoAuth",
+        "upstream_adapter_test.go:38: unsupported capability: TestDefragmentWithNoAuth; see tests/upstream/README.md",
+        "--- SKIP: TestDefragmentWithNoAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestDefragmentWithInvalidAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestDefragmentWithInvalidAuth",
+        "upstream_adapter_test.go:38: unsupported capability: TestDefragmentWithInvalidAuth; see tests/upstream/README.md",
+        "--- SKIP: TestDefragmentWithInvalidAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestDefragmentWithRootAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestDefragmentWithRootAuth",
+        "upstream_adapter_test.go:38: unsupported capability: TestDefragmentWithRootAuth; see tests/upstream/README.md",
+        "--- SKIP: TestDefragmentWithRootAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestDefragmentWithUserAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestDefragmentWithUserAuth",
+        "upstream_adapter_test.go:38: unsupported capability: TestDefragmentWithUserAuth; see tests/upstream/README.md",
+        "--- SKIP: TestDefragmentWithUserAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestDowngradeWithNoAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestDowngradeWithNoAuth",
+        "upstream_common_maintenance_auth_test.go:78:",
+        "--- SKIP: TestDowngradeWithNoAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestDowngradeWithInvalidAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestDowngradeWithInvalidAuth",
+        "upstream_common_maintenance_auth_test.go:78:",
+        "--- SKIP: TestDowngradeWithInvalidAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestDowngradeWithRootAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestDowngradeWithRootAuth",
+        "upstream_common_maintenance_auth_test.go:78:",
+        "--- SKIP: TestDowngradeWithRootAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestDowngradeWithUserAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestDowngradeWithUserAuth",
+        "upstream_common_maintenance_auth_test.go:78:",
+        "--- SKIP: TestDowngradeWithUserAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestHashKVWithNoAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestHashKVWithNoAuth",
+        "upstream_adapter_test.go:38: unsupported capability: TestHashKVWithNoAuth; see tests/upstream/README.md",
+        "--- SKIP: TestHashKVWithNoAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestHashKVWithInvalidAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestHashKVWithInvalidAuth",
+        "upstream_adapter_test.go:38: unsupported capability: TestHashKVWithInvalidAuth; see tests/upstream/README.md",
+        "--- SKIP: TestHashKVWithInvalidAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestHashKVWithRootAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestHashKVWithRootAuth",
+        "upstream_adapter_test.go:38: unsupported capability: TestHashKVWithRootAuth; see tests/upstream/README.md",
+        "--- SKIP: TestHashKVWithRootAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestHashKVWithUserAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestHashKVWithUserAuth",
+        "upstream_adapter_test.go:38: unsupported capability: TestHashKVWithUserAuth; see tests/upstream/README.md",
+        "--- SKIP: TestHashKVWithUserAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestMoveLeaderWithNoAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestMoveLeaderWithNoAuth",
+        "upstream_common_maintenance_auth_test.go:128:",
+        "--- SKIP: TestMoveLeaderWithNoAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestMoveLeaderWithInvalidAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestMoveLeaderWithInvalidAuth",
+        "upstream_common_maintenance_auth_test.go:128:",
+        "--- SKIP: TestMoveLeaderWithInvalidAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestMoveLeaderWithRootAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestMoveLeaderWithRootAuth",
+        "upstream_common_maintenance_auth_test.go:128:",
+        "--- SKIP: TestMoveLeaderWithRootAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestMoveLeaderWithUserAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestMoveLeaderWithUserAuth",
+        "upstream_common_maintenance_auth_test.go:128:",
+        "--- SKIP: TestMoveLeaderWithUserAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestSnapshotWithNoAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestSnapshotWithNoAuth",
+        "upstream_common_maintenance_auth_test.go:152:",
+        "--- SKIP: TestSnapshotWithNoAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestSnapshotWithInvalidAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestSnapshotWithInvalidAuth",
+        "upstream_common_maintenance_auth_test.go:152:",
+        "--- SKIP: TestSnapshotWithInvalidAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestSnapshotWithRootAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestSnapshotWithRootAuth",
+        "upstream_common_maintenance_auth_test.go:152:",
+        "--- SKIP: TestSnapshotWithRootAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestSnapshotWithUserAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestSnapshotWithUserAuth",
+        "upstream_common_maintenance_auth_test.go:152:",
+        "--- SKIP: TestSnapshotWithUserAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestStatusWithNoAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestStatusWithNoAuth",
+        "upstream_adapter_test.go:38: unsupported capability: TestStatusWithNoAuth; see tests/upstream/README.md",
+        "--- SKIP: TestStatusWithNoAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestStatusWithInvalidAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestStatusWithInvalidAuth",
+        "upstream_adapter_test.go:38: unsupported capability: TestStatusWithInvalidAuth; see tests/upstream/README.md",
+        "--- SKIP: TestStatusWithInvalidAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestStatusWithRootAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestStatusWithRootAuth",
+        "upstream_adapter_test.go:38: unsupported capability: TestStatusWithRootAuth; see tests/upstream/README.md",
+        "--- SKIP: TestStatusWithRootAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestStatusWithUserAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestStatusWithUserAuth",
+        "upstream_adapter_test.go:38: unsupported capability: TestStatusWithUserAuth; see tests/upstream/README.md",
+        "--- SKIP: TestStatusWithUserAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestMemberList",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestMemberList",
+        "upstream_adapter_test.go:38: unsupported capability: TestMemberList; see tests/upstream/README.md",
+        "--- SKIP: TestMemberList (0.00s)"
+      ]
+    },
+    {
+      "name": "TestMemberAdd",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestMemberAdd",
+        "upstream_adapter_test.go:38: unsupported capability: TestMemberAdd; see tests/upstream/README.md",
+        "--- SKIP: TestMemberAdd (0.00s)"
+      ]
+    },
+    {
+      "name": "TestMemberRemove",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestMemberRemove",
+        "upstream_adapter_test.go:38: unsupported capability: TestMemberRemove; see tests/upstream/README.md",
+        "--- SKIP: TestMemberRemove (0.00s)"
+      ]
+    },
+    {
+      "name": "TestRoleAdd_Simple",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestRoleAdd_Simple",
+        "upstream_adapter_test.go:38: unsupported capability: TestRoleAdd_Simple; see tests/upstream/README.md",
+        "--- SKIP: TestRoleAdd_Simple (0.00s)"
+      ]
+    },
+    {
+      "name": "TestRoleAdd_Error",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestRoleAdd_Error",
+        "upstream_adapter_test.go:38: unsupported capability: TestRoleAdd_Error; see tests/upstream/README.md",
+        "--- SKIP: TestRoleAdd_Error (0.00s)"
+      ]
+    },
+    {
+      "name": "TestRootRole",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestRootRole",
+        "upstream_adapter_test.go:38: unsupported capability: TestRootRole; see tests/upstream/README.md",
+        "--- SKIP: TestRootRole (0.00s)"
+      ]
+    },
+    {
+      "name": "TestRoleGrantRevokePermission",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestRoleGrantRevokePermission",
+        "upstream_adapter_test.go:38: unsupported capability: TestRoleGrantRevokePermission; see tests/upstream/README.md",
+        "--- SKIP: TestRoleGrantRevokePermission (0.00s)"
+      ]
+    },
+    {
+      "name": "TestRoleDelete",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestRoleDelete",
+        "upstream_adapter_test.go:38: unsupported capability: TestRoleDelete; see tests/upstream/README.md",
+        "--- SKIP: TestRoleDelete (0.00s)"
+      ]
+    },
+    {
+      "name": "TestStatus",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestStatus",
+        "upstream_adapter_test.go:38: unsupported capability: TestStatus; see tests/upstream/README.md",
+        "--- SKIP: TestStatus (0.00s)"
+      ]
+    },
+    {
+      "name": "TestTxnSucc/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.06
+    },
+    {
+      "name": "TestTxnSucc",
+      "result": "pass",
+      "seconds": 1.06
+    },
+    {
+      "name": "TestTxnFail/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.16
+    },
+    {
+      "name": "TestTxnFail",
+      "result": "pass",
+      "seconds": 1.16
+    },
+    {
+      "name": "TestUserAdd_Simple",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestUserAdd_Simple",
+        "upstream_adapter_test.go:38: unsupported capability: TestUserAdd_Simple; see tests/upstream/README.md",
+        "--- SKIP: TestUserAdd_Simple (0.00s)"
+      ]
+    },
+    {
+      "name": "TestUserAdd_DuplicateUserNotAllowed",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestUserAdd_DuplicateUserNotAllowed",
+        "upstream_adapter_test.go:38: unsupported capability: TestUserAdd_DuplicateUserNotAllowed; see tests/upstream/README.md",
+        "--- SKIP: TestUserAdd_DuplicateUserNotAllowed (0.00s)"
+      ]
+    },
+    {
+      "name": "TestUserList",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestUserList",
+        "upstream_adapter_test.go:38: unsupported capability: TestUserList; see tests/upstream/README.md",
+        "--- SKIP: TestUserList (0.00s)"
+      ]
+    },
+    {
+      "name": "TestUserDelete",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestUserDelete",
+        "upstream_adapter_test.go:38: unsupported capability: TestUserDelete; see tests/upstream/README.md",
+        "--- SKIP: TestUserDelete (0.00s)"
+      ]
+    },
+    {
+      "name": "TestUserChangePassword",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestUserChangePassword",
+        "upstream_adapter_test.go:38: unsupported capability: TestUserChangePassword; see tests/upstream/README.md",
+        "--- SKIP: TestUserChangePassword (0.00s)"
+      ]
+    },
+    {
+      "name": "TestWaitLeader/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.16
+    },
+    {
+      "name": "TestWaitLeader",
+      "result": "pass",
+      "seconds": 1.16
+    },
+    {
+      "name": "TestWaitLeader_MemberStop/PeerTLS",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestWaitLeader_MemberStop/PeerTLS",
+        "upstream_adapter_test.go:49: unsupported cluster configuration: requires three voters without TLS or quota",
+        "--- SKIP: TestWaitLeader_MemberStop/PeerTLS (0.00s)"
+      ]
+    },
+    {
+      "name": "TestWaitLeader_MemberStop/PeerAutoTLS",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestWaitLeader_MemberStop/PeerAutoTLS",
+        "upstream_adapter_test.go:49: unsupported cluster configuration: requires three voters without TLS or quota",
+        "--- SKIP: TestWaitLeader_MemberStop/PeerAutoTLS (0.00s)"
+      ]
+    },
+    {
+      "name": "TestWaitLeader_MemberStop",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestWatch",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestWatch",
+        "upstream_adapter_test.go:38: unsupported capability: TestWatch; see tests/upstream/README.md",
+        "--- SKIP: TestWatch (0.00s)"
+      ]
+    },
+    {
+      "name": "FuzzKVSequence/seed#0",
+      "result": "pass",
+      "seconds": 2.2
+    },
+    {
+      "name": "FuzzKVSequence/seed#1",
+      "result": "pass",
+      "seconds": 2.75
+    },
+    {
+      "name": "FuzzKVSequence/seed#2",
+      "result": "pass",
+      "seconds": 1.43
+    },
+    {
+      "name": "FuzzKVSequence",
+      "result": "pass",
+      "seconds": 6.38
+    }
+  ],
+  "counts": {
+    "pass": 123,
+    "skip": 79
+  },
+  "leaf_counts": {
+    "pass": 110,
+    "skip": 79
+  },
+  "passed": true,
+  "complete": false
+}

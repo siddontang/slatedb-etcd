@@ -189,10 +189,46 @@ impl Kv for Service {
 
     async fn compact(
         &self,
-        _: Request<CompactionRequest>,
+        request: Request<CompactionRequest>,
     ) -> Result<Response<CompactionResponse>, Status> {
-        Err(Status::unimplemented(
-            "MVCC history compaction is not implemented",
-        ))
+        let forwarded = is_forwarded(&request);
+        let request = request.into_inner();
+        if request.physical {
+            return Err(Status::unimplemented(
+                "etcdserver: physical MVCC compaction is not implemented",
+            ));
+        }
+        let (tx, rx) = oneshot::channel();
+        self.events
+            .try_send(Event::EtcdCompact(request, tx))
+            .map_err(|_| Status::unavailable("etcdserver: too many requests"))?;
+        let reply = tokio::time::timeout(Duration::from_secs(10), rx)
+            .await
+            .map_err(|_| {
+                Status::deadline_exceeded("etcdserver: request timed out; outcome unknown")
+            })?
+            .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?;
+        let mut response = match reply {
+            Ok(value) => {
+                let outcome: Outcome<CompactionResponse> =
+                    serde_json::from_value(value).map_err(|e| Status::internal(e.to_string()))?;
+                outcome.result.map_err(|e| e.status())?
+            }
+            Err(error) if error.error == "not leader" && !forwarded => {
+                let channel = self
+                    .peers
+                    .get(&error.leader_id)
+                    .ok_or_else(|| Status::unavailable("etcdserver: no leader"))?;
+                KvClient::new(channel.clone())
+                    .compact(forward(request))
+                    .await?
+                    .into_inner()
+            }
+            Err(error) => return Err(Status::unavailable(format!("etcdserver: {}", error.error))),
+        };
+        if let Some(header) = &mut response.header {
+            header.member_id = self.member;
+        }
+        Ok(Response::new(response))
     }
 }

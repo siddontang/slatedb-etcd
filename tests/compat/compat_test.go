@@ -77,6 +77,8 @@ func newCluster(t *testing.T) *cluster {
 				}
 				t.Logf("node %d: %s", i, data)
 			}
+		} else if os.Getenv("SLATEDB_KEEP_DATA") != "1" && t.Name() != "TestRobustness" {
+			os.RemoveAll(root)
 		}
 	})
 	for i := 1; i <= 3; i++ {
@@ -221,6 +223,8 @@ func responseHeader(m proto.Message) *pb.ResponseHeader {
 	case *pb.DeleteRangeResponse:
 		return r.Header
 	case *pb.TxnResponse:
+		return r.Header
+	case *pb.CompactionResponse:
 		return r.Header
 	default:
 		panic("unknown response")
@@ -486,7 +490,7 @@ func TestPartitionReadModes(t *testing.T) {
 	c := newCluster(t)
 	isolated := c.leader()
 	minority := client(t, []string{c.addresses[isolated-1]})
-	mustCall(t, minority, clientv3.OpPut("partition", "before"))
+	initial := mustCall(t, minority, clientv3.OpPut("partition", "before")).(*pb.PutResponse).Header.Revision
 	for id := range c.processes {
 		blocked := []int{isolated}
 		if id == isolated {
@@ -537,6 +541,13 @@ func TestPartitionReadModes(t *testing.T) {
 	cancel()
 	if err == nil {
 		t.Fatal("An isolated replica served a linearizable read")
+	}
+	if _, err := compact(minority, initial, false); err == nil {
+		t.Fatal("An isolated replica acknowledged compaction")
+	}
+	if _, err := call(minority, clientv3.OpGet("partition",
+		clientv3.WithRev(initial-1), clientv3.WithSerializable())); err != nil {
+		t.Fatalf("An isolated replica applied uncommitted compaction: %v", err)
 	}
 	for id := range c.processes {
 		if _, err := c.http(id, "/debug/partition", map[string]any{"blocked": []int{}}); err != nil {

@@ -53,13 +53,17 @@ pub enum RaftCommand {
         id: String,
         etcd: proto::etcdserverpb::RequestOp,
     },
+    Compact {
+        id: String,
+        compact: proto::etcdserverpb::CompactionRequest,
+    },
 }
 
 impl RaftCommand {
     pub fn id(&self) -> &str {
         match self {
             Self::Legacy(c) => &c.id,
-            Self::Etcd { id, .. } => id,
+            Self::Etcd { id, .. } | Self::Compact { id, .. } => id,
         }
     }
 }

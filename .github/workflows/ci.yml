@@ -2,7 +2,18 @@ name: Verify
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      extended:
+        description: Run 100 DST seeds and 16 process fault seeds
+        type: boolean
+        default: false
+
+concurrency:
+  group: verify-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -10,7 +21,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -19,16 +30,51 @@ jobs:
           cache-dependency-path: tests/compat/go.sum
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install pinned Jepsen test runner
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/technomancy/leiningen/releases/download/2.11.2/leiningen-2.11.2-standalone.jar \
+            --output "$RUNNER_TEMP/lein.jar"
+          echo "7d31ae23ae769e927438b0cd55d15a93e7dabab09fd4fc15877979161e108774  $RUNNER_TEMP/lein.jar" | sha256sum --check
+          echo "LEIN_JAR=$RUNNER_TEMP/lein.jar" >> "$GITHUB_ENV"
+      - name: Select test seeds
+        env:
+          EXTENDED: ${{ inputs.extended }}
+        run: |
+          python3 - <<'PY'
+          import os
+          extended = os.environ["EXTENDED"] == "true"
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              dst = ",".join(map(str, range(1, 101))) if extended else "1,2,42"
+              faults = ",".join(map(str, range(1, 17))) if extended else "1,2,3,4"
+              env.write(f"SLATEDB_DST_SEEDS={dst}\nFAULT_SEEDS={faults}\n")
+          PY
       - name: Check Rust
         run: |
           cargo fmt --check
           scripts/cargo.sh clippy --locked --all-targets -- -D warnings
-          scripts/cargo.sh test --locked
+          scripts/cargo.sh test --locked -- --skip seeded_fault_schedules_replay_identically
+          python3 scripts/check-dst.py --seeds "$SLATEDB_DST_SEEDS" --output results/ci/dst.json
           scripts/cargo.sh build --locked --release
       - name: Check etcd compatibility and recovery
         run: |
           python3 scripts/check-compat.py --output results/ci/etcd-compatibility.json
+          python3 scripts/check-compat.py --tags upstream \
+            --output results/ci/etcd-upstream.json
           python3 scripts/harness.py test --output results/ci/etcd-core-fault-tests.json
+      - name: Check process faults with etcd and Jepsen models
+        run: |
+          python3 scripts/check-jepsen.py --self-test
+          python3 scripts/check-robustness.py --seeds "$FAULT_SEEDS" --jepsen \
+            --output results/ci/robustness.json
+      - name: Run bounded API fuzzing
+        run: |
+          cd tests/compat
+          go test -mod=readonly -run '^$' -fuzz '^FuzzKVSequence$' -fuzztime=10x -timeout=2m -parallel=1
       - name: Record test results
         if: always()
         run: |

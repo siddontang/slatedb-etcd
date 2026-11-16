@@ -4,3 +4,6 @@
 __pycache__/
 .DS_Store
 /reference/
+/tests/jepsen/target/
+/tests/jepsen/store/
+/tests/jepsen/.lein-failures

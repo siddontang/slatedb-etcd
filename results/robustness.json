@@ -1,0 +1,123 @@
+{
+  "created_at": "2026-11-16T07:43:32.201217+00:00",
+  "passed": true,
+  "binary_sha256": "23e223e90be4074912ff0b1e01b08e5473857a4e0eaec2274dccf84a60a1f92e",
+  "jepsen_requested": true,
+  "runs": [
+    {
+      "seed": 1,
+      "passed": true,
+      "directory": "<repo>/tmp/test-results/robustness-1",
+      "model": {
+        "checker": "etcd v3.6.5 NonDeterministicModel with Porcupine v0.1.4",
+        "faults": [
+          {
+            "fault": "partition-leader",
+            "member": 1,
+            "time_ns": 305402875
+          },
+          {
+            "fault": "heal",
+            "member": 0,
+            "time_ns": 1812559166
+          }
+        ],
+        "operations": 255,
+        "process_logs": "<tmp>/slatedb-etcd-compat-838749748",
+        "result": "Ok",
+        "seed": 1,
+        "successful_operations": [
+          58,
+          58,
+          67
+        ]
+      },
+      "jepsen_passed": true
+    },
+    {
+      "seed": 2,
+      "passed": true,
+      "directory": "<repo>/tmp/test-results/robustness-2",
+      "model": {
+        "checker": "etcd v3.6.5 NonDeterministicModel with Porcupine v0.1.4",
+        "faults": [
+          {
+            "fault": "kill-leader",
+            "member": 1,
+            "time_ns": 306500000
+          }
+        ],
+        "operations": 268,
+        "process_logs": "<tmp>/slatedb-etcd-compat-2005279361",
+        "result": "Ok",
+        "seed": 2,
+        "successful_operations": [
+          70,
+          60,
+          64
+        ]
+      },
+      "jepsen_passed": true
+    },
+    {
+      "seed": 3,
+      "passed": true,
+      "directory": "<repo>/tmp/test-results/robustness-3",
+      "model": {
+        "checker": "etcd v3.6.5 NonDeterministicModel with Porcupine v0.1.4",
+        "faults": [
+          {
+            "fault": "pause-leader",
+            "member": 3,
+            "time_ns": 306597625
+          },
+          {
+            "fault": "resume",
+            "member": 3,
+            "time_ns": 1807574417
+          }
+        ],
+        "operations": 263,
+        "process_logs": "<tmp>/slatedb-etcd-compat-4198292371",
+        "result": "Ok",
+        "seed": 3,
+        "successful_operations": [
+          67,
+          67,
+          56
+        ]
+      },
+      "jepsen_passed": true
+    },
+    {
+      "seed": 4,
+      "passed": true,
+      "directory": "<repo>/tmp/test-results/robustness-4",
+      "model": {
+        "checker": "etcd v3.6.5 NonDeterministicModel with Porcupine v0.1.4",
+        "faults": [
+          {
+            "fault": "kill-all",
+            "member": 0,
+            "time_ns": 302957875
+          },
+          {
+            "fault": "restart-all",
+            "member": 0,
+            "time_ns": 1505815208
+          }
+        ],
+        "operations": 261,
+        "process_logs": "<tmp>/slatedb-etcd-compat-2103116593",
+        "result": "Ok",
+        "seed": 4,
+        "successful_operations": [
+          60,
+          63,
+          69
+        ]
+      },
+      "jepsen_passed": true
+    }
+  ]
+}

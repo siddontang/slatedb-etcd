@@ -15,6 +15,7 @@ use crate::proto::mvccpb::KeyValue;
 const CURRENT: &[u8] = b"etcd/current/";
 const HISTORY: &[u8] = b"etcd/history/";
 pub const REVISION: &[u8] = b"etcd/revision";
+pub const COMPACT_REVISION: &[u8] = b"etcd/compact-revision";
 type KvResult<T> = Result<T, KvError>;
 type KvFuture<'a, T> = Pin<Box<dyn Future<Output = KvResult<T>> + Send + 'a>>;
 type Rows = BTreeMap<Vec<u8>, KeyValue>;
@@ -47,8 +48,8 @@ impl KvError {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Outcome {
-    pub result: KvResult<ResponseOp>,
+pub struct Outcome<T = ResponseOp> {
+    pub result: KvResult<T>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -201,6 +202,7 @@ enum Plan {
 struct View<'a> {
     db: &'a Db,
     revision: i64,
+    compact_revision: i64,
     changes: BTreeMap<Vec<u8>, Option<KeyValue>>,
 }
 
@@ -362,10 +364,15 @@ impl View<'_> {
                         children,
                     })
                 }
-                Op::RequestRange(r) if nested && r.revision < -1 => Err(KvError::new(
-                    Code::OutOfRange,
-                    "mvcc: required revision has been compacted",
-                )),
+                Op::RequestRange(r)
+                    if r.revision < self.compact_revision
+                        && (r.revision > 0 || (nested && r.revision != 0)) =>
+                {
+                    Err(KvError::new(
+                        Code::OutOfRange,
+                        "mvcc: required revision has been compacted",
+                    ))
+                }
                 Op::RequestRange(r) if r.revision > self.revision => Err(KvError::new(
                     Code::OutOfRange,
                     "mvcc: required revision is a future revision",
@@ -509,12 +516,14 @@ impl View<'_> {
 pub async fn prepare(
     db: &Db,
     revision: i64,
+    compact_revision: i64,
     request: &RequestOp,
 ) -> KvResult<(ResponseOp, WriteBatch, i64)> {
     validate(request)?;
     let mut view = View {
         db,
         revision,
+        compact_revision,
         changes: BTreeMap::new(),
     };
     let plan = view.plan(request, false).await?;
@@ -541,6 +550,58 @@ pub async fn prepare(
     }
     batch.put(REVISION, next.to_be_bytes());
     Ok((response, batch, next))
+}
+
+/// Remove older versions while retaining each key's value at the compaction boundary.
+pub async fn prepare_compaction(
+    db: &Db,
+    revision: i64,
+    compact_revision: i64,
+    request: &CompactionRequest,
+) -> KvResult<(CompactionResponse, WriteBatch)> {
+    if request.physical {
+        return Err(KvError::new(
+            Code::Unimplemented,
+            "physical MVCC compaction is not implemented",
+        ));
+    }
+    if request.revision <= compact_revision {
+        return Err(KvError::new(
+            Code::OutOfRange,
+            "mvcc: required revision has been compacted",
+        ));
+    }
+    if request.revision > revision {
+        return Err(KvError::new(
+            Code::OutOfRange,
+            "mvcc: required revision is a future revision",
+        ));
+    }
+    let mut batch = WriteBatch::new();
+    let mut scan = db
+        .scan_prefix(HISTORY, ..)
+        .await
+        .map_err(KvError::storage)?;
+    let mut previous: Option<(Vec<u8>, Vec<u8>)> = None;
+    while let Some(row) = scan.next().await.map_err(KvError::storage)? {
+        let version: Version = bincode::deserialize(&row.value).map_err(KvError::storage)?;
+        if version.revision <= request.revision {
+            // History keys sort by user key, then by increasing revision.
+            if let Some((key, history_key)) = previous.take() {
+                if key == version.key {
+                    batch.delete(history_key);
+                }
+            }
+            previous = Some((version.key, row.key.to_vec()));
+        }
+    }
+    batch.put(COMPACT_REVISION, request.revision.to_be_bytes());
+    Ok((
+        CompactionResponse {
+            header: header(revision),
+        },
+        batch,
+    ))
 }
 
 pub fn response_header(op: &mut ResponseOp) -> Option<&mut ResponseHeader> {
