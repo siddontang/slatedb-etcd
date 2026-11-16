@@ -1,0 +1,342 @@
+{
+  "mode": "test",
+  "host": "macOS-27.2.1-arm64-arm-64bit",
+  "machine": "arm64",
+  "created_at": "2026-11-16T06:19:59.731735+00:00",
+  "logical_cpus": 10,
+  "binary_sha256": "a013506992f367295ac04928c35d84e03546e295e53dcbebc33c897a9681b419",
+  "python": "3.9.6 (default, Apr 30 2025, 02:07:17) \n[Clang 17.0.0 (clang-1700.0.13.5)]",
+  "run_directory": "<tmp>/slatedb-raft-poc-kt8i2tlm",
+  "binary": "<repo>/target/release/slatedb-etcd",
+  "deployment": "three processes on one host and disk; loopback HTTP; local object store",
+  "durability": "raft-engine synchronous writes; process crashes tested, power loss not tested",
+  "checks": [
+    {
+      "name": "election_and_atomic_write",
+      "passed": true,
+      "leader": 1,
+      "index": 2
+    },
+    {
+      "name": "leader_sigkill_and_follower_rejoin",
+      "passed": true,
+      "old_leader": 1,
+      "new_leader": 3,
+      "failover_to_success_ms": 1220.4072499999997
+    },
+    {
+      "name": "all_processes_sigkill_and_wal_replay",
+      "passed": true,
+      "recovered_from": {
+        "1": 0,
+        "2": 0,
+        "3": 0
+      }
+    },
+    {
+      "name": "log_compaction_physical_gc_and_snapshot_catchup",
+      "passed": true,
+      "lagging_node": 2,
+      "snapshot_index": 522,
+      "reclaimed_files": 8,
+      "log_bytes_before": 2199623,
+      "log_bytes_after": 139670
+    },
+    {
+      "name": "restart_after_log_gc",
+      "passed": true
+    },
+    {
+      "name": "partition_rejects_minority_and_replaces_uncommitted_suffix",
+      "passed": true
+    },
+    {
+      "name": "replicated_delete_and_linearizable_read",
+      "passed": true
+    },
+    {
+      "name": "slow_background_snapshot_keeps_heartbeats_and_writes",
+      "passed": true,
+      "writes_during_snapshot": 127
+    }
+  ],
+  "final_status": [
+    {
+      "applied_index": 657,
+      "blocked_peers": [],
+      "checkpoint_running": false,
+      "cluster_id": "poc-slatedb-raft-poc-kt8i2tlm",
+      "commit_index": 657,
+      "durable_applied_index": 522,
+      "first_log_index": 523,
+      "id": 1,
+      "installed_snapshots": 0,
+      "last_log_index": 657,
+      "leader_id": 3,
+      "log": {
+        "bytes": 168155,
+        "files": [
+          "0000000000000009.raftlog"
+        ]
+      },
+      "pending": 0,
+      "recovered_from_index": 522,
+      "revision": 1,
+      "role": "Follower",
+      "snapshot_delay_ms": 0,
+      "snapshot_index": 522,
+      "sync_writes": 272,
+      "term": 5
+    },
+    {
+      "applied_index": 657,
+      "blocked_peers": [],
+      "checkpoint_running": false,
+      "cluster_id": "poc-slatedb-raft-poc-kt8i2tlm",
+      "commit_index": 657,
+      "durable_applied_index": 522,
+      "first_log_index": 523,
+      "id": 2,
+      "installed_snapshots": 0,
+      "last_log_index": 657,
+      "leader_id": 3,
+      "log": {
+        "bytes": 96545,
+        "files": [
+          "0000000000000001.raftlog"
+        ]
+      },
+      "pending": 0,
+      "recovered_from_index": 522,
+      "revision": 1,
+      "role": "Follower",
+      "snapshot_delay_ms": 0,
+      "snapshot_index": 522,
+      "sync_writes": 270,
+      "term": 5
+    },
+    {
+      "applied_index": 657,
+      "blocked_peers": [],
+      "checkpoint_running": false,
+      "cluster_id": "poc-slatedb-raft-poc-kt8i2tlm",
+      "commit_index": 657,
+      "durable_applied_index": 530,
+      "first_log_index": 531,
+      "id": 3,
+      "installed_snapshots": 0,
+      "last_log_index": 657,
+      "leader_id": 3,
+      "log": {
+        "bytes": 234589,
+        "files": [
+          "0000000000000009.raftlog"
+        ]
+      },
+      "pending": 0,
+      "recovered_from_index": 522,
+      "revision": 1,
+      "role": "Leader",
+      "snapshot_delay_ms": 0,
+      "snapshot_index": 530,
+      "sync_writes": 273,
+      "term": 5
+    }
+  ],
+  "passed": true,
+  "node_log_summary": {
+    "node-1": {
+      "completed_snapshots": 1,
+      "last_snapshot_index": 522,
+      "raft_state_changes": [
+        {
+          "role": "PreCandidate",
+          "term": 0,
+          "leader_id": 0
+        },
+        {
+          "role": "Candidate",
+          "term": 1,
+          "leader_id": 0
+        },
+        {
+          "role": "Leader",
+          "term": 1,
+          "leader_id": 1
+        },
+        {
+          "role": "Follower",
+          "term": 2,
+          "leader_id": 3
+        },
+        {
+          "role": "PreCandidate",
+          "term": 2,
+          "leader_id": 0
+        },
+        {
+          "role": "Candidate",
+          "term": 3,
+          "leader_id": 0
+        },
+        {
+          "role": "Leader",
+          "term": 3,
+          "leader_id": 1
+        },
+        {
+          "role": "Follower",
+          "term": 4,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 4,
+          "leader_id": 2
+        },
+        {
+          "role": "Follower",
+          "term": 5,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 5,
+          "leader_id": 3
+        }
+      ]
+    },
+    "node-2": {
+      "completed_snapshots": 0,
+      "last_snapshot_index": null,
+      "raft_state_changes": [
+        {
+          "role": "Follower",
+          "term": 1,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 1,
+          "leader_id": 1
+        },
+        {
+          "role": "Follower",
+          "term": 2,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 2,
+          "leader_id": 3
+        },
+        {
+          "role": "Follower",
+          "term": 3,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 3,
+          "leader_id": 1
+        },
+        {
+          "role": "Follower",
+          "term": 3,
+          "leader_id": 1
+        },
+        {
+          "role": "PreCandidate",
+          "term": 3,
+          "leader_id": 0
+        },
+        {
+          "role": "Candidate",
+          "term": 4,
+          "leader_id": 0
+        },
+        {
+          "role": "Leader",
+          "term": 4,
+          "leader_id": 2
+        },
+        {
+          "role": "Follower",
+          "term": 4,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 5,
+          "leader_id": 3
+        }
+      ]
+    },
+    "node-3": {
+      "completed_snapshots": 2,
+      "last_snapshot_index": 530,
+      "raft_state_changes": [
+        {
+          "role": "Follower",
+          "term": 1,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 1,
+          "leader_id": 1
+        },
+        {
+          "role": "PreCandidate",
+          "term": 1,
+          "leader_id": 0
+        },
+        {
+          "role": "Candidate",
+          "term": 2,
+          "leader_id": 0
+        },
+        {
+          "role": "Leader",
+          "term": 2,
+          "leader_id": 3
+        },
+        {
+          "role": "Follower",
+          "term": 3,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 3,
+          "leader_id": 1
+        },
+        {
+          "role": "Follower",
+          "term": 4,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 4,
+          "leader_id": 2
+        },
+        {
+          "role": "PreCandidate",
+          "term": 4,
+          "leader_id": 0
+        },
+        {
+          "role": "Candidate",
+          "term": 5,
+          "leader_id": 0
+        },
+        {
+          "role": "Leader",
+          "term": 5,
+          "leader_id": 3
+        }
+      ]
+    }
+  }
+}

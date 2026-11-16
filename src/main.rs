@@ -60,6 +60,7 @@ async fn main() -> Result<()> {
     );
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     let (tx, rx) = mpsc::channel(2048);
+    let grpc = slatedb_etcd::grpc::service(args.id, tx.clone(), &peers);
     let node = Node::open(
         NodeOptions {
             id: args.id,
@@ -74,7 +75,8 @@ async fn main() -> Result<()> {
     let app = router(ApiState {
         events: tx,
         cluster_id: args.cluster_id,
-    });
+    })
+    .fallback_service(grpc);
     tracing::info!(node = args.id, listen = %args.listen, "Node started");
     tokio::select! {
         result = node.run(rx) => result,

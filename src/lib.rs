@@ -1,5 +1,8 @@
 pub mod api;
+pub mod grpc;
+pub mod mvcc;
 pub mod node;
+pub mod proto;
 pub mod state;
 pub mod storage;
 
@@ -40,6 +43,25 @@ impl Request {
 pub struct Command {
     pub id: String,
     pub request: Request,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum RaftCommand {
+    Legacy(Command),
+    Etcd {
+        id: String,
+        etcd: proto::etcdserverpb::RequestOp,
+    },
+}
+
+impl RaftCommand {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Legacy(c) => &c.id,
+            Self::Etcd { id, .. } => id,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]

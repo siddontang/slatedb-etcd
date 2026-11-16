@@ -9,6 +9,8 @@ use slatedb::config::{Settings, WriteOptions};
 use slatedb::object_store::local::LocalFileSystem;
 use slatedb::{Db, WriteBatch};
 
+use crate::mvcc::{self, Outcome};
+use crate::proto::etcdserverpb::RequestOp;
 use crate::{Command, Operation, Reply};
 
 const APPLIED: &[u8] = b"meta/applied";
@@ -25,6 +27,7 @@ pub struct StateMachine {
     db: Arc<Db>,
     pub applied: u64,
     pub durable_applied: u64,
+    pub revision: i64,
 }
 
 impl StateMachine {
@@ -55,10 +58,12 @@ impl StateMachine {
             db.snapshot()?.seq() == applied,
             "SlateDB sequence and apply marker differ"
         );
+        let revision = read_revision(&db).await?;
         Ok(Self {
             db: Arc::new(db),
             applied,
             durable_applied: applied,
+            revision,
         })
     }
 
@@ -114,6 +119,46 @@ impl StateMachine {
         Ok(data)
     }
 
+    pub async fn read_etcd(&self, request: &RequestOp) -> Result<Outcome> {
+        let result = mvcc::prepare(&self.db, self.revision, request).await;
+        if let Err(error) = &result {
+            ensure!(
+                error.code != tonic::Code::Internal as i32,
+                "{}",
+                error.message
+            );
+        }
+        Ok(Outcome {
+            result: result.map(|(response, _, _)| response),
+        })
+    }
+
+    pub async fn apply_etcd(&mut self, index: u64, request: &RequestOp) -> Result<Outcome> {
+        ensure!(
+            index == self.applied + 1,
+            "non-contiguous state machine apply"
+        );
+        let (result, mut batch, revision) =
+            match mvcc::prepare(&self.db, self.revision, request).await {
+                Ok((response, batch, revision)) => (Ok(response), batch, revision),
+                Err(error) => {
+                    ensure!(
+                        error.code != tonic::Code::Internal as i32,
+                        "{}",
+                        error.message
+                    );
+                    (Err(error), WriteBatch::new(), self.revision)
+                }
+            };
+        batch.put(APPLIED, index.to_be_bytes());
+        self.db
+            .write_with_options(batch, &WriteOptions { seqnum: index })
+            .await?;
+        self.applied = index;
+        self.revision = revision;
+        Ok(Outcome { result })
+    }
+
     /// Pin the applied prefix now, then flush and serialize it outside the Raft loop.
     pub fn snapshot_job(
         &self,
@@ -128,12 +173,12 @@ impl StateMachine {
         Ok(async move {
             db.flush().await?;
             let mut rows = vec![];
-            let mut iterator = snapshot.scan_prefix(DATA, ..).await?;
+            let mut iterator = snapshot.scan_prefix(b"", ..).await?;
             while let Some(row) = iterator.next().await? {
                 rows.push((row.key.to_vec(), row.value.to_vec()));
             }
             Ok(bincode::serialize(&SnapshotData {
-                version: 1,
+                version: 2,
                 applied,
                 rows,
             })?)
@@ -147,16 +192,19 @@ impl StateMachine {
         }
         let data: SnapshotData = bincode::deserialize(snapshot.get_data())?;
         ensure!(
-            data.version == 1 && data.applied == index,
+            (data.version == 1 || data.version == 2) && data.applied == index,
             "invalid snapshot metadata"
         );
         let mut batch = WriteBatch::new();
-        let mut iterator = self.db.scan_prefix(DATA, ..).await?;
+        let mut iterator = self.db.scan_prefix(b"", ..).await?;
         while let Some(row) = iterator.next().await? {
             batch.delete(row.key);
         }
         for (key, value) in data.rows {
-            ensure!(key.starts_with(DATA), "invalid snapshot key");
+            ensure!(
+                key.starts_with(DATA) || key.starts_with(b"etcd/") || key == APPLIED,
+                "invalid snapshot key"
+            );
             batch.put(key, value);
         }
         batch.put(APPLIED, index.to_be_bytes());
@@ -167,6 +215,7 @@ impl StateMachine {
         self.db.flush().await?;
         self.applied = index;
         self.durable_applied = index;
+        self.revision = read_revision(&self.db).await?;
         Ok(())
     }
 
@@ -177,6 +226,13 @@ impl StateMachine {
             .map(|value| String::from_utf8(value.to_vec()).map_err(Into::into))
             .transpose()
     }
+}
+
+async fn read_revision(db: &Db) -> Result<i64> {
+    Ok(match db.get(mvcc::REVISION).await? {
+        Some(bytes) => i64::from_be_bytes(bytes.as_ref().try_into().context("invalid revision")?),
+        None => 1,
+    })
 }
 
 fn data_key(key: &str) -> Vec<u8> {

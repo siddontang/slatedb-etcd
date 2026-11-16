@@ -3,10 +3,43 @@
 This service runs one Raft group with three fixed voters. Each process uses `raft-rs` for consensus,
 `raft-engine` for durable logs, and SlateDB for its state machine. SlateDB's native WAL is disabled.
 
-The PoC supports atomic batches of UTF-8 puts, deletes, and reads. It does not expose the etcd API.
+The service exposes the etcd v3 gRPC KV API. It supports binary keys, values, and MVCC history.
+The original JSON API remains available in a separate diagnostic keyspace.
 All endpoints bind to loopback. There is no authentication or dynamic membership.
 
-See [measured results](RESULTS.md) for the tested revision, failure checks, and latency data.
+See [compatibility results](COMPATIBILITY.md) for the etcd checks.
+The [original PoC results](RESULTS.md) describe measurements before this repository was extracted.
+
+## etcd v3 KV API
+
+The same port serves HTTP diagnostics and plaintext gRPC. No separate client port is required.
+Any replica accepts client requests. Followers forward writes and linearizable reads to the leader.
+Serializable Range requests read the local replica. Linearizable reads currently enter the Raft log.
+
+Supported behavior:
+
+- Range: exact keys, byte ranges, prefixes, historical revisions, sort, limit, count, and filters.
+- Put: create and modification revisions, key version, previous value, and ignore flags.
+- DeleteRange: exact keys, ranges, previous values, tombstones, and no-op deletion.
+- Txn: comparisons, success and failure branches, nested transactions, and atomic multi-key writes.
+
+A mutating transaction advances the global revision once. Reads and empty deletes do not advance it.
+The initial revision is 1. Invalid transactions leave the keyspace and revision unchanged.
+Nested predicates use the state before the transaction. Operations then execute in request order.
+The implementation rejects duplicate writes and overlapping Put/DeleteRange operations.
+
+Use a standard etcd client against any node:
+
+```sh
+etcdctl --endpoints=http://127.0.0.1:7001 put hello world
+etcdctl --endpoints=http://127.0.0.1:7002 get hello --write-out=json
+etcdctl --endpoints=http://127.0.0.1:7003 del hello --prev-kv
+```
+
+The official Go client integration tests also exercise Txn and historical reads.
+Watch, Lease, Auth, Cluster, Maintenance, and MVCC Compact are not implemented.
+A Put with a nonzero lease returns the standard lease-not-found error.
+This service is not yet a complete etcd replacement or a supported Kubernetes backend.
 
 ## Build and verify
 
@@ -17,10 +50,13 @@ scripts/cargo.sh build --release -p slatedb-etcd
 scripts/cargo.sh test -p slatedb-etcd
 scripts/cargo.sh clippy -p slatedb-etcd --all-targets -- -D warnings
 python3 scripts/harness.py test \
-  --output results/fault-tests.json
+  --output results/etcd-core-fault-tests.json
+python3 scripts/check-compat.py
 ```
 
 Rust uses the repository's pinned toolchain. Python 3.9 or later needs no extra packages.
+The compatibility suite requires Go 1.24 or later. It pins the official client and etcd to v3.6.5.
+It starts its own reference etcd and three service processes, then stops them after the tests.
 The build wrapper handles an old `protobuf-build` version check on Apple Silicon. It uses that
 crate's bundled protoc 3.9 through Rosetta when the system protoc is incompatible. Alternatively,
 set `PROTOC` to a working protoc 3.x compiler. The wrapper does not change the system installation.
@@ -148,15 +184,29 @@ SlateDB flushes can advance storage beyond it. `snapshot_index` is the durable l
 Each replica owns an independent object-store directory and manifest. The PoC does not let three
 writers share a manifest. A shared SST design needs a separate ownership and reference-GC protocol.
 
-## Next steps toward etcd
+## MVCC storage and recovery
 
-1. Add explicit MVCC records, key metadata, revisions, and event history in the state machine.
-   Allocate one etcd revision for a mutating transaction, independently of the Raft index.
-2. Add the etcd v3 gRPC KV API and ReadIndex-based reads. Test Range and Txn behavior against etcd.
+SlateDB stores the current value for each key and one history record for each changed revision.
+History records include deletions. The revision, key changes, and Raft apply marker use one batch.
+Raft log replay and full snapshots restore both current state and historical versions.
+The revision is independent of the SlateDB sequence number, which tracks the Raft apply index.
+
+Point reads use the current-key index. Current range reads scan the requested key interval.
+Historical point reads scan one key's versions. Historical range reads currently scan all history.
+Range responses collect matching keys in memory before sorting or applying a limit.
+These choices favor compatibility testing. Large data sets need bounded scans and a history index.
+
+History compaction is not implemented. Raft log GC removes covered log entries, but retains MVCC
+history in SlateDB and in the recovery snapshot. It does not implement the etcd Compact RPC.
+The diagnostic JSON keyspace is separate from the etcd keyspace and does not affect etcd revisions.
+
+## Next steps
+
+1. Add ReadIndex-based linearizable reads and separate state-apply workers.
+2. Add MVCC history compaction, bounded range scans, and checkpoint references for large snapshots.
 3. Add Watch history replay, live delivery, compaction errors, and progress notifications.
-4. Add leases with replicated revocation and deletion. Do not map lease expiry to local SlateDB TTL.
+4. Add leases with replicated revocation and deletion. Do not use local SlateDB TTL for leases.
 5. Add membership changes, TLS, authentication, quotas, maintenance APIs, and operational metrics.
 
-Before larger workloads, replace full snapshot payloads with pinned object-store checkpoint
-references and a verified restore protocol. Test object-store outages, slow disks, interrupted
-snapshot installation, and cross-host failover before using the service for coordination.
+Test object-store outages, slow disks, interrupted snapshot installation, and cross-host failover
+before using the service for coordination.

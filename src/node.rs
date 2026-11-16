@@ -9,14 +9,17 @@ use raft::{Config, RawNode, SnapshotStatus, StateRole, Storage};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::proto::etcdserverpb::RequestOp;
 use crate::state::StateMachine;
 use crate::storage::RaftStorage;
-use crate::{ApiError, Command, Request};
+use crate::{ApiError, Command, RaftCommand, Request};
 
 pub type Response = oneshot::Sender<Result<Value, ApiError>>;
 
 pub enum Event {
     Propose(Request, Response),
+    EtcdPropose(RequestOp, Response),
+    EtcdRead(RequestOp, Response),
     Step(Message, Response),
     Status(Response),
     Checkpoint(Response),
@@ -194,30 +197,27 @@ impl Node {
     async fn handle(&mut self, event: Event, step_responses: &mut Vec<Response>) -> Result<()> {
         match event {
             Event::Propose(request, response) => {
-                if self.raw.raft.state != StateRole::Leader {
-                    let _ = response.send(Err(self.error("not leader")));
-                } else if self.pending.len() >= 1024 {
-                    let _ = response.send(Err(self.error("too many pending requests")));
-                } else {
-                    let command = Command {
+                self.propose(
+                    RaftCommand::Legacy(Command {
                         id: uuid::Uuid::new_v4().to_string(),
                         request,
-                    };
-                    match self.raw.propose(vec![], serde_json::to_vec(&command)?) {
-                        Ok(()) => {
-                            self.pending.insert(
-                                command.id,
-                                Pending {
-                                    response,
-                                    started: Instant::now(),
-                                },
-                            );
-                        }
-                        Err(error) => {
-                            let _ = response.send(Err(self.error(&error.to_string())));
-                        }
-                    }
-                }
+                    }),
+                    response,
+                )?;
+            }
+            Event::EtcdPropose(etcd, response) => {
+                self.propose(
+                    RaftCommand::Etcd {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        etcd,
+                    },
+                    response,
+                )?;
+            }
+            Event::EtcdRead(request, response) => {
+                let mut outcome = self.state.read_etcd(&request).await?;
+                self.fill_etcd_header(&mut outcome);
+                let _ = response.send(Ok(serde_json::to_value(outcome)?));
             }
             Event::Step(message, response) => {
                 if message.to != self.options.id
@@ -338,19 +338,63 @@ impl Node {
                 entry.get_entry_type() == EntryType::EntryNormal,
                 "membership changes are not supported"
             );
-            let command: Option<Command> = if entry.data.is_empty() {
-                None
-            } else {
-                Some(serde_json::from_slice(&entry.data)?)
+            if entry.data.is_empty() {
+                self.state.apply(entry.index, None).await?;
+                continue;
+            }
+            let command: RaftCommand = serde_json::from_slice(&entry.data)?;
+            let reply = match &command {
+                RaftCommand::Legacy(command) => {
+                    serde_json::to_value(self.state.apply(entry.index, Some(command)).await?)?
+                }
+                RaftCommand::Etcd { etcd, .. } => {
+                    let mut outcome = self.state.apply_etcd(entry.index, etcd).await?;
+                    self.fill_etcd_header(&mut outcome);
+                    serde_json::to_value(outcome)?
+                }
             };
-            let reply = self.state.apply(entry.index, command.as_ref()).await?;
-            if let Some(command) = command {
-                if let Some(pending) = self.pending.remove(&command.id) {
-                    let _ = pending.response.send(Ok(serde_json::to_value(reply)?));
+            if let Some(pending) = self.pending.remove(command.id()) {
+                let _ = pending.response.send(Ok(reply));
+            }
+        }
+        Ok(())
+    }
+
+    fn propose(&mut self, command: RaftCommand, response: Response) -> Result<()> {
+        if self.raw.raft.state != StateRole::Leader {
+            let _ = response.send(Err(self.error("not leader")));
+        } else if self.pending.len() >= 1024 {
+            let _ = response.send(Err(self.error("too many pending requests")));
+        } else {
+            match self.raw.propose(vec![], serde_json::to_vec(&command)?) {
+                Ok(()) => {
+                    self.pending.insert(
+                        command.id().to_owned(),
+                        Pending {
+                            response,
+                            started: Instant::now(),
+                        },
+                    );
+                }
+                Err(error) => {
+                    let _ = response.send(Err(self.error(&error.to_string())));
                 }
             }
         }
         Ok(())
+    }
+
+    fn fill_etcd_header(&self, outcome: &mut crate::mvcc::Outcome) {
+        if let Ok(response) = &mut outcome.result {
+            let cluster = self
+                .options
+                .cluster_id
+                .bytes()
+                .fold(0xcbf29ce484222325u64, |hash, byte| {
+                    (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+                });
+            crate::mvcc::fill_header(response, cluster, self.options.id, self.raw.raft.term);
+        }
     }
 
     fn send(&mut self, messages: Vec<Message>) {
@@ -448,6 +492,7 @@ impl Node {
             "recovered_from_index": self.recovered_from_index, "log": self.raw.store().log_stats()?,
             "checkpoint_running": self.checkpoint_running,
             "snapshot_delay_ms": self.snapshot_delay_ms,
+            "revision": self.state.revision,
         }))
     }
 }

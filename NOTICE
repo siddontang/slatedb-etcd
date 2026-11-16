@@ -5,3 +5,6 @@ Pinned revision: 8b68800252064164397ca6ce53e5883dcfbc37b9
 
 The files under results/ record the original PoC runs before repository extraction.
 Their original paths and binary hashes remain unchanged for traceability.
+
+The protocol definitions are adapted from etcd v3.6.5 under Apache License 2.0.
+Copyright The etcd Authors. Source: https://github.com/etcd-io/etcd
