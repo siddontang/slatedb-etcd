@@ -27,7 +27,7 @@ pub struct KvError {
 }
 
 impl KvError {
-    fn new(code: Code, message: &str) -> Self {
+    pub(crate) fn new(code: Code, message: &str) -> Self {
         Self {
             code: code as i32,
             message: format!("etcdserver: {message}"),
@@ -38,7 +38,7 @@ impl KvError {
         Self::new(Code::InvalidArgument, message)
     }
 
-    fn storage(error: impl std::fmt::Display) -> Self {
+    pub(crate) fn storage(error: impl std::fmt::Display) -> Self {
         Self::new(Code::Internal, &format!("storage error: {error}"))
     }
 
@@ -72,7 +72,7 @@ fn history_prefix(key: &[u8]) -> Vec<u8> {
     out
 }
 
-fn contains(key: &[u8], begin: &[u8], end: &[u8]) -> bool {
+pub(crate) fn contains(key: &[u8], begin: &[u8], end: &[u8]) -> bool {
     if end.is_empty() {
         key == begin
     } else {
@@ -80,7 +80,7 @@ fn contains(key: &[u8], begin: &[u8], end: &[u8]) -> bool {
     }
 }
 
-fn header(revision: i64) -> Option<ResponseHeader> {
+pub(crate) fn header(revision: i64) -> Option<ResponseHeader> {
     Some(ResponseHeader {
         revision,
         ..Default::default()
@@ -204,6 +204,8 @@ struct View<'a> {
     revision: i64,
     compact_revision: i64,
     changes: BTreeMap<Vec<u8>, Option<KeyValue>>,
+    events: Vec<crate::proto::mvccpb::Event>,
+    leases: &'a BTreeMap<i64, crate::lease::LeaseRecord>,
 }
 
 impl View<'_> {
@@ -378,7 +380,7 @@ impl View<'_> {
                     "mvcc: required revision is a future revision",
                 )),
                 Op::RequestPut(p) => {
-                    if p.lease != 0 {
+                    if p.lease != 0 && !self.leases.contains_key(&p.lease) {
                         return Err(KvError::new(Code::NotFound, "requested lease not found"));
                     }
                     if (p.ignore_value || p.ignore_lease)
@@ -482,8 +484,17 @@ impl View<'_> {
                         version: old.as_ref().map_or(1, |v| v.version + 1),
                         create_revision: old.as_ref().map_or(revision, |v| v.create_revision),
                         mod_revision: revision,
-                        lease: 0,
+                        lease: if p.ignore_lease {
+                            old.as_ref().unwrap().lease
+                        } else {
+                            p.lease
+                        },
                     };
+                    self.events.push(crate::proto::mvccpb::Event {
+                        r#type: 0,
+                        kv: Some(kv.clone()),
+                        prev_kv: old.clone(),
+                    });
                     self.changes.insert(p.key, Some(kv));
                     response(Resp::ResponsePut(PutResponse {
                         header: header(revision),
@@ -493,7 +504,16 @@ impl View<'_> {
                 Plan::Op(Op::RequestDeleteRange(d)) => {
                     let rows = self.latest(&d.key, &d.range_end, true).await?;
                     let deleted = rows.len() as i64;
-                    for key in rows.keys() {
+                    for (key, old) in &rows {
+                        self.events.push(crate::proto::mvccpb::Event {
+                            r#type: 1,
+                            kv: Some(KeyValue {
+                                key: key.clone(),
+                                mod_revision: self.revision + 1,
+                                ..Default::default()
+                            }),
+                            prev_kv: Some(old.clone()),
+                        });
                         self.changes.insert(key.clone(), None);
                     }
                     response(Resp::ResponseDeleteRange(DeleteRangeResponse {
@@ -518,6 +538,7 @@ pub async fn prepare(
     revision: i64,
     compact_revision: i64,
     request: &RequestOp,
+    leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
 ) -> KvResult<(ResponseOp, WriteBatch, i64)> {
     validate(request)?;
     let mut view = View {
@@ -525,11 +546,14 @@ pub async fn prepare(
         revision,
         compact_revision,
         changes: BTreeMap::new(),
+        events: vec![],
+        leases,
     };
     let plan = view.plan(request, false).await?;
     let response = view.execute(plan, false).await?;
     let next = view.current_revision();
     let mut batch = WriteBatch::new();
+    crate::watch::record(db, revision, next, &view.events, &mut batch).await?;
     for (key, value) in view.changes {
         if let Some(value) = &value {
             batch.put(current_key(&key), value.encode_to_vec());
@@ -595,6 +619,7 @@ pub async fn prepare_compaction(
             previous = Some((version.key, row.key.to_vec()));
         }
     }
+    crate::watch::compact(db, request.revision, &mut batch).await?;
     batch.put(COMPACT_REVISION, request.revision.to_be_bytes());
     Ok((
         CompactionResponse {
@@ -621,4 +646,65 @@ pub fn fill_header(op: &mut ResponseOp, cluster: u64, member: u64, term: u64) {
         header.member_id = member;
         header.raft_term = term;
     }
+}
+
+pub(crate) async fn lease_keys(db: &Db, id: i64) -> KvResult<Vec<Vec<u8>>> {
+    let mut scan = db
+        .scan_prefix(CURRENT, ..)
+        .await
+        .map_err(KvError::storage)?;
+    let mut keys = vec![];
+    while let Some(row) = scan.next().await.map_err(KvError::storage)? {
+        let kv = KeyValue::decode(row.value).map_err(KvError::storage)?;
+        if kv.lease == id {
+            keys.push(kv.key);
+        }
+    }
+    Ok(keys)
+}
+
+pub(crate) async fn revoke_keys(
+    db: &Db,
+    revision: i64,
+    compact_revision: i64,
+    id: i64,
+    leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
+) -> KvResult<(WriteBatch, i64)> {
+    let mut view = View {
+        db,
+        revision,
+        compact_revision,
+        changes: BTreeMap::new(),
+        events: vec![],
+        leases,
+    };
+    for key in lease_keys(db, id).await? {
+        view.execute(
+            Plan::Op(Op::RequestDeleteRange(DeleteRangeRequest {
+                key,
+                ..Default::default()
+            })),
+            true,
+        )
+        .await?;
+    }
+    let next = view.current_revision();
+    let mut batch = WriteBatch::new();
+    for (key, value) in view.changes {
+        batch.delete(current_key(&key));
+        let mut history_key = history_prefix(&key);
+        history_key.extend_from_slice(&next.to_be_bytes());
+        batch.put(
+            history_key,
+            bincode::serialize(&Version {
+                key,
+                revision: next,
+                value,
+            })
+            .map_err(KvError::storage)?,
+        );
+    }
+    crate::watch::record(db, revision, next, &view.events, &mut batch).await?;
+    batch.put(REVISION, next.to_be_bytes());
+    Ok((batch, next))
 }

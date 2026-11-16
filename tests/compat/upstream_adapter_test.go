@@ -32,7 +32,8 @@ func (slateRunner) BeforeTest(t testing.TB) {
 	}
 	name := strings.Split(t.Name(), "/")[0]
 	if strings.HasPrefix(name, "TestKV") || strings.HasPrefix(name, "TestTxn") ||
-		name == "TestCompact" || strings.HasPrefix(name, "TestWaitLeader") {
+		name == "TestCompact" || name == "TestWatch" || strings.HasPrefix(name, "TestLease") ||
+		strings.HasPrefix(name, "TestWaitLeader") {
 		return
 	}
 	t.Skip("unsupported capability: " + name + "; see tests/upstream/README.md")

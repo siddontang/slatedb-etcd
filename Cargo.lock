@@ -2379,6 +2379,7 @@ dependencies = [
  "slog",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-build",
  "tracing",

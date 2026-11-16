@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/anishathalye/porcupine"
+	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	recording "go.etcd.io/etcd/tests/v3/robustness/client"
 	"go.etcd.io/etcd/tests/v3/robustness/identity"
@@ -66,6 +67,9 @@ func TestRobustness(t *testing.T) {
 		}
 		defer recorders[i].Close()
 	}
+	watchCtx, stopWatch := context.WithTimeout(context.Background(), 25*time.Second)
+	defer stopWatch()
+	watchResults := startFaultWatches(t, c, watchCtx)
 	stop := make(chan struct{})
 	var done sync.WaitGroup
 	for i, recorder := range recorders {
@@ -74,6 +78,8 @@ func TestRobustness(t *testing.T) {
 			defer done.Done()
 			rng := rand.New(rand.NewSource(seed + int64(i)*1009))
 			process := i
+			var leaseID int64
+			leaseAttached := false
 			for n := 0; ; n++ {
 				select {
 				case <-stop:
@@ -85,7 +91,7 @@ func TestRobustness(t *testing.T) {
 				callTime := time.Since(base).Nanoseconds()
 				function, input, output := "", "nil", "nil"
 				var err error
-				switch rng.Intn(7) {
+				switch rng.Intn(8) {
 				case 0:
 					function, input = "write", strconv.Quote(value)
 					_, err = recorder.Put(ctx, "register", value)
@@ -117,6 +123,23 @@ func TestRobustness(t *testing.T) {
 							If(clientv3.Compare(clientv3.ModRevision("pair/a"), "=", revision)).
 							Then(clientv3.OpPut("pair/a", value), clientv3.OpPut("pair/b", value)).Commit()
 					}
+				case 7:
+					if leaseID == 0 {
+						var lease *clientv3.LeaseGrantResponse
+						lease, err = recorder.LeaseGrant(ctx, 300)
+						if err == nil {
+							leaseID = int64(lease.ID)
+						}
+					} else if !leaseAttached {
+						_, err = recorder.PutWithLease(ctx, fmt.Sprintf("lease/%d", i), value, leaseID)
+						if err == nil {
+							leaseAttached = true
+						}
+					} else {
+						_, err = recorder.LeaseRevoke(ctx, leaseID)
+						leaseID, leaseAttached = 0, false
+					}
+
 				case 6:
 					var invoke, result string
 					var kind string
@@ -262,6 +285,14 @@ func TestRobustness(t *testing.T) {
 			jepsenEvent{start, process, "invoke", "txn", "[[:r :a nil] [:r :b nil]]"},
 			jepsenEvent{time.Since(base).Nanoseconds(), process, "ok", "txn", value})
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	barrier, err := recorders[0].Put(ctx, "__watch_barrier", "done")
+	require.NoError(t, err)
+	final, err := recorders[0].Range(ctx, "\x00", "\xff", 0, 0)
+	cancel()
+	require.NoError(t, err)
+	watchHistories := finishFaultWatches(t, watchResults, barrier.Header.Revision, final.Kvs)
+	stopWatch()
 	globalEnd := time.Since(base).Nanoseconds() + int64(time.Second)
 	var history []porcupine.Operation
 	for _, recorder := range recorders {
@@ -285,6 +316,7 @@ func TestRobustness(t *testing.T) {
 	}
 	saveJSON(t, filepath.Join(root, "operations.json"), history)
 	saveJSON(t, filepath.Join(root, "faults.json"), faults)
+	saveJSON(t, filepath.Join(root, "watches.json"), watchHistories)
 	saveEDN(t, filepath.Join(root, "jepsen.edn"), events)
 	saveEDN(t, filepath.Join(root, "append.edn"), appendEvents)
 	result, info := porcupine.CheckOperationsVerbose(model.NonDeterministicModel, history, 30*time.Second)
@@ -295,7 +327,7 @@ func TestRobustness(t *testing.T) {
 	saveJSON(t, filepath.Join(root, "result.json"), map[string]any{
 		"seed": seed, "checker": "etcd v3.6.5 NonDeterministicModel with Porcupine v0.1.4",
 		"result": result, "operations": len(history), "successful_operations": counts,
-		"process_logs": c.root, "faults": faults,
+		"process_logs": c.root, "faults": faults, "watch_replicas": len(watchHistories),
 	})
 	t.Log("Fault history:", root)
 	for _, count := range counts {

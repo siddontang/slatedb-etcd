@@ -9,6 +9,7 @@ use raft::{Config, RawNode, SnapshotStatus, StateRole, Storage};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::lease::{LeaseCommand, LeaseReply};
 use crate::proto::etcdserverpb::{CompactionRequest, RequestOp, ResponseHeader};
 use crate::state::StateMachine;
 use crate::storage::RaftStorage;
@@ -24,6 +25,13 @@ pub enum Event {
     EtcdPropose(RequestOp, Response),
     EtcdRead(RequestOp, Response),
     EtcdCompact(CompactionRequest, Response),
+    Lease(LeaseCommand, Response),
+    Watch(
+        crate::proto::etcdserverpb::WatchCreateRequest,
+        bool,
+        Option<i64>,
+        Response,
+    ),
     Step(Message, Response),
     Status(Response),
     Checkpoint(Response),
@@ -68,6 +76,9 @@ pub struct Node {
     checkpoint_running: bool,
     checkpoint_waiters: Vec<(u64, Response)>,
     snapshot_delay_ms: u64,
+    lease_term: u64,
+    lease_deadlines: BTreeMap<i64, (u64, Instant)>,
+    lease_expiring: BTreeSet<(i64, u64)>,
 }
 
 impl Node {
@@ -156,6 +167,9 @@ impl Node {
             checkpoint_running: false,
             checkpoint_waiters: vec![],
             snapshot_delay_ms: 0,
+            lease_term: 0,
+            lease_deadlines: BTreeMap::new(),
+            lease_expiring: BTreeSet::new(),
         })
     }
 
@@ -172,7 +186,7 @@ impl Node {
         loop {
             let mut step_responses = vec![];
             tokio::select! {
-                _ = ticks.tick() => { self.raw.tick(); }
+                _ = ticks.tick() => { self.raw.tick(); self.expire_leases()?; }
                 event = events.recv() => {
                     let Some(event) = event else { return Ok(()); };
                     self.handle(event, &mut step_responses).await?;
@@ -187,6 +201,7 @@ impl Node {
             for response in step_responses {
                 let _ = response.send(Ok(json!({"accepted": true})));
             }
+            self.sync_lease_deadlines();
             self.expire_pending();
             let role = (
                 self.raw.raft.state,
@@ -244,6 +259,34 @@ impl Node {
                     },
                     response,
                 )?;
+            }
+            Event::Lease(mut lease, response) => {
+                self.expire_leases()?;
+                if let LeaseCommand::Grant { id, .. } = &mut lease {
+                    if *id == 0 {
+                        *id = ((uuid::Uuid::new_v4().as_u128() as u64) & i64::MAX as u64).max(1)
+                            as i64;
+                    }
+                }
+                self.propose(
+                    RaftCommand::Lease {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        lease,
+                    },
+                    response,
+                )?;
+            }
+            Event::Watch(request, require_leader, through, response) => {
+                if require_leader && self.raw.raft.leader_id == 0 {
+                    let _ = response.send(Err(self.error("no leader")));
+                } else {
+                    let mut page = self.state.watch(&request, through).await?;
+                    self.fill_header(page.header.as_mut());
+                    for response in &mut page.responses {
+                        self.fill_header(response.header.as_mut());
+                    }
+                    let _ = response.send(Ok(serde_json::to_value(page)?));
+                }
             }
             Event::Step(message, response) => {
                 if message.to != self.options.id
@@ -378,6 +421,28 @@ impl Node {
                     self.fill_etcd_header(&mut outcome);
                     serde_json::to_value(outcome)?
                 }
+                RaftCommand::Lease { lease, .. } => {
+                    let mut outcome = self.state.apply_lease(entry.index, lease).await?;
+                    if let LeaseCommand::Expire { id, generation } = lease {
+                        self.lease_expiring.remove(&(*id, *generation));
+                    }
+                    self.sync_lease_deadlines();
+                    if let Ok(response) = &mut outcome.result {
+                        if let LeaseReply::TimeToLive(response) = response {
+                            if response.ttl >= 0 {
+                                if let Some((_, deadline)) = self.lease_deadlines.get(&response.id)
+                                {
+                                    response.ttl = deadline
+                                        .saturating_duration_since(Instant::now())
+                                        .as_secs()
+                                        as i64;
+                                }
+                            }
+                        }
+                        self.fill_header(response.header_mut());
+                    }
+                    serde_json::to_value(outcome)?
+                }
                 RaftCommand::Compact { compact, .. } => {
                     let mut outcome = self.state.apply_compaction(entry.index, compact).await?;
                     if let Ok(response) = &mut outcome.result {
@@ -388,6 +453,53 @@ impl Node {
             };
             if let Some(pending) = self.pending.remove(command.id()) {
                 let _ = pending.response.send(Ok(reply));
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_lease_deadlines(&mut self) {
+        if self.raw.raft.state != StateRole::Leader || self.lease_term != self.raw.raft.term {
+            self.lease_deadlines.clear();
+            self.lease_expiring.clear();
+            self.lease_term = self.raw.raft.term;
+        }
+        if self.raw.raft.state != StateRole::Leader {
+            return;
+        }
+        self.lease_deadlines
+            .retain(|id, _| self.state.leases.contains_key(id));
+        for (&id, lease) in &self.state.leases {
+            let entry = self
+                .lease_deadlines
+                .entry(id)
+                .or_insert((0, Instant::now()));
+            if entry.0 != lease.generation {
+                *entry = (
+                    lease.generation,
+                    Instant::now() + Duration::from_secs(lease.ttl as u64),
+                );
+            }
+        }
+    }
+
+    fn expire_leases(&mut self) -> Result<()> {
+        self.sync_lease_deadlines();
+        let now = Instant::now();
+        for (&id, &(generation, deadline)) in &self.lease_deadlines {
+            if deadline > now || self.lease_expiring.contains(&(id, generation)) {
+                continue;
+            }
+            let command = RaftCommand::Lease {
+                id: uuid::Uuid::new_v4().to_string(),
+                lease: LeaseCommand::Expire { id, generation },
+            };
+            if self
+                .raw
+                .propose(vec![], serde_json::to_vec(&command)?)
+                .is_ok()
+            {
+                self.lease_expiring.insert((id, generation));
             }
         }
         Ok(())

@@ -1,10 +1,12 @@
 pub mod api;
 pub mod grpc;
+pub mod lease;
 pub mod mvcc;
 pub mod node;
 pub mod proto;
 pub mod state;
 pub mod storage;
+pub mod watch;
 
 use serde::{Deserialize, Serialize};
 
@@ -53,6 +55,10 @@ pub enum RaftCommand {
         id: String,
         etcd: proto::etcdserverpb::RequestOp,
     },
+    Lease {
+        id: String,
+        lease: lease::LeaseCommand,
+    },
     Compact {
         id: String,
         compact: proto::etcdserverpb::CompactionRequest,
@@ -63,7 +69,7 @@ impl RaftCommand {
     pub fn id(&self) -> &str {
         match self {
             Self::Legacy(c) => &c.id,
-            Self::Etcd { id, .. } | Self::Compact { id, .. } => id,
+            Self::Etcd { id, .. } | Self::Compact { id, .. } | Self::Lease { id, .. } => id,
         }
     }
 }

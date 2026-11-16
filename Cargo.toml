@@ -23,6 +23,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 
+tokio-stream = "0.1"
 prost = "0.13"
 tonic = { version = "0.12", features = ["transport"] }
 

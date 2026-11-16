@@ -3,7 +3,8 @@
 This service runs one Raft group with three fixed voters. Each process uses `raft-rs` for consensus,
 `raft-engine` for durable logs, and SlateDB for its state machine. SlateDB's native WAL is disabled.
 
-The service exposes the etcd v3 gRPC KV API. It supports binary keys, values, and MVCC history.
+The service exposes the etcd v3 gRPC KV, Watch, and Lease APIs. It supports binary keys, values, and
+MVCC history.
 The original JSON API remains available in a separate diagnostic keyspace.
 All endpoints bind to loopback. There is no authentication or dynamic membership.
 
@@ -12,7 +13,7 @@ See [test commands](tests/README.md) for upstream tests, fault checks, Jepsen, f
 The [upstream audit](tests/upstream/README.md) maps the source suites and lists coverage gaps.
 The [original PoC results](RESULTS.md) describe measurements before this repository was extracted.
 
-## etcd v3 KV API
+## etcd v3 APIs
 
 The same port serves HTTP diagnostics and plaintext gRPC. No separate client port is required.
 Any replica accepts client requests. Followers forward writes and linearizable reads to the leader.
@@ -26,6 +27,9 @@ Supported behavior:
 - DeleteRange: exact keys, ranges, previous values, tombstones, and no-op deletion.
 - Txn: comparisons, success and failure branches, nested transactions, and atomic multi-key writes.
 - Compact: a replicated history boundary, removal of older versions, and recovery of that boundary.
+- Watch: live events, history replay, filters, previous values, cancellation, progress, and
+  fragments.
+- Lease: grant, revoke, streamed keepalive, TTL, attached keys, listing, and replicated expiry.
 
 A mutating transaction advances the global revision once. Reads and empty deletes do not advance it.
 The initial revision is 1. Invalid transactions leave the keyspace and revision unchanged.
@@ -41,9 +45,9 @@ etcdctl --endpoints=http://127.0.0.1:7003 del hello --prev-kv
 ```
 
 The official Go client integration tests also exercise Txn and historical reads.
-Watch, Lease, Auth, Cluster, and Maintenance are not implemented.
+Auth, Cluster, and Maintenance are not implemented.
 Compact supports the default `physical=false` option. `physical=true` returns Unimplemented.
-A Put with a nonzero lease returns the standard lease-not-found error.
+A Put with an unknown lease returns the standard lease-not-found error.
 This service is not yet a complete etcd replacement or a supported Kubernetes backend.
 
 ## Build and verify
@@ -208,8 +212,8 @@ Historical point reads scan one key's versions. Historical range reads currently
 Range responses collect matching keys in memory before sorting or applying a limit.
 These choices favor compatibility testing. Large data sets need bounded scans and a history index.
 
-Compact runs through Raft and writes history deletions, the compaction boundary, and the apply marker
-in one SlateDB batch. It does not advance the KV revision. Reads below the boundary return the
+Compact uses one Raft command and one SlateDB batch for history deletion, the boundary,
+and the apply marker. It does not advance the KV revision. Reads below the boundary return the
 standard compacted-revision error. Reads at the boundary remain valid.
 
 Compaction keeps the latest version at or before the boundary for each key, including tombstones.
@@ -219,18 +223,52 @@ Raft log GC remains separate from MVCC compaction.
 
 Compaction scans all history and builds one deletion batch on the node loop. Large histories can
 delay heartbeats and requests. SlateDB reclaims old SST data in the background; pinned snapshots can
-retain older data. The service rejects `physical=true` because it cannot yet wait for that reclamation.
+retain older data. The service rejects `physical=true` because it cannot yet wait for that
+reclamation.
 Do not downgrade to an older binary after compaction; older binaries do not enforce its boundary.
 
 The diagnostic JSON keyspace is separate from the etcd keyspace and does not affect etcd revisions.
+
+## Watch and Lease recovery
+
+Each MVCC write stores ordered Watch events with the key changes and revision in one batch.
+A transaction keeps request order within one revision. Lease revocation deletes all attached keys
+at one revision. Watch replay uses this journal after restart and snapshot installation.
+Compaction removes events below the boundary. Events at the boundary remain available.
+Previous values are omitted when the revision before the event is below the boundary.
+
+Watch runs on the receiving replica and can lag the leader. It does not provide linearizable reads.
+Streams poll the node every 50 ms. Each page contains at most 32 revisions.
+The output channel buffers 32 responses.
+Each stream supports at most 1,024 watches. Automatic progress uses a 10-second interval.
+Progress replies follow all events through their reported revision. Future watches delay progress.
+The fragment option splits large responses near 1 MiB. Each encoded response must fit within 64 MiB.
+
+Databases from binaries without Watch have no complete event journal.
+Historical watches before the first recorded revision return a compacted-revision error.
+Existing KV history remains readable. Upgrade all nodes together; mixed-version operation is
+untested.
+Do not downgrade after lease commands enter the Raft log.
+
+Lease grants, renewals, revocations, TTL queries, and listing enter Raft.
+A minority cannot acknowledge a renewal. The leader measures expiry with a monotonic clock.
+Expiry includes the lease generation, so an old expiry command cannot remove a renewed lease.
+Lease metadata, attached key deletion, Watch events, and the apply marker commit together.
+Followers do not expire leases from their local clocks. SlateDB TTL does not control leases.
+
+The minimum TTL is two seconds. A new leader gives each surviving lease its full granted TTL.
+The service does not checkpoint remaining TTL. Repeated leader changes can extend a lease's
+lifetime.
+Loss of quorum delays deletion until a majority can commit it. Clients must not treat TTL as a
+maximum lifetime or use lease expiry alone to fence external writes.
+Lease key lookup and revocation scan current keys. Large leases can delay the node loop.
 
 ## Next steps
 
 1. Add ReadIndex-based linearizable reads and separate state-apply workers.
 2. Bound compaction work and range scans, and use checkpoint references for large snapshots.
-3. Add Watch history replay, live delivery, compaction errors, and progress notifications.
-4. Add leases with replicated revocation and deletion. Do not use local SlateDB TTL for leases.
-5. Add membership changes, TLS, authentication, quotas, maintenance APIs, and operational metrics.
+3. Add lease TTL checkpoints and a key index for leases. Bound Watch catch-up work.
+4. Add membership changes, TLS, authentication, quotas, maintenance APIs, and operational metrics.
 
 Test object-store outages, slow disks, interrupted snapshot installation, and cross-host failover
 before using the service for coordination.

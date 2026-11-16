@@ -1,13 +1,13 @@
 # etcd v3 test results
 
-Run date: 2026-11-16, Asia/Singapore.
+Run date: 2026-11-17, Asia/Singapore.
 The reference server, common suite, model, and official Go client use etcd v3.6.5.
 The test host uses ARM64 macOS. All three service replicas share one host and disk.
 
 Tested release binary SHA-256:
 
 ```text
-23e223e90be4074912ff0b1e01b08e5473857a4e0eaec2274dccf84a60a1f92e
+24f10d0b653160b2695930994533c76698e94ad05e0a8726a40b083329686e71
 ```
 
 ## Results
@@ -16,11 +16,15 @@ Tested release binary SHA-256:
 | --- | --- |
 | Differential KV cases against real etcd | 55 passed |
 | Differential Compact cases | 39 passed |
+| Differential Lease cases | 25 passed |
+| Differential Watch history cases | 5 passed |
+| Watch stream control checks against real etcd | 2 passed |
+| Watch and Lease process and stream suites | 4 passed |
 | Official client recovery and concurrency suites | 4 passed |
 | Fixed API fuzz corpus | 3 seeds passed |
 | Bounded API fuzz run | 10 completed inputs passed |
-| Supported profile with upstream common tests | 110 leaf tests passed; 79 skipped |
-| Rust state and storage recovery tests | 7 passed |
+| Supported profile with upstream common tests | 154 leaf tests passed; 73 skipped |
+| Rust state and storage recovery tests | 10 passed |
 | Original process fault scenarios | 8 passed |
 | Native etcd model with process faults | 4 campaigns passed |
 | Jepsen register and Elle append checks | Both checkers passed all 4 campaigns |
@@ -32,7 +36,7 @@ Tested release binary SHA-256:
 The upstream profile includes the local differential and integration suites.
 Its counts are not additional to the other rows. Parent test results do not count as leaf tests.
 All skips have explicit reasons in the report. They do not establish compatibility.
-The full capability probe rejects the missing Watch API instead of skipping it.
+The full capability probe still fails on missing APIs, including Auth and Maintenance.
 
 The differential suites compare values, revisions, key metadata, counts, and errors.
 They ignore cluster IDs, member IDs, and Raft terms across independent clusters.
@@ -44,10 +48,15 @@ Transactions cover both branches, nested predicates, rollback, duplicate writes,
 and revision guards.
 Compaction tests check boundary reads, errors, deletion history, restart, and snapshot recovery.
 Compaction stores the boundary, history deletion, and applied index in one state-machine batch.
+Watch checks cover filters, event order, previous values, compaction, progress, and fragments.
+Lease checks cover attachment, reassignment, renewal, revocation, expiry, and recovery.
+A minority cannot acknowledge a renewal. A stale expiry command cannot delete a renewed lease.
 
 The process campaigns inject a leader partition, leader kill, leader pause, or full cluster restart.
 Traffic continues during each fault. Final reads check state after recovery.
-The original etcd model checks the complete KV history, including uncertain writes.
+The original etcd model checks KV and Lease history, including uncertain writes.
+Lease campaigns use long TTLs; separate process tests check expiry.
+A local Watch checker compares all three replicas, progress, previous values, and final state.
 Jepsen checks register operations. Elle checks multi-key append transactions.
 The adapters correct two recorder issues: long Txn value encoding and nil read ambiguity.
 Negative controls verify that the checkers reject known invalid histories.
@@ -66,9 +75,9 @@ The CI workflow runs the same test layers on Linux.
 
 ## Scope
 
-This is partial etcd v3 compatibility. Supported RPCs are Range, Put, DeleteRange, Txn, and Compact.
+This is partial etcd v3 compatibility. It supports KV, Watch, and Lease RPCs.
 Compact supports logical compaction. The physical option returns Unimplemented.
-Watch, Lease, Auth, Cluster, and Maintenance remain unsupported.
+Auth, Cluster, and Maintenance remain unsupported. Their Watch and Lease cross-tests still skip.
 The service does not claim Kubernetes compatibility.
 
 The repository indexes 1,771 upstream functions and imports the complete common suite.
@@ -77,7 +86,9 @@ It is not a claim that every upstream test passed or every fault was reproduced.
 
 DST uses real node storage with a simulated transport and logical Raft ticks.
 It requires repeatable event traces and checks acknowledged values after recovery.
-It does not control operating system threads, storage completion, or SlateDB background scheduling.
+It also checks retained lease generations and complete Watch journals on each replica.
+It does not control lease wall-clock expiry, operating system threads, or storage completion.
+SlateDB background scheduling remains outside its control.
 
 The Jepsen integration uses real checkers with a local process driver.
 The upstream SSH deployment, clock faults, membership faults, bit flips, and lazyfs are not ported.
@@ -87,3 +98,7 @@ Historical reads scan stored history. Logical compaction also scans history on t
 Large scans can delay heartbeats. Physical SST reclamation remains asynchronous.
 Snapshot transfers retain the 64 MiB peer limit.
 See [storage limits](README.md#mvcc-storage-and-recovery).
+
+Lease remaining TTL is not checkpointed. Leader promotion resets surviving leases to their full TTL.
+Older databases cannot replay events before the new Watch journal begins.
+See [Watch and Lease recovery limits](README.md#watch-and-lease-recovery).

@@ -6,6 +6,9 @@ use tokio::sync::{mpsc, oneshot};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 
+mod lease;
+mod watch;
+
 use crate::mvcc::{self, Outcome};
 use crate::node::Event;
 use crate::proto::etcdserverpb::kv_client::KvClient;
@@ -25,7 +28,7 @@ pub fn service(
     member: u64,
     events: mpsc::Sender<Event>,
     peers: &BTreeMap<u64, String>,
-) -> KvServer<Service> {
+) -> axum::Router {
     let peers = peers
         .iter()
         .map(|(&id, address)| {
@@ -35,13 +38,26 @@ pub fn service(
             (id, endpoint.connect_lazy())
         })
         .collect();
-    KvServer::new(Service {
+    let service = Service {
         events,
         peers,
         member,
-    })
-    .max_decoding_message_size(1536 * 1024)
-    .max_encoding_message_size(64 * 1024 * 1024)
+    };
+    axum::Router::new()
+        .route_service(
+            "/etcdserverpb.KV/{*method}",
+            KvServer::new(service.clone())
+                .max_decoding_message_size(1536 * 1024)
+                .max_encoding_message_size(64 * 1024 * 1024),
+        )
+        .route_service(
+            "/etcdserverpb.Lease/{*method}",
+            lease_server::LeaseServer::new(service.clone()),
+        )
+        .route_service(
+            "/etcdserverpb.Watch/{*method}",
+            watch_server::WatchServer::new(service).max_encoding_message_size(64 * 1024 * 1024),
+        )
 }
 
 impl Service {

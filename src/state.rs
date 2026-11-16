@@ -29,6 +29,7 @@ pub struct StateMachine {
     pub durable_applied: u64,
     pub revision: i64,
     pub compact_revision: i64,
+    pub leases: std::collections::BTreeMap<i64, crate::lease::LeaseRecord>,
 }
 
 impl StateMachine {
@@ -65,12 +66,14 @@ impl StateMachine {
             compact_revision <= revision,
             "compaction exceeds current revision"
         );
+        let leases = crate::lease::load(&db).await?;
         Ok(Self {
             db: Arc::new(db),
             applied,
             durable_applied: applied,
             revision,
             compact_revision,
+            leases,
         })
     }
 
@@ -127,7 +130,14 @@ impl StateMachine {
     }
 
     pub async fn read_etcd(&self, request: &RequestOp) -> Result<Outcome> {
-        let result = mvcc::prepare(&self.db, self.revision, self.compact_revision, request).await;
+        let result = mvcc::prepare(
+            &self.db,
+            self.revision,
+            self.compact_revision,
+            request,
+            &self.leases,
+        )
+        .await;
         if let Err(error) = &result {
             ensure!(
                 error.code != tonic::Code::Internal as i32,
@@ -145,18 +155,25 @@ impl StateMachine {
             index == self.applied + 1,
             "non-contiguous state machine apply"
         );
-        let (result, mut batch, revision) =
-            match mvcc::prepare(&self.db, self.revision, self.compact_revision, request).await {
-                Ok((response, batch, revision)) => (Ok(response), batch, revision),
-                Err(error) => {
-                    ensure!(
-                        error.code != tonic::Code::Internal as i32,
-                        "{}",
-                        error.message
-                    );
-                    (Err(error), WriteBatch::new(), self.revision)
-                }
-            };
+        let (result, mut batch, revision) = match mvcc::prepare(
+            &self.db,
+            self.revision,
+            self.compact_revision,
+            request,
+            &self.leases,
+        )
+        .await
+        {
+            Ok((response, batch, revision)) => (Ok(response), batch, revision),
+            Err(error) => {
+                ensure!(
+                    error.code != tonic::Code::Internal as i32,
+                    "{}",
+                    error.message
+                );
+                (Err(error), WriteBatch::new(), self.revision)
+            }
+        };
         batch.put(APPLIED, index.to_be_bytes());
         self.db
             .write_with_options(batch, &WriteOptions { seqnum: index })
@@ -198,6 +215,66 @@ impl StateMachine {
             self.compact_revision = request.revision;
         }
         Ok(Outcome { result })
+    }
+
+    pub async fn apply_lease(
+        &mut self,
+        index: u64,
+        command: &crate::lease::LeaseCommand,
+    ) -> Result<Outcome<crate::lease::LeaseReply>> {
+        ensure!(
+            index == self.applied + 1,
+            "non-contiguous state machine apply"
+        );
+        let (result, mut batch, revision, change) = match crate::lease::prepare(
+            &self.db,
+            self.revision,
+            self.compact_revision,
+            index,
+            &self.leases,
+            command,
+        )
+        .await
+        {
+            Ok((reply, batch, revision, change)) => (Ok(reply), batch, revision, change),
+            Err(error) => {
+                ensure!(
+                    error.code != tonic::Code::Internal as i32,
+                    "{}",
+                    error.message
+                );
+                (Err(error), WriteBatch::new(), self.revision, None)
+            }
+        };
+        batch.put(APPLIED, index.to_be_bytes());
+        self.db
+            .write_with_options(batch, &WriteOptions { seqnum: index })
+            .await?;
+        self.applied = index;
+        self.revision = revision;
+        if let Some((id, record)) = change {
+            if let Some(record) = record {
+                self.leases.insert(id, record);
+            } else {
+                self.leases.remove(&id);
+            }
+        }
+        Ok(Outcome { result })
+    }
+
+    pub async fn watch(
+        &self,
+        request: &crate::proto::etcdserverpb::WatchCreateRequest,
+        through: Option<i64>,
+    ) -> Result<crate::watch::WatchPage> {
+        crate::watch::read(
+            &self.db,
+            through.unwrap_or(self.revision).min(self.revision),
+            self.compact_revision,
+            request,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))
     }
 
     /// Pin the applied prefix now, then flush and serialize it outside the Raft loop.
@@ -258,6 +335,7 @@ impl StateMachine {
         self.durable_applied = index;
         self.revision = read_revision(&self.db).await?;
         self.compact_revision = read_compact_revision(&self.db).await?;
+        self.leases = crate::lease::load(&self.db).await?;
         ensure!(
             self.compact_revision <= self.revision,
             "compaction exceeds current revision"
@@ -494,5 +572,213 @@ mod tests {
             .unwrap();
         assert_eq!(history_len(&restored).await, 1);
         assert!(read(&restored, b"key", 2).await.result.is_err());
+    }
+
+    #[tokio::test]
+    async fn renewed_lease_and_watch_history_survive_snapshot_and_stale_expiry() {
+        use crate::lease::LeaseCommand;
+        use crate::proto::etcdserverpb::{TxnRequest, WatchCreateRequest};
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let mut state = StateMachine::open(dir.path()).await.unwrap();
+        state
+            .apply_lease(1, &LeaseCommand::Grant { id: 7, ttl: 30 })
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let mut writes = vec![];
+        for key in [b"z", b"a"] {
+            let mut request = put(key, key);
+            if let Some(Op::RequestPut(p)) = &mut request.request {
+                p.lease = 7;
+            }
+            writes.push(request);
+        }
+        state
+            .apply_etcd(
+                2,
+                &RequestOp {
+                    request: Some(Op::RequestTxn(TxnRequest {
+                        success: writes,
+                        ..Default::default()
+                    })),
+                },
+            )
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        state
+            .apply_lease(3, &LeaseCommand::KeepAlive { id: 7 })
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let mut snapshot = Snapshot::default();
+        snapshot.mut_metadata().index = 3;
+        snapshot.data = state.snapshot_data().await.unwrap().into();
+        let mut restored = StateMachine::open(other.path()).await.unwrap();
+        restored.install_snapshot(&snapshot).await.unwrap();
+        assert_eq!(restored.leases[&7].generation, 3);
+        restored
+            .apply_lease(
+                4,
+                &LeaseCommand::Expire {
+                    id: 7,
+                    generation: 1,
+                },
+            )
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(restored.revision, 2);
+        assert!(restored.leases.contains_key(&7));
+        restored
+            .apply_lease(
+                5,
+                &LeaseCommand::Expire {
+                    id: 7,
+                    generation: 3,
+                },
+            )
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(restored.revision, 3);
+        assert!(restored.leases.is_empty());
+        let request = WatchCreateRequest {
+            key: vec![0],
+            range_end: vec![0],
+            start_revision: 1,
+            prev_kv: true,
+            ..Default::default()
+        };
+        let page = restored.watch(&request, None).await.unwrap();
+        assert_eq!(page.responses.len(), 2);
+        let put_events = &page.responses[0].events;
+        assert_eq!(put_events[0].kv.as_ref().unwrap().key, b"z");
+        assert_eq!(put_events[1].kv.as_ref().unwrap().key, b"a");
+        let deletes = &page.responses[1].events;
+        assert_eq!(deletes.len(), 2);
+        for event in deletes {
+            assert_eq!(event.r#type, 1);
+            assert_eq!(event.kv.as_ref().unwrap().mod_revision, 3);
+            assert_eq!(event.prev_kv.as_ref().unwrap().lease, 7);
+            let key = &event.kv.as_ref().unwrap().key;
+            assert!(
+                matches!(read(&restored, key, 0).await.result.unwrap().response,
+                Some(Resp::ResponseRange(r)) if r.kvs.is_empty())
+            );
+        }
+        restored.db.flush().await.unwrap();
+        restored.db.close().await.unwrap();
+        drop(restored);
+        let restored = StateMachine::open(other.path()).await.unwrap();
+        assert_eq!(restored.applied, 5);
+        assert!(restored.leases.is_empty());
+        assert_eq!(
+            restored.watch(&request, None).await.unwrap().responses,
+            page.responses
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_revoke_deletes_more_keys_than_the_user_transaction_limit() {
+        use crate::lease::LeaseCommand;
+        use crate::proto::etcdserverpb::WatchCreateRequest;
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = StateMachine::open(dir.path()).await.unwrap();
+        state
+            .apply_lease(1, &LeaseCommand::Grant { id: 9, ttl: 30 })
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        for n in 0..130 {
+            let mut request = put(format!("key-{n}").as_bytes(), b"value");
+            if let Some(Op::RequestPut(p)) = &mut request.request {
+                p.lease = 9;
+            }
+            state
+                .apply_etcd(n + 2, &request)
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+        }
+        state
+            .apply_lease(132, &LeaseCommand::Revoke { id: 9 })
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let page = state
+            .watch(
+                &WatchCreateRequest {
+                    key: vec![0],
+                    range_end: vec![0],
+                    start_revision: 132,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.responses.len(), 1);
+        assert_eq!(page.responses[0].events.len(), 130);
+        assert!(crate::mvcc::lease_keys(&state.db, 9)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_state_rejects_missing_watch_history_and_records_new_events() {
+        use crate::proto::etcdserverpb::WatchCreateRequest;
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = StateMachine::open(dir.path()).await.unwrap();
+        state
+            .apply_etcd(1, &put(b"key", b"old"))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        // Remove the journal to reproduce a database from a binary without Watch.
+        let mut batch = WriteBatch::new();
+        batch.delete(b"etcd/watch-floor");
+        batch.delete([b"etcd/events/".as_slice(), &2_i64.to_be_bytes()].concat());
+        batch.put(APPLIED, 2_u64.to_be_bytes());
+        state
+            .db
+            .write_with_options(batch, &WriteOptions { seqnum: 2 })
+            .await
+            .unwrap();
+        state.applied = 2;
+        let mut request = WatchCreateRequest {
+            key: b"key".to_vec(),
+            start_revision: 1,
+            prev_kv: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            state.watch(&request, None).await.unwrap().compact_revision,
+            3
+        );
+        state
+            .apply_etcd(3, &put(b"key", b"new"))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        request.start_revision = 3;
+        let page = state.watch(&request, None).await.unwrap();
+        assert_eq!(page.compact_revision, 0);
+        assert_eq!(
+            page.responses[0].events[0].prev_kv.as_ref().unwrap().value,
+            b"old"
+        );
     }
 }

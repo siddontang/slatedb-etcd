@@ -9,3 +9,10 @@ message KeyValue {
   bytes value = 5;
   int64 lease = 6;
 }
+
+message Event {
+  enum EventType { PUT = 0; DELETE = 1; }
+  EventType type = 1;
+  KeyValue kv = 2;
+  KeyValue prev_kv = 3;
+}

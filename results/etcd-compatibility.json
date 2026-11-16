@@ -1,6 +1,6 @@
 {
-  "created_at": "2026-11-16T07:48:10.404161+00:00",
-  "binary_sha256": "23e223e90be4074912ff0b1e01b08e5473857a4e0eaec2274dccf84a60a1f92e",
+  "created_at": "2026-11-16T17:45:53.091694+00:00",
+  "binary_sha256": "24f10d0b653160b2695930994533c76698e94ad05e0a8726a40b083329686e71",
   "reference_etcd": "3.6.5",
   "client": "go.etcd.io/etcd/client/v3 v3.6.5",
   "go": "go version go1.25.6 darwin/arm64",
@@ -20,27 +20,27 @@
     {
       "name": "TestDifferentialCompaction/negative_revision",
       "result": "pass",
-      "seconds": 0.02
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialCompaction/initial_boundary",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.03
     },
     {
       "name": "TestDifferentialCompaction/zero_revision",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0.05
     },
     {
       "name": "TestDifferentialCompaction/repeated_zero",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialCompaction/empty_store",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0.03
     },
     {
       "name": "TestDifferentialCompaction/empty_boundary_read",
@@ -80,7 +80,7 @@
     {
       "name": "TestDifferentialCompaction/future_revision",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialCompaction/future_compact_keeps_history",
@@ -165,7 +165,7 @@
     {
       "name": "TestDifferentialCompaction/nested_boundary_read",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialCompaction/repeat_boundary",
@@ -215,32 +215,32 @@
     {
       "name": "TestDifferentialCompaction",
       "result": "pass",
-      "seconds": 2.05
+      "seconds": 2.09
     },
     {
       "name": "TestCompactionRecovery",
       "result": "pass",
-      "seconds": 5.73
+      "seconds": 6.86
     },
     {
       "name": "TestDifferentialKV/initial_revision",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/create",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/same_value_increments_version",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.02
     },
     {
       "name": "TestDifferentialKV/update_prev_kv",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/history",
@@ -280,12 +280,12 @@
     {
       "name": "TestDifferentialKV/prefix_b",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/prefix_c",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/prefix_limit_more",
@@ -320,7 +320,7 @@
     {
       "name": "TestDifferentialKV/revision_filter_count",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/create_revision_filters",
@@ -340,17 +340,17 @@
     {
       "name": "TestDifferentialKV/ignore_value",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/ignore_lease",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/missing_ignore_value",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/invalid_ignore_value",
@@ -360,7 +360,7 @@
     {
       "name": "TestDifferentialKV/missing_lease",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/invalid_ignore_lease",
@@ -370,12 +370,12 @@
     {
       "name": "TestDifferentialKV/txn_one_revision",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/txn_else",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/txn_read_before_write",
@@ -395,7 +395,7 @@
     {
       "name": "TestDifferentialKV/missing_value_compare",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/range_compare",
@@ -405,12 +405,12 @@
     {
       "name": "TestDifferentialKV/nested_base_predicates",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/nested_mutually_exclusive_writes",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/nested_negative_revision",
@@ -430,7 +430,7 @@
     {
       "name": "TestDifferentialKV/txn_future_revision_rollback",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/duplicate_put",
@@ -450,7 +450,7 @@
     {
       "name": "TestDifferentialKV/delete_previous",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/deleted_history",
@@ -480,7 +480,7 @@
     {
       "name": "TestDifferentialKV/overlapping_deletes",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/empty_key",
@@ -500,49 +500,244 @@
     {
       "name": "TestDifferentialKV",
       "result": "pass",
-      "seconds": 2.8
+      "seconds": 2.11
     },
     {
       "name": "TestFailoverAndSnapshotRecovery",
       "result": "pass",
-      "seconds": 4.62
+      "seconds": 5.6
     },
     {
       "name": "TestConcurrentCompareAndSwap",
       "result": "pass",
-      "seconds": 1.39
+      "seconds": 1.87
     },
     {
       "name": "TestPartitionReadModes",
       "result": "pass",
-      "seconds": 4.77
+      "seconds": 4.28
+    },
+    {
+      "name": "TestDifferentialLease/grant",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialLease/duplicate",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/second",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/too_large",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/negative_id",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/minimum",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/revoke_minimum",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/attach_a",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/attach_b",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/keys",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/reassign",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/ignore_lease",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/old_keys",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/new_keys",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/compare",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/rollback",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/rollback_absent",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/detach",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/revoke_old",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialLease/detached_survives",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/revoke_new",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/attached_deleted",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/missing_ttl",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/missing_revoke",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/list",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease",
+      "result": "pass",
+      "seconds": 1.87
+    },
+    {
+      "name": "TestDifferentialWatch/order_and_previous",
+      "result": "pass",
+      "seconds": 0.09
+    },
+    {
+      "name": "TestDifferentialWatch/no_put",
+      "result": "pass",
+      "seconds": 0.1
+    },
+    {
+      "name": "TestDifferentialWatch/no_delete",
+      "result": "pass",
+      "seconds": 0.1
+    },
+    {
+      "name": "TestDifferentialWatch/exact",
+      "result": "pass",
+      "seconds": 0.1
+    },
+    {
+      "name": "TestDifferentialWatch/range",
+      "result": "pass",
+      "seconds": 0.1
+    },
+    {
+      "name": "TestDifferentialWatch",
+      "result": "pass",
+      "seconds": 2.67
+    },
+    {
+      "name": "TestWatchLeaseRestartAndSnapshot",
+      "result": "pass",
+      "seconds": 4.42
+    },
+    {
+      "name": "TestWatchStreamControls/service",
+      "result": "pass",
+      "seconds": 0.1
+    },
+    {
+      "name": "TestWatchStreamControls/etcd",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestWatchStreamControls",
+      "result": "pass",
+      "seconds": 2.27
+    },
+    {
+      "name": "TestWatchLeaseKeepAliveAndLeaderFailure",
+      "result": "pass",
+      "seconds": 18.16
+    },
+    {
+      "name": "TestWatchLeaseMinorityCannotRenew",
+      "result": "pass",
+      "seconds": 5.06
+    },
+    {
+      "name": "TestWatchCatchupProgressAndFragmentation",
+      "result": "pass",
+      "seconds": 1.46
     },
     {
       "name": "FuzzKVSequence/seed#0",
       "result": "pass",
-      "seconds": 1.35
+      "seconds": 1.47
     },
     {
       "name": "FuzzKVSequence/seed#1",
       "result": "pass",
-      "seconds": 1.81
+      "seconds": 1.41
     },
     {
       "name": "FuzzKVSequence/seed#2",
       "result": "pass",
-      "seconds": 2.16
+      "seconds": 1.83
     },
     {
       "name": "FuzzKVSequence",
       "result": "pass",
-      "seconds": 5.32
+      "seconds": 4.7
     }
   ],
   "counts": {
-    "pass": 104
+    "pass": 143
   },
   "leaf_counts": {
-    "pass": 101
+    "pass": 137
   },
   "passed": true,
   "complete": true

@@ -1,7 +1,7 @@
 {
-  "created_at": "2026-11-16T07:43:32.201217+00:00",
+  "created_at": "2026-11-16T17:48:34.590666+00:00",
   "passed": true,
-  "binary_sha256": "23e223e90be4074912ff0b1e01b08e5473857a4e0eaec2274dccf84a60a1f92e",
+  "binary_sha256": "24f10d0b653160b2695930994533c76698e94ad05e0a8726a40b083329686e71",
   "jepsen_requested": true,
   "runs": [
     {
@@ -13,24 +13,25 @@
         "faults": [
           {
             "fault": "partition-leader",
-            "member": 1,
-            "time_ns": 305402875
+            "member": 2,
+            "time_ns": 307779125
           },
           {
             "fault": "heal",
             "member": 0,
-            "time_ns": 1812559166
+            "time_ns": 1812253500
           }
         ],
-        "operations": 255,
-        "process_logs": "<tmp>/slatedb-etcd-compat-838749748",
+        "operations": 242,
+        "process_logs": "<tmp>/slatedb-etcd-compat-3740807159",
         "result": "Ok",
         "seed": 1,
         "successful_operations": [
-          58,
-          58,
-          67
-        ]
+          57,
+          67,
+          58
+        ],
+        "watch_replicas": 3
       },
       "jepsen_passed": true
     },
@@ -43,19 +44,20 @@
         "faults": [
           {
             "fault": "kill-leader",
-            "member": 1,
-            "time_ns": 306500000
+            "member": 3,
+            "time_ns": 309108417
           }
         ],
-        "operations": 268,
-        "process_logs": "<tmp>/slatedb-etcd-compat-2005279361",
+        "operations": 248,
+        "process_logs": "<tmp>/slatedb-etcd-compat-489196068",
         "result": "Ok",
         "seed": 2,
         "successful_operations": [
+          69,
           70,
-          60,
-          64
-        ]
+          43
+        ],
+        "watch_replicas": 3
       },
       "jepsen_passed": true
     },
@@ -68,24 +70,25 @@
         "faults": [
           {
             "fault": "pause-leader",
-            "member": 3,
-            "time_ns": 306597625
+            "member": 2,
+            "time_ns": 306314250
           },
           {
             "fault": "resume",
-            "member": 3,
-            "time_ns": 1807574417
+            "member": 2,
+            "time_ns": 1806731333
           }
         ],
-        "operations": 263,
-        "process_logs": "<tmp>/slatedb-etcd-compat-4198292371",
+        "operations": 244,
+        "process_logs": "<tmp>/slatedb-etcd-compat-2104247867",
         "result": "Ok",
         "seed": 3,
         "successful_operations": [
-          67,
-          67,
-          56
-        ]
+          58,
+          58,
+          67
+        ],
+        "watch_replicas": 3
       },
       "jepsen_passed": true
     },
@@ -99,23 +102,24 @@
           {
             "fault": "kill-all",
             "member": 0,
-            "time_ns": 302957875
+            "time_ns": 303645459
           },
           {
             "fault": "restart-all",
             "member": 0,
-            "time_ns": 1505815208
+            "time_ns": 1766064042
           }
         ],
-        "operations": 261,
-        "process_logs": "<tmp>/slatedb-etcd-compat-2103116593",
+        "operations": 251,
+        "process_logs": "<tmp>/slatedb-etcd-compat-2580508300",
         "result": "Ok",
         "seed": 4,
         "successful_operations": [
-          60,
-          63,
-          69
-        ]
+          57,
+          70,
+          57
+        ],
+        "watch_replicas": 3
       },
       "jepsen_passed": true
     }

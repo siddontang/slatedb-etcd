@@ -14,7 +14,7 @@ The index is an audit record. It does not mean that 1,771 tests passed against t
 | Source family | Integration in this project |
 | --- | --- |
 | `tests/common` | Import all 85 functions; adapt the cluster and client interfaces. |
-| `tests/integration` | Audit 493 functions; port KV, Txn, recovery, and compaction behavior. |
+| `tests/integration` | Audit 493 functions; port KV, Txn, Watch, Lease, and recovery behavior. |
 | `tests/e2e` | Audit 218 functions; use real local processes for failure and recovery. |
 | `tests/robustness` | Use the original recorder, model, and Porcupine checker. |
 | Server and client unit tests | Keep source references; use Rust tests for storage invariants. |
@@ -34,7 +34,8 @@ It extracts the upstream client adapter and adds a guard for physical compaction
 
 ## Capabilities
 
-The supported profile runs KV, Txn, logical Compact, and leader failure tests on three voters.
+The supported profile runs KV, Txn, logical Compact, Watch, Lease, and leader failure tests on three
+voters.
 It skips unsupported tests with reasons. Reports retain all skip records.
 Parent tests can pass while their children skip. Use `leaf_counts` for coverage counts.
 `passed` means the selected profile passed. `complete` also requires zero skips.
@@ -44,8 +45,6 @@ This mode disables capability skips. It must fail until the missing features exi
 
 | Missing capability | Imported tests remain available |
 | --- | --- |
-| Watch | Events, revisions, ordering, cancellation, and compaction behavior |
-| Lease | Grant, revoke, keepalive, expiry, listing, and attached keys |
 | Auth | Users, roles, permissions, cache changes, and authenticated transactions |
 | Cluster | Membership changes and member listing |
 | Maintenance | Status, hash, snapshot RPC, defrag, alarms, and leader transfer |
@@ -65,7 +64,11 @@ This mode disables capability skips. It must fail until the missing features exi
 | Offline follower after log truncation | Snapshot transfer in process tests and DST |
 | Snapshot persisted before state installation | Rust recovery test at that storage boundary |
 | Delayed snapshot creation | Pinned snapshot tests with later writes and compaction |
-| Watch issues 15271, 17247, 17529, 18089, 19179 | Blocked by the missing Watch API |
+| Watch order, previous values, and compaction | Differential tests and replica fault histories |
+| Watch catch-up and progress | Paged replay, fragments, future revisions, and progress tests |
+| Lease renewal versus stale expiry | State snapshot test and seeded Raft schedules |
+| Lease quorum and leader failure | Renewal rejection, streamed renewal, and expiry tests |
+| Watch issues 15271, 17247, 17529, 18089, 19179 | Exact upstream issue schedules remain unported |
 | Defrag issues 14370 and 14685 | Blocked by the missing defrag API and different storage engine |
 | etcd gofail hooks around bbolt and WAL | Require equivalent Rust storage hooks; not yet ported |
 | Disk exhaustion, corruption, and lost unsynced writes | Not yet covered by process SIGKILL |
@@ -77,7 +80,12 @@ Each process campaign applies one fault. Seeds select partition, kill, pause, or
 The workload continues during the fault and after recovery.
 Use four consecutive seeds to include all four fault types.
 
-The native history covers single-key operations, atomic pairs, revision guards, and list appends.
+The native history covers single-key operations, atomic pairs, revision guards, list appends, and
+leases.
+Lease workloads grant, attach keys, and revoke. They use long TTLs to exclude unrecorded expiry.
+A separate Watch checker compares complete event histories on all three replicas after recovery.
+It checks revision continuity, atomic delivery, progress, previous values, and final state.
+The Watch checker is local code. The native etcd model still checks KV and Lease operations.
 Unknown writes remain eligible to commit until the history ends.
 No timeout or checker `Unknown` result counts as a pass.
 
@@ -101,7 +109,7 @@ They also check both possible outcomes of an uncertain write.
 
 This is a local fault driver with real Jepsen checkers.
 It does not run the upstream Jepsen SSH deployment or its complete nemesis suite.
-Watch, locks, membership, clock faults, bit flips, and lazyfs remain gaps.
+Jepsen Watch and lock workloads, membership, clock faults, bit flips, and lazyfs remain gaps.
 The upstream source pin lets future adapters reuse those workloads without losing provenance.
 
 ## DST scope
@@ -114,6 +122,9 @@ Every seed runs twice. The test requires identical event traces.
 
 The test checks one leader per term, stable committed entries, and valid apply boundaries.
 It requires snapshot transfer and checks every acknowledged value on all replicas after recovery.
+Writes carry a lease. A seeded prelude renews that lease and submits an obsolete expiry command.
+The test compares the retained lease and complete Watch journal across all replicas.
+Lease wall-clock expiry is outside this schedule; process tests cover it separately.
 Partial traces remain available after an assertion failure.
 
 This is deterministic event scheduling, not a deterministic operating system.

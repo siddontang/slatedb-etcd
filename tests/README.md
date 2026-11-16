@@ -24,6 +24,7 @@ The runners retain JSON reports and Go logs. Fault results stay in `tmp/test-res
 
 - `operations.json`: typed etcd model history, including unknown writes.
 - `faults.json`: fault actions and monotonic times.
+- `watches.json`: full event histories from all three replicas, including previous values.
 - `history.html`: Porcupine history visualization.
 - `jepsen.edn`: register history with invocation and completion events.
 - `append.edn`: append transaction history for Elle.
@@ -58,6 +59,8 @@ python3 scripts/check-dst.py --seeds 1,2,42
 Traces stay under `target/dst/`. Set `SLATEDB_DST_TRACE_DIR` to change this path.
 Repeat a failing seed with the same command. Each run also writes a partial `seed-N-last.json`.
 The test drives real storage with a simulated transport and Raft clock.
+It checks lease generations and Watch journals after recovery. It does not simulate lease expiry
+time.
 It does not control disk completion, operating system threads, or SlateDB background scheduling.
 
 ## API sequence fuzzing

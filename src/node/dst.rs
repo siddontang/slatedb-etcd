@@ -1,10 +1,11 @@
 //! Drive the real node with seeded message delivery and a logical clock.
 
 use super::*;
+use crate::lease::{LeaseCommand, LeaseReply};
 use crate::mvcc::Outcome;
 use crate::proto::etcdserverpb::request_op::Request as Op;
 use crate::proto::etcdserverpb::response_op::Response as Resp;
-use crate::proto::etcdserverpb::{PutRequest, RangeRequest};
+use crate::proto::etcdserverpb::{PutRequest, RangeRequest, WatchCreateRequest};
 
 struct ClientRequest {
     key: String,
@@ -239,6 +240,7 @@ impl Simulation {
                         request: Some(Op::RequestPut(PutRequest {
                             key: key.as_bytes().to_vec(),
                             value: value.as_bytes().to_vec(),
+                            lease: 77,
                             ..Default::default()
                         })),
                     },
@@ -277,8 +279,37 @@ impl Simulation {
         self.drive().await;
     }
 
+    async fn lease(&mut self, lease: LeaseCommand) {
+        let leader = self.leader().unwrap();
+        let (tx, mut rx) = oneshot::channel();
+        let id = format!("lease-{lease:?}");
+        self.trace.push(id.clone());
+        self.nodes
+            .get_mut(&leader)
+            .unwrap()
+            .propose(RaftCommand::Lease { id, lease }, tx)
+            .unwrap();
+        self.drive().await;
+        for _ in 0..300 {
+            self.deliver(false).await;
+            if let Ok(result) = rx.try_recv() {
+                let outcome: Outcome<LeaseReply> = serde_json::from_value(result.unwrap()).unwrap();
+                outcome.result.unwrap();
+                return;
+            }
+        }
+        panic!("lease command did not commit");
+    }
+
     async fn run(seed: u64) -> Vec<String> {
         let mut sim = Self::new(seed).await;
+        for _ in 0..100 {
+            sim.deliver(false).await;
+        }
+        sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+        let generation = sim.nodes[&sim.leader().unwrap()].state.leases[&77].generation;
+        sim.lease(LeaseCommand::KeepAlive { id: 77 }).await;
+        sim.lease(LeaseCommand::Expire { id: 77, generation }).await;
         let mut offline = 0;
         for step in 0..400 {
             match step {
@@ -293,7 +324,8 @@ impl Simulation {
                     sim.trace.push("heal".into());
                 }
                 220 => {
-                    offline = sim.leader().unwrap() % 3 + 1;
+                    // A fault schedule can reach this step during an election.
+                    offline = sim.leader().unwrap_or(1) % 3 + 1;
                     sim.stop(offline);
                 }
                 260 => sim.checkpoint().await,
@@ -337,7 +369,39 @@ impl Simulation {
                 .map(|n| n.installed_snapshots)
                 .sum::<u64>();
         assert!(snapshots > 0, "seed {seed}: no snapshot transfer");
+        let mut expected_events = None;
         for node in sim.nodes.values() {
+            assert!(node.state.leases[&77].generation > generation);
+            let mut request = WatchCreateRequest {
+                key: vec![0],
+                range_end: vec![0],
+                start_revision: 1,
+                prev_kv: true,
+                ..Default::default()
+            };
+            let mut events = vec![];
+            loop {
+                let page = node.state.watch(&request, None).await.unwrap();
+                assert_eq!(page.compact_revision, 0);
+                for response in page.responses {
+                    events.extend(response.events);
+                }
+                if page.next_revision > node.state.revision {
+                    break;
+                }
+                request.start_revision = page.next_revision;
+            }
+            assert_eq!(events.len() as i64, node.state.revision - 1);
+            for (i, event) in events.iter().enumerate() {
+                assert_eq!(event.r#type, 0);
+                assert_eq!(event.kv.as_ref().unwrap().mod_revision, i as i64 + 2);
+                assert_eq!(event.kv.as_ref().unwrap().lease, 77);
+            }
+            if let Some(expected) = &expected_events {
+                assert_eq!(&events, expected);
+            } else {
+                expected_events = Some(events.clone());
+            }
             for (key, value) in &sim.acknowledged {
                 let outcome = node
                     .state
@@ -358,6 +422,13 @@ impl Simulation {
                     "seed {seed}: lost acknowledged key {key}"
                 );
                 assert_eq!(response.kvs[0].value, value.as_bytes());
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event.kv.as_ref().unwrap().key == key.as_bytes())
+                        .count(),
+                    1
+                );
             }
         }
         sim.trace.clone()
