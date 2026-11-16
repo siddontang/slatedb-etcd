@@ -27,12 +27,20 @@ jobs:
           scripts/cargo.sh build --locked --release
       - name: Check etcd compatibility and recovery
         run: |
-          python3 scripts/check-compat.py
-          python3 scripts/harness.py test --output results/etcd-core-fault-tests.json
-      - uses: actions/upload-artifact@v4
+          python3 scripts/check-compat.py --output results/ci/etcd-compatibility.json
+          python3 scripts/harness.py test --output results/ci/etcd-core-fault-tests.json
+      - name: Record test results
         if: always()
-        with:
-          name: test-results
-          path: |
-            results/etcd-compatibility.json
-            results/etcd-core-fault-tests.json
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              for path in sorted(Path("results/ci").glob("*.json")):
+                  report = json.loads(path.read_text())
+                  state = "passed" if report["passed"] else "failed"
+                  summary.write(f"- {path.name}: {state}\n")
+                  print(path.name)
+                  print(path.read_text())
+          PY
