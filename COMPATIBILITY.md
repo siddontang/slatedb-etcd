@@ -7,7 +7,7 @@ The test host uses ARM64 macOS. All three service replicas share one host and di
 Tested release binary SHA-256:
 
 ```text
-a013506992f367295ac04928c35d84e03546e295e53dcbebc33c897a9681b419
+2bbaae2f834a122f8ea396fa33509b95a847c62f84c7abd4bf8adb067ffeec4e
 ```
 
 ## Results
@@ -40,10 +40,10 @@ The integration suites also test:
 - An offline follower recovering current and historical state from a snapshot after log GC.
 - Full restart after snapshot installation and continued revision allocation.
 - Twelve concurrent clients completing 120 successful compare-and-swap increments.
-- An isolated replica serving serializable reads while rejecting linearizable reads.
+- An isolated replica serving serializable Range and Txn calls while rejecting linearizable reads.
 
-The final core fault run recovered write availability 1.22 seconds after leader SIGKILL.
-It removed eight old log files. Log bytes fell from 2,199,623 to 139,670.
+The final core fault run recovered write availability 1.75 seconds after leader SIGKILL.
+It removed eight old log files. Log bytes fell from 2,199,792 to 139,670.
 These are individual observations, not latency bounds.
 
 Raw reports:

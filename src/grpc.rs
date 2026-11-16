@@ -56,7 +56,15 @@ impl Service {
         }
         mvcc::validate(&request).map_err(|e| e.status())?;
         let (tx, rx) = oneshot::channel();
-        let local = matches!(&op, Op::RequestRange(r) if r.serializable);
+        let local = match &op {
+            Op::RequestRange(r) => r.serializable,
+            Op::RequestTxn(t) => t
+                .success
+                .iter()
+                .chain(&t.failure)
+                .all(|op| matches!(&op.request, Some(Op::RequestRange(r)) if r.serializable)),
+            _ => false,
+        };
         let event = if local {
             Event::EtcdRead(request, tx)
         } else {

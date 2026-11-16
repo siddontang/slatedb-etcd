@@ -15,6 +15,7 @@ The [original PoC results](RESULTS.md) describe measurements before this reposit
 The same port serves HTTP diagnostics and plaintext gRPC. No separate client port is required.
 Any replica accepts client requests. Followers forward writes and linearizable reads to the leader.
 Serializable Range requests read the local replica. Linearizable reads currently enter the Raft log.
+A read-only Txn also stays local when both branches contain only serializable Range operations.
 
 Supported behavior:
 
@@ -82,6 +83,8 @@ recovery when a snapshot was saved before the state machine could install it.
 They also check that a background snapshot excludes writes after its pinned apply position.
 
 ## Measure write latency
+
+These commands benchmark the diagnostic JSON API. They do not measure gRPC or MVCC overhead.
 
 ```sh
 python3 scripts/harness.py bench \

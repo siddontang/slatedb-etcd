@@ -252,7 +252,7 @@ func normalize(m proto.Message) {
 
 func TestDifferentialKV(t *testing.T) {
 	cluster := newCluster(t)
-	actual := client(t, cluster.addresses)
+	actual := client(t, []string{cluster.addresses[cluster.leader()-1]})
 	expected := reference(t)
 	check := func(name string, op clientv3.Op) {
 		t.Helper()
@@ -523,6 +523,14 @@ func TestPartitionReadModes(t *testing.T) {
 	local := mustCall(t, minority, clientv3.OpGet("partition", clientv3.WithSerializable())).(*pb.RangeResponse)
 	if len(local.Kvs) != 1 || string(local.Kvs[0].Value) != "before" {
 		t.Fatalf("Unexpected local read: %v", local)
+	}
+	localCtx, localCancel := context.WithTimeout(context.Background(), time.Second)
+	localTxn, localErr := minority.Txn(localCtx).If(clientv3.Compare(clientv3.Version("partition"), "=", 1)).Then(
+		clientv3.OpGet("partition", clientv3.WithSerializable()),
+	).Commit()
+	localCancel()
+	if localErr != nil || !localTxn.Succeeded || string(localTxn.Responses[0].GetResponseRange().Kvs[0].Value) != "before" {
+		t.Fatalf("Serializable transaction failed on isolated replica: %v %v", localTxn, localErr)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	_, err := minority.Get(ctx, "partition")
