@@ -60,24 +60,31 @@ python3 scripts/check-secrets.py
 A normal clone cannot prove that server-retained PR refs or cached commits are clean.
 Do not merge an old clone or PR branch into rewritten history. Re-clone or rebase reviewed changes.
 
-## Remote retention
+## Repository separation
 
-GitHub keeps old pull request refs and cached commit views after a branch rewrite.
-The seven old PR heads retain the original history until GitHub removes their references.
-These read-only refs cannot be changed with a normal Git push.
-A clean default branch is therefore insufficient to clear the existing repository for publication.
+The old repository was renamed to `slatedb-etcd-private-archive` and remains private.
+It retains the old PR refs, cached commits, and Actions records for private reference.
+Do not change the archive's visibility.
 
-See GitHub's [sensitive data removal guide][removal].
-GitHub Support can assess a request to remove retained references and cached data.
-Support does not guarantee removal of data it considers non-sensitive.
-Another option is to keep the old repository private and publish only clean history in a new repo.
+A separate private repository now uses the `slatedb-etcd` name.
+Only the cleaned `main` history was pushed to that repository.
+No old PR refs, tags, audit refs, logs, or release assets were imported.
+Historical commit subjects retain PR numbers from the private archive.
+Those numbers do not identify PRs in the new repository.
+
+Verification uses a fresh clone from the new repository and enumerates all advertised refs.
+It checks sign-offs, commit metadata, historical blobs, current files, and secret patterns.
+It also checks that representative old commits cannot be fetched from the new repository.
+Full CI runs against the imported branch in the new repository.
+
+GitHub retains old PR refs and cached commit views after a branch rewrite.
+Repository separation keeps those records outside the repository intended for publication.
+See GitHub's [sensitive data removal guide][removal] for the limits of a branch rewrite.
 
 [removal]: https://docs.github.com/articles/removing-sensitive-data-from-a-repository
 
-Old Actions records can also retain original author metadata and logs.
-Archive required evidence privately before removing affected runs and artifacts.
-Repository issues, PR text, release assets, forks, and account settings need separate review.
 A history rewrite cannot remove copies held by other users.
+The private archive and local recovery copies still contain the original metadata.
 
 ## Scope and remaining owner actions
 
@@ -88,7 +95,7 @@ The private recovery archive contains the original history and must stay private
 Before changing visibility:
 
 - Check the intended branch, tags, fetched PR refs, and current CI result.
-- Resolve the server-retained history described above.
+- Keep the old archive private and confirm that the new repository has only clean refs.
 - Accept the deliberate public owner email in every sign-off.
 - Keep the Apache license and upstream notices.
 - Enable available secret scanning, push protection, and private vulnerability reporting.
