@@ -9,26 +9,28 @@ The Rust API can change before a stable release.
 
 ```toml
 [dependencies]
+anyhow = "1"
 slatedb-etcd = { git = "https://github.com/siddontang/slatedb-etcd", rev = "<reviewed-commit>" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 ## Start and stop
 
-```rust,no_run
+```rust
 use std::time::Duration;
 use slatedb_etcd::server::{Server, ServerConfig};
 
-# async fn example() -> anyhow::Result<()> {
-let server = Server::start(ServerConfig::single_node("data/member-1")).await?;
-let ready = server.wait_ready(Duration::from_secs(10)).await;
-if ready.is_ok() {
-    println!("Client endpoint: {}", server.client_url());
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let server = Server::start(ServerConfig::single_node("data/member-1")).await?;
+    let ready = server.wait_ready(Duration::from_secs(10)).await;
+    if ready.is_ok() {
+        println!("Client endpoint: {}", server.client_url());
+    }
+    let shutdown = server.shutdown().await;
+    ready.and(shutdown)?;
+    Ok(())
 }
-let shutdown = server.shutdown().await;
-ready.and(shutdown)?;
-# Ok(())
-# }
 ```
 
 `start` validates configuration, binds both listeners, and opens local and object storage.
