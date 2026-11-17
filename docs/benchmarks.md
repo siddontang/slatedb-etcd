@@ -2,6 +2,8 @@
 
 Run these commands from the repository root.
 
+See the [measured results](../results/performance/README.md) for quota and state-cache comparisons.
+
 ## Measure write latency
 
 These commands benchmark the diagnostic JSON API. They do not measure gRPC or MVCC overhead.
