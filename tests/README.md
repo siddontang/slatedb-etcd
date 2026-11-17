@@ -59,7 +59,8 @@ python3 scripts/check-dst.py --seeds 1,2,42
 Traces stay under `target/dst/`. Set `SLATEDB_DST_TRACE_DIR` to change this path.
 Repeat a failing seed with the same command. Each run also writes a partial `seed-N-last.json`.
 The test drives real storage with a simulated transport and Raft clock.
-It checks lease generations and Watch journals after recovery. It does not simulate lease expiry
+It checks lease generations, Watch journals, auth revocation, and physical compaction after
+recovery. It does not simulate lease expiry
 time.
 The scheduler controls disk execution, completion delivery, and apply jobs.
 A 1 KiB cache forces asynchronous reads. Each schedule checks all four log pool limits.
@@ -86,8 +87,11 @@ python3 scripts/check-compat.py --tags upstream --all-capabilities \
   --output results/etcd-all-capabilities.json
 ```
 
-This probe must fail for missing APIs. It does not convert unsupported features into success.
-The standard CI job runs the supported profile, faults, Jepsen controls, and 10 fuzz inputs.
+The adapter runs single-voter, three-voter, client TLS, and peer TLS configurations.
+Both profile commands now run all imported capability tests without capability skips.
+The three upstream Maintenance TODO helpers have local implementations.
+The Downgrade helper checks authorization and the explicit unsupported binary-format result.
+The standard CI job runs these profiles, faults, Jepsen controls, and 10 fuzz inputs.
 The manual `extended` workflow option runs 100 DST seeds and 16 process fault seeds.
 
 ## Official client integration workflows
@@ -126,3 +130,14 @@ Auth status, member listing, Maintenance status, and physical compaction return 
 A passing gap control confirms a difference. It does not prove support for that capability.
 `TestFollowerReadIndexWaitsForLocalApply` guards the STM regression found by these workflows.
 `TestBoundedLogCacheRecoversLaggingFollower` checks small caches with delayed and failed disk reads.
+
+## Administration regressions
+
+The administration tests compare HashKV and lease permission errors with real etcd.
+They check certificate trust, missing client certificates, hostname errors, and forged identity
+headers.
+Member tests join a learner through a snapshot, promote it, transfer leadership, remove a voter,
+and restart with old bootstrap addresses.
+Snapshot tests verify chunk accounting, SHA-256, new-cluster restore, and stale-token rejection.
+They reject damaged backups and existing restore directories.
+DST pauses apply between permission revocation and a queued write, then restores the follower.

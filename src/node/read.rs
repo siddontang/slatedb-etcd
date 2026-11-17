@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) struct PendingRead {
     request: Option<RequestOp>,
+    credentials: Option<crate::auth::Credentials>,
     response: Response,
     term: u64,
     leader: u64,
@@ -12,7 +13,17 @@ pub(super) struct PendingRead {
 }
 
 impl Node {
+    #[cfg(test)]
     pub(super) fn linear_read(&mut self, request: RequestOp, response: Response) {
+        self.linear_read_auth(request, None, response);
+    }
+
+    pub(super) fn linear_read_auth(
+        &mut self,
+        request: RequestOp,
+        credentials: Option<crate::auth::Credentials>,
+        response: Response,
+    ) {
         if !crate::mvcc::read_only(&request, false) {
             let _ = response.send(Err(self.error("read index request contains a write")));
         } else if self.raw.raft.leader_id == 0 {
@@ -30,6 +41,7 @@ impl Node {
                 id.clone(),
                 PendingRead {
                     request: Some(request),
+                    credentials,
                     response,
                     term: self.raw.raft.term,
                     leader: self.raw.raft.leader_id,
@@ -79,7 +91,11 @@ impl Node {
             }
             if read.index.is_some_and(|index| index <= self.state.applied) {
                 if let Some(request) = read.request.take() {
-                    self.queries.push_back(Query::Linear(request, id.clone()));
+                    self.queries.push_back(Query::Linear(
+                        request,
+                        read.credentials.take(),
+                        id.clone(),
+                    ));
                 }
             }
         }

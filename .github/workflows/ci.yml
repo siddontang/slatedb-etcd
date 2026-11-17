@@ -21,7 +21,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -63,7 +63,7 @@ jobs:
       - name: Check etcd compatibility and recovery
         run: |
           python3 scripts/check-compat.py --output results/ci/etcd-compatibility.json
-          python3 scripts/check-compat.py --tags upstream \
+          python3 scripts/check-compat.py --tags upstream --all-capabilities \
             --output results/ci/etcd-upstream.json
           python3 scripts/harness.py test --output results/ci/etcd-core-fault-tests.json
       - name: Check process faults with etcd and Jepsen models
@@ -90,3 +90,12 @@ jobs:
                   print(path.name)
                   print(path.read_text())
           PY
+      - name: Save validation reports
+        if: always()
+        # Full reports also remain in the job logs if artifact storage is unavailable.
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-reports
+          path: results/ci/*.json
+          retention-days: 14

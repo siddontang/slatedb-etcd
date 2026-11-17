@@ -32,6 +32,15 @@ pub async fn record(
     if db.get(FLOOR).await.map_err(KvError::storage)?.is_none() {
         batch.put(FLOOR, floor(db, previous).await?.to_be_bytes());
     }
+    if db
+        .get(b"etcd/hash-origin")
+        .await
+        .map_err(KvError::storage)?
+        .is_none()
+    {
+        batch.put(b"etcd/hash-origin", previous.to_be_bytes());
+    }
+    crate::state::maintenance::record_hash(revision, events, batch).await;
     if !events.is_empty() {
         batch.put(
             key(revision),
@@ -42,6 +51,7 @@ pub async fn record(
 }
 
 pub async fn compact(db: &Db, revision: i64, batch: &mut WriteBatch) -> Result<(), KvError> {
+    crate::state::maintenance::compact_hash(db, revision, batch).await?;
     let mut scan = db
         .scan(EVENTS.to_vec()..key(revision))
         .await
@@ -111,6 +121,7 @@ pub async fn read(
                 Some(event)
             })
             .collect();
+
         if !events.is_empty() {
             page.responses.push(WatchResponse {
                 header: mvcc::header(revision),

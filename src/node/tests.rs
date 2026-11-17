@@ -3,6 +3,11 @@ use raft::eraftpb::{HardState, Snapshot};
 
 fn options(dir: &std::path::Path) -> NodeOptions {
     NodeOptions {
+        client_peers: BTreeMap::new(),
+        transport: crate::tls::Transport::default(),
+        strict_reconfiguration: false,
+        join: false,
+        quota_bytes: 0,
         id: 1,
         cluster_id: "worker-test".into(),
         dir: dir.to_owned(),
@@ -93,6 +98,7 @@ async fn committed_backlog_rejects_new_proposals_before_log_growth() {
     let (tx, rx) = oneshot::channel();
     node.propose(
         RaftCommand::Lease {
+            origin: 1,
             id: "overflow".into(),
             lease: LeaseCommand::List,
         },
@@ -385,6 +391,7 @@ async fn read_index_waits_for_apply_and_rejects_late_results_after_term_change()
     let (tx, _) = oneshot::channel();
     node.propose(
         RaftCommand::Lease {
+            origin: 1,
             id: "advance".into(),
             lease: LeaseCommand::List,
         },

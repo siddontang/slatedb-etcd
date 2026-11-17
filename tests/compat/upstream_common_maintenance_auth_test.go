@@ -18,10 +18,13 @@ package compat
 
 import (
 	"context"
+	"io"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/tests/v3/framework/config"
@@ -73,9 +76,18 @@ func TestDowngradeWithUserAuth(t *testing.T) {
 	testDowngradeWithAuth(t, false, true, WithAuth("user0", "user0Pass"))
 }
 
-func testDowngradeWithAuth(t *testing.T, _expectConnectionError, _expectOperationError bool, _opts ...config.ClientOption) {
-	// TODO(ahrtr): finish this after we added interface methods `Downgrade` into `Client`
-	t.Skip()
+// SlateDB cannot run etcd binaries. This probe checks authorization before that format error.
+func testDowngradeWithAuth(t *testing.T, connectError, operationError bool, opts ...config.ClientOption) {
+	testMaintenanceOperationWithAuth(t, connectError, operationError,
+		func(ctx context.Context, cc intf.Client) error {
+			_, err := cc.(integrationClient).Client.Downgrade(ctx, clientv3.DowngradeValidate, "3.5")
+			if !operationError {
+				require.Equal(t, codes.Unimplemented, status.Code(err))
+				return nil
+			}
+			require.NotEqual(t, codes.Unimplemented, status.Code(err))
+			return err
+		}, opts...)
 }
 
 /*
@@ -123,9 +135,17 @@ func TestMoveLeaderWithUserAuth(t *testing.T) {
 	testMoveLeaderWithAuth(t, false, true, WithAuth("user0", "user0Pass"))
 }
 
-func testMoveLeaderWithAuth(t *testing.T, _expectConnectionError, _expectOperationError bool, _opts ...config.ClientOption) {
-	// TODO(ahrtr): finish this after we added interface methods `MoveLeader` into `Client`
-	t.Skip()
+func testMoveLeaderWithAuth(t *testing.T, connectError, operationError bool, opts ...config.ClientOption) {
+	testMaintenanceOperationWithAuth(t, connectError, operationError,
+		func(ctx context.Context, cc intf.Client) error {
+			api := cc.(integrationClient).Client
+			members, err := api.MemberList(ctx)
+			if err != nil {
+				return err
+			}
+			_, err = api.MoveLeader(ctx, members.Members[0].ID)
+			return err
+		}, opts...)
 }
 
 /*
@@ -147,9 +167,20 @@ func TestSnapshotWithUserAuth(t *testing.T) {
 	testSnapshotWithAuth(t, false, true, WithAuth("user0", "user0Pass"))
 }
 
-func testSnapshotWithAuth(t *testing.T, _expectConnectionError, _expectOperationError bool, _opts ...config.ClientOption) {
-	// TODO(ahrtr): finish this after we added interface methods `Snapshot` into `Client`
-	t.Skip()
+func testSnapshotWithAuth(t *testing.T, connectError, operationError bool, opts ...config.ClientOption) {
+	testMaintenanceOperationWithAuth(t, connectError, operationError,
+		func(ctx context.Context, cc intf.Client) error {
+			stream, err := cc.(integrationClient).Client.Snapshot(ctx)
+			if err != nil {
+				return err
+			}
+			defer stream.Close()
+			bytes, err := io.ReadAll(stream)
+			if err == nil {
+				require.Greater(t, len(bytes), 32)
+			}
+			return err
+		}, opts...)
 }
 
 /*

@@ -1,0 +1,106 @@
+# Administration and compatibility limits
+
+The service implements the etcd v3 administration wire API over one Raft group.
+Use the official etcd v3.6.5 client or `etcdctl` for the supported operations.
+It is not a supported Kubernetes backend or a binary replacement for etcd.
+
+## Authentication
+
+Create a root user and grant the root role before enabling authentication:
+
+```sh
+etcdctl --endpoints=http://127.0.0.1:7001 user add root
+etcdctl --endpoints=http://127.0.0.1:7001 user grant-role root root
+etcdctl --endpoints=http://127.0.0.1:7001 auth enable
+etcdctl --endpoints=http://127.0.0.1:7001 --user=root auth status
+```
+
+Users, roles, range grants, password hashes, tokens, and auth revisions replicate through Raft.
+Authentication uses random tokens by default. `--auth-token` also accepts an RS256 key pair:
+
+```text
+jwt,pub-key=/path/public.pem,priv-key=/path/private.pem,sign-method=RS256,ttl=300s
+```
+
+All nodes must use the same token configuration. The token store has a 10,000-token limit.
+Auth changes invalidate existing tokens. The official client obtains a new token when required.
+TLS client authentication can use a certificate CN as the user name, including passwordless users.
+Use TLS for password authentication on an untrusted transport.
+
+## TLS listeners
+
+Set separate client and peer ports. Repeat the peer and client addresses on each initial member.
+For node 1, the relevant options are:
+
+```sh
+--listen 127.0.0.1:7001 --peer-listen 127.0.0.1:7101 \
+--peer 1=https://127.0.0.1:7101 --peer 2=https://127.0.0.1:7102 \
+--peer 3=https://127.0.0.1:7103 \
+--client-peer 1=https://127.0.0.1:7001 --client-peer 2=https://127.0.0.1:7002 \
+--client-peer 3=https://127.0.0.1:7003 \
+--cert-file client-server.pem --key-file client-server-key.pem \
+--trusted-ca-file client-ca.pem --client-cert-auth \
+--peer-cert-file peer.pem --peer-key-file peer-key.pem --peer-trusted-ca-file peer-ca.pem
+```
+
+Certificates must contain the advertised IP address or DNS name in their SAN extension.
+Peer TLS requires client certificates. Keep peer and client trust roots separate.
+The peer listener carries Raft, forwarded requests, and trusted diagnostic controls.
+The client listener carries only gRPC services and cannot supply a forwarded peer identity.
+All listeners remain on loopback. Cross-host deployment and certificate reload are future work.
+The server does not generate automatic TLS certificates.
+
+## Member changes
+
+MemberAdd, MemberAddAsLearner, MemberUpdate, MemberRemove, and MemberPromote use the official API.
+Use a learner when replacing or adding a server. The service allows one learner at a time.
+
+1. Add its peer URL with `etcdctl member add NAME --learner --peer-urls=URL`.
+2. Start the new process with the returned member ID, `--join`, and the same cluster ID.
+3. Supply the full current peer map, including the new member. Configure its client address as
+   above.
+4. Wait for snapshot installation and log catch-up. Then call `member promote ID`.
+5. Use `move-leader ID` when the new voter should become leader.
+
+Keep the same bootstrap arguments when restarting an existing data directory.
+The persisted membership controls voting and transport after recovery.
+A removed member ID cannot rejoin. Do not reuse its old data directory for a new member.
+Strict reconfiguration checks protect quorum by default. Disabling them can make a cluster
+unavailable.
+
+## Maintenance and storage
+
+Status returns local identity, Raft progress, size estimates, quota, and alarms.
+The gRPC health service checks quorum and local apply progress.
+`--quota-backend-bytes` limits logical data bytes. Zero disables that limit.
+The limit can be exceeded by one request. It does not reserve free disk space.
+NOSPACE alarms reject writes; deletion and compaction can free logical space before alarm disarm.
+
+Physical Compact waits for the MVCC deletion batch to flush to SlateDB.
+Defragment rewrites the current SST set and waits for the replacement manifest.
+Neither operation promises immediate filesystem shrinkage. SlateDB retains objects needed by
+checkpoints and reclaims obsolete objects through its own garbage collector.
+
+HashKV uses etcd's CRC32C revision encoding and compaction semantics.
+Databases created before the hash journal cannot return a complete HashKV result.
+The deprecated Hash RPC hashes native records. Its result cannot be compared with a bbolt backend
+hash.
+
+Snapshot streams the native state image with a trailing SHA-256 digest.
+It includes auth, membership, alarms, leases, and MVCC metadata.
+This image uses the same format as Raft recovery snapshots.
+It is not an etcd bbolt backup and cannot be restored with `etcdutl`.
+
+Restore it with `--restore-snapshot /path/native.snapshot` when starting each new member.
+Use new, empty data directories, a new cluster ID, and the same new peer map on all restored
+members.
+The restore path verifies the checksum, replaces membership, and invalidates old auth tokens.
+It retains KV revisions, compaction, leases, users, roles, and alarm types.
+Remove `--restore-snapshot` when restarting the restored cluster. Existing directories are never
+replaced. A damaged checksum stops restoration before any data directory is created.
+The server builds the complete snapshot in memory.
+Native backups and peer snapshots have a 64 MiB limit.
+
+Downgrade authenticates the administrator and returns Unimplemented.
+The SlateDB format cannot run an older etcd binary. No rolling binary downgrade is claimed.
+Status advertises the compatible etcd API version, not a shared on-disk format.

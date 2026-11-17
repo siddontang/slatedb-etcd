@@ -445,7 +445,12 @@ func TestWatchCatchupProgressAndFragmentation(t *testing.T) {
 		require.NoError(t, err)
 		revision = r.Header.Revision
 	}
-	stream, err := pb.NewWatchClient(api.ActiveConnection()).Watch(ctx)
+	// Progress reports local apply state. Wait for this member before asserting a cluster revision.
+	watchClient := client(t, []string{c.addresses[0]})
+	ready, err := watchClient.Get(ctx, "catchup")
+	require.NoError(t, err)
+	require.Equal(t, revision, ready.Header.Revision)
+	stream, err := pb.NewWatchClient(watchClient.ActiveConnection()).Watch(ctx)
 	require.NoError(t, err)
 	require.NoError(t, stream.Send(&pb.WatchRequest{RequestUnion: &pb.WatchRequest_CreateRequest{
 		CreateRequest: &pb.WatchCreateRequest{Key: []byte("catchup"), StartRevision: 1}}}))
@@ -473,7 +478,7 @@ func TestWatchCatchupProgressAndFragmentation(t *testing.T) {
 	}
 	txn, err := api.Txn(ctx).Then(operations...).Commit()
 	require.NoError(t, err)
-	stream, err = pb.NewWatchClient(api.ActiveConnection()).Watch(ctx)
+	stream, err = pb.NewWatchClient(watchClient.ActiveConnection()).Watch(ctx)
 	require.NoError(t, err)
 	require.NoError(t, stream.Send(&pb.WatchRequest{RequestUnion: &pb.WatchRequest_CreateRequest{
 		CreateRequest: &pb.WatchCreateRequest{Key: []byte("large/"), RangeEnd: []byte("large0"),

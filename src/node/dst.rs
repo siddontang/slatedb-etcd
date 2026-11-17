@@ -108,6 +108,11 @@ impl Simulation {
         }
         let node = Node::open_with_transport(
             NodeOptions {
+                client_peers: BTreeMap::new(),
+                transport: crate::tls::Transport::default(),
+                strict_reconfiguration: false,
+                join: false,
+                quota_bytes: 0,
                 id,
                 cluster_id: "dst".into(),
                 dir: self.root.path().join(id.to_string()),
@@ -348,6 +353,7 @@ impl Simulation {
             .unwrap()
             .propose(
                 RaftCommand::Etcd {
+                    origin: 1,
                     id: key.clone(),
                     etcd: RequestOp {
                         request: Some(Op::RequestPut(PutRequest {
@@ -430,7 +436,14 @@ impl Simulation {
         self.nodes
             .get_mut(&leader)
             .unwrap()
-            .propose(RaftCommand::Lease { id, lease }, tx)
+            .propose(
+                RaftCommand::Lease {
+                    id,
+                    lease,
+                    origin: leader,
+                },
+                tx,
+            )
             .unwrap();
         self.drive().await;
         for _ in 0..300 {
@@ -442,6 +455,209 @@ impl Simulation {
             }
         }
         panic!("lease command did not commit");
+    }
+
+    async fn admin_command(&mut self, command: RaftCommand) -> Outcome<Value> {
+        let leader = self.leader().unwrap();
+        self.trace.push(format!("admin {}", command.id()));
+        let (tx, mut rx) = oneshot::channel();
+        self.nodes
+            .get_mut(&leader)
+            .unwrap()
+            .propose(command, tx)
+            .unwrap();
+        self.drive().await;
+        for _ in 0..500 {
+            self.deliver(false).await;
+            if let Ok(result) = rx.try_recv() {
+                return serde_json::from_value(result.unwrap()).unwrap();
+            }
+        }
+        panic!("admin command did not commit");
+    }
+
+    async fn admin_recovery(&mut self) {
+        use crate::auth::{Command as A, Credentials};
+        use crate::proto::etcdserverpb::*;
+        let root = Credentials {
+            user: Some("root".into()),
+            time: 100,
+            ..Default::default()
+        };
+        let writer = Credentials {
+            user: Some("writer".into()),
+            time: 100,
+            ..Default::default()
+        };
+        let commands = [
+            A::UserAdd(AuthUserAddRequest {
+                name: "root".into(),
+                ..Default::default()
+            }),
+            A::UserGrantRole(AuthUserGrantRoleRequest {
+                user: "root".into(),
+                role: "root".into(),
+            }),
+            A::UserAdd(AuthUserAddRequest {
+                name: "writer".into(),
+                hashed_password: "hash".into(),
+                ..Default::default()
+            }),
+            A::RoleAdd(AuthRoleAddRequest {
+                name: "writer".into(),
+            }),
+            A::RoleGrantPermission(AuthRoleGrantPermissionRequest {
+                name: "writer".into(),
+                perm: Some(crate::proto::authpb::Permission {
+                    perm_type: 2,
+                    key: b"a".to_vec(),
+                    range_end: b"z".to_vec(),
+                }),
+            }),
+            A::UserGrantRole(AuthUserGrantRoleRequest {
+                user: "writer".into(),
+                role: "writer".into(),
+            }),
+            A::Enable(AuthEnableRequest {}),
+            A::IssueToken {
+                name: "writer".into(),
+                password: "hash".into(),
+                token: "dst-token".into(),
+                expires: 150,
+            },
+        ];
+        for (i, auth) in commands.into_iter().enumerate() {
+            self.admin_command(RaftCommand::Auth {
+                id: format!("auth-{i}"),
+                auth,
+                credentials: root.clone(),
+            })
+            .await
+            .result
+            .unwrap();
+        }
+        let token = Credentials {
+            token: "dst-token".into(),
+            time: 100,
+            ..Default::default()
+        };
+        let leader = self.leader().unwrap();
+        assert!(self.nodes[&leader]
+            .state
+            .auth
+            .range(&token, b"admin", b"", true)
+            .is_ok());
+        let expired = Credentials {
+            time: 150,
+            ..token.clone()
+        };
+        assert!(self.nodes[&leader]
+            .state
+            .auth
+            .range(&expired, b"admin", b"", true)
+            .is_err());
+        let lagging = leader % 3 + 1;
+        self.isolated = Some(lagging);
+        self.paused_apply = Some(leader);
+        let (revoke_tx, mut revoke_rx) = oneshot::channel();
+        let (put_tx, mut put_rx) = oneshot::channel();
+        let node = self.nodes.get_mut(&leader).unwrap();
+        node.propose(
+            RaftCommand::Auth {
+                id: "revoke".into(),
+                credentials: root.clone(),
+                auth: A::RoleRevokePermission(AuthRoleRevokePermissionRequest {
+                    role: "writer".into(),
+                    key: b"a".to_vec(),
+                    range_end: b"z".to_vec(),
+                }),
+            },
+            revoke_tx,
+        )
+        .unwrap();
+        node.propose(
+            RaftCommand::Etcd {
+                id: "denied-put".into(),
+                origin: leader,
+                etcd: RequestOp {
+                    request: Some(Op::RequestPut(PutRequest {
+                        key: b"admin".to_vec(),
+                        value: b"forbidden".to_vec(),
+                        ..Default::default()
+                    })),
+                },
+            }
+            .secure(Some(writer.clone())),
+            put_tx,
+        )
+        .unwrap();
+        self.drive().await;
+        for _ in 0..200 {
+            self.deliver(false).await;
+        }
+        assert!(revoke_rx.try_recv().is_err());
+        assert!(put_rx.try_recv().is_err());
+        self.paused_apply = None;
+        self.drive().await;
+        let revoked: Outcome<Value> =
+            serde_json::from_value(revoke_rx.await.unwrap().unwrap()).unwrap();
+        revoked.result.unwrap();
+        let denied: Outcome<Value> =
+            serde_json::from_value(put_rx.await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            denied.result.unwrap_err().code,
+            tonic::Code::PermissionDenied as i32
+        );
+        self.trace.push("revocation fences queued write".into());
+        let revision = self.nodes[&leader].state.revision;
+        self.admin_command(
+            RaftCommand::Compact {
+                id: "physical".into(),
+                compact: CompactionRequest {
+                    revision,
+                    physical: true,
+                },
+            }
+            .secure(Some(root)),
+        )
+        .await
+        .result
+        .unwrap();
+        assert!(self.nodes[&leader].state.durable_applied >= self.nodes[&leader].state.applied);
+        self.checkpoint().await;
+        self.stop(lagging);
+        self.start(lagging).await;
+        self.isolated = None;
+        for _ in 0..50 {
+            for id in 1..=3 {
+                self.tick(id).await;
+            }
+            for _ in 0..30 {
+                self.deliver(false).await;
+            }
+        }
+        for node in self.nodes.values() {
+            assert_eq!(node.state.compact_revision, revision);
+            assert!(node.state.auth.range(&writer, b"admin", b"", true).is_err());
+            assert!(node.state.auth.range(&token, b"admin", b"", true).is_err());
+            let value = node
+                .worker
+                .state()
+                .read_etcd(&RequestOp {
+                    request: Some(Op::RequestRange(RangeRequest {
+                        key: b"admin".to_vec(),
+                        ..Default::default()
+                    })),
+                })
+                .await
+                .unwrap();
+            let Some(Resp::ResponseRange(value)) = value.result.unwrap().response else {
+                panic!()
+            };
+            assert!(value.kvs.is_empty());
+        }
+        self.trace
+            .push("auth and physical compact recovered".into());
     }
 
     async fn run(seed: u64) -> Vec<String> {
@@ -728,6 +944,7 @@ impl Simulation {
                 );
             }
         }
+        sim.admin_recovery().await;
         sim.trace.clone()
     }
 }

@@ -2,11 +2,11 @@
   "mode": "test",
   "host": "macOS-27.2.1-arm64-arm-64bit",
   "machine": "arm64",
-  "created_at": "2026-11-17T05:19:47.091488+00:00",
+  "created_at": "2026-11-17T08:28:49.891306+00:00",
   "logical_cpus": 10,
-  "binary_sha256": "68c3a60a79ebdf59ebefc8cd893792d69e77a93ba030f7114f0b1a4133ff0372",
+  "binary_sha256": "9fad926293a3e1917926561048138e363d31485b014655b67b37963702236f75",
   "python": "3.9.6 (default, Apr 30 2025, 02:07:17) \n[Clang 17.0.0 (clang-1700.0.13.5)]",
-  "run_directory": "<tmp>/slatedb-raft-poc-hq58ngx6",
+  "run_directory": "<tmp>/slatedb-raft-poc-pabdacap",
   "binary": "<repo>/target/release/slatedb-etcd",
   "deployment": "three processes on one host and disk; loopback HTTP; local object store",
   "durability": "raft-engine synchronous writes; process crashes tested, power loss not tested",
@@ -14,15 +14,15 @@
     {
       "name": "election_and_atomic_write",
       "passed": true,
-      "leader": 2,
+      "leader": 1,
       "index": 2
     },
     {
       "name": "leader_sigkill_and_follower_rejoin",
       "passed": true,
-      "old_leader": 2,
-      "new_leader": 3,
-      "failover_to_success_ms": 1177.637334
+      "old_leader": 1,
+      "new_leader": 2,
+      "failover_to_success_ms": 1017.1918339999999
     },
     {
       "name": "all_processes_sigkill_and_wal_replay",
@@ -36,11 +36,11 @@
     {
       "name": "log_compaction_physical_gc_and_snapshot_catchup",
       "passed": true,
-      "lagging_node": 1,
+      "lagging_node": 2,
       "snapshot_index": 522,
       "reclaimed_files": 8,
-      "log_bytes_before": 2199792,
-      "log_bytes_after": 139670
+      "log_bytes_before": 2199623,
+      "log_bytes_after": 140114
     },
     {
       "name": "restart_after_log_gc",
@@ -57,148 +57,30 @@
     {
       "name": "slow_background_snapshot_keeps_heartbeats_and_writes",
       "passed": true,
-      "writes_during_snapshot": 121
+      "writes_during_snapshot": 127
     }
   ],
   "final_status": [
     {
-      "applied_index": 651,
+      "applied_index": 657,
       "apply_busy": false,
       "apply_delay_ms": 0,
       "apply_lag": 0,
-      "apply_target": 651,
+      "apply_target": 657,
       "blocked_peers": [],
-      "cached_last_log_index": 651,
-      "checkpoint_running": false,
-      "cluster_id": "poc-slatedb-raft-poc-hq58ngx6",
-      "commit_index": 651,
-      "compact_revision": -1,
-      "durable_applied_index": 522,
-      "first_log_index": 523,
-      "id": 1,
-      "installed_snapshots": 0,
-      "last_log_index": 651,
-      "leader_id": 3,
-      "log": {
-        "bytes": 95273,
-        "files": [
-          "0000000000000001.raftlog"
-        ]
-      },
-      "log_busy": false,
-      "log_delay_ms": 0,
-      "log_fail": false,
-      "log_memory": {
-        "cache_bytes": 49837,
-        "cache_limit": 8388608,
-        "disk_reads": 0,
-        "evictions": 2,
-        "hits": 256,
-        "misses": 0,
-        "pending_bytes": 0,
-        "pending_limit": 33554432,
-        "read_bytes": 0,
-        "read_limit": 16777216,
-        "read_reserved": 0,
-        "stale_reads": 0,
-        "term_bytes": 128,
-        "term_limit": 1048576
-      },
-      "log_read_delay_ms": 0,
-      "log_read_fail": false,
-      "pending": 0,
-      "pending_read_indexes": 0,
-      "queued_log_bytes": 0,
-      "queued_log_jobs": 0,
-      "queued_state_reads": 0,
-      "raft_commit_index": 651,
-      "recovered_from_index": 522,
-      "revision": 1,
-      "role": "Follower",
-      "snapshot_delay_ms": 0,
-      "snapshot_index": 522,
-      "sync_writes": 258,
-      "term": 5
-    },
-    {
-      "applied_index": 651,
-      "apply_busy": false,
-      "apply_delay_ms": 0,
-      "apply_lag": 0,
-      "apply_target": 651,
-      "blocked_peers": [],
-      "cached_last_log_index": 651,
-      "checkpoint_running": false,
-      "cluster_id": "poc-slatedb-raft-poc-hq58ngx6",
-      "commit_index": 651,
-      "compact_revision": -1,
-      "durable_applied_index": 522,
-      "first_log_index": 523,
-      "id": 2,
-      "installed_snapshots": 0,
-      "last_log_index": 651,
-      "leader_id": 3,
-      "log": {
-        "bytes": 166871,
-        "files": [
-          "0000000000000009.raftlog"
-        ]
-      },
-      "log_busy": false,
-      "log_delay_ms": 0,
-      "log_fail": false,
-      "log_memory": {
-        "cache_bytes": 50470,
-        "cache_limit": 8388608,
-        "disk_reads": 0,
-        "evictions": 0,
-        "hits": 258,
-        "misses": 0,
-        "pending_bytes": 0,
-        "pending_limit": 33554432,
-        "read_bytes": 0,
-        "read_limit": 16777216,
-        "read_reserved": 0,
-        "stale_reads": 0,
-        "term_bytes": 128,
-        "term_limit": 1048576
-      },
-      "log_read_delay_ms": 0,
-      "log_read_fail": false,
-      "pending": 0,
-      "pending_read_indexes": 0,
-      "queued_log_bytes": 0,
-      "queued_log_jobs": 0,
-      "queued_state_reads": 0,
-      "raft_commit_index": 651,
-      "recovered_from_index": 522,
-      "revision": 1,
-      "role": "Follower",
-      "snapshot_delay_ms": 0,
-      "snapshot_index": 522,
-      "sync_writes": 260,
-      "term": 5
-    },
-    {
-      "applied_index": 651,
-      "apply_busy": false,
-      "apply_delay_ms": 0,
-      "apply_lag": 0,
-      "apply_target": 651,
-      "blocked_peers": [],
-      "cached_last_log_index": 651,
+      "cached_last_log_index": 657,
       "checkpoint_running": true,
-      "cluster_id": "poc-slatedb-raft-poc-hq58ngx6",
-      "commit_index": 651,
+      "cluster_id": "poc-slatedb-raft-poc-pabdacap",
+      "commit_index": 657,
       "compact_revision": -1,
       "durable_applied_index": 530,
       "first_log_index": 531,
-      "id": 3,
+      "id": 1,
       "installed_snapshots": 0,
-      "last_log_index": 651,
-      "leader_id": 3,
+      "last_log_index": 657,
+      "leader_id": 1,
       "log": {
-        "bytes": 233305,
+        "bytes": 235477,
         "files": [
           "0000000000000009.raftlog"
         ]
@@ -210,8 +92,8 @@
         "cache_bytes": 0,
         "cache_limit": 8388608,
         "disk_reads": 0,
-        "evictions": 129,
-        "hits": 259,
+        "evictions": 135,
+        "hits": 271,
         "misses": 0,
         "pending_bytes": 0,
         "pending_limit": 33554432,
@@ -229,85 +111,137 @@
       "queued_log_bytes": 0,
       "queued_log_jobs": 0,
       "queued_state_reads": 0,
-      "raft_commit_index": 651,
+      "raft_commit_index": 657,
       "recovered_from_index": 522,
       "revision": 1,
       "role": "Leader",
       "snapshot_delay_ms": 0,
       "snapshot_index": 530,
-      "sync_writes": 261,
+      "sync_writes": 273,
+      "term": 5
+    },
+    {
+      "applied_index": 657,
+      "apply_busy": false,
+      "apply_delay_ms": 0,
+      "apply_lag": 0,
+      "apply_target": 657,
+      "blocked_peers": [],
+      "cached_last_log_index": 657,
+      "checkpoint_running": false,
+      "cluster_id": "poc-slatedb-raft-poc-pabdacap",
+      "commit_index": 657,
+      "compact_revision": -1,
+      "durable_applied_index": 522,
+      "first_log_index": 523,
+      "id": 2,
+      "installed_snapshots": 0,
+      "last_log_index": 657,
+      "leader_id": 1,
+      "log": {
+        "bytes": 96989,
+        "files": [
+          "0000000000000001.raftlog"
+        ]
+      },
+      "log_busy": false,
+      "log_delay_ms": 0,
+      "log_fail": false,
+      "log_memory": {
+        "cache_bytes": 52207,
+        "cache_limit": 8388608,
+        "disk_reads": 0,
+        "evictions": 2,
+        "hits": 268,
+        "misses": 0,
+        "pending_bytes": 0,
+        "pending_limit": 33554432,
+        "read_bytes": 0,
+        "read_limit": 16777216,
+        "read_reserved": 0,
+        "stale_reads": 0,
+        "term_bytes": 128,
+        "term_limit": 1048576
+      },
+      "log_read_delay_ms": 0,
+      "log_read_fail": false,
+      "pending": 0,
+      "pending_read_indexes": 0,
+      "queued_log_bytes": 0,
+      "queued_log_jobs": 0,
+      "queued_state_reads": 0,
+      "raft_commit_index": 657,
+      "recovered_from_index": 522,
+      "revision": 1,
+      "role": "Follower",
+      "snapshot_delay_ms": 0,
+      "snapshot_index": 522,
+      "sync_writes": 270,
+      "term": 5
+    },
+    {
+      "applied_index": 657,
+      "apply_busy": false,
+      "apply_delay_ms": 0,
+      "apply_lag": 0,
+      "apply_target": 657,
+      "blocked_peers": [],
+      "cached_last_log_index": 657,
+      "checkpoint_running": false,
+      "cluster_id": "poc-slatedb-raft-poc-pabdacap",
+      "commit_index": 657,
+      "compact_revision": -1,
+      "durable_applied_index": 522,
+      "first_log_index": 523,
+      "id": 3,
+      "installed_snapshots": 0,
+      "last_log_index": 657,
+      "leader_id": 1,
+      "log": {
+        "bytes": 168599,
+        "files": [
+          "0000000000000009.raftlog"
+        ]
+      },
+      "log_busy": false,
+      "log_delay_ms": 0,
+      "log_fail": false,
+      "log_memory": {
+        "cache_bytes": 52840,
+        "cache_limit": 8388608,
+        "disk_reads": 0,
+        "evictions": 0,
+        "hits": 270,
+        "misses": 0,
+        "pending_bytes": 0,
+        "pending_limit": 33554432,
+        "read_bytes": 0,
+        "read_limit": 16777216,
+        "read_reserved": 0,
+        "stale_reads": 0,
+        "term_bytes": 128,
+        "term_limit": 1048576
+      },
+      "log_read_delay_ms": 0,
+      "log_read_fail": false,
+      "pending": 0,
+      "pending_read_indexes": 0,
+      "queued_log_bytes": 0,
+      "queued_log_jobs": 0,
+      "queued_state_reads": 0,
+      "raft_commit_index": 657,
+      "recovered_from_index": 522,
+      "revision": 1,
+      "role": "Follower",
+      "snapshot_delay_ms": 0,
+      "snapshot_index": 522,
+      "sync_writes": 272,
       "term": 5
     }
   ],
   "passed": true,
   "node_log_summary": {
     "node-1": {
-      "completed_snapshots": 0,
-      "last_snapshot_index": null,
-      "raft_state_changes": [
-        {
-          "role": "Follower",
-          "term": 1,
-          "leader_id": 0
-        },
-        {
-          "role": "Follower",
-          "term": 1,
-          "leader_id": 2
-        },
-        {
-          "role": "Follower",
-          "term": 2,
-          "leader_id": 0
-        },
-        {
-          "role": "Follower",
-          "term": 2,
-          "leader_id": 3
-        },
-        {
-          "role": "Follower",
-          "term": 3,
-          "leader_id": 0
-        },
-        {
-          "role": "Follower",
-          "term": 3,
-          "leader_id": 3
-        },
-        {
-          "role": "Follower",
-          "term": 3,
-          "leader_id": 3
-        },
-        {
-          "role": "PreCandidate",
-          "term": 3,
-          "leader_id": 0
-        },
-        {
-          "role": "Candidate",
-          "term": 4,
-          "leader_id": 0
-        },
-        {
-          "role": "Leader",
-          "term": 4,
-          "leader_id": 1
-        },
-        {
-          "role": "Follower",
-          "term": 4,
-          "leader_id": 0
-        },
-        {
-          "role": "Follower",
-          "term": 5,
-          "leader_id": 3
-        }
-      ]
-    },
-    "node-2": {
       "completed_snapshots": 0,
       "last_snapshot_index": null,
       "raft_state_changes": [
@@ -324,12 +258,83 @@
         {
           "role": "Leader",
           "term": 1,
-          "leader_id": 2
+          "leader_id": 1
         },
         {
           "role": "Follower",
           "term": 2,
-          "leader_id": 3
+          "leader_id": 2
+        },
+        {
+          "role": "PreCandidate",
+          "term": 2,
+          "leader_id": 0
+        },
+        {
+          "role": "Candidate",
+          "term": 3,
+          "leader_id": 0
+        },
+        {
+          "role": "Leader",
+          "term": 3,
+          "leader_id": 1
+        },
+        {
+          "role": "Follower",
+          "term": 4,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 4,
+          "leader_id": 2
+        },
+        {
+          "role": "PreCandidate",
+          "term": 4,
+          "leader_id": 0
+        },
+        {
+          "role": "Candidate",
+          "term": 5,
+          "leader_id": 0
+        },
+        {
+          "role": "Leader",
+          "term": 5,
+          "leader_id": 1
+        }
+      ]
+    },
+    "node-2": {
+      "completed_snapshots": 0,
+      "last_snapshot_index": null,
+      "raft_state_changes": [
+        {
+          "role": "Follower",
+          "term": 1,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 1,
+          "leader_id": 1
+        },
+        {
+          "role": "PreCandidate",
+          "term": 1,
+          "leader_id": 0
+        },
+        {
+          "role": "Candidate",
+          "term": 2,
+          "leader_id": 0
+        },
+        {
+          "role": "Leader",
+          "term": 2,
+          "leader_id": 2
         },
         {
           "role": "Follower",
@@ -339,7 +344,12 @@
         {
           "role": "Follower",
           "term": 3,
-          "leader_id": 3
+          "leader_id": 1
+        },
+        {
+          "role": "Follower",
+          "term": 3,
+          "leader_id": 1
         },
         {
           "role": "PreCandidate",
@@ -352,24 +362,19 @@
           "leader_id": 0
         },
         {
+          "role": "Leader",
+          "term": 4,
+          "leader_id": 2
+        },
+        {
           "role": "Follower",
           "term": 4,
           "leader_id": 0
         },
         {
           "role": "Follower",
-          "term": 4,
+          "term": 5,
           "leader_id": 1
-        },
-        {
-          "role": "Follower",
-          "term": 5,
-          "leader_id": 0
-        },
-        {
-          "role": "Follower",
-          "term": 5,
-          "leader_id": 3
         }
       ]
     },
@@ -385,62 +390,47 @@
         {
           "role": "Follower",
           "term": 1,
-          "leader_id": 2
-        },
-        {
-          "role": "PreCandidate",
-          "term": 1,
-          "leader_id": 0
-        },
-        {
-          "role": "Candidate",
-          "term": 2,
-          "leader_id": 0
-        },
-        {
-          "role": "Leader",
-          "term": 2,
-          "leader_id": 3
-        },
-        {
-          "role": "PreCandidate",
-          "term": 2,
-          "leader_id": 0
-        },
-        {
-          "role": "Candidate",
-          "term": 3,
-          "leader_id": 0
-        },
-        {
-          "role": "Leader",
-          "term": 3,
-          "leader_id": 3
-        },
-        {
-          "role": "Follower",
-          "term": 4,
-          "leader_id": 0
-        },
-        {
-          "role": "Follower",
-          "term": 4,
           "leader_id": 1
         },
         {
-          "role": "PreCandidate",
+          "role": "Follower",
+          "term": 2,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 2,
+          "leader_id": 2
+        },
+        {
+          "role": "Follower",
+          "term": 3,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 3,
+          "leader_id": 1
+        },
+        {
+          "role": "Follower",
           "term": 4,
           "leader_id": 0
         },
         {
-          "role": "Candidate",
+          "role": "Follower",
+          "term": 4,
+          "leader_id": 2
+        },
+        {
+          "role": "Follower",
           "term": 5,
           "leader_id": 0
         },
         {
-          "role": "Leader",
+          "role": "Follower",
           "term": 5,
-          "leader_id": 3
+          "leader_id": 1
         }
       ]
     }

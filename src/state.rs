@@ -13,6 +13,9 @@ use crate::mvcc::{self, Outcome};
 use crate::proto::etcdserverpb::{CompactionRequest, CompactionResponse, RequestOp};
 use crate::{Command, Operation, Reply};
 
+mod backup;
+pub(crate) mod maintenance;
+
 const APPLIED: &[u8] = b"meta/applied";
 const DATA: &[u8] = b"data/";
 
@@ -25,6 +28,11 @@ struct SnapshotData {
 
 pub struct StateMachine {
     db: Arc<Db>,
+    pub auth: crate::auth::Store,
+    pub members: crate::cluster::Store,
+    admin: slatedb::admin::Admin,
+    pub quota: u64,
+    pub alarms: Vec<crate::proto::etcdserverpb::AlarmMember>,
     pub applied: u64,
     pub durable_applied: u64,
     pub revision: i64,
@@ -45,7 +53,12 @@ impl StateMachine {
         // Frequent checkpoints need prompt L0 compaction and manifest refreshes.
         if let Some(compactor) = settings.compactor_options.as_mut() {
             compactor.poll_interval = Duration::from_millis(100);
+            compactor.commit_compacted_interval = Duration::from_millis(100);
+            if let Some(worker) = compactor.worker.as_mut() {
+                worker.compactions_poll_interval = Duration::from_millis(100);
+            }
         }
+        let admin = slatedb::admin::Admin::builder("state", object_store.clone()).build();
         let db = Db::builder("state", object_store)
             .with_settings(settings)
             .build()
@@ -67,7 +80,24 @@ impl StateMachine {
             "compaction exceeds current revision"
         );
         let leases = crate::lease::load(&db).await?;
+        let auth = match db.get(crate::auth::KEY).await? {
+            Some(data) => serde_json::from_slice(&data)?,
+            None => crate::auth::Store::default(),
+        };
+        let alarms = match db.get(crate::maintenance::ALARMS).await? {
+            Some(data) => serde_json::from_slice(&data)?,
+            None => vec![],
+        };
+        let members = match db.get(crate::cluster::KEY).await? {
+            Some(data) => serde_json::from_slice(&data)?,
+            None => crate::cluster::Store::default(),
+        };
         Ok(Self {
+            members,
+            admin,
+            quota: 0,
+            alarms,
+            auth,
             db: Arc::new(db),
             applied,
             durable_applied: applied,
@@ -75,6 +105,161 @@ impl StateMachine {
             compact_revision,
             leases,
         })
+    }
+
+    pub fn snapshot_conf(bytes: &[u8]) -> Result<Option<raft::eraftpb::ConfState>> {
+        let data: SnapshotData = bincode::deserialize(bytes)?;
+        for (key, value) in data.rows {
+            if key == crate::cluster::KEY {
+                let members: crate::cluster::Store = serde_json::from_slice(&value)?;
+                return Ok(Some(members.conf()));
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn apply_cluster(
+        &mut self,
+        index: u64,
+        request: &crate::cluster::Command,
+        credentials: &crate::auth::Credentials,
+    ) -> Result<Outcome<serde_json::Value>> {
+        ensure!(index == self.applied + 1, "non-contiguous cluster apply");
+        let allowed = if matches!(
+            request,
+            crate::cluster::Command::List(_) | crate::cluster::Command::Publish { .. }
+        ) {
+            Ok(())
+        } else {
+            self.auth.admin(credentials)
+        };
+        let mut members = self.members.clone();
+        let result = allowed.and_then(|()| members.validate(request)).map(|()| {
+            members.apply(request);
+            let mut response = serde_json::json!({"header": mvcc::header(self.revision),
+                "members": members.members.values().collect::<Vec<_>>()});
+            if let crate::cluster::Command::Add(member) = request {
+                response["member"] = serde_json::json!(member);
+            }
+            response
+        });
+        let mut batch = WriteBatch::new();
+        batch.put(crate::cluster::KEY, serde_json::to_vec(&members)?);
+        batch.put(APPLIED, index.to_be_bytes());
+        self.db
+            .write_with_options(batch, &WriteOptions { seqnum: index })
+            .await?;
+        self.members = members;
+        self.applied = index;
+        Ok(Outcome { result })
+    }
+
+    pub async fn apply_auth(
+        &mut self,
+        index: u64,
+        credentials: &crate::auth::Credentials,
+        command: &crate::auth::Command,
+    ) -> Result<Outcome<serde_json::Value>> {
+        ensure!(index == self.applied + 1, "non-contiguous auth apply");
+        let mut next = self.auth.clone();
+        let result = next.execute(credentials, command, self.revision);
+        let mut batch = WriteBatch::new();
+        if result.is_ok() {
+            batch.put(crate::auth::KEY, serde_json::to_vec(&next)?);
+        }
+        batch.put(APPLIED, index.to_be_bytes());
+        self.db
+            .write_with_options(batch, &WriteOptions { seqnum: index })
+            .await?;
+        self.applied = index;
+        if result.is_ok() {
+            self.auth = next;
+        }
+        Ok(Outcome { result })
+    }
+
+    pub async fn read_etcd_authorized(
+        &self,
+        request: &RequestOp,
+        credentials: Option<&crate::auth::Credentials>,
+    ) -> Result<Outcome> {
+        if let Some(credentials) = credentials {
+            if let Err(error) = self.auth.kv(credentials, request) {
+                return Ok(Outcome { result: Err(error) });
+            }
+        }
+        self.read_etcd(request).await
+    }
+
+    pub async fn authorize(
+        &self,
+        auth: &crate::auth::Credentials,
+        command: &crate::RaftCommand,
+    ) -> std::result::Result<(), mvcc::KvError> {
+        use crate::lease::LeaseCommand as L;
+        match command {
+            crate::RaftCommand::Etcd { etcd, .. } => {
+                self.auth.kv(auth, etcd)?;
+                let mut requests = vec![etcd];
+                let mut leases = std::collections::BTreeSet::new();
+                while let Some(request) = requests.pop() {
+                    use crate::proto::etcdserverpb::request_op::Request as Op;
+                    match &request.request {
+                        Some(Op::RequestPut(put)) if put.lease != 0 => {
+                            leases.insert(put.lease);
+                        }
+                        Some(Op::RequestTxn(txn)) => {
+                            requests.extend(txn.success.iter().chain(&txn.failure));
+                        }
+                        _ => (),
+                    }
+                }
+                if self.auth.enabled && !leases.is_empty() {
+                    use prost::Message;
+                    let mut scan = self
+                        .db
+                        .scan_prefix(b"etcd/current/", ..)
+                        .await
+                        .map_err(mvcc::KvError::storage)?;
+                    while let Some(row) = scan.next().await.map_err(mvcc::KvError::storage)? {
+                        let kv = crate::proto::mvccpb::KeyValue::decode(row.value)
+                            .map_err(mvcc::KvError::storage)?;
+                        if leases.contains(&kv.lease) {
+                            self.auth.range(auth, &kv.key, &[], true)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            crate::RaftCommand::Lease { lease, .. } => {
+                self.auth.authenticated(auth)?;
+                let (id, write) = match lease {
+                    L::KeepAlive { id } | L::Revoke { id } => (*id, true),
+                    L::TimeToLive { id, keys: true } => (*id, false),
+                    L::TimeToLive { keys: false, .. } => return Ok(()),
+                    L::Grant { .. } | L::List => return Ok(()),
+                    L::Expire { .. } => return Err(crate::auth::denied()),
+                };
+                if self.auth.enabled {
+                    let mut scan = self
+                        .db
+                        .scan_prefix(b"etcd/current/", ..)
+                        .await
+                        .map_err(mvcc::KvError::storage)?;
+                    use prost::Message;
+                    while let Some(row) = scan.next().await.map_err(mvcc::KvError::storage)? {
+                        let kv = crate::proto::mvccpb::KeyValue::decode(row.value)
+                            .map_err(mvcc::KvError::storage)?;
+                        if kv.lease == id {
+                            self.auth.range(auth, &kv.key, &[], write)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            crate::RaftCommand::Compact { .. } => self.auth.admin(auth),
+            _ => Err(crate::auth::denied()),
+        }
     }
 
     pub async fn apply(&mut self, index: u64, command: Option<&Command>) -> Result<Reply> {
@@ -150,6 +335,47 @@ impl StateMachine {
         })
     }
 
+    pub async fn apply_etcd_quota(
+        &mut self,
+        index: u64,
+        request: &RequestOp,
+        origin: u64,
+    ) -> Result<Outcome> {
+        let corrupt = self.alarms.iter().any(|a| a.alarm == 2);
+        let full = crate::maintenance::has_put(request)
+            && (self.alarms.iter().any(|a| a.alarm == 1)
+                || (self.quota > 0 && self.logical_size().await? >= self.quota));
+        if corrupt || full {
+            let mut batch = WriteBatch::new();
+            if full && !self.alarms.iter().any(|a| a.alarm == 1) {
+                self.alarms.push(crate::proto::etcdserverpb::AlarmMember {
+                    member_id: origin,
+                    alarm: 1,
+                });
+            }
+            batch.put(
+                crate::maintenance::ALARMS,
+                serde_json::to_vec(&self.alarms)?,
+            );
+            batch.put(APPLIED, index.to_be_bytes());
+            self.db
+                .write_with_options(batch, &WriteOptions { seqnum: index })
+                .await?;
+            self.applied = index;
+            return Ok(Outcome {
+                result: Err(if corrupt {
+                    mvcc::KvError::new(tonic::Code::DataLoss, "corrupt cluster")
+                } else {
+                    mvcc::KvError::new(
+                        tonic::Code::ResourceExhausted,
+                        "mvcc: database space exceeded",
+                    )
+                }),
+            });
+        }
+        self.apply_etcd(index, request).await
+    }
+
     pub async fn apply_etcd(&mut self, index: u64, request: &RequestOp) -> Result<Outcome> {
         ensure!(
             index == self.applied + 1,
@@ -192,6 +418,12 @@ impl StateMachine {
             index == self.applied + 1,
             "non-contiguous state machine apply"
         );
+        if self.alarms.iter().any(|alarm| alarm.alarm == 2) {
+            self.apply(index, None).await?;
+            return Ok(Outcome {
+                result: Err(mvcc::KvError::new(tonic::Code::DataLoss, "corrupt cluster")),
+            });
+        }
         let (result, mut batch) =
             match mvcc::prepare_compaction(&self.db, self.revision, self.compact_revision, request)
                 .await
@@ -206,6 +438,16 @@ impl StateMachine {
                     (Err(error), WriteBatch::new())
                 }
             };
+        if result.is_ok() {
+            if let Ok(hash) = self.hash_kv(request.revision).await {
+                let mut hashes = self.hash_cache().await?;
+                hashes.push(hash);
+                if hashes.len() > 10 {
+                    hashes.remove(0);
+                }
+                batch.put(b"etcd/hash-cache", serde_json::to_vec(&hashes)?);
+            }
+        }
         batch.put(APPLIED, index.to_be_bytes());
         self.db
             .write_with_options(batch, &WriteOptions { seqnum: index })
@@ -213,6 +455,10 @@ impl StateMachine {
         self.applied = index;
         if result.is_ok() {
             self.compact_revision = request.revision;
+            if request.physical {
+                self.db.flush().await?;
+                self.durable_applied = self.applied;
+            }
         }
         Ok(Outcome { result })
     }
@@ -222,10 +468,56 @@ impl StateMachine {
         index: u64,
         command: &crate::lease::LeaseCommand,
     ) -> Result<Outcome<crate::lease::LeaseReply>> {
+        self.apply_lease_from(index, command, 0).await
+    }
+
+    pub async fn apply_lease_from(
+        &mut self,
+        index: u64,
+        command: &crate::lease::LeaseCommand,
+        origin: u64,
+    ) -> Result<Outcome<crate::lease::LeaseReply>> {
         ensure!(
             index == self.applied + 1,
             "non-contiguous state machine apply"
         );
+        use crate::lease::LeaseCommand as L;
+        let corrupt = self.alarms.iter().any(|a| a.alarm == 2)
+            && matches!(
+                command,
+                L::Grant { .. } | L::Revoke { .. } | L::Expire { .. }
+            );
+        let full = matches!(command, L::Grant { .. })
+            && (self.alarms.iter().any(|a| a.alarm == 1)
+                || (self.quota > 0 && self.logical_size().await? >= self.quota));
+        if corrupt || full {
+            if full && !self.alarms.iter().any(|a| a.alarm == 1) {
+                self.alarms.push(crate::proto::etcdserverpb::AlarmMember {
+                    member_id: origin,
+                    alarm: 1,
+                });
+            }
+            let mut batch = WriteBatch::new();
+            batch.put(
+                crate::maintenance::ALARMS,
+                serde_json::to_vec(&self.alarms)?,
+            );
+            batch.put(APPLIED, index.to_be_bytes());
+            self.db
+                .write_with_options(batch, &WriteOptions { seqnum: index })
+                .await?;
+            self.applied = index;
+            return Ok(Outcome {
+                result: Err(if corrupt {
+                    mvcc::KvError::new(tonic::Code::DataLoss, "corrupt cluster")
+                } else {
+                    mvcc::KvError::new(
+                        tonic::Code::ResourceExhausted,
+                        "mvcc: database space exceeded",
+                    )
+                }),
+            });
+        }
         let (result, mut batch, revision, change) = match crate::lease::prepare(
             &self.db,
             self.revision,
@@ -284,6 +576,7 @@ impl StateMachine {
         let snapshot = self.db.snapshot()?;
         let db = Arc::clone(&self.db);
         let applied = self.applied;
+        let members = serde_json::to_vec(&self.members)?;
         ensure!(
             snapshot.seq() == applied,
             "snapshot does not match the apply marker"
@@ -295,6 +588,8 @@ impl StateMachine {
             while let Some(row) = iterator.next().await? {
                 rows.push((row.key.to_vec(), row.value.to_vec()));
             }
+            rows.retain(|(key, _)| key != crate::cluster::KEY);
+            rows.push((crate::cluster::KEY.to_vec(), members));
             Ok(bincode::serialize(&SnapshotData {
                 version: 2,
                 applied,
@@ -336,6 +631,18 @@ impl StateMachine {
         self.revision = read_revision(&self.db).await?;
         self.compact_revision = read_compact_revision(&self.db).await?;
         self.leases = crate::lease::load(&self.db).await?;
+        self.alarms = match self.db.get(crate::maintenance::ALARMS).await? {
+            Some(data) => serde_json::from_slice(&data)?,
+            None => vec![],
+        };
+        self.members = match self.db.get(crate::cluster::KEY).await? {
+            Some(data) => serde_json::from_slice(&data)?,
+            None => crate::cluster::Store::default(),
+        };
+        self.auth = match self.db.get(crate::auth::KEY).await? {
+            Some(data) => serde_json::from_slice(&data)?,
+            None => crate::auth::Store::default(),
+        };
         ensure!(
             self.compact_revision <= self.revision,
             "compaction exceeds current revision"

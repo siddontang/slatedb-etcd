@@ -596,12 +596,6 @@ pub async fn prepare_compaction(
     compact_revision: i64,
     request: &CompactionRequest,
 ) -> KvResult<(CompactionResponse, WriteBatch)> {
-    if request.physical {
-        return Err(KvError::new(
-            Code::Unimplemented,
-            "physical MVCC compaction is not implemented",
-        ));
-    }
     if request.revision <= compact_revision {
         return Err(KvError::new(
             Code::OutOfRange,

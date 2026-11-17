@@ -10,7 +10,6 @@ import (
 	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
@@ -117,10 +116,12 @@ func TestDifferentialCompaction(t *testing.T) {
 	checkCompact("older_boundary", old)
 	checkCompact("compact_deleted_version", deleted)
 	check("deleted_boundary_range", clientv3.OpGet("", clientv3.WithFromKey(), clientv3.WithRev(deleted)))
-	if _, err := compact(actual, latest, true); status.Code(err) != codes.Unimplemented {
-		t.Fatalf("Physical compaction must fail explicitly: %v", err)
+	for _, api := range []*clientv3.Client{actual, expected} {
+		if _, err := compact(api, latest, true); err != nil {
+			t.Fatal(err)
+		}
 	}
-	check("physical_rejection_keeps_boundary", clientv3.OpGet("key", clientv3.WithRev(deleted)))
+	check("physical_compact_removes_history", clientv3.OpGet("key", clientv3.WithRev(deleted)))
 	checkCompact("compact_current", latest)
 	check("current_boundary", clientv3.OpGet("", clientv3.WithFromKey(), clientv3.WithRev(latest)))
 	check("write_after_compact", clientv3.OpPut("key", "fourth", clientv3.WithPrevKV()))

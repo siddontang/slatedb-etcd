@@ -3,7 +3,8 @@
 This document defines the storage contract, execution model, and project roadmap.
 The baseline is commit `0b1509e`, which added Watch and Lease support.
 Commit `fc967ed` completed phase 1. Commit `c14308a` added ReadIndex and separate log I/O.
-This change adds bounded log pools, asynchronous entry reads, and follower read barriers.
+The implementation also has bounded log pools, asynchronous entry reads, and follower read barriers.
+The administration milestone adds replicated Auth, membership, alarms, and secure transport.
 Sections marked as targets describe work that is not implemented yet.
 
 ## Purpose and scope
@@ -12,14 +13,16 @@ Build an etcd v3 compatible service with Raft commit durability and a SlateDB st
 Keep object writes off the normal commit path. Preserve recovery of acknowledged writes.
 Validate correctness before making claims about latency, cost, or deployment readiness.
 
-The current service has one Raft group and three fixed voters.
+The current service has one Raft group, a configurable voter set, and one optional learner.
 It uses `raft-rs`, `raft-engine`, and SlateDB. It does not embed TiKV or use PD.
 All listeners and peers use loopback addresses. Each replica has its own storage directory.
 SlateDB currently uses `LocalFileSystem`, not a remote object store.
 No replica shares its manifest or SST ownership with another replica.
 
-KV, Txn, logical Compact, Watch, and Lease are implemented.
-Auth, Cluster, Maintenance, TLS, backend capacity quotas, and physical compaction remain incomplete.
+KV, Txn, Compact, Watch, Lease, Auth, and Cluster are implemented.
+Maintenance, TLS, backend quotas, and physical compaction have local integration coverage.
+Native snapshots and backend hashes do not use the etcd bbolt format. Binary downgrade is
+unsupported.
 This service is not yet a supported replacement for etcd or a Kubernetes backend.
 
 ## Components
@@ -68,6 +71,11 @@ SlateDB uses these logical keys:
 | `etcd/revision` and `etcd/compact-revision` | MVCC progress and retained history boundary |
 | `etcd/events/` and `etcd/watch-floor` | Ordered events and the first complete journal revision |
 | `etcd/leases/` | Lease TTL and generation |
+| `etcd/auth` | Users, roles, bcrypt hashes, tokens, and authentication revision |
+| `etcd/members` | Voters, learners, addresses, and removed member IDs |
+| `etcd/alarms` | Replicated capacity and corruption alarms |
+| `etcd/hash/` | Canonical etcd revision records for HashKV |
+| `etcd/hash-cache` and `etcd/hash-origin` | Retained compaction hashes and format coverage |
 
 The full snapshot preserves these keys together. A checkpoint has one pinned apply boundary.
 
@@ -298,6 +306,46 @@ Leader promotion currently resets each surviving lease to its full granted TTL.
 Remaining TTL is not checkpointed. Loss of quorum delays committed expiry.
 Apply isolation must retain these semantics and must not acknowledge a renewal before apply.
 
+## Authentication and administration
+
+The apply owner persists authentication changes in the same sequence as KV operations.
+A secured proposal carries a token or a verified certificate identity.
+Apply checks permissions after all earlier changes. A queued write cannot use a revoked grant.
+Transactions require permission for comparisons and both branches. Lease operations check attached
+keys.
+Watch polls recheck identity and range permission. Token expiry and auth changes cancel stale
+streams.
+Password checks use blocking workers. Raft carries bcrypt hashes and issued tokens, never passwords.
+
+Membership changes use Raft configuration entries. Only one configuration change can remain pending.
+Apply validates the change again and produces either the new configuration or a no-op.
+The Raft owner applies that configuration before advancing its applied index.
+Each membership change triggers a checkpoint with the configuration at that snapshot's index.
+A new learner starts with an empty configuration and installs a membership snapshot before replay.
+Durable membership takes precedence over startup transport addresses after recovery.
+Peer updates publish the member name and client URLs through the trusted Raft transport.
+Leader transfer returns after Raft observes the target leader, or reports a timeout.
+
+TLS uses separate client and peer listeners. The peer listener requires a trusted client certificate
+when peer TLS is configured. Use separate certificate authorities for peer and client identities.
+Only the peer listener accepts a forwarded certificate identity.
+The client listener ignores peer forwarding headers. Verified client certificate CNs map to users.
+The plaintext local mode retains trusted diagnostics. It is not a hostile multi-user boundary.
+
+Status and serializable member lists read local applied metadata during quorum loss.
+HashKV and linearizable member lists use a ReadIndex barrier.
+HashKV follows etcd revision encoding, compaction filtering, and retained compaction hash semantics.
+Older databases without complete revision records return an explicit HashKV format error.
+Quota checks use logical stored bytes. Replicated alarms stop writes until an administrator clears
+them.
+This quota is not a filesystem capacity limit.
+
+Physical Compact flushes MVCC deletions. Defragment rewrites SSTs through the SlateDB compactor.
+Both operations run on the apply worker. Slow state work cannot stop Raft heartbeats.
+Compactor failures return RPC errors; they do not stop the Raft owner.
+Native snapshot export includes SHA-256 and uses bounded response chunks, but builds a full buffer.
+Snapshots contain authentication, membership, alarms, leases, and revision metadata together.
+
 ## Target storage and deployment architecture
 
 The first remote-store deployment will retain one independent SlateDB owner per replica.
@@ -332,7 +380,9 @@ Local JSON benchmarks do not establish remote-store latency or cost.
 Phases 1 and 2 now separate state work and log I/O from the Raft owner.
 The apply worker remains a Tokio task and shares CPU and disk resources with other process work.
 Large scans, full snapshots, and lease metadata copies still need bounded work and memory controls.
-Remote storage, membership changes, and object-reference snapshots remain future work.
+Remote storage and object-reference snapshots remain future work.
+Phase 3 now includes local administrative and secure transport tests.
+Its remaining format and deployment limits appear in [administration](administration.md).
 
 The phase 2 tests cover quorum loss, apply lag, read cancellation, and unchanged log write counts.
 They cover delayed log writes, failed writes, delayed checkpoint publication, and worker failure.

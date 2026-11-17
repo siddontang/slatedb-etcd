@@ -5,3 +5,7 @@ pub mod mvccpb {
 pub mod etcdserverpb {
     tonic::include_proto!("etcdserverpb");
 }
+
+pub mod authpb {
+    tonic::include_proto!("authpb");
+}

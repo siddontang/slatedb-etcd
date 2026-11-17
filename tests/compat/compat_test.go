@@ -3,6 +3,7 @@ package compat
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -25,12 +27,16 @@ import (
 )
 
 type cluster struct {
-	t            *testing.T
-	root, binary string
-	addresses    []string
-	processes    map[int]*exec.Cmd
-	logs         map[int]*os.File
-	args         []string
+	peerAddresses []string
+	tlsClient     *tls.Config
+	httpClient    *http.Client
+	snapshotEvery uint64
+	t             *testing.T
+	root, binary  string
+	addresses     []string
+	processes     map[int]*exec.Cmd
+	logs          map[int]*os.File
+	args          []string
 }
 
 func address(t *testing.T) string {
@@ -45,6 +51,14 @@ func address(t *testing.T) string {
 }
 
 func newCluster(t *testing.T, extraArgs ...string) *cluster {
+	return newClusterSize(t, 3, extraArgs...)
+}
+
+func newClusterSize(t *testing.T, size int, extraArgs ...string) *cluster {
+	return newClusterConfigured(t, size, nil, extraArgs...)
+}
+
+func newClusterConfigured(t *testing.T, size int, configure func(*cluster), extraArgs ...string) *cluster {
 	t.Helper()
 	binary := os.Getenv("SLATEDB_ETCD_BINARY")
 	if binary == "" {
@@ -62,8 +76,11 @@ func newCluster(t *testing.T, extraArgs ...string) *cluster {
 		t.Fatal(err)
 	}
 	c := &cluster{t: t, root: root, binary: binary, args: extraArgs, processes: map[int]*exec.Cmd{}, logs: map[int]*os.File{}}
-	for i := 0; i < 3; i++ {
+	for i := 0; i < size; i++ {
 		c.addresses = append(c.addresses, address(t))
+	}
+	if configure != nil {
+		configure(c)
 	}
 	t.Log("Process logs and data:", root)
 	t.Cleanup(func() {
@@ -71,7 +88,7 @@ func newCluster(t *testing.T, extraArgs ...string) *cluster {
 			c.stop(id)
 		}
 		if t.Failed() {
-			for i := 1; i <= 3; i++ {
+			for i := 1; i <= size; i++ {
 				data, _ := os.ReadFile(filepath.Join(root, fmt.Sprintf("node-%d.log", i)))
 				if len(data) > 4000 {
 					data = data[len(data)-4000:]
@@ -82,18 +99,26 @@ func newCluster(t *testing.T, extraArgs ...string) *cluster {
 			os.RemoveAll(root)
 		}
 	})
-	for i := 1; i <= 3; i++ {
+	for i := 1; i <= size; i++ {
 		c.start(i)
 	}
-	c.leader()
+	c.waitReady()
 	return c
 }
 
 func (c *cluster) start(id int) {
 	c.t.Helper()
-	args := []string{"--id", strconv.Itoa(id), "--listen", c.addresses[id-1], "--dir", filepath.Join(c.root, fmt.Sprintf("node-%d", id)), "--cluster-id", filepath.Base(c.root), "--snapshot-every", "0"}
+	args := []string{"--id", strconv.Itoa(id), "--listen", endpointHost(c.addresses[id-1]), "--dir", filepath.Join(c.root, fmt.Sprintf("node-%d", id)), "--cluster-id", filepath.Base(c.root), "--snapshot-every", fmt.Sprint(c.snapshotEvery)}
 	args = append(args, c.args...)
-	for i, addr := range c.addresses {
+	peers := c.addresses
+	if len(c.peerAddresses) != 0 {
+		peers = c.peerAddresses
+		args = append(args, "--peer-listen", endpointHost(peers[id-1]))
+		for i, addr := range c.addresses {
+			args = append(args, "--client-peer", fmt.Sprintf("%d=%s", i+1, addr))
+		}
+	}
+	for i, addr := range peers {
 		args = append(args, "--peer", fmt.Sprintf("%d=%s", i+1, addr))
 	}
 	file, err := os.OpenFile(filepath.Join(c.root, fmt.Sprintf("node-%d.log", id)), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
@@ -123,19 +148,30 @@ func (c *cluster) stop(id int) {
 }
 
 func (c *cluster) http(id int, path string, body any) (map[string]any, error) {
+	address := c.addresses[id-1]
+	if len(c.peerAddresses) != 0 {
+		address = c.peerAddresses[id-1]
+	}
+	if !strings.Contains(address, "://") {
+		address = "http://" + address
+	}
 	var req *http.Request
 	var err error
 	if body == nil {
-		req, err = http.NewRequest("GET", "http://"+c.addresses[id-1]+path, nil)
+		req, err = http.NewRequest("GET", address+path, nil)
 	} else {
 		data, _ := json.Marshal(body)
-		req, err = http.NewRequest("POST", "http://"+c.addresses[id-1]+path, bytes.NewReader(data))
+		req, err = http.NewRequest("POST", address+path, bytes.NewReader(data))
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if err != nil {
 		return nil, err
 	}
-	resp, err := (&http.Client{Timeout: 12 * time.Second}).Do(req)
+	httpClient := c.httpClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 12 * time.Second}
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -161,6 +197,35 @@ func (c *cluster) leader() int {
 	}
 	c.t.Fatal("No leader elected")
 	return 0
+}
+
+func (c *cluster) waitReady() {
+	c.t.Helper()
+	// Initial clients can select any member. Each member must know the elected leader.
+	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); {
+		var leader, term any
+		ready, sawLeader := true, false
+		for id := range c.processes {
+			s, err := c.http(id, "/status", nil)
+			if err != nil || s["leader_id"] == float64(0) {
+				ready = false
+				break
+			}
+			if leader == nil {
+				leader, term = s["leader_id"], s["term"]
+			}
+			if s["leader_id"] != leader || s["term"] != term {
+				ready = false
+				break
+			}
+			sawLeader = sawLeader || (leader == float64(id) && s["role"] == "Leader")
+		}
+		if ready && sawLeader {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	c.t.Fatal("Initial members did not agree on a leader")
 }
 
 func client(t *testing.T, addresses []string) *clientv3.Client {
@@ -564,4 +629,15 @@ func TestPartitionReadModes(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("The healed replica did not catch up")
+}
+
+func endpointHost(address string) string {
+	if !strings.Contains(address, "://") {
+		return address
+	}
+	endpoint, err := url.Parse(address)
+	if err != nil {
+		panic(err)
+	}
+	return endpoint.Host
 }

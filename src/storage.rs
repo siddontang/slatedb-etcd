@@ -140,6 +140,19 @@ impl RaftStorage {
 
     /// Publish the replacement snapshot and truncate its covered log in one synced batch.
     pub fn checkpoint(&mut self, index: u64, data: Vec<u8>) -> Result<()> {
+        self.checkpoint_with_conf(
+            index,
+            data,
+            self.snapshot.get_metadata().get_conf_state().clone(),
+        )
+    }
+
+    pub fn checkpoint_with_conf(
+        &mut self,
+        index: u64,
+        data: Vec<u8>,
+        conf: ConfState,
+    ) -> Result<()> {
         ensure!(
             index <= self.hard_state.commit,
             "cannot snapshot uncommitted data"
@@ -148,9 +161,7 @@ impl RaftStorage {
         let mut snapshot = Snapshot::default();
         snapshot.mut_metadata().index = index;
         snapshot.mut_metadata().term = self.term(index)?;
-        snapshot
-            .mut_metadata()
-            .set_conf_state(self.snapshot.get_metadata().get_conf_state().clone());
+        snapshot.mut_metadata().set_conf_state(conf);
         snapshot.data = data.into();
         let mut batch = LogBatch::default();
         batch.put_message(GROUP, SNAPSHOT.to_vec(), &snapshot)?;

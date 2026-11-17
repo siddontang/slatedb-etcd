@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 	"testing"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -18,7 +17,12 @@ import (
 func init() {
 	testRunner = slateRunner{}
 	clusterTestCases = func() []testCase {
-		return []testCase{{name: "ThreeVoters", config: config.DefaultClusterConfig()}}
+		return []testCase{
+			{name: "ThreeVoters", config: config.DefaultClusterConfig()},
+			{name: "SingleVoter", config: config.ClusterConfig{ClusterSize: 1}},
+			{name: "PeerTLS", config: config.ClusterConfig{ClusterSize: 3, PeerTLS: config.ManualTLS}},
+			{name: "ClientTLS", config: config.ClusterConfig{ClusterSize: 1, ClientTLS: config.ManualTLS}},
+		}
 	}
 }
 
@@ -26,31 +30,22 @@ type slateRunner struct{}
 
 func (slateRunner) TestMain(m *testing.M) { os.Exit(m.Run()) }
 
-func (slateRunner) BeforeTest(t testing.TB) {
-	if os.Getenv("SLATEDB_UPSTREAM_ALL") == "1" {
-		return
-	}
-	name := strings.Split(t.Name(), "/")[0]
-	if strings.HasPrefix(name, "TestKV") || strings.HasPrefix(name, "TestTxn") ||
-		name == "TestCompact" || name == "TestWatch" || strings.HasPrefix(name, "TestLease") ||
-		strings.HasPrefix(name, "TestWaitLeader") {
-		return
-	}
-	t.Skip("unsupported capability: " + name + "; see tests/upstream/README.md")
-}
+func (slateRunner) BeforeTest(testing.TB) {}
 
 func (r slateRunner) NewCluster(_ context.Context, tb testing.TB, opts ...config.ClusterOption) intf.Cluster {
 	r.BeforeTest(tb)
 	cfg := config.NewClusterConfig(opts...)
-	if cfg.ClusterSize != 3 || cfg.PeerTLS != config.NoTLS || cfg.ClientTLS != config.NoTLS ||
-		cfg.QuotaBackendBytes != 0 || cfg.SnapshotCount != 0 {
-		if os.Getenv("SLATEDB_UPSTREAM_ALL") == "1" {
-			tb.Fatal("unsupported cluster configuration")
-		}
-		tb.Skip("unsupported cluster configuration: requires three voters without TLS or quota")
-	}
 	t := tb.(*testing.T)
-	return &slateCluster{cluster: newCluster(t)}
+	args := []string{"--quota-backend-bytes", fmt.Sprint(cfg.QuotaBackendBytes), "--strict-reconfig-check", fmt.Sprint(cfg.StrictReconfigCheck)}
+	if cfg.AuthToken != "" {
+		args = append(args, "--auth-token", cfg.AuthToken)
+	}
+	return &slateCluster{cluster: newClusterConfigured(t, cfg.ClusterSize, func(c *cluster) {
+		c.snapshotEvery = cfg.SnapshotCount
+		if cfg.PeerTLS != config.NoTLS || cfg.ClientTLS != config.NoTLS {
+			configureTLS(c, cfg.PeerTLS != config.NoTLS, cfg.ClientTLS != config.NoTLS, false)
+		}
+	}, args...)}
 }
 
 type slateCluster struct{ *cluster }
@@ -64,10 +59,14 @@ func (c *slateCluster) Close() error {
 	return nil
 }
 func (c *slateCluster) Members() []intf.Member {
-	return []intf.Member{slateMember{c, 1}, slateMember{c, 2}, slateMember{c, 3}}
+	members := make([]intf.Member, len(c.addresses))
+	for i := range members {
+		members[i] = slateMember{c, i + 1}
+	}
+	return members
 }
 func (c *slateCluster) Client(opts ...config.ClientOption) (intf.Client, error) {
-	cfg := clientv3.Config{Endpoints: c.addresses, Logger: zap.NewNop()}
+	cfg := clientv3.Config{Endpoints: c.addresses, Logger: zap.NewNop(), TLS: c.tlsClient}
 	for _, option := range opts {
 		option(&cfg)
 	}
@@ -96,6 +95,7 @@ func (m slateMember) Start(context.Context) error {
 		return fmt.Errorf("member %d is already running", m.id)
 	}
 	m.cluster.start(m.id)
+	m.cluster.leader()
 	return nil
 }
 func (m slateMember) Stop() { m.cluster.stop(m.id) }

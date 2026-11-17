@@ -18,7 +18,9 @@ use crate::{ApiError, Command, RaftCommand, Request};
 mod apply;
 mod cache;
 pub use cache::LogMemory;
+mod cluster;
 mod log;
+mod maintenance;
 mod read;
 use apply::{AppliedState, Completion, Header, Job, Output, Query, Reply, Work, Worker};
 
@@ -30,6 +32,12 @@ mod tests;
 pub type Response = oneshot::Sender<Result<Value, ApiError>>;
 
 pub enum Event {
+    Authenticated(crate::auth::Credentials, Box<Event>),
+    Auth(crate::auth::Command, Response),
+    AuthLookup(String, Response),
+    Maintenance(crate::maintenance::Command, Response),
+    Cluster(crate::cluster::Command, Response),
+    PeerAddress(u64, Response),
     Propose(Request, Response),
     EtcdPropose(RequestOp, Response),
     EtcdRead(RequestOp, Response),
@@ -69,6 +77,11 @@ pub struct NodeOptions {
     pub dir: PathBuf,
     pub snapshot_every: u64,
     pub log_memory: LogMemory,
+    pub quota_bytes: u64,
+    pub strict_reconfiguration: bool,
+    pub join: bool,
+    pub client_peers: BTreeMap<u64, String>,
+    pub transport: crate::tls::Transport,
 }
 
 struct Pending {
@@ -89,6 +102,12 @@ struct LogTask {
 }
 
 pub struct Node {
+    transfers: Vec<(u64, Instant, Response)>,
+    published_at: Option<Instant>,
+    events: mpsc::Sender<Event>,
+    manual_transport: bool,
+    peer_health: BTreeMap<u64, Instant>,
+    membership_checkpoint: u64,
     raw: RawNode<log::Cache>,
     log_worker: log::Worker,
     log_queue: VecDeque<LogTask>,
@@ -136,10 +155,7 @@ impl Node {
         events: mpsc::Sender<Event>,
         transport_override: Option<BTreeMap<u64, mpsc::Sender<Message>>>,
     ) -> Result<Self> {
-        ensure!(
-            options.peers.len() == 3,
-            "this PoC requires exactly three fixed voters"
-        );
+        ensure!(!options.peers.is_empty(), "the initial voter set is empty");
         ensure!(
             options.id != 0 && options.peers.contains_key(&options.id),
             "invalid node id"
@@ -154,16 +170,29 @@ impl Node {
             &options.dir.join("raft"),
             options.id,
             &options.cluster_id,
-            options.peers.keys().copied().collect(),
+            if options.join {
+                vec![]
+            } else {
+                options.peers.keys().copied().collect()
+            },
         )?;
         let mut state = StateMachine::open(&options.dir.join("objects")).await?;
+        state.quota = options.quota_bytes;
         ensure!(
             state.applied <= storage.commit_index(),
             "state is ahead of durable commit"
         );
         let recovered_from_index = state.applied;
         state.install_snapshot(storage.recovery_snapshot()).await?;
-        let cache = match log::Cache::load(&storage, state.applied, options.log_memory) {
+        if state.members.members.is_empty() && !options.join {
+            state.members = crate::cluster::Store::initial(&options.peers);
+            for (&id, address) in &options.client_peers {
+                if let Some(member) = state.members.members.get_mut(&id) {
+                    member.client_ur_ls = vec![crate::cluster::url(address)];
+                }
+            }
+        }
+        let mut cache = match log::Cache::load(&storage, state.applied, options.log_memory) {
             Ok(cache) => cache,
             Err(error) if error.is::<cache::PendingQuota>() => {
                 apply::recover(
@@ -180,6 +209,7 @@ impl Node {
             }
             Err(error) => return Err(error),
         };
+        cache.initial_conf = Some(state.members.conf());
         let config = Config {
             id: options.id,
             election_tick: 10,
@@ -214,6 +244,7 @@ impl Node {
                     options.cluster_id.clone(),
                     rx,
                     events.clone(),
+                    options.transport.http.clone(),
                 ));
             }
             senders
@@ -221,7 +252,13 @@ impl Node {
         let applied = AppliedState::from(&state);
         let worker = Worker::start(state, events.clone(), manual_apply);
         let log_worker = log::Worker::start(storage, manual_apply)?;
-        Ok(Self {
+        let mut node = Self {
+            transfers: vec![],
+            published_at: None,
+            events,
+            manual_transport: manual_apply,
+            peer_health: BTreeMap::new(),
+            membership_checkpoint: 0,
             raw,
             log_worker,
             log_queue: VecDeque::new(),
@@ -257,7 +294,9 @@ impl Node {
             lease_term: 0,
             lease_deadlines: BTreeMap::new(),
             lease_expiring: BTreeSet::new(),
-        })
+        };
+        node.sync_members();
+        Ok(node)
     }
 
     pub async fn run(mut self, mut events: mpsc::Receiver<Event>) -> Result<()> {
@@ -273,7 +312,7 @@ impl Node {
         loop {
             let mut step_responses = vec![];
             tokio::select! {
-                _ = ticks.tick() => { self.raw.tick(); self.retry_reads(); self.expire_leases()?; }
+                _ = ticks.tick() => { self.raw.tick(); self.retry_reads(); self.expire_leases()?; self.publish_member()?; }
                 persisted = self.log_worker.next() => { self.complete_log(persisted?)?; }
                 completed = self.worker.next() => { self.complete_apply(completed?)?; }
                 event = events.recv() => {
@@ -290,6 +329,7 @@ impl Node {
             self.drive_ready().await?;
             self.sync_lease_deadlines();
             self.expire_pending();
+            self.finish_transfers()?;
             let role = (
                 self.raw.raft.state,
                 self.raw.raft.term,
@@ -337,7 +377,68 @@ impl Node {
     }
 
     async fn handle(&mut self, event: Event, step_responses: &mut Vec<Response>) -> Result<()> {
+        let (credentials, event) = match event {
+            Event::Authenticated(credentials, event) => (Some(credentials), *event),
+            event => (None, event),
+        };
         match event {
+            Event::Authenticated(..) => anyhow::bail!("nested authentication context"),
+            Event::Auth(auth, response) => self.propose(
+                RaftCommand::Auth {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    auth,
+                    credentials: credentials.unwrap_or_default(),
+                },
+                response,
+            )?,
+            Event::Cluster(request, response) => {
+                self.cluster_request(request, credentials.unwrap_or_default(), response)?
+            }
+            Event::PeerAddress(id, response) => {
+                let address = self.options.peers.get(&id).cloned();
+                let _ = response.send(Ok(json!(address)));
+            }
+            Event::Maintenance(request, response) => {
+                use crate::maintenance::Command as M;
+                match request {
+                    M::MoveLeader(target) => {
+                        self.move_leader(target, credentials.unwrap_or_default(), response)?
+                    }
+                    M::Alarm(_) | M::Downgrade(_) => self.propose(
+                        RaftCommand::Maintenance {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            request,
+                            credentials: credentials.unwrap_or_default(),
+                        },
+                        response,
+                    )?,
+                    _ => {
+                        let status = crate::proto::etcdserverpb::StatusResponse {
+                            is_learner: self
+                                .state
+                                .members
+                                .members
+                                .get(&self.options.id)
+                                .is_some_and(|member| member.is_learner),
+                            leader: self.raw.raft.leader_id,
+                            raft_index: self.raw.store().commit_index(),
+                            raft_term: self.raw.raft.term,
+                            version: "3.6.5".into(),
+                            storage_version: "3.6.0".into(),
+                            ..Default::default()
+                        };
+                        self.enqueue_query(Query::Maintenance(
+                            request,
+                            credentials.unwrap_or_default(),
+                            Box::new(status),
+                            response,
+                        ));
+                    }
+                }
+            }
+            Event::AuthLookup(name, response) => {
+                self.enqueue_query(Query::AuthLookup(name, response))
+            }
             Event::Propose(request, response) => {
                 self.propose(
                     RaftCommand::Legacy(Command {
@@ -350,22 +451,27 @@ impl Node {
             Event::EtcdPropose(etcd, response) => {
                 self.propose(
                     RaftCommand::Etcd {
+                        origin: self.options.id,
                         id: uuid::Uuid::new_v4().to_string(),
                         etcd,
-                    },
+                    }
+                    .secure(credentials),
                     response,
                 )?;
             }
-            Event::LinearRead(request, response) => self.linear_read(request, response),
+            Event::LinearRead(request, response) => {
+                self.linear_read_auth(request, credentials, response)
+            }
             Event::EtcdRead(request, response) => {
-                self.enqueue_query(Query::Read(request, response));
+                self.enqueue_query(Query::Read(request, credentials, response));
             }
             Event::EtcdCompact(compact, response) => {
                 self.propose(
                     RaftCommand::Compact {
                         id: uuid::Uuid::new_v4().to_string(),
                         compact,
-                    },
+                    }
+                    .secure(credentials),
                     response,
                 )?;
             }
@@ -379,9 +485,11 @@ impl Node {
                 }
                 self.propose(
                     RaftCommand::Lease {
+                        origin: self.options.id,
                         id: uuid::Uuid::new_v4().to_string(),
                         lease,
-                    },
+                    }
+                    .secure(credentials),
                     response,
                 )?;
             }
@@ -389,11 +497,33 @@ impl Node {
                 if require_leader && self.raw.raft.leader_id == 0 {
                     let _ = response.send(Err(self.error("no leader")));
                 } else {
-                    self.enqueue_query(Query::Watch(request, require_leader, through, response));
+                    self.enqueue_query(Query::Watch(
+                        request,
+                        require_leader,
+                        through,
+                        credentials,
+                        response,
+                    ));
                 }
             }
             Event::Step(message, response) => {
-                if message.to != self.options.id
+                if self.options.join
+                    && self.state.applied == 0
+                    && self.raw.store().snapshot_index() == 0
+                    && message.get_msg_type() == MessageType::MsgAppend
+                {
+                    self.send(vec![Message {
+                        msg_type: MessageType::MsgAppendResponse,
+                        to: message.from,
+                        from: self.options.id,
+                        term: message.term,
+                        index: message.index,
+                        reject: true,
+                        reject_hint: 0,
+                        ..Default::default()
+                    }]);
+                    let _ = response.send(Ok(json!({"accepted": false})));
+                } else if message.to != self.options.id
                     || message.from == self.options.id
                     || !self.options.peers.contains_key(&message.from)
                     || self.blocked.contains(&message.from)
@@ -464,6 +594,11 @@ impl Node {
                 snapshot,
                 success,
             } => {
+                if success {
+                    self.peer_health.entry(peer).or_insert_with(Instant::now);
+                } else {
+                    self.peer_health.remove(&peer);
+                }
                 if snapshot {
                     self.raw.report_snapshot(
                         peer,
@@ -487,7 +622,12 @@ impl Node {
         if self.log_queue.len() < log::MAX_JOBS && self.log_bytes < log::MAX_BYTES {
             if let Some((index, data)) = self.built_checkpoint.take() {
                 self.queue_log(
-                    log::Job::Checkpoint { index, data },
+                    log::Job::Checkpoint {
+                        index,
+                        conf: StateMachine::snapshot_conf(&data)?
+                            .unwrap_or_else(|| self.state.members.conf()),
+                        data,
+                    },
                     None,
                     Some(index),
                     vec![],
@@ -661,10 +801,12 @@ impl Node {
                 snapshot_index,
             );
         }
-        let checkpoint_due = self
-            .checkpoint_waiters
-            .iter()
-            .any(|(index, _)| *index <= self.state.applied)
+        let checkpoint_due = (self.membership_checkpoint > snapshot_index
+            && self.state.applied >= self.membership_checkpoint)
+            || self
+                .checkpoint_waiters
+                .iter()
+                .any(|(index, _)| *index <= self.state.applied)
             || (self.options.snapshot_every > 0
                 && self.state.applied.saturating_sub(snapshot_index)
                     >= self.options.snapshot_every);
@@ -721,14 +863,17 @@ impl Node {
         self.state = completed.state;
         self.state.durable_applied = durable;
         self.apply_busy = false;
-        self.raw.advance_apply_to(self.state.applied);
-        self.raw.mut_store().applied_to(self.state.applied);
+
         self.sync_lease_deadlines();
         self.expire_pending();
         self.expire_reads();
         match completed.output {
             Output::Entries(replies) => {
                 for command in replies {
+                    if let Some(change) = &command.change {
+                        self.raw.apply_conf_change(change)?;
+                        self.membership_checkpoint = self.state.applied;
+                    }
                     if let Some(LeaseCommand::Expire { id, generation }) = command.lease {
                         self.lease_expiring.remove(&(id, generation));
                     }
@@ -758,7 +903,10 @@ impl Node {
                     }
                 }
             }
-            Output::Snapshot => self.installed_snapshots += 1,
+            Output::Snapshot => {
+                self.installed_snapshots += 1;
+                self.options.join = false;
+            }
             Output::Query {
                 response,
                 value,
@@ -774,6 +922,9 @@ impl Node {
             Output::Linear { id, value } => self.finish_read(id, value),
             Output::Checkpoint => {}
         }
+        self.raw.advance_apply_to(self.state.applied);
+        self.raw.mut_store().applied_to(self.state.applied);
+        self.sync_members();
         Ok(())
     }
 
@@ -831,6 +982,7 @@ impl Node {
                 continue;
             }
             let command = RaftCommand::Lease {
+                origin: self.options.id,
                 id: uuid::Uuid::new_v4().to_string(),
                 lease: LeaseCommand::Expire { id, generation },
             };
@@ -877,7 +1029,23 @@ impl Node {
                 let _ = response.send(Err(self.error("pending log memory quota is full")));
                 return Ok(());
             }
-            match self.raw.propose(vec![], data) {
+            let proposed = if let RaftCommand::Cluster { request, .. } = &command {
+                if matches!(
+                    request,
+                    crate::cluster::Command::List(_)
+                        | crate::cluster::Command::Update(_)
+                        | crate::cluster::Command::Publish { .. }
+                ) {
+                    self.raw.propose(vec![], data)
+                } else {
+                    let mut change = request.change();
+                    change.context = data.into();
+                    self.raw.propose_conf_change(vec![], change)
+                }
+            } else {
+                self.raw.propose(vec![], data)
+            };
+            match proposed {
                 Ok(()) => {
                     self.pending.insert(
                         command.id().to_owned(),
@@ -1026,13 +1194,13 @@ async fn transport(
     cluster_id: String,
     mut messages: mpsc::Receiver<Message>,
     events: mpsc::Sender<Event>,
+    client: reqwest::Client,
 ) {
-    let client = reqwest::Client::new();
     while let Some(message) = messages.recv().await {
         let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
         let result: Result<()> = async {
             let response = client
-                .post(format!("http://{address}/raft"))
+                .post(format!("{}/raft", crate::cluster::url(&address)))
                 .header("x-cluster-id", &cluster_id)
                 .timeout(if snapshot {
                     Duration::from_secs(30)
@@ -1051,7 +1219,7 @@ async fn transport(
             Ok(())
         }
         .await;
-        if snapshot || result.is_err() {
+        {
             let _ = events
                 .send(Event::NetworkResult {
                     peer,

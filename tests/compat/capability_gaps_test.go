@@ -7,39 +7,91 @@ import (
 
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
-// These controls assert known differences. They do not establish compatibility.
-func TestCapabilityDifferences(t *testing.T) {
+func TestAdminCompatibility(t *testing.T) {
 	c := newCluster(t)
 	actual, expected := client(t, c.addresses), reference(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	probes := []struct {
-		name string
-		run  func(*clientv3.Client) error
-	}{
-		{"auth", func(api *clientv3.Client) error { _, err := api.AuthStatus(ctx); return err }},
-		{"members", func(api *clientv3.Client) error { _, err := api.MemberList(ctx); return err }},
-		{"status", func(api *clientv3.Client) error {
-			_, err := api.Status(ctx, api.Endpoints()[0])
-			return err
-		}},
-		{"physical-compact", func(api *clientv3.Client) error {
-			result, err := api.Put(ctx, "/capability/compact", "value")
-			if err != nil {
-				return err
-			}
-			_, err = api.Compact(ctx, result.Header.Revision, clientv3.WithCompactPhysical())
-			return err
-		}},
+	a, err := actual.AuthStatus(ctx)
+	require.NoError(t, err)
+	b, err := expected.AuthStatus(ctx)
+	require.NoError(t, err)
+	require.Equal(t, b.Enabled, a.Enabled)
+	require.Equal(t, b.AuthRevision, a.AuthRevision)
+	members, err := actual.MemberList(ctx)
+	require.NoError(t, err)
+	require.Len(t, members.Members, 3)
+	for i, endpoint := range c.addresses {
+		local := client(t, []string{endpoint})
+		auth, err := local.AuthStatus(ctx)
+		require.NoError(t, err)
+		require.Equal(t, uint64(i+1), auth.Header.MemberId)
+		members, err := local.MemberList(ctx)
+		require.NoError(t, err)
+		require.Equal(t, uint64(i+1), members.Header.MemberId)
+		s, err := actual.Status(ctx, endpoint)
+		require.NoError(t, err)
+		require.Equal(t, uint64(i+1), s.Header.MemberId)
+		require.NotZero(t, s.Leader)
+		require.GreaterOrEqual(t, s.RaftIndex, s.RaftAppliedIndex)
 	}
-	for _, probe := range probes {
-		t.Run(probe.name, func(t *testing.T) {
-			require.NoError(t, probe.run(expected), "reference etcd must support this operation")
-			require.Equal(t, codes.Unimplemented, status.Code(probe.run(actual)))
-		})
+	for _, api := range []*clientv3.Client{actual, expected} {
+		result, err := api.Put(ctx, "/capability/compact", "old")
+		require.NoError(t, err)
+		_, err = api.Put(ctx, "/capability/compact", "new")
+		require.NoError(t, err)
+		_, err = api.Compact(ctx, result.Header.Revision+1, clientv3.WithCompactPhysical())
+		require.NoError(t, err)
+	}
+	_, ae := actual.Get(ctx, "/capability/compact", clientv3.WithRev(2))
+	_, be := expected.Get(ctx, "/capability/compact", clientv3.WithRev(2))
+	require.Error(t, ae)
+	require.Equal(t, status.Code(be), status.Code(ae))
+}
+
+func TestDifferentialHashKV(t *testing.T) {
+	c := newCluster(t)
+	actual, expected := client(t, c.addresses), reference(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	check := func(revision int64) {
+		t.Helper()
+		a, ae := actual.HashKV(ctx, actual.Endpoints()[0], revision)
+		b, be := expected.HashKV(ctx, expected.Endpoints()[0], revision)
+		require.Equal(t, status.Code(be), status.Code(ae))
+		if ae == nil {
+			require.Equal(t, b.Hash, a.Hash, "revision %d", revision)
+			require.Equal(t, b.CompactRevision, a.CompactRevision)
+			require.Equal(t, b.HashRevision, a.HashRevision)
+		}
+	}
+	check(0)
+	ops := []clientv3.Op{
+		clientv3.OpPut("a", "one"), clientv3.OpPut("b", "two"),
+		clientv3.OpPut("a", "three"), clientv3.OpDelete("b"),
+		clientv3.OpTxn(nil, []clientv3.Op{clientv3.OpPut("c", "c"), clientv3.OpPut("d", "d")}, nil),
+		clientv3.OpDelete("c", clientv3.WithRange("e")), clientv3.OpPut("b", "again"),
+	}
+	for _, op := range ops {
+		_, err := actual.Do(ctx, op)
+		require.NoError(t, err)
+		_, err = expected.Do(ctx, op)
+		require.NoError(t, err)
+		check(0)
+	}
+	for revision := int64(2); revision <= 8; revision++ {
+		check(revision)
+	}
+	for _, revision := range []int64{4, 5, 7, 8} {
+		for _, api := range []*clientv3.Client{actual, expected} {
+			_, err := api.Compact(ctx, revision, clientv3.WithCompactPhysical())
+			require.NoError(t, err)
+		}
+		check(0)
+		check(revision)
+		check(revision - 1)
 	}
 }

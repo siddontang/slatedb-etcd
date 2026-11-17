@@ -123,6 +123,7 @@ pub(super) struct Cache {
     history: RefCell<History>,
     limits: LogMemory,
     snapshot: Snapshot,
+    pub initial_conf: Option<raft::eraftpb::ConfState>,
     hard_state: HardState,
     pub durable: log::Durable,
 }
@@ -141,6 +142,7 @@ impl Cache {
             history: RefCell::new(History::default()),
             limits,
             snapshot: durable.snapshot.clone(),
+            initial_conf: None,
             hard_state: durable.hard_state.clone(),
             durable,
         };
@@ -391,7 +393,10 @@ impl Storage for Cache {
     fn initial_state(&self) -> raft::Result<RaftState> {
         Ok(RaftState {
             hard_state: self.hard_state.clone(),
-            conf_state: self.snapshot.get_metadata().get_conf_state().clone(),
+            conf_state: self
+                .initial_conf
+                .clone()
+                .unwrap_or_else(|| self.snapshot.get_metadata().get_conf_state().clone()),
         })
     }
     fn entries(
@@ -687,6 +692,11 @@ mod tests {
         let (peer, mut replies) = mpsc::channel(8);
         let mut node = Node::open_with_transport(
             NodeOptions {
+                client_peers: BTreeMap::new(),
+                transport: crate::tls::Transport::default(),
+                quota_bytes: 0,
+                strict_reconfiguration: false,
+                join: false,
                 id: 1,
                 cluster_id: "quota".into(),
                 dir: dir.path().to_owned(),

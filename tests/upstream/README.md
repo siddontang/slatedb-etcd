@@ -28,28 +28,36 @@ Copying these files would still test etcd internals. Their source remains availa
 The integration and e2e suites also depend on etcd flags, process controls, and maintenance RPCs.
 The portable common suite uses this service through an adapter instead.
 
-The importer keeps upstream test bodies and license notices. It changes only the package and tag.
-It extracts the upstream client adapter and adds a guard for physical compaction.
+The importer keeps upstream license notices and changes the package and build tag.
+It extracts the upstream client adapter without capability guards.
+It applies [maintenance-auth.patch](maintenance-auth.patch) to three incomplete upstream helpers.
+Those helpers test Snapshot, MoveLeader, and authorization before the native Downgrade format error.
 [LICENSE.etcd](LICENSE.etcd) contains the upstream Apache 2.0 license.
 
 ## Capabilities
 
-The supported profile runs KV, Txn, logical Compact, Watch, Lease, and leader failure tests on three
-voters.
-It skips unsupported tests with reasons. Reports retain all skip records.
-Parent tests can pass while their children skip. Use `leaf_counts` for coverage counts.
-`passed` means the selected profile passed. `complete` also requires zero skips.
+The adapter runs all imported capability tests. It covers single-voter and three-voter clusters,
+client TLS, and peer TLS. TLS fixtures use fresh certificates and independent client and peer CAs.
+Automatic certificate generation and mixed etcd binary versions are not implemented.
 
-The complete common suite is available with `--all-capabilities`.
-This mode disables capability skips. It must fail until the missing features exist.
+Reports retain all skip records. Parent tests can pass while their children skip.
+Use `leaf_counts` for case counts and `passed` for the complete process outcome.
+`complete` also requires zero skips. The `--all-capabilities` flag remains for command
+compatibility.
 
-| Missing capability | Imported tests remain available |
+| Capability | Coverage |
 | --- | --- |
-| Auth | Users, roles, permissions, cache changes, and authenticated transactions |
-| Cluster | Membership changes and member listing |
-| Maintenance | Status, hash, snapshot RPC, defrag, alarms, and leader transfer |
-| Deployment | TLS, quota, variable voter counts, and rolling version changes |
-| Physical Compact | Waiting for physical storage reclamation |
+| Auth | Users, roles, permissions, tokens, recovery, and authenticated transactions |
+| Cluster | Add, remove, update, learner promotion, leadership transfer, and recovery |
+| Maintenance | Status, HashKV, native snapshot export and restore, defrag, and alarms |
+| Deployment | Client TLS, peer TLS, certificate rejection, quota, and variable voter counts |
+| Physical Compact | Flush completion, boundary reads, restart, and snapshot recovery |
+
+Snapshot files use the native SlateDB state format, not bbolt.
+The Downgrade RPC returns Unimplemented after permission checks. Its adapted test asserts that
+limit.
+The deprecated Hash RPC has native backend semantics. HashKV has differential etcd coverage.
+These tests do not establish complete etcd compatibility or rolling binary upgrades.
 
 ## Fault and regression map
 
@@ -69,10 +77,11 @@ This mode disables capability skips. It must fail until the missing features exi
 | Lease renewal versus stale expiry | State snapshot test and seeded Raft schedules |
 | Lease quorum and leader failure | Renewal rejection, streamed renewal, and expiry tests |
 | Watch issues 15271, 17247, 17529, 18089, 19179 | Exact upstream issue schedules remain unported |
-| Defrag issues 14370 and 14685 | Blocked by the missing defrag API and different storage engine |
+| Defrag issues 14370 and 14685 | API tests pass; exact bbolt failure schedules remain unported |
 | etcd gofail hooks around bbolt and WAL | Require equivalent Rust storage hooks; not yet ported |
 | Disk exhaustion, corruption, and lost unsynced writes | Not yet covered by process SIGKILL |
-| Clock jumps and membership replacement | Not yet covered by the current service |
+| Membership replacement | Learner join, promotion, leader transfer, removal, and restart tests |
+| Clock jumps | Not yet covered by the current service |
 
 Peer partitions use the service's bidirectional message-drop endpoint.
 They do not emulate kernel routing, packet latency, bandwidth limits, or cross-host outages.

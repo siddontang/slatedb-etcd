@@ -38,17 +38,11 @@ def main():
     license_header = text[:text.index("package integration")]
     client = text[text.index("type integrationClient struct"):]
     client = client.replace("*clientv3.Client\n}", "*clientv3.Client\n\ttb testing.TB\n}", 1)
-    marker = "func (c integrationClient) Compact(ctx context.Context, rev int64, o config.CompactOption) (*clientv3.CompactResponse, error) {"
-    client = client.replace(marker, marker + '''
-    if o.Physical && os.Getenv("SLATEDB_UPSTREAM_ALL") != "1" {
-        c.tb.Skip("unsupported capability: physical compaction")
-    }''')
     imports = '''package compat
 
 import (
     "context"
     "fmt"
-    "os"
     "strings"
     "testing"
     healthpb "google.golang.org/grpc/health/grpc_health_v1"
@@ -60,6 +54,9 @@ import (
 '''
     (target / "upstream_client_test.go").write_text(
         "//go:build upstream\n\n" + license_header + imports + client)
+    subprocess.run(["git", "apply", "--unidiff-zero",
+                    str(ROOT / "tests/upstream/maintenance-auth.patch")],
+                   cwd=ROOT, check=True)
     copied.append({"source": str(path.relative_to(source)), "target": "upstream_client_test.go",
                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
     tests = []

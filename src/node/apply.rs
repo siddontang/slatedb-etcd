@@ -12,6 +12,8 @@ pub(super) struct AppliedState {
     pub durable_applied: u64,
     pub revision: i64,
     pub compact_revision: i64,
+    pub members: crate::cluster::Store,
+    pub auth: crate::auth::Store,
     pub leases: BTreeMap<i64, crate::lease::LeaseRecord>,
 }
 
@@ -23,6 +25,8 @@ impl From<&StateMachine> for AppliedState {
             revision: state.revision,
             compact_revision: state.compact_revision,
             leases: state.leases.clone(),
+            members: state.members.clone(),
+            auth: state.auth.clone(),
         }
     }
 }
@@ -51,12 +55,20 @@ impl Header {
 }
 
 pub(super) enum Query {
-    Read(RequestOp, Response),
-    Linear(RequestOp, Vec<u8>),
+    AuthLookup(String, Response),
+    Maintenance(
+        crate::maintenance::Command,
+        crate::auth::Credentials,
+        Box<crate::proto::etcdserverpb::StatusResponse>,
+        Response,
+    ),
+    Read(RequestOp, Option<crate::auth::Credentials>, Response),
+    Linear(RequestOp, Option<crate::auth::Credentials>, Vec<u8>),
     Watch(
         crate::proto::etcdserverpb::WatchCreateRequest,
         bool,
         Option<i64>,
+        Option<crate::auth::Credentials>,
         Response,
     ),
     Local(String, Response),
@@ -66,9 +78,11 @@ impl Query {
     pub fn reject(self, error: ApiError) {
         let response = match self {
             Self::Linear(..) => unreachable!("linear reads wait for queue capacity"),
-            Self::Read(_, response) | Self::Watch(_, _, _, response) | Self::Local(_, response) => {
-                response
-            }
+            Self::Maintenance(_, _, _, response)
+            | Self::AuthLookup(_, response)
+            | Self::Read(_, _, response)
+            | Self::Watch(_, _, _, _, response)
+            | Self::Local(_, response) => response,
         };
         let _ = response.send(Err(error));
     }
@@ -96,6 +110,7 @@ pub(super) enum Reply {
 
 pub(super) struct AppliedCommand {
     pub id: String,
+    pub change: Option<raft::eraftpb::ConfChange>,
     pub lease: Option<LeaseCommand>,
     pub reply: Reply,
 }
@@ -150,16 +165,39 @@ impl Executor {
                 Output::Snapshot
             }
             Job::Query(query) => match query {
-                Query::Linear(request, id) => {
-                    let mut outcome = self.state.read_etcd(&request).await?;
+                Query::Maintenance(command, credentials, status, response) => {
+                    let mut outcome = self
+                        .state
+                        .maintenance(&command, &credentials, *status)
+                        .await?;
+                    fill_value_header(work.header, &mut outcome)?;
+                    Output::Query {
+                        response,
+                        value: serde_json::to_value(outcome)?,
+                        require_leader: false,
+                    }
+                }
+                Query::AuthLookup(name, response) => Output::Query {
+                    response,
+                    value: serde_json::to_value(self.state.auth.users.get(&name))?,
+                    require_leader: false,
+                },
+                Query::Linear(request, credentials, id) => {
+                    let mut outcome = self
+                        .state
+                        .read_etcd_authorized(&request, credentials.as_ref())
+                        .await?;
                     work.header.outcome(&mut outcome);
                     Output::Linear {
                         id,
                         value: serde_json::to_value(outcome)?,
                     }
                 }
-                Query::Read(request, response) => {
-                    let mut outcome = self.state.read_etcd(&request).await?;
+                Query::Read(request, credentials, response) => {
+                    let mut outcome = self
+                        .state
+                        .read_etcd_authorized(&request, credentials.as_ref())
+                        .await?;
                     work.header.outcome(&mut outcome);
                     Output::Query {
                         response,
@@ -167,15 +205,37 @@ impl Executor {
                         require_leader: false,
                     }
                 }
-                Query::Watch(request, require_leader, through, response) => {
-                    let mut page = self.state.watch(&request, through).await?;
+                Query::Watch(request, require_leader, through, credentials, response) => {
+                    let permission = credentials.as_ref().map_or(Ok(()), |auth| {
+                        if request.key.is_empty() {
+                            self.state.auth.authenticated(auth)
+                        } else {
+                            self.state
+                                .auth
+                                .range(auth, &request.key, &request.range_end, false)
+                        }
+                    });
+                    let mut page = if let Err(error) = permission {
+                        return Ok(Completion {
+                            state: AppliedState::from(&self.state),
+                            output: Output::Query {
+                                response,
+                                require_leader,
+                                value: serde_json::to_value(Outcome::<Value> {
+                                    result: Err(error),
+                                })?,
+                            },
+                        });
+                    } else {
+                        self.state.watch(&request, through).await?
+                    };
                     work.header.fill(page.header.as_mut());
                     for response in &mut page.responses {
                         work.header.fill(response.header.as_mut());
                     }
                     Output::Query {
                         response,
-                        value: serde_json::to_value(page)?,
+                        value: serde_json::to_value(Outcome { result: Ok(page) })?,
                         require_leader,
                     }
                 }
@@ -308,28 +368,98 @@ async fn apply_entries(
             entry.index == state.applied + 1,
             "apply batch has an index gap"
         );
-        ensure!(
-            entry.get_entry_type() == EntryType::EntryNormal,
-            "membership changes are not supported"
-        );
         if entry.data.is_empty() {
             state.apply(entry.index, None).await?;
             continue;
         }
-        let command: RaftCommand = serde_json::from_slice(&entry.data)?;
+        let change = match entry.get_entry_type() {
+            EntryType::EntryNormal => None,
+            EntryType::EntryConfChange => {
+                Some(raft::eraftpb::ConfChange::parse_from_bytes(&entry.data)?)
+            }
+            EntryType::EntryConfChangeV2 => anyhow::bail!("unsupported joint configuration entry"),
+        };
+        let command: RaftCommand = serde_json::from_slice(
+            change
+                .as_ref()
+                .map_or(entry.data.as_ref(), |change| change.context.as_ref()),
+        )?;
+        let id = command.id().to_owned();
+        let command = if let RaftCommand::Secured {
+            credentials,
+            command,
+            ..
+        } = &command
+        {
+            if let Err(error) = state.authorize(credentials, command).await {
+                state.apply(entry.index, None).await?;
+                replies.push(AppliedCommand {
+                    id,
+                    change: None,
+                    lease: None,
+                    reply: Reply::Encoded(serde_json::to_value(Outcome::<Value> {
+                        result: Err(error),
+                    })?),
+                });
+                continue;
+            }
+            command.as_ref()
+        } else {
+            &command
+        };
         let mut lease_command = None;
-        let reply = match &command {
+        let mut change = change;
+        let reply = match command {
+            RaftCommand::Secured { .. } => anyhow::bail!("nested secured command"),
+            RaftCommand::Cluster {
+                request,
+                credentials,
+                ..
+            } => {
+                let mut outcome = state
+                    .apply_cluster(entry.index, request, credentials)
+                    .await?;
+                if outcome.result.is_err() {
+                    if let Some(change) = &mut change {
+                        change.node_id = 0;
+                    }
+                }
+                fill_value_header(header, &mut outcome)?;
+                Reply::Encoded(serde_json::to_value(outcome)?)
+            }
+            RaftCommand::Maintenance {
+                request,
+                credentials,
+                ..
+            } => {
+                let mut outcome = state
+                    .apply_maintenance(entry.index, request, credentials)
+                    .await?;
+                fill_value_header(header, &mut outcome)?;
+                Reply::Encoded(serde_json::to_value(outcome)?)
+            }
+            RaftCommand::Auth {
+                auth, credentials, ..
+            } => {
+                let mut outcome = state.apply_auth(entry.index, credentials, auth).await?;
+                if let Ok(value) = &mut outcome.result {
+                    let mut h: ResponseHeader = serde_json::from_value(value["header"].clone())?;
+                    header.fill(Some(&mut h));
+                    value["header"] = serde_json::to_value(h)?;
+                }
+                Reply::Encoded(serde_json::to_value(outcome)?)
+            }
             RaftCommand::Legacy(c) => Reply::Encoded(serde_json::to_value(
                 state.apply(entry.index, Some(c)).await?,
             )?),
-            RaftCommand::Etcd { etcd, .. } => {
-                let mut outcome = state.apply_etcd(entry.index, etcd).await?;
+            RaftCommand::Etcd { etcd, origin, .. } => {
+                let mut outcome = state.apply_etcd_quota(entry.index, etcd, *origin).await?;
                 header.outcome(&mut outcome);
                 Reply::Encoded(serde_json::to_value(outcome)?)
             }
-            RaftCommand::Lease { lease, .. } => {
+            RaftCommand::Lease { lease, origin, .. } => {
                 lease_command = Some(lease.clone());
-                Reply::Lease(state.apply_lease(entry.index, lease).await?)
+                Reply::Lease(state.apply_lease_from(entry.index, lease, *origin).await?)
             }
             RaftCommand::Compact { compact, .. } => {
                 let mut outcome = state.apply_compaction(entry.index, compact).await?;
@@ -341,6 +471,7 @@ async fn apply_entries(
         };
         replies.push(AppliedCommand {
             id: command.id().to_owned(),
+            change,
             lease: lease_command,
             reply,
         });
@@ -364,6 +495,15 @@ pub(super) async fn recover(
         )?;
         ensure!(!entries.is_empty(), "empty recovery batch");
         apply_entries(state, entries, header).await?;
+    }
+    Ok(())
+}
+
+fn fill_value_header(header: Header, outcome: &mut Outcome<Value>) -> Result<()> {
+    if let Ok(value) = &mut outcome.result {
+        let mut h: ResponseHeader = serde_json::from_value(value["header"].clone())?;
+        header.fill(Some(&mut h));
+        value["header"] = serde_json::to_value(h)?;
     }
     Ok(())
 }

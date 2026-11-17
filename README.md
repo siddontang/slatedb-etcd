@@ -1,12 +1,14 @@
 # SlateDB etcd service
 
-This service runs one Raft group with three fixed voters. Each process uses `raft-rs` for consensus,
+This service runs one Raft group with a configurable voter set and one optional learner. Each
+process uses `raft-rs` for consensus,
 `raft-engine` for durable logs, and SlateDB for its state machine. SlateDB's native WAL is disabled.
 
-The service exposes the etcd v3 gRPC KV, Watch, and Lease APIs. It supports binary keys, values, and
+The service exposes etcd v3 gRPC data, authentication, cluster, and maintenance APIs. It supports
+binary keys, values, and
 MVCC history.
 The original JSON API remains available in a separate diagnostic keyspace.
-All endpoints bind to loopback. There is no authentication or dynamic membership.
+All endpoints bind to loopback. Authentication, TLS, and dynamic membership are available.
 
 See the [architecture and roadmap](docs/architecture.md) for design rules and implementation phases.
 See [compatibility results](COMPATIBILITY.md) for the etcd checks.
@@ -16,7 +18,8 @@ The [original PoC results](RESULTS.md) describe measurements before this reposit
 
 ## etcd v3 APIs
 
-The same port serves HTTP diagnostics and plaintext gRPC. No separate client port is required.
+The default local mode shares HTTP diagnostics and plaintext gRPC on one port.
+TLS uses separate client and peer listeners. See [administration](docs/administration.md).
 Any replica accepts client requests. Followers forward writes to the leader.
 Serializable Range requests read local applied state. Linearizable reads use Safe ReadIndex.
 The receiving member waits for local apply and executes the read.
@@ -47,8 +50,12 @@ etcdctl --endpoints=http://127.0.0.1:7003 del hello --prev-kv
 ```
 
 The official Go client integration tests also exercise Txn and historical reads.
-Auth, Cluster, and Maintenance are not implemented.
-Compact supports the default `physical=false` option. `physical=true` returns Unimplemented.
+Auth stores users, roles, range permissions, and tokens through Raft.
+Cluster supports member listing, add, update, remove, learner promotion, and leader transfer.
+Maintenance supports status, health, hashes, alarms, native snapshots, and SlateDB defragmentation.
+Physical Compact waits for the local state deletion batch to flush.
+Native snapshots and the deprecated backend Hash use the SlateDB format.
+HashKV has differential etcd coverage. Binary downgrade remains unsupported.
 A Put with an unknown lease returns the standard lease-not-found error.
 This service is not yet a complete etcd replacement or a supported Kubernetes backend.
 
@@ -92,8 +99,9 @@ Rust tests also cover persistent terms, votes, conflicting log suffixes, node id
 recovery when a snapshot was saved before the state machine could install it.
 They also check that a background snapshot excludes writes after its pinned apply position.
 
-The imported etcd common suite runs through a real cluster adapter. Unsupported capabilities produce
-explicit skips. Process fault histories use the original etcd model, plus Jepsen and Elle checks.
+The imported etcd common suite runs through a real cluster adapter without capability skips.
+Its Downgrade helper checks authorization and the explicit native-format limit.
+Process fault histories use the original etcd model, plus Jepsen and Elle checks.
 The DST harness drives real node storage through seeded message delivery and logical Raft ticks.
 It repeats each schedule and compares traces. It does not simulate the operating system or disk.
 
@@ -181,7 +189,8 @@ For a checkpoint, the node:
 3. Saves the snapshot and log truncation command in one synchronous raft-engine batch.
 4. Calls raft-engine's purge routine to reclaim obsolete files.
 
-The saved snapshot retains the boundary term and fixed voter configuration. On snapshot receipt,
+The saved snapshot retains the boundary term and membership at the same applied index. On snapshot
+receipt,
 the node atomically replaces its persistent Raft state before changing SlateDB. A crash in between
 is safe: startup can repeat the state replacement from the durable snapshot payload.
 
@@ -279,9 +288,9 @@ Raft log GC remains separate from MVCC compaction.
 
 Compaction scans all history and builds one deletion batch on the apply worker.
 Large histories can delay state reads and write completion. Raft keeps processing ticks and peers.
-SlateDB reclaims old SST data in the background; pinned snapshots can
-retain older data. The service rejects `physical=true` because it cannot yet wait for that
-reclamation.
+Physical Compact waits for the deletion batch to flush before it returns.
+Defragment rewrites the current SST set and waits for manifest publication.
+SlateDB garbage collection reclaims obsolete objects later. Pinned checkpoints can retain them.
 Do not downgrade to an older binary after compaction; older binaries do not enforce its boundary.
 
 The diagnostic JSON keyspace is separate from the etcd keyspace and does not affect etcd revisions.
@@ -349,7 +358,7 @@ for accounting and recovery rules.
 
 1. Bound compaction work and range scans, and use checkpoint references for large snapshots.
 2. Add lease TTL checkpoints and a key index for leases. Bound Watch catch-up work.
-3. Add membership changes, TLS, authentication, backend quotas, and maintenance APIs.
+3. Add certificate reload, streamed snapshots, and bounded administration scans.
 4. Add remote object storage, cross-host tests, and operational metrics.
 
 Test object-store outages, slow disks, interrupted snapshot installation, and cross-host failover

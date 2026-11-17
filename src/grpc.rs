@@ -3,10 +3,14 @@ use std::time::Duration;
 
 use prost::Message;
 use tokio::sync::{mpsc, oneshot};
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
+mod auth;
+mod cluster;
+mod health;
 mod lease;
+mod maintenance;
 mod watch;
 
 use crate::mvcc::{self, Outcome};
@@ -20,30 +24,53 @@ use crate::proto::etcdserverpb::*;
 #[derive(Clone)]
 pub struct Service {
     events: mpsc::Sender<Event>,
-    peers: BTreeMap<u64, Channel>,
+    peers: std::sync::Arc<std::sync::Mutex<BTreeMap<u64, (String, Channel)>>>,
     member: u64,
+    tokens: crate::auth::TokenIssuer,
+    transport: crate::tls::Transport,
 }
 
 pub fn service(
     member: u64,
     events: mpsc::Sender<Event>,
     peers: &BTreeMap<u64, String>,
-) -> axum::Router {
+    tokens: crate::auth::TokenIssuer,
+    transport: crate::tls::Transport,
+) -> anyhow::Result<axum::Router> {
     let peers = peers
         .iter()
         .map(|(&id, address)| {
-            let endpoint = Endpoint::from_shared(format!("http://{address}"))
-                .expect("validated peer address")
-                .timeout(Duration::from_secs(10));
-            (id, endpoint.connect_lazy())
+            Ok((
+                id,
+                (crate::cluster::url(address), transport.channel(address)?),
+            ))
         })
-        .collect();
+        .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
     let service = Service {
         events,
-        peers,
+        peers: std::sync::Arc::new(std::sync::Mutex::new(peers)),
         member,
+        tokens,
+        transport,
     };
-    axum::Router::new()
+    Ok(axum::Router::new()
+        .route_service(
+            "/etcdserverpb.Cluster/{*method}",
+            cluster_server::ClusterServer::new(service.clone()),
+        )
+        .route_service(
+            "/grpc.health.v1.Health/{*method}",
+            tonic_health::pb::health_server::HealthServer::new(service.clone()),
+        )
+        .route_service(
+            "/etcdserverpb.Maintenance/{*method}",
+            maintenance_server::MaintenanceServer::new(service.clone())
+                .max_encoding_message_size(64 * 1024 * 1024),
+        )
+        .route_service(
+            "/etcdserverpb.Auth/{*method}",
+            auth_server::AuthServer::new(service.clone()),
+        )
         .route_service(
             "/etcdserverpb.KV/{*method}",
             KvServer::new(service.clone())
@@ -57,10 +84,42 @@ pub fn service(
         .route_service(
             "/etcdserverpb.Watch/{*method}",
             watch_server::WatchServer::new(service).max_encoding_message_size(64 * 1024 * 1024),
-        )
+        ))
 }
 
 impl Service {
+    async fn peer_channel(&self, id: u64) -> Result<Channel, Status> {
+        let (tx, rx) = oneshot::channel();
+        self.events
+            .send(Event::PeerAddress(id, tx))
+            .await
+            .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?;
+        let value = rx
+            .await
+            .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?
+            .map_err(|e| Status::unavailable(e.error))?;
+        let address: Option<String> =
+            serde_json::from_value(value).map_err(|e| Status::internal(e.to_string()))?;
+        let address = crate::cluster::url(
+            &address.ok_or_else(|| Status::unavailable("etcdserver: no leader"))?,
+        );
+        let mut peers = self
+            .peers
+            .lock()
+            .map_err(|_| Status::internal("peer channel lock failed"))?;
+        if let Some((old, channel)) = peers.get(&id) {
+            if old == &address {
+                return Ok(channel.clone());
+            }
+        }
+        let channel = self
+            .transport
+            .channel(&address)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        peers.insert(id, (address, channel.clone()));
+        Ok(channel)
+    }
+
     // A forwarded result can supply a revision for the next local STM read.
     async fn local_barrier(&self) -> Result<(), Status> {
         let (tx, rx) = oneshot::channel();
@@ -89,7 +148,12 @@ impl Service {
         Ok(())
     }
 
-    async fn execute(&self, op: Op, forwarded: bool) -> Result<ResponseOp, Status> {
+    async fn execute(
+        &self,
+        op: Op,
+        forwarded: bool,
+        credentials: crate::auth::Credentials,
+    ) -> Result<ResponseOp, Status> {
         let request = RequestOp {
             request: Some(op.clone()),
         };
@@ -108,7 +172,7 @@ impl Service {
             Event::EtcdPropose(request, tx)
         };
         self.events
-            .try_send(event)
+            .try_send(Event::Authenticated(credentials.clone(), Box::new(event)))
             .map_err(|_| Status::unavailable("etcdserver: too many requests"))?;
         let reply = tokio::time::timeout(Duration::from_secs(10), rx)
             .await
@@ -123,25 +187,34 @@ impl Service {
                 outcome.result.map_err(|e| e.status())
             }
             Err(error) if error.error == "not leader" && !forwarded => {
-                let channel = self
-                    .peers
-                    .get(&error.leader_id)
-                    .ok_or_else(|| Status::unavailable("etcdserver: no leader"))?;
+                let channel = self.peer_channel(error.leader_id).await?;
                 let mut client =
                     KvClient::new(channel.clone()).max_decoding_message_size(64 * 1024 * 1024);
                 let response = match op {
-                    Op::RequestRange(r) => {
-                        Resp::ResponseRange(client.range(forward(r)).await?.into_inner())
-                    }
-                    Op::RequestPut(r) => {
-                        Resp::ResponsePut(client.put(forward(r)).await?.into_inner())
-                    }
-                    Op::RequestDeleteRange(r) => Resp::ResponseDeleteRange(
-                        client.delete_range(forward(r)).await?.into_inner(),
+                    Op::RequestRange(r) => Resp::ResponseRange(
+                        client
+                            .range(forward_auth(r, &credentials))
+                            .await?
+                            .into_inner(),
                     ),
-                    Op::RequestTxn(r) => {
-                        Resp::ResponseTxn(client.txn(forward(r)).await?.into_inner())
-                    }
+                    Op::RequestPut(r) => Resp::ResponsePut(
+                        client
+                            .put(forward_auth(r, &credentials))
+                            .await?
+                            .into_inner(),
+                    ),
+                    Op::RequestDeleteRange(r) => Resp::ResponseDeleteRange(
+                        client
+                            .delete_range(forward_auth(r, &credentials))
+                            .await?
+                            .into_inner(),
+                    ),
+                    Op::RequestTxn(r) => Resp::ResponseTxn(
+                        client
+                            .txn(forward_auth(r, &credentials))
+                            .await?
+                            .into_inner(),
+                    ),
                 };
                 let mut response = ResponseOp {
                     response: Some(response),
@@ -165,8 +238,59 @@ fn forward<T>(body: T) -> Request<T> {
     request
 }
 
+fn credentials<T>(request: &Request<T>) -> crate::auth::Credentials {
+    let user = if request
+        .extensions()
+        .get::<crate::tls::PeerServer>()
+        .is_some()
+    {
+        request
+            .metadata()
+            .get("x-slatedb-user")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    } else {
+        request
+            .extensions()
+            .get::<crate::tls::VerifiedUser>()
+            .map(|u| u.0.clone())
+    };
+    crate::auth::Credentials {
+        user,
+        token: request
+            .metadata()
+            .get("token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned(),
+        time: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    }
+}
+
+fn forward_auth<T>(body: T, auth: &crate::auth::Credentials) -> Request<T> {
+    let mut request = forward(body);
+    if let Some(user) = &auth.user {
+        if let Ok(user) = user.parse() {
+            request.metadata_mut().insert("x-slatedb-user", user);
+        }
+    }
+    if !auth.token.is_empty() {
+        if let Ok(token) = auth.token.parse() {
+            request.metadata_mut().insert("token", token);
+        }
+    }
+    request
+}
+
 fn is_forwarded<T>(request: &Request<T>) -> bool {
-    request.metadata().contains_key("x-slatedb-forwarded")
+    request
+        .extensions()
+        .get::<crate::tls::ClientServer>()
+        .is_none()
+        && request.metadata().contains_key("x-slatedb-forwarded")
 }
 
 #[tonic::async_trait]
@@ -175,9 +299,14 @@ impl Kv for Service {
         &self,
         request: Request<RangeRequest>,
     ) -> Result<Response<RangeResponse>, Status> {
+        let credentials = credentials(&request);
         let forwarded = is_forwarded(&request);
         match self
-            .execute(Op::RequestRange(request.into_inner()), forwarded)
+            .execute(
+                Op::RequestRange(request.into_inner()),
+                forwarded,
+                credentials,
+            )
             .await?
             .response
         {
@@ -187,9 +316,10 @@ impl Kv for Service {
     }
 
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
+        let credentials = credentials(&request);
         let forwarded = is_forwarded(&request);
         match self
-            .execute(Op::RequestPut(request.into_inner()), forwarded)
+            .execute(Op::RequestPut(request.into_inner()), forwarded, credentials)
             .await?
             .response
         {
@@ -202,9 +332,14 @@ impl Kv for Service {
         &self,
         request: Request<DeleteRangeRequest>,
     ) -> Result<Response<DeleteRangeResponse>, Status> {
+        let credentials = credentials(&request);
         let forwarded = is_forwarded(&request);
         match self
-            .execute(Op::RequestDeleteRange(request.into_inner()), forwarded)
+            .execute(
+                Op::RequestDeleteRange(request.into_inner()),
+                forwarded,
+                credentials,
+            )
             .await?
             .response
         {
@@ -214,9 +349,10 @@ impl Kv for Service {
     }
 
     async fn txn(&self, request: Request<TxnRequest>) -> Result<Response<TxnResponse>, Status> {
+        let credentials = credentials(&request);
         let forwarded = is_forwarded(&request);
         match self
-            .execute(Op::RequestTxn(request.into_inner()), forwarded)
+            .execute(Op::RequestTxn(request.into_inner()), forwarded, credentials)
             .await?
             .response
         {
@@ -229,16 +365,15 @@ impl Kv for Service {
         &self,
         request: Request<CompactionRequest>,
     ) -> Result<Response<CompactionResponse>, Status> {
+        let credentials = credentials(&request);
         let forwarded = is_forwarded(&request);
         let request = request.into_inner();
-        if request.physical {
-            return Err(Status::unimplemented(
-                "etcdserver: physical MVCC compaction is not implemented",
-            ));
-        }
         let (tx, rx) = oneshot::channel();
         self.events
-            .try_send(Event::EtcdCompact(request, tx))
+            .try_send(Event::Authenticated(
+                credentials.clone(),
+                Box::new(Event::EtcdCompact(request, tx)),
+            ))
             .map_err(|_| Status::unavailable("etcdserver: too many requests"))?;
         let reply = tokio::time::timeout(Duration::from_secs(10), rx)
             .await
@@ -253,12 +388,9 @@ impl Kv for Service {
                 outcome.result.map_err(|e| e.status())?
             }
             Err(error) if error.error == "not leader" && !forwarded => {
-                let channel = self
-                    .peers
-                    .get(&error.leader_id)
-                    .ok_or_else(|| Status::unavailable("etcdserver: no leader"))?;
+                let channel = self.peer_channel(error.leader_id).await?;
                 let response = KvClient::new(channel.clone())
-                    .compact(forward(request))
+                    .compact(forward_auth(request, &credentials))
                     .await?
                     .into_inner();
                 self.local_barrier().await?;

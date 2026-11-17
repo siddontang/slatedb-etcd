@@ -9,10 +9,14 @@ impl Service {
         &self,
         command: LeaseCommand,
         forwarded: bool,
+        credentials: crate::auth::Credentials,
     ) -> Result<LeaseReply, Status> {
         let (tx, rx) = oneshot::channel();
         self.events
-            .try_send(Event::Lease(command.clone(), tx))
+            .try_send(Event::Authenticated(
+                credentials.clone(),
+                Box::new(Event::Lease(command.clone(), tx)),
+            ))
             .map_err(|_| Status::unavailable("etcdserver: too many requests"))?;
         let reply = tokio::time::timeout(Duration::from_secs(10), rx)
             .await
@@ -26,38 +30,41 @@ impl Service {
                 .result
                 .map_err(|e| e.status())?,
             Err(error) if error.error == "not leader" && !forwarded => {
-                let channel = self
-                    .peers
-                    .get(&error.leader_id)
-                    .ok_or_else(|| Status::unavailable("etcdserver: no leader"))?;
+                let channel = self.peer_channel(error.leader_id).await?;
                 let mut client = LeaseClient::new(channel.clone());
                 let response = match command {
                     LeaseCommand::Grant { id, ttl } => LeaseReply::Grant(
                         client
-                            .lease_grant(forward(LeaseGrantRequest { id, ttl }))
+                            .lease_grant(forward_auth(LeaseGrantRequest { id, ttl }, &credentials))
                             .await?
                             .into_inner(),
                     ),
                     LeaseCommand::Revoke { id } => LeaseReply::Revoke(
                         client
-                            .lease_revoke(forward(LeaseRevokeRequest { id }))
+                            .lease_revoke(forward_auth(LeaseRevokeRequest { id }, &credentials))
                             .await?
                             .into_inner(),
                     ),
                     LeaseCommand::TimeToLive { id, keys } => LeaseReply::TimeToLive(
                         client
-                            .lease_time_to_live(forward(LeaseTimeToLiveRequest { id, keys }))
+                            .lease_time_to_live(forward_auth(
+                                LeaseTimeToLiveRequest { id, keys },
+                                &credentials,
+                            ))
                             .await?
                             .into_inner(),
                     ),
                     LeaseCommand::List => LeaseReply::List(
                         client
-                            .lease_leases(forward(LeaseLeasesRequest {}))
+                            .lease_leases(forward_auth(LeaseLeasesRequest {}, &credentials))
                             .await?
                             .into_inner(),
                     ),
                     LeaseCommand::KeepAlive { id } => {
-                        let request = forward(tokio_stream::iter([LeaseKeepAliveRequest { id }]));
+                        let request = forward_auth(
+                            tokio_stream::iter([LeaseKeepAliveRequest { id }]),
+                            &credentials,
+                        );
                         let response = client
                             .lease_keep_alive(request)
                             .await?
@@ -89,6 +96,7 @@ impl Lease for Service {
         &self,
         request: Request<LeaseGrantRequest>,
     ) -> Result<Response<LeaseGrantResponse>, Status> {
+        let credentials = credentials(&request);
         let forwarded = is_forwarded(&request);
         let r = request.into_inner();
         match self
@@ -98,6 +106,7 @@ impl Lease for Service {
                     ttl: r.ttl,
                 },
                 forwarded,
+                credentials,
             )
             .await?
         {
@@ -109,6 +118,7 @@ impl Lease for Service {
         &self,
         request: Request<LeaseRevokeRequest>,
     ) -> Result<Response<LeaseRevokeResponse>, Status> {
+        let credentials = credentials(&request);
         let forwarded = is_forwarded(&request);
         match self
             .execute_lease(
@@ -116,6 +126,7 @@ impl Lease for Service {
                     id: request.into_inner().id,
                 },
                 forwarded,
+                credentials,
             )
             .await?
         {
@@ -127,6 +138,7 @@ impl Lease for Service {
         &self,
         request: Request<LeaseTimeToLiveRequest>,
     ) -> Result<Response<LeaseTimeToLiveResponse>, Status> {
+        let credentials = credentials(&request);
         let forwarded = is_forwarded(&request);
         let r = request.into_inner();
         match self
@@ -136,6 +148,7 @@ impl Lease for Service {
                     keys: r.keys,
                 },
                 forwarded,
+                credentials,
             )
             .await?
         {
@@ -148,7 +161,11 @@ impl Lease for Service {
         request: Request<LeaseLeasesRequest>,
     ) -> Result<Response<LeaseLeasesResponse>, Status> {
         match self
-            .execute_lease(LeaseCommand::List, is_forwarded(&request))
+            .execute_lease(
+                LeaseCommand::List,
+                is_forwarded(&request),
+                credentials(&request),
+            )
             .await?
         {
             LeaseReply::List(response) => Ok(Response::new(response)),
@@ -160,6 +177,7 @@ impl Lease for Service {
         &self,
         request: Request<tonic::Streaming<LeaseKeepAliveRequest>>,
     ) -> Result<Response<Self::LeaseKeepAliveStream>, Status> {
+        let credentials = credentials(&request);
         let forwarded = is_forwarded(&request);
         let mut input = request.into_inner();
         let service = self.clone();
@@ -170,7 +188,11 @@ impl Lease for Service {
                     tokio::select! { _ = tx.closed() => break, result = input.message() => result };
                 let result = match next {
                     Ok(Some(request)) => match service
-                        .execute_lease(LeaseCommand::KeepAlive { id: request.id }, forwarded)
+                        .execute_lease(
+                            LeaseCommand::KeepAlive { id: request.id },
+                            forwarded,
+                            credentials.clone(),
+                        )
                         .await
                     {
                         Ok(LeaseReply::KeepAlive(response)) => Ok(response),

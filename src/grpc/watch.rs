@@ -7,6 +7,7 @@ use watch_server::Watch;
 struct Watcher {
     request: WatchCreateRequest,
     progress: tokio::time::Instant,
+    credentials: crate::auth::Credentials,
 }
 
 type Output = mpsc::Sender<Result<WatchResponse, Status>>;
@@ -17,10 +18,18 @@ impl Service {
         request: WatchCreateRequest,
         require_leader: bool,
         through: Option<i64>,
+        mut credentials: crate::auth::Credentials,
     ) -> Result<WatchPage, Status> {
+        credentials.time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let (tx, rx) = oneshot::channel();
         self.events
-            .send(Event::Watch(request, require_leader, through, tx))
+            .send(Event::Authenticated(
+                credentials,
+                Box::new(Event::Watch(request, require_leader, through, tx)),
+            ))
             .await
             .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?;
         let value = tokio::time::timeout(Duration::from_secs(10), rx)
@@ -28,7 +37,10 @@ impl Service {
             .map_err(|_| Status::deadline_exceeded("etcdserver: watch request timed out"))?
             .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?
             .map_err(|e| Status::unavailable(format!("etcdserver: {}", e.error)))?;
-        serde_json::from_value(value).map_err(|e| Status::internal(e.to_string()))
+        serde_json::from_value::<Outcome<WatchPage>>(value)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .result
+            .map_err(|e| e.status())
     }
 
     async fn poll_watch(
@@ -40,7 +52,12 @@ impl Service {
     ) -> Result<bool, Status> {
         loop {
             let page = self
-                .watch_page(watcher.request.clone(), require_leader, through)
+                .watch_page(
+                    watcher.request.clone(),
+                    require_leader,
+                    through,
+                    watcher.credentials.clone(),
+                )
                 .await?;
             if page.compact_revision != 0 {
                 send(
@@ -94,6 +111,7 @@ impl Service {
         mut input: tonic::Streaming<WatchRequest>,
         tx: &Output,
         require_leader: bool,
+        credentials: crate::auth::Credentials,
     ) -> Result<(), Status> {
         let mut watchers = BTreeMap::<i64, Watcher>::new();
         let mut next_id = 0;
@@ -129,7 +147,7 @@ impl Service {
                                 request.watch_id = next_id;
                                 next_id += 1;
                             }
-                            let page = self.watch_page(WatchCreateRequest::default(), require_leader, None).await?;
+                            let page = self.watch_page(WatchCreateRequest::default(), require_leader, None, credentials.clone()).await?;
                             send(tx, WatchResponse { header: page.header,
                                 watch_id: if reason.is_empty() { request.watch_id } else { -1 },
                                 created: true, canceled: !reason.is_empty(), cancel_reason: reason.into(),
@@ -137,17 +155,17 @@ impl Service {
                             if !reason.is_empty() { continue; }
                             if request.start_revision <= 0 { request.start_revision = page.next_revision; }
                             watchers.insert(request.watch_id,
-                                Watcher { request, progress: tokio::time::Instant::now() });
+                                Watcher { request, progress: tokio::time::Instant::now(), credentials: credentials.clone() });
                         }
                         Some(RequestUnion::CancelRequest(request)) => {
                             if watchers.remove(&request.watch_id).is_some() {
-                                let page = self.watch_page(WatchCreateRequest::default(), require_leader, None).await?;
+                                let page = self.watch_page(WatchCreateRequest::default(), require_leader, None, credentials.clone()).await?;
                                 send(tx, WatchResponse { header: page.header, watch_id: request.watch_id,
                                     canceled: true, ..Default::default() }).await?;
                             }
                         }
                         Some(RequestUnion::ProgressRequest(_)) => {
-                            let page = self.watch_page(WatchCreateRequest::default(), require_leader, None).await?;
+                            let page = self.watch_page(WatchCreateRequest::default(), require_leader, None, credentials.clone()).await?;
                             let goal = page.header.as_ref().unwrap().revision;
                             let mut canceled = vec![];
                             for (&id, watcher) in &mut watchers {
@@ -205,12 +223,13 @@ impl Watch for Service {
         &self,
         request: Request<tonic::Streaming<WatchRequest>>,
     ) -> Result<Response<Self::WatchStream>, Status> {
+        let credentials = credentials(&request);
         let require_leader = request.metadata().contains_key("hasleader");
         let service = self.clone();
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             if let Err(error) = service
-                .watch_stream(request.into_inner(), &tx, require_leader)
+                .watch_stream(request.into_inner(), &tx, require_leader, credentials)
                 .await
             {
                 let _ = tx.send(Err(error)).await;

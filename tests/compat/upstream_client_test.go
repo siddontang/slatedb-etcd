@@ -23,7 +23,6 @@ import (
 	etcdctlcmd "go.etcd.io/etcd/etcdctl/v3/ctlv3/command"
 	"go.etcd.io/etcd/tests/v3/framework/config"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
-	"os"
 	"strings"
 	"testing"
 )
@@ -96,9 +95,6 @@ func (c integrationClient) Delete(ctx context.Context, key string, o config.Dele
 }
 
 func (c integrationClient) Compact(ctx context.Context, rev int64, o config.CompactOption) (*clientv3.CompactResponse, error) {
-	if o.Physical && os.Getenv("SLATEDB_UPSTREAM_ALL") != "1" {
-		c.tb.Skip("unsupported capability: physical compaction")
-	}
 	if o.Timeout != 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, o.Timeout)

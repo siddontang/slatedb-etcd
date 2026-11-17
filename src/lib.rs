@@ -1,11 +1,15 @@
 pub mod api;
+pub mod auth;
+pub mod cluster;
 pub mod grpc;
 pub mod lease;
+pub mod maintenance;
 pub mod mvcc;
 pub mod node;
 pub mod proto;
 pub mod state;
 pub mod storage;
+pub mod tls;
 pub mod watch;
 
 use serde::{Deserialize, Serialize};
@@ -51,12 +55,36 @@ pub struct Command {
 #[serde(untagged)]
 pub enum RaftCommand {
     Legacy(Command),
+    Cluster {
+        id: String,
+        request: cluster::Command,
+        credentials: auth::Credentials,
+    },
+    Maintenance {
+        id: String,
+        request: maintenance::Command,
+        credentials: auth::Credentials,
+    },
+    Auth {
+        id: String,
+        auth: auth::Command,
+        credentials: auth::Credentials,
+    },
+    Secured {
+        id: String,
+        credentials: auth::Credentials,
+        command: Box<RaftCommand>,
+    },
     Etcd {
         id: String,
+        #[serde(default)]
+        origin: u64,
         etcd: proto::etcdserverpb::RequestOp,
     },
     Lease {
         id: String,
+        #[serde(default)]
+        origin: u64,
         lease: lease::LeaseCommand,
     },
     Compact {
@@ -66,10 +94,27 @@ pub enum RaftCommand {
 }
 
 impl RaftCommand {
+    pub fn secure(self, credentials: Option<auth::Credentials>) -> Self {
+        match credentials {
+            Some(credentials) => Self::Secured {
+                id: self.id().to_owned(),
+                credentials,
+                command: Box::new(self),
+            },
+            None => self,
+        }
+    }
+
     pub fn id(&self) -> &str {
         match self {
             Self::Legacy(c) => &c.id,
-            Self::Etcd { id, .. } | Self::Compact { id, .. } | Self::Lease { id, .. } => id,
+            Self::Cluster { id, .. }
+            | Self::Maintenance { id, .. }
+            | Self::Auth { id, .. }
+            | Self::Secured { id, .. }
+            | Self::Etcd { id, .. }
+            | Self::Compact { id, .. }
+            | Self::Lease { id, .. } => id,
         }
     }
 }

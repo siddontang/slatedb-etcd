@@ -21,7 +21,7 @@ def main():
     parser.add_argument("--all-capabilities", action="store_true")
     args = parser.parse_args()
     binary = args.binary.resolve()
-    command = ["go", "test", "-mod=readonly", "-json", "-count=1", "-timeout=10m"]
+    command = ["go", "test", "-mod=readonly", "-json", "-count=1", "-timeout=30m"]
     if args.tags:
         command += ["-tags", args.tags]
     if args.run:
