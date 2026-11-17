@@ -185,67 +185,78 @@ impl Node {
             .object_store
             .open(&options.dir, &options.cluster_id, options.id)
             .await?;
-        state.quota = options.quota_bytes;
-        ensure!(
-            state.applied <= storage.commit_index(),
-            "state is ahead of durable commit"
-        );
-        let recovered_from_index = state.applied;
-        state.install_snapshot(storage.recovery_snapshot()).await?;
-        if state.members.members.is_empty() && !options.join {
-            state.members = crate::cluster::Store::initial(&options.peers);
-            for (&id, address) in &options.client_peers {
-                if let Some(member) = state.members.members.get_mut(&id) {
-                    member.client_ur_ls = vec![crate::cluster::url(address)];
-                }
-            }
-        }
-        if options.require_peer_tls {
+        let recovered = async {
+            state.quota = options.quota_bytes;
             ensure!(
-                options.transport.tls.is_some(),
-                "remote peers require a TLS transport"
+                state.applied <= storage.commit_index(),
+                "state is ahead of durable commit"
             );
-            for member in state.members.members.values() {
-                for address in &member.peer_ur_ls {
-                    crate::tls::validate_url(address, true, true)?;
+            let recovered_from_index = state.applied;
+            state.install_snapshot(storage.recovery_snapshot()).await?;
+            if state.members.members.is_empty() && !options.join {
+                state.members = crate::cluster::Store::initial(&options.peers);
+                for (&id, address) in &options.client_peers {
+                    if let Some(member) = state.members.members.get_mut(&id) {
+                        member.client_ur_ls = vec![crate::cluster::url(address)];
+                    }
                 }
             }
-        }
-        let mut cache = match log::Cache::load(&storage, state.applied, options.log_memory) {
-            Ok(cache) => cache,
-            Err(error) if error.is::<cache::PendingQuota>() => {
-                apply::recover(
-                    &mut state,
-                    &storage,
-                    Header {
-                        cluster: 0,
-                        member: options.id,
-                        term: storage.initial_state()?.hard_state.term,
-                    },
-                )
-                .await?;
-                log::Cache::load(&storage, state.applied, options.log_memory)?
+            if options.require_peer_tls {
+                ensure!(
+                    options.transport.tls.is_some(),
+                    "remote peers require a TLS transport"
+                );
+                for member in state.members.members.values() {
+                    for address in &member.peer_ur_ls {
+                        crate::tls::validate_url(address, true, true)?;
+                    }
+                }
             }
-            Err(error) => return Err(error),
+            let mut cache = match log::Cache::load(&storage, state.applied, options.log_memory) {
+                Ok(cache) => cache,
+                Err(error) if error.is::<cache::PendingQuota>() => {
+                    apply::recover(
+                        &mut state,
+                        &storage,
+                        Header {
+                            cluster: 0,
+                            member: options.id,
+                            term: storage.initial_state()?.hard_state.term,
+                        },
+                    )
+                    .await?;
+                    log::Cache::load(&storage, state.applied, options.log_memory)?
+                }
+                Err(error) => return Err(error),
+            };
+            cache.initial_conf = Some(state.members.conf());
+            let config = Config {
+                id: options.id,
+                election_tick: 10,
+                heartbeat_tick: 1,
+                applied: state.applied,
+                check_quorum: true,
+                pre_vote: true,
+                read_only_option: raft::ReadOnlyOption::Safe,
+                max_size_per_msg: 1024 * 1024,
+                max_inflight_msgs: 64,
+                max_uncommitted_size: 16 * 1024 * 1024,
+                max_committed_size_per_ready: apply::BATCH_BYTES,
+                ..Config::default()
+            };
+            config.validate()?;
+            let logger = slog::Logger::root(slog::Discard, slog::o!());
+            let raw = RawNode::new(&config, cache, &logger)?;
+            anyhow::Ok((raw, recovered_from_index))
+        }
+        .await;
+        let (raw, recovered_from_index) = match recovered {
+            Ok(recovered) => recovered,
+            Err(error) => {
+                let _ = state.close().await;
+                return Err(error);
+            }
         };
-        cache.initial_conf = Some(state.members.conf());
-        let config = Config {
-            id: options.id,
-            election_tick: 10,
-            heartbeat_tick: 1,
-            applied: state.applied,
-            check_quorum: true,
-            pre_vote: true,
-            read_only_option: raft::ReadOnlyOption::Safe,
-            max_size_per_msg: 1024 * 1024,
-            max_inflight_msgs: 64,
-            max_uncommitted_size: 16 * 1024 * 1024,
-            max_committed_size_per_ready: apply::BATCH_BYTES,
-            ..Config::default()
-        };
-        config.validate()?;
-        let logger = slog::Logger::root(slog::Discard, slog::o!());
-        let raw = RawNode::new(&config, cache, &logger)?;
         let manual_apply = transport_override.is_some();
         let mut transports = tokio::task::JoinSet::new();
         let senders = if let Some(senders) = transport_override {

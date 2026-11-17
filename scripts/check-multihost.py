@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -24,6 +25,7 @@ def run(*args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--linux-binary", type=Path, help="Existing Linux ARM64 binary")
+    parser.add_argument("--save-linux-binary", type=Path, help="Save the built binary for later runs")
     parser.add_argument("--reuse", help="Three disposable Lima guest names; delete them after this run")
     parser.add_argument("--output", type=Path, default=ROOT / "results/multihost.json")
     args = parser.parse_args()
@@ -74,6 +76,9 @@ sync
                 subprocess.run(["limactl", "shell", names[0], "--", "sh", "build.sh"], check=True)
                 binary = directory / "slatedb-etcd-linux"
                 run("limactl", "copy", names[0]+":slatedb-build/target/release/slatedb-etcd", str(binary))
+            if args.save_linux_binary:
+                args.save_linux_binary.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(binary, args.save_linux_binary)
             kernels = [run("limactl", "shell", name, "--", "uname", "-sr") for name in names]
             env = dict(os.environ, SLATEDB_VM_NAMES=",".join(names),
                        SLATEDB_LINUX_BINARY=str(binary.resolve()))

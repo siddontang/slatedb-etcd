@@ -271,6 +271,7 @@ impl Executor {
 }
 
 pub(super) struct Worker {
+    database: std::sync::Arc<slatedb::Db>,
     work: mpsc::Sender<Work>,
     completed: mpsc::Receiver<Result<Completion>>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
@@ -290,6 +291,7 @@ impl Worker {
     pub fn start(state: StateMachine, events: mpsc::Sender<Event>, manual: bool) -> Self {
         let (work, mut jobs) = mpsc::channel::<Work>(1);
         let (done, completed) = mpsc::channel(1);
+        let database = state.db.clone();
         let mut executor = Executor {
             state,
             events,
@@ -298,6 +300,7 @@ impl Worker {
         #[cfg(test)]
         if manual {
             return Self {
+                database,
                 work,
                 completed,
                 task: None,
@@ -320,6 +323,7 @@ impl Worker {
             executor.state.close().await
         });
         Self {
+            database,
             work,
             completed,
             task: Some(task),
@@ -332,7 +336,16 @@ impl Worker {
         self.completed.close();
         self.work = mpsc::channel(1).0;
         if let Some(task) = self.task.take() {
-            task.await??;
+            match task.await {
+                Ok(result) => result?,
+                Err(error) => {
+                    let _ = self
+                        .database
+                        .close_with_options(slatedb::config::CloseOptions { flush_type: None })
+                        .await;
+                    return Err(error.into());
+                }
+            }
         }
         Ok(())
     }
@@ -348,6 +361,11 @@ impl Worker {
             .recv()
             .await
             .context("apply worker stopped")?
+    }
+
+    #[cfg(test)]
+    pub fn database(&self) -> std::sync::Arc<slatedb::Db> {
+        self.database.clone()
     }
 
     #[cfg(test)]

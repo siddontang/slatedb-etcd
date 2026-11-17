@@ -33,6 +33,8 @@ ready.and(shutdown)?;
 
 `start` validates configuration, binds both listeners, and opens local and object storage.
 It returns before leader election. This lets the host start all initial members without deadlock.
+If the caller cancels startup, an owned task completes initialization.
+It then shuts down any unclaimed member.
 `wait_ready` confirms a ReadIndex with the quorum and waits for local apply.
 Readiness describes that instant. A later failure can make the member unavailable.
 

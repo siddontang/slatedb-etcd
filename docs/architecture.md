@@ -166,7 +166,7 @@ Mutating transactions, Lease operations, and the diagnostic JSON API retain thei
 Queued reads must receive service between apply batches, so continuous writes cannot starve them.
 
 A slow worker must delay client completion without delaying Raft heartbeats.
-Worker failure or panic must terminate the node. Node shutdown must cancel the worker.
+Worker failure or panic must terminate the node. Shutdown must stop the worker and wait for exit.
 The deterministic driver executes the same worker jobs under an explicit scheduler.
 
 ## ReadIndex protocol

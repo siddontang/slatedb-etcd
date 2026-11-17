@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -46,23 +47,82 @@ func TestThreeVirtualMachines(t *testing.T) {
 	guestDirs := make([]string, 3)
 	endpoints, peerEndpoints := make([]string, 3), make([]string, 3)
 	tunnels := make([]*exec.Cmd, 3)
+	tunnelDone := make([]chan error, 3)
+	stopTunnel := func(i int) {
+		if tunnels[i] != nil {
+			tunnels[i].Process.Kill()
+			<-tunnelDone[i]
+			tunnels[i] = nil
+		}
+	}
+	t.Cleanup(func() {
+		for i, name := range names {
+			if t.Failed() {
+				output, _ := exec.Command("limactl", "shell", name, "--", "sudo", "journalctl",
+					"--no-pager", "-u", "slatedb-validation", "-n", "80").CombinedOutput()
+				t.Logf("guest %d service log: %s", i+1, output)
+			}
+			exec.Command("limactl", "shell", name, "--", "sudo", "systemctl", "stop", "slatedb-validation").Run()
+			stopTunnel(i)
+			if t.Failed() {
+				output, _ := os.ReadFile(filepath.Join(root, fmt.Sprintf("ssh-%d.log", i)))
+				t.Logf("guest %d tunnel log: %s", i+1, output)
+			}
+		}
+	})
 	for i := range names {
 		endpoints[i], peerEndpoints[i] = "https://"+address(t), "https://"+address(t)
 	}
 	tunnel := func(i int) {
 		t.Helper()
-		if tunnels[i] != nil {
-			tunnels[i].Process.Kill()
-			tunnels[i].Wait()
-		}
+		stopTunnel(i)
 		home, err := os.UserHomeDir()
 		require.NoError(t, err)
 		command := exec.Command("ssh", "-F", filepath.Join(home, ".lima", names[i], "ssh.config"),
-			"-o", "ExitOnForwardFailure=yes", "-N",
+			"-o", "ExitOnForwardFailure=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none",
+			"-o", "ServerAliveInterval=2", "-o", "ServerAliveCountMax=3", "-N",
 			"-L", strings.TrimPrefix(endpoints[i], "https://")+":127.0.0.1:2379",
 			"-L", strings.TrimPrefix(peerEndpoints[i], "https://")+":127.0.0.1:2380", "lima-"+names[i])
-		require.NoError(t, command.Start())
+		logPath := filepath.Join(root, fmt.Sprintf("ssh-%d.log", i))
+		log, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		require.NoError(t, err)
+		command.Stderr = log
+		if err := command.Start(); err != nil {
+			log.Close()
+			t.Fatal(err)
+		}
 		tunnels[i] = command
+		done := make(chan error, 1)
+		tunnelDone[i] = done
+		go func() {
+			err := command.Wait()
+			log.Close()
+			done <- err
+		}()
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			select {
+			case err := <-done:
+				tunnels[i] = nil
+				output, _ := os.ReadFile(logPath)
+				t.Fatalf("SSH tunnel exited: %v: %s", err, output)
+			default:
+			}
+			ready := true
+			for _, endpoint := range []string{endpoints[i], peerEndpoints[i]} {
+				connection, err := net.DialTimeout("tcp", strings.TrimPrefix(endpoint, "https://"), 100*time.Millisecond)
+				if err != nil {
+					ready = false
+				} else {
+					connection.Close()
+				}
+			}
+			if ready {
+				return
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		t.Fatal("SSH tunnel did not open both ports")
 	}
 	start := func(i int) {
 		t.Helper()
@@ -102,15 +162,6 @@ func TestThreeVirtualMachines(t *testing.T) {
 		tunnel(i)
 		start(i)
 	}
-	t.Cleanup(func() {
-		for i, name := range names {
-			exec.Command("limactl", "shell", name, "--", "sudo", "systemctl", "stop", "slatedb-validation").Run()
-			if tunnels[i] != nil {
-				tunnels[i].Process.Kill()
-				tunnels[i].Wait()
-			}
-		}
-	})
 	newClient := func(addresses []string, tls *tls.Config) *clientv3.Client {
 		c, err := clientv3.New(clientv3.Config{Endpoints: addresses, TLS: tls, DialTimeout: 3 * time.Second})
 		require.NoError(t, err)

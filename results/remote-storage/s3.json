@@ -1,6 +1,6 @@
 {
-  "created_at": "2026-11-17T19:37:11.469784+00:00",
-  "binary_sha256": "ad50bd9bba2c328a53abd6bb7f67927d3fbdb85cdb674c199eb2de1fc8a001d6",
+  "created_at": "2026-11-17T20:09:10.248039+00:00",
+  "binary_sha256": "a8617f24ef908db0f2ab2f15fc39cd68c22f73b573b4a159097efbd7cad11804",
   "reference_etcd": "3.6.5",
   "client": "go.etcd.io/etcd/client/v3 v3.6.5",
   "go": "go version go1.25.6 darwin/arm64",
@@ -20,37 +20,37 @@
     "./..."
   ],
   "profile": "supported-capabilities",
-  "log": "<repo>/tmp/test-results/s3-final.jsonl",
+  "log": "<repo>/tmp/test-results/s3-cleanup.jsonl",
   "tests": [
     {
       "name": "TestS3Recovery/delayed-put-keeps-raft-active",
       "result": "pass",
-      "seconds": 0.02
+      "seconds": 0.01
     },
     {
       "name": "TestS3Recovery/lost-put-response",
       "result": "pass",
-      "seconds": 0.25
+      "seconds": 0.19
     },
     {
       "name": "TestS3Recovery/outage-crash-and-recovery",
       "result": "pass",
-      "seconds": 1.92
+      "seconds": 1.95
     },
     {
       "name": "TestS3Recovery/read-outage-at-restart",
       "result": "pass",
-      "seconds": 0.18
+      "seconds": 0.05
     },
     {
       "name": "TestS3Recovery/snapshot-transfer-and-full-restart",
       "result": "pass",
-      "seconds": 1.25
+      "seconds": 1.29
     },
     {
       "name": "TestS3Recovery",
       "result": "pass",
-      "seconds": 5.25
+      "seconds": 5.55
     }
   ],
   "counts": {

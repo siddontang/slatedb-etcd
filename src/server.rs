@@ -79,7 +79,14 @@ impl Server {
     /// Bind all listeners and recover storage. This does not wait for a Raft quorum.
     ///
     /// The host owns logging, process signals, and the Tokio runtime.
-    pub async fn start(mut config: ServerConfig) -> Result<Self> {
+    pub async fn start(config: ServerConfig) -> Result<Self> {
+        // A cancelled caller must not interrupt storage initialization or cleanup.
+        tokio::spawn(Self::start_inner(config))
+            .await
+            .context("server startup panicked")?
+    }
+
+    async fn start_inner(mut config: ServerConfig) -> Result<Self> {
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
         config.log_memory.validate()?;
         ensure!(

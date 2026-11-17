@@ -133,6 +133,7 @@ async fn worker_panic_stops_the_node() {
     let dir = tempfile::tempdir().unwrap();
     let (events, receiver) = mpsc::channel(256);
     let mut node = Node::open(options(dir.path()), events).await.unwrap();
+    let database = node.worker.database();
     node.submit_apply(Job::Panic, 0).unwrap();
     let result = tokio::time::timeout(Duration::from_secs(2), node.run(receiver))
         .await
@@ -141,6 +142,10 @@ async fn worker_panic_stops_the_node() {
         .unwrap_err()
         .to_string()
         .contains("apply worker stopped"));
+    assert!(
+        database.get(b"unused").await.is_err(),
+        "state storage stayed open"
+    );
 }
 
 #[tokio::test]

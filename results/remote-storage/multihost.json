@@ -1,6 +1,6 @@
 {
-  "created_at": "2026-11-17T19:36:26.493318+00:00",
-  "binary_sha256": "f37ac22544ae5c961bc867d46087664efb38065a1cc59854aa16d644cca6915d",
+  "created_at": "2026-11-17T20:10:20.840241+00:00",
+  "binary_sha256": "782f8e9bc31cbca55447d49b4308d177201f02f5e362393b5d3879d71040d472",
   "reference_etcd": "3.6.5",
   "client": "go.etcd.io/etcd/client/v3 v3.6.5",
   "go": "go version go1.25.6 darwin/arm64",
@@ -20,7 +20,7 @@
     "./..."
   ],
   "profile": "supported-capabilities",
-  "log": "<repo>/tmp/test-results/multihost-final.jsonl",
+  "log": "<repo>/tmp/test-results/multihost-embedded-2.jsonl",
   "tests": [
     {
       "name": "TestThreeVirtualMachines/mutual-tls",
@@ -30,22 +30,22 @@
     {
       "name": "TestThreeVirtualMachines/leader-machine-crash",
       "result": "pass",
-      "seconds": 13.38
+      "seconds": 12.77
     },
     {
       "name": "TestThreeVirtualMachines/kernel-peer-partition",
       "result": "pass",
-      "seconds": 2.31
+      "seconds": 2.32
     },
     {
       "name": "TestThreeVirtualMachines/object-outage-crash-and-snapshot",
       "result": "pass",
-      "seconds": 25.73
+      "seconds": 21.76
     },
     {
       "name": "TestThreeVirtualMachines",
       "result": "pass",
-      "seconds": 47.36
+      "seconds": 46.88
     }
   ],
   "counts": {

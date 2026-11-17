@@ -7,7 +7,8 @@ The current CI workflow reruns portable checks on every pull request.
 | Report | Scope |
 | --- | --- |
 | [S3](s3.json) | Five real MinIO fault and recovery cases |
-| [Crash boundaries](crash-boundaries.json) | 19 crash hooks and two TLS failover cases |
+| [Crash boundaries](crash-boundaries.json) | 19 native crash hooks |
+| [Upstream](upstream.json) | 395 leaf cases, including two TLS failover cases |
 | [Downstream](downstream.json) | 200 leaf cases across Kubernetes, CoreDNS, and reference etcd |
 | [DST](dst.json) | Five seeds, with two identical traces required per seed |
 | [Three guests](multihost.json) | TLS, VM crash, partition, and S3 recovery |
@@ -15,6 +16,8 @@ The current CI workflow reruns portable checks on every pull request.
 
 The guest report confirms removal of all three temporary VMs. Each guest had its own kernel,
 network stack, and data disk. All guests and MinIO shared one physical Apple Silicon host.
+The harness owns each SSH tunnel and checks both forwarded ports before use.
+Recovery checks every acknowledged value at its recorded revision on all three members.
 No independent power-domain, disk-controller, availability-zone, or managed AWS S3 test is claimed.
 
 The benchmark used 100 keys, 256-byte values, and 1,000 measured operations per sample.

@@ -27,7 +27,7 @@ struct SnapshotData {
 }
 
 pub struct StateMachine {
-    db: Arc<Db>,
+    pub(crate) db: Arc<Db>,
     pub auth: crate::auth::Store,
     pub members: crate::cluster::Store,
     admin: slatedb::admin::Admin,
@@ -71,48 +71,58 @@ impl StateMachine {
             .with_settings(settings)
             .build()
             .await?;
-        let applied = match db.get(APPLIED).await? {
-            Some(bytes) => {
-                u64::from_be_bytes(bytes.as_ref().try_into().context("invalid apply marker")?)
-            }
-            None => 0,
-        };
-        ensure!(
-            db.snapshot()?.seq() == applied,
-            "SlateDB sequence and apply marker differ"
-        );
-        let revision = read_revision(&db).await?;
-        let compact_revision = read_compact_revision(&db).await?;
-        ensure!(
-            compact_revision <= revision,
-            "compaction exceeds current revision"
-        );
-        let leases = crate::lease::load(&db).await?;
-        let auth = match db.get(crate::auth::KEY).await? {
-            Some(data) => serde_json::from_slice(&data)?,
-            None => crate::auth::Store::default(),
-        };
-        let alarms = match db.get(crate::maintenance::ALARMS).await? {
-            Some(data) => serde_json::from_slice(&data)?,
-            None => vec![],
-        };
-        let members = match db.get(crate::cluster::KEY).await? {
-            Some(data) => serde_json::from_slice(&data)?,
-            None => crate::cluster::Store::default(),
-        };
-        Ok(Self {
-            members,
-            admin,
-            quota: 0,
-            alarms,
-            auth,
-            db: Arc::new(db),
-            applied,
-            durable_applied: applied,
-            revision,
-            compact_revision,
-            leases,
-        })
+        let db = Arc::new(db);
+        let result = async {
+            let applied = match db.get(APPLIED).await? {
+                Some(bytes) => {
+                    u64::from_be_bytes(bytes.as_ref().try_into().context("invalid apply marker")?)
+                }
+                None => 0,
+            };
+            ensure!(
+                db.snapshot()?.seq() == applied,
+                "SlateDB sequence and apply marker differ"
+            );
+            let revision = read_revision(&db).await?;
+            let compact_revision = read_compact_revision(&db).await?;
+            ensure!(
+                compact_revision <= revision,
+                "compaction exceeds current revision"
+            );
+            let leases = crate::lease::load(&db).await?;
+            let auth = match db.get(crate::auth::KEY).await? {
+                Some(data) => serde_json::from_slice(&data)?,
+                None => crate::auth::Store::default(),
+            };
+            let alarms = match db.get(crate::maintenance::ALARMS).await? {
+                Some(data) => serde_json::from_slice(&data)?,
+                None => vec![],
+            };
+            let members = match db.get(crate::cluster::KEY).await? {
+                Some(data) => serde_json::from_slice(&data)?,
+                None => crate::cluster::Store::default(),
+            };
+            Ok(Self {
+                members,
+                admin,
+                quota: 0,
+                alarms,
+                auth,
+                db: Arc::clone(&db),
+                applied,
+                durable_applied: applied,
+                revision,
+                compact_revision,
+                leases,
+            })
+        }
+        .await;
+        if result.is_err() {
+            let _ = db
+                .close_with_options(slatedb::config::CloseOptions { flush_type: None })
+                .await;
+        }
+        result
     }
 
     pub(crate) async fn close(&self) -> Result<()> {
