@@ -353,7 +353,10 @@ The worker updates the counter only after SlateDB accepts the atomic batch.
 Quota reads cost O(1). Batch accounting uses K point reads for K changed logical keys.
 Startup performs one O(N) scan over N logical records.
 Snapshot replacement uses the same batch path.
-The counter adds no stored metadata, so older state and snapshots remain readable.
+The counter adds no stored metadata. Snapshot import accepts only the current format, version 2.
+Each member uses a 64 MiB weighted Moka cache for immutable SST blocks and metadata.
+This state cache has a separate budget from Raft log memory. It has no time-based expiry.
+The weight limit covers cached entries; allocator and cache overhead can add resident memory.
 Tests compare the counter with a full scan after state changes, restart, and DST recovery.
 
 Physical Compact flushes MVCC deletions. Defragment rewrites SSTs through the SlateDB compactor.

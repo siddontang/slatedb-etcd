@@ -7,6 +7,7 @@ use anyhow::{ensure, Context, Result};
 use raft::eraftpb::Snapshot;
 use serde::{Deserialize, Serialize};
 use slatedb::config::{Settings, WriteOptions};
+use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::object_store::local::LocalFileSystem;
 use slatedb::Db;
 
@@ -71,7 +72,14 @@ impl StateMachine {
             }
         }
         let admin = slatedb::admin::Admin::builder(prefix, object_store.clone()).build();
+        // Keep state cache weights separate from Raft log memory budgets.
+        let cache = MokaCache::new_with_opts(MokaCacheOptions {
+            max_capacity: 64 * 1024 * 1024,
+            time_to_live: None,
+            time_to_idle: None,
+        });
         let db = Db::builder(prefix, object_store)
+            .with_db_cache(Arc::new(cache), 0)
             .with_settings(settings)
             .build()
             .await?;
@@ -378,7 +386,7 @@ impl StateMachine {
         let corrupt = self.alarms.iter().any(|a| a.alarm == 2);
         let full = crate::maintenance::has_put(request)
             && (self.alarms.iter().any(|a| a.alarm == 1)
-                || (self.quota > 0 && self.logical_size().await? >= self.quota));
+                || (self.quota > 0 && self.logical_size() >= self.quota));
         if corrupt || full {
             let mut batch = WriteBatch::new();
             if full && !self.alarms.iter().any(|a| a.alarm == 1) {
@@ -523,7 +531,7 @@ impl StateMachine {
             );
         let full = matches!(command, L::Grant { .. })
             && (self.alarms.iter().any(|a| a.alarm == 1)
-                || (self.quota > 0 && self.logical_size().await? >= self.quota));
+                || (self.quota > 0 && self.logical_size() >= self.quota));
         if corrupt || full {
             if full && !self.alarms.iter().any(|a| a.alarm == 1) {
                 self.alarms.push(crate::proto::etcdserverpb::AlarmMember {
@@ -635,7 +643,7 @@ impl StateMachine {
         }
         let data: SnapshotData = bincode::deserialize(snapshot.get_data())?;
         ensure!(
-            (data.version == 1 || data.version == 2) && data.applied == index,
+            data.version == 2 && data.applied == index,
             "invalid snapshot metadata"
         );
         let mut batch = WriteBatch::new();

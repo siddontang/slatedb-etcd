@@ -1037,7 +1037,7 @@ impl Simulation {
             while let Some(row) = rows.next().await.unwrap() {
                 size += (row.key.len() + row.value.len()) as u64;
             }
-            assert_eq!(state.logical_size().await.unwrap(), size, "seed {seed}");
+            assert_eq!(state.logical_size(), size, "seed {seed}");
             assert!(node.state.leases[&77].generation > generation);
             let mut request = WatchCreateRequest {
                 key: vec![0],

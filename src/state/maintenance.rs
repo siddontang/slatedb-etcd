@@ -8,8 +8,8 @@ use slatedb::compactor::{CompactionSpec, CompactionStatus, SourceId};
 use tonic::Code;
 
 impl StateMachine {
-    pub async fn logical_size(&self) -> Result<u64> {
-        Ok(self.logical_bytes)
+    pub fn logical_size(&self) -> u64 {
+        self.logical_bytes
     }
 
     pub async fn maintenance(
@@ -24,7 +24,7 @@ impl StateMachine {
         status.header = mvcc::header(self.revision);
         let result = match command {
             Command::Status => {
-                let size = self.logical_size().await?;
+                let size = self.logical_size();
                 status.db_size_in_use = size as i64;
                 status.db_size = self.physical_size().await?.max(size) as i64;
                 status.db_size_quota = self.quota as i64;
@@ -331,7 +331,7 @@ pub(crate) async fn compact_hash(
     Ok(())
 }
 
-// Rebuild derived accounting once when opening existing state. No format migration is required.
+// Rebuild derived accounting when opening stored state.
 pub(super) async fn count_logical_size(db: &Db) -> Result<u64> {
     let mut scan = db.scan_prefix(b"etcd/", ..).await?;
     let mut size = 0_u64;

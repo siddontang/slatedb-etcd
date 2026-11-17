@@ -6,7 +6,7 @@ use crate::proto::etcdserverpb::*;
 
 async fn check(state: &StateMachine) {
     assert_eq!(
-        state.logical_size().await.unwrap(),
+        state.logical_size(),
         maintenance::count_logical_size(&state.db).await.unwrap()
     );
 }
@@ -269,5 +269,89 @@ async fn quota_matches_scan_across_state_changes_and_recovery() {
     let state = StateMachine::open(dir.path()).await.unwrap();
     check(&state).await;
     assert_eq!(state.logical_bytes, expected);
+    state.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn snapshot_import_requires_the_current_format() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open(&dir.path().join("state")).await.unwrap();
+    let data = SnapshotData {
+        version: 1,
+        applied: 1,
+        rows: vec![],
+    };
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = 1;
+    let mut bytes = bincode::serialize(&data).unwrap();
+    snapshot.set_data(bytes.clone().into());
+    assert!(state.install_snapshot(&snapshot).await.is_err());
+    assert_eq!(state.applied, 0);
+    check(&state).await;
+    bytes.extend_from_slice(&Sha256::digest(&bytes));
+    let path = dir.path().join("backup");
+    std::fs::write(&path, bytes).unwrap();
+    let members = crate::cluster::Store::initial(&std::collections::BTreeMap::from([(
+        1,
+        "http://127.0.0.1:2380".into(),
+    )]));
+    let error =
+        StateMachine::restore_backup(&path, &dir.path().join("restore"), 1, "test", &members)
+            .unwrap_err();
+    assert!(error.to_string().contains("unsupported snapshot version"));
+    state.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn warm_reads_use_the_state_cache_and_observe_new_versions() {
+    use crate::object::faults::{FaultStore, FAIL_SST_GET};
+    use crate::proto::etcdserverpb::response_op::Response as Resp;
+    use slatedb::object_store::memory::InMemory;
+    let store = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let mut state = StateMachine::open_store(store.clone(), "cached")
+        .await
+        .unwrap();
+    state
+        .apply_etcd(1, &put(b"cached", b"first", 0))
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    state.db.flush().await.unwrap();
+    let request = RequestOp {
+        request: Some(Op::RequestRange(RangeRequest {
+            key: b"cached".to_vec(),
+            ..Default::default()
+        })),
+    };
+    let first = state.read_etcd(&request).await.unwrap().result.unwrap();
+    store.set(FAIL_SST_GET);
+    for _ in 0..3 {
+        assert_eq!(
+            state.read_etcd(&request).await.unwrap().result.unwrap(),
+            first
+        );
+    }
+    store.set(0);
+    state
+        .apply_etcd(2, &put(b"cached", b"second", 0))
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    state.db.flush().await.unwrap();
+    let Some(Resp::ResponseRange(response)) = state
+        .read_etcd(&request)
+        .await
+        .unwrap()
+        .result
+        .unwrap()
+        .response
+    else {
+        panic!("expected range response");
+    };
+    assert_eq!(response.kvs[0].value, b"second");
+    check(&state).await;
     state.close().await.unwrap();
 }

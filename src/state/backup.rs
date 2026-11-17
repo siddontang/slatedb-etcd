@@ -42,10 +42,7 @@ impl StateMachine {
             .with_limit(MAX_BACKUP_BYTES)
             .deserialize(payload)
             .context("invalid native snapshot")?;
-        ensure!(
-            data.version == 1 || data.version == 2,
-            "unsupported snapshot version"
-        );
+        ensure!(data.version == 2, "unsupported snapshot version");
         let mut seen = std::collections::BTreeSet::new();
         for (key, value) in &mut data.rows {
             ensure!(
