@@ -208,3 +208,21 @@ func TestClientMetadataCannotImpersonate(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, []codes.Code{codes.Unauthenticated, codes.PermissionDenied, codes.InvalidArgument}, status.Code(err))
 }
+
+func TestRemoteMembershipRejectsPlaintext(t *testing.T) {
+	c := newClusterConfigured(t, 3, func(c *cluster) {
+		configureTLS(c, true, true, true)
+	}, "--allow-remote")
+	api, err := clientv3.New(clientv3.Config{Endpoints: c.addresses, TLS: c.tlsClient})
+	require.NoError(t, err)
+	defer api.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err = api.MemberAddAsLearner(ctx, []string{"http://" + address(t)})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	_, err = api.MemberUpdate(ctx, uint64(c.leader()), []string{"http://" + address(t)})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	members, err := api.MemberList(ctx)
+	require.NoError(t, err)
+	require.Len(t, members.Members, 3)
+}

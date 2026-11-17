@@ -60,7 +60,7 @@ def main():
     for binary, package in [("etcd", "reference-etcd"), ("benchmark", "benchmark")]:
         subprocess.run(["go", "build", "-mod=readonly", "-o", str(tools / binary),
                         "./cmd/" + package], cwd=ROOT / "tests/compat", check=True)
-    report = {"passed": True, "samples": [], "platform": platform.system(),
+    report = {"passed": False, "samples": [], "platform": platform.system(),
               "architecture": platform.machine(), "logical_cpus": os.cpu_count(),
               "deployment": "three processes per backend; shared host and disk; loopback plaintext",
               "reference_etcd": "v3.6.5", "state_backend": "s3" if args.s3_bucket else "local", "raft_snapshot_entries": 1000,
@@ -68,6 +68,9 @@ def main():
               "limits": "closed-loop client; warmup excluded; RSS includes allocator and page caches; "
                         "no cross-AZ or capacity claim", "binaries": {}}
     report["resource_phases"] = "RSS, CPU, and disk samples include preload and measured operations"
+    expected_samples = 2 * len(args.concurrency) * len(args.read_percent)
+    report["expected_samples"] = expected_samples
+    successful = True
     binaries = {"service": args.binary.resolve(), "etcd": tools / "etcd"}
     for kind, binary in binaries.items():
         report["binaries"][kind] = hashlib.sha256(binary.read_bytes()).hexdigest()
@@ -138,7 +141,8 @@ def main():
                               allocated_data_bytes=sum(p.stat().st_blocks*512
                                   for p in root.glob("node*/**/*") if p.is_file()))
                 report["samples"].append(sample)
-                report["passed"] &= result.returncode == 0 and sample["passed"]
+                successful &= result.returncode == 0 and sample["passed"]
+                report["passed"] = successful and len(report["samples"]) == expected_samples
                 write_report(args.output, report)
                 print(kind, concurrency, reads, sample.get("successful_ops_per_second"), flush=True)
             finally:
