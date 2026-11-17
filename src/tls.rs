@@ -34,6 +34,39 @@ pub struct PeerServer;
 #[derive(Clone)]
 pub struct ClientServer;
 
+pub fn validate_url(address: &str, allow_remote: bool, require_tls: bool) -> Result<()> {
+    let url = reqwest::Url::parse(&crate::cluster::url(address))?;
+    ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.host().is_some()
+            && url.port_or_known_default().is_some()
+            && url.path() == "/"
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "invalid service URL"
+    );
+    ensure!(
+        !require_tls || url.scheme() == "https",
+        "TLS requires an HTTPS URL"
+    );
+    let loopback = url
+        .host_str()
+        .and_then(|host| {
+            host.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .ok()
+        })
+        .is_some_and(|ip| ip.is_loopback());
+    ensure!(
+        allow_remote || loopback,
+        "remote URLs require --allow-remote"
+    );
+    Ok(())
+}
+
 impl Options {
     pub fn server(&self) -> Result<Option<Arc<rustls::ServerConfig>>> {
         ensure!(
@@ -160,5 +193,27 @@ pub async fn serve(
                 .serve_connection_with_upgrades(TokioIo::new(stream), TowerToHyperService::new(app))
                 .await;
         });
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::validate_url;
+
+    #[test]
+    fn remote_urls_require_tls_and_local_urls_use_literal_loopback() {
+        assert!(validate_url("127.0.0.1:2379", false, false).is_ok());
+        assert!(validate_url("http://[::1]:2379", false, false).is_ok());
+        assert!(validate_url("https://node.example:2379", true, true).is_ok());
+        for url in [
+            "http://node.example",
+            "https://user:password@node.example",
+            "https://node.example/path",
+            "https://node.example?token=value",
+        ] {
+            assert!(validate_url(url, true, true).is_err());
+        }
+        assert!(validate_url("http://localhost:2379", false, false).is_err());
+        assert!(validate_url("http://192.0.2.1:2379", false, false).is_err());
     }
 }

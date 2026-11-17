@@ -14,9 +14,14 @@ struct Args {
     /// Persistent member ID. Keep it with its data directory.
     #[arg(long)]
     id: u64,
-    /// Client listener address. Use a loopback IP and port.
+    #[command(flatten)]
+    object_store: slatedb_etcd::object::Args,
+    /// Client listener address. Remote listeners require --allow-remote.
     #[arg(long)]
     listen: SocketAddr,
+    /// Allow remote hosts with separate client and peer listeners and mutual TLS.
+    #[arg(long)]
+    allow_remote: bool,
     /// Separate peer listener address. Required when TLS is enabled.
     #[arg(long)]
     peer_listen: Option<SocketAddr>,
@@ -114,45 +119,34 @@ async fn main() -> Result<()> {
         args.peer_listen.is_some() || (client_tls.is_none() && peer_tls.is_none()),
         "TLS requires a separate peer listener"
     );
-    ensure!(
-        args.listen.ip().is_loopback(),
-        "the service must bind to loopback"
-    );
+    if args.allow_remote {
+        ensure!(
+            args.peer_listen.is_some()
+                && client_tls.is_some()
+                && args.client_cert_auth
+                && peer_tls.is_some(),
+            "remote mode requires separate listeners and mutual client and peer TLS"
+        );
+    } else {
+        ensure!(
+            args.listen.ip().is_loopback(),
+            "remote listeners require --allow-remote"
+        );
+    }
     let mut peers = BTreeMap::new();
     for peer in args.peers {
         let (id, address) = peer.split_once('=').context("peer must be ID=IP:PORT")?;
         let id = id.parse()?;
-        let url = reqwest::Url::parse(&slatedb_etcd::cluster::url(address))?;
-        let host = url.host_str().context("peer URL has no host")?;
-        let socket: SocketAddr = format!(
-            "{}:{}",
-            host,
-            url.port_or_known_default()
-                .context("peer URL has no port")?
-        )
-        .parse()?;
+        slatedb_etcd::tls::validate_url(address, args.allow_remote, peer_tls.is_some())?;
         ensure!(
-            socket.ip().is_loopback(),
-            "PoC peers must use loopback addresses"
-        );
-        ensure!(
-            peers
-                .insert(
-                    id,
-                    if address.contains("://") {
-                        address.to_owned()
-                    } else {
-                        socket.to_string()
-                    }
-                )
-                .is_none(),
+            peers.insert(id, address.to_owned()).is_none(),
             "duplicate peer id"
         );
     }
     let peer_listen = args.peer_listen.unwrap_or(args.listen);
     ensure!(
-        peer_listen.ip().is_loopback(),
-        "peer listener must bind to loopback"
+        args.allow_remote || peer_listen.ip().is_loopback(),
+        "remote peer listeners require --allow-remote"
     );
     let own_peer = reqwest::Url::parse(&slatedb_etcd::cluster::url(
         peers.get(&args.id).context("missing local peer")?,
@@ -164,8 +158,18 @@ async fn main() -> Result<()> {
     let mut client_peers = BTreeMap::new();
     for peer in args.client_peers {
         let (id, address) = peer.split_once('=').context("client peer must be ID=URL")?;
-        client_peers.insert(id.parse()?, address.to_owned());
+        slatedb_etcd::tls::validate_url(address, args.allow_remote, client_tls.is_some())?;
+        ensure!(
+            client_peers
+                .insert(id.parse()?, address.to_owned())
+                .is_none(),
+            "duplicate client peer id"
+        );
     }
+    ensure!(
+        !args.allow_remote || peers.keys().all(|id| client_peers.contains_key(id)),
+        "remote mode requires a client URL for every initial peer"
+    );
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     if let Some(backup) = &args.restore_snapshot {
         let mut members = slatedb_etcd::cluster::Store::initial(&peers);
@@ -192,6 +196,8 @@ async fn main() -> Result<()> {
     )?;
     let node = Node::open(
         NodeOptions {
+            object_store: args.object_store.config()?,
+            require_peer_tls: args.allow_remote,
             client_peers,
             transport,
             strict_reconfiguration: args.strict_reconfig_check,

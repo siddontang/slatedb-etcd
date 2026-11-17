@@ -6,11 +6,11 @@ SlateDB's native WAL is disabled. Raft protects acknowledged writes.
 
 The service has one Raft group, a configurable voter set, and one optional learner.
 It exposes etcd v3 gRPC APIs to the official etcd client.
-Each replica owns an independent local object directory and manifest.
+Each replica owns an independent local or S3 object namespace and manifest.
 
-**Status:** local research software. It is not a supported Kubernetes backend or a complete etcd
-replacement. All listeners use loopback. Remote object storage and cross-host operation are future
-work.
+**Status:** experimental research software. It is not a supported Kubernetes backend or a complete
+etcd replacement. S3 storage and remote mutual TLS are available for controlled validation.
+See [remote storage](docs/remote-storage.md) for ownership, recovery, and deployment limits.
 
 ## Start here
 
@@ -88,7 +88,7 @@ Raw logs and generated data stay outside tracked reports.
 - [Contributing](CONTRIBUTING.md): repository layout, checks, and upstream test imports.
 - [Security](SECURITY.md): trust boundaries and private issue reporting.
 
-The next work is remote object storage, cross-host faults, bounded state scans and snapshots,
+The next work is independent-host fault validation, bounded state scans and snapshots,
 and lease TTL checkpoints. The architecture document defines the phase exit criteria.
 
 ## License and provenance

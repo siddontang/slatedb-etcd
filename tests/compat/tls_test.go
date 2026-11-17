@@ -30,7 +30,7 @@ type testTLS struct {
 	config        *tls.Config
 }
 
-func makeTLS(t *testing.T, root, name, user string) testTLS {
+func makeTLS(t *testing.T, root, name, user string, hosts ...string) testTLS {
 	t.Helper()
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -50,7 +50,7 @@ func makeTLS(t *testing.T, root, name, user string) testTLS {
 	}
 	cert := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: user},
 		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(24 * time.Hour),
-		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, DNSNames: []string{"localhost"},
+		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, DNSNames: append([]string{"localhost"}, hosts...),
 		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}}
 	der, err := x509.CreateCertificate(rand.Reader, cert, ca, &key.PublicKey, caKey)
 	if err != nil {

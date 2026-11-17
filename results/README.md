@@ -26,3 +26,6 @@ Publication cleanup replaced paths with `<repo>`, `<home>`, and `<tmp>` labels.
 It did not change measurements, outcomes, test counts, seeds, or hashes.
 The referenced logs and traces are local artifacts and are not included in this repository.
 CI prints fresh reports in its logs and attempts an optional artifact upload.
+
+The [remote storage evidence](remote-storage/README.md) adds S3 faults, native crash boundaries,
+downstream projects, deterministic object faults, three-guest recovery, and gRPC comparisons.

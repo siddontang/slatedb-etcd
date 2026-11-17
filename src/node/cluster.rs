@@ -94,6 +94,18 @@ impl Node {
     }
 
     fn check_membership(&self, request: &C) -> std::result::Result<(), KvError> {
+        let urls = match request {
+            C::Add(member) => &member.peer_ur_ls[..],
+            C::Update(member) => &member.peer_ur_ls[..],
+            _ => &[],
+        };
+        if self.options.require_peer_tls {
+            for url in urls {
+                crate::tls::validate_url(url, true, true).map_err(|_| {
+                    KvError::new(Code::InvalidArgument, "remote peers require an HTTPS URL")
+                })?;
+            }
+        }
         if matches!(request, C::List(_)) {
             return Ok(());
         }

@@ -1,6 +1,6 @@
 # Security policy
 
-This project is experimental local software. It has no supported production release or security
+This project is experimental software. It has no supported production release or security
 maintenance schedule. Do not use it as a Kubernetes backend or assume complete etcd compatibility.
 
 ## Report an issue
@@ -16,7 +16,8 @@ channel.
 
 ## Trust boundaries
 
-All listeners bind to loopback. Local users and processes can still connect to loopback ports.
+Listeners bind to loopback by default. Remote mode requires mutual TLS on separate client and peer
+ports. Local users and processes can still connect to loopback ports.
 The default shared plaintext listener exposes trusted diagnostic and fault controls.
 Those controls, including Raft transport, are outside etcd Auth enforcement.
 Enabling Auth alone does not make that shared listener safe for untrusted local users.
@@ -24,7 +25,8 @@ Enabling Auth alone does not make that shared listener safe for untrusted local 
 Use separate client and peer listeners with mutual peer TLS for identity separation.
 A peer certificate grants access to trusted forwarding and diagnostic controls.
 Keep peer and client CAs separate, and restrict peer private keys to trusted operators.
-Certificate reload, automatic certificate generation, and cross-host deployment remain unsupported.
+Certificate reload and automatic certificate generation remain unsupported.
+Remote operation has controlled three-guest coverage, not independent physical host validation.
 Do not expose the service through a public proxy or port forward.
 
 Passwords use bcrypt. Auth changes invalidate tokens and replicate through Raft.

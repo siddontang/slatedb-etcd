@@ -1,11 +1,13 @@
 pub mod api;
 pub mod auth;
 pub mod cluster;
+mod failpoint;
 pub mod grpc;
 pub mod lease;
 pub mod maintenance;
 pub mod mvcc;
 pub mod node;
+pub mod object;
 pub mod proto;
 pub mod state;
 pub mod storage;

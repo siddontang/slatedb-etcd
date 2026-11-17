@@ -32,6 +32,7 @@ mod tests;
 pub type Response = oneshot::Sender<Result<Value, ApiError>>;
 
 pub enum Event {
+    SubscribeApply(oneshot::Sender<tokio::sync::watch::Receiver<u64>>),
     Authenticated(crate::auth::Credentials, Box<Event>),
     Auth(crate::auth::Command, Response),
     AuthLookup(String, Response),
@@ -82,6 +83,8 @@ pub struct NodeOptions {
     pub join: bool,
     pub client_peers: BTreeMap<u64, String>,
     pub transport: crate::tls::Transport,
+    pub object_store: crate::object::Config,
+    pub require_peer_tls: bool,
 }
 
 struct Pending {
@@ -102,6 +105,7 @@ struct LogTask {
 }
 
 pub struct Node {
+    applied_notify: tokio::sync::watch::Sender<u64>,
     transfers: Vec<(u64, Instant, Response)>,
     published_at: Option<Instant>,
     events: mpsc::Sender<Event>,
@@ -176,7 +180,10 @@ impl Node {
                 options.peers.keys().copied().collect()
             },
         )?;
-        let mut state = StateMachine::open(&options.dir.join("objects")).await?;
+        let mut state = options
+            .object_store
+            .open(&options.dir, &options.cluster_id, options.id)
+            .await?;
         state.quota = options.quota_bytes;
         ensure!(
             state.applied <= storage.commit_index(),
@@ -189,6 +196,17 @@ impl Node {
             for (&id, address) in &options.client_peers {
                 if let Some(member) = state.members.members.get_mut(&id) {
                     member.client_ur_ls = vec![crate::cluster::url(address)];
+                }
+            }
+        }
+        if options.require_peer_tls {
+            ensure!(
+                options.transport.tls.is_some(),
+                "remote peers require a TLS transport"
+            );
+            for member in state.members.members.values() {
+                for address in &member.peer_ur_ls {
+                    crate::tls::validate_url(address, true, true)?;
                 }
             }
         }
@@ -253,6 +271,7 @@ impl Node {
         let worker = Worker::start(state, events.clone(), manual_apply);
         let log_worker = log::Worker::start(storage, manual_apply)?;
         let mut node = Self {
+            applied_notify: tokio::sync::watch::channel(applied.applied).0,
             transfers: vec![],
             published_at: None,
             events,
@@ -545,6 +564,9 @@ impl Node {
                     }
                 }
             }
+            Event::SubscribeApply(response) => {
+                let _ = response.send(self.applied_notify.subscribe());
+            }
             Event::Status(response) => {
                 let _ = response.send(Ok(self.status()?));
             }
@@ -746,6 +768,7 @@ impl Node {
             self.raw.on_entries_fetched(fetch.context);
         }
         if let Some(number) = task.ready {
+            crate::failpoint::hit("raft-before-advance");
             self.raw.on_persist_ready(number);
         }
         if let Some(index) = task.checkpoint {
@@ -861,6 +884,9 @@ impl Node {
             .durable_applied
             .max(completed.state.durable_applied);
         self.state = completed.state;
+        if *self.applied_notify.borrow() != self.state.applied {
+            self.applied_notify.send_replace(self.state.applied);
+        }
         self.state.durable_applied = durable;
         self.apply_busy = false;
 
@@ -1084,6 +1110,11 @@ impl Node {
 
     fn send(&mut self, messages: Vec<Message>) {
         for message in messages {
+            if self.raw.raft.state == StateRole::Leader {
+                crate::failpoint::hit("raft-before-leader-send");
+            } else {
+                crate::failpoint::hit("raft-before-follower-send");
+            }
             let peer = message.to;
             let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
             let sent = !self.blocked.contains(&peer)

@@ -1,0 +1,122 @@
+//go:build failpoints
+
+package compat
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
+)
+
+// Crash real processes at the Rust equivalents of etcd persistence and apply hooks.
+func TestFailpointRecovery(t *testing.T) {
+	points := []string{
+		"wal-before-sync", "wal-after-sync",
+		"raft-before-advance", "raft-before-leader-send", "raft-before-follower-send",
+		"snapshot-before-save", "snapshot-after-save", "apply-before-entry", "apply-after-entry",
+		"checkpoint-before-save", "checkpoint-after-save", "checkpoint-after-gc",
+		"snapshot-before-install", "snapshot-after-install-write", "snapshot-after-install-flush",
+		"compact-before-apply", "compact-after-apply", "watch-before-send", "lease-before-expire",
+	}
+	for _, point := range points {
+		t.Run(point, func(t *testing.T) {
+			c := newCluster(t)
+			leader := c.leader()
+			target := leader%3 + 1
+			if point == "raft-before-leader-send" {
+				target = leader
+			}
+			api := client(t, []string{c.addresses[leader-1]})
+			base := mustCall(t, api, clientv3.OpPut("anchor", "acknowledged")).(*pb.PutResponse)
+			for _, endpoint := range c.addresses {
+				mustCall(t, client(t, []string{endpoint}), clientv3.OpGet("anchor"))
+			}
+			trigger := filepath.Join(c.root, fmt.Sprintf("fault-%d", target))
+			witness := trigger + ".reached"
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if strings.HasPrefix(point, "snapshot-") {
+				c.stop(target)
+				for i := 0; i < 8; i++ {
+					mustCall(t, api, clientv3.OpPut("later", fmt.Sprint(i)))
+				}
+				for id := range c.processes {
+					_, err := c.http(id, "/checkpoint", map[string]any{})
+					require.NoError(t, err)
+				}
+				require.NoError(t, os.WriteFile(trigger, []byte(point), 0600))
+				c.start(target)
+			} else if point == "lease-before-expire" {
+				// Only the leader proposes expiration. Its follower must replay that entry.
+				grant, err := api.Grant(ctx, 2)
+				require.NoError(t, err)
+				_, err = api.Put(ctx, "expiring", "lease", clientv3.WithLease(grant.ID))
+				require.NoError(t, err)
+				require.NoError(t, os.WriteFile(trigger, []byte(point), 0600))
+			} else if point == "watch-before-send" {
+				watcher := client(t, []string{c.addresses[target-1]})
+				stream := watcher.Watch(ctx, "watched", clientv3.WithCreatedNotify())
+				select {
+				case created := <-stream:
+					require.True(t, created.Created)
+				case <-ctx.Done():
+					t.Fatal("watch creation timed out")
+				}
+				require.NoError(t, os.WriteFile(trigger, []byte(point), 0600))
+				mustCall(t, api, clientv3.OpPut("watched", "event"))
+			} else {
+				require.NoError(t, os.WriteFile(trigger, []byte(point), 0600))
+				switch {
+				case strings.HasPrefix(point, "checkpoint-"):
+					_, _ = c.http(target, "/checkpoint", map[string]any{})
+				case strings.HasPrefix(point, "compact-"):
+					_, err := compact(api, base.Header.Revision, true)
+					require.NoError(t, err)
+				default:
+					if point == "raft-before-leader-send" {
+						_, _ = api.Put(ctx, "trigger", "uncertain-on-target")
+					} else {
+						mustCall(t, api, clientv3.OpPut("trigger", "uncertain-on-target"))
+					}
+				}
+			}
+			require.Eventually(t, func() bool {
+				data, err := os.ReadFile(witness)
+				return err == nil && string(data) == point
+			}, 15*time.Second, 20*time.Millisecond, "fault hook was not reached")
+			require.NoError(t, os.Remove(trigger))
+			c.stop(target)
+			c.start(target)
+			c.waitReady()
+			recovered := client(t, []string{c.addresses[target-1]})
+			got := mustCall(t, recovered, clientv3.OpGet("anchor")).(*pb.RangeResponse)
+			require.Len(t, got.Kvs, 1)
+			require.Equal(t, "acknowledged", string(got.Kvs[0].Value))
+			require.GreaterOrEqual(t, got.Header.Revision, base.Header.Revision)
+			mustCall(t, recovered, clientv3.OpPut("after-fault", point))
+			if point == "watch-before-send" {
+				replay := recovered.Watch(ctx, "watched", clientv3.WithRev(base.Header.Revision+1))
+				select {
+				case response := <-replay:
+					require.NoError(t, response.Err())
+					require.Len(t, response.Events, 1)
+					require.Equal(t, "event", string(response.Events[0].Kv.Value))
+				case <-ctx.Done():
+					t.Fatal("watch replay timed out")
+				}
+			}
+			if point == "lease-before-expire" {
+				gone := mustCall(t, recovered, clientv3.OpGet("expiring")).(*pb.RangeResponse)
+				require.Empty(t, gone.Kvs)
+			}
+		})
+	}
+}

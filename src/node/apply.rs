@@ -409,6 +409,7 @@ async fn apply_entries(
         };
         let mut lease_command = None;
         let mut change = change;
+        crate::failpoint::hit("apply-before-entry");
         let reply = match command {
             RaftCommand::Secured { .. } => anyhow::bail!("nested secured command"),
             RaftCommand::Cluster {
@@ -469,6 +470,7 @@ async fn apply_entries(
                 Reply::Encoded(serde_json::to_value(outcome)?)
             }
         };
+        crate::failpoint::hit("apply-after-entry");
         replies.push(AppliedCommand {
             id: command.id().to_owned(),
             change,

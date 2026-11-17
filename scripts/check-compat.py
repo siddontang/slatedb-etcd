@@ -21,6 +21,8 @@ def main():
     parser.add_argument("--tags", default="", help="Go build tags, such as upstream or robustness")
     parser.add_argument("--run", default="", help="Go test name expression")
     parser.add_argument("--all-capabilities", action="store_true")
+    parser.add_argument("--suite", choices=["compat", "downstream"], default="compat")
+    parser.add_argument("--deployment", default="three local service processes; one embedded reference etcd")
     args = parser.parse_args()
     binary = args.binary.resolve()
     command = ["go", "test", "-mod=readonly", "-json", "-count=1", "-timeout=30m"]
@@ -37,14 +39,15 @@ def main():
         "reference_etcd": "3.6.5",
         "client": "go.etcd.io/etcd/client/v3 v3.6.5",
         "go": subprocess.check_output(["go", "version"], text=True).strip(),
-        "deployment": "three local service processes; one embedded reference etcd",
+        "deployment": args.deployment,
+        "suite": args.suite,
         "command": command,
         "profile": "all-capabilities" if args.all_capabilities else "supported-capabilities",
         "log": str(log),
         "tests": [],
     }
     process = subprocess.Popen(
-        command, cwd=root / "tests/compat",
+        command, cwd=root / "tests" / args.suite,
         env=dict(os.environ, SLATEDB_ETCD_BINARY=str(binary),
                  SLATEDB_UPSTREAM_ALL="1" if args.all_capabilities else "0"),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,

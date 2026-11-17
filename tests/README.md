@@ -141,3 +141,21 @@ and restart with old bootstrap addresses.
 Snapshot tests verify chunk accounting, SHA-256, new-cluster restore, and stale-token rejection.
 They reject damaged backups and existing restore directories.
 DST pauses apply between permission revocation and a queued write, then restores the follower.
+
+## Remote storage, native crash hooks, and downstream projects
+
+See [remote storage](../docs/remote-storage.md) for S3 and disposable guest commands.
+The [fault map](upstream/fault-mapping.md) accounts for all named gofail hooks at the pinned etcd
+version. It distinguishes equivalent native boundaries, imported behavior, and remaining gaps.
+
+```sh
+python3 scripts/check-s3.py --output results/ci/s3.json
+scripts/cargo.sh build --locked --release --features fault-injection
+python3 scripts/check-compat.py --tags failpoints --run '^TestFailpointRecovery$' \
+  --output results/ci/failpoints.json
+python3 scripts/check-compat.py --suite downstream --output results/ci/downstream.json
+```
+
+Do not enable `fault-injection` in a deployment build.
+The test-only file selector can exit a process.
+Test credentials and guest disks are temporary. The drivers do not use existing database volumes.

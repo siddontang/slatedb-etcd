@@ -22,6 +22,7 @@ struct ReadRequest {
 struct Simulation {
     seed: u64,
     root: tempfile::TempDir,
+    stores: BTreeMap<u64, std::sync::Arc<crate::object::faults::FaultStore>>,
     nodes: BTreeMap<u64, Node>,
     links: BTreeMap<(u64, u64), mpsc::Receiver<Message>>,
     messages: Vec<Message>,
@@ -60,6 +61,7 @@ impl Simulation {
         let mut sim = Self {
             seed,
             root: tempfile::tempdir().unwrap(),
+            stores: BTreeMap::new(),
             nodes: BTreeMap::new(),
             links: BTreeMap::new(),
             messages: vec![],
@@ -106,10 +108,23 @@ impl Simulation {
             senders.insert(peer, tx);
             self.links.insert((id, peer), rx);
         }
+        let store = self
+            .stores
+            .entry(id)
+            .or_insert_with(|| {
+                let path = self.root.path().join(id.to_string()).join("objects");
+                std::fs::create_dir_all(&path).unwrap();
+                std::sync::Arc::new(crate::object::faults::FaultStore::new(std::sync::Arc::new(
+                    slatedb::object_store::local::LocalFileSystem::new_with_prefix(path).unwrap(),
+                )))
+            })
+            .clone();
         let node = Node::open_with_transport(
             NodeOptions {
                 client_peers: BTreeMap::new(),
                 transport: crate::tls::Transport::default(),
+                require_peer_tls: false,
+                object_store: crate::object::Config::Test(store, "state".into()),
                 strict_reconfiguration: false,
                 join: false,
                 quota_bytes: 0,
@@ -428,6 +443,138 @@ impl Simulation {
         self.drive().await;
     }
 
+    async fn object_faults(&mut self) {
+        use crate::object::faults::{FAIL_GET, FAIL_PUT, LOSE_PUT_REPLY, PAUSE_PUT};
+        let id = self.choose(3) as u64 + 1;
+        let store = self.stores[&id].clone();
+        let node = &self.nodes[&id];
+        let before = node.raw.store().snapshot_index();
+        let first = node.raw.store().first_index().unwrap();
+        store.set(PAUSE_PUT);
+        let index = node.state.applied;
+        let job = tokio::spawn(node.worker.state().snapshot_job().unwrap());
+        tokio::time::timeout(Duration::from_secs(10), store.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        self.trace.push(format!("pause object put {id}"));
+        // Raft can commit and ReadIndex can complete while the checkpoint waits for S3.
+        self.propose().await;
+        for _ in 0..100 {
+            self.deliver(false).await;
+        }
+        self.read().await;
+        assert!(!job.is_finished());
+        assert_eq!(self.nodes[&id].raw.store().snapshot_index(), before);
+        assert_eq!(self.nodes[&id].raw.store().first_index().unwrap(), first);
+        store.release.add_permits(1);
+        let data = job.await.unwrap().unwrap();
+        if self.choose(2) == 0 {
+            self.nodes
+                .get_mut(&id)
+                .unwrap()
+                .handle(
+                    Event::SnapshotBuilt {
+                        index,
+                        result: Ok(data),
+                    },
+                    &mut vec![],
+                )
+                .await
+                .unwrap();
+            self.drive().await;
+            self.trace.push(format!("publish object checkpoint {id}"));
+        } else {
+            self.trace
+                .push(format!("drop object checkpoint completion {id}"));
+        }
+        self.stop(id);
+        store.set(FAIL_GET);
+        assert!(StateMachine::open_store(store.clone(), "state")
+            .await
+            .is_err());
+        self.trace.push(format!("fail object recovery read {id}"));
+        store.set(0);
+        self.start(id).await;
+        for _ in 0..25 {
+            for member in 1..=3 {
+                self.tick(member).await;
+            }
+            for _ in 0..30 {
+                self.deliver(false).await;
+            }
+        }
+        // A successful PUT with a lost reply must keep the same immutable object.
+        self.propose().await;
+        for _ in 0..100 {
+            self.deliver(false).await;
+        }
+        let before = self.nodes[&id].raw.store().snapshot_index();
+        while let Ok(permit) = store.entered.try_acquire() {
+            permit.forget();
+        }
+        store.set(LOSE_PUT_REPLY);
+        self.nodes[&id]
+            .worker
+            .state()
+            .snapshot_job()
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(self.nodes[&id].raw.store().snapshot_index(), before);
+        assert!(store.entered.try_acquire().is_ok());
+        self.trace
+            .push(format!("recover lost object put reply {id}"));
+        self.propose().await;
+        for _ in 0..100 {
+            self.deliver(false).await;
+        }
+        let before = self.nodes[&id].raw.store().snapshot_index();
+        let first = self.nodes[&id].raw.store().first_index().unwrap();
+        store.set(FAIL_PUT);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.nodes[&id].worker.state().snapshot_job().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        assert_eq!(self.nodes[&id].raw.store().snapshot_index(), before);
+        assert_eq!(self.nodes[&id].raw.store().first_index().unwrap(), first);
+        self.trace
+            .push(format!("fail object checkpoint without log GC {id}"));
+        self.stop(id);
+        store.set(0);
+        self.start(id).await;
+        for _ in 0..25 {
+            for member in 1..=3 {
+                self.tick(member).await;
+            }
+            for _ in 0..30 {
+                self.deliver(false).await;
+            }
+        }
+        for (key, value) in &self.acknowledged {
+            let outcome = self.nodes[&id]
+                .worker
+                .state()
+                .read_etcd(&RequestOp {
+                    request: Some(Op::RequestRange(RangeRequest {
+                        key: key.as_bytes().to_vec(),
+                        ..Default::default()
+                    })),
+                })
+                .await
+                .unwrap();
+            let Some(Resp::ResponseRange(response)) = outcome.result.unwrap().response else {
+                panic!("expected range");
+            };
+            assert_eq!(response.kvs.len(), 1);
+            assert_eq!(response.kvs[0].value, value.as_bytes());
+        }
+    }
+
     async fn lease(&mut self, lease: LeaseCommand) {
         let leader = self.leader().unwrap();
         let (tx, mut rx) = oneshot::channel();
@@ -669,6 +816,7 @@ impl Simulation {
         let generation = sim.nodes[&sim.leader().unwrap()].state.leases[&77].generation;
         sim.lease(LeaseCommand::KeepAlive { id: 77 }).await;
         sim.lease(LeaseCommand::Expire { id: 77, generation }).await;
+        sim.object_faults().await;
         let failed = sim.leader().unwrap();
         sim.expected_log_failure = Some(failed);
         sim.nodes.get_mut(&failed).unwrap().log_fail = true;

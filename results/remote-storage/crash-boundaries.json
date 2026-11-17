@@ -1,0 +1,149 @@
+{
+  "created_at": "2026-11-17T19:34:40.353201+00:00",
+  "binary_sha256": "ad50bd9bba2c328a53abd6bb7f67927d3fbdb85cdb674c199eb2de1fc8a001d6",
+  "reference_etcd": "3.6.5",
+  "client": "go.etcd.io/etcd/client/v3 v3.6.5",
+  "go": "go version go1.25.6 darwin/arm64",
+  "deployment": "three local service processes; one embedded reference etcd",
+  "suite": "compat",
+  "command": [
+    "go",
+    "test",
+    "-mod=readonly",
+    "-json",
+    "-count=1",
+    "-timeout=30m",
+    "-tags",
+    "failpoints",
+    "-run",
+    "^TestFailpointRecovery$|^TestClientFailoverWithTLS$",
+    "./..."
+  ],
+  "profile": "supported-capabilities",
+  "log": "<repo>/tmp/test-results/failpoints-final.jsonl",
+  "tests": [
+    {
+      "name": "TestClientFailoverWithTLS/client-before-failure",
+      "result": "pass",
+      "seconds": 3.17
+    },
+    {
+      "name": "TestClientFailoverWithTLS/client-after-failure",
+      "result": "pass",
+      "seconds": 2.73
+    },
+    {
+      "name": "TestClientFailoverWithTLS",
+      "result": "pass",
+      "seconds": 5.9
+    },
+    {
+      "name": "TestFailpointRecovery/wal-before-sync",
+      "result": "pass",
+      "seconds": 1.62
+    },
+    {
+      "name": "TestFailpointRecovery/wal-after-sync",
+      "result": "pass",
+      "seconds": 1.81
+    },
+    {
+      "name": "TestFailpointRecovery/raft-before-advance",
+      "result": "pass",
+      "seconds": 2.19
+    },
+    {
+      "name": "TestFailpointRecovery/raft-before-leader-send",
+      "result": "pass",
+      "seconds": 2.2
+    },
+    {
+      "name": "TestFailpointRecovery/raft-before-follower-send",
+      "result": "pass",
+      "seconds": 1.58
+    },
+    {
+      "name": "TestFailpointRecovery/snapshot-before-save",
+      "result": "pass",
+      "seconds": 1.58
+    },
+    {
+      "name": "TestFailpointRecovery/snapshot-after-save",
+      "result": "pass",
+      "seconds": 2.12
+    },
+    {
+      "name": "TestFailpointRecovery/apply-before-entry",
+      "result": "pass",
+      "seconds": 1.71
+    },
+    {
+      "name": "TestFailpointRecovery/apply-after-entry",
+      "result": "pass",
+      "seconds": 1.57
+    },
+    {
+      "name": "TestFailpointRecovery/checkpoint-before-save",
+      "result": "pass",
+      "seconds": 1.38
+    },
+    {
+      "name": "TestFailpointRecovery/checkpoint-after-save",
+      "result": "pass",
+      "seconds": 1.27
+    },
+    {
+      "name": "TestFailpointRecovery/checkpoint-after-gc",
+      "result": "pass",
+      "seconds": 1.47
+    },
+    {
+      "name": "TestFailpointRecovery/snapshot-before-install",
+      "result": "pass",
+      "seconds": 1.2
+    },
+    {
+      "name": "TestFailpointRecovery/snapshot-after-install-write",
+      "result": "pass",
+      "seconds": 1.68
+    },
+    {
+      "name": "TestFailpointRecovery/snapshot-after-install-flush",
+      "result": "pass",
+      "seconds": 1.29
+    },
+    {
+      "name": "TestFailpointRecovery/compact-before-apply",
+      "result": "pass",
+      "seconds": 1.37
+    },
+    {
+      "name": "TestFailpointRecovery/compact-after-apply",
+      "result": "pass",
+      "seconds": 1.07
+    },
+    {
+      "name": "TestFailpointRecovery/watch-before-send",
+      "result": "pass",
+      "seconds": 1.16
+    },
+    {
+      "name": "TestFailpointRecovery/lease-before-expire",
+      "result": "pass",
+      "seconds": 3.67
+    },
+    {
+      "name": "TestFailpointRecovery",
+      "result": "pass",
+      "seconds": 31.93
+    }
+  ],
+  "counts": {
+    "pass": 23
+  },
+  "leaf_counts": {
+    "pass": 21
+  },
+  "passed": true,
+  "complete": true
+}

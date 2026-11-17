@@ -44,9 +44,17 @@ impl StateMachine {
     pub async fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let object_store = Arc::new(LocalFileSystem::new_with_prefix(dir)?);
+        Self::open_store(object_store, "state").await
+    }
+
+    pub async fn open_store(
+        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+        prefix: &str,
+    ) -> Result<Self> {
         let mut settings = Settings {
             wal_enabled: false,
             flush_interval: None,
+            object_store_max_retries: Some(3),
             manifest_poll_interval: Duration::from_millis(100),
             ..Settings::default()
         };
@@ -58,8 +66,8 @@ impl StateMachine {
                 worker.compactions_poll_interval = Duration::from_millis(100);
             }
         }
-        let admin = slatedb::admin::Admin::builder("state", object_store.clone()).build();
-        let db = Db::builder("state", object_store)
+        let admin = slatedb::admin::Admin::builder(prefix, object_store.clone()).build();
+        let db = Db::builder(prefix, object_store)
             .with_settings(settings)
             .build()
             .await?;
@@ -448,6 +456,7 @@ impl StateMachine {
                 batch.put(b"etcd/hash-cache", serde_json::to_vec(&hashes)?);
             }
         }
+        crate::failpoint::hit("compact-before-apply");
         batch.put(APPLIED, index.to_be_bytes());
         self.db
             .write_with_options(batch, &WriteOptions { seqnum: index })
@@ -460,6 +469,7 @@ impl StateMachine {
                 self.durable_applied = self.applied;
             }
         }
+        crate::failpoint::hit("compact-after-apply");
         Ok(Outcome { result })
     }
 
@@ -482,6 +492,10 @@ impl StateMachine {
             "non-contiguous state machine apply"
         );
         use crate::lease::LeaseCommand as L;
+        if matches!(command, L::Expire { .. }) {
+            crate::failpoint::hit("lease-before-expire");
+        }
+
         let corrupt = self.alarms.iter().any(|a| a.alarm == 2)
             && matches!(
                 command,
@@ -620,12 +634,15 @@ impl StateMachine {
             );
             batch.put(key, value);
         }
+        crate::failpoint::hit("snapshot-before-install");
         batch.put(APPLIED, index.to_be_bytes());
         self.db
             .write_with_options(batch, &WriteOptions { seqnum: index })
             .await?;
+        crate::failpoint::hit("snapshot-after-install-write");
         // The durable Raft snapshot lets a restart repeat this atomic replacement.
         self.db.flush().await?;
+        crate::failpoint::hit("snapshot-after-install-flush");
         self.applied = index;
         self.durable_applied = index;
         self.revision = read_revision(&self.db).await?;
