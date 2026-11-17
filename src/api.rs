@@ -43,6 +43,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/debug/partition", post(partition))
         .route("/debug/snapshot-delay", post(snapshot_delay))
         .route("/debug/apply-delay", post(apply_delay))
+        .route("/debug/log-fault", post(log_fault))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
 }
@@ -145,4 +146,19 @@ async fn apply_delay(
     Json(delay): Json<SnapshotDelay>,
 ) -> Result<Json<Value>, ApiError> {
     dispatch(state, |tx| Event::ApplyDelay(delay.delay_ms, tx)).await
+}
+
+#[derive(Deserialize)]
+struct LogFault {
+    #[serde(default)]
+    delay_ms: u64,
+    #[serde(default)]
+    fail: bool,
+}
+
+async fn log_fault(
+    State(state): State<ApiState>,
+    Json(fault): Json<LogFault>,
+) -> Result<Json<Value>, ApiError> {
+    dispatch(state, |tx| Event::LogFault(fault.delay_ms, fault.fail, tx)).await
 }

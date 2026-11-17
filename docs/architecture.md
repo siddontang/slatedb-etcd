@@ -2,7 +2,7 @@
 
 This document defines the storage contract, execution model, and project roadmap.
 The baseline is commit `0b1509e`, which added Watch and Lease support.
-Phase 1, described below, is implemented in this change.
+Commit `fc967ed` completed phase 1. This change adds ReadIndex and separates Raft log I/O.
 Sections marked as targets describe work that is not implemented yet.
 
 ## Purpose and scope
@@ -44,7 +44,8 @@ The diagnostic JSON API uses a separate keyspace from the etcd API.
 | Component | Responsibility |
 | --- | --- |
 | gRPC service | Validate requests, forward leader requests, and manage streams |
-| Raft owner | Run elections, persist Ready, send messages, and track commit |
+| Raft owner | Run elections, stage Ready, send permitted messages, and track completion |
+| Log worker | Persist Ready, publish snapshots, reclaim files, and collect disk statistics |
 | raft-engine | Store log entries, terms, votes, commit position, and recovery snapshots |
 | Apply owner | Execute committed entries in order and maintain state metadata |
 | SlateDB | Store current values, history, event journals, leases, and the apply marker |
@@ -84,11 +85,11 @@ See [the original experiment](../RESULTS.md#failure-found-during-development).
 
 The service must preserve these rules across every implementation phase:
 
-1. Persist Raft entries, terms, and votes before dependent messages leave the node.
+1. Persist terms, votes, and entries before sending dependent vote or append acknowledgements.
 2. Persist the commit position before submitting entries to the state machine.
 3. Apply a committed prefix in index order. Never apply an uncommitted entry.
 4. Store each state change and its apply marker in one SlateDB batch.
-5. Reply with success only after quorum commit and local apply.
+5. Reply with write success only after quorum commit, local log persistence, and local apply.
 6. Advance RawNode's applied position only after the apply owner reports completion.
 7. Reclaim log entries only after a durable snapshot covers them.
 8. Stop the node after a state storage failure. Do not continue from uncertain state.
@@ -104,7 +105,8 @@ A timeout or leader change can leave a request's result unknown. There is no ret
 
 ## Apply isolation design
 
-The Raft owner retains RawNode, raft-engine, peer transport, and pending client proposals.
+The Raft owner retains RawNode, an in-memory log view, peer transport, and pending proposals.
+A dedicated operating-system thread owns raft-engine and all steady-state log I/O.
 One apply worker owns StateMachine. State reads and mutations run through that owner.
 The worker executes committed batches, snapshot installation, local reads, and Watch scans.
 It also pins checkpoints. A separate task builds each pinned snapshot.
@@ -113,7 +115,10 @@ It also pins checkpoints. A separate task builds each pinned snapshot.
 flowchart LR
     RPC[Client requests] --> Raft[Raft owner]
     Peers[Peer messages and ticks] <--> Raft
-    Raft --> Log[Durable Raft log]
+    Raft --> Cache[In-memory log view]
+    Raft -->|Ordered jobs| IO[Log I/O thread]
+    IO --> Log[Durable Raft log]
+    IO -->|Durable completion| Raft
     Raft -->|Bounded work| Apply[One apply worker]
     Apply --> DB[SlateDB]
     Apply -->|Completion and applied metadata| Raft
@@ -138,22 +143,73 @@ It never treats a submitted batch as completed work.
 Client replies must remain tied to proposal IDs. A role change can invalidate a pending reply.
 
 Local reads use the worker's applied state. They may lag durable commit.
-Linearizable reads continue to use replicated log entries in this phase.
-ReadIndex is a later change with its own quorum and apply barriers.
-That design must confirm leadership through a quorum and obtain a read index.
-It must then wait for the worker to apply through that index before reading state.
-A local commit counter alone cannot replace the quorum confirmation.
+ReadIndex now serves linearizable Range requests and transactions that contain only reads.
+Both transaction branches must contain only reads, including nested transactions.
+Mutating transactions, Lease operations, and the diagnostic JSON API retain their log path.
 Queued reads must receive service between apply batches, so continuous writes cannot starve them.
 
 A slow worker must delay client completion without delaying Raft heartbeats.
 Worker failure or panic must terminate the node. Node shutdown must cancel the worker.
 The deterministic driver executes the same worker jobs under an explicit scheduler.
 
+## ReadIndex protocol
+
+The receiving replica forwards linearizable reads to the leader.
+The leader submits a unique context through raft-rs Safe ReadIndex.
+The context includes a process nonce and a counter, so restart cannot reuse an old context.
+Raft confirms leadership through a quorum and returns the associated committed index.
+It also requires a committed entry in the leader's current term.
+
+The owner waits for local application through that index before scheduling the state read.
+Local application already requires a durable local commit position.
+The apply worker evaluates the entire read-only transaction against one applied state view.
+The owner checks the term and leadership again before returning the result.
+Leadership loss, a five-second timeout, or client cancellation removes the pending request.
+At most 64 ReadIndex requests can wait. These requests do not append log entries.
+
+Serializable reads still use the local applied prefix without quorum confirmation.
+A local commit counter cannot replace the ReadIndex quorum exchange.
+
+## Raft log I/O protocol
+
+The owner stages each Ready in its memory view before calling `advance_append_async`.
+This makes entries and terms readable through the synchronous Raft Storage interface.
+A FIFO worker persists Ready updates, checkpoint publication, log reclamation, and disk statistics.
+The owner calls `on_persist_ready` only after it receives the matching completion.
+It then releases the associated persisted messages and ReadIndex states.
+Errors or worker panic stop the node.
+
+Raft permits leaders to send replication messages before their own local persistence completes.
+Follower vote and append acknowledgements remain behind their persistence barrier.
+Ordinary HTTP receipt only confirms message delivery. It does not confirm Raft persistence.
+Holding that receipt behind disk I/O would block the peer's subsequent heartbeat responses.
+Snapshot HTTP receipt remains behind durable snapshot storage, before state installation.
+
+The queue contains at most 64 jobs and uses a 16 MiB admission target.
+One Ready or full snapshot can exceed that byte target.
+The owner rejects new proposals when this queue or the apply backlog reaches its admission limit.
+A worker failure stops progress instead of reporting an uncertain write as durable.
+Shutdown cancels queued work and injected delays. A running kernel I/O call must finish before
+its thread releases the storage lock.
+
+The memory view contains the entire retained Raft log.
+Startup loads those entries before serving requests. Durable checkpoints remove covered entries.
+This avoids synchronous log reads in the Raft loop, but memory grows with the retained log.
+Disabling checkpoints removes that reclamation path. The cache has no independent memory quota.
+A bounded cache with asynchronous entry fetch is future work for larger deployments.
+
+Status separates `raft_commit_index` from durable `commit_index`.
+It also exposes `cached_last_log_index`, `log_busy`, queued log jobs and bytes, and pending reads.
+Snapshot installation waits if the memory view contains a snapshot that is not durable yet.
+Entry selection pauses until that snapshot becomes durable.
+Apply cannot select entries from a cache prefix that the new snapshot removed.
+
 ## Snapshot order and recovery
 
-A local checkpoint pins the exact applied view and its index.
+A checkpoint request waits for the Raft commit index observed when the request arrived.
+It then pins the exact applied view and its index.
 The builder flushes SlateDB, then serializes that pinned view.
-The Raft owner saves the snapshot and truncates its covered log prefix in one synchronous batch.
+The log worker saves the snapshot and truncates its covered log prefix in one synchronous batch.
 Only then can raft-engine reclaim obsolete log files.
 
 The current snapshot includes all logical state and duplicates that data in raft-engine.
@@ -221,17 +277,22 @@ Local JSON benchmarks do not establish remote-store latency or cost.
 | Phase | Deliverable | Exit criterion |
 | --- | --- | --- |
 | 1 | Isolate state apply and reads from Raft | Slow apply preserves heartbeats and reply ordering |
-| 2 | ReadIndex and bounded storage work | Reads remain correct under lag and leader loss |
+| 2 | ReadIndex and a separate log I/O thread | Reads and persistence preserve their barriers |
 | 3 | TLS, Auth, membership, and Maintenance | Matching upstream cases run without skips |
 | 4 | Remote store and cross-host tests | Recovery and measured costs use real storage |
 | 5 | Object-reference snapshots and lease indexes | Bound transfer and scan work for large state |
 | 6 | Wider fault injection and simulation | Reproduce storage and clock fault regressions |
 
-Phase 1 does not move raft-engine persistence off the Raft owner.
-A slow local log fsync can still delay that owner. Separate log I/O needs another ordering design.
-The apply worker is a Tokio task. It shares the runtime with Raft and storage background work.
-The Raft owner no longer awaits state work. This does not provide CPU or disk isolation.
-It also does not add ReadIndex, remote storage, membership changes, or a new snapshot format.
+Phases 1 and 2 now separate state work and log I/O from the Raft owner.
+The apply worker remains a Tokio task and shares CPU and disk resources with other process work.
+Large scans, full snapshots, and lease metadata copies still need bounded work and memory controls.
+Remote storage, membership changes, and object-reference snapshots remain future work.
+
+The phase 2 tests cover quorum loss, apply lag, read cancellation, and unchanged log write counts.
+They cover delayed log writes, failed writes, delayed checkpoint publication, and worker failure.
+DST controls log execution and completion separately from state application.
+It injects a disk write failure, restarts that node, and checks persistence-dependent messages.
+Read histories must contain every write acknowledged before each read began.
 
 The phase 1 tests cover:
 
@@ -246,12 +307,15 @@ The phase 1 tests cover:
 Later fault coverage must include slow and failed object writes, disk exhaustion, corruption,
 interrupted installation, clock changes, and rolling upgrades.
 DST should control apply completion and lease time before it claims full time determinism.
-Current DST does not control the operating system, disk completion, or SlateDB background work.
+Current DST controls log job execution and completion delivery through the real storage executor.
+It does not simulate partial sector writes, operating-system scheduling, or SlateDB background work.
 
 ## Implementation and evidence
 
 - [Node and Raft integration](../src/node.rs)
 - [Apply worker and bounded jobs](../src/node/apply.rs)
+- [Log I/O worker and memory view](../src/node/log.rs)
+- [ReadIndex request lifecycle](../src/node/read.rs)
 - [Persistent Raft storage](../src/storage.rs)
 - [State machine and snapshots](../src/state.rs)
 - [MVCC](../src/mvcc.rs), [Watch](../src/watch.rs), and [Lease](../src/lease.rs)

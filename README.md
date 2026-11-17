@@ -18,7 +18,7 @@ The [original PoC results](RESULTS.md) describe measurements before this reposit
 
 The same port serves HTTP diagnostics and plaintext gRPC. No separate client port is required.
 Any replica accepts client requests. Followers forward writes and linearizable reads to the leader.
-Serializable Range requests read the local replica. Linearizable reads currently enter the Raft log.
+Serializable Range requests read the local replica. Linearizable reads use Safe ReadIndex.
 A read-only Txn also stays local when both branches contain only serializable Range operations.
 
 Supported behavior:
@@ -157,9 +157,9 @@ traffic in both the receive and send paths. Send `{"blocked":[]}` to restore tra
 ## Commit and recovery rules
 
 Each node persists Raft entries, terms, and votes with a non-empty synchronous raft-engine batch.
-The baseline persists before sending all Ready messages, including those Raft permits it to send
-early. It also persists the commit index before applying entries. This is conservative and leaves
-room to overlap leader disk I/O with replication later.
+A dedicated log thread persists these batches. Leader replication can overlap local disk I/O.
+Vote and append acknowledgements wait for their dependent writes.
+The node also persists the commit index before applying entries.
 
 The leader replies only after quorum commit and local apply. Followers apply the same committed
 commands in order. Each command updates its business keys and `meta/applied` in one SlateDB batch.
@@ -167,7 +167,7 @@ The SlateDB sequence number is the Raft index. Even an empty Raft entry advances
 This index is not an etcd revision.
 
 Reads in `/kv` enter the Raft log as barriers. This provides a simple linearizable read path, but
-adds log writes. A later implementation can use ReadIndex and an apply barrier instead.
+adds log writes. The etcd gRPC read path uses ReadIndex and an apply barrier.
 
 On restart, the node reads the apply marker from SlateDB. It installs a newer durable Raft snapshot
 if necessary, then replays committed log entries after that marker. It never treats an in-memory
@@ -186,10 +186,11 @@ is safe: startup can repeat the state replacement from the durable snapshot payl
 
 Full snapshots deliberately duplicate state in raft-engine. This makes recovery independent of
 uncopied local object files, but limits the PoC to small data sets. Snapshots use the peer HTTP body
-limit of 64 MiB. Snapshot creation runs in the background. Snapshot persistence still runs on the
-Raft owner and can raise tail latency.
+limit of 64 MiB. Snapshot creation runs in the background.
+A dedicated log I/O thread persists snapshots.
+Slow persistence can still raise client tail latency.
 A separate apply task owns SlateDB, installs snapshots, and executes committed state changes.
-Production use still needs bounded snapshot transfer and separate log I/O.
+Production use still needs bounded snapshot transfer and bounded retained-log memory.
 
 The local PoC polls compaction and manifest updates every 100 ms. The default slower polling caused
 L0 backpressure during repeated checkpoints in an earlier run. That run is retained in
@@ -204,7 +205,8 @@ writers share a manifest. A shared SST design needs a separate ownership and ref
 
 ## Raft and apply execution
 
-The Raft owner persists and replicates entries while one apply task owns SlateDB.
+The Raft owner stages and replicates entries. A dedicated thread persists them in raft-engine.
+One apply task owns SlateDB.
 Only worker completion advances `applied_index` or permits a successful write response.
 Committed work stays in the durable log until the worker can accept it.
 A batch has at most 32 entries and a 512 KiB target. One larger entry can exceed the byte target.
@@ -214,13 +216,35 @@ Local reads receive service between entry batches. They can lag durable commit.
 The owner queues at most 64 local reads and 64 checkpoint requests.
 It rejects new proposals at 1,024 committed but unapplied entries.
 Worker failure or panic stops the node. Shutdown cancels the worker and its snapshot builder.
-Raft log persistence and checkpoint publication still use synchronous local storage on the owner.
+The log thread performs steady-state disk I/O, file reclamation, and disk statistics.
+The Raft owner uses an in-memory copy of the retained log.
+Checkpoints reclaim that cache; it has no independent memory quota.
 The apply task shares the process runtime; this change does not isolate CPU or disk resources.
 
 Status reports `apply_lag`, `apply_busy`, `apply_target`, and `queued_state_reads`.
 `POST /debug/apply-delay` accepts `{"delay_ms":2500}` to delay entry apply and snapshot
 installation.
 This loopback test hook has a five-second limit. Set the delay to zero to restore normal operation.
+
+Linearizable Range requests and read-only transactions use Safe ReadIndex.
+The leader confirms a quorum, waits for local apply through the read index, then runs the read.
+Both branches of nested transactions must contain only reads.
+Leadership loss, timeout, or cancellation removes the pending read. At most 64 reads can wait.
+These reads do not append log entries. Serializable reads remain local and can return older state.
+
+Log work uses a FIFO queue with 64 jobs and a 16 MiB admission target.
+One Ready or full snapshot can exceed the target. New proposals stop at the queue limit.
+Raft advances durable progress and releases dependent messages only after log completion.
+Leader replication can run before local persistence, as permitted by raft-rs.
+Ordinary HTTP receipt confirms delivery; snapshot receipt waits for durable snapshot storage.
+
+Status separates `raft_commit_index`, durable `commit_index`, and `applied_index`.
+It also reports `cached_last_log_index`, `log_busy`, `queued_log_jobs`, `queued_log_bytes`,
+and `pending_read_indexes`.
+`POST /debug/log-fault` accepts `{"delay_ms":2500,"fail":false}` for local fault tests.
+The delay has a five-second limit. `fail=true` stops the node on its next log write.
+Set both fields to zero or false to clear future injected faults.
+Shutdown cancels queued work and injected delays. An active kernel I/O call cannot be cancelled.
 
 ## MVCC storage and recovery
 
@@ -288,7 +312,7 @@ Lease key lookup and revocation scan current keys. Large leases can delay the ap
 
 ## Next steps
 
-1. Add ReadIndex-based linearizable reads and separate Raft log I/O.
+1. Bound retained-log memory with asynchronous entry fetch and a cache quota.
 2. Bound compaction work and range scans, and use checkpoint references for large snapshots.
 3. Add lease TTL checkpoints and a key index for leases. Bound Watch catch-up work.
 4. Add membership changes, TLS, authentication, quotas, maintenance APIs, and operational metrics.

@@ -7,7 +7,7 @@ The test host uses ARM64 macOS. All three service replicas share one host and di
 Tested release binary SHA-256:
 
 ```text
-fee4428d466088964ab49e24a67e0dfd6bdc50f4cdcbb441ba064d630c83552e
+a6647ba35ba4d1c1060a046beffc483b0372478bfed1175c012c52549ed2fad6
 ```
 
 ## Results
@@ -21,11 +21,12 @@ fee4428d466088964ab49e24a67e0dfd6bdc50f4cdcbb441ba064d630c83552e
 | Watch stream control checks against real etcd | 2 passed |
 | Watch and Lease process and stream suites | 4 passed |
 | Apply isolation and backlog recovery suites | 3 passed |
+| ReadIndex and log I/O fault suites | 5 passed |
 | Official client recovery and concurrency suites | 4 passed |
 | Fixed API fuzz corpus | 3 seeds passed |
 | Bounded API fuzz run | 10 completed inputs passed |
-| Supported profile with upstream common tests | 157 leaf tests passed; 73 skipped |
-| Rust node, state, and storage recovery tests | 17 passed |
+| Supported profile with upstream common tests | 162 leaf tests passed; 73 skipped |
+| Rust node, state, and storage recovery tests | 23 passed |
 | Original process fault scenarios | 8 passed |
 | Native etcd model with process faults | 4 campaigns passed |
 | Jepsen register and Elle append checks | Both checkers passed all 4 campaigns |
@@ -55,6 +56,10 @@ A minority cannot acknowledge a renewal. A stale expiry command cannot delete a 
 Apply isolation tests delay state work beyond an election timeout without losing the leader.
 They check reply ordering, committed backlog recovery, and peer progress during snapshot
 installation.
+ReadIndex tests check quorum loss, delayed apply, term changes, and bounded pending requests.
+Range requests and nested read-only transactions leave log indexes and sync counts unchanged.
+Log tests delay writes and checkpoint publication without losing the leader.
+They check failed writes, restart before completion delivery, and worker shutdown.
 
 The process campaigns inject a leader partition, leader kill, leader pause, or full cluster restart.
 Traffic continues during each fault. Final reads check state after recovery.
@@ -91,8 +96,10 @@ It is not a claim that every upstream test passed or every fault was reproduced.
 DST uses real node storage with a simulated transport and logical Raft ticks.
 It requires repeatable event traces and checks acknowledged values after recovery.
 It also checks retained lease generations and complete Watch journals on each replica.
-The scheduler can pause apply jobs while it continues Raft message delivery.
-It does not control lease wall-clock expiry, operating system threads, or storage completion.
+The scheduler controls apply jobs, log execution, and log completion delivery.
+It injects a failed log write, restarts the node, and checks dependent vote and append messages.
+Each successful read must include writes acknowledged before that read began.
+It does not control lease wall-clock expiry, operating-system threads, or partial sector writes.
 SlateDB background scheduling remains outside its control.
 
 The Jepsen integration uses real checkers with a local process driver.
@@ -101,7 +108,8 @@ Tests also exclude cross-host faults, object-store outages, power loss, and roll
 
 Historical reads and logical compaction scan history on the apply worker.
 Large scans can delay state reads and write completion. Physical SST reclamation stays asynchronous.
-Raft log fsync and snapshot publication still run on the Raft owner.
+A separate log thread handles fsync, snapshot publication, and disk statistics.
+The Raft owner keeps the full retained log in memory; the cache has no independent memory quota.
 Snapshot transfers retain the 64 MiB peer limit.
 See [storage limits](README.md#mvcc-storage-and-recovery).
 

@@ -52,6 +52,7 @@ impl Header {
 
 pub(super) enum Query {
     Read(RequestOp, Response),
+    Linear(RequestOp, Vec<u8>),
     Watch(
         crate::proto::etcdserverpb::WatchCreateRequest,
         bool,
@@ -64,6 +65,7 @@ pub(super) enum Query {
 impl Query {
     pub fn reject(self, error: ApiError) {
         let response = match self {
+            Self::Linear(..) => unreachable!("linear reads wait for queue capacity"),
             Self::Read(_, response) | Self::Watch(_, _, _, response) | Self::Local(_, response) => {
                 response
             }
@@ -99,6 +101,10 @@ pub(super) struct AppliedCommand {
 }
 
 pub(super) enum Output {
+    Linear {
+        id: Vec<u8>,
+        value: Value,
+    },
     Entries(Vec<AppliedCommand>),
     Snapshot,
     Query {
@@ -188,6 +194,14 @@ impl Executor {
                 Output::Snapshot
             }
             Job::Query(query) => match query {
+                Query::Linear(request, id) => {
+                    let mut outcome = self.state.read_etcd(&request).await?;
+                    work.header.outcome(&mut outcome);
+                    Output::Linear {
+                        id,
+                        value: serde_json::to_value(outcome)?,
+                    }
+                }
                 Query::Read(request, response) => {
                     let mut outcome = self.state.read_etcd(&request).await?;
                     work.header.outcome(&mut outcome);

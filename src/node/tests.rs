@@ -165,6 +165,7 @@ async fn future_checkpoint_and_automatic_checkpoints_do_not_stop_apply() {
         .unwrap();
     for _ in 0..1000 {
         node.drive_ready().await.unwrap();
+        node.drain_log().await.unwrap();
         if let Some(completed) = node.worker.step().await.unwrap() {
             node.complete_apply(completed).unwrap();
         }
@@ -220,6 +221,7 @@ async fn received_snapshot_fences_an_older_batch_and_later_entries() {
     message.set_snapshot(snapshot);
     node.raw.step(message).unwrap();
     node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
     assert_eq!(node.raw.store().snapshot_index(), 200);
     assert_eq!(node.state.applied, 0);
     let old_batch = node.worker.step().await.unwrap().unwrap();
@@ -244,6 +246,7 @@ async fn received_snapshot_fences_an_older_batch_and_later_entries() {
     });
     node.raw.step(append).unwrap();
     node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
     assert_eq!(node.raw.store().commit_index(), 201);
     assert_eq!(node.state.applied, 32);
     let install = node.worker.step().await.unwrap().unwrap();
@@ -286,6 +289,253 @@ async fn dropping_the_node_cancels_an_active_worker() {
     tokio::time::timeout(Duration::from_secs(1), async {
         while !task.is_finished() {
             tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+async fn leader_node(dir: &std::path::Path) -> Node {
+    seed_log(dir, 1);
+    let (events, _) = mpsc::channel(256);
+    let mut node = Node::open_with_transport(options(dir), events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    node.raw.campaign().unwrap();
+    for kind in [
+        MessageType::MsgRequestPreVoteResponse,
+        MessageType::MsgRequestVoteResponse,
+    ] {
+        let mut vote = Message::default();
+        vote.set_msg_type(kind);
+        vote.from = 2;
+        vote.to = 1;
+        vote.term = node.raw.raft.term + u64::from(kind == MessageType::MsgRequestPreVoteResponse);
+        node.raw.step(vote).unwrap();
+    }
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    let mut ack = Message::default();
+    ack.set_msg_type(MessageType::MsgAppendResponse);
+    ack.from = 2;
+    ack.to = 1;
+    ack.term = node.raw.raft.term;
+    ack.index = node.raw.store().last_index().unwrap();
+    node.raw.step(ack).unwrap();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    node.drain_apply().await.unwrap();
+    assert_eq!(node.raw.raft.state, StateRole::Leader);
+    node
+}
+
+fn range_request() -> RequestOp {
+    RequestOp {
+        request: Some(
+            crate::proto::etcdserverpb::request_op::Request::RequestRange(
+                crate::proto::etcdserverpb::RangeRequest {
+                    key: b"key".to_vec(),
+                    ..Default::default()
+                },
+            ),
+        ),
+    }
+}
+
+async fn confirm_read(node: &mut Node, id: &[u8]) {
+    let mut message = Message::default();
+    message.set_msg_type(MessageType::MsgHeartbeatResponse);
+    message.from = 2;
+    message.to = 1;
+    message.term = node.raw.raft.term;
+    message.context = id.to_vec().into();
+    node.raw.step(message).unwrap();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+}
+
+#[tokio::test]
+async fn read_index_requires_quorum_and_does_not_write_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    let last = node.raw.store().durable.last_index;
+    let syncs = node.raw.store().durable.sync_writes;
+    let (tx, mut reply) = oneshot::channel();
+    node.linear_read(range_request(), tx);
+    let id = node.reads.keys().next().unwrap().clone();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    node.drain_apply().await.unwrap();
+    assert!(
+        reply.try_recv().is_err(),
+        "local commit must not replace quorum confirmation"
+    );
+    confirm_read(&mut node, &id).await;
+    node.drain_apply().await.unwrap();
+    assert!(reply.await.unwrap().is_ok());
+    assert_eq!(node.raw.store().durable.last_index, last);
+    assert_eq!(node.raw.store().durable.sync_writes, syncs);
+}
+
+#[tokio::test]
+async fn read_index_waits_for_apply_and_rejects_late_results_after_term_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    let (tx, _) = oneshot::channel();
+    node.propose(
+        RaftCommand::Lease {
+            id: "advance".into(),
+            lease: LeaseCommand::List,
+        },
+        tx,
+    )
+    .unwrap();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    let mut ack = Message::default();
+    ack.set_msg_type(MessageType::MsgAppendResponse);
+    ack.from = 2;
+    ack.to = 1;
+    ack.term = node.raw.raft.term;
+    ack.index = node.raw.store().last_index().unwrap();
+    node.raw.step(ack).unwrap();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    assert!(node.state.applied < node.raw.store().commit_index());
+    let (tx, mut reply) = oneshot::channel();
+    node.linear_read(range_request(), tx);
+    let id = node.reads.keys().next().unwrap().clone();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    confirm_read(&mut node, &id).await;
+    assert!(reply.try_recv().is_err());
+    assert!(node.queries.is_empty(), "read passed the apply barrier");
+    let completed = node.worker.step().await.unwrap().unwrap();
+    node.complete_apply(completed).unwrap();
+    node.drive_ready().await.unwrap();
+    let read_result = node.worker.step().await.unwrap().unwrap();
+    node.raw.raft.become_follower(node.raw.raft.term + 1, 2);
+    node.complete_apply(read_result).unwrap();
+    assert!(reply.await.unwrap().is_err());
+    assert!(node.reads.is_empty());
+}
+
+#[tokio::test]
+async fn log_persistence_fences_votes_and_survives_restart_before_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let (events, _) = mpsc::channel(256);
+    let (peer, mut messages) = mpsc::channel(256);
+    let mut node = Node::open_with_transport(
+        options(dir.path()),
+        events,
+        Some(BTreeMap::from([(2, peer)])),
+    )
+    .await
+    .unwrap();
+    let mut vote = Message::default();
+    vote.set_msg_type(MessageType::MsgRequestVote);
+    vote.from = 2;
+    vote.to = 1;
+    vote.term = 1;
+    node.raw.step(vote).unwrap();
+    node.drive_ready().await.unwrap();
+    assert!(messages.try_recv().is_err(), "vote escaped before fsync");
+    assert_eq!(node.raw.store().durable.hard_state.vote, 0);
+    // Save the write, then crash before the owner receives its completion.
+    let completion = node.log_worker.step().unwrap().unwrap();
+    assert_eq!(completion.durable.hard_state.vote, 2);
+    drop(node);
+    let (events, _) = mpsc::channel(256);
+    let node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    assert_eq!(node.raw.store().durable.hard_state.vote, 2);
+    assert_eq!(node.raw.raft.term, 1);
+}
+
+#[tokio::test]
+async fn log_failure_and_panic_stop_the_node() {
+    for panic in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, receiver) = mpsc::channel(256);
+        let mut node = Node::open(options(dir.path()), events).await.unwrap();
+        node.log_fail = !panic;
+        let job = if panic {
+            log::Job::Panic
+        } else {
+            log::Job::Ready {
+                entries: vec![],
+                hs: Some(HardState {
+                    term: 1,
+                    vote: 1,
+                    ..Default::default()
+                }),
+                snapshot: None,
+            }
+        };
+        node.queue_log(job, None, None, vec![], vec![]);
+        node.start_log().unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), node.run(receiver))
+            .await
+            .unwrap();
+        assert!(result.is_err());
+    }
+}
+
+#[tokio::test]
+async fn pending_read_indexes_are_bounded_and_cancelled_on_leader_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    let mut replies = vec![];
+    for _ in 0..apply::MAX_QUERIES {
+        let (tx, rx) = oneshot::channel();
+        node.linear_read(range_request(), tx);
+        replies.push(rx);
+    }
+    let (tx, rx) = oneshot::channel();
+    node.linear_read(range_request(), tx);
+    assert!(rx.await.unwrap().unwrap_err().error.contains("too many"));
+    node.raw.raft.become_follower(node.raw.raft.term + 1, 2);
+    node.drive_ready().await.unwrap();
+    assert!(node.reads.is_empty());
+    for reply in replies {
+        assert!(reply.await.unwrap().is_err());
+    }
+}
+
+#[tokio::test]
+async fn shutdown_interrupts_the_log_fault_delay() {
+    let dir = tempfile::tempdir().unwrap();
+    let (events, _) = mpsc::channel(256);
+    let mut node = Node::open(options(dir.path()), events).await.unwrap();
+    node.log_delay_ms = 5000;
+    node.queue_log(
+        log::Job::Ready {
+            entries: vec![],
+            hs: Some(HardState {
+                term: 1,
+                vote: 1,
+                ..Default::default()
+            }),
+            snapshot: None,
+        },
+        None,
+        None,
+        vec![],
+        vec![],
+    );
+    node.start_log().unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    drop(node);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Ok(store) =
+                RaftStorage::open(&dir.path().join("raft"), 1, "worker-test", vec![1, 2, 3])
+            {
+                assert_eq!(store.initial_state().unwrap().hard_state.vote, 0);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
     .await

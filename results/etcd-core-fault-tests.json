@@ -2,11 +2,11 @@
   "mode": "test",
   "host": "macOS-27.2.1-arm64-arm-64bit",
   "machine": "arm64",
-  "created_at": "2026-11-17T00:11:06.026426+00:00",
+  "created_at": "2026-11-17T01:33:59.851604+00:00",
   "logical_cpus": 10,
-  "binary_sha256": "fee4428d466088964ab49e24a67e0dfd6bdc50f4cdcbb441ba064d630c83552e",
+  "binary_sha256": "a6647ba35ba4d1c1060a046beffc483b0372478bfed1175c012c52549ed2fad6",
   "python": "3.9.6 (default, Apr 30 2025, 02:07:17) \n[Clang 17.0.0 (clang-1700.0.13.5)]",
-  "run_directory": "<tmp>/slatedb-raft-poc-7kcxbbjt",
+  "run_directory": "<tmp>/slatedb-raft-poc-8_axr7r4",
   "binary": "<repo>/target/release/slatedb-etcd",
   "deployment": "three processes on one host and disk; loopback HTTP; local object store",
   "durability": "raft-engine synchronous writes; process crashes tested, power loss not tested",
@@ -14,15 +14,15 @@
     {
       "name": "election_and_atomic_write",
       "passed": true,
-      "leader": 2,
+      "leader": 3,
       "index": 2
     },
     {
       "name": "leader_sigkill_and_follower_rejoin",
       "passed": true,
-      "old_leader": 2,
-      "new_leader": 3,
-      "failover_to_success_ms": 1013.7302500000003
+      "old_leader": 3,
+      "new_leader": 1,
+      "failover_to_success_ms": 1582.464291
     },
     {
       "name": "all_processes_sigkill_and_wal_replay",
@@ -39,7 +39,7 @@
       "lagging_node": 1,
       "snapshot_index": 522,
       "reclaimed_files": 8,
-      "log_bytes_before": 2199623,
+      "log_bytes_before": 2199792,
       "log_bytes_after": 139670
     },
     {
@@ -57,101 +57,125 @@
     {
       "name": "slow_background_snapshot_keeps_heartbeats_and_writes",
       "passed": true,
-      "writes_during_snapshot": 122
+      "writes_during_snapshot": 121
     }
   ],
   "final_status": [
     {
-      "applied_index": 652,
+      "applied_index": 651,
       "apply_busy": false,
       "apply_delay_ms": 0,
       "apply_lag": 0,
-      "apply_target": 652,
+      "apply_target": 651,
       "blocked_peers": [],
-      "checkpoint_running": false,
-      "cluster_id": "poc-slatedb-raft-poc-7kcxbbjt",
-      "commit_index": 652,
+      "cached_last_log_index": 651,
+      "checkpoint_running": true,
+      "cluster_id": "poc-slatedb-raft-poc-8_axr7r4",
+      "commit_index": 651,
       "compact_revision": -1,
-      "durable_applied_index": 522,
-      "first_log_index": 523,
+      "durable_applied_index": 530,
+      "first_log_index": 531,
       "id": 1,
       "installed_snapshots": 0,
-      "last_log_index": 652,
-      "leader_id": 2,
+      "last_log_index": 651,
+      "leader_id": 1,
       "log": {
-        "bytes": 95662,
+        "bytes": 161882,
         "files": [
           "0000000000000001.raftlog"
         ]
       },
+      "log_busy": false,
+      "log_delay_ms": 0,
+      "log_fail": false,
       "pending": 0,
+      "pending_read_indexes": 0,
+      "queued_log_bytes": 0,
+      "queued_log_jobs": 0,
       "queued_state_reads": 0,
-      "recovered_from_index": 522,
-      "revision": 1,
-      "role": "Follower",
-      "snapshot_delay_ms": 0,
-      "snapshot_index": 522,
-      "sync_writes": 262,
-      "term": 5
-    },
-    {
-      "applied_index": 652,
-      "apply_busy": false,
-      "apply_delay_ms": 0,
-      "apply_lag": 0,
-      "apply_target": 652,
-      "blocked_peers": [],
-      "checkpoint_running": true,
-      "cluster_id": "poc-slatedb-raft-poc-7kcxbbjt",
-      "commit_index": 652,
-      "compact_revision": -1,
-      "durable_applied_index": 530,
-      "first_log_index": 531,
-      "id": 2,
-      "installed_snapshots": 0,
-      "last_log_index": 652,
-      "leader_id": 2,
-      "log": {
-        "bytes": 233519,
-        "files": [
-          "0000000000000009.raftlog"
-        ]
-      },
-      "pending": 0,
-      "queued_state_reads": 0,
+      "raft_commit_index": 651,
       "recovered_from_index": 522,
       "revision": 1,
       "role": "Leader",
       "snapshot_delay_ms": 0,
       "snapshot_index": 530,
-      "sync_writes": 263,
+      "sync_writes": 261,
       "term": 5
     },
     {
-      "applied_index": 652,
+      "applied_index": 651,
       "apply_busy": false,
       "apply_delay_ms": 0,
       "apply_lag": 0,
-      "apply_target": 652,
+      "apply_target": 651,
       "blocked_peers": [],
+      "cached_last_log_index": 651,
       "checkpoint_running": false,
-      "cluster_id": "poc-slatedb-raft-poc-7kcxbbjt",
-      "commit_index": 652,
+      "cluster_id": "poc-slatedb-raft-poc-8_axr7r4",
+      "commit_index": 651,
+      "compact_revision": -1,
+      "durable_applied_index": 522,
+      "first_log_index": 523,
+      "id": 2,
+      "installed_snapshots": 0,
+      "last_log_index": 651,
+      "leader_id": 1,
+      "log": {
+        "bytes": 166696,
+        "files": [
+          "0000000000000009.raftlog"
+        ]
+      },
+      "log_busy": false,
+      "log_delay_ms": 0,
+      "log_fail": false,
+      "pending": 0,
+      "pending_read_indexes": 0,
+      "queued_log_bytes": 0,
+      "queued_log_jobs": 0,
+      "queued_state_reads": 0,
+      "raft_commit_index": 651,
+      "recovered_from_index": 522,
+      "revision": 1,
+      "role": "Follower",
+      "snapshot_delay_ms": 0,
+      "snapshot_index": 522,
+      "sync_writes": 258,
+      "term": 5
+    },
+    {
+      "applied_index": 651,
+      "apply_busy": false,
+      "apply_delay_ms": 0,
+      "apply_lag": 0,
+      "apply_target": 651,
+      "blocked_peers": [],
+      "cached_last_log_index": 651,
+      "checkpoint_running": false,
+      "cluster_id": "poc-slatedb-raft-poc-8_axr7r4",
+      "commit_index": 651,
       "compact_revision": -1,
       "durable_applied_index": 522,
       "first_log_index": 523,
       "id": 3,
       "installed_snapshots": 0,
-      "last_log_index": 652,
-      "leader_id": 2,
+      "last_log_index": 651,
+      "leader_id": 1,
       "log": {
-        "bytes": 166908,
+        "bytes": 166871,
         "files": [
           "0000000000000009.raftlog"
         ]
       },
+      "log_busy": false,
+      "log_delay_ms": 0,
+      "log_fail": false,
       "pending": 0,
+      "pending_read_indexes": 0,
+      "queued_log_bytes": 0,
+      "queued_log_jobs": 0,
       "queued_state_reads": 0,
+      "raft_commit_index": 651,
       "recovered_from_index": 522,
       "revision": 1,
       "role": "Follower",
@@ -175,27 +199,22 @@
         {
           "role": "Follower",
           "term": 1,
-          "leader_id": 2
-        },
-        {
-          "role": "Follower",
-          "term": 2,
-          "leader_id": 0
-        },
-        {
-          "role": "Follower",
-          "term": 2,
           "leader_id": 3
         },
         {
           "role": "PreCandidate",
+          "term": 1,
+          "leader_id": 0
+        },
+        {
+          "role": "Candidate",
           "term": 2,
           "leader_id": 0
         },
         {
-          "role": "Candidate",
-          "term": 3,
-          "leader_id": 0
+          "role": "Leader",
+          "term": 2,
+          "leader_id": 1
         },
         {
           "role": "Follower",
@@ -210,43 +229,104 @@
         {
           "role": "Follower",
           "term": 3,
+          "leader_id": 2
+        },
+        {
+          "role": "Follower",
+          "term": 4,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 4,
           "leader_id": 2
         },
         {
           "role": "PreCandidate",
-          "term": 3,
+          "term": 4,
           "leader_id": 0
         },
         {
           "role": "Candidate",
-          "term": 4,
-          "leader_id": 0
-        },
-        {
-          "role": "Follower",
-          "term": 4,
-          "leader_id": 0
-        },
-        {
-          "role": "Follower",
-          "term": 4,
-          "leader_id": 3
-        },
-        {
-          "role": "Follower",
           "term": 5,
           "leader_id": 0
         },
         {
-          "role": "Follower",
+          "role": "Leader",
           "term": 5,
-          "leader_id": 2
+          "leader_id": 1
         }
       ]
     },
     "node-2": {
-      "completed_snapshots": 2,
-      "last_snapshot_index": 530,
+      "completed_snapshots": 0,
+      "last_snapshot_index": null,
+      "raft_state_changes": [
+        {
+          "role": "Follower",
+          "term": 1,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 1,
+          "leader_id": 3
+        },
+        {
+          "role": "Follower",
+          "term": 2,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 2,
+          "leader_id": 1
+        },
+        {
+          "role": "PreCandidate",
+          "term": 2,
+          "leader_id": 0
+        },
+        {
+          "role": "Candidate",
+          "term": 3,
+          "leader_id": 0
+        },
+        {
+          "role": "Leader",
+          "term": 3,
+          "leader_id": 2
+        },
+        {
+          "role": "PreCandidate",
+          "term": 3,
+          "leader_id": 0
+        },
+        {
+          "role": "Candidate",
+          "term": 4,
+          "leader_id": 0
+        },
+        {
+          "role": "Leader",
+          "term": 4,
+          "leader_id": 2
+        },
+        {
+          "role": "Follower",
+          "term": 4,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 5,
+          "leader_id": 1
+        }
+      ]
+    },
+    "node-3": {
+      "completed_snapshots": 0,
+      "last_snapshot_index": null,
       "raft_state_changes": [
         {
           "role": "PreCandidate",
@@ -261,25 +341,20 @@
         {
           "role": "Leader",
           "term": 1,
-          "leader_id": 2
+          "leader_id": 3
         },
         {
           "role": "Follower",
           "term": 2,
-          "leader_id": 3
+          "leader_id": 1
         },
         {
-          "role": "PreCandidate",
-          "term": 2,
-          "leader_id": 0
-        },
-        {
-          "role": "Candidate",
+          "role": "Follower",
           "term": 3,
           "leader_id": 0
         },
         {
-          "role": "Leader",
+          "role": "Follower",
           "term": 3,
           "leader_id": 2
         },
@@ -291,88 +366,17 @@
         {
           "role": "Follower",
           "term": 4,
-          "leader_id": 3
+          "leader_id": 2
         },
         {
-          "role": "PreCandidate",
-          "term": 4,
-          "leader_id": 0
-        },
-        {
-          "role": "Candidate",
+          "role": "Follower",
           "term": 5,
-          "leader_id": 0
-        },
-        {
-          "role": "Leader",
-          "term": 5,
-          "leader_id": 2
-        }
-      ]
-    },
-    "node-3": {
-      "completed_snapshots": 1,
-      "last_snapshot_index": 522,
-      "raft_state_changes": [
-        {
-          "role": "Follower",
-          "term": 1,
-          "leader_id": 0
-        },
-        {
-          "role": "Follower",
-          "term": 1,
-          "leader_id": 2
-        },
-        {
-          "role": "PreCandidate",
-          "term": 1,
-          "leader_id": 0
-        },
-        {
-          "role": "Candidate",
-          "term": 2,
-          "leader_id": 0
-        },
-        {
-          "role": "Leader",
-          "term": 2,
-          "leader_id": 3
-        },
-        {
-          "role": "Follower",
-          "term": 3,
-          "leader_id": 0
-        },
-        {
-          "role": "Follower",
-          "term": 3,
-          "leader_id": 2
-        },
-        {
-          "role": "PreCandidate",
-          "term": 3,
-          "leader_id": 0
-        },
-        {
-          "role": "Candidate",
-          "term": 4,
-          "leader_id": 0
-        },
-        {
-          "role": "Leader",
-          "term": 4,
-          "leader_id": 3
-        },
-        {
-          "role": "Follower",
-          "term": 4,
           "leader_id": 0
         },
         {
           "role": "Follower",
           "term": 5,
-          "leader_id": 2
+          "leader_id": 1
         }
       ]
     }

@@ -101,6 +101,19 @@ fn key_check(key: &[u8]) -> KvResult<()> {
     }
 }
 
+/// Require both branches, including nested transactions, to contain only permitted reads.
+pub fn read_only(request: &RequestOp, serializable: bool) -> bool {
+    match &request.request {
+        Some(Op::RequestRange(range)) => !serializable || range.serializable,
+        Some(Op::RequestTxn(txn)) => txn
+            .success
+            .iter()
+            .chain(&txn.failure)
+            .all(|op| read_only(op, serializable)),
+        _ => false,
+    }
+}
+
 /// Check both transaction branches before evaluating any predicate.
 pub fn validate(request: &RequestOp) -> KvResult<()> {
     validate_op(request, 128)?;

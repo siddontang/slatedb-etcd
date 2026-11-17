@@ -13,6 +13,12 @@ struct ClientRequest {
     reply: oneshot::Receiver<Result<Value, ApiError>>,
 }
 
+struct ReadRequest {
+    node: u64,
+    known: BTreeMap<String, String>,
+    reply: oneshot::Receiver<Result<Value, ApiError>>,
+}
+
 struct Simulation {
     seed: u64,
     root: tempfile::TempDir,
@@ -20,11 +26,17 @@ struct Simulation {
     links: BTreeMap<(u64, u64), mpsc::Receiver<Message>>,
     messages: Vec<Message>,
     requests: Vec<ClientRequest>,
+    reads: Vec<ReadRequest>,
+    read_count: usize,
     acknowledged: BTreeMap<String, String>,
     committed_entries: BTreeMap<u64, Vec<u8>>,
     terms: BTreeMap<u64, u64>,
     isolated: Option<u64>,
     paused_apply: Option<u64>,
+    paused_log: Option<u64>,
+    held_log: Option<(u64, log::Completion)>,
+    expected_log_failure: Option<u64>,
+    log_failures: usize,
     random: u64,
     next_request: u64,
     trace: Vec<String>,
@@ -52,11 +64,17 @@ impl Simulation {
             links: BTreeMap::new(),
             messages: vec![],
             requests: vec![],
+            reads: vec![],
+            read_count: 0,
             acknowledged: BTreeMap::new(),
             committed_entries: BTreeMap::new(),
             terms: BTreeMap::new(),
             isolated: None,
             paused_apply: None,
+            paused_log: None,
+            held_log: None,
+            expected_log_failure: None,
+            log_failures: 0,
             random: seed.max(1),
             next_request: 0,
             trace: vec![],
@@ -120,14 +138,59 @@ impl Simulation {
     }
 
     async fn drive(&mut self) {
+        let mut failed = vec![];
         for (&id, node) in &mut self.nodes {
             node.drive_ready().await.unwrap();
+            if self.paused_log != Some(id) {
+                if let Err(error) = node.drain_log().await {
+                    assert_eq!(
+                        self.expected_log_failure,
+                        Some(id),
+                        "unexpected disk error: {error}"
+                    );
+                    self.expected_log_failure = None;
+                    self.log_failures += 1;
+                    failed.push(id);
+                    continue;
+                }
+            }
             if self.paused_apply != Some(id) {
                 node.drain_apply().await.unwrap();
             }
         }
-        for link in self.links.values_mut() {
+        for id in failed {
+            self.trace.push(format!("log failure {id}"));
+            self.stop(id);
+        }
+        for (&(from, _), link) in &mut self.links {
             while let Ok(message) = link.try_recv() {
+                if let Some(node) = self.nodes.get(&from) {
+                    if !message.reject
+                        && matches!(
+                            message.get_msg_type(),
+                            MessageType::MsgAppendResponse | MessageType::MsgRequestVoteResponse
+                        )
+                    {
+                        let durable = &node.raw.store().durable;
+                        assert!(
+                            durable.hard_state.term >= message.term,
+                            "reply preceded durable term"
+                        );
+                        if durable.hard_state.term == message.term {
+                            if message.get_msg_type() == MessageType::MsgRequestVoteResponse {
+                                assert_eq!(
+                                    durable.hard_state.vote, message.to,
+                                    "vote preceded persistence"
+                                );
+                            } else {
+                                assert!(
+                                    message.index <= durable.last_index,
+                                    "append reply preceded persistence"
+                                );
+                            }
+                        }
+                    }
+                }
                 self.messages.push(message);
             }
         }
@@ -145,6 +208,33 @@ impl Simulation {
             }
         }
         self.requests = pending;
+        let mut pending_reads = vec![];
+        for mut read in self.reads.drain(..) {
+            match read.reply.try_recv() {
+                Ok(Ok(value)) => {
+                    let result: Outcome = serde_json::from_value(value).unwrap();
+                    let Some(Resp::ResponseRange(response)) = result.result.unwrap().response
+                    else {
+                        panic!("expected range");
+                    };
+                    for (key, value) in read.known {
+                        assert!(
+                            response
+                                .kvs
+                                .iter()
+                                .any(|kv| kv.key == key.as_bytes() && kv.value == value.as_bytes()),
+                            "read lost a prior acknowledged write"
+                        );
+                    }
+                    self.trace
+                        .push(format!("read ack {} {}", read.node, response.kvs.len()));
+                    self.read_count += 1;
+                }
+                Ok(Err(_)) | Err(oneshot::error::TryRecvError::Closed) => {}
+                Err(oneshot::error::TryRecvError::Empty) => pending_reads.push(read),
+            }
+        }
+        self.reads = pending_reads;
         let mut leaders = BTreeMap::new();
         for (&id, node) in &self.nodes {
             let term = node.raw.raft.term;
@@ -159,14 +249,18 @@ impl Simulation {
             let store = node.raw.store();
             assert!(node.state.applied <= store.commit_index());
             assert!(store.commit_index() <= store.last_index().unwrap());
-            let entries = store
-                .entries(
-                    store.first_index().unwrap(),
-                    store.commit_index() + 1,
-                    None,
-                    raft::GetEntriesContext::empty(false),
-                )
-                .unwrap();
+            let entries = if store.first_index().unwrap() > store.commit_index() {
+                vec![]
+            } else {
+                store
+                    .entries(
+                        store.first_index().unwrap(),
+                        store.commit_index() + 1,
+                        None,
+                        raft::GetEntriesContext::empty(false),
+                    )
+                    .unwrap()
+            };
             for entry in entries {
                 let bytes = entry.write_to_bytes().unwrap();
                 if let Some(previous) = self.committed_entries.insert(entry.index, bytes.clone()) {
@@ -205,7 +299,10 @@ impl Simulation {
             let to = message.to;
             node.raw.step(message).unwrap();
             node.drive_ready().await.unwrap();
-            if snapshot {
+            if snapshot
+                && node.raw.store().snapshot_index() > 0
+                && !node.raw.store().snapshot_pending()
+            {
                 if let Some(sender) = self.nodes.get_mut(&from) {
                     // The normal HTTP transport reports this after the receiver saves Ready.
                     sender.raw.report_snapshot(to, SnapshotStatus::Finish);
@@ -257,6 +354,30 @@ impl Simulation {
         self.requests.push(ClientRequest {
             key,
             value,
+            reply: rx,
+        });
+        self.drive().await;
+    }
+
+    async fn read(&mut self) {
+        let Some(id) = self.leader() else {
+            return;
+        };
+        let (tx, rx) = oneshot::channel();
+        self.nodes.get_mut(&id).unwrap().linear_read(
+            RequestOp {
+                request: Some(Op::RequestRange(RangeRequest {
+                    key: b"key-".to_vec(),
+                    range_end: b"key.".to_vec(),
+                    ..Default::default()
+                })),
+            },
+            tx,
+        );
+        self.trace.push(format!("read {id}"));
+        self.reads.push(ReadRequest {
+            node: id,
+            known: self.acknowledged.clone(),
             reply: rx,
         });
         self.drive().await;
@@ -315,6 +436,20 @@ impl Simulation {
         let generation = sim.nodes[&sim.leader().unwrap()].state.leases[&77].generation;
         sim.lease(LeaseCommand::KeepAlive { id: 77 }).await;
         sim.lease(LeaseCommand::Expire { id: 77, generation }).await;
+        let failed = sim.leader().unwrap();
+        sim.expected_log_failure = Some(failed);
+        sim.nodes.get_mut(&failed).unwrap().log_fail = true;
+        sim.propose().await;
+        assert_eq!(sim.log_failures, 1);
+        sim.start(failed).await;
+        for _ in 0..25 {
+            for id in 1..=3 {
+                sim.tick(id).await;
+            }
+            for _ in 0..30 {
+                sim.deliver(false).await;
+            }
+        }
         let mut offline = 0;
         for step in 0..400 {
             match step {
@@ -326,6 +461,40 @@ impl Simulation {
                 60 => {
                     sim.paused_apply = None;
                     sim.trace.push("resume apply".into());
+                }
+                65 => {
+                    sim.paused_log = sim.leader();
+                    sim.trace.push(format!("pause log {:?}", sim.paused_log));
+                }
+                67 => sim.propose().await,
+                68 => {
+                    if let Some(id) = sim.paused_log {
+                        if let Some(node) = sim.nodes.get_mut(&id) {
+                            while node.log_busy {
+                                let bytes = node.log_queue.front().unwrap().bytes;
+                                let completion = node.log_worker.step().unwrap().unwrap();
+                                if bytes > 0 {
+                                    sim.trace.push(format!("hold durable log completion {id}"));
+                                    sim.held_log = Some((id, completion));
+                                    break;
+                                }
+                                node.complete_log(completion).unwrap();
+                                node.drive_ready().await.unwrap();
+                            }
+                        }
+                    }
+                }
+                90 => {
+                    if let Some((id, completion)) = sim.held_log.take() {
+                        if let Some(node) = sim.nodes.get_mut(&id) {
+                            node.complete_log(completion).unwrap();
+                            sim.trace.push(format!("release log completion {id}"));
+                        } else {
+                            sim.trace.push(format!("crash before log completion {id}"));
+                        }
+                    }
+                    sim.paused_log = None;
+                    sim.trace.push("resume log".into());
                 }
                 70 => sim.stop(3),
                 95 => sim.start(3).await,
@@ -343,7 +512,15 @@ impl Simulation {
                     sim.stop(offline);
                 }
                 260 => sim.checkpoint().await,
-                300 => sim.start(offline).await,
+                300 => {
+                    sim.paused_log = Some(offline);
+                    sim.trace.push(format!("pause snapshot log {offline}"));
+                    sim.start(offline).await;
+                }
+                320 => {
+                    sim.paused_log = None;
+                    sim.trace.push("resume snapshot log".into());
+                }
                 350 => {
                     for id in 1..=3 {
                         sim.stop(id);
@@ -356,6 +533,9 @@ impl Simulation {
             }
             let id = sim.choose(3) as u64 + 1;
             sim.tick(id).await;
+            if step % 17 == 0 {
+                sim.read().await;
+            }
             if step % 10 == 0 {
                 sim.propose().await;
             }
@@ -375,6 +555,10 @@ impl Simulation {
         assert!(
             sim.acknowledged.len() >= 10,
             "seed {seed}: insufficient writes"
+        );
+        assert!(
+            sim.read_count >= 5,
+            "seed {seed}: insufficient read index checks"
         );
         let snapshots = sim.installed_snapshots
             + sim
