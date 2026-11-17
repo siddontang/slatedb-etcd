@@ -53,7 +53,12 @@ CPU per successful operation measures work. Average CPU cores measure utilizatio
 The controller samples RSS every 100 ms and includes both measurement boundaries.
 RSS is not unique physical memory. Short samples can amplify CPU rounding and barrier overhead.
 Latency percentiles include successful operations only. Any failed request makes the report fail.
-A short CI run tests the driver; it does not enforce a performance threshold.
+CI runs three repeats of each workload on Linux with the normal release binary.
+The `validation-reports` artifact includes `benchmark-linux.json`.
+CI checks request success and report completeness. It does not enforce a performance threshold.
+Shared CI hosts can vary in CPU scheduling, storage latency, and available memory.
+Linux resource sampling reads process CPU ticks and resident pages from `/proc`.
+macOS sampling reads `ps` counters. Both exclude child processes and the controller.
 
 Use `--s3-bucket`, `--s3-endpoint`, and optional `--s3-allow-http` to measure remote state storage.
 Create the bucket first and supply credentials through the supported AWS environment settings.
@@ -71,6 +76,14 @@ Use `--read-requests` for longer read-only samples, and `--warmup` to set unmeas
 The driver shuffles backend and workload order for each repeat.
 Each repeat shares one operation seed.
 Keys and read choices use a seeded uniform distribution. Reads verify the expected value.
+Summarize complete runs with medians and ranges across repeats:
+
+```sh
+python3 scripts/summarize-benchmark.py results/ci/benchmark-etcd.json \
+  --output results/ci/benchmark-summary.json
+```
+
+The summary keeps each repeat's percentiles separate. It does not pool or average latency samples.
 An incomplete run or failed resource sample cannot produce a passing report.
 Keep build, test, and profiler workloads separate from final measurements.
 

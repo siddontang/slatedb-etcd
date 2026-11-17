@@ -35,6 +35,15 @@ def parse_cpu(value):
 
 
 def resources(processes):
+    if platform.system() == "Linux":
+        ticks = os.sysconf("SC_CLK_TCK")
+        page = os.sysconf("SC_PAGE_SIZE")
+        rows = []
+        for process in processes:
+            # The command name can contain spaces and parentheses.
+            fields = Path(f"/proc/{process.pid}/stat").read_text().rsplit(")", 1)[1].split()
+            rows.append(((int(fields[11]) + int(fields[12])) / ticks, int(fields[21]) * page))
+        return rows
     result = subprocess.run(["ps", "-o", "pid=,time=,rss=", "-p",
                              ",".join(str(p.pid) for p in processes)],
                             capture_output=True, text=True, check=True)
