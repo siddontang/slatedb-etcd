@@ -54,9 +54,9 @@ import (
 '''
     (target / "upstream_client_test.go").write_text(
         "//go:build upstream\n\n" + license_header + imports + client)
-    subprocess.run(["git", "apply", "--unidiff-zero",
-                    str(ROOT / "tests/upstream/maintenance-auth.patch")],
-                   cwd=ROOT, check=True)
+    for patch in ["maintenance-auth.patch", "jwt-fixture.patch"]:
+        subprocess.run(["git", "apply", "--unidiff-zero",
+                        str(ROOT / "tests/upstream" / patch)], cwd=ROOT, check=True)
     copied.append({"source": str(path.relative_to(source)), "target": "upstream_client_test.go",
                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
     tests = []
@@ -85,6 +85,13 @@ import (
     destination.mkdir(exist_ok=True)
     (destination / "etcd-inventory.json").write_text(json.dumps(report, indent=2) + "\n")
     (destination / "LICENSE.etcd").write_bytes((source / "LICENSE").read_bytes())
+    for item in copied:
+        path = target / item["target"]
+        text = path.read_text().replace(
+            "//go:build upstream\n\n",
+            "//go:build upstream\n\n"
+            "// Adapted for SlateDB etcd. See tests/upstream/README.md for local changes.\n\n", 1)
+        path.write_text(text)
     subprocess.run(["gofmt", "-w", *map(str, target.glob("upstream_*.go"))], check=True)
     print(f"Imported {len(copied)} files; indexed {len(tests)} upstream functions.")
 

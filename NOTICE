@@ -3,8 +3,12 @@ It uses SlateDB under the Apache License 2.0.
 Upstream: https://github.com/slatedb/slatedb
 Pinned revision: 8b68800252064164397ca6ce53e5883dcfbc37b9
 
-The files under results/ record the original PoC runs before repository extraction.
-Their original paths and binary hashes remain unchanged for traceability.
+The files under results/ include historical experiments and later compatibility checks.
+Publication cleanup removed workstation paths. Measurements and binary hashes remain unchanged.
 
 The protocol definitions are adapted from etcd v3.6.5 under Apache License 2.0.
 Copyright The etcd Authors. Source: https://github.com/etcd-io/etcd
+
+Imported common tests retain notices from The etcd Authors under Apache License 2.0.
+Their adapted source and license appear under tests/compat/ and tests/upstream/.
+The SlateDB license text retains the upstream copyright notice for Chris Riccomini.

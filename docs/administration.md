@@ -87,6 +87,8 @@ The deprecated Hash RPC hashes native records. Its result cannot be compared wit
 hash.
 
 Snapshot streams the native state image with a trailing SHA-256 digest.
+Use the [native export tool](operations.md#backups-and-restoration) to save it.
+`etcdctl snapshot save` expects bbolt page alignment and can reject this native image.
 It includes auth, membership, alarms, leases, and MVCC metadata.
 This image uses the same format as Raft recovery snapshots.
 It is not an etcd bbolt backup and cannot be restored with `etcdutl`.

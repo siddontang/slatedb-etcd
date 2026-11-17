@@ -1,0 +1,24 @@
+# Documentation
+
+Start with the quick start. Read compatibility and security limits before running a real workload.
+Commands use the repository root unless a guide states otherwise.
+
+| Task | Guide |
+| --- | --- |
+| Build and run a local service | [Quick start](getting-started.md) |
+| Select flags and memory limits | [Configuration](configuration.md) |
+| Enable Auth, TLS, and member changes | [Administration](administration.md) |
+| Check health, disk use, and recovery | [Operations](operations.md) |
+| Understand storage and the roadmap | [Architecture](architecture.md) |
+| Inspect current implementation details | [Implementation notes](internals.md) |
+| Use local diagnostics and injected faults | [Diagnostic APIs](diagnostics.md) |
+| Measure local write latency | [Benchmarks](benchmarks.md) |
+| Assess etcd compatibility | [Compatibility report](../COMPATIBILITY.md) |
+| Run tests, Jepsen, fuzzing, and DST | [Test guide](../tests/README.md) |
+| Check the upstream test coverage map | [Upstream audit](../tests/upstream/README.md) |
+| Contribute a change | [Contributing](../CONTRIBUTING.md) |
+| Report a security issue | [Security policy](../SECURITY.md) |
+| Review the public release audit | [Publication review](publication.md) |
+
+The architecture separates current behavior from target behavior.
+Historical benchmark results describe older binaries. Each retained report records its scope.

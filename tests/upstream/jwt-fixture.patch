@@ -1,0 +1,16 @@
+--- a/tests/compat/upstream_common_auth_test.go
++++ b/tests/compat/upstream_common_auth_test.go
+@@ -22 +21,0 @@
+-	"path/filepath"
+@@ -36,2 +35 @@
+-	defaultAuthToken = fmt.Sprintf("jwt,pub-key=%s,priv-key=%s,sign-method=RS256,ttl=%s",
+-		mustAbsPath("../fixtures/server.crt"), mustAbsPath("../fixtures/server.key.insecure"), tokenTTL)
++	defaultAuthToken = "ephemeral-rs256"
+@@ -861,7 +858,0 @@
+-func mustAbsPath(path string) string {
+-	abs, err := filepath.Abs(path)
+-	if err != nil {
+-		panic(err)
+-	}
+-	return abs
+-}

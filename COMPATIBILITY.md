@@ -89,6 +89,8 @@ untested.
 
 Native backup and backend Hash formats differ from etcd bbolt.
 Use `--restore-snapshot` for native backups; `etcdutl` cannot restore them.
+Use the [native export tool](docs/operations.md#backups-and-restoration) to save a backup.
+`etcdctl snapshot save` can reject the native image because it requires bbolt page alignment.
 Downgrade returns Unimplemented after administrator authorization.
 Automatic certificate generation and certificate reload remain unsupported.
 HashKV requires revision records from database creation; older databases return a format error.

@@ -11,6 +11,8 @@ import subprocess
 import sys
 import time
 
+from reporting import write_report
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -53,7 +55,7 @@ def main():
         report["runs"].append(run)
         report["passed"] &= run["passed"]
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(report, indent=2) + "\n")
+        write_report(args.output, report)
     print("Report:", args.output)
     raise SystemExit(0 if report["passed"] else 1)
 

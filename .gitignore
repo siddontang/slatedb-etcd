@@ -7,3 +7,15 @@ __pycache__/
 /tests/jepsen/target/
 /tests/jepsen/store/
 /tests/jepsen/.lein-failures
+/results/ci/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.snapshot
+*.log
+/.idea/
+/.vscode/

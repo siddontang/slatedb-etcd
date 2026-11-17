@@ -32,6 +32,7 @@ The importer keeps upstream license notices and changes the package and build ta
 It extracts the upstream client adapter without capability guards.
 It applies [maintenance-auth.patch](maintenance-auth.patch) to three incomplete upstream helpers.
 Those helpers test Snapshot, MoveLeader, and authorization before the native Downgrade format error.
+The [JWT patch](jwt-fixture.patch) selects temporary RSA keys instead of committed key files.
 [LICENSE.etcd](LICENSE.etcd) contains the upstream Apache 2.0 license.
 
 ## Capabilities

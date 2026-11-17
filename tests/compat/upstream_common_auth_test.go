@@ -1,5 +1,7 @@
 //go:build upstream
 
+// Adapted for SlateDB etcd. See tests/upstream/README.md for local changes.
+
 // Copyright 2022 The etcd Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,7 +21,6 @@ package compat
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -33,8 +34,7 @@ import (
 
 var (
 	tokenTTL         = time.Second * 3
-	defaultAuthToken = fmt.Sprintf("jwt,pub-key=%s,priv-key=%s,sign-method=RS256,ttl=%s",
-		mustAbsPath("../fixtures/server.crt"), mustAbsPath("../fixtures/server.key.insecure"), tokenTTL)
+	defaultAuthToken = "ephemeral-rs256"
 )
 
 const (
@@ -856,12 +856,4 @@ func TestAuthLeaseTimeToLive(t *testing.T) {
 		_, err = testUserAuthClient.TimeToLive(ctx, leaseID, config.LeaseOption{WithAttachedKeys: false})
 		require.NoError(t, err)
 	})
-}
-
-func mustAbsPath(path string) string {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		panic(err)
-	}
-	return abs
 }

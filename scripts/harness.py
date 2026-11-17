@@ -20,6 +20,8 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import quote
 
+from reporting import write_report
+
 
 class ApiFailure(Exception):
     def __init__(self, status, data):
@@ -378,7 +380,7 @@ def main():
         report["node_log_summary"] = log_summary(root)
         destination = args.output or root / "report.json"
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(json.dumps(report, indent=2) + "\n")
+        write_report(destination, report)
         print(f"Report: {destination}", flush=True)
 
 

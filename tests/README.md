@@ -56,12 +56,12 @@ The CI workflow pins Leiningen 2.11.2 and verifies its SHA-256.
 python3 scripts/check-dst.py --seeds 1,2,42
 ```
 
-Traces stay under `target/dst/`. Set `SLATEDB_DST_TRACE_DIR` to change this path.
+The runner writes traces under `target/dst/`.
+Direct Cargo tests accept `SLATEDB_DST_TRACE_DIR` to select another trace directory.
 Repeat a failing seed with the same command. Each run also writes a partial `seed-N-last.json`.
 The test drives real storage with a simulated transport and Raft clock.
 It checks lease generations, Watch journals, auth revocation, and physical compaction after
-recovery. It does not simulate lease expiry
-time.
+recovery. It does not simulate lease expiry time.
 The scheduler controls disk execution, completion delivery, and apply jobs.
 A 1 KiB cache forces asynchronous reads. Each schedule checks all four log pool limits.
 It injects read and write failure, restart, and late read completion after a term change.
@@ -125,9 +125,9 @@ python3 scripts/check-compat.py --run '^TestOfficialClientWorkflows$' \
   --output tmp/test-results/client-workflows.json
 ```
 
-`TestCapabilityDifferences` checks four known gaps against real etcd.
-Auth status, member listing, Maintenance status, and physical compaction return Unimplemented.
-A passing gap control confirms a difference. It does not prove support for that capability.
+`TestAdminCompatibility` checks Auth, Cluster, Maintenance, and physical Compact support.
+`TestDifferentialHashKV` compares exact revision hashes with real etcd.
+The documented native backup and binary downgrade limits remain explicit.
 `TestFollowerReadIndexWaitsForLocalApply` guards the STM regression found by these workflows.
 `TestBoundedLogCacheRecoversLaggingFollower` checks small caches with delayed and failed disk reads.
 

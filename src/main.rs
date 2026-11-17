@@ -9,57 +9,78 @@ use slatedb_etcd::node::{LogMemory, Node, NodeOptions};
 use tokio::sync::mpsc;
 
 #[derive(Parser)]
-#[command(about = "Three-voter SlateDB and Raft proof of concept")]
+#[command(about = "Experimental etcd v3 service with Raft and SlateDB")]
 struct Args {
+    /// Persistent member ID. Keep it with its data directory.
     #[arg(long)]
     id: u64,
+    /// Client listener address. Use a loopback IP and port.
     #[arg(long)]
     listen: SocketAddr,
+    /// Separate peer listener address. Required when TLS is enabled.
     #[arg(long)]
     peer_listen: Option<SocketAddr>,
+    /// Advertised client URL. Repeat as --client-peer ID=URL.
     #[arg(long = "client-peer")]
     client_peers: Vec<String>,
+    /// Client listener certificate chain in PEM format.
     #[arg(long)]
     cert_file: Option<PathBuf>,
+    /// Client listener private key in PEM format.
     #[arg(long)]
     key_file: Option<PathBuf>,
+    /// Trusted CA certificates for client authentication.
     #[arg(long)]
     trusted_ca_file: Option<PathBuf>,
+    /// Require verified client certificates.
     #[arg(long)]
     client_cert_auth: bool,
+    /// Peer certificate chain for incoming and outgoing connections.
     #[arg(long)]
     peer_cert_file: Option<PathBuf>,
+    /// Peer private key in PEM format.
     #[arg(long)]
     peer_key_file: Option<PathBuf>,
+    /// Trusted peer CA certificates. Peer TLS requires mutual authentication.
     #[arg(long)]
     peer_trusted_ca_file: Option<PathBuf>,
     /// Repeat as --peer 1=127.0.0.1:7001. Include this node.
     #[arg(long = "peer", required = true)]
     peers: Vec<String>,
+    /// Data directory for this member's Raft log and SlateDB objects.
     #[arg(long)]
     dir: PathBuf,
+    /// Shared cluster identity. Preserve it when restarting existing data.
     #[arg(long, default_value = "slatedb-raft-poc")]
     cluster_id: String,
     /// Zero disables automatic snapshots. The checkpoint endpoint remains available.
     #[arg(long, default_value_t = 1000)]
     snapshot_every: u64,
+    /// Log entry cache budget in bytes.
     #[arg(long, default_value_t = 8 * 1024 * 1024)]
     log_cache_bytes: usize,
+    /// Logical data quota in bytes. Zero disables the quota.
     #[arg(long, default_value_t = 0)]
     quota_backend_bytes: u64,
+    /// Token mode: simple, or jwt with RS256 public-key and private-key paths.
     #[arg(long, default_value = "simple")]
     auth_token: String,
+    /// Reject member changes that would violate the quorum health checks.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     strict_reconfig_check: bool,
+    /// Join after MemberAdd, with a new directory and the assigned member ID.
     #[arg(long)]
     join: bool,
     /// Restore a native snapshot into a new data directory.
     #[arg(long, conflicts_with = "join")]
     restore_snapshot: Option<PathBuf>,
+    /// Pending log entry budget in bytes, including unapplied entries.
     #[arg(long, default_value_t = 32 * 1024 * 1024)]
     log_pending_bytes: usize,
+    /// Asynchronous log read result budget in bytes.
     #[arg(long, default_value_t = 16 * 1024 * 1024)]
     log_read_bytes: usize,
+    /// Compressed log term metadata budget in bytes.
     #[arg(long, default_value_t = 1024 * 1024)]
     log_term_bytes: usize,
 }
@@ -95,7 +116,7 @@ async fn main() -> Result<()> {
     );
     ensure!(
         args.listen.ip().is_loopback(),
-        "the unauthenticated PoC must bind to loopback"
+        "the service must bind to loopback"
     );
     let mut peers = BTreeMap::new();
     for peer in args.peers {

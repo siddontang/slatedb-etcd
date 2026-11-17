@@ -4,8 +4,13 @@ package compat
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -38,7 +43,11 @@ func (r slateRunner) NewCluster(_ context.Context, tb testing.TB, opts ...config
 	t := tb.(*testing.T)
 	args := []string{"--quota-backend-bytes", fmt.Sprint(cfg.QuotaBackendBytes), "--strict-reconfig-check", fmt.Sprint(cfg.StrictReconfigCheck)}
 	if cfg.AuthToken != "" {
-		args = append(args, "--auth-token", cfg.AuthToken)
+		token := cfg.AuthToken
+		if token == defaultAuthToken {
+			token = temporaryJWT(t)
+		}
+		args = append(args, "--auth-token", token)
 	}
 	return &slateCluster{cluster: newClusterConfigured(t, cfg.ClusterSize, func(c *cluster) {
 		c.snapshotEvery = cfg.SnapshotCount
@@ -105,4 +114,29 @@ func WithAuth(user, password string) config.ClientOption {
 }
 func WithEndpoints(endpoints []string) config.ClientOption {
 	return func(value any) { value.(*clientv3.Config).Endpoints = endpoints }
+}
+
+// Each JWT cluster uses a new key pair. The test cleanup removes both files.
+func temporaryJWT(t *testing.T) string {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	privatePath, publicPath := filepath.Join(dir, "private.pem"), filepath.Join(dir, "public.pem")
+	for path, block := range map[string]*pem.Block{
+		privatePath: {Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)},
+		publicPath:  {Type: "PUBLIC KEY", Bytes: public},
+	} {
+		if err := os.WriteFile(path, pem.EncodeToMemory(block), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return fmt.Sprintf("jwt,pub-key=%s,priv-key=%s,sign-method=RS256,ttl=%s",
+		publicPath, privatePath, tokenTTL)
 }

@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 import subprocess
 
+from reporting import write_report
+
 
 def main():
     root = Path(__file__).resolve().parents[1]
@@ -78,7 +80,7 @@ def main():
     report["passed"] = code == 0 and counts["pass"] > 0
     report["complete"] = report["passed"] and counts["skip"] == 0
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, indent=2) + "\n")
+    write_report(args.output, report)
     if not report["passed"]:
         print("".join(output))
     print("Report:", args.output)

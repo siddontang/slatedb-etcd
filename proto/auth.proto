@@ -1,13 +1,10 @@
+// Adapted from etcd v3.6.5. Copyright The etcd Authors. Apache-2.0.
 syntax = "proto3";
 package authpb;
-
-
-
 
 message UserAddOptions {
   bool no_password = 1;
 };
-
 
 message User {
   bytes name = 1;
@@ -15,7 +12,6 @@ message User {
   repeated string roles = 3;
   UserAddOptions options = 4;
 }
-
 
 message Permission {
   enum Type {
@@ -28,7 +24,6 @@ message Permission {
   bytes key = 2;
   bytes range_end = 3;
 }
-
 
 message Role {
   bytes name = 1;

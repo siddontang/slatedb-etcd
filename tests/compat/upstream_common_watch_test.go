@@ -1,5 +1,7 @@
 //go:build upstream
 
+// Adapted for SlateDB etcd. See tests/upstream/README.md for local changes.
+
 // Copyright 2022 The etcd Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
