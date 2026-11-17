@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Compare three service processes with three pinned etcd processes through the same gRPC driver."""
+"""Compare three-member services with one gRPC workload and separate resource phases."""
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
+import random
 import socket
 import subprocess
 import tempfile
@@ -24,134 +26,211 @@ def address():
         return "127.0.0.1:" + str(listener.getsockname()[1])
 
 
-def cpu_seconds(processes):
-    output = subprocess.run(["ps", "-o", "time=", "-p",
-        ",".join(str(p.pid) for p in processes)], capture_output=True, text=True).stdout
-    total = 0.0
-    for value in output.split():
-        days, clock = value.split("-", 1) if "-" in value else ("0", value)
-        seconds = 0.0
-        for part in clock.split(":"):
-            seconds = seconds * 60 + float(part)
-        total += int(days) * 86400 + seconds
-    return total
+def parse_cpu(value):
+    days, clock = value.split("-", 1) if "-" in value else ("0", value)
+    seconds = 0.0
+    for part in clock.split(":"):
+        seconds = seconds * 60 + float(part)
+    return int(days) * 86400 + seconds
+
+
+def resources(processes):
+    result = subprocess.run(["ps", "-o", "pid=,time=,rss=", "-p",
+                             ",".join(str(p.pid) for p in processes)],
+                            capture_output=True, text=True, check=True)
+    rows = {int(pid): (parse_cpu(cpu), int(rss)*1024)
+            for pid, cpu, rss in (line.split() for line in result.stdout.splitlines())}
+    if len(rows) != len(processes):
+        raise RuntimeError("a benchmark process exited during resource sampling")
+    return [rows[p.pid] for p in processes]
+
+
+def wait_file(path, processes, deadline):
+    while not path.exists():
+        if any(p.poll() is not None for p in processes):
+            raise RuntimeError("a benchmark process exited before " + path.name)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("benchmark deadline exceeded before " + path.name)
+        time.sleep(0.005)
+
+
+def run_sample(args, tools, binary, kind, concurrency, reads, repeat):
+    with tempfile.TemporaryDirectory(prefix="slatedb-bench-") as directory:
+        root = Path(directory)
+        clients, peers = [address() for _ in range(3)], [address() for _ in range(3)]
+        processes, logs = [], []
+        driver = None
+        stop = threading.Event()
+        sampler = None
+        memory, resource_errors = [], []
+        initial = ",".join(f"node{i+1}=http://{peer}" for i, peer in enumerate(peers))
+        sample = {"passed": False, "backend": kind, "concurrency": concurrency,
+                  "read_percent": reads, "repeat": repeat}
+        try:
+            for i in range(3):
+                data = root / f"node{i+1}"
+                if kind == "etcd":
+                    command = [str(binary), "--name", f"node{i+1}", "--data-dir", str(data),
+                               "--listen-client-urls", "http://"+clients[i],
+                               "--advertise-client-urls", "http://"+clients[i],
+                               "--listen-peer-urls", "http://"+peers[i],
+                               "--initial-advertise-peer-urls", "http://"+peers[i],
+                               "--initial-cluster", initial, "--snapshot-count", str(args.snapshot_entries),
+                               "--quota-backend-bytes", str(args.quota_bytes), "--log-level", "error"]
+                else:
+                    command = [str(binary), "--id", str(i+1), "--dir", str(data),
+                               "--listen", clients[i], "--peer-listen", peers[i],
+                               "--cluster-id", root.name, "--snapshot-every", str(args.snapshot_entries),
+                               "--quota-backend-bytes", str(args.quota_bytes)]
+                    if args.s3_bucket:
+                        command += ["--s3-bucket", args.s3_bucket]
+                    if args.s3_endpoint:
+                        command += ["--s3-endpoint", args.s3_endpoint]
+                    if args.s3_allow_http:
+                        command += ["--s3-allow-http"]
+                    for j in range(3):
+                        command += ["--peer", f"{j+1}={peers[j]}", "--client-peer", f"{j+1}={clients[j]}"]
+                log = open(root / f"node{i+1}.log", "w")
+                logs.append(log)
+                processes.append(subprocess.Popen(command, stdout=log, stderr=log))
+            log = open(root / "client.log", "w")
+            logs.append(log)
+            result_path = root / "sample.json"
+            driver = subprocess.Popen([str(tools / "benchmark"), "--endpoints", ",".join(clients),
+                "--requests", str(args.read_requests if reads == 100 and args.read_requests else args.requests), "--keys", str(args.keys), "--value-size", str(args.value_size),
+                "--concurrency", str(concurrency), "--read-percent", str(reads), "--warmup", str(args.warmup),
+                "--seed", str(args.seed+repeat), "--control-dir", str(root), "--output", str(result_path)],
+                stdout=log, stderr=log)
+            all_processes = processes + [driver]
+            deadline = time.monotonic() + args.timeout_seconds
+            wait_file(root / "ready", all_processes, deadline)
+            before = resources(all_processes)
+            sample["startup_preload_warmup_server_cpu_seconds"] = sum(row[0] for row in before[:3])
+            sample["server_rss_after_warmup_bytes"] = sum(row[1] for row in before[:3])
+            memory.append([row[1] for row in before])
+
+            def sample_memory():
+                while not stop.wait(0.1):
+                    try:
+                        memory.append([row[1] for row in resources(all_processes)])
+                    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                        resource_errors.append(str(error))
+                        return
+
+            sampler = threading.Thread(target=sample_memory)
+            sampler.start()
+            (root / "start").touch()
+            wait_file(root / "done", all_processes, deadline)
+            after = resources(all_processes)
+            memory.append([row[1] for row in after])
+            stop.set()
+            sampler.join()
+            (root / "finish").touch()
+            code = driver.wait(timeout=10)
+            sample.update(json.loads(result_path.read_text()))
+            sample["passed"] &= code == 0 and not resource_errors and all(p.poll() is None for p in processes)
+            cpu = [max(0, end[0]-start[0]) for start, end in zip(before, after)]
+            sample.update(process_cpu_seconds=sum(cpu[:3]), client_cpu_seconds=cpu[3],
+                          average_server_cpu_cores=sum(cpu[:3])/sample["seconds"],
+                          server_cpu_microseconds_per_success=sum(cpu[:3])*1e6/max(1, sample["successes"]),
+                          peak_process_rss_bytes=max(sum(row[:3]) for row in memory),
+                          peak_client_rss_bytes=max(row[3] for row in memory),
+                          resource_samples=len(memory), resource_errors=resource_errors,
+                          allocated_data_bytes=sum(p.stat().st_blocks*512
+                              for p in root.glob("node*/**/*") if p.is_file()))
+        except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as error:
+            sample.update(passed=False, error=str(error))
+        finally:
+            stop.set()
+            if sampler:
+                sampler.join()
+            for process in processes + ([driver] if driver else []):
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+            for log in logs:
+                log.close()
+            if not sample["passed"]:
+                sample["logs"] = {p.name: p.read_text(errors="replace")[-4000:] for p in root.glob("*.log")}
+        return sample
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--requests", type=int, default=10000)
+    parser.add_argument("--read-requests", type=int, help="Separate request count for read-only samples")
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 8, 32])
     parser.add_argument("--read-percent", type=int, nargs="+", default=[0, 50, 100])
     parser.add_argument("--keys", type=int, default=1000)
     parser.add_argument("--value-size", type=int, default=256)
+    parser.add_argument("--warmup", type=int, default=100)
+    parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--snapshot-entries", type=int, default=1000)
+    parser.add_argument("--quota-bytes", type=int, default=2*1024**3)
     parser.add_argument("--output", type=Path, default=ROOT / "results/benchmark-etcd.json")
     parser.add_argument("--binary", type=Path, default=ROOT / "target/release/slatedb-etcd")
+    parser.add_argument("--baseline-binary", type=Path)
+    parser.add_argument("--backends", nargs="+", choices=["baseline", "service", "etcd"])
     parser.add_argument("--s3-bucket")
     parser.add_argument("--s3-endpoint")
     parser.add_argument("--s3-allow-http", action="store_true")
     parser.add_argument("--timeout-seconds", type=int, default=600)
     args = parser.parse_args()
-    if min(args.requests, args.keys, args.value_size, args.timeout_seconds, *args.concurrency) < 1:
-        parser.error("Counts, sizes, and timeouts must be positive")
+    if min(args.requests, args.keys, args.value_size, args.timeout_seconds, args.repeat,
+           args.snapshot_entries, args.quota_bytes, *args.concurrency) < 1 or args.warmup < 0:
+        parser.error("Counts, sizes, quotas, and timeouts must be positive; warmup can be zero")
+    if args.read_requests is not None and args.read_requests < 1:
+        parser.error("Read request count must be positive")
+    if args.seed < 0 or args.seed+args.repeat > 2**64-1:
+        parser.error("Seeds must fit in an unsigned 64-bit integer")
     if any(value < 0 or value > 100 for value in args.read_percent):
         parser.error("Read percentages must be between zero and 100")
+    kinds = args.backends or (["baseline", "service", "etcd"] if args.baseline_binary else ["service", "etcd"])
+    if "baseline" in kinds and not args.baseline_binary:
+        parser.error("The baseline backend requires --baseline-binary")
+    if len(set(kinds)) != len(kinds):
+        parser.error("Backend names must be distinct")
+    expected = len(kinds)*len(args.concurrency)*len(args.read_percent)*args.repeat
+    report = {"schema_version": 2, "passed": False, "complete": False, "samples": [],
+              "created_at": datetime.now(timezone.utc).isoformat(), "expected_samples": expected,
+              "platform": platform.system(), "architecture": platform.machine(), "logical_cpus": os.cpu_count(),
+              "deployment": "three processes per backend; shared host and disk; loopback plaintext",
+              "reference_etcd": "v3.6.5", "state_backend": "s3" if args.s3_bucket else "local",
+              "raft_snapshot_entries": args.snapshot_entries, "quota_bytes": args.quota_bytes,
+              "order_seed": args.seed, "binaries": {},
+              "resource_phases": "CPU deltas and peak RSS cover only the measured phase; retained preload memory remains",
+              "limits": "closed loop; warm keys; host page cache is not cleared; RSS is not unique physical memory; "
+                        "ps CPU precision and controller barriers affect short samples; no capacity or cross-AZ claim"}
+    report["host_memory_bytes"] = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    if platform.system() == "Darwin":
+        report["cpu_model"] = subprocess.check_output(
+            ["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip()
+    else:
+        report["cpu_model"] = platform.processor()
+    report["kernel"] = platform.release()
+    write_report(args.output, report)
     tools = ROOT / "tmp/benchmark-tools"
     tools.mkdir(parents=True, exist_ok=True)
     for binary, package in [("etcd", "reference-etcd"), ("benchmark", "benchmark")]:
         subprocess.run(["go", "build", "-mod=readonly", "-o", str(tools / binary),
                         "./cmd/" + package], cwd=ROOT / "tests/compat", check=True)
-    report = {"passed": False, "samples": [], "platform": platform.system(),
-              "architecture": platform.machine(), "logical_cpus": os.cpu_count(),
-              "deployment": "three processes per backend; shared host and disk; loopback plaintext",
-              "reference_etcd": "v3.6.5", "state_backend": "s3" if args.s3_bucket else "local", "raft_snapshot_entries": 1000,
-              "quota_bytes": 2 * 1024**3,
-              "limits": "closed-loop client; warmup excluded; RSS includes allocator and page caches; "
-                        "no cross-AZ or capacity claim", "binaries": {}}
-    report["resource_phases"] = "RSS, CPU, and disk samples include preload and measured operations"
-    expected_samples = 2 * len(args.concurrency) * len(args.read_percent)
-    report["expected_samples"] = expected_samples
-    successful = True
     binaries = {"service": args.binary.resolve(), "etcd": tools / "etcd"}
-    for kind, binary in binaries.items():
-        report["binaries"][kind] = hashlib.sha256(binary.read_bytes()).hexdigest()
-    for kind, concurrency, reads in [(kind, concurrency, reads) for kind in binaries
-                                     for concurrency in args.concurrency for reads in args.read_percent]:
-        binary = binaries[kind]
-        with tempfile.TemporaryDirectory(prefix="slatedb-bench-") as directory:
-            root = Path(directory)
-            clients, peers = [address() for _ in range(3)], [address() for _ in range(3)]
-            processes, logs = [], []
-            initial = ",".join(f"node{i+1}=http://{peer}" for i, peer in enumerate(peers))
-            try:
-                for i in range(3):
-                    data = root / f"node{i+1}"
-                    if kind == "etcd":
-                        command = [str(binary), "--name", f"node{i+1}", "--data-dir", str(data),
-                                   "--listen-client-urls", "http://"+clients[i],
-                                   "--advertise-client-urls", "http://"+clients[i],
-                                   "--listen-peer-urls", "http://"+peers[i],
-                                   "--initial-advertise-peer-urls", "http://"+peers[i],
-                                   "--initial-cluster", initial, "--snapshot-count", "1000",
-                                   "--quota-backend-bytes", str(2*1024**3), "--log-level", "error"]
-                    else:
-                        command = [str(binary), "--id", str(i+1), "--dir", str(data),
-                                   "--listen", clients[i], "--cluster-id", root.name, "--snapshot-every", "1000",
-                                   "--quota-backend-bytes", str(2*1024**3)]
-                        if args.s3_bucket:
-                            command += ["--s3-bucket", args.s3_bucket]
-                        if args.s3_endpoint:
-                            command += ["--s3-endpoint", args.s3_endpoint]
-                        if args.s3_allow_http:
-                            command += ["--s3-allow-http"]
-                        for j, endpoint in enumerate(clients):
-                            command += ["--peer", f"{j+1}={endpoint}"]
-                    log = open(root / f"node{i+1}.log", "w")
-                    logs.append(log)
-                    processes.append(subprocess.Popen(command, stdout=log, stderr=log))
-                time.sleep(3)
-                stop, memory = threading.Event(), []
-                def sample_memory():
-                    while not stop.is_set():
-                        result = subprocess.run(["ps", "-o", "rss=", "-p",
-                                                 ",".join(str(p.pid) for p in processes)],
-                                                capture_output=True, text=True)
-                        if result.returncode == 0:
-                            memory.append(sum(int(n) for n in result.stdout.split())*1024)
-                        stop.wait(0.1)
-                sampler = threading.Thread(target=sample_memory)
-                sampler.start()
-                cpu_before = cpu_seconds(processes)
-                result_path = root / "sample.json"
-                try:
-                    result = subprocess.run([str(tools / "benchmark"), "--endpoints",
-                        ",".join(clients), "--requests", str(args.requests),
-                        "--keys", str(args.keys), "--value-size", str(args.value_size),
-                        "--concurrency", str(concurrency), "--read-percent", str(reads),
-                        "--output", str(result_path)], capture_output=True, text=True,
-                        timeout=args.timeout_seconds)
-                except subprocess.TimeoutExpired:
-                    result = subprocess.CompletedProcess([], 1, "", "benchmark deadline exceeded")
-                finally:
-                    stop.set()
-                    sampler.join()
-                sample = json.loads(result_path.read_text()) if result_path.exists() else {
-                    "passed": False, "error": result.stderr[-2000:]}
-                sample.update(backend=kind, process_cpu_seconds=cpu_seconds(processes)-cpu_before,
-                              peak_process_rss_bytes=max(memory, default=0),
-                              allocated_data_bytes=sum(p.stat().st_blocks*512
-                                  for p in root.glob("node*/**/*") if p.is_file()))
-                report["samples"].append(sample)
-                successful &= result.returncode == 0 and sample["passed"]
-                report["passed"] = successful and len(report["samples"]) == expected_samples
-                write_report(args.output, report)
-                print(kind, concurrency, reads, sample.get("successful_ops_per_second"), flush=True)
-            finally:
-                for process in processes:
-                    process.kill()
-                    process.wait()
-                for log in logs:
-                    log.close()
-    write_report(args.output, report)
+    if args.baseline_binary:
+        binaries["baseline"] = args.baseline_binary.resolve()
+    for kind in kinds:
+        report["binaries"][kind] = hashlib.sha256(binaries[kind].read_bytes()).hexdigest()
+    for repeat in range(args.repeat):
+        cases = [(kind, concurrency, reads) for kind in kinds
+                 for concurrency in args.concurrency for reads in args.read_percent]
+        random.Random(args.seed+repeat).shuffle(cases)
+        for kind, concurrency, reads in cases:
+            sample = run_sample(args, tools, binaries[kind], kind, concurrency, reads, repeat)
+            report["samples"].append(sample)
+            report["complete"] = len(report["samples"]) == expected
+            report["passed"] = report["complete"] and all(s["passed"] for s in report["samples"])
+            write_report(args.output, report)
+            print(kind, repeat, concurrency, reads, sample.get("successful_ops_per_second"), flush=True)
     raise SystemExit(0 if report["passed"] else 1)
 
 

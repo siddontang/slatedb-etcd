@@ -2,12 +2,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::WriteBatch;
 use anyhow::{ensure, Context, Result};
 use raft::eraftpb::Snapshot;
 use serde::{Deserialize, Serialize};
 use slatedb::config::{Settings, WriteOptions};
 use slatedb::object_store::local::LocalFileSystem;
-use slatedb::{Db, WriteBatch};
+use slatedb::Db;
 
 use crate::mvcc::{self, Outcome};
 use crate::proto::etcdserverpb::{CompactionRequest, CompactionResponse, RequestOp};
@@ -15,6 +16,8 @@ use crate::{Command, Operation, Reply};
 
 mod backup;
 pub(crate) mod maintenance;
+#[cfg(test)]
+mod quota_tests;
 
 const APPLIED: &[u8] = b"meta/applied";
 const DATA: &[u8] = b"data/";
@@ -32,6 +35,7 @@ pub struct StateMachine {
     pub members: crate::cluster::Store,
     admin: slatedb::admin::Admin,
     pub quota: u64,
+    logical_bytes: u64,
     pub alarms: Vec<crate::proto::etcdserverpb::AlarmMember>,
     pub applied: u64,
     pub durable_applied: u64,
@@ -106,6 +110,7 @@ impl StateMachine {
                 members,
                 admin,
                 quota: 0,
+                logical_bytes: maintenance::count_logical_size(&db).await?,
                 alarms,
                 auth,
                 db: Arc::clone(&db),
@@ -123,6 +128,15 @@ impl StateMachine {
                 .await;
         }
         result
+    }
+
+    async fn write_batch(&mut self, batch: WriteBatch, index: u64) -> Result<()> {
+        let size = batch.logical_size(&self.db, self.logical_bytes).await?;
+        self.db
+            .write_with_options(batch.into_storage(), &WriteOptions { seqnum: index })
+            .await?;
+        self.logical_bytes = size;
+        Ok(())
     }
 
     pub(crate) async fn close(&self) -> Result<()> {
@@ -172,9 +186,7 @@ impl StateMachine {
         let mut batch = WriteBatch::new();
         batch.put(crate::cluster::KEY, serde_json::to_vec(&members)?);
         batch.put(APPLIED, index.to_be_bytes());
-        self.db
-            .write_with_options(batch, &WriteOptions { seqnum: index })
-            .await?;
+        self.write_batch(batch, index).await?;
         self.members = members;
         self.applied = index;
         Ok(Outcome { result })
@@ -194,9 +206,7 @@ impl StateMachine {
             batch.put(crate::auth::KEY, serde_json::to_vec(&next)?);
         }
         batch.put(APPLIED, index.to_be_bytes());
-        self.db
-            .write_with_options(batch, &WriteOptions { seqnum: index })
-            .await?;
+        self.write_batch(batch, index).await?;
         self.applied = index;
         if result.is_ok() {
             self.auth = next;
@@ -327,9 +337,7 @@ impl StateMachine {
         }
         batch.put(APPLIED, index.to_be_bytes());
         // Raft already made this command durable. Waiting for SlateDB here would wait for L0.
-        self.db
-            .write_with_options(batch, &WriteOptions { seqnum: index })
-            .await?;
+        self.write_batch(batch, index).await?;
         self.applied = index;
         Ok(Reply { index, values })
     }
@@ -384,9 +392,7 @@ impl StateMachine {
                 serde_json::to_vec(&self.alarms)?,
             );
             batch.put(APPLIED, index.to_be_bytes());
-            self.db
-                .write_with_options(batch, &WriteOptions { seqnum: index })
-                .await?;
+            self.write_batch(batch, index).await?;
             self.applied = index;
             return Ok(Outcome {
                 result: Err(if corrupt {
@@ -427,9 +433,7 @@ impl StateMachine {
             }
         };
         batch.put(APPLIED, index.to_be_bytes());
-        self.db
-            .write_with_options(batch, &WriteOptions { seqnum: index })
-            .await?;
+        self.write_batch(batch, index).await?;
         self.applied = index;
         self.revision = revision;
         Ok(Outcome { result })
@@ -476,9 +480,7 @@ impl StateMachine {
         }
         crate::failpoint::hit("compact-before-apply");
         batch.put(APPLIED, index.to_be_bytes());
-        self.db
-            .write_with_options(batch, &WriteOptions { seqnum: index })
-            .await?;
+        self.write_batch(batch, index).await?;
         self.applied = index;
         if result.is_ok() {
             self.compact_revision = request.revision;
@@ -535,9 +537,7 @@ impl StateMachine {
                 serde_json::to_vec(&self.alarms)?,
             );
             batch.put(APPLIED, index.to_be_bytes());
-            self.db
-                .write_with_options(batch, &WriteOptions { seqnum: index })
-                .await?;
+            self.write_batch(batch, index).await?;
             self.applied = index;
             return Ok(Outcome {
                 result: Err(if corrupt {
@@ -571,9 +571,7 @@ impl StateMachine {
             }
         };
         batch.put(APPLIED, index.to_be_bytes());
-        self.db
-            .write_with_options(batch, &WriteOptions { seqnum: index })
-            .await?;
+        self.write_batch(batch, index).await?;
         self.applied = index;
         self.revision = revision;
         if let Some((id, record)) = change {
@@ -654,9 +652,7 @@ impl StateMachine {
         }
         crate::failpoint::hit("snapshot-before-install");
         batch.put(APPLIED, index.to_be_bytes());
-        self.db
-            .write_with_options(batch, &WriteOptions { seqnum: index })
-            .await?;
+        self.write_batch(batch, index).await?;
         crate::failpoint::hit("snapshot-after-install-write");
         // The durable Raft snapshot lets a restart repeat this atomic replacement.
         self.db.flush().await?;
@@ -1095,7 +1091,7 @@ mod tests {
         batch.put(APPLIED, 2_u64.to_be_bytes());
         state
             .db
-            .write_with_options(batch, &WriteOptions { seqnum: 2 })
+            .write_with_options(batch.into_storage(), &WriteOptions { seqnum: 2 })
             .await
             .unwrap();
         state.applied = 2;

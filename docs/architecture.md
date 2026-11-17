@@ -347,6 +347,14 @@ Older databases without complete revision records return an explicit HashKV form
 Quota checks use logical stored bytes. Replicated alarms stop writes until an administrator clears
 them.
 This quota is not a filesystem capacity limit.
+The apply worker keeps a derived count of keys and values under `etcd/`.
+Each batch keeps the final mutation per key and reads each old value once.
+The worker updates the counter only after SlateDB accepts the atomic batch.
+Quota reads cost O(1). Batch accounting uses K point reads for K changed logical keys.
+Startup performs one O(N) scan over N logical records.
+Snapshot replacement uses the same batch path.
+The counter adds no stored metadata, so older state and snapshots remain readable.
+Tests compare the counter with a full scan after state changes, restart, and DST recovery.
 
 Physical Compact flushes MVCC deletions. Defragment rewrites SSTs through the SlateDB compactor.
 Both operations run on the apply worker. Slow state work cannot stop Raft heartbeats.

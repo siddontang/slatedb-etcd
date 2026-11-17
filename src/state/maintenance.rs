@@ -9,12 +9,7 @@ use tonic::Code;
 
 impl StateMachine {
     pub async fn logical_size(&self) -> Result<u64> {
-        let mut scan = self.db.scan_prefix(b"etcd/", ..).await?;
-        let mut size = 0;
-        while let Some(row) = scan.next().await? {
-            size += (row.key.len() + row.value.len()) as u64;
-        }
-        Ok(size)
+        Ok(self.logical_bytes)
     }
 
     pub async fn maintenance(
@@ -126,9 +121,7 @@ impl StateMachine {
         });
         batch.put(ALARMS, serde_json::to_vec(&alarms)?);
         batch.put(APPLIED, index.to_be_bytes());
-        self.db
-            .write_with_options(batch, &WriteOptions { seqnum: index })
-            .await?;
+        self.write_batch(batch, index).await?;
         self.applied = index;
         self.alarms = alarms;
         Ok(Outcome { result })
@@ -336,4 +329,16 @@ pub(crate) async fn compact_hash(
         }
     }
     Ok(())
+}
+
+// Rebuild derived accounting once when opening existing state. No format migration is required.
+pub(super) async fn count_logical_size(db: &Db) -> Result<u64> {
+    let mut scan = db.scan_prefix(b"etcd/", ..).await?;
+    let mut size = 0_u64;
+    while let Some(row) = scan.next().await? {
+        size = size
+            .checked_add((row.key.len() + row.value.len()) as u64)
+            .context("logical size counter overflow")?;
+    }
+    Ok(size)
 }

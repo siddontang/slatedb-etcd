@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::WriteBatch;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use slatedb::{Db, WriteBatch};
+use slatedb::Db;
 use tonic::{Code, Status};
 
 use crate::proto::etcdserverpb::request_op::Request as Op;

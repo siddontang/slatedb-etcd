@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -17,6 +18,41 @@ import (
 	"go.uber.org/zap"
 )
 
+func mix(value uint64) uint64 {
+	value += 0x9e3779b97f4a7c15
+	value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9
+	value = (value ^ (value >> 27)) * 0x94d049bb133111eb
+	return value ^ (value >> 31)
+}
+
+func percentiles(samples []float64) map[string]float64 {
+	sort.Float64s(samples)
+	result := map[string]float64{}
+	for name, fraction := range map[string]float64{"p50": .5, "p95": .95, "p99": .99, "p999": .999, "max": 1} {
+		if len(samples) > 0 {
+			result[name] = samples[int(float64(len(samples)-1)*fraction)]
+		}
+	}
+	return result
+}
+
+func barrier(directory, notify, release string) error {
+	if directory == "" {
+		return nil
+	}
+	if err := os.WriteFile(filepath.Join(directory, notify), nil, 0600); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(30 * time.Minute)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(filepath.Join(directory, release)); err == nil {
+			return nil
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return fmt.Errorf("controller did not release %s", notify)
+}
+
 func main() {
 	endpoints := flag.String("endpoints", "", "Comma-separated client endpoints")
 	requests := flag.Int("requests", 10000, "Measured operations")
@@ -24,9 +60,12 @@ func main() {
 	reads := flag.Int("read-percent", 50, "Linearizable read percentage")
 	keys := flag.Int("keys", 1000, "Preloaded keys")
 	size := flag.Int("value-size", 256, "Value size in bytes")
+	warmup := flag.Int("warmup", 100, "Unmeasured operations after preload")
+	seed := flag.Uint64("seed", 42, "Deterministic workload seed")
+	control := flag.String("control-dir", "", "Optional controller barrier directory")
 	output := flag.String("output", "", "JSON result file")
 	flag.Parse()
-	if *endpoints == "" || *requests < 1 || *concurrency < 1 || *keys < 1 || *size < 1 || *reads < 0 || *reads > 100 {
+	if *endpoints == "" || *requests < 1 || *concurrency < 1 || *keys < 1 || *size < 1 || *warmup < 0 || *reads < 0 || *reads > 100 {
 		fmt.Fprintln(os.Stderr, "invalid benchmark arguments")
 		os.Exit(2)
 	}
@@ -36,12 +75,47 @@ func main() {
 		panic(err)
 	}
 	defer client.Close()
+	deadline := time.Now().Add(30 * time.Second)
+	for _, endpoint := range client.Endpoints() {
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			status, err := client.Status(ctx, endpoint)
+			cancel()
+			if err == nil && status.Leader != 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				panic("cluster readiness timed out")
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+	}
 	value := strings.Repeat("v", *size)
 	for i := 0; i < *keys; i++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		_, err := client.Put(ctx, fmt.Sprintf("bench/%08d", i), value)
 		cancel()
 		if err != nil {
+			panic(err)
+		}
+	}
+	isRead := func(i int) bool { return mix(uint64(i)^*seed)%100 < uint64(*reads) }
+	operation := func(i int) error {
+		key := fmt.Sprintf("bench/%08d", mix(uint64(i)^*seed^0x51ed270b)%uint64(*keys))
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if isRead(i) {
+			response, err := client.Get(ctx, key)
+			if err == nil && (len(response.Kvs) != 1 || string(response.Kvs[0].Value) != value) {
+				return fmt.Errorf("read returned an unexpected value")
+			}
+			return err
+		}
+		_, err := client.Put(ctx, key, value)
+		return err
+	}
+	for i := 0; i < *warmup; i++ {
+		if err := operation(*requests + i); err != nil {
 			panic(err)
 		}
 	}
@@ -60,54 +134,50 @@ func main() {
 				if i >= *requests {
 					return
 				}
-				key := fmt.Sprintf("bench/%08d", i%*keys)
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				began := time.Now()
-				var err error
-				if i%100 < *reads {
-					var response *clientv3.GetResponse
-					response, err = client.Get(ctx, key)
-					if err == nil && (len(response.Kvs) != 1 || string(response.Kvs[0].Value) != value) {
-						err = fmt.Errorf("read returned an unexpected value")
-					}
-				} else {
-					_, err = client.Put(ctx, key, value)
-				}
+				err := operation(i)
 				durations[i] = float64(time.Since(began).Nanoseconds()) / 1e6
-				cancel()
 				if err != nil {
 					failures[i] = err.Error()
 				}
 			}
 		}()
 	}
+	if err := barrier(*control, "ready", "start"); err != nil {
+		panic(err)
+	}
 	began := time.Now()
 	close(start)
 	wg.Wait()
 	elapsed := time.Since(began).Seconds()
-	samples, errors := []float64{}, map[string]int{}
+	if err := barrier(*control, "done", "finish"); err != nil {
+		panic(err)
+	}
+	samples, getSamples, putSamples, errors := []float64{}, []float64{}, []float64{}, map[string]int{}
+	readCount := 0
 	for i, failure := range failures {
+		if isRead(i) {
+			readCount++
+		}
 		if failure != "" {
 			errors[failure]++
 		} else {
 			samples = append(samples, durations[i])
+			if isRead(i) {
+				getSamples = append(getSamples, durations[i])
+			} else {
+				putSamples = append(putSamples, durations[i])
+			}
 		}
-	}
-	sort.Float64s(samples)
-	percentile := func(fraction float64) float64 {
-		if len(samples) == 0 {
-			return 0
-		}
-		index := int(float64(len(samples)-1) * fraction)
-		return samples[index]
 	}
 	report := map[string]any{"passed": len(samples) == *requests, "requests": *requests,
 		"successes": len(samples), "errors": errors, "concurrency": *concurrency,
-		"read_percent": *reads, "keys": *keys, "value_bytes": *size,
+		"read_percent": *reads, "read_requests": readCount, "write_requests": *requests - readCount,
+		"keys": *keys, "value_bytes": *size, "warmup_operations": *warmup, "seed": *seed,
 		"seconds": elapsed, "successful_ops_per_second": float64(len(samples)) / elapsed,
-		"latency_ms": map[string]float64{"p50": percentile(.5), "p95": percentile(.95),
-			"p99": percentile(.99), "p999": percentile(.999), "max": percentile(1)},
-		"model": "closed loop; warmup excluded; latency includes successful operations only"}
+		"latency_ms": percentiles(samples), "read_latency_ms": percentiles(getSamples),
+		"write_latency_ms": percentiles(putSamples),
+		"model":            "closed loop; seeded uniform keys and read selection; latency includes successful operations only"}
 	data, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
 		panic(err)

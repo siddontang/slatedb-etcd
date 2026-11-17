@@ -1031,6 +1031,13 @@ impl Simulation {
         assert!(snapshots > 0, "seed {seed}: no snapshot transfer");
         let mut expected_events = None;
         for node in sim.nodes.values() {
+            let state = node.worker.state();
+            let mut rows = state.db.scan_prefix(b"etcd/", ..).await.unwrap();
+            let mut size = 0;
+            while let Some(row) = rows.next().await.unwrap() {
+                size += (row.key.len() + row.value.len()) as u64;
+            }
+            assert_eq!(state.logical_size().await.unwrap(), size, "seed {seed}");
             assert!(node.state.leases[&77].generation > generation);
             let mut request = WatchCreateRequest {
                 key: vec![0],

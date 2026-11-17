@@ -39,6 +39,7 @@ jobs:
         run: |
           python3 scripts/check-public.py
           python3 scripts/test_reporting.py
+          python3 scripts/test_benchmark.py
           python3 scripts/test_history.py
           python3 scripts/check-history.py
           python3 scripts/test_secret_scan.py
