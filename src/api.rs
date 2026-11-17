@@ -44,6 +44,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/debug/snapshot-delay", post(snapshot_delay))
         .route("/debug/apply-delay", post(apply_delay))
         .route("/debug/log-fault", post(log_fault))
+        .route("/debug/log-read-fault", post(log_read_fault))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
 }
@@ -161,4 +162,14 @@ async fn log_fault(
     Json(fault): Json<LogFault>,
 ) -> Result<Json<Value>, ApiError> {
     dispatch(state, |tx| Event::LogFault(fault.delay_ms, fault.fail, tx)).await
+}
+
+async fn log_read_fault(
+    State(state): State<ApiState>,
+    Json(fault): Json<LogFault>,
+) -> impl IntoResponse {
+    dispatch(state, |tx| {
+        Event::LogReadFault(fault.delay_ms, fault.fail, tx)
+    })
+    .await
 }

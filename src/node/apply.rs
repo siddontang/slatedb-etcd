@@ -143,51 +143,7 @@ impl Executor {
             #[cfg(test)]
             Job::Panic => panic!("injected apply worker panic"),
             Job::Entries(entries) => {
-                let mut replies = vec![];
-                for entry in entries {
-                    ensure!(
-                        entry.index == self.state.applied + 1,
-                        "apply batch has an index gap"
-                    );
-                    ensure!(
-                        entry.get_entry_type() == EntryType::EntryNormal,
-                        "membership changes are not supported"
-                    );
-                    if entry.data.is_empty() {
-                        self.state.apply(entry.index, None).await?;
-                        continue;
-                    }
-                    let command: RaftCommand = serde_json::from_slice(&entry.data)?;
-                    let mut lease_command = None;
-                    let reply = match &command {
-                        RaftCommand::Legacy(c) => Reply::Encoded(serde_json::to_value(
-                            self.state.apply(entry.index, Some(c)).await?,
-                        )?),
-                        RaftCommand::Etcd { etcd, .. } => {
-                            let mut outcome = self.state.apply_etcd(entry.index, etcd).await?;
-                            work.header.outcome(&mut outcome);
-                            Reply::Encoded(serde_json::to_value(outcome)?)
-                        }
-                        RaftCommand::Lease { lease, .. } => {
-                            lease_command = Some(lease.clone());
-                            Reply::Lease(self.state.apply_lease(entry.index, lease).await?)
-                        }
-                        RaftCommand::Compact { compact, .. } => {
-                            let mut outcome =
-                                self.state.apply_compaction(entry.index, compact).await?;
-                            if let Ok(response) = &mut outcome.result {
-                                work.header.fill(response.header.as_mut());
-                            }
-                            Reply::Encoded(serde_json::to_value(outcome)?)
-                        }
-                    };
-                    replies.push(AppliedCommand {
-                        id: command.id().to_owned(),
-                        lease: lease_command,
-                        reply,
-                    });
-                }
-                Output::Entries(replies)
+                Output::Entries(apply_entries(&mut self.state, entries, work.header).await?)
             }
             Job::Snapshot(snapshot) => {
                 self.state.install_snapshot(&snapshot).await?;
@@ -339,4 +295,75 @@ impl Worker {
     pub fn state(&self) -> &StateMachine {
         &self.manual.as_ref().unwrap().0.state
     }
+}
+
+async fn apply_entries(
+    state: &mut StateMachine,
+    entries: Vec<Entry>,
+    header: Header,
+) -> Result<Vec<AppliedCommand>> {
+    let mut replies = vec![];
+    for entry in entries {
+        ensure!(
+            entry.index == state.applied + 1,
+            "apply batch has an index gap"
+        );
+        ensure!(
+            entry.get_entry_type() == EntryType::EntryNormal,
+            "membership changes are not supported"
+        );
+        if entry.data.is_empty() {
+            state.apply(entry.index, None).await?;
+            continue;
+        }
+        let command: RaftCommand = serde_json::from_slice(&entry.data)?;
+        let mut lease_command = None;
+        let reply = match &command {
+            RaftCommand::Legacy(c) => Reply::Encoded(serde_json::to_value(
+                state.apply(entry.index, Some(c)).await?,
+            )?),
+            RaftCommand::Etcd { etcd, .. } => {
+                let mut outcome = state.apply_etcd(entry.index, etcd).await?;
+                header.outcome(&mut outcome);
+                Reply::Encoded(serde_json::to_value(outcome)?)
+            }
+            RaftCommand::Lease { lease, .. } => {
+                lease_command = Some(lease.clone());
+                Reply::Lease(state.apply_lease(entry.index, lease).await?)
+            }
+            RaftCommand::Compact { compact, .. } => {
+                let mut outcome = state.apply_compaction(entry.index, compact).await?;
+                if let Ok(response) = &mut outcome.result {
+                    header.fill(response.header.as_mut());
+                }
+                Reply::Encoded(serde_json::to_value(outcome)?)
+            }
+        };
+        replies.push(AppliedCommand {
+            id: command.id().to_owned(),
+            lease: lease_command,
+            reply,
+        });
+    }
+    Ok(replies)
+}
+
+// Replay in bounded batches when recovery exceeds the pending-entry quota.
+pub(super) async fn recover(
+    state: &mut StateMachine,
+    storage: &RaftStorage,
+    header: Header,
+) -> Result<()> {
+    while state.applied < storage.commit_index() {
+        let low = state.applied + 1;
+        let entries = storage.entries(
+            low,
+            (low + BATCH_ENTRIES).min(storage.commit_index() + 1),
+            Some(BATCH_BYTES),
+            raft::GetEntriesContext::empty(false),
+        )?;
+        ensure!(!entries.is_empty(), "empty recovery batch");
+        apply_entries(state, entries, header).await?;
+    }
+    Ok(())
 }

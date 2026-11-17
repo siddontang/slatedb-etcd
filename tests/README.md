@@ -61,7 +61,10 @@ Repeat a failing seed with the same command. Each run also writes a partial `see
 The test drives real storage with a simulated transport and Raft clock.
 It checks lease generations and Watch journals after recovery. It does not simulate lease expiry
 time.
-It does not control disk completion, operating system threads, or SlateDB background scheduling.
+The scheduler controls disk execution, completion delivery, and apply jobs.
+A 1 KiB cache forces asynchronous reads. Each schedule checks all four log pool limits.
+It injects read and write failure, restart, and late read completion after a term change.
+It does not control operating system threads or SlateDB background scheduling.
 
 ## API sequence fuzzing
 
@@ -86,3 +89,40 @@ python3 scripts/check-compat.py --tags upstream --all-capabilities \
 This probe must fail for missing APIs. It does not convert unsupported features into success.
 The standard CI job runs the supported profile, faults, Jepsen controls, and 10 fuzz inputs.
 The manual `extended` workflow option runs 100 DST seeds and 16 process fault seeds.
+
+## Official client integration workflows
+
+`TestOfficialClientWorkflows` runs the same cases against three service processes and real etcd
+3.6.5.
+It uses the unchanged official `client/v3/concurrency` package:
+
+- Mutex: exclude competing owners, wait on Watch, and hand off after session revocation.
+- Election: campaign, observe, proclaim, resign, and remove the leader through lease revocation.
+- STM: transfer balances under three isolation modes and force conflict retries.
+
+The STM modes are SerializableSnapshot, Serializable, and RepeatableReads.
+STM uses one member endpoint because its historical reads are serializable.
+Switching replicas can reach a member that has not applied the selected revision.
+The official client uses round-robin routing with multiple endpoints.
+These cases do not establish STM behavior across endpoint changes.
+Mutex and election cases use all service endpoints.
+ReadCommitted does not check read conflicts, so it cannot guarantee this transfer invariant.
+
+These cases follow the official [mutex], [election], and [STM] APIs.
+They are new integration tests, not copies of all upstream integration tests.
+The [upstream source index](upstream/README.md) records the wider coverage boundary.
+
+[mutex]: https://github.com/etcd-io/etcd/blob/v3.6.5/client/v3/concurrency/mutex.go
+[election]: https://github.com/etcd-io/etcd/blob/v3.6.5/client/v3/concurrency/election.go
+[STM]: https://github.com/etcd-io/etcd/blob/v3.6.5/client/v3/concurrency/stm.go
+
+```sh
+python3 scripts/check-compat.py --run '^TestOfficialClientWorkflows$' \
+  --output tmp/test-results/client-workflows.json
+```
+
+`TestCapabilityDifferences` checks four known gaps against real etcd.
+Auth status, member listing, Maintenance status, and physical compaction return Unimplemented.
+A passing gap control confirms a difference. It does not prove support for that capability.
+`TestFollowerReadIndexWaitsForLocalApply` guards the STM regression found by these workflows.
+`TestBoundedLogCacheRecoversLaggingFollower` checks small caches with delayed and failed disk reads.

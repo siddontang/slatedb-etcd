@@ -17,9 +17,10 @@ The [original PoC results](RESULTS.md) describe measurements before this reposit
 ## etcd v3 APIs
 
 The same port serves HTTP diagnostics and plaintext gRPC. No separate client port is required.
-Any replica accepts client requests. Followers forward writes and linearizable reads to the leader.
-Serializable Range requests read the local replica. Linearizable reads use Safe ReadIndex.
-A read-only Txn also stays local when both branches contain only serializable Range operations.
+Any replica accepts client requests. Followers forward writes to the leader.
+Serializable Range requests read local applied state. Linearizable reads use Safe ReadIndex.
+The receiving member waits for local apply and executes the read.
+The same rules apply to read-only transactions, including both nested branches.
 
 Supported behavior:
 
@@ -190,7 +191,7 @@ limit of 64 MiB. Snapshot creation runs in the background.
 A dedicated log I/O thread persists snapshots.
 Slow persistence can still raise client tail latency.
 A separate apply task owns SlateDB, installs snapshots, and executes committed state changes.
-Production use still needs bounded snapshot transfer and bounded retained-log memory.
+Production use still needs bounded snapshot transfer and bounded state scans.
 
 The local PoC polls compaction and manifest updates every 100 ms. The default slower polling caused
 L0 backpressure during repeated checkpoints in an earlier run. That run is retained in
@@ -217,8 +218,9 @@ The owner queues at most 64 local reads and 64 checkpoint requests.
 It rejects new proposals at 1,024 committed but unapplied entries.
 Worker failure or panic stops the node. Shutdown cancels the worker and its snapshot builder.
 The log thread performs steady-state disk I/O, file reclamation, and disk statistics.
-The Raft owner uses an in-memory copy of the retained log.
-Checkpoints reclaim that cache; it has no independent memory quota.
+The owner pins unapplied entries and keeps a bounded cache of applied log payloads.
+Cache misses fetch entries asynchronously through the disk worker.
+Term runs support synchronous Raft term lookup without retaining every payload.
 The apply task shares the process runtime; this change does not isolate CPU or disk resources.
 
 Status reports `apply_lag`, `apply_busy`, `apply_target`, and `queued_state_reads`.
@@ -227,10 +229,14 @@ installation.
 This loopback test hook has a five-second limit. Set the delay to zero to restore normal operation.
 
 Linearizable Range requests and read-only transactions use Safe ReadIndex.
-The leader confirms a quorum, waits for local apply through the read index, then runs the read.
+The leader confirms a quorum. The receiving member waits for local apply through the read index.
+Followers use Raft to request that index, then evaluate the read locally.
+Forwarded KV, Lease, and Compact results also wait for a local barrier.
+Later STM reads on that member can then use their revisions.
 Both branches of nested transactions must contain only reads.
 Leadership loss, timeout, or cancellation removes the pending read. At most 64 reads can wait.
-These reads do not append log entries. Serializable reads remain local and can return older state.
+These reads do not append log entries. Unconfirmed requests retry every two Raft ticks.
+Serializable reads remain local and can return older state.
 
 Log work uses a FIFO queue with 64 jobs and a 16 MiB admission target.
 One Ready or full snapshot can exceed the target. New proposals stop at the queue limit.
@@ -241,8 +247,12 @@ Ordinary HTTP receipt confirms delivery; snapshot receipt waits for durable snap
 Status separates `raft_commit_index`, durable `commit_index`, and `applied_index`.
 It also reports `cached_last_log_index`, `log_busy`, `queued_log_jobs`, `queued_log_bytes`,
 and `pending_read_indexes`.
+`log_memory` reports bytes and limits for the cache, pending entries, read results,
+and term metadata.
+It also reports hits, misses, evictions, disk reads, and discarded stale results.
 `POST /debug/log-fault` accepts `{"delay_ms":2500,"fail":false}` for local fault tests.
 The delay has a five-second limit. `fail=true` stops the node on its next log write.
+`POST /debug/log-read-fault` accepts the same fields for asynchronous entry reads.
 Set both fields to zero or false to clear future injected faults.
 Shutdown cancels queued work and injected delays. An active kernel I/O call cannot be cancelled.
 
@@ -310,12 +320,37 @@ Loss of quorum delays deletion until a majority can commit it. Clients must not 
 maximum lifetime or use lease expiry alone to fence external writes.
 Lease key lookup and revocation scan current keys. Large leases can delay the apply worker.
 
+## Log memory limits
+
+The following flags set independent log pool limits:
+
+| Flag | Default |
+| --- | --- |
+| `--log-cache-bytes` | 8388608 |
+| `--log-pending-bytes` | 33554432 |
+| `--log-read-bytes` | 16777216 |
+| `--log-term-bytes` | 1048576 |
+
+The history cache evicts entries even when automatic checkpoints are disabled.
+Unapplied entries remain pinned. Admission reserves 64 KiB for control entries.
+Each entry charge includes its encoded size and 256 bytes of structure allowance.
+Each compressed term run costs 64 bytes. An encoded entry cannot exceed 8 MiB.
+Read batches target 512 KiB and contain at most 128 entries. One large entry can exceed the target.
+The read quota must hold one maximum entry. A cache smaller than an entry uses the read result pool.
+
+These limits do not bound process RSS, snapshots, transport buffers, or SlateDB allocations.
+Term exhaustion or a control entry beyond the hard pending limit stops the node.
+Startup replays a large committed backlog in bounded batches before activation.
+An uncommitted tail beyond its quota requires a larger pending limit before restart.
+See the [log pool protocol](docs/architecture.md#bounded-log-pools)
+for accounting and recovery rules.
+
 ## Next steps
 
-1. Bound retained-log memory with asynchronous entry fetch and a cache quota.
-2. Bound compaction work and range scans, and use checkpoint references for large snapshots.
-3. Add lease TTL checkpoints and a key index for leases. Bound Watch catch-up work.
-4. Add membership changes, TLS, authentication, quotas, maintenance APIs, and operational metrics.
+1. Bound compaction work and range scans, and use checkpoint references for large snapshots.
+2. Add lease TTL checkpoints and a key index for leases. Bound Watch catch-up work.
+3. Add membership changes, TLS, authentication, backend quotas, and maintenance APIs.
+4. Add remote object storage, cross-host tests, and operational metrics.
 
 Test object-store outages, slow disks, interrupted snapshot installation, and cross-host failover
 before using the service for coordination.

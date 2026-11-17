@@ -31,7 +31,7 @@ impl Service {
                     .get(&error.leader_id)
                     .ok_or_else(|| Status::unavailable("etcdserver: no leader"))?;
                 let mut client = LeaseClient::new(channel.clone());
-                match command {
+                let response = match command {
                     LeaseCommand::Grant { id, ttl } => LeaseReply::Grant(
                         client
                             .lease_grant(forward(LeaseGrantRequest { id, ttl }))
@@ -70,7 +70,9 @@ impl Service {
                     LeaseCommand::Expire { .. } => {
                         return Err(Status::internal("internal lease command"))
                     }
-                }
+                };
+                self.local_barrier().await?;
+                response
             }
             Err(error) => return Err(Status::unavailable(format!("etcdserver: {}", error.error))),
         };

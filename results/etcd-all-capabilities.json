@@ -1,0 +1,2786 @@
+{
+  "created_at": "2026-11-17T05:17:59.388413+00:00",
+  "binary_sha256": "68c3a60a79ebdf59ebefc8cd893792d69e77a93ba030f7114f0b1a4133ff0372",
+  "reference_etcd": "3.6.5",
+  "client": "go.etcd.io/etcd/client/v3 v3.6.5",
+  "go": "go version go1.25.6 darwin/arm64",
+  "deployment": "three local service processes; one embedded reference etcd",
+  "command": [
+    "go",
+    "test",
+    "-mod=readonly",
+    "-json",
+    "-count=1",
+    "-timeout=10m",
+    "-tags",
+    "upstream",
+    "./..."
+  ],
+  "profile": "all-capabilities",
+  "log": "<repo>/tmp/test-results/etcd-all-capabilities.jsonl",
+  "tests": [
+    {
+      "name": "TestSlowApplyKeepsRaftLive",
+      "result": "pass",
+      "seconds": 3.49
+    },
+    {
+      "name": "TestCommittedApplyBacklogSurvivesRestart",
+      "result": "pass",
+      "seconds": 2.75
+    },
+    {
+      "name": "TestSnapshotApplyKeepsPeerReplicationLive",
+      "result": "pass",
+      "seconds": 3.65
+    },
+    {
+      "name": "TestCapabilityDifferences/auth",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestCapabilityDifferences/members",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestCapabilityDifferences/status",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestCapabilityDifferences/physical-compact",
+      "result": "pass",
+      "seconds": 0.07
+    },
+    {
+      "name": "TestCapabilityDifferences",
+      "result": "pass",
+      "seconds": 1.71
+    },
+    {
+      "name": "TestOfficialClientWorkflows/service/mutex",
+      "result": "pass",
+      "seconds": 0.54
+    },
+    {
+      "name": "TestOfficialClientWorkflows/service/election",
+      "result": "pass",
+      "seconds": 0.22
+    },
+    {
+      "name": "TestOfficialClientWorkflows/service/stm-0",
+      "result": "pass",
+      "seconds": 0.1
+    },
+    {
+      "name": "TestOfficialClientWorkflows/service/stm-1",
+      "result": "pass",
+      "seconds": 0.03
+    },
+    {
+      "name": "TestOfficialClientWorkflows/service/stm-2",
+      "result": "pass",
+      "seconds": 0.03
+    },
+    {
+      "name": "TestOfficialClientWorkflows/service",
+      "result": "pass",
+      "seconds": 1.89
+    },
+    {
+      "name": "TestOfficialClientWorkflows/etcd/mutex",
+      "result": "pass",
+      "seconds": 0.66
+    },
+    {
+      "name": "TestOfficialClientWorkflows/etcd/election",
+      "result": "pass",
+      "seconds": 0.16
+    },
+    {
+      "name": "TestOfficialClientWorkflows/etcd/stm-0",
+      "result": "pass",
+      "seconds": 0.2
+    },
+    {
+      "name": "TestOfficialClientWorkflows/etcd/stm-1",
+      "result": "pass",
+      "seconds": 0.23
+    },
+    {
+      "name": "TestOfficialClientWorkflows/etcd/stm-2",
+      "result": "pass",
+      "seconds": 0.24
+    },
+    {
+      "name": "TestOfficialClientWorkflows/etcd",
+      "result": "pass",
+      "seconds": 1.73
+    },
+    {
+      "name": "TestOfficialClientWorkflows",
+      "result": "pass",
+      "seconds": 3.61
+    },
+    {
+      "name": "TestDifferentialCompaction/negative_revision",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialCompaction/initial_boundary",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/zero_revision",
+      "result": "pass",
+      "seconds": 0.03
+    },
+    {
+      "name": "TestDifferentialCompaction/repeated_zero",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialCompaction/empty_store",
+      "result": "pass",
+      "seconds": 0.03
+    },
+    {
+      "name": "TestDifferentialCompaction/empty_boundary_read",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/stable_key",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/first_version",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/second_version",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/delete",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialCompaction/recreate",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialCompaction/newer_key",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/future_revision",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/future_compact_keeps_history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/compact_middle",
+      "result": "pass",
+      "seconds": 0.03
+    },
+    {
+      "name": "TestDifferentialCompaction/compacted_point",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialCompaction/compacted_missing_key",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/compacted_count",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/boundary_point",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/boundary_range",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/stable_anchor",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/delete_history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/recreated_history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/current",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/negative_direct_read",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/negative_txn_read",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/txn_rollback",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/rollback_absent",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/inactive_compacted_branch",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/nested_boundary_read",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/repeat_boundary",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/older_boundary",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/compact_deleted_version",
+      "result": "pass",
+      "seconds": 0.03
+    },
+    {
+      "name": "TestDifferentialCompaction/deleted_boundary_range",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialCompaction/physical_rejection_keeps_boundary",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/compact_current",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialCompaction/current_boundary",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/write_after_compact",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/read_after_compact",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction",
+      "result": "pass",
+      "seconds": 2.8
+    },
+    {
+      "name": "TestCompactionRecovery",
+      "result": "pass",
+      "seconds": 6.31
+    },
+    {
+      "name": "TestDifferentialKV/initial_revision",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/create",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/same_value_increments_version",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/update_prev_kv",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/negative_revision_reads_latest",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/future_revision",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/binary_put",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/binary_get",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/empty_value",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/prefix_a",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/prefix_b",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/prefix_c",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/prefix_limit_more",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/sort_value",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/sort_key_desc",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/sort_mod",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/keys_only",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/count_only",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/revision_filter_count",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/create_revision_filters",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/all_keys",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/range_end",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/ignore_value",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/ignore_lease",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/missing_ignore_value",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/invalid_ignore_value",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/missing_lease",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/invalid_ignore_lease",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_one_revision",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/txn_else",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/txn_read_before_write",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/txn_read_only",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_empty",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/missing_value_compare",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/range_compare",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/nested_base_predicates",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/nested_mutually_exclusive_writes",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/nested_negative_revision",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_rollback",
+      "result": "pass",
+      "seconds": 0.03
+    },
+    {
+      "name": "TestDifferentialKV/rollback_absent",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_future_revision_rollback",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/duplicate_put",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/overlapping_put_delete",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/unselected_invalid_branch",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/delete_previous",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/deleted_history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/deleted_latest",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/delete_missing_no_revision",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/recreate_resets_version",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/recreated_metadata",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/overlapping_deletes",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/empty_key",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/too_many_operations",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/final_state",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV",
+      "result": "pass",
+      "seconds": 2.27
+    },
+    {
+      "name": "TestFailoverAndSnapshotRecovery",
+      "result": "pass",
+      "seconds": 5.33
+    },
+    {
+      "name": "TestConcurrentCompareAndSwap",
+      "result": "pass",
+      "seconds": 1.44
+    },
+    {
+      "name": "TestPartitionReadModes",
+      "result": "pass",
+      "seconds": 4.53
+    },
+    {
+      "name": "TestBoundedLogCacheRecoversLaggingFollower/delayed-read",
+      "result": "pass",
+      "seconds": 3.65
+    },
+    {
+      "name": "TestBoundedLogCacheRecoversLaggingFollower/failed-read",
+      "result": "pass",
+      "seconds": 2.12
+    },
+    {
+      "name": "TestBoundedLogCacheRecoversLaggingFollower",
+      "result": "pass",
+      "seconds": 5.77
+    },
+    {
+      "name": "TestFollowerReadIndexWaitsForLocalApply",
+      "result": "pass",
+      "seconds": 4.08
+    },
+    {
+      "name": "TestForwardedWriteWaitsForLocalApply",
+      "result": "pass",
+      "seconds": 3.76
+    },
+    {
+      "name": "TestReadIndexAndNestedReadTxnDoNotWriteLogs",
+      "result": "pass",
+      "seconds": 1.05
+    },
+    {
+      "name": "TestReadIndexRejectsMinorityLeader",
+      "result": "pass",
+      "seconds": 2.85
+    },
+    {
+      "name": "TestSlowLogKeepsRaftLiveAndFencesReplies",
+      "result": "pass",
+      "seconds": 3.78
+    },
+    {
+      "name": "TestLogWriteFailureStopsNodeAndRecoversAcknowledgedState",
+      "result": "pass",
+      "seconds": 1.98
+    },
+    {
+      "name": "TestSlowCheckpointPublicationKeepsRaftLive",
+      "result": "pass",
+      "seconds": 4.47
+    },
+    {
+      "name": "TestAlarm",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAlarm",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAlarm (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAlarmlistOnMemberRestart",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAlarmlistOnMemberRestart",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAlarmlistOnMemberRestart (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthEnable",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthEnable",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthEnable (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthDisable",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthDisable",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthDisable (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthGracefulDisable",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthGracefulDisable",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthGracefulDisable (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthStatus",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthStatus",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthStatus (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthRoleUpdate",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthRoleUpdate",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthRoleUpdate (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthUserDeleteDuringOps",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthUserDeleteDuringOps",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthUserDeleteDuringOps (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthRoleRevokeDuringOps",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthRoleRevokeDuringOps",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthRoleRevokeDuringOps (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthWriteKey",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthWriteKey",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthWriteKey (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthTxn/NoJWT",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthTxn/NoJWT",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthTxn/NoJWT (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthTxn/JWT",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthTxn/JWT",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthTxn/JWT (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthTxn",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthTxn",
+        "--- FAIL: TestAuthTxn (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthPrefixPerm",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthPrefixPerm",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthPrefixPerm (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthLeaseKeepAlive",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthLeaseKeepAlive",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthLeaseKeepAlive (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthRevokeWithDelete",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthRevokeWithDelete",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthRevokeWithDelete (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthLeaseTimeToLiveExpired",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthLeaseTimeToLiveExpired",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthLeaseTimeToLiveExpired (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthLeaseGrantLeases/NoJWT",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthLeaseGrantLeases/NoJWT",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthLeaseGrantLeases/NoJWT (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthLeaseGrantLeases/JWT",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthLeaseGrantLeases/JWT",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthLeaseGrantLeases/JWT (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthLeaseGrantLeases",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthLeaseGrantLeases",
+        "--- FAIL: TestAuthLeaseGrantLeases (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthMemberAdd",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthMemberAdd",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthMemberAdd (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthMemberRemove",
+      "result": "fail",
+      "seconds": 0.98,
+      "details": [
+        "=== RUN   TestAuthMemberRemove",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-2640421102",
+        "upstream_common_auth_test.go:606:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_auth_test.go:606",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "RoleAdd failed: rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestAuthMemberRemove",
+        "Messages:   \tfailed to enable auth",
+        "compat_test.go:79: node 1: 2026-11-17T05:19:06.238557Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:60330",
+        "2026-11-17T05:19:07.142774Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:07.143337Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 2: 2026-11-17T05:19:06.238586Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:60331",
+        "2026-11-17T05:19:07.142775Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:07.143327Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 3: 2026-11-17T05:19:06.239236Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:60332",
+        "2026-11-17T05:19:07.141235Z  INFO slatedb_etcd::node: Raft state changed node=3 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:07.142274Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:07.143179Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Leader term=1 leader=3",
+        "--- FAIL: TestAuthMemberRemove (0.98s)"
+      ]
+    },
+    {
+      "name": "TestAuthTestInvalidMgmt",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthTestInvalidMgmt",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthTestInvalidMgmt (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthLeaseRevoke",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthLeaseRevoke",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthLeaseRevoke (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthRoleGet",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthRoleGet",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthRoleGet (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthUserGet",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthUserGet",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthUserGet (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthRoleList",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthRoleList",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthRoleList (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthJWTExpire",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthJWTExpire",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthJWTExpire (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthRevisionConsistency",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthRevisionConsistency",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthRevisionConsistency (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthTestCacheReload",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthTestCacheReload",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthTestCacheReload (0.00s)"
+      ]
+    },
+    {
+      "name": "TestAuthLeaseTimeToLive",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestAuthLeaseTimeToLive",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestAuthLeaseTimeToLive (0.00s)"
+      ]
+    },
+    {
+      "name": "TestCompact/NoPhysical",
+      "result": "pass",
+      "seconds": 1.47
+    },
+    {
+      "name": "TestCompact/Physical",
+      "result": "fail",
+      "seconds": 1.23,
+      "details": [
+        "=== RUN   TestCompact/Physical",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-3973741221",
+        "upstream_common_compact_test.go:65:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_compact_test.go:65",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = etcdserver: physical MVCC compaction is not implemented",
+        "Test:       \tTestCompact/Physical",
+        "Messages:   \tcompactTest: Compact error",
+        "compat_test.go:79: node 1: 2026-11-17T05:19:08.684424Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:60394",
+        "2026-11-17T05:19:09.887404Z  INFO slatedb_etcd::node: Raft state changed node=1 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:09.888512Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:09.889422Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Leader term=1 leader=1",
+        "compat_test.go:79: node 2: 2026-11-17T05:19:08.684616Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:60395",
+        "2026-11-17T05:19:09.889085Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:09.889597Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=1",
+        "compat_test.go:79: node 3: 2026-11-17T05:19:08.685297Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:60396",
+        "2026-11-17T05:19:09.889092Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:09.889568Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=1",
+        "--- FAIL: TestCompact/Physical (1.23s)"
+      ]
+    },
+    {
+      "name": "TestCompact",
+      "result": "fail",
+      "seconds": 2.7,
+      "details": [
+        "=== RUN   TestCompact",
+        "--- FAIL: TestCompact (2.70s)"
+      ]
+    },
+    {
+      "name": "TestDefragOnline",
+      "result": "fail",
+      "seconds": 1.08,
+      "details": [
+        "=== RUN   TestDefragOnline",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-4114167144",
+        "upstream_common_defrag_test.go:44:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_defrag_test.go:44",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = etcdserver: physical MVCC compaction is not implemented",
+        "Test:       \tTestDefragOnline",
+        "Messages:   \tdefrag_test: compact with revision error (rpc error: code = Unimplemented desc = etcdserver: physical MVCC compaction is not implemented)",
+        "compat_test.go:79: node 1: 2026-11-17T05:19:09.915806Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:60448",
+        "2026-11-17T05:19:10.922442Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:10.923053Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 2: 2026-11-17T05:19:09.916074Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:60449",
+        "2026-11-17T05:19:10.922443Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:10.923065Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 3: 2026-11-17T05:19:09.917282Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:60450",
+        "2026-11-17T05:19:10.918926Z  INFO slatedb_etcd::node: Raft state changed node=3 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:10.921930Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:10.922933Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Leader term=1 leader=3",
+        "--- FAIL: TestDefragOnline (1.08s)"
+      ]
+    },
+    {
+      "name": "TestEndpointStatus",
+      "result": "fail",
+      "seconds": 1.48,
+      "details": [
+        "=== RUN   TestEndpointStatus",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-1875658907",
+        "upstream_common_endpoint_test.go:40:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_endpoint_test.go:40",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestEndpointStatus",
+        "Messages:   \tget endpoint status error: rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "compat_test.go:79: node 1: 2026-11-17T05:19:11.022001Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:60501",
+        "2026-11-17T05:19:12.425180Z  INFO slatedb_etcd::node: Raft state changed node=1 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:12.427781Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:12.429221Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Leader term=1 leader=1",
+        "compat_test.go:79: node 2: 2026-11-17T05:19:11.022673Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:60502",
+        "2026-11-17T05:19:12.428771Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:12.429376Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=1",
+        "compat_test.go:79: node 3: 2026-11-17T05:19:11.023437Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:60503",
+        "2026-11-17T05:19:12.428765Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:12.429376Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=1",
+        "--- FAIL: TestEndpointStatus (1.48s)"
+      ]
+    },
+    {
+      "name": "TestEndpointHashKV",
+      "result": "fail",
+      "seconds": 6.2,
+      "details": [
+        "=== RUN   TestEndpointHashKV",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-291288965",
+        "upstream_common_endpoint_test.go:52: Add some entries",
+        "upstream_common_endpoint_test.go:59: Check all members' Hash and HashRevision",
+        "upstream_common_endpoint_test.go:62:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_endpoint_test.go:62",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestEndpointHashKV",
+        "Messages:   \tfailed to get endpoint hashkv",
+        "upstream_common_endpoint_test.go:60:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_endpoint_test.go:60",
+        "Error:      \tCondition never satisfied",
+        "Test:       \tTestEndpointHashKV",
+        "compat_test.go:79: node 1: 2026-11-17T05:19:12.480864Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:60551",
+        "2026-11-17T05:19:13.589034Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:13.589716Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 2: 2026-11-17T05:19:12.480981Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:60552",
+        "2026-11-17T05:19:13.589034Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:13.589715Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 3: 2026-11-17T05:19:12.482901Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:60553",
+        "2026-11-17T05:19:13.585230Z  INFO slatedb_etcd::node: Raft state changed node=3 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:13.587873Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:13.589561Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Leader term=1 leader=3",
+        "--- FAIL: TestEndpointHashKV (6.20s)"
+      ]
+    },
+    {
+      "name": "TestEndpointHealth",
+      "result": "fail",
+      "seconds": 1.08,
+      "details": [
+        "=== RUN   TestEndpointHealth",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-3775160316",
+        "upstream_common_endpoint_test.go:83:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_endpoint_test.go:83",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestEndpointHealth",
+        "Messages:   \tget endpoint health error",
+        "compat_test.go:79: node 1: 2026-11-17T05:19:18.684295Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:60742",
+        "2026-11-17T05:19:19.689247Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:19.689848Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=2",
+        "compat_test.go:79: node 2: 2026-11-17T05:19:18.684543Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:60743",
+        "2026-11-17T05:19:19.685692Z  INFO slatedb_etcd::node: Raft state changed node=2 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:19.688337Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:19.689698Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Leader term=1 leader=2",
+        "compat_test.go:79: node 3: 2026-11-17T05:19:18.685315Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:60744",
+        "2026-11-17T05:19:19.689247Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:19.689852Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=2",
+        "--- FAIL: TestEndpointHealth (1.08s)"
+      ]
+    },
+    {
+      "name": "TestKVPut/ThreeVoters",
+      "result": "pass",
+      "seconds": 0.99
+    },
+    {
+      "name": "TestKVPut",
+      "result": "pass",
+      "seconds": 0.99
+    },
+    {
+      "name": "TestKVGet/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.22
+    },
+    {
+      "name": "TestKVGet",
+      "result": "pass",
+      "seconds": 1.22
+    },
+    {
+      "name": "TestKVDelete/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.13
+    },
+    {
+      "name": "TestKVDelete",
+      "result": "pass",
+      "seconds": 1.13
+    },
+    {
+      "name": "TestKVGetNoQuorum/Serializable",
+      "result": "pass",
+      "seconds": 0.98
+    },
+    {
+      "name": "TestKVGetNoQuorum/Linearizable",
+      "result": "pass",
+      "seconds": 1.99
+    },
+    {
+      "name": "TestKVGetNoQuorum",
+      "result": "pass",
+      "seconds": 2.97
+    },
+    {
+      "name": "TestLeaseGrantTimeToLive/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.37
+    },
+    {
+      "name": "TestLeaseGrantTimeToLive",
+      "result": "pass",
+      "seconds": 1.37
+    },
+    {
+      "name": "TestLeaseGrantAndList/ThreeVoters/no_leases",
+      "result": "pass",
+      "seconds": 1.27
+    },
+    {
+      "name": "TestLeaseGrantAndList/ThreeVoters/one_lease",
+      "result": "pass",
+      "seconds": 1.01
+    },
+    {
+      "name": "TestLeaseGrantAndList/ThreeVoters/many_leases",
+      "result": "pass",
+      "seconds": 1.49
+    },
+    {
+      "name": "TestLeaseGrantAndList",
+      "result": "pass",
+      "seconds": 3.77
+    },
+    {
+      "name": "TestLeaseGrantTimeToLiveExpired/ThreeVoters",
+      "result": "pass",
+      "seconds": 4.21
+    },
+    {
+      "name": "TestLeaseGrantTimeToLiveExpired",
+      "result": "pass",
+      "seconds": 4.21
+    },
+    {
+      "name": "TestLeaseGrantKeepAliveOnce/ThreeVoters",
+      "result": "pass",
+      "seconds": 3.1
+    },
+    {
+      "name": "TestLeaseGrantKeepAliveOnce",
+      "result": "pass",
+      "seconds": 3.1
+    },
+    {
+      "name": "TestLeaseGrantRevoke/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.09
+    },
+    {
+      "name": "TestLeaseGrantRevoke",
+      "result": "pass",
+      "seconds": 1.09
+    },
+    {
+      "name": "TestDefragmentWithNoAuth",
+      "result": "fail",
+      "seconds": 1.08,
+      "details": [
+        "=== RUN   TestDefragmentWithNoAuth",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-2135085740",
+        "upstream_common_maintenance_auth_test.go:216:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_maintenance_auth_test.go:216",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:52",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:36",
+        "Error:      \tReceived unexpected error:",
+        "RoleAdd failed: rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestDefragmentWithNoAuth",
+        "compat_test.go:79: node 1: 2026-11-17T05:19:39.610530Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:61384",
+        "2026-11-17T05:19:40.611809Z  INFO slatedb_etcd::node: Raft state changed node=1 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:40.612842Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:40.613489Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Leader term=1 leader=1",
+        "compat_test.go:79: node 2: 2026-11-17T05:19:39.610553Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:61385",
+        "2026-11-17T05:19:40.612250Z  INFO slatedb_etcd::node: Raft state changed node=2 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:40.613143Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:40.613596Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=1",
+        "compat_test.go:79: node 3: 2026-11-17T05:19:39.611756Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:61386",
+        "2026-11-17T05:19:40.613189Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:40.613608Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=1",
+        "--- FAIL: TestDefragmentWithNoAuth (1.08s)"
+      ]
+    },
+    {
+      "name": "TestDefragmentWithInvalidAuth",
+      "result": "fail",
+      "seconds": 1.06,
+      "details": [
+        "=== RUN   TestDefragmentWithInvalidAuth",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-3602913438",
+        "upstream_common_maintenance_auth_test.go:216:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_maintenance_auth_test.go:216",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:52",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:40",
+        "Error:      \tReceived unexpected error:",
+        "RoleAdd failed: rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestDefragmentWithInvalidAuth",
+        "compat_test.go:79: node 1: 2026-11-17T05:19:40.718567Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:61414",
+        "2026-11-17T05:19:41.724176Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:41.724822Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=2",
+        "compat_test.go:79: node 2: 2026-11-17T05:19:40.719401Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:61415",
+        "2026-11-17T05:19:41.720701Z  INFO slatedb_etcd::node: Raft state changed node=2 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:41.723252Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:41.724709Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Leader term=1 leader=2",
+        "compat_test.go:79: node 3: 2026-11-17T05:19:40.719554Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:61416",
+        "2026-11-17T05:19:41.724177Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:41.724866Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=2",
+        "--- FAIL: TestDefragmentWithInvalidAuth (1.06s)"
+      ]
+    },
+    {
+      "name": "TestDefragmentWithRootAuth",
+      "result": "fail",
+      "seconds": 1.24,
+      "details": [
+        "=== RUN   TestDefragmentWithRootAuth",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-3221971303",
+        "upstream_common_maintenance_auth_test.go:216:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_maintenance_auth_test.go:216",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:52",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:44",
+        "Error:      \tReceived unexpected error:",
+        "RoleAdd failed: rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestDefragmentWithRootAuth",
+        "compat_test.go:79: node 1: 2026-11-17T05:19:41.753564Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:61443",
+        "2026-11-17T05:19:42.960640Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:42.961278Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=2",
+        "compat_test.go:79: node 2: 2026-11-17T05:19:41.754030Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:61444",
+        "2026-11-17T05:19:42.956916Z  INFO slatedb_etcd::node: Raft state changed node=2 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:42.959553Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:42.961123Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Leader term=1 leader=2",
+        "compat_test.go:79: node 3: 2026-11-17T05:19:41.755342Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:61445",
+        "2026-11-17T05:19:42.960645Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:42.961278Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=2",
+        "--- FAIL: TestDefragmentWithRootAuth (1.24s)"
+      ]
+    },
+    {
+      "name": "TestDefragmentWithUserAuth",
+      "result": "fail",
+      "seconds": 1.19,
+      "details": [
+        "=== RUN   TestDefragmentWithUserAuth",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-256650774",
+        "upstream_common_maintenance_auth_test.go:216:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_maintenance_auth_test.go:216",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:52",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:48",
+        "Error:      \tReceived unexpected error:",
+        "RoleAdd failed: rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestDefragmentWithUserAuth",
+        "compat_test.go:79: node 1: 2026-11-17T05:19:42.993504Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:61489",
+        "2026-11-17T05:19:44.098123Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:44.098673Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=2",
+        "compat_test.go:79: node 2: 2026-11-17T05:19:42.993510Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:61490",
+        "2026-11-17T05:19:44.095440Z  INFO slatedb_etcd::node: Raft state changed node=2 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:44.097242Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:44.098531Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Leader term=1 leader=2",
+        "compat_test.go:79: node 3: 2026-11-17T05:19:42.995790Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:61491",
+        "2026-11-17T05:19:44.098123Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:44.098662Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=2",
+        "--- FAIL: TestDefragmentWithUserAuth (1.19s)"
+      ]
+    },
+    {
+      "name": "TestDowngradeWithNoAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestDowngradeWithNoAuth",
+        "upstream_common_maintenance_auth_test.go:78:",
+        "--- SKIP: TestDowngradeWithNoAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestDowngradeWithInvalidAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestDowngradeWithInvalidAuth",
+        "upstream_common_maintenance_auth_test.go:78:",
+        "--- SKIP: TestDowngradeWithInvalidAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestDowngradeWithRootAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestDowngradeWithRootAuth",
+        "upstream_common_maintenance_auth_test.go:78:",
+        "--- SKIP: TestDowngradeWithRootAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestDowngradeWithUserAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestDowngradeWithUserAuth",
+        "upstream_common_maintenance_auth_test.go:78:",
+        "--- SKIP: TestDowngradeWithUserAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestHashKVWithNoAuth",
+      "result": "fail",
+      "seconds": 1.28,
+      "details": [
+        "=== RUN   TestHashKVWithNoAuth",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-893985496",
+        "upstream_common_maintenance_auth_test.go:216:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_maintenance_auth_test.go:216",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:101",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:85",
+        "Error:      \tReceived unexpected error:",
+        "RoleAdd failed: rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestHashKVWithNoAuth",
+        "compat_test.go:79: node 1: 2026-11-17T05:19:44.178145Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:61558",
+        "2026-11-17T05:19:45.383290Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:45.383926Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=2",
+        "compat_test.go:79: node 2: 2026-11-17T05:19:44.178517Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:61559",
+        "2026-11-17T05:19:45.380320Z  INFO slatedb_etcd::node: Raft state changed node=2 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:45.382386Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:45.383757Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Leader term=1 leader=2",
+        "compat_test.go:79: node 3: 2026-11-17T05:19:44.179821Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:61560",
+        "2026-11-17T05:19:45.381154Z  INFO slatedb_etcd::node: Raft state changed node=3 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:45.382638Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:45.383745Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:45.383922Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=2",
+        "--- FAIL: TestHashKVWithNoAuth (1.28s)"
+      ]
+    },
+    {
+      "name": "TestHashKVWithInvalidAuth",
+      "result": "fail",
+      "seconds": 1.55,
+      "details": [
+        "=== RUN   TestHashKVWithInvalidAuth",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-1840166732",
+        "upstream_common_maintenance_auth_test.go:216:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_maintenance_auth_test.go:216",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:101",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:89",
+        "Error:      \tReceived unexpected error:",
+        "RoleAdd failed: rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestHashKVWithInvalidAuth",
+        "compat_test.go:79: node 1: 2026-11-17T05:19:45.460291Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:61613",
+        "2026-11-17T05:19:46.962956Z  INFO slatedb_etcd::node: Raft state changed node=1 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:46.964022Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:46.964419Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Leader term=1 leader=1",
+        "compat_test.go:79: node 2: 2026-11-17T05:19:45.460843Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:61614",
+        "2026-11-17T05:19:46.964224Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:46.964507Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=1",
+        "compat_test.go:79: node 3: 2026-11-17T05:19:45.462813Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:61615",
+        "2026-11-17T05:19:46.964226Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:46.964508Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=1",
+        "--- FAIL: TestHashKVWithInvalidAuth (1.55s)"
+      ]
+    },
+    {
+      "name": "TestHashKVWithRootAuth",
+      "result": "fail",
+      "seconds": 0.96,
+      "details": [
+        "=== RUN   TestHashKVWithRootAuth",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-75172210",
+        "upstream_common_maintenance_auth_test.go:216:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_maintenance_auth_test.go:216",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:101",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:93",
+        "Error:      \tReceived unexpected error:",
+        "RoleAdd failed: rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestHashKVWithRootAuth",
+        "compat_test.go:79: node 1: 2026-11-17T05:19:46.996789Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:61654",
+        "2026-11-17T05:19:47.903285Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:47.903970Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 2: 2026-11-17T05:19:46.997088Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:61655",
+        "2026-11-17T05:19:47.903283Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:47.903974Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 3: 2026-11-17T05:19:46.997720Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:61656",
+        "2026-11-17T05:19:47.900497Z  INFO slatedb_etcd::node: Raft state changed node=3 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:47.902408Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:47.903797Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Leader term=1 leader=3",
+        "--- FAIL: TestHashKVWithRootAuth (0.96s)"
+      ]
+    },
+    {
+      "name": "TestHashKVWithUserAuth",
+      "result": "fail",
+      "seconds": 1.35,
+      "details": [
+        "=== RUN   TestHashKVWithUserAuth",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-2101046783",
+        "upstream_common_maintenance_auth_test.go:216:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_maintenance_auth_test.go:216",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:101",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:97",
+        "Error:      \tReceived unexpected error:",
+        "RoleAdd failed: rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestHashKVWithUserAuth",
+        "compat_test.go:79: node 1: 2026-11-17T05:19:47.959181Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:61730",
+        "2026-11-17T05:19:49.261298Z  INFO slatedb_etcd::node: Raft state changed node=1 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:49.263787Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:49.265148Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Leader term=1 leader=1",
+        "compat_test.go:79: node 2: 2026-11-17T05:19:47.959952Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:61731",
+        "2026-11-17T05:19:49.264691Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:49.265291Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=1",
+        "compat_test.go:79: node 3: 2026-11-17T05:19:47.960889Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:61732",
+        "2026-11-17T05:19:49.264695Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:49.265293Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=1",
+        "--- FAIL: TestHashKVWithUserAuth (1.35s)"
+      ]
+    },
+    {
+      "name": "TestMoveLeaderWithNoAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestMoveLeaderWithNoAuth",
+        "upstream_common_maintenance_auth_test.go:128:",
+        "--- SKIP: TestMoveLeaderWithNoAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestMoveLeaderWithInvalidAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestMoveLeaderWithInvalidAuth",
+        "upstream_common_maintenance_auth_test.go:128:",
+        "--- SKIP: TestMoveLeaderWithInvalidAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestMoveLeaderWithRootAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestMoveLeaderWithRootAuth",
+        "upstream_common_maintenance_auth_test.go:128:",
+        "--- SKIP: TestMoveLeaderWithRootAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestMoveLeaderWithUserAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestMoveLeaderWithUserAuth",
+        "upstream_common_maintenance_auth_test.go:128:",
+        "--- SKIP: TestMoveLeaderWithUserAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestSnapshotWithNoAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestSnapshotWithNoAuth",
+        "upstream_common_maintenance_auth_test.go:152:",
+        "--- SKIP: TestSnapshotWithNoAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestSnapshotWithInvalidAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestSnapshotWithInvalidAuth",
+        "upstream_common_maintenance_auth_test.go:152:",
+        "--- SKIP: TestSnapshotWithInvalidAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestSnapshotWithRootAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestSnapshotWithRootAuth",
+        "upstream_common_maintenance_auth_test.go:152:",
+        "--- SKIP: TestSnapshotWithRootAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestSnapshotWithUserAuth",
+      "result": "skip",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestSnapshotWithUserAuth",
+        "upstream_common_maintenance_auth_test.go:152:",
+        "--- SKIP: TestSnapshotWithUserAuth (0.00s)"
+      ]
+    },
+    {
+      "name": "TestStatusWithNoAuth",
+      "result": "fail",
+      "seconds": 1.08,
+      "details": [
+        "=== RUN   TestStatusWithNoAuth",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-1299058303",
+        "upstream_common_maintenance_auth_test.go:216:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_maintenance_auth_test.go:216",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:175",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:159",
+        "Error:      \tReceived unexpected error:",
+        "RoleAdd failed: rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestStatusWithNoAuth",
+        "compat_test.go:79: node 1: 2026-11-17T05:19:49.313642Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:61827",
+        "2026-11-17T05:19:50.314918Z  INFO slatedb_etcd::node: Raft state changed node=1 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:50.317076Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:50.318643Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Leader term=1 leader=1",
+        "compat_test.go:79: node 2: 2026-11-17T05:19:49.314357Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:61828",
+        "2026-11-17T05:19:50.318018Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:50.318808Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=1",
+        "compat_test.go:79: node 3: 2026-11-17T05:19:49.315934Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:61829",
+        "2026-11-17T05:19:50.318030Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:50.318814Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=1",
+        "--- FAIL: TestStatusWithNoAuth (1.08s)"
+      ]
+    },
+    {
+      "name": "TestStatusWithInvalidAuth",
+      "result": "fail",
+      "seconds": 0.97,
+      "details": [
+        "=== RUN   TestStatusWithInvalidAuth",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-3675954",
+        "upstream_common_maintenance_auth_test.go:216:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_maintenance_auth_test.go:216",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:175",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:163",
+        "Error:      \tReceived unexpected error:",
+        "RoleAdd failed: rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestStatusWithInvalidAuth",
+        "compat_test.go:79: node 1: 2026-11-17T05:19:50.397059Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:61923",
+        "2026-11-17T05:19:51.299422Z  INFO slatedb_etcd::node: Raft state changed node=1 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:51.300997Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:51.302004Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Leader term=1 leader=1",
+        "compat_test.go:79: node 2: 2026-11-17T05:19:50.397064Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:61924",
+        "2026-11-17T05:19:51.299015Z  INFO slatedb_etcd::node: Raft state changed node=2 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:51.300989Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:51.302035Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:51.302125Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=1",
+        "compat_test.go:79: node 3: 2026-11-17T05:19:50.398616Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:61925",
+        "2026-11-17T05:19:51.301608Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:51.302148Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=1",
+        "--- FAIL: TestStatusWithInvalidAuth (0.97s)"
+      ]
+    },
+    {
+      "name": "TestStatusWithRootAuth",
+      "result": "fail",
+      "seconds": 1.09,
+      "details": [
+        "=== RUN   TestStatusWithRootAuth",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-2986750949",
+        "upstream_common_maintenance_auth_test.go:216:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_maintenance_auth_test.go:216",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:175",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:167",
+        "Error:      \tReceived unexpected error:",
+        "RoleAdd failed: rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestStatusWithRootAuth",
+        "compat_test.go:79: node 1: 2026-11-17T05:19:51.366099Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:62530",
+        "2026-11-17T05:19:52.370944Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:52.371626Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=2",
+        "compat_test.go:79: node 2: 2026-11-17T05:19:51.366164Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:62531",
+        "2026-11-17T05:19:52.368251Z  INFO slatedb_etcd::node: Raft state changed node=2 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:52.370200Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:52.371432Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Leader term=1 leader=2",
+        "compat_test.go:79: node 3: 2026-11-17T05:19:51.367632Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:62532",
+        "2026-11-17T05:19:52.370944Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:52.371626Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=2",
+        "--- FAIL: TestStatusWithRootAuth (1.09s)"
+      ]
+    },
+    {
+      "name": "TestStatusWithUserAuth",
+      "result": "fail",
+      "seconds": 1.35,
+      "details": [
+        "=== RUN   TestStatusWithUserAuth",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-3388911389",
+        "upstream_common_maintenance_auth_test.go:216:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_maintenance_auth_test.go:216",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:175",
+        "<repo>/tests/compat/upstream_common_maintenance_auth_test.go:171",
+        "Error:      \tReceived unexpected error:",
+        "RoleAdd failed: rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestStatusWithUserAuth",
+        "compat_test.go:79: node 1: 2026-11-17T05:19:52.453217Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:62624",
+        "2026-11-17T05:19:53.762454Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:53.763144Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 2: 2026-11-17T05:19:52.453729Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:62625",
+        "2026-11-17T05:19:53.762454Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:53.763097Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 3: 2026-11-17T05:19:52.455490Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:62626",
+        "2026-11-17T05:19:53.759418Z  INFO slatedb_etcd::node: Raft state changed node=3 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:53.761879Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:53.762941Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Leader term=1 leader=3",
+        "--- FAIL: TestStatusWithUserAuth (1.35s)"
+      ]
+    },
+    {
+      "name": "TestMemberList/ThreeVoters",
+      "result": "fail",
+      "seconds": 1.19,
+      "details": [
+        "=== RUN   TestMemberList/ThreeVoters",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-4020543685",
+        "upstream_common_member_test.go:47:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_member_test.go:47",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestMemberList/ThreeVoters",
+        "Messages:   \tcould not get member list",
+        "compat_test.go:79: node 1: 2026-11-17T05:19:53.804951Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:62699",
+        "2026-11-17T05:19:54.911834Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:54.912381Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=2",
+        "compat_test.go:79: node 2: 2026-11-17T05:19:53.805628Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:62700",
+        "2026-11-17T05:19:54.909379Z  INFO slatedb_etcd::node: Raft state changed node=2 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:54.911367Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:54.912222Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Leader term=1 leader=2",
+        "compat_test.go:79: node 3: 2026-11-17T05:19:53.807111Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:62701",
+        "2026-11-17T05:19:54.911853Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:54.912422Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=2",
+        "--- FAIL: TestMemberList/ThreeVoters (1.19s)"
+      ]
+    },
+    {
+      "name": "TestMemberList",
+      "result": "fail",
+      "seconds": 1.19,
+      "details": [
+        "=== RUN   TestMemberList",
+        "--- FAIL: TestMemberList (1.19s)"
+      ]
+    },
+    {
+      "name": "TestMemberAdd/NotLearner/StrictReconfigCheck/WaitForQuorum/ThreeVoters",
+      "result": "fail",
+      "seconds": 5.98,
+      "details": [
+        "=== RUN   TestMemberAdd/NotLearner/StrictReconfigCheck/WaitForQuorum/ThreeVoters",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-1093449473",
+        "upstream_common_member_test.go:143:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_member_test.go:143",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestMemberAdd/NotLearner/StrictReconfigCheck/WaitForQuorum/ThreeVoters",
+        "Messages:   \tMemberAdd failed",
+        "compat_test.go:79: node 1: 2026-11-17T05:19:54.996191Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:62815",
+        "2026-11-17T05:19:55.900650Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:19:55.901040Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 2: 2026-11-17T05:19:54.996460Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:62816",
+        "2026-11-17T05:19:55.899718Z  INFO slatedb_etcd::node: Raft state changed node=2 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:55.900420Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:55.901082Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 3: 2026-11-17T05:19:54.998088Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:62817",
+        "2026-11-17T05:19:55.899461Z  INFO slatedb_etcd::node: Raft state changed node=3 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:19:55.900345Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Candidate term=1 leader=0",
+        "2026-11-17T05:19:55.900957Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Leader term=1 leader=3",
+        "--- FAIL: TestMemberAdd/NotLearner/StrictReconfigCheck/WaitForQuorum/ThreeVoters (5.98s)"
+      ]
+    },
+    {
+      "name": "TestMemberAdd/NotLearner/StrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+      "result": "fail",
+      "seconds": 1.46,
+      "details": [
+        "=== RUN   TestMemberAdd/NotLearner/StrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-2161177178",
+        "upstream_common_member_test.go:141:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_member_test.go:141",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tError \"rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type\" does not contain \"etcdserver: unhealthy cluster\"",
+        "Test:       \tTestMemberAdd/NotLearner/StrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:00.971496Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:62970",
+        "2026-11-17T05:20:02.376090Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:02.376727Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=2",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:00.971949Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:62971",
+        "2026-11-17T05:20:02.373215Z  INFO slatedb_etcd::node: Raft state changed node=2 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:02.375229Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:02.376542Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Leader term=1 leader=2",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:00.973464Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:62972",
+        "2026-11-17T05:20:02.376090Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:02.376714Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=2",
+        "--- FAIL: TestMemberAdd/NotLearner/StrictReconfigCheck/NoWaitForQuorum/ThreeVoters (1.46s)"
+      ]
+    },
+    {
+      "name": "TestMemberAdd/NotLearner/DisableStrictReconfigCheck/WaitForQuorum/ThreeVoters",
+      "result": "fail",
+      "seconds": 6.56,
+      "details": [
+        "=== RUN   TestMemberAdd/NotLearner/DisableStrictReconfigCheck/WaitForQuorum/ThreeVoters",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-3022336869",
+        "upstream_common_member_test.go:143:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_member_test.go:143",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestMemberAdd/NotLearner/DisableStrictReconfigCheck/WaitForQuorum/ThreeVoters",
+        "Messages:   \tMemberAdd failed",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:02.432704Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:62989",
+        "2026-11-17T05:20:03.935540Z  INFO slatedb_etcd::node: Raft state changed node=1 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:03.937977Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:03.939553Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Leader term=1 leader=1",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:02.432688Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:62990",
+        "2026-11-17T05:20:03.939108Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:03.939691Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=1",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:02.433601Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:62991",
+        "2026-11-17T05:20:03.939100Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:03.939684Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=1",
+        "--- FAIL: TestMemberAdd/NotLearner/DisableStrictReconfigCheck/WaitForQuorum/ThreeVoters (6.56s)"
+      ]
+    },
+    {
+      "name": "TestMemberAdd/NotLearner/DisableStrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+      "result": "fail",
+      "seconds": 0.98,
+      "details": [
+        "=== RUN   TestMemberAdd/NotLearner/DisableStrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-3079700432",
+        "upstream_common_member_test.go:143:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_member_test.go:143",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestMemberAdd/NotLearner/DisableStrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+        "Messages:   \tMemberAdd failed",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:08.996341Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:63026",
+        "2026-11-17T05:20:09.902598Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:09.903100Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:08.996320Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:63027",
+        "2026-11-17T05:20:09.899348Z  INFO slatedb_etcd::node: Raft state changed node=2 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:09.901630Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:09.903100Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:08.997080Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:63028",
+        "2026-11-17T05:20:09.900433Z  INFO slatedb_etcd::node: Raft state changed node=3 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:09.901989Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:09.902983Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Leader term=1 leader=3",
+        "--- FAIL: TestMemberAdd/NotLearner/DisableStrictReconfigCheck/NoWaitForQuorum/ThreeVoters (0.98s)"
+      ]
+    },
+    {
+      "name": "TestMemberAdd/Learner/StrictReconfigCheck/WaitForQuorum/ThreeVoters",
+      "result": "fail",
+      "seconds": 6.09,
+      "details": [
+        "=== RUN   TestMemberAdd/Learner/StrictReconfigCheck/WaitForQuorum/ThreeVoters",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-1546647245",
+        "upstream_common_member_test.go:143:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_member_test.go:143",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestMemberAdd/Learner/StrictReconfigCheck/WaitForQuorum/ThreeVoters",
+        "Messages:   \tMemberAdd failed",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:09.974383Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:63049",
+        "2026-11-17T05:20:10.981434Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:10.982040Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:09.975058Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:63050",
+        "2026-11-17T05:20:10.981436Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:10.982039Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:09.976591Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:63051",
+        "2026-11-17T05:20:10.978181Z  INFO slatedb_etcd::node: Raft state changed node=3 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:10.980581Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:10.981897Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Leader term=1 leader=3",
+        "--- FAIL: TestMemberAdd/Learner/StrictReconfigCheck/WaitForQuorum/ThreeVoters (6.09s)"
+      ]
+    },
+    {
+      "name": "TestMemberAdd/Learner/StrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+      "result": "fail",
+      "seconds": 1.36,
+      "details": [
+        "=== RUN   TestMemberAdd/Learner/StrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-636537478",
+        "upstream_common_member_test.go:141:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_member_test.go:141",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tError \"rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type\" does not contain \"etcdserver: unhealthy cluster\"",
+        "Test:       \tTestMemberAdd/Learner/StrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:16.069353Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:63126",
+        "2026-11-17T05:20:17.374667Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:17.375131Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=2",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:16.069384Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:63127",
+        "2026-11-17T05:20:17.372750Z  INFO slatedb_etcd::node: Raft state changed node=2 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:17.374166Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:17.375015Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Leader term=1 leader=2",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:16.070980Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:63128",
+        "2026-11-17T05:20:17.374666Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:17.375131Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=2",
+        "--- FAIL: TestMemberAdd/Learner/StrictReconfigCheck/NoWaitForQuorum/ThreeVoters (1.36s)"
+      ]
+    },
+    {
+      "name": "TestMemberAdd/Learner/DisableStrictReconfigCheck/WaitForQuorum/ThreeVoters",
+      "result": "fail",
+      "seconds": 6.3,
+      "details": [
+        "=== RUN   TestMemberAdd/Learner/DisableStrictReconfigCheck/WaitForQuorum/ThreeVoters",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-1037792924",
+        "upstream_common_member_test.go:143:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_member_test.go:143",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestMemberAdd/Learner/DisableStrictReconfigCheck/WaitForQuorum/ThreeVoters",
+        "Messages:   \tMemberAdd failed",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:17.441737Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:63167",
+        "2026-11-17T05:20:18.643256Z  INFO slatedb_etcd::node: Raft state changed node=1 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:18.645678Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:18.647379Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Leader term=1 leader=1",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:17.441749Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:63168",
+        "2026-11-17T05:20:18.646648Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:18.647551Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=1",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:17.441735Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:63169",
+        "2026-11-17T05:20:18.646660Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:18.647547Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=1",
+        "--- FAIL: TestMemberAdd/Learner/DisableStrictReconfigCheck/WaitForQuorum/ThreeVoters (6.30s)"
+      ]
+    },
+    {
+      "name": "TestMemberAdd/Learner/DisableStrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+      "result": "fail",
+      "seconds": 0.98,
+      "details": [
+        "=== RUN   TestMemberAdd/Learner/DisableStrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-2780100869",
+        "upstream_common_member_test.go:143:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_member_test.go:143",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestMemberAdd/Learner/DisableStrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+        "Messages:   \tMemberAdd failed",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:23.726579Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:63190",
+        "2026-11-17T05:20:24.632136Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:24.632637Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=2",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:23.727215Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:63191",
+        "2026-11-17T05:20:24.628960Z  INFO slatedb_etcd::node: Raft state changed node=2 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:24.631164Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:24.632527Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Leader term=1 leader=2",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:23.728779Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:63192",
+        "2026-11-17T05:20:24.630161Z  INFO slatedb_etcd::node: Raft state changed node=3 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:24.631805Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:24.632653Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:24.632892Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=2",
+        "--- FAIL: TestMemberAdd/Learner/DisableStrictReconfigCheck/NoWaitForQuorum/ThreeVoters (0.98s)"
+      ]
+    },
+    {
+      "name": "TestMemberAdd",
+      "result": "fail",
+      "seconds": 29.71,
+      "details": [
+        "=== RUN   TestMemberAdd",
+        "--- FAIL: TestMemberAdd (29.71s)"
+      ]
+    },
+    {
+      "name": "TestMemberRemove/StrictReconfigCheck/WaitForQuorum/ThreeVoters",
+      "result": "fail",
+      "seconds": 8.09,
+      "details": [
+        "=== RUN   TestMemberRemove/StrictReconfigCheck/WaitForQuorum/ThreeVoters",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-4063127430",
+        "upstream_common_member_test.go:241:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_member_test.go:241",
+        "<repo>/tests/compat/upstream_common_member_test.go:209",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestMemberRemove/StrictReconfigCheck/WaitForQuorum/ThreeVoters",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:24.707852Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:63211",
+        "2026-11-17T05:20:25.715034Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:25.715690Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:24.708218Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:63212",
+        "2026-11-17T05:20:25.715034Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:25.715744Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:24.709743Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:63213",
+        "2026-11-17T05:20:25.711836Z  INFO slatedb_etcd::node: Raft state changed node=3 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:25.714086Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:25.715549Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Leader term=1 leader=3",
+        "--- FAIL: TestMemberRemove/StrictReconfigCheck/WaitForQuorum/ThreeVoters (8.09s)"
+      ]
+    },
+    {
+      "name": "TestMemberRemove/StrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+      "result": "fail",
+      "seconds": 1.35,
+      "details": [
+        "=== RUN   TestMemberRemove/StrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-2004287166",
+        "upstream_common_member_test.go:241:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_member_test.go:241",
+        "<repo>/tests/compat/upstream_common_member_test.go:209",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestMemberRemove/StrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:32.796937Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:63232",
+        "2026-11-17T05:20:34.098216Z  INFO slatedb_etcd::node: Raft state changed node=1 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:34.100602Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:34.101981Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Leader term=1 leader=1",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:32.797466Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:63233",
+        "2026-11-17T05:20:34.101531Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:34.102148Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=1",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:32.798631Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:63234",
+        "2026-11-17T05:20:34.101531Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:34.102127Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=1",
+        "--- FAIL: TestMemberRemove/StrictReconfigCheck/NoWaitForQuorum/ThreeVoters (1.35s)"
+      ]
+    },
+    {
+      "name": "TestMemberRemove/DisableStrictReconfigCheck/WaitForQuorum/ThreeVoters",
+      "result": "fail",
+      "seconds": 8.25,
+      "details": [
+        "=== RUN   TestMemberRemove/DisableStrictReconfigCheck/WaitForQuorum/ThreeVoters",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-2544036590",
+        "upstream_common_member_test.go:241:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_member_test.go:241",
+        "<repo>/tests/compat/upstream_common_member_test.go:209",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestMemberRemove/DisableStrictReconfigCheck/WaitForQuorum/ThreeVoters",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:34.146217Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:63250",
+        "2026-11-17T05:20:35.353543Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:35.354204Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:34.146865Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:63251",
+        "2026-11-17T05:20:35.353543Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:35.354194Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:34.148216Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:63252",
+        "2026-11-17T05:20:35.350228Z  INFO slatedb_etcd::node: Raft state changed node=3 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:35.352608Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:35.354028Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Leader term=1 leader=3",
+        "--- FAIL: TestMemberRemove/DisableStrictReconfigCheck/WaitForQuorum/ThreeVoters (8.25s)"
+      ]
+    },
+    {
+      "name": "TestMemberRemove/DisableStrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+      "result": "fail",
+      "seconds": 1.46,
+      "details": [
+        "=== RUN   TestMemberRemove/DisableStrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-1201895018",
+        "upstream_common_member_test.go:241:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_member_test.go:241",
+        "<repo>/tests/compat/upstream_common_member_test.go:209",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestMemberRemove/DisableStrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:42.398208Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:63265",
+        "2026-11-17T05:20:43.800249Z  INFO slatedb_etcd::node: Raft state changed node=1 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:43.801917Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:43.803354Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:43.803573Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:42.398259Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:63266",
+        "2026-11-17T05:20:43.802692Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:43.803560Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:42.399192Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:63267",
+        "2026-11-17T05:20:43.800841Z  INFO slatedb_etcd::node: Raft state changed node=3 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:43.802029Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:43.803360Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Leader term=1 leader=3",
+        "--- FAIL: TestMemberRemove/DisableStrictReconfigCheck/NoWaitForQuorum/ThreeVoters (1.46s)"
+      ]
+    },
+    {
+      "name": "TestMemberRemove",
+      "result": "fail",
+      "seconds": 19.15,
+      "details": [
+        "=== RUN   TestMemberRemove",
+        "--- FAIL: TestMemberRemove (19.15s)"
+      ]
+    },
+    {
+      "name": "TestRoleAdd_Simple/ThreeVoters",
+      "result": "fail",
+      "seconds": 1.14,
+      "details": [
+        "=== RUN   TestRoleAdd_Simple/ThreeVoters",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-3387031646",
+        "upstream_common_role_test.go:44:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_role_test.go:44",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestRoleAdd_Simple/ThreeVoters",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:43.860706Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:63282",
+        "2026-11-17T05:20:44.969467Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:44.970083Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:43.861479Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:63283",
+        "2026-11-17T05:20:44.969467Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:44.970086Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:43.862990Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:63284",
+        "2026-11-17T05:20:44.966115Z  INFO slatedb_etcd::node: Raft state changed node=3 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:44.968589Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:44.969944Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Leader term=1 leader=3",
+        "--- FAIL: TestRoleAdd_Simple/ThreeVoters (1.14s)"
+      ]
+    },
+    {
+      "name": "TestRoleAdd_Simple",
+      "result": "fail",
+      "seconds": 1.14,
+      "details": [
+        "=== RUN   TestRoleAdd_Simple",
+        "--- FAIL: TestRoleAdd_Simple (1.14s)"
+      ]
+    },
+    {
+      "name": "TestRoleAdd_Error",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestRoleAdd_Error",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestRoleAdd_Error (0.00s)"
+      ]
+    },
+    {
+      "name": "TestRootRole",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestRootRole",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestRootRole (0.00s)"
+      ]
+    },
+    {
+      "name": "TestRoleGrantRevokePermission",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestRoleGrantRevokePermission",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestRoleGrantRevokePermission (0.00s)"
+      ]
+    },
+    {
+      "name": "TestRoleDelete",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestRoleDelete",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestRoleDelete (0.00s)"
+      ]
+    },
+    {
+      "name": "TestStatus/ThreeVoters",
+      "result": "fail",
+      "seconds": 1.14,
+      "details": [
+        "=== RUN   TestStatus/ThreeVoters",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-617484440",
+        "upstream_common_status_test.go:43:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_status_test.go:43",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestStatus/ThreeVoters",
+        "Messages:   \tcould not get status",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:45.000663Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:63301",
+        "2026-11-17T05:20:46.107712Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:46.108235Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=2",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:45.001193Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:63302",
+        "2026-11-17T05:20:46.104716Z  INFO slatedb_etcd::node: Raft state changed node=2 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:46.107281Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:46.108096Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Leader term=1 leader=2",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:45.002292Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:63303",
+        "2026-11-17T05:20:46.107712Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:46.108237Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=2",
+        "--- FAIL: TestStatus/ThreeVoters (1.14s)"
+      ]
+    },
+    {
+      "name": "TestStatus",
+      "result": "fail",
+      "seconds": 1.14,
+      "details": [
+        "=== RUN   TestStatus",
+        "--- FAIL: TestStatus (1.14s)"
+      ]
+    },
+    {
+      "name": "TestTxnSucc/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.37
+    },
+    {
+      "name": "TestTxnSucc",
+      "result": "pass",
+      "seconds": 1.37
+    },
+    {
+      "name": "TestTxnFail/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.1
+    },
+    {
+      "name": "TestTxnFail",
+      "result": "pass",
+      "seconds": 1.1
+    },
+    {
+      "name": "TestUserAdd_Simple/ThreeVoters/empty_username_not_allowed",
+      "result": "fail",
+      "seconds": 1.08,
+      "details": [
+        "=== RUN   TestUserAdd_Simple/ThreeVoters/empty_username_not_allowed",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-2941902102",
+        "upstream_common_user_test.go:80:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_user_test.go:80",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tError \"rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type\" does not contain \"user name\"",
+        "Test:       \tTestUserAdd_Simple/ThreeVoters/empty_username_not_allowed",
+        "Messages:   \texpected user creation to fail",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:48.606288Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:63363",
+        "2026-11-17T05:20:49.607156Z  INFO slatedb_etcd::node: Raft state changed node=1 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:49.609240Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:49.610448Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Leader term=1 leader=1",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:48.606410Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:63364",
+        "2026-11-17T05:20:49.610034Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:49.610582Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=1",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:48.607707Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:63365",
+        "2026-11-17T05:20:49.608560Z  INFO slatedb_etcd::node: Raft state changed node=3 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:49.609671Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:49.610606Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=1",
+        "--- FAIL: TestUserAdd_Simple/ThreeVoters/empty_username_not_allowed (1.08s)"
+      ]
+    },
+    {
+      "name": "TestUserAdd_Simple/ThreeVoters/no_password_with_noPassword_set",
+      "result": "fail",
+      "seconds": 0.96,
+      "details": [
+        "=== RUN   TestUserAdd_Simple/ThreeVoters/no_password_with_noPassword_set",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-1640485985",
+        "upstream_common_user_test.go:82:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_user_test.go:82",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestUserAdd_Simple/ThreeVoters/no_password_with_noPassword_set",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:49.692883Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:63384",
+        "2026-11-17T05:20:50.596950Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:50.597149Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=2",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:49.693529Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:63385",
+        "2026-11-17T05:20:50.596154Z  INFO slatedb_etcd::node: Raft state changed node=2 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:50.596804Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:50.597078Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Leader term=1 leader=2",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:49.695129Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:63386",
+        "2026-11-17T05:20:50.596932Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:50.597177Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=2",
+        "--- FAIL: TestUserAdd_Simple/ThreeVoters/no_password_with_noPassword_set (0.96s)"
+      ]
+    },
+    {
+      "name": "TestUserAdd_Simple/ThreeVoters/no_password_without_noPassword_set",
+      "result": "fail",
+      "seconds": 0.96,
+      "details": [
+        "=== RUN   TestUserAdd_Simple/ThreeVoters/no_password_without_noPassword_set",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-136446546",
+        "upstream_common_user_test.go:82:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_user_test.go:82",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestUserAdd_Simple/ThreeVoters/no_password_without_noPassword_set",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:50.642974Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:63405",
+        "2026-11-17T05:20:51.549657Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:51.550294Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:50.643138Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:63406",
+        "2026-11-17T05:20:51.549657Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:51.550294Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:50.644062Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:63407",
+        "2026-11-17T05:20:51.546501Z  INFO slatedb_etcd::node: Raft state changed node=3 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:51.548771Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:51.550126Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Leader term=1 leader=3",
+        "--- FAIL: TestUserAdd_Simple/ThreeVoters/no_password_without_noPassword_set (0.96s)"
+      ]
+    },
+    {
+      "name": "TestUserAdd_Simple/ThreeVoters/regular_user_with_password",
+      "result": "fail",
+      "seconds": 0.98,
+      "details": [
+        "=== RUN   TestUserAdd_Simple/ThreeVoters/regular_user_with_password",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-2825292900",
+        "upstream_common_user_test.go:82:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_user_test.go:82",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestUserAdd_Simple/ThreeVoters/regular_user_with_password",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:51.616709Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:63424",
+        "2026-11-17T05:20:52.518666Z  INFO slatedb_etcd::node: Raft state changed node=1 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:52.520993Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:52.522473Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Leader term=1 leader=1",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:51.617147Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:63425",
+        "2026-11-17T05:20:52.522021Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:52.522593Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=1",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:51.618883Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:63426",
+        "2026-11-17T05:20:52.519817Z  INFO slatedb_etcd::node: Raft state changed node=3 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:52.521570Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:52.522594Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=1",
+        "--- FAIL: TestUserAdd_Simple/ThreeVoters/regular_user_with_password (0.98s)"
+      ]
+    },
+    {
+      "name": "TestUserAdd_Simple",
+      "result": "fail",
+      "seconds": 3.99,
+      "details": [
+        "=== RUN   TestUserAdd_Simple",
+        "--- FAIL: TestUserAdd_Simple (3.99s)"
+      ]
+    },
+    {
+      "name": "TestUserAdd_DuplicateUserNotAllowed/ThreeVoters",
+      "result": "fail",
+      "seconds": 1.14,
+      "details": [
+        "=== RUN   TestUserAdd_DuplicateUserNotAllowed/ThreeVoters",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-2502856214",
+        "upstream_common_user_test.go:106:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_user_test.go:106",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestUserAdd_DuplicateUserNotAllowed/ThreeVoters",
+        "Messages:   \tfirst user creation should succeed",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:52.599127Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:63445",
+        "2026-11-17T05:20:53.705316Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:53.705926Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=2",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:52.599672Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:63446",
+        "2026-11-17T05:20:53.701996Z  INFO slatedb_etcd::node: Raft state changed node=2 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:53.704424Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:53.705774Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Leader term=1 leader=2",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:52.601044Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:63447",
+        "2026-11-17T05:20:53.705317Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:53.705910Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Follower term=1 leader=2",
+        "--- FAIL: TestUserAdd_DuplicateUserNotAllowed/ThreeVoters (1.14s)"
+      ]
+    },
+    {
+      "name": "TestUserAdd_DuplicateUserNotAllowed",
+      "result": "fail",
+      "seconds": 1.14,
+      "details": [
+        "=== RUN   TestUserAdd_DuplicateUserNotAllowed",
+        "--- FAIL: TestUserAdd_DuplicateUserNotAllowed (1.14s)"
+      ]
+    },
+    {
+      "name": "TestUserList/ThreeVoters",
+      "result": "fail",
+      "seconds": 0.98,
+      "details": [
+        "=== RUN   TestUserList/ThreeVoters",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-4165614985",
+        "upstream_common_user_test.go:128:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_user_test.go:128",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestUserList/ThreeVoters",
+        "Messages:   \tuser listing should succeed",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:53.737520Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:63463",
+        "2026-11-17T05:20:54.644599Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:54.645186Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:53.737571Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:63464",
+        "2026-11-17T05:20:54.644599Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:54.645185Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:53.738855Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:63465",
+        "2026-11-17T05:20:54.641228Z  INFO slatedb_etcd::node: Raft state changed node=3 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:54.643644Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:54.645045Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Leader term=1 leader=3",
+        "--- FAIL: TestUserList/ThreeVoters (0.98s)"
+      ]
+    },
+    {
+      "name": "TestUserList",
+      "result": "fail",
+      "seconds": 0.98,
+      "details": [
+        "=== RUN   TestUserList",
+        "--- FAIL: TestUserList (0.98s)"
+      ]
+    },
+    {
+      "name": "TestUserDelete/ThreeVoters",
+      "result": "fail",
+      "seconds": 1.57,
+      "details": [
+        "=== RUN   TestUserDelete/ThreeVoters",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-678614666",
+        "upstream_common_user_test.go:161:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_user_test.go:161",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestUserDelete/ThreeVoters",
+        "Messages:   \tuser creation should succeed",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:54.715383Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:63482",
+        "2026-11-17T05:20:56.223134Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:56.223757Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:54.715420Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:63483",
+        "2026-11-17T05:20:56.223134Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:56.223764Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:54.717031Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:63484",
+        "2026-11-17T05:20:56.219434Z  INFO slatedb_etcd::node: Raft state changed node=3 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:56.222094Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:56.223608Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Leader term=1 leader=3",
+        "--- FAIL: TestUserDelete/ThreeVoters (1.57s)"
+      ]
+    },
+    {
+      "name": "TestUserDelete",
+      "result": "fail",
+      "seconds": 1.57,
+      "details": [
+        "=== RUN   TestUserDelete",
+        "--- FAIL: TestUserDelete (1.57s)"
+      ]
+    },
+    {
+      "name": "TestUserChangePassword/ThreeVoters",
+      "result": "fail",
+      "seconds": 0.98,
+      "details": [
+        "=== RUN   TestUserChangePassword/ThreeVoters",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-3508930643",
+        "upstream_common_user_test.go:199:",
+        "Error Trace:\t<repo>/tests/compat/upstream_common_user_test.go:199",
+        "<home>/go/pkg/mod/go.etcd.io/etcd/tests/v3@v3.6.5/framework/testutils/execute.go:38",
+        "/opt/homebrew/Cellar/go/1.25.6/libexec/src/runtime/asm_arm64.s:1268",
+        "Error:      \tReceived unexpected error:",
+        "rpc error: code = Unimplemented desc = unexpected HTTP status code received from server: 404 (Not Found); malformed header: missing HTTP content-type",
+        "Test:       \tTestUserChangePassword/ThreeVoters",
+        "Messages:   \tuser creation should succeed",
+        "compat_test.go:79: node 1: 2026-11-17T05:20:56.284077Z  INFO slatedb_etcd: Node started node=1 listen=127.0.0.1:63501",
+        "2026-11-17T05:20:57.192738Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:57.193298Z  INFO slatedb_etcd::node: Raft state changed node=1 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 2: 2026-11-17T05:20:56.284645Z  INFO slatedb_etcd: Node started node=2 listen=127.0.0.1:63502",
+        "2026-11-17T05:20:57.192738Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=0",
+        "2026-11-17T05:20:57.193301Z  INFO slatedb_etcd::node: Raft state changed node=2 role=Follower term=1 leader=3",
+        "compat_test.go:79: node 3: 2026-11-17T05:20:56.286254Z  INFO slatedb_etcd: Node started node=3 listen=127.0.0.1:63503",
+        "2026-11-17T05:20:57.189580Z  INFO slatedb_etcd::node: Raft state changed node=3 role=PreCandidate term=0 leader=0",
+        "2026-11-17T05:20:57.192062Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Candidate term=1 leader=0",
+        "2026-11-17T05:20:57.193157Z  INFO slatedb_etcd::node: Raft state changed node=3 role=Leader term=1 leader=3",
+        "--- FAIL: TestUserChangePassword/ThreeVoters (0.98s)"
+      ]
+    },
+    {
+      "name": "TestUserChangePassword",
+      "result": "fail",
+      "seconds": 0.98,
+      "details": [
+        "=== RUN   TestUserChangePassword",
+        "--- FAIL: TestUserChangePassword (0.98s)"
+      ]
+    },
+    {
+      "name": "TestWaitLeader/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.25
+    },
+    {
+      "name": "TestWaitLeader",
+      "result": "pass",
+      "seconds": 1.25
+    },
+    {
+      "name": "TestWaitLeader_MemberStop/PeerTLS",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestWaitLeader_MemberStop/PeerTLS",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestWaitLeader_MemberStop/PeerTLS (0.00s)"
+      ]
+    },
+    {
+      "name": "TestWaitLeader_MemberStop/PeerAutoTLS",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestWaitLeader_MemberStop/PeerAutoTLS",
+        "upstream_adapter_test.go:48: unsupported cluster configuration",
+        "--- FAIL: TestWaitLeader_MemberStop/PeerAutoTLS (0.00s)"
+      ]
+    },
+    {
+      "name": "TestWaitLeader_MemberStop",
+      "result": "fail",
+      "seconds": 0,
+      "details": [
+        "=== RUN   TestWaitLeader_MemberStop",
+        "--- FAIL: TestWaitLeader_MemberStop (0.00s)"
+      ]
+    },
+    {
+      "name": "TestWatch/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.2
+    },
+    {
+      "name": "TestWatch",
+      "result": "pass",
+      "seconds": 1.2
+    },
+    {
+      "name": "TestDifferentialLease/grant",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/duplicate",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/second",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/too_large",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/negative_id",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/minimum",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/revoke_minimum",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/attach_a",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/attach_b",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/keys",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/reassign",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/ignore_lease",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/old_keys",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/new_keys",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/compare",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/rollback",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/rollback_absent",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/detach",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/revoke_old",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/detached_survives",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/revoke_new",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/attached_deleted",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/missing_ttl",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/missing_revoke",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/list",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease",
+      "result": "pass",
+      "seconds": 2.01
+    },
+    {
+      "name": "TestDifferentialWatch/order_and_previous",
+      "result": "pass",
+      "seconds": 0.09
+    },
+    {
+      "name": "TestDifferentialWatch/no_put",
+      "result": "pass",
+      "seconds": 0.1
+    },
+    {
+      "name": "TestDifferentialWatch/no_delete",
+      "result": "pass",
+      "seconds": 0.1
+    },
+    {
+      "name": "TestDifferentialWatch/exact",
+      "result": "pass",
+      "seconds": 0.1
+    },
+    {
+      "name": "TestDifferentialWatch/range",
+      "result": "pass",
+      "seconds": 0.1
+    },
+    {
+      "name": "TestDifferentialWatch",
+      "result": "pass",
+      "seconds": 2.77
+    },
+    {
+      "name": "TestWatchLeaseRestartAndSnapshot",
+      "result": "pass",
+      "seconds": 4.32
+    },
+    {
+      "name": "TestWatchStreamControls/service",
+      "result": "pass",
+      "seconds": 0.1
+    },
+    {
+      "name": "TestWatchStreamControls/etcd",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestWatchStreamControls",
+      "result": "pass",
+      "seconds": 2.15
+    },
+    {
+      "name": "TestWatchLeaseKeepAliveAndLeaderFailure",
+      "result": "pass",
+      "seconds": 18.06
+    },
+    {
+      "name": "TestWatchLeaseMinorityCannotRenew",
+      "result": "pass",
+      "seconds": 4.75
+    },
+    {
+      "name": "TestWatchCatchupProgressAndFragmentation",
+      "result": "pass",
+      "seconds": 1.08
+    },
+    {
+      "name": "FuzzKVSequence/seed#0",
+      "result": "pass",
+      "seconds": 1.51
+    },
+    {
+      "name": "FuzzKVSequence/seed#1",
+      "result": "pass",
+      "seconds": 1.21
+    },
+    {
+      "name": "FuzzKVSequence/seed#2",
+      "result": "pass",
+      "seconds": 2.02
+    },
+    {
+      "name": "FuzzKVSequence",
+      "result": "pass",
+      "seconds": 4.73
+    }
+  ],
+  "counts": {
+    "pass": 204,
+    "fail": 89,
+    "skip": 12
+  },
+  "leaf_counts": {
+    "pass": 180,
+    "fail": 75,
+    "skip": 12
+  },
+  "passed": false,
+  "complete": false
+}

@@ -113,6 +113,10 @@ impl Simulation {
                 dir: self.root.path().join(id.to_string()),
                 peers: (1..=3).map(|n| (n, format!("127.0.0.1:{n}"))).collect(),
                 snapshot_every: 0,
+                log_memory: LogMemory {
+                    cache_bytes: 1024,
+                    ..LogMemory::default()
+                },
             },
             events,
             Some(senders),
@@ -249,18 +253,24 @@ impl Simulation {
             let store = node.raw.store();
             assert!(node.state.applied <= store.commit_index());
             assert!(store.commit_index() <= store.last_index().unwrap());
-            let entries = if store.first_index().unwrap() > store.commit_index() {
-                vec![]
-            } else {
-                store
-                    .entries(
-                        store.first_index().unwrap(),
-                        store.commit_index() + 1,
-                        None,
-                        raft::GetEntriesContext::empty(false),
-                    )
-                    .unwrap()
-            };
+            let stats = store.stats();
+            for (used, limit) in [
+                ("cache_bytes", "cache_limit"),
+                ("pending_bytes", "pending_limit"),
+                ("term_bytes", "term_limit"),
+                ("read_bytes", "read_limit"),
+            ] {
+                assert!(stats[used].as_u64().unwrap() <= stats[limit].as_u64().unwrap());
+            }
+            let disk = node.log_worker.storage();
+            let entries = disk
+                .entries(
+                    disk.first_index().unwrap(),
+                    disk.commit_index() + 1,
+                    None,
+                    raft::GetEntriesContext::empty(false),
+                )
+                .unwrap();
             for entry in entries {
                 let bytes = entry.write_to_bytes().unwrap();
                 if let Some(previous) = self.committed_entries.insert(entry.index, bytes.clone()) {
@@ -319,6 +329,7 @@ impl Simulation {
                 .raft
                 .set_randomized_election_timeout(10 + id as usize * 2);
             node.raw.tick();
+            node.retry_reads();
             self.trace.push(format!("tick {id}"));
         }
         self.drive().await;
@@ -360,9 +371,15 @@ impl Simulation {
     }
 
     async fn read(&mut self) {
-        let Some(id) = self.leader() else {
+        let candidates: Vec<_> = self
+            .nodes
+            .iter()
+            .filter_map(|(&id, node)| (node.raw.raft.leader_id != 0).then_some(id))
+            .collect();
+        if candidates.is_empty() {
             return;
-        };
+        }
+        let id = candidates[self.choose(candidates.len())];
         let (tx, rx) = oneshot::channel();
         self.nodes.get_mut(&id).unwrap().linear_read(
             RequestOp {
@@ -450,6 +467,70 @@ impl Simulation {
                 sim.deliver(false).await;
             }
         }
+        // Fail a cache-miss read through the real disk executor, then restart the node.
+        for _ in 0..8 {
+            sim.propose().await;
+            for _ in 0..60 {
+                sim.deliver(false).await;
+            }
+        }
+        let reader = sim.leader().unwrap();
+        let node = sim.nodes.get_mut(&reader).unwrap();
+        let low = node.raw.store().first_index().unwrap();
+        assert!(matches!(
+            node.raw
+                .store()
+                .entries(low, low + 1, None, raft::GetEntriesContext::empty(true)),
+            Err(raft::Error::Store(
+                raft::StorageError::LogTemporarilyUnavailable
+            ))
+        ));
+        node.log_read_fail = true;
+        sim.expected_log_failure = Some(reader);
+        sim.drive().await;
+        assert_eq!(sim.log_failures, 2);
+        sim.start(reader).await;
+        for _ in 0..25 {
+            for id in 1..=3 {
+                sim.tick(id).await;
+            }
+            for _ in 0..30 {
+                sim.deliver(false).await;
+            }
+        }
+        // Hold a real SendAppend fetch while a higher term cancels its Raft context.
+        let reader = sim.leader().unwrap();
+        sim.paused_log = Some(reader);
+        let node = sim.nodes.get_mut(&reader).unwrap();
+        let low = node.raw.store().first_index().unwrap();
+        let peer = reader % 3 + 1;
+        let progress = node.raw.raft.mut_prs().get_mut(peer).unwrap();
+        progress.matched = 0;
+        progress.become_probe();
+        progress.next_idx = low;
+        node.raw.raft.send_append(peer);
+        assert!(node.raw.store().stats()["read_reserved"].as_u64().unwrap() > 0);
+        node.drive_ready().await.unwrap();
+        let completed = node.log_worker.step().unwrap().unwrap();
+        assert!(completed.fetched.is_some());
+        node.raw.raft.become_follower(node.raw.raft.term + 1, 0);
+        node.complete_log(completed).unwrap();
+        assert!(node
+            .raw
+            .raft
+            .msgs
+            .iter()
+            .all(|m| m.get_msg_type() != MessageType::MsgAppend));
+        sim.trace.push(format!("late log read {reader}"));
+        sim.paused_log = None;
+        for _ in 0..25 {
+            for id in 1..=3 {
+                sim.tick(id).await;
+            }
+            for _ in 0..30 {
+                sim.deliver(false).await;
+            }
+        }
         let mut offline = 0;
         for step in 0..400 {
             match step {
@@ -511,7 +592,24 @@ impl Simulation {
                     offline = sim.leader().unwrap_or(1) % 3 + 1;
                     sim.stop(offline);
                 }
-                260 => sim.checkpoint().await,
+                260 => {
+                    // Establish a new committed prefix while the selected follower stays offline.
+                    for _ in 0..25 {
+                        for id in 1..=3 {
+                            sim.tick(id).await;
+                        }
+                        for _ in 0..30 {
+                            sim.deliver(false).await;
+                        }
+                    }
+                    for _ in 0..5 {
+                        sim.propose().await;
+                        for _ in 0..100 {
+                            sim.deliver(false).await;
+                        }
+                    }
+                    sim.checkpoint().await;
+                }
                 300 => {
                     sim.paused_log = Some(offline);
                     sim.trace.push(format!("pause snapshot log {offline}"));

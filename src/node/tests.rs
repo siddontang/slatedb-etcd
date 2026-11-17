@@ -8,6 +8,7 @@ fn options(dir: &std::path::Path) -> NodeOptions {
         dir: dir.to_owned(),
         peers: (1..=3).map(|id| (id, format!("127.0.0.1:{id}"))).collect(),
         snapshot_every: 0,
+        log_memory: LogMemory::default(),
     }
 }
 
@@ -540,4 +541,85 @@ async fn shutdown_interrupts_the_log_fault_delay() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn recovery_replays_a_backlog_larger_than_the_pending_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut storage =
+        RaftStorage::open(&dir.path().join("raft"), 1, "worker-test", vec![1, 2, 3]).unwrap();
+    let entries: Vec<_> = (1..=12)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            context: vec![0; 900 * 1024].into(),
+            ..Default::default()
+        })
+        .collect();
+    storage
+        .persist(
+            &entries,
+            Some(&HardState {
+                term: 1,
+                commit: 12,
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+    drop(storage);
+    let mut config = options(dir.path());
+    config.log_memory.cache_bytes = 1024;
+    config.log_memory.pending_bytes = 9 * 1024 * 1024;
+    let (events, _) = mpsc::channel(256);
+    let node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    assert_eq!(node.recovered_from_index, 0);
+    assert_eq!(node.state.applied, 12);
+    assert_eq!(node.raw.store().stats()["pending_bytes"], 0);
+    assert_eq!(node.raw.store().stats()["cache_bytes"], 0);
+}
+
+#[tokio::test]
+async fn read_index_retries_after_the_first_commit_in_a_new_term() {
+    let dir = tempfile::tempdir().unwrap();
+    let (events, _) = mpsc::channel(256);
+    let mut node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    node.raw.raft.become_candidate();
+    node.raw.raft.become_leader();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    assert!(!node.raw.raft.commit_to_current_term());
+    let (tx, mut reply) = oneshot::channel();
+    node.linear_read(range_request(), tx);
+    let id = node.reads.keys().next().unwrap().clone();
+    // The initial request is discarded before the leader commits its no-op entry.
+    confirm_read(&mut node, &id).await;
+    node.drain_apply().await.unwrap();
+    assert!(reply.try_recv().is_err());
+    let ack = Message {
+        msg_type: MessageType::MsgAppendResponse,
+        from: 2,
+        to: 1,
+        term: node.raw.raft.term,
+        index: 1,
+        ..Default::default()
+    };
+    node.raw.step(ack).unwrap();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    node.drain_apply().await.unwrap();
+    assert!(node.raw.raft.commit_to_current_term());
+    let syncs = node.raw.store().durable.sync_writes;
+    node.retry_reads();
+    node.retry_reads();
+    confirm_read(&mut node, &id).await;
+    node.drain_apply().await.unwrap();
+    assert!(reply.await.unwrap().is_ok());
+    assert_eq!(node.raw.store().durable.last_index, 1);
+    assert_eq!(node.raw.store().durable.sync_writes, syncs);
+    assert!(node.reads.is_empty());
 }

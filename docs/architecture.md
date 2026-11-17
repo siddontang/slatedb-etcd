@@ -2,7 +2,8 @@
 
 This document defines the storage contract, execution model, and project roadmap.
 The baseline is commit `0b1509e`, which added Watch and Lease support.
-Commit `fc967ed` completed phase 1. This change adds ReadIndex and separates Raft log I/O.
+Commit `fc967ed` completed phase 1. Commit `c14308a` added ReadIndex and separate log I/O.
+This change adds bounded log pools, asynchronous entry reads, and follower read barriers.
 Sections marked as targets describe work that is not implemented yet.
 
 ## Purpose and scope
@@ -18,7 +19,7 @@ SlateDB currently uses `LocalFileSystem`, not a remote object store.
 No replica shares its manifest or SST ownership with another replica.
 
 KV, Txn, logical Compact, Watch, and Lease are implemented.
-Auth, Cluster, Maintenance, TLS, quotas, and physical compaction remain incomplete.
+Auth, Cluster, Maintenance, TLS, backend capacity quotas, and physical compaction remain incomplete.
 This service is not yet a supported replacement for etcd or a Kubernetes backend.
 
 ## Components
@@ -45,7 +46,7 @@ The diagnostic JSON API uses a separate keyspace from the etcd API.
 | --- | --- |
 | gRPC service | Validate requests, forward leader requests, and manage streams |
 | Raft owner | Run elections, stage Ready, send permitted messages, and track completion |
-| Log worker | Persist Ready, publish snapshots, reclaim files, and collect disk statistics |
+| Log worker | Persist Ready, fetch entries, publish snapshots, and reclaim files |
 | raft-engine | Store log entries, terms, votes, commit position, and recovery snapshots |
 | Apply owner | Execute committed entries in order and maintain state metadata |
 | SlateDB | Store current values, history, event journals, leases, and the apply marker |
@@ -154,8 +155,8 @@ The deterministic driver executes the same worker jobs under an explicit schedul
 
 ## ReadIndex protocol
 
-The receiving replica forwards linearizable reads to the leader.
-The leader submits a unique context through raft-rs Safe ReadIndex.
+The receiving replica submits a unique context through raft-rs Safe ReadIndex.
+A follower sends the request through Raft to its known leader.
 The context includes a process nonce and a counter, so restart cannot reuse an old context.
 Raft confirms leadership through a quorum and returns the associated committed index.
 It also requires a committed entry in the leader's current term.
@@ -163,9 +164,15 @@ It also requires a committed entry in the leader's current term.
 The owner waits for local application through that index before scheduling the state read.
 Local application already requires a durable local commit position.
 The apply worker evaluates the entire read-only transaction against one applied state view.
-The owner checks the term and leadership again before returning the result.
+The owner checks the term, role, and leader identity again before returning the result.
 Leadership loss, a five-second timeout, or client cancellation removes the pending request.
 At most 64 ReadIndex requests can wait. These requests do not append log entries.
+Unconfirmed requests retry every two Raft ticks until confirmation, cancellation, or timeout.
+Retries cover lost messages and reads dropped before a new leader commits its first entry.
+
+Forwarded KV, Lease, and Compact results also wait for a local ReadIndex barrier before returning.
+This makes their revisions available to later local STM reads on the same member.
+The barrier adds a quorum exchange to forwarded writes.
 
 Serializable reads still use the local applied prefix without quorum confirmation.
 A local commit counter cannot replace the ReadIndex quorum exchange.
@@ -192,14 +199,53 @@ A worker failure stops progress instead of reporting an uncertain write as durab
 Shutdown cancels queued work and injected delays. A running kernel I/O call must finish before
 its thread releases the storage lock.
 
-The memory view contains the entire retained Raft log.
-Startup loads those entries before serving requests. Durable checkpoints remove covered entries.
-This avoids synchronous log reads in the Raft loop, but memory grows with the retained log.
-Disabling checkpoints removes that reclamation path. The cache has no independent memory quota.
-A bounded cache with asynchronous entry fetch is future work for larger deployments.
+### Bounded log pools
+
+The cache evicts applied entry payloads independently of checkpoints.
+It pins unapplied entries because raft-rs requires synchronous reads during elections and Ready.
+Compressed term runs preserve synchronous term lookup across the retained log.
+
+| Pool | Default charge limit | Rule |
+| --- | --- | --- |
+| Applied history | 8 MiB | Evict the lowest cached index when full |
+| Pending entries | 32 MiB | Reject new data before the pool is full |
+| Disk read results | 16 MiB | Admit one fetch or one result window |
+| Term metadata | 1 MiB | Charge 64 bytes for each term run; stop on exhaustion |
+
+Entry charges use encoded size plus 256 bytes of structure allowance.
+These are accounting limits for owned log pools, not process RSS limits.
+Raft, transport, apply batches, snapshots, raft-engine indexes, and SlateDB have separate
+allocations.
+Admission includes unstaged Raft entries. It frees an overwritten suffix before charging its
+replacement.
+Data admission reserves 64 KiB for Raft control entries. An encoded entry cannot exceed 8 MiB.
+Quota checks permit prefix rejection and replacements that do not grow the pending pool.
+This lets a full follower report conflicts and acknowledge entries it already holds.
+A node stops if a control entry or term run exceeds its hard limit.
+Operators must increase the corresponding limit before restarting such a node.
+
+A historical cache miss returns `LogTemporarilyUnavailable` only when the Raft context permits it.
+The log worker fetches at most 128 entries with a 512 KiB encoded-byte target.
+One larger entry can exceed that target, but it must fit the separate read quota.
+A result window serves entries that cannot fit the history cache.
+The owner resumes Raft with `on_entries_fetched` after completion.
+Other misses retry through Raft while the single fetch slot is occupied.
+Slow reads share the FIFO disk worker with writes, but do not stop Raft ticks or heartbeat handling.
+
+Each fetch carries a cache generation. Overwrite, compaction, and snapshot replacement advance it.
+The owner discards results from old generations before they can enter the cache.
+Raft also discards fetch callbacks from an old leader term.
+A current read error stops the node. An obsolete read error releases its reservation.
+
+Startup scans retained logs in bounded batches to rebuild terms and warm the cache.
+If recovery exceeds the pending quota, startup replays committed entries in bounded apply batches.
+It then loads only the remaining uncommitted tail into the pending pool.
+An oversized uncommitted tail fails startup with an explicit quota error.
+Startup disk reads run before the Raft event loop begins.
 
 Status separates `raft_commit_index` from durable `commit_index`.
 It also exposes `cached_last_log_index`, `log_busy`, queued log jobs and bytes, and pending reads.
+`log_memory` reports each pool, its limit, cache misses, disk reads, evictions, and stale results.
 Snapshot installation waits if the memory view contains a snapshot that is not durable yet.
 Entry selection pauses until that snapshot becomes durable.
 Apply cannot select entries from a cache prefix that the new snapshot removed.
@@ -277,7 +323,7 @@ Local JSON benchmarks do not establish remote-store latency or cost.
 | Phase | Deliverable | Exit criterion |
 | --- | --- | --- |
 | 1 | Isolate state apply and reads from Raft | Slow apply preserves heartbeats and reply ordering |
-| 2 | ReadIndex and a separate log I/O thread | Reads and persistence preserve their barriers |
+| 2 | ReadIndex and bounded log I/O | Preserve read, durable, and memory barriers |
 | 3 | TLS, Auth, membership, and Maintenance | Matching upstream cases run without skips |
 | 4 | Remote store and cross-host tests | Recovery and measured costs use real storage |
 | 5 | Object-reference snapshots and lease indexes | Bound transfer and scan work for large state |
@@ -291,7 +337,10 @@ Remote storage, membership changes, and object-reference snapshots remain future
 The phase 2 tests cover quorum loss, apply lag, read cancellation, and unchanged log write counts.
 They cover delayed log writes, failed writes, delayed checkpoint publication, and worker failure.
 DST controls log execution and completion separately from state application.
-It injects a disk write failure, restarts that node, and checks persistence-dependent messages.
+It injects disk write and read failures, restarts nodes, and checks persistence-dependent messages.
+A 1 KiB cache forces eviction. Each schedule checks pool limits and delayed read completion.
+Process tests cover oversized cache entries, follower catch-up, slow reads, and read failure.
+Unit tests cover stale reads after overwrite, compaction, or snapshot replacement.
 Read histories must contain every write acknowledged before each read began.
 
 The phase 1 tests cover:
@@ -314,7 +363,8 @@ It does not simulate partial sector writes, operating-system scheduling, or Slat
 
 - [Node and Raft integration](../src/node.rs)
 - [Apply worker and bounded jobs](../src/node/apply.rs)
-- [Log I/O worker and memory view](../src/node/log.rs)
+- [Log I/O worker](../src/node/log.rs)
+- [Bounded log pools and asynchronous fetch](../src/node/cache.rs)
 - [ReadIndex request lifecycle](../src/node/read.rs)
 - [Persistent Raft storage](../src/storage.rs)
 - [State machine and snapshots](../src/state.rs)

@@ -61,6 +61,34 @@ pub fn service(
 }
 
 impl Service {
+    // A forwarded result can supply a revision for the next local STM read.
+    async fn local_barrier(&self) -> Result<(), Status> {
+        let (tx, rx) = oneshot::channel();
+        self.events
+            .try_send(Event::LinearRead(
+                RequestOp {
+                    request: Some(Op::RequestRange(RangeRequest {
+                        key: vec![0],
+                        limit: 1,
+                        ..Default::default()
+                    })),
+                },
+                tx,
+            ))
+            .map_err(|_| Status::unavailable("etcdserver: too many requests"))?;
+        let value = tokio::time::timeout(Duration::from_secs(10), rx)
+            .await
+            .map_err(|_| {
+                Status::deadline_exceeded("etcdserver: local apply timed out; outcome unknown")
+            })?
+            .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?
+            .map_err(|e| Status::unavailable(e.error))?;
+        let outcome: Outcome =
+            serde_json::from_value(value).map_err(|e| Status::internal(e.to_string()))?;
+        outcome.result.map_err(|e| e.status())?;
+        Ok(())
+    }
+
     async fn execute(&self, op: Op, forwarded: bool) -> Result<ResponseOp, Status> {
         let request = RequestOp {
             request: Some(op.clone()),
@@ -118,6 +146,7 @@ impl Service {
                 let mut response = ResponseOp {
                     response: Some(response),
                 };
+                self.local_barrier().await?;
                 if let Some(header) = mvcc::response_header(&mut response) {
                     header.member_id = self.member;
                 }
@@ -228,10 +257,12 @@ impl Kv for Service {
                     .peers
                     .get(&error.leader_id)
                     .ok_or_else(|| Status::unavailable("etcdserver: no leader"))?;
-                KvClient::new(channel.clone())
+                let response = KvClient::new(channel.clone())
                     .compact(forward(request))
                     .await?
-                    .into_inner()
+                    .into_inner();
+                self.local_barrier().await?;
+                response
             }
             Err(error) => return Err(Status::unavailable(format!("etcdserver: {}", error.error))),
         };

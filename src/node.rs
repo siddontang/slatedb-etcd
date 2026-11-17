@@ -16,6 +16,8 @@ use crate::storage::RaftStorage;
 use crate::{ApiError, Command, RaftCommand, Request};
 
 mod apply;
+mod cache;
+pub use cache::LogMemory;
 mod log;
 mod read;
 use apply::{AppliedState, Completion, Header, Job, Output, Query, Reply, Work, Worker};
@@ -52,6 +54,7 @@ pub enum Event {
     SnapshotDelay(u64, Response),
     ApplyDelay(u64, Response),
     LogFault(u64, bool, Response),
+    LogReadFault(u64, bool, Response),
     NetworkResult {
         peer: u64,
         snapshot: bool,
@@ -65,6 +68,7 @@ pub struct NodeOptions {
     pub peers: BTreeMap<u64, String>,
     pub dir: PathBuf,
     pub snapshot_every: u64,
+    pub log_memory: LogMemory,
 }
 
 struct Pending {
@@ -93,6 +97,8 @@ pub struct Node {
     log_bytes: usize,
     log_delay_ms: u64,
     log_fail: bool,
+    log_read_delay_ms: u64,
+    log_read_fail: bool,
     peer_waiters: Vec<Response>,
     built_checkpoint: Option<(u64, Vec<u8>)>,
     reads: BTreeMap<Vec<u8>, read::PendingRead>,
@@ -157,6 +163,23 @@ impl Node {
         );
         let recovered_from_index = state.applied;
         state.install_snapshot(storage.recovery_snapshot()).await?;
+        let cache = match log::Cache::load(&storage, state.applied, options.log_memory) {
+            Ok(cache) => cache,
+            Err(error) if error.is::<cache::PendingQuota>() => {
+                apply::recover(
+                    &mut state,
+                    &storage,
+                    Header {
+                        cluster: 0,
+                        member: options.id,
+                        term: storage.initial_state()?.hard_state.term,
+                    },
+                )
+                .await?;
+                log::Cache::load(&storage, state.applied, options.log_memory)?
+            }
+            Err(error) => return Err(error),
+        };
         let config = Config {
             id: options.id,
             election_tick: 10,
@@ -173,7 +196,6 @@ impl Node {
         };
         config.validate()?;
         let logger = slog::Logger::root(slog::Discard, slog::o!());
-        let cache = log::Cache::load(&storage)?;
         let raw = RawNode::new(&config, cache, &logger)?;
         let manual_apply = transport_override.is_some();
         let senders = if let Some(senders) = transport_override {
@@ -208,6 +230,8 @@ impl Node {
             log_bytes: 0,
             log_delay_ms: 0,
             log_fail: false,
+            log_read_delay_ms: 0,
+            log_read_fail: false,
             peer_waiters: vec![],
             built_checkpoint: None,
             reads: BTreeMap::new(),
@@ -249,7 +273,7 @@ impl Node {
         loop {
             let mut step_responses = vec![];
             tokio::select! {
-                _ = ticks.tick() => { self.raw.tick(); self.expire_leases()?; }
+                _ = ticks.tick() => { self.raw.tick(); self.retry_reads(); self.expire_leases()?; }
                 persisted = self.log_worker.next() => { self.complete_log(persisted?)?; }
                 completed = self.worker.next() => { self.complete_apply(completed?)?; }
                 event = events.recv() => {
@@ -287,6 +311,29 @@ impl Node {
             }
             self.finish_checkpoint_waiters()?;
         }
+    }
+
+    fn admits_peer(&self, message: &Message) -> bool {
+        let kind = message.get_msg_type();
+        if message.entries.is_empty()
+            || !matches!(kind, MessageType::MsgAppend | MessageType::MsgPropose)
+        {
+            return true;
+        }
+        if kind == MessageType::MsgAppend
+            && (message.index < self.raw.raft.raft_log.committed
+                || !self
+                    .raw
+                    .raft
+                    .raft_log
+                    .match_term(message.index, message.log_term))
+        {
+            // Let Raft reject a prefix mismatch without charging entries it will discard.
+            return true;
+        }
+        self.raw
+            .store()
+            .admits_message(self.raw.raft.raft_log.unstable_entries(), message)
     }
 
     async fn handle(&mut self, event: Event, step_responses: &mut Vec<Response>) -> Result<()> {
@@ -350,6 +397,7 @@ impl Node {
                     || message.from == self.options.id
                     || !self.options.peers.contains_key(&message.from)
                     || self.blocked.contains(&message.from)
+                    || !self.admits_peer(&message)
                     || self.peer_waiters.len() + step_responses.len() >= 256
                 {
                     let _ = response.send(Err(self.error("peer message rejected")));
@@ -392,6 +440,11 @@ impl Node {
             }
             Event::ApplyDelay(delay_ms, response) => {
                 self.apply_delay_ms = delay_ms.min(5000);
+                let _ = response.send(Ok(self.status()?));
+            }
+            Event::LogReadFault(delay_ms, fail, response) => {
+                self.log_read_delay_ms = delay_ms.min(5000);
+                self.log_read_fail = fail;
                 let _ = response.send(Ok(self.status()?));
             }
             Event::LogFault(delay_ms, fail, response) => {
@@ -473,6 +526,11 @@ impl Node {
                 }
             }
         }
+        if self.log_queue.len() < log::MAX_JOBS {
+            if let Some(fetch) = self.raw.mut_store().take_fetch() {
+                self.queue_log(log::Job::Fetch(fetch), None, None, vec![], vec![]);
+            }
+        }
         if !self.raw.has_ready() {
             if let Some(task) = self.log_queue.back_mut() {
                 task.responses.append(&mut self.peer_waiters);
@@ -514,11 +572,21 @@ impl Node {
     fn start_log(&mut self) -> Result<()> {
         if !self.log_busy {
             if let Some(task) = self.log_queue.front_mut() {
+                let job = task.work.take().context("log job already submitted")?;
+                let reading = matches!(job, log::Job::Fetch(_));
                 self.log_worker.submit(log::Work {
                     id: task.id,
-                    job: task.work.take().context("log job already submitted")?,
-                    delay: Duration::from_millis(self.log_delay_ms),
-                    fail: self.log_fail,
+                    job,
+                    delay: Duration::from_millis(if reading {
+                        self.log_read_delay_ms
+                    } else {
+                        self.log_delay_ms
+                    }),
+                    fail: if reading {
+                        self.log_read_fail
+                    } else {
+                        self.log_fail
+                    },
                 })?;
                 self.log_busy = true;
             }
@@ -533,6 +601,10 @@ impl Node {
         self.log_bytes -= task.bytes;
         self.log_busy = false;
         self.raw.mut_store().complete(completed.durable)?;
+        if let Some((fetch, entries)) = completed.fetched {
+            self.raw.mut_store().fetched(&fetch, entries)?;
+            self.raw.on_entries_fetched(fetch.context);
+        }
         if let Some(number) = task.ready {
             self.raw.on_persist_ready(number);
         }
@@ -650,6 +722,7 @@ impl Node {
         self.state.durable_applied = durable;
         self.apply_busy = false;
         self.raw.advance_apply_to(self.state.applied);
+        self.raw.mut_store().applied_to(self.state.applied);
         self.sync_lease_deadlines();
         self.expire_pending();
         self.expire_reads();
@@ -761,11 +834,15 @@ impl Node {
                 id: uuid::Uuid::new_v4().to_string(),
                 lease: LeaseCommand::Expire { id, generation },
             };
-            if self
-                .raw
-                .propose(vec![], serde_json::to_vec(&command)?)
-                .is_ok()
-            {
+            let data = serde_json::to_vec(&command)?;
+            if !self.raw.store().admits(
+                self.raw.raft.raft_log.unstable_entries(),
+                &[],
+                data.len() + cache::ENTRY_OVERHEAD + 64,
+            ) {
+                break;
+            }
+            if self.raw.propose(vec![], data).is_ok() {
                 self.lease_expiring.insert((id, generation));
             }
         }
@@ -789,7 +866,18 @@ impl Node {
         } else if self.pending.len() >= 1024 {
             let _ = response.send(Err(self.error("too many pending requests")));
         } else {
-            match self.raw.propose(vec![], serde_json::to_vec(&command)?) {
+            let data = serde_json::to_vec(&command)?;
+            if data.len() + 64 > cache::MAX_ENTRY_BYTES
+                || !self.raw.store().admits(
+                    self.raw.raft.raft_log.unstable_entries(),
+                    &[],
+                    data.len() + cache::ENTRY_OVERHEAD + 64,
+                )
+            {
+                let _ = response.send(Err(self.error("pending log memory quota is full")));
+                return Ok(());
+            }
+            match self.raw.propose(vec![], data) {
                 Ok(()) => {
                     self.pending.insert(
                         command.id().to_owned(),
@@ -924,6 +1012,8 @@ impl Node {
             "log_fail": self.log_fail, "pending_read_indexes": self.reads.len(),
             "raft_commit_index": self.raw.raft.raft_log.committed,
             "cached_last_log_index": self.raw.store().last_index()?,
+            "log_memory": self.raw.store().stats(),
+            "log_read_delay_ms": self.log_read_delay_ms, "log_read_fail": self.log_read_fail,
             "revision": self.state.revision,
             "compact_revision": self.state.compact_revision,
         }))

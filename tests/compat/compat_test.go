@@ -30,6 +30,7 @@ type cluster struct {
 	addresses    []string
 	processes    map[int]*exec.Cmd
 	logs         map[int]*os.File
+	args         []string
 }
 
 func address(t *testing.T) string {
@@ -43,7 +44,7 @@ func address(t *testing.T) string {
 	return addr
 }
 
-func newCluster(t *testing.T) *cluster {
+func newCluster(t *testing.T, extraArgs ...string) *cluster {
 	t.Helper()
 	binary := os.Getenv("SLATEDB_ETCD_BINARY")
 	if binary == "" {
@@ -60,7 +61,7 @@ func newCluster(t *testing.T) *cluster {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := &cluster{t: t, root: root, binary: binary, processes: map[int]*exec.Cmd{}, logs: map[int]*os.File{}}
+	c := &cluster{t: t, root: root, binary: binary, args: extraArgs, processes: map[int]*exec.Cmd{}, logs: map[int]*os.File{}}
 	for i := 0; i < 3; i++ {
 		c.addresses = append(c.addresses, address(t))
 	}
@@ -91,6 +92,7 @@ func newCluster(t *testing.T) *cluster {
 func (c *cluster) start(id int) {
 	c.t.Helper()
 	args := []string{"--id", strconv.Itoa(id), "--listen", c.addresses[id-1], "--dir", filepath.Join(c.root, fmt.Sprintf("node-%d", id)), "--cluster-id", filepath.Base(c.root), "--snapshot-every", "0"}
+	args = append(args, c.args...)
 	for i, addr := range c.addresses {
 		args = append(args, "--peer", fmt.Sprintf("%d=%s", i+1, addr))
 	}

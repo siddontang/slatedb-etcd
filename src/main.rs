@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use slatedb_etcd::api::{router, ApiState};
-use slatedb_etcd::node::{Node, NodeOptions};
+use slatedb_etcd::node::{LogMemory, Node, NodeOptions};
 use tokio::sync::mpsc;
 
 #[derive(Parser)]
@@ -25,6 +25,14 @@ struct Args {
     /// Zero disables automatic snapshots. The checkpoint endpoint remains available.
     #[arg(long, default_value_t = 1000)]
     snapshot_every: u64,
+    #[arg(long, default_value_t = 8 * 1024 * 1024)]
+    log_cache_bytes: usize,
+    #[arg(long, default_value_t = 32 * 1024 * 1024)]
+    log_pending_bytes: usize,
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    log_read_bytes: usize,
+    #[arg(long, default_value_t = 1024 * 1024)]
+    log_term_bytes: usize,
 }
 
 #[tokio::main(worker_threads = 4)]
@@ -68,6 +76,12 @@ async fn main() -> Result<()> {
             peers,
             dir: args.dir,
             snapshot_every: args.snapshot_every,
+            log_memory: LogMemory {
+                cache_bytes: args.log_cache_bytes,
+                pending_bytes: args.log_pending_bytes,
+                read_bytes: args.log_read_bytes,
+                term_bytes: args.log_term_bytes,
+            },
         },
         tx.clone(),
     )
