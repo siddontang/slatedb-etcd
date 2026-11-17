@@ -16,7 +16,7 @@ Stage 2 adds a 64 MiB weighted cache for immutable SST blocks and metadata.
 - Builds: Rust 1.91.1 release without crash hooks; Go 1.25.6; pinned dependencies.
 - Baseline source: `0d41aaa8288253cfc9bd61af4999f1e0d6de0d91`.
 - Quota-only runtime source: `6edef42`.
-- Final runtime source: `03eba4f`, with the state cache and current-format snapshot checks.
+- Cached runtime source: `03eba4f`, with the state cache and current-format snapshot checks.
 - Each report retains the three binary SHA-256 values for its stage.
 
 Each sample starts a fresh cluster. Each repeat shuffles workload and backend order.
@@ -155,6 +155,18 @@ Cache and allocator overhead can add memory beyond the weight limit.
 A targeted fault test blocks SST reads after warmup and confirms cached reads still return data.
 It then writes and flushes a new version and checks that reads return the new value.
 The full Rust suite and five replayed DST seeds also pass with the cache enabled.
+
+## Linux socket delay
+
+The first Linux check found a median latency near 41 ms for reads and writes.
+Its cached service reached only 247 read operations per second at concurrency 8.
+The server accepted client and peer sockets without setting `TCP_NODELAY`.
+Small replies could therefore wait for delayed acknowledgments.
+
+The server now sets `TCP_NODELAY` before it starts HTTP or TLS on each accepted socket.
+This applies to both client and peer listeners. It changes no Raft or storage durability setting.
+The macOS tables above predate this socket change and retain their measured binary hashes.
+Use the final PR check's Linux report to assess the socket change and compare against etcd.
 
 ## Remaining work
 

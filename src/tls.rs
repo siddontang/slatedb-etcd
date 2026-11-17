@@ -174,6 +174,10 @@ pub(crate) async fn serve_until(
             Ok(incoming) => incoming,
             Err(error) => break Err(error.into()),
         };
+        // Send small client and Raft replies without waiting for a delayed ACK.
+        if let Err(error) = stream.set_nodelay(true) {
+            break Err(error.into());
+        }
         let Ok(permit) = permits.clone().try_acquire_owned() else {
             continue;
         };
