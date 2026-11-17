@@ -195,19 +195,6 @@ impl StateMachine {
     }
 
     pub(super) async fn hash_kv(&self, revision: i64) -> std::result::Result<Value, KvError> {
-        if self.revision > 1 {
-            let origin = self
-                .db
-                .get(b"etcd/hash-origin")
-                .await
-                .map_err(KvError::storage)?;
-            if origin.as_deref() != Some(1_i64.to_be_bytes().as_slice()) {
-                return Err(KvError::new(
-                    Code::Unimplemented,
-                    "HashKV requires complete revision records from database creation",
-                ));
-            }
-        }
         if revision > 0 {
             for mut cached in self.hash_cache().await.map_err(KvError::storage)? {
                 if cached["hash_revision"].as_i64() == Some(revision) {
@@ -281,7 +268,7 @@ impl StateMachine {
     }
 }
 
-pub(crate) async fn record_hash(
+pub(crate) fn record_hash(
     revision: i64,
     events: &[crate::proto::mvccpb::Event],
     batch: &mut WriteBatch,

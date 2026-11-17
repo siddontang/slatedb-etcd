@@ -77,13 +77,13 @@ SlateDB uses these logical keys:
 | `etcd/current/` | Current values and key metadata |
 | `etcd/history/` | Historical versions and tombstones |
 | `etcd/revision` and `etcd/compact-revision` | MVCC progress and retained history boundary |
-| `etcd/events/` and `etcd/watch-floor` | Ordered events and the first complete journal revision |
+| `etcd/events/` | Ordered Watch events with previous values |
 | `etcd/leases/` | Lease TTL and generation |
 | `etcd/auth` | Users, roles, bcrypt hashes, tokens, and authentication revision |
 | `etcd/members` | Voters, learners, addresses, and removed member IDs |
 | `etcd/alarms` | Replicated capacity and corruption alarms |
 | `etcd/hash/` | Canonical etcd revision records for HashKV |
-| `etcd/hash-cache` and `etcd/hash-origin` | Retained compaction hashes and format coverage |
+| `etcd/hash-cache` | Retained compaction hashes |
 
 The full snapshot preserves these keys together. A checkpoint has one pinned apply boundary.
 
@@ -343,7 +343,7 @@ The plaintext local mode retains trusted diagnostics. It is not a hostile multi-
 Status and serializable member lists read local applied metadata during quorum loss.
 HashKV and linearizable member lists use a ReadIndex barrier.
 HashKV follows etcd revision encoding, compaction filtering, and retained compaction hash semantics.
-Older databases without complete revision records return an explicit HashKV format error.
+Databases from older binaries without Watch journals or HashKV revision records are unsupported.
 Quota checks use logical stored bytes. Replicated alarms stop writes until an administrator clears
 them.
 This quota is not a filesystem capacity limit.

@@ -48,7 +48,7 @@ Do not combine results from the two hosts into one ranking.
 ## Measurements
 
 All 81 measured samples passed without request or resource errors.
-The final Rust suite passed 46 tests, plus five DST seeds with two replays each.
+The Rust suite for `03eba4f` passed 46 tests, plus five DST seeds with two replays each.
 
 Stage 1 increased pure-write throughput by 33.6x at concurrency 1 and 22.6x at concurrency 8.
 At concurrency 8, median CPU work fell 94.2%, and p99 latency fell 95.2%.
@@ -167,6 +167,10 @@ The server now sets `TCP_NODELAY` before it starts HTTP or TLS on each accepted 
 This applies to both client and peer listeners. It changes no Raft or storage durability setting.
 The macOS tables above predate this socket change and retain their measured binary hashes.
 Use the final PR check's Linux report to assess the socket change and compare against etcd.
+
+The final source also removes compatibility markers for missing Watch and HashKV history.
+Watch uses the normal compaction boundary. Event recording no longer reads compatibility markers.
+The macOS measurements predate this removal.
 
 ## Remaining work
 
