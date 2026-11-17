@@ -8,13 +8,8 @@ use slatedb::compactor::{CompactionSpec, CompactionStatus, SourceId};
 use tonic::Code;
 
 impl StateMachine {
-    pub async fn logical_size(&self) -> Result<u64> {
-        let mut scan = self.db.scan_prefix(b"etcd/", ..).await?;
-        let mut size = 0;
-        while let Some(row) = scan.next().await? {
-            size += (row.key.len() + row.value.len()) as u64;
-        }
-        Ok(size)
+    pub fn logical_size(&self) -> u64 {
+        self.logical_bytes
     }
 
     pub async fn maintenance(
@@ -29,7 +24,7 @@ impl StateMachine {
         status.header = mvcc::header(self.revision);
         let result = match command {
             Command::Status => {
-                let size = self.logical_size().await?;
+                let size = self.logical_size();
                 status.db_size_in_use = size as i64;
                 status.db_size = self.physical_size().await?.max(size) as i64;
                 status.db_size_quota = self.quota as i64;
@@ -126,9 +121,7 @@ impl StateMachine {
         });
         batch.put(ALARMS, serde_json::to_vec(&alarms)?);
         batch.put(APPLIED, index.to_be_bytes());
-        self.db
-            .write_with_options(batch, &WriteOptions { seqnum: index })
-            .await?;
+        self.write_batch(batch, index).await?;
         self.applied = index;
         self.alarms = alarms;
         Ok(Outcome { result })
@@ -202,19 +195,6 @@ impl StateMachine {
     }
 
     pub(super) async fn hash_kv(&self, revision: i64) -> std::result::Result<Value, KvError> {
-        if self.revision > 1 {
-            let origin = self
-                .db
-                .get(b"etcd/hash-origin")
-                .await
-                .map_err(KvError::storage)?;
-            if origin.as_deref() != Some(1_i64.to_be_bytes().as_slice()) {
-                return Err(KvError::new(
-                    Code::Unimplemented,
-                    "HashKV requires complete revision records from database creation",
-                ));
-            }
-        }
         if revision > 0 {
             for mut cached in self.hash_cache().await.map_err(KvError::storage)? {
                 if cached["hash_revision"].as_i64() == Some(revision) {
@@ -288,7 +268,7 @@ impl StateMachine {
     }
 }
 
-pub(crate) async fn record_hash(
+pub(crate) fn record_hash(
     revision: i64,
     events: &[crate::proto::mvccpb::Event],
     batch: &mut WriteBatch,
@@ -336,4 +316,16 @@ pub(crate) async fn compact_hash(
         }
     }
     Ok(())
+}
+
+// Rebuild derived accounting when opening stored state.
+pub(super) async fn count_logical_size(db: &Db) -> Result<u64> {
+    let mut scan = db.scan_prefix(b"etcd/", ..).await?;
+    let mut size = 0_u64;
+    while let Some(row) = scan.next().await? {
+        size = size
+            .checked_add((row.key.len() + row.value.len()) as u64)
+            .context("logical size counter overflow")?;
+    }
+    Ok(size)
 }

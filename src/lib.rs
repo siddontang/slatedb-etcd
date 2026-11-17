@@ -1,3 +1,6 @@
+mod batch;
+pub use batch::WriteBatch;
+
 pub mod api;
 pub mod auth;
 pub mod cluster;

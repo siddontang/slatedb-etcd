@@ -22,6 +22,7 @@ pub(crate) const FAIL_PUT: u8 = 1;
 pub(crate) const PAUSE_PUT: u8 = 2;
 pub(crate) const LOSE_PUT_REPLY: u8 = 3;
 pub(crate) const FAIL_GET: u8 = 4;
+pub(crate) const FAIL_SST_GET: u8 = 5;
 
 impl FaultStore {
     pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
@@ -94,7 +95,8 @@ impl ObjectStore for FaultStore {
     }
 
     async fn get_opts(&self, path: &Path, options: GetOptions) -> Result<GetResult> {
-        if self.mode.load(Ordering::SeqCst) == FAIL_GET {
+        let mode = self.mode.load(Ordering::SeqCst);
+        if mode == FAIL_GET || (mode == FAIL_SST_GET && path.as_ref().ends_with(".sst")) {
             self.entered.add_permits(1);
             return Err(error());
         }

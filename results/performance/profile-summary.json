@@ -1,0 +1,898 @@
+{
+  "method": "macOS sample; requested five seconds and one millisecond intervals",
+  "limits": "Wall-stack samples include waits, nested frames, and profiler overhead. Counts are not CPU percentages.",
+  "baseline_probe": {
+    "source": "0d41aaa",
+    "keys": 1000,
+    "requests": 3000,
+    "concurrency": 8,
+    "read_percent": 0
+  },
+  "quota_only_probes": {
+    "source": "6edef42",
+    "keys": 1000,
+    "concurrency": 8,
+    "write_requests": 10000,
+    "read_requests": 100000
+  },
+  "finding": "Quota-only profiles still open SST files. Both default SlateDB caches were disabled by feature selection.",
+  "profiles": [
+    {
+      "profile": "cpu-baseline",
+      "quota_scan_call_graph_site_counts": [
+        116,
+        2,
+        1,
+        1,
+        122,
+        2,
+        1,
+        165,
+        2,
+        1,
+        114,
+        3
+      ],
+      "top_stack_samples": [
+        {
+          "symbol": "__psynch_cvwait",
+          "image": "libsystem_kernel.dylib",
+          "samples": 17888
+        },
+        {
+          "symbol": "semaphore_timedwait_trap",
+          "image": "libsystem_kernel.dylib",
+          "samples": 1474
+        },
+        {
+          "symbol": "kevent",
+          "image": "libsystem_kernel.dylib",
+          "samples": 1383
+        },
+        {
+          "symbol": "__open",
+          "image": "libsystem_kernel.dylib",
+          "samples": 455
+        },
+        {
+          "symbol": "close",
+          "image": "libsystem_kernel.dylib",
+          "samples": 97
+        },
+        {
+          "symbol": "__psynch_cvsignal",
+          "image": "libsystem_kernel.dylib",
+          "samples": 89
+        },
+        {
+          "symbol": "_xzm_free_main",
+          "image": "libsystem_malloc.dylib",
+          "samples": 46
+        },
+        {
+          "symbol": "mach_absolute_time",
+          "image": "libsystem_kernel.dylib",
+          "samples": 46
+        },
+        {
+          "symbol": "_xzm_xzone_malloc_tiny",
+          "image": "libsystem_malloc.dylib",
+          "samples": 43
+        },
+        {
+          "symbol": "pread",
+          "image": "libsystem_kernel.dylib",
+          "samples": 35
+        },
+        {
+          "symbol": "__gettimeofday",
+          "image": "libsystem_kernel.dylib",
+          "samples": 34
+        },
+        {
+          "symbol": "<deduplicated_symbol>",
+          "image": "libsystem_malloc.dylib",
+          "samples": 32
+        },
+        {
+          "symbol": "_platform_memmove",
+          "image": "libsystem_platform.dylib",
+          "samples": 26
+        },
+        {
+          "symbol": "slatedb::merge_iterator::MergeIterator::advance::_$u7b$$u7b$closure$u7d$$u7d$",
+          "image": "slatedb-etcd-baseline",
+          "samples": 19
+        },
+        {
+          "symbol": "fstat",
+          "image": "libsystem_kernel.dylib",
+          "samples": 17
+        }
+      ],
+      "observed_paths": [
+        "object_store::local::open_file",
+        "slatedb::merge_iterator"
+      ]
+    },
+    {
+      "profile": "cpu-optimized-read-1",
+      "quota_scan_call_graph_site_counts": [],
+      "top_stack_samples": [
+        {
+          "symbol": "__psynch_cvwait",
+          "image": "libsystem_kernel.dylib",
+          "samples": 9889
+        },
+        {
+          "symbol": "semaphore_timedwait_trap",
+          "image": "libsystem_kernel.dylib",
+          "samples": 941
+        },
+        {
+          "symbol": "kevent",
+          "image": "libsystem_kernel.dylib",
+          "samples": 850
+        },
+        {
+          "symbol": "__open",
+          "image": "libsystem_kernel.dylib",
+          "samples": 78
+        },
+        {
+          "symbol": "__open_nocancel",
+          "image": "libsystem_kernel.dylib",
+          "samples": 67
+        },
+        {
+          "symbol": "__psynch_cvsignal",
+          "image": "libsystem_kernel.dylib",
+          "samples": 30
+        },
+        {
+          "symbol": "__getdirentries64",
+          "image": "libsystem_kernel.dylib",
+          "samples": 25
+        },
+        {
+          "symbol": "__recvfrom",
+          "image": "libsystem_kernel.dylib",
+          "samples": 18
+        },
+        {
+          "symbol": "close",
+          "image": "libsystem_kernel.dylib",
+          "samples": 18
+        },
+        {
+          "symbol": "writev",
+          "image": "libsystem_kernel.dylib",
+          "samples": 18
+        },
+        {
+          "symbol": "__close_nocancel",
+          "image": "libsystem_kernel.dylib",
+          "samples": 15
+        },
+        {
+          "symbol": "mach_absolute_time",
+          "image": "libsystem_kernel.dylib",
+          "samples": 13
+        },
+        {
+          "symbol": "flatbuffers::verifier::append_trace",
+          "image": "slatedb-etcd-optimized",
+          "samples": 11
+        },
+        {
+          "symbol": "slatedb::flatbuffer_types::SsTableIndexOwned::new",
+          "image": "slatedb-etcd-optimized",
+          "samples": 10
+        },
+        {
+          "symbol": "__gettimeofday",
+          "image": "libsystem_kernel.dylib",
+          "samples": 8
+        }
+      ],
+      "observed_paths": [
+        "object_store::local::open_file",
+        "slatedb_etcd::node::transport"
+      ]
+    },
+    {
+      "profile": "cpu-optimized-read-2",
+      "quota_scan_call_graph_site_counts": [],
+      "top_stack_samples": [
+        {
+          "symbol": "__psynch_cvwait",
+          "image": "libsystem_kernel.dylib",
+          "samples": 9628
+        },
+        {
+          "symbol": "semaphore_timedwait_trap",
+          "image": "libsystem_kernel.dylib",
+          "samples": 777
+        },
+        {
+          "symbol": "kevent",
+          "image": "libsystem_kernel.dylib",
+          "samples": 681
+        },
+        {
+          "symbol": "__open",
+          "image": "libsystem_kernel.dylib",
+          "samples": 90
+        },
+        {
+          "symbol": "__open_nocancel",
+          "image": "libsystem_kernel.dylib",
+          "samples": 59
+        },
+        {
+          "symbol": "__psynch_cvsignal",
+          "image": "libsystem_kernel.dylib",
+          "samples": 47
+        },
+        {
+          "symbol": "__recvfrom",
+          "image": "libsystem_kernel.dylib",
+          "samples": 26
+        },
+        {
+          "symbol": "writev",
+          "image": "libsystem_kernel.dylib",
+          "samples": 23
+        },
+        {
+          "symbol": "__getdirentries64",
+          "image": "libsystem_kernel.dylib",
+          "samples": 20
+        },
+        {
+          "symbol": "close",
+          "image": "libsystem_kernel.dylib",
+          "samples": 18
+        },
+        {
+          "symbol": "_platform_memmove",
+          "image": "libsystem_platform.dylib",
+          "samples": 10
+        },
+        {
+          "symbol": "mach_absolute_time",
+          "image": "libsystem_kernel.dylib",
+          "samples": 9
+        },
+        {
+          "symbol": "__gettimeofday",
+          "image": "libsystem_kernel.dylib",
+          "samples": 7
+        },
+        {
+          "symbol": "flatbuffers::verifier::Verifier::visit_table",
+          "image": "slatedb-etcd-optimized",
+          "samples": 7
+        },
+        {
+          "symbol": "flatbuffers::verifier::append_trace",
+          "image": "slatedb-etcd-optimized",
+          "samples": 7
+        }
+      ],
+      "observed_paths": [
+        "object_store::local::open_file",
+        "slatedb_etcd::node::transport"
+      ]
+    },
+    {
+      "profile": "cpu-optimized-read-3",
+      "quota_scan_call_graph_site_counts": [],
+      "top_stack_samples": [
+        {
+          "symbol": "__psynch_cvwait",
+          "image": "libsystem_kernel.dylib",
+          "samples": 8135
+        },
+        {
+          "symbol": "semaphore_timedwait_trap",
+          "image": "libsystem_kernel.dylib",
+          "samples": 666
+        },
+        {
+          "symbol": "kevent",
+          "image": "libsystem_kernel.dylib",
+          "samples": 550
+        },
+        {
+          "symbol": "__open",
+          "image": "libsystem_kernel.dylib",
+          "samples": 104
+        },
+        {
+          "symbol": "__open_nocancel",
+          "image": "libsystem_kernel.dylib",
+          "samples": 54
+        },
+        {
+          "symbol": "__psynch_cvsignal",
+          "image": "libsystem_kernel.dylib",
+          "samples": 49
+        },
+        {
+          "symbol": "__recvfrom",
+          "image": "libsystem_kernel.dylib",
+          "samples": 25
+        },
+        {
+          "symbol": "writev",
+          "image": "libsystem_kernel.dylib",
+          "samples": 25
+        },
+        {
+          "symbol": "close",
+          "image": "libsystem_kernel.dylib",
+          "samples": 23
+        },
+        {
+          "symbol": "__getdirentries64",
+          "image": "libsystem_kernel.dylib",
+          "samples": 20
+        },
+        {
+          "symbol": "_xzm_free_main",
+          "image": "libsystem_malloc.dylib",
+          "samples": 16
+        },
+        {
+          "symbol": "flatbuffers::verifier::append_trace",
+          "image": "slatedb-etcd-optimized",
+          "samples": 14
+        },
+        {
+          "symbol": "__close_nocancel",
+          "image": "libsystem_kernel.dylib",
+          "samples": 12
+        },
+        {
+          "symbol": "lstat",
+          "image": "libsystem_kernel.dylib",
+          "samples": 11
+        },
+        {
+          "symbol": "_xzm_xzone_malloc_tiny",
+          "image": "libsystem_malloc.dylib",
+          "samples": 10
+        }
+      ],
+      "observed_paths": [
+        "object_store::local::open_file",
+        "slatedb_etcd::node::transport"
+      ]
+    },
+    {
+      "profile": "cpu-optimized-write-1",
+      "quota_scan_call_graph_site_counts": [],
+      "top_stack_samples": [
+        {
+          "symbol": "__psynch_cvwait",
+          "image": "libsystem_kernel.dylib",
+          "samples": 8367
+        },
+        {
+          "symbol": "semaphore_timedwait_trap",
+          "image": "libsystem_kernel.dylib",
+          "samples": 821
+        },
+        {
+          "symbol": "kevent",
+          "image": "libsystem_kernel.dylib",
+          "samples": 720
+        },
+        {
+          "symbol": "__open",
+          "image": "libsystem_kernel.dylib",
+          "samples": 148
+        },
+        {
+          "symbol": "__psynch_cvsignal",
+          "image": "libsystem_kernel.dylib",
+          "samples": 47
+        },
+        {
+          "symbol": "writev",
+          "image": "libsystem_kernel.dylib",
+          "samples": 37
+        },
+        {
+          "symbol": "close",
+          "image": "libsystem_kernel.dylib",
+          "samples": 36
+        },
+        {
+          "symbol": "__recvfrom",
+          "image": "libsystem_kernel.dylib",
+          "samples": 33
+        },
+        {
+          "symbol": "__open_nocancel",
+          "image": "libsystem_kernel.dylib",
+          "samples": 29
+        },
+        {
+          "symbol": "fsync",
+          "image": "libsystem_kernel.dylib",
+          "samples": 29
+        },
+        {
+          "symbol": "_xzm_xzone_malloc_tiny",
+          "image": "libsystem_malloc.dylib",
+          "samples": 21
+        },
+        {
+          "symbol": "_platform_memmove",
+          "image": "libsystem_platform.dylib",
+          "samples": 20
+        },
+        {
+          "symbol": "lstat",
+          "image": "libsystem_kernel.dylib",
+          "samples": 17
+        },
+        {
+          "symbol": "_xzm_free_main",
+          "image": "libsystem_malloc.dylib",
+          "samples": 15
+        },
+        {
+          "symbol": "pwrite",
+          "image": "libsystem_kernel.dylib",
+          "samples": 15
+        }
+      ],
+      "observed_paths": [
+        "object_store::local::open_file",
+        "slatedb::merge_iterator",
+        "slatedb_etcd::node::transport",
+        "serde_json::de::from_slice"
+      ]
+    },
+    {
+      "profile": "cpu-optimized-write-2",
+      "quota_scan_call_graph_site_counts": [],
+      "top_stack_samples": [
+        {
+          "symbol": "__psynch_cvwait",
+          "image": "libsystem_kernel.dylib",
+          "samples": 8865
+        },
+        {
+          "symbol": "semaphore_timedwait_trap",
+          "image": "libsystem_kernel.dylib",
+          "samples": 734
+        },
+        {
+          "symbol": "kevent",
+          "image": "libsystem_kernel.dylib",
+          "samples": 676
+        },
+        {
+          "symbol": "__open",
+          "image": "libsystem_kernel.dylib",
+          "samples": 146
+        },
+        {
+          "symbol": "__psynch_cvsignal",
+          "image": "libsystem_kernel.dylib",
+          "samples": 51
+        },
+        {
+          "symbol": "__open_nocancel",
+          "image": "libsystem_kernel.dylib",
+          "samples": 39
+        },
+        {
+          "symbol": "close",
+          "image": "libsystem_kernel.dylib",
+          "samples": 34
+        },
+        {
+          "symbol": "pwrite",
+          "image": "libsystem_kernel.dylib",
+          "samples": 21
+        },
+        {
+          "symbol": "__recvfrom",
+          "image": "libsystem_kernel.dylib",
+          "samples": 17
+        },
+        {
+          "symbol": "_xzm_xzone_malloc_tiny",
+          "image": "libsystem_malloc.dylib",
+          "samples": 17
+        },
+        {
+          "symbol": "writev",
+          "image": "libsystem_kernel.dylib",
+          "samples": 17
+        },
+        {
+          "symbol": "_platform_memmove",
+          "image": "libsystem_platform.dylib",
+          "samples": 16
+        },
+        {
+          "symbol": "fsync",
+          "image": "libsystem_kernel.dylib",
+          "samples": 16
+        },
+        {
+          "symbol": "lstat",
+          "image": "libsystem_kernel.dylib",
+          "samples": 14
+        },
+        {
+          "symbol": "__gettimeofday",
+          "image": "libsystem_kernel.dylib",
+          "samples": 13
+        }
+      ],
+      "observed_paths": [
+        "object_store::local::open_file",
+        "slatedb::merge_iterator",
+        "slatedb_etcd::node::transport",
+        "serde_json::de::from_slice"
+      ]
+    },
+    {
+      "profile": "cpu-optimized-write-3",
+      "quota_scan_call_graph_site_counts": [],
+      "top_stack_samples": [
+        {
+          "symbol": "__psynch_cvwait",
+          "image": "libsystem_kernel.dylib",
+          "samples": 8736
+        },
+        {
+          "symbol": "semaphore_timedwait_trap",
+          "image": "libsystem_kernel.dylib",
+          "samples": 781
+        },
+        {
+          "symbol": "kevent",
+          "image": "libsystem_kernel.dylib",
+          "samples": 715
+        },
+        {
+          "symbol": "__open",
+          "image": "libsystem_kernel.dylib",
+          "samples": 146
+        },
+        {
+          "symbol": "__psynch_cvsignal",
+          "image": "libsystem_kernel.dylib",
+          "samples": 52
+        },
+        {
+          "symbol": "__open_nocancel",
+          "image": "libsystem_kernel.dylib",
+          "samples": 34
+        },
+        {
+          "symbol": "close",
+          "image": "libsystem_kernel.dylib",
+          "samples": 33
+        },
+        {
+          "symbol": "fsync",
+          "image": "libsystem_kernel.dylib",
+          "samples": 23
+        },
+        {
+          "symbol": "writev",
+          "image": "libsystem_kernel.dylib",
+          "samples": 18
+        },
+        {
+          "symbol": "__recvfrom",
+          "image": "libsystem_kernel.dylib",
+          "samples": 17
+        },
+        {
+          "symbol": "flatbuffers::verifier::append_trace",
+          "image": "slatedb-etcd-optimized",
+          "samples": 17
+        },
+        {
+          "symbol": "mach_absolute_time",
+          "image": "libsystem_kernel.dylib",
+          "samples": 15
+        },
+        {
+          "symbol": "pwrite",
+          "image": "libsystem_kernel.dylib",
+          "samples": 14
+        },
+        {
+          "symbol": "__getdirentries64",
+          "image": "libsystem_kernel.dylib",
+          "samples": 13
+        },
+        {
+          "symbol": "_xzm_free_main",
+          "image": "libsystem_malloc.dylib",
+          "samples": 13
+        }
+      ],
+      "observed_paths": [
+        "object_store::local::open_file",
+        "slatedb::merge_iterator",
+        "slatedb_etcd::node::transport",
+        "serde_json::de::from_slice"
+      ]
+    },
+    {
+      "profile": "cpu-cached-read-1",
+      "quota_scan_call_graph_site_counts": [],
+      "top_stack_samples": [
+        {
+          "symbol": "__psynch_cvwait",
+          "image": "libsystem_kernel.dylib",
+          "samples": 20696
+        },
+        {
+          "symbol": "semaphore_timedwait_trap",
+          "image": "libsystem_kernel.dylib",
+          "samples": 1638
+        },
+        {
+          "symbol": "kevent",
+          "image": "libsystem_kernel.dylib",
+          "samples": 1383
+        },
+        {
+          "symbol": "__open_nocancel",
+          "image": "libsystem_kernel.dylib",
+          "samples": 179
+        },
+        {
+          "symbol": "__recvfrom",
+          "image": "libsystem_kernel.dylib",
+          "samples": 63
+        },
+        {
+          "symbol": "__getdirentries64",
+          "image": "libsystem_kernel.dylib",
+          "samples": 53
+        },
+        {
+          "symbol": "writev",
+          "image": "libsystem_kernel.dylib",
+          "samples": 47
+        },
+        {
+          "symbol": "__psynch_cvsignal",
+          "image": "libsystem_kernel.dylib",
+          "samples": 36
+        },
+        {
+          "symbol": "__close_nocancel",
+          "image": "libsystem_kernel.dylib",
+          "samples": 27
+        },
+        {
+          "symbol": "_xzm_xzone_malloc_tiny",
+          "image": "libsystem_malloc.dylib",
+          "samples": 21
+        },
+        {
+          "symbol": "mach_absolute_time",
+          "image": "libsystem_kernel.dylib",
+          "samples": 18
+        },
+        {
+          "symbol": "_xzm_free_main",
+          "image": "libsystem_malloc.dylib",
+          "samples": 16
+        },
+        {
+          "symbol": "lstat",
+          "image": "libsystem_kernel.dylib",
+          "samples": 15
+        },
+        {
+          "symbol": "_platform_memmove",
+          "image": "libsystem_platform.dylib",
+          "samples": 11
+        },
+        {
+          "symbol": "fstatfs",
+          "image": "libsystem_kernel.dylib",
+          "samples": 9
+        }
+      ],
+      "observed_paths": [
+        "object_store::local::open_file",
+        "slatedb_etcd::node::transport",
+        "moka::future"
+      ]
+    },
+    {
+      "profile": "cpu-cached-read-2",
+      "quota_scan_call_graph_site_counts": [],
+      "top_stack_samples": [
+        {
+          "symbol": "__psynch_cvwait",
+          "image": "libsystem_kernel.dylib",
+          "samples": 20927
+        },
+        {
+          "symbol": "semaphore_timedwait_trap",
+          "image": "libsystem_kernel.dylib",
+          "samples": 1649
+        },
+        {
+          "symbol": "kevent",
+          "image": "libsystem_kernel.dylib",
+          "samples": 1421
+        },
+        {
+          "symbol": "__open_nocancel",
+          "image": "libsystem_kernel.dylib",
+          "samples": 130
+        },
+        {
+          "symbol": "__recvfrom",
+          "image": "libsystem_kernel.dylib",
+          "samples": 59
+        },
+        {
+          "symbol": "__psynch_cvsignal",
+          "image": "libsystem_kernel.dylib",
+          "samples": 57
+        },
+        {
+          "symbol": "writev",
+          "image": "libsystem_kernel.dylib",
+          "samples": 45
+        },
+        {
+          "symbol": "__getdirentries64",
+          "image": "libsystem_kernel.dylib",
+          "samples": 37
+        },
+        {
+          "symbol": "__close_nocancel",
+          "image": "libsystem_kernel.dylib",
+          "samples": 23
+        },
+        {
+          "symbol": "lstat",
+          "image": "libsystem_kernel.dylib",
+          "samples": 21
+        },
+        {
+          "symbol": "_platform_memmove",
+          "image": "libsystem_platform.dylib",
+          "samples": 14
+        },
+        {
+          "symbol": "_xzm_xzone_malloc_tiny",
+          "image": "libsystem_malloc.dylib",
+          "samples": 13
+        },
+        {
+          "symbol": "mach_absolute_time",
+          "image": "libsystem_kernel.dylib",
+          "samples": 12
+        },
+        {
+          "symbol": "fstatfs",
+          "image": "libsystem_kernel.dylib",
+          "samples": 7
+        },
+        {
+          "symbol": "_xzm_free_main",
+          "image": "libsystem_malloc.dylib",
+          "samples": 6
+        }
+      ],
+      "observed_paths": [
+        "object_store::local::open_file",
+        "slatedb_etcd::node::transport",
+        "moka::future"
+      ]
+    },
+    {
+      "profile": "cpu-cached-read-3",
+      "quota_scan_call_graph_site_counts": [],
+      "top_stack_samples": [
+        {
+          "symbol": "__psynch_cvwait",
+          "image": "libsystem_kernel.dylib",
+          "samples": 20943
+        },
+        {
+          "symbol": "semaphore_timedwait_trap",
+          "image": "libsystem_kernel.dylib",
+          "samples": 1667
+        },
+        {
+          "symbol": "kevent",
+          "image": "libsystem_kernel.dylib",
+          "samples": 1317
+        },
+        {
+          "symbol": "__open_nocancel",
+          "image": "libsystem_kernel.dylib",
+          "samples": 186
+        },
+        {
+          "symbol": "__recvfrom",
+          "image": "libsystem_kernel.dylib",
+          "samples": 105
+        },
+        {
+          "symbol": "__psynch_cvsignal",
+          "image": "libsystem_kernel.dylib",
+          "samples": 67
+        },
+        {
+          "symbol": "writev",
+          "image": "libsystem_kernel.dylib",
+          "samples": 64
+        },
+        {
+          "symbol": "__getdirentries64",
+          "image": "libsystem_kernel.dylib",
+          "samples": 46
+        },
+        {
+          "symbol": "_xzm_xzone_malloc_tiny",
+          "image": "libsystem_malloc.dylib",
+          "samples": 31
+        },
+        {
+          "symbol": "__close_nocancel",
+          "image": "libsystem_kernel.dylib",
+          "samples": 24
+        },
+        {
+          "symbol": "_xzm_free_main",
+          "image": "libsystem_malloc.dylib",
+          "samples": 23
+        },
+        {
+          "symbol": "lstat",
+          "image": "libsystem_kernel.dylib",
+          "samples": 22
+        },
+        {
+          "symbol": "mach_absolute_time",
+          "image": "libsystem_kernel.dylib",
+          "samples": 19
+        },
+        {
+          "symbol": "<deduplicated_symbol>",
+          "image": "libsystem_malloc.dylib",
+          "samples": 12
+        },
+        {
+          "symbol": "_$LT$core..future..poll_fn..PollFn$LT$F$GT$$u20$as$u20$core..future..future..Future$GT$::poll",
+          "image": "slatedb-etcd-cached",
+          "samples": 12
+        }
+      ],
+      "observed_paths": [
+        "slatedb_etcd::node::transport",
+        "moka::future"
+      ]
+    }
+  ],
+  "cached_probe": {
+    "source": "03eba4f",
+    "keys": 1000,
+    "concurrency": 8,
+    "read_requests": 100000
+  }
+}

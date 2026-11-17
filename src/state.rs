@@ -2,12 +2,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::WriteBatch;
 use anyhow::{ensure, Context, Result};
 use raft::eraftpb::Snapshot;
 use serde::{Deserialize, Serialize};
 use slatedb::config::{Settings, WriteOptions};
+use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::object_store::local::LocalFileSystem;
-use slatedb::{Db, WriteBatch};
+use slatedb::Db;
 
 use crate::mvcc::{self, Outcome};
 use crate::proto::etcdserverpb::{CompactionRequest, CompactionResponse, RequestOp};
@@ -15,6 +17,8 @@ use crate::{Command, Operation, Reply};
 
 mod backup;
 pub(crate) mod maintenance;
+#[cfg(test)]
+mod quota_tests;
 
 const APPLIED: &[u8] = b"meta/applied";
 const DATA: &[u8] = b"data/";
@@ -32,6 +36,7 @@ pub struct StateMachine {
     pub members: crate::cluster::Store,
     admin: slatedb::admin::Admin,
     pub quota: u64,
+    logical_bytes: u64,
     pub alarms: Vec<crate::proto::etcdserverpb::AlarmMember>,
     pub applied: u64,
     pub durable_applied: u64,
@@ -67,7 +72,14 @@ impl StateMachine {
             }
         }
         let admin = slatedb::admin::Admin::builder(prefix, object_store.clone()).build();
+        // Keep state cache weights separate from Raft log memory budgets.
+        let cache = MokaCache::new_with_opts(MokaCacheOptions {
+            max_capacity: 64 * 1024 * 1024,
+            time_to_live: None,
+            time_to_idle: None,
+        });
         let db = Db::builder(prefix, object_store)
+            .with_db_cache(Arc::new(cache), 0)
             .with_settings(settings)
             .build()
             .await?;
@@ -106,6 +118,7 @@ impl StateMachine {
                 members,
                 admin,
                 quota: 0,
+                logical_bytes: maintenance::count_logical_size(&db).await?,
                 alarms,
                 auth,
                 db: Arc::clone(&db),
@@ -123,6 +136,15 @@ impl StateMachine {
                 .await;
         }
         result
+    }
+
+    async fn write_batch(&mut self, batch: WriteBatch, index: u64) -> Result<()> {
+        let size = batch.logical_size(&self.db, self.logical_bytes).await?;
+        self.db
+            .write_with_options(batch.into_storage(), &WriteOptions { seqnum: index })
+            .await?;
+        self.logical_bytes = size;
+        Ok(())
     }
 
     pub(crate) async fn close(&self) -> Result<()> {
@@ -172,9 +194,7 @@ impl StateMachine {
         let mut batch = WriteBatch::new();
         batch.put(crate::cluster::KEY, serde_json::to_vec(&members)?);
         batch.put(APPLIED, index.to_be_bytes());
-        self.db
-            .write_with_options(batch, &WriteOptions { seqnum: index })
-            .await?;
+        self.write_batch(batch, index).await?;
         self.members = members;
         self.applied = index;
         Ok(Outcome { result })
@@ -194,9 +214,7 @@ impl StateMachine {
             batch.put(crate::auth::KEY, serde_json::to_vec(&next)?);
         }
         batch.put(APPLIED, index.to_be_bytes());
-        self.db
-            .write_with_options(batch, &WriteOptions { seqnum: index })
-            .await?;
+        self.write_batch(batch, index).await?;
         self.applied = index;
         if result.is_ok() {
             self.auth = next;
@@ -327,9 +345,7 @@ impl StateMachine {
         }
         batch.put(APPLIED, index.to_be_bytes());
         // Raft already made this command durable. Waiting for SlateDB here would wait for L0.
-        self.db
-            .write_with_options(batch, &WriteOptions { seqnum: index })
-            .await?;
+        self.write_batch(batch, index).await?;
         self.applied = index;
         Ok(Reply { index, values })
     }
@@ -370,7 +386,7 @@ impl StateMachine {
         let corrupt = self.alarms.iter().any(|a| a.alarm == 2);
         let full = crate::maintenance::has_put(request)
             && (self.alarms.iter().any(|a| a.alarm == 1)
-                || (self.quota > 0 && self.logical_size().await? >= self.quota));
+                || (self.quota > 0 && self.logical_size() >= self.quota));
         if corrupt || full {
             let mut batch = WriteBatch::new();
             if full && !self.alarms.iter().any(|a| a.alarm == 1) {
@@ -384,9 +400,7 @@ impl StateMachine {
                 serde_json::to_vec(&self.alarms)?,
             );
             batch.put(APPLIED, index.to_be_bytes());
-            self.db
-                .write_with_options(batch, &WriteOptions { seqnum: index })
-                .await?;
+            self.write_batch(batch, index).await?;
             self.applied = index;
             return Ok(Outcome {
                 result: Err(if corrupt {
@@ -427,9 +441,7 @@ impl StateMachine {
             }
         };
         batch.put(APPLIED, index.to_be_bytes());
-        self.db
-            .write_with_options(batch, &WriteOptions { seqnum: index })
-            .await?;
+        self.write_batch(batch, index).await?;
         self.applied = index;
         self.revision = revision;
         Ok(Outcome { result })
@@ -476,9 +488,7 @@ impl StateMachine {
         }
         crate::failpoint::hit("compact-before-apply");
         batch.put(APPLIED, index.to_be_bytes());
-        self.db
-            .write_with_options(batch, &WriteOptions { seqnum: index })
-            .await?;
+        self.write_batch(batch, index).await?;
         self.applied = index;
         if result.is_ok() {
             self.compact_revision = request.revision;
@@ -521,7 +531,7 @@ impl StateMachine {
             );
         let full = matches!(command, L::Grant { .. })
             && (self.alarms.iter().any(|a| a.alarm == 1)
-                || (self.quota > 0 && self.logical_size().await? >= self.quota));
+                || (self.quota > 0 && self.logical_size() >= self.quota));
         if corrupt || full {
             if full && !self.alarms.iter().any(|a| a.alarm == 1) {
                 self.alarms.push(crate::proto::etcdserverpb::AlarmMember {
@@ -535,9 +545,7 @@ impl StateMachine {
                 serde_json::to_vec(&self.alarms)?,
             );
             batch.put(APPLIED, index.to_be_bytes());
-            self.db
-                .write_with_options(batch, &WriteOptions { seqnum: index })
-                .await?;
+            self.write_batch(batch, index).await?;
             self.applied = index;
             return Ok(Outcome {
                 result: Err(if corrupt {
@@ -571,9 +579,7 @@ impl StateMachine {
             }
         };
         batch.put(APPLIED, index.to_be_bytes());
-        self.db
-            .write_with_options(batch, &WriteOptions { seqnum: index })
-            .await?;
+        self.write_batch(batch, index).await?;
         self.applied = index;
         self.revision = revision;
         if let Some((id, record)) = change {
@@ -637,7 +643,7 @@ impl StateMachine {
         }
         let data: SnapshotData = bincode::deserialize(snapshot.get_data())?;
         ensure!(
-            (data.version == 1 || data.version == 2) && data.applied == index,
+            data.version == 2 && data.applied == index,
             "invalid snapshot metadata"
         );
         let mut batch = WriteBatch::new();
@@ -654,9 +660,7 @@ impl StateMachine {
         }
         crate::failpoint::hit("snapshot-before-install");
         batch.put(APPLIED, index.to_be_bytes());
-        self.db
-            .write_with_options(batch, &WriteOptions { seqnum: index })
-            .await?;
+        self.write_batch(batch, index).await?;
         crate::failpoint::hit("snapshot-after-install-write");
         // The durable Raft snapshot lets a restart repeat this atomic replacement.
         self.db.flush().await?;
@@ -1075,52 +1079,5 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
-    }
-
-    #[tokio::test]
-    async fn legacy_state_rejects_missing_watch_history_and_records_new_events() {
-        use crate::proto::etcdserverpb::WatchCreateRequest;
-        let dir = tempfile::tempdir().unwrap();
-        let mut state = StateMachine::open(dir.path()).await.unwrap();
-        state
-            .apply_etcd(1, &put(b"key", b"old"))
-            .await
-            .unwrap()
-            .result
-            .unwrap();
-        // Remove the journal to reproduce a database from a binary without Watch.
-        let mut batch = WriteBatch::new();
-        batch.delete(b"etcd/watch-floor");
-        batch.delete([b"etcd/events/".as_slice(), &2_i64.to_be_bytes()].concat());
-        batch.put(APPLIED, 2_u64.to_be_bytes());
-        state
-            .db
-            .write_with_options(batch, &WriteOptions { seqnum: 2 })
-            .await
-            .unwrap();
-        state.applied = 2;
-        let mut request = WatchCreateRequest {
-            key: b"key".to_vec(),
-            start_revision: 1,
-            prev_kv: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            state.watch(&request, None).await.unwrap().compact_revision,
-            3
-        );
-        state
-            .apply_etcd(3, &put(b"key", b"new"))
-            .await
-            .unwrap()
-            .result
-            .unwrap();
-        request.start_revision = 3;
-        let page = state.watch(&request, None).await.unwrap();
-        assert_eq!(page.compact_revision, 0);
-        assert_eq!(
-            page.responses[0].events[0].prev_kv.as_ref().unwrap().value,
-            b"old"
-        );
     }
 }

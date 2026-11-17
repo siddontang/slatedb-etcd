@@ -86,7 +86,7 @@ Raw logs and generated data stay outside tracked reports.
 - [Operations](docs/operations.md): health, shutdown, disk use, and recovery diagnosis.
 - [Implementation notes](docs/internals.md): current MVCC, Watch, Lease, and log behavior.
 - [Diagnostic APIs](docs/diagnostics.md): trusted local controls and fault injection.
-- [Benchmarks](docs/benchmarks.md): local JSON measurements and their limits.
+- [Benchmarks](docs/benchmarks.md): gRPC comparisons, resource measurements, and limits.
 - [Contributing](CONTRIBUTING.md): repository layout, checks, and upstream test imports.
 - [Security](SECURITY.md): trust boundaries and private issue reporting.
 

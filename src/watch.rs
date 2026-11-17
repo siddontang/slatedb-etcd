@@ -1,46 +1,19 @@
+use crate::WriteBatch;
 use serde::{Deserialize, Serialize};
-use slatedb::{Db, WriteBatch};
+use slatedb::Db;
 
 use crate::mvcc::{self, KvError};
 use crate::proto::etcdserverpb::{ResponseHeader, WatchCreateRequest, WatchResponse};
 use crate::proto::mvccpb::Event;
 
 const EVENTS: &[u8] = b"etcd/events/";
-const FLOOR: &[u8] = b"etcd/watch-floor";
 
 fn key(revision: i64) -> Vec<u8> {
     [EVENTS, &revision.to_be_bytes()].concat()
 }
 
-pub async fn floor(db: &Db, revision: i64) -> Result<i64, KvError> {
-    match db.get(FLOOR).await.map_err(KvError::storage)? {
-        Some(value) => Ok(i64::from_be_bytes(
-            value.as_ref().try_into().map_err(KvError::storage)?,
-        )),
-        // Older binaries did not record event order or previous values.
-        None => Ok(if revision > 1 { revision + 1 } else { 1 }),
-    }
-}
-
-pub async fn record(
-    db: &Db,
-    previous: i64,
-    revision: i64,
-    events: &[Event],
-    batch: &mut WriteBatch,
-) -> Result<(), KvError> {
-    if db.get(FLOOR).await.map_err(KvError::storage)?.is_none() {
-        batch.put(FLOOR, floor(db, previous).await?.to_be_bytes());
-    }
-    if db
-        .get(b"etcd/hash-origin")
-        .await
-        .map_err(KvError::storage)?
-        .is_none()
-    {
-        batch.put(b"etcd/hash-origin", previous.to_be_bytes());
-    }
-    crate::state::maintenance::record_hash(revision, events, batch).await;
+pub fn record(revision: i64, events: &[Event], batch: &mut WriteBatch) -> Result<(), KvError> {
+    crate::state::maintenance::record_hash(revision, events, batch);
     if !events.is_empty() {
         batch.put(
             key(revision),
@@ -85,9 +58,8 @@ pub async fn read(
     if request.start_revision <= 0 {
         return Ok(page);
     }
-    let floor = floor(db, current).await?.max(compact_revision);
-    if request.start_revision < floor {
-        page.compact_revision = floor;
+    if request.start_revision < compact_revision {
+        page.compact_revision = compact_revision;
         return Ok(page);
     }
     if request.start_revision > current {

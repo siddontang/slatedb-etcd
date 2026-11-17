@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::WriteBatch;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use slatedb::{Db, WriteBatch};
+use slatedb::Db;
 use tonic::{Code, Status};
 
 use crate::proto::etcdserverpb::request_op::Request as Op;
@@ -566,7 +567,7 @@ pub async fn prepare(
     let response = view.execute(plan, false).await?;
     let next = view.current_revision();
     let mut batch = WriteBatch::new();
-    crate::watch::record(db, revision, next, &view.events, &mut batch).await?;
+    crate::watch::record(next, &view.events, &mut batch)?;
     for (key, value) in view.changes {
         if let Some(value) = &value {
             batch.put(current_key(&key), value.encode_to_vec());
@@ -711,7 +712,7 @@ pub(crate) async fn revoke_keys(
             .map_err(KvError::storage)?,
         );
     }
-    crate::watch::record(db, revision, next, &view.events, &mut batch).await?;
+    crate::watch::record(next, &view.events, &mut batch)?;
     batch.put(REVISION, next.to_be_bytes());
     Ok((batch, next))
 }

@@ -39,6 +39,7 @@ jobs:
         run: |
           python3 scripts/check-public.py
           python3 scripts/test_reporting.py
+          python3 scripts/test_benchmark.py
           python3 scripts/test_history.py
           python3 scripts/check-history.py
           python3 scripts/test_secret_scan.py
@@ -87,6 +88,11 @@ jobs:
           scripts/cargo.sh test --locked -- --skip seeded_fault_schedules_replay_identically
           python3 scripts/check-dst.py --seeds "$SLATEDB_DST_SEEDS" --output results/ci/dst.json
           scripts/cargo.sh build --locked --release
+      - name: Compare gRPC performance on Linux
+        run: |
+          python3 scripts/benchmark-etcd.py --requests 2000 --read-requests 30000 \
+            --keys 1000 --value-size 256 --concurrency 8 --read-percent 0 50 100 \
+            --warmup 200 --repeat 3 --output results/ci/benchmark-linux.json
       - name: Check etcd compatibility and recovery
         run: |
           python3 scripts/check-compat.py --output results/ci/etcd-compatibility.json
@@ -102,10 +108,6 @@ jobs:
           scripts/cargo.sh build --locked --release --features fault-injection
           python3 scripts/check-compat.py --tags failpoints --run '^TestFailpointRecovery$' \
             --output results/ci/failpoints.json
-      - name: Check the comparative benchmark driver
-        run: |
-          python3 scripts/benchmark-etcd.py --requests 50 --keys 10 --concurrency 2 \
-            --read-percent 50 --output results/ci/benchmark-smoke.json
       - name: Check process faults with etcd and Jepsen models
         run: |
           python3 scripts/check-jepsen.py --self-test

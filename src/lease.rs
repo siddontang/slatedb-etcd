@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
+use crate::WriteBatch;
 use serde::{Deserialize, Serialize};
-use slatedb::{Db, WriteBatch};
+use slatedb::Db;
 use tonic::Code;
 
 use crate::mvcc::{self, KvError};
