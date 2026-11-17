@@ -182,6 +182,7 @@ impl Node {
             self.options.peers = peers;
             return;
         }
+        while self.transports.try_join_next().is_some() {}
         self.senders.retain(|id, _| peers.contains_key(id));
         for (&id, address) in &peers {
             if id == self.options.id {
@@ -198,7 +199,7 @@ impl Node {
             let (tx, rx) = mpsc::channel(256);
             self.senders.insert(id, tx);
             self.peer_health.remove(&id);
-            tokio::spawn(transport(
+            self.transports.spawn(transport(
                 id,
                 address.clone(),
                 self.options.cluster_id.clone(),

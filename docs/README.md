@@ -6,6 +6,7 @@ Commands use the repository root unless a guide states otherwise.
 | Task | Guide |
 | --- | --- |
 | Build and run a local service | [Quick start](getting-started.md) |
+| Embed a member in a Rust program | [Embedding](embedding.md) |
 | Select flags and memory limits | [Configuration](configuration.md) |
 | Enable Auth, TLS, and member changes | [Administration](administration.md) |
 | Check health, disk use, and recovery | [Operations](operations.md) |

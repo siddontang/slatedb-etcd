@@ -139,6 +139,7 @@ pub(super) struct Worker {
     work: mpsc::Sender<Work>,
     done: mpsc::Receiver<Result<Completion>>,
     stop: Arc<(Mutex<bool>, Condvar)>,
+    task: Option<std::thread::JoinHandle<()>>,
     #[cfg(test)]
     manual: Option<(Executor, mpsc::Receiver<Work>)>,
 }
@@ -162,12 +163,13 @@ impl Worker {
                 work,
                 done,
                 stop,
+                task: None,
                 manual: Some((executor, jobs)),
             });
         }
         assert!(!manual);
         let shutdown = Arc::clone(&stop);
-        std::thread::Builder::new()
+        let task = std::thread::Builder::new()
             .name("raft-log-io".into())
             .spawn(move || {
                 while let Some(work) = jobs.blocking_recv() {
@@ -196,10 +198,24 @@ impl Worker {
             work,
             done,
             stop,
+            task: Some(task),
             #[cfg(test)]
             manual: None,
         })
     }
+    pub async fn shutdown(&mut self) -> Result<()> {
+        *self.stop.0.lock().unwrap() = true;
+        self.stop.1.notify_all();
+        self.done.close();
+        self.work = mpsc::channel(1).0;
+        if let Some(task) = self.task.take() {
+            tokio::task::spawn_blocking(move || task.join())
+                .await?
+                .map_err(|_| anyhow::anyhow!("log worker panicked"))?;
+        }
+        Ok(())
+    }
+
     pub fn submit(&self, work: Work) -> Result<()> {
         self.work
             .try_send(work)

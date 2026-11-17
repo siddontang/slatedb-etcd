@@ -151,20 +151,45 @@ pub async fn serve(
     app: Router,
     tls: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<()> {
-    let Some(config) = tls else {
-        return axum::serve(listener, app).await.map_err(Into::into);
-    };
-    let acceptor = tokio_rustls::TlsAcceptor::from(config);
+    serve_until(listener, app, tls, std::future::pending()).await
+}
+
+pub(crate) async fn serve_until(
+    listener: TcpListener,
+    app: Router,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<()> {
+    let acceptor = tls.map(tokio_rustls::TlsAcceptor::from);
     let permits = Arc::new(tokio::sync::Semaphore::new(1024));
-    loop {
-        let (stream, _) = listener.accept().await?;
+    let mut connections = tokio::task::JoinSet::new();
+    tokio::pin!(stop);
+    let result = loop {
+        let incoming = tokio::select! {
+            _ = &mut stop => break Ok(()),
+            _ = connections.join_next(), if !connections.is_empty() => continue,
+            incoming = listener.accept() => incoming,
+        };
+        let (stream, _) = match incoming {
+            Ok(incoming) => incoming,
+            Err(error) => break Err(error.into()),
+        };
         let Ok(permit) = permits.clone().try_acquire_owned() else {
             continue;
         };
         let acceptor = acceptor.clone();
         let app = app.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let _permit = permit;
+            let Some(acceptor) = acceptor else {
+                let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                    .serve_connection_with_upgrades(
+                        TokioIo::new(stream),
+                        TowerToHyperService::new(app),
+                    )
+                    .await;
+                return;
+            };
             let stream =
                 match tokio::time::timeout(Duration::from_secs(5), acceptor.accept(stream)).await {
                     Ok(Ok(stream)) => stream,
@@ -193,7 +218,10 @@ pub async fn serve(
                 .serve_connection_with_upgrades(TokioIo::new(stream), TowerToHyperService::new(app))
                 .await;
         });
-    }
+    };
+    drop(listener);
+    connections.shutdown().await;
+    result
 }
 
 #[cfg(test)]

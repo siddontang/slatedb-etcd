@@ -158,8 +158,19 @@ func TestThreeVirtualMachines(t *testing.T) {
 		}
 		return value, err
 	}
-	written, err := api.Put(ctx, "anchor", "acknowledged")
-	require.NoError(t, err)
+	type acknowledgedWrite struct {
+		key, value string
+		revision   int64
+	}
+	var acknowledged []acknowledgedWrite
+	write := func(c *clientv3.Client, call context.Context, key, value string) error {
+		result, err := c.Put(call, key, value)
+		if err == nil {
+			acknowledged = append(acknowledged, acknowledgedWrite{key, value, result.Header.Revision})
+		}
+		return err
+	}
+	require.NoError(t, write(api, ctx, "anchor", "acknowledged"))
 	verify := func() {
 		for _, endpoint := range endpoints {
 			c := newClient([]string{endpoint}, clientTLS.config)
@@ -167,9 +178,15 @@ func TestThreeVirtualMachines(t *testing.T) {
 				call, cancel := context.WithTimeout(ctx, time.Second)
 				defer cancel()
 				result, err := c.Get(call, "anchor")
-				return err == nil && len(result.Kvs) == 1 && string(result.Kvs[0].Value) == "acknowledged" &&
-					result.Header.Revision >= written.Header.Revision
+				return err == nil && result.Header.Revision >= acknowledged[len(acknowledged)-1].revision
 			}, 30*time.Second, 100*time.Millisecond)
+			for _, written := range acknowledged {
+				result, err := c.Get(ctx, written.key, clientv3.WithRev(written.revision))
+				require.NoError(t, err)
+				require.Len(t, result.Kvs, 1)
+				require.Equal(t, written.value, string(result.Kvs[0].Value))
+				require.Equal(t, written.revision, result.Kvs[0].ModRevision)
+			}
 		}
 	}
 	verify()
@@ -193,8 +210,7 @@ func TestThreeVirtualMachines(t *testing.T) {
 		require.Eventually(t, func() bool {
 			call, cancel := context.WithTimeout(ctx, time.Second)
 			defer cancel()
-			_, err := healthy.Put(call, "after-failover", "available")
-			return err == nil
+			return write(healthy, call, "after-failover", "available") == nil
 		}, 20*time.Second, 100*time.Millisecond)
 		run("start", "--yes", names[old])
 		tunnel(old)
@@ -216,12 +232,11 @@ func TestThreeVirtualMachines(t *testing.T) {
 			}
 		}()
 		majority := newClient([]string{endpoints[(isolated+1)%3], endpoints[(isolated+2)%3]}, clientTLS.config)
-		_, err := majority.Put(ctx, "partition", "majority")
-		require.NoError(t, err)
+		require.NoError(t, write(majority, ctx, "partition", "majority"))
 		minority := newClient([]string{endpoints[isolated]}, clientTLS.config)
 		call, cancel := context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
-		_, err = minority.Get(call, "partition")
+		_, err := minority.Get(call, "partition")
 		require.Error(t, err)
 	}) {
 		return
@@ -236,8 +251,7 @@ func TestThreeVirtualMachines(t *testing.T) {
 		checkpoint := make(chan error, 1)
 		go func() { _, err := diagnostic(follower, "/checkpoint"); checkpoint <- err }()
 		for i := 0; i < 20; i++ {
-			_, err := api.Put(ctx, "bulk", strconv.Itoa(i))
-			require.NoError(t, err)
+			require.NoError(t, write(api, ctx, "bulk", strconv.Itoa(i)))
 		}
 		current, err := diagnostic(follower, "/status")
 		require.NoError(t, err)
@@ -247,8 +261,7 @@ func TestThreeVirtualMachines(t *testing.T) {
 		require.Error(t, <-checkpoint)
 		healthy := newClient([]string{endpoints[(follower+1)%3], endpoints[(follower+2)%3]}, clientTLS.config)
 		for i := 0; i < 8; i++ {
-			_, err := healthy.Put(ctx, "offline", strconv.Itoa(i))
-			require.NoError(t, err)
+			require.NoError(t, write(healthy, ctx, "offline", strconv.Itoa(i)))
 		}
 		for i := range names {
 			if i != follower {

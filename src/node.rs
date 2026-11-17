@@ -136,6 +136,7 @@ pub struct Node {
     apply_delay_ms: u64,
     options: NodeOptions,
     senders: BTreeMap<u64, mpsc::Sender<Message>>,
+    transports: tokio::task::JoinSet<()>,
     pending: HashMap<String, Pending>,
     blocked: BTreeSet<u64>,
     installed_snapshots: u64,
@@ -246,6 +247,7 @@ impl Node {
         let logger = slog::Logger::root(slog::Discard, slog::o!());
         let raw = RawNode::new(&config, cache, &logger)?;
         let manual_apply = transport_override.is_some();
+        let mut transports = tokio::task::JoinSet::new();
         let senders = if let Some(senders) = transport_override {
             senders
         } else {
@@ -256,7 +258,7 @@ impl Node {
                 }
                 let (tx, rx) = mpsc::channel(256);
                 senders.insert(peer, tx);
-                tokio::spawn(transport(
+                transports.spawn(transport(
                     peer,
                     address.clone(),
                     options.cluster_id.clone(),
@@ -302,6 +304,7 @@ impl Node {
             apply_delay_ms: 0,
             options,
             senders,
+            transports,
             pending: HashMap::new(),
             blocked: BTreeSet::new(),
             installed_snapshots: 0,
@@ -318,7 +321,27 @@ impl Node {
         Ok(node)
     }
 
-    pub async fn run(mut self, mut events: mpsc::Receiver<Event>) -> Result<()> {
+    pub async fn run(self, events: mpsc::Receiver<Event>) -> Result<()> {
+        self.run_until(events, std::future::pending()).await
+    }
+
+    pub(crate) async fn run_until(
+        mut self,
+        events: mpsc::Receiver<Event>,
+        stop: impl std::future::Future<Output = ()>,
+    ) -> Result<()> {
+        let result = tokio::select! {
+            result = self.run_loop(events) => result,
+            _ = stop => Ok(()),
+        };
+        self.transports.shutdown().await;
+        // Keep the Raft directory locked until the state worker has stopped.
+        let apply = self.worker.shutdown().await;
+        let log = self.log_worker.shutdown().await;
+        result.and(apply).and(log)
+    }
+
+    async fn run_loop(&mut self, mut events: mpsc::Receiver<Event>) -> Result<()> {
         // Schedule committed log recovery before accepting client work.
         self.drive_ready().await?;
         let mut ticks = tokio::time::interval(Duration::from_millis(100));

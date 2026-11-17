@@ -4,9 +4,8 @@ use std::path::PathBuf;
 
 use anyhow::{ensure, Context, Result};
 use clap::Parser;
-use slatedb_etcd::api::{router, ApiState};
-use slatedb_etcd::node::{LogMemory, Node, NodeOptions};
-use tokio::sync::mpsc;
+use slatedb_etcd::node::LogMemory;
+use slatedb_etcd::server::{Server, ServerConfig};
 
 #[derive(Parser)]
 #[command(about = "Experimental etcd v3 service with Raft and SlateDB")]
@@ -99,151 +98,60 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
-    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
-    let client_tls = slatedb_etcd::tls::Options {
-        cert: args.cert_file.clone(),
-        key: args.key_file.clone(),
-        ca: args.trusted_ca_file.clone(),
-        client_auth: args.client_cert_auth,
-    }
-    .server()?;
-    let peer_options = slatedb_etcd::tls::Options {
-        cert: args.peer_cert_file.clone(),
-        key: args.peer_key_file.clone(),
-        ca: args.peer_trusted_ca_file.clone(),
-        client_auth: args.peer_cert_file.is_some(),
+    let config = ServerConfig {
+        id: args.id,
+        cluster_id: args.cluster_id,
+        dir: args.dir,
+        listen: args.listen,
+        peer_listen: args.peer_listen,
+        peers: parse_peers(args.peers)?,
+        client_peers: parse_peers(args.client_peers)?,
+        allow_remote: args.allow_remote,
+        client_tls: slatedb_etcd::tls::Options {
+            cert: args.cert_file,
+            key: args.key_file,
+            ca: args.trusted_ca_file,
+            client_auth: args.client_cert_auth,
+        },
+        peer_tls: slatedb_etcd::tls::Options {
+            client_auth: args.peer_cert_file.is_some(),
+            cert: args.peer_cert_file,
+            key: args.peer_key_file,
+            ca: args.peer_trusted_ca_file,
+        },
+        object_store: args.object_store.config()?,
+        snapshot_every: args.snapshot_every,
+        log_memory: LogMemory {
+            cache_bytes: args.log_cache_bytes,
+            pending_bytes: args.log_pending_bytes,
+            read_bytes: args.log_read_bytes,
+            term_bytes: args.log_term_bytes,
+        },
+        quota_bytes: args.quota_backend_bytes,
+        auth_token: args.auth_token,
+        strict_reconfiguration: args.strict_reconfig_check,
+        join: args.join,
+        restore_snapshot: args.restore_snapshot,
     };
-    let peer_tls = peer_options.server()?;
-    let transport = peer_options.transport()?;
-    ensure!(
-        args.peer_listen.is_some() || (client_tls.is_none() && peer_tls.is_none()),
-        "TLS requires a separate peer listener"
-    );
-    if args.allow_remote {
-        ensure!(
-            args.peer_listen.is_some()
-                && client_tls.is_some()
-                && args.client_cert_auth
-                && peer_tls.is_some(),
-            "remote mode requires separate listeners and mutual client and peer TLS"
-        );
-    } else {
-        ensure!(
-            args.listen.ip().is_loopback(),
-            "remote listeners require --allow-remote"
-        );
+    let mut server = Server::start(config).await?;
+    tracing::info!(node = args.id, listen = %server.client_addr(), "Node started");
+    tokio::select! {
+        result = server.wait() => result,
+        result = tokio::signal::ctrl_c() => {
+            result?;
+            server.shutdown().await
+        },
     }
-    let mut peers = BTreeMap::new();
-    for peer in args.peers {
-        let (id, address) = peer.split_once('=').context("peer must be ID=IP:PORT")?;
-        let id = id.parse()?;
-        slatedb_etcd::tls::validate_url(address, args.allow_remote, peer_tls.is_some())?;
+}
+
+fn parse_peers(peers: Vec<String>) -> Result<BTreeMap<u64, String>> {
+    let mut result = BTreeMap::new();
+    for peer in peers {
+        let (id, address) = peer.split_once('=').context("peer must be ID=URL")?;
         ensure!(
-            peers.insert(id, address.to_owned()).is_none(),
+            result.insert(id.parse()?, address.to_owned()).is_none(),
             "duplicate peer id"
         );
     }
-    let peer_listen = args.peer_listen.unwrap_or(args.listen);
-    ensure!(
-        args.allow_remote || peer_listen.ip().is_loopback(),
-        "remote peer listeners require --allow-remote"
-    );
-    let own_peer = reqwest::Url::parse(&slatedb_etcd::cluster::url(
-        peers.get(&args.id).context("missing local peer")?,
-    ))?;
-    ensure!(
-        own_peer.port_or_known_default() == Some(peer_listen.port()),
-        "peer listener differs from advertised peer port"
-    );
-    let mut client_peers = BTreeMap::new();
-    for peer in args.client_peers {
-        let (id, address) = peer.split_once('=').context("client peer must be ID=URL")?;
-        slatedb_etcd::tls::validate_url(address, args.allow_remote, client_tls.is_some())?;
-        ensure!(
-            client_peers
-                .insert(id.parse()?, address.to_owned())
-                .is_none(),
-            "duplicate client peer id"
-        );
-    }
-    ensure!(
-        !args.allow_remote || peers.keys().all(|id| client_peers.contains_key(id)),
-        "remote mode requires a client URL for every initial peer"
-    );
-    let listener = tokio::net::TcpListener::bind(args.listen).await?;
-    if let Some(backup) = &args.restore_snapshot {
-        let mut members = slatedb_etcd::cluster::Store::initial(&peers);
-        for (&id, address) in &client_peers {
-            if let Some(member) = members.members.get_mut(&id) {
-                member.client_ur_ls = vec![slatedb_etcd::cluster::url(address)];
-            }
-        }
-        slatedb_etcd::state::StateMachine::restore_backup(
-            backup,
-            &args.dir,
-            args.id,
-            &args.cluster_id,
-            &members,
-        )?;
-    }
-    let (tx, rx) = mpsc::channel(2048);
-    let grpc = slatedb_etcd::grpc::service(
-        args.id,
-        tx.clone(),
-        &peers,
-        slatedb_etcd::auth::TokenIssuer::parse(&args.auth_token)?,
-        transport.clone(),
-    )?;
-    let node = Node::open(
-        NodeOptions {
-            object_store: args.object_store.config()?,
-            require_peer_tls: args.allow_remote,
-            client_peers,
-            transport,
-            strict_reconfiguration: args.strict_reconfig_check,
-            join: args.join,
-            quota_bytes: args.quota_backend_bytes,
-            id: args.id,
-            cluster_id: args.cluster_id.clone(),
-            peers,
-            dir: args.dir,
-            snapshot_every: args.snapshot_every,
-            log_memory: LogMemory {
-                cache_bytes: args.log_cache_bytes,
-                pending_bytes: args.log_pending_bytes,
-                read_bytes: args.log_read_bytes,
-                term_bytes: args.log_term_bytes,
-            },
-        },
-        tx.clone(),
-    )
-    .await?;
-    let diagnostics = router(ApiState {
-        events: tx,
-        cluster_id: args.cluster_id,
-    });
-    let peer_app = diagnostics.clone().fallback_service(
-        grpc.clone()
-            .layer(axum::Extension(slatedb_etcd::tls::PeerServer)),
-    );
-    let app = if args.peer_listen.is_some() {
-        grpc.layer(axum::Extension(slatedb_etcd::tls::ClientServer))
-    } else {
-        diagnostics.fallback_service(grpc)
-    };
-    let peer_server = async {
-        if let Some(address) = args.peer_listen {
-            let listener = tokio::net::TcpListener::bind(address).await?;
-            slatedb_etcd::tls::serve(listener, peer_app, peer_tls).await
-        } else {
-            std::future::pending::<Result<()>>().await
-        }
-    };
-    tracing::info!(node = args.id, listen = %args.listen, "Node started");
-    tokio::select! {
-        result = node.run(rx) => result,
-        result = slatedb_etcd::tls::serve(listener, app, client_tls) => result,
-        result = peer_server => result,
-        result = tokio::signal::ctrl_c() => result.map_err(Into::into),
-    }
+    Ok(result)
 }

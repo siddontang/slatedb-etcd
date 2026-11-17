@@ -42,6 +42,7 @@ for Auth and separate TLS client and peer listeners.
 
 | Area | Implemented behavior |
 | --- | --- |
+| Embedding | Rust configuration, startup, quorum readiness, shutdown, and generated gRPC clients |
 | KV and Txn | Binary data, MVCC, historical reads, nested transactions, and Safe ReadIndex |
 | Watch and Lease | Durable event replay, progress, fragments, keepalive, expiry, and recovery |
 | Auth | Users, roles, range grants, bcrypt passwords, simple tokens, and RS256 JWT |
@@ -79,6 +80,7 @@ Raw logs and generated data stay outside tracked reports.
 ## Project guides
 
 - [Architecture and roadmap](docs/architecture.md): storage rules, execution, and future phases.
+- [Rust embedding](docs/embedding.md): run a member inside an existing application.
 - [Configuration](docs/configuration.md): all server flags and their defaults.
 - [Administration](docs/administration.md): authentication, TLS, membership, and backup restore.
 - [Operations](docs/operations.md): health, shutdown, disk use, and recovery diagnosis.

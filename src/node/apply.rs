@@ -273,7 +273,7 @@ impl Executor {
 pub(super) struct Worker {
     work: mpsc::Sender<Work>,
     completed: mpsc::Receiver<Result<Completion>>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    task: Option<tokio::task::JoinHandle<Result<()>>>,
     #[cfg(test)]
     manual: Option<(Executor, mpsc::Receiver<Work>)>,
 }
@@ -313,6 +313,11 @@ impl Worker {
                     break;
                 }
             }
+            if let Some(task) = executor.snapshot_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            executor.state.close().await
         });
         Self {
             work,
@@ -321,6 +326,15 @@ impl Worker {
             #[cfg(test)]
             manual: None,
         }
+    }
+
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.completed.close();
+        self.work = mpsc::channel(1).0;
+        if let Some(task) = self.task.take() {
+            task.await??;
+        }
+        Ok(())
     }
 
     pub fn submit(&self, work: Work) -> Result<()> {

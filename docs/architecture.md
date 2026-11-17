@@ -15,6 +15,12 @@ Validate correctness before making claims about latency, cost, or deployment rea
 
 The current service has one Raft group, a configurable voter set, and one optional learner.
 It uses `raft-rs`, `raft-engine`, and SlateDB. It does not embed TiKV or use PD.
+
+The CLI and Rust hosts use one `server::Server` lifecycle.
+Startup binds listeners and opens storage.
+Readiness confirms quorum ReadIndex and local apply.
+Shutdown joins workers before releasing storage.
+See [Rust embedding](embedding.md) for the API contract and client examples.
 Each replica keeps its own durable Raft directory and local or S3 object namespace.
 Remote listeners require separate client and peer ports with mutual TLS.
 No replica shares its manifest or SST ownership with another replica.

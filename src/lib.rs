@@ -9,6 +9,7 @@ pub mod mvcc;
 pub mod node;
 pub mod object;
 pub mod proto;
+pub mod server;
 pub mod state;
 pub mod storage;
 pub mod tls;

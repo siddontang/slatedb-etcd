@@ -1,0 +1,348 @@
+//! Start an etcd-compatible member inside an existing Tokio runtime.
+
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::{ensure, Context, Result};
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+
+use crate::api::{router, ApiState};
+use crate::node::{Event, LogMemory, Node, NodeOptions};
+use crate::proto::etcdserverpb::{request_op, RangeRequest, RequestOp};
+
+/// Configuration for one member. Preserve its ID, cluster ID, and directory across restarts.
+#[derive(Clone)]
+pub struct ServerConfig {
+    pub id: u64,
+    pub cluster_id: String,
+    pub dir: PathBuf,
+    pub listen: SocketAddr,
+    pub peer_listen: Option<SocketAddr>,
+    pub peers: BTreeMap<u64, String>,
+    pub client_peers: BTreeMap<u64, String>,
+    pub allow_remote: bool,
+    pub client_tls: crate::tls::Options,
+    pub peer_tls: crate::tls::Options,
+    pub object_store: crate::object::Config,
+    pub snapshot_every: u64,
+    pub log_memory: LogMemory,
+    pub quota_bytes: u64,
+    pub auth_token: String,
+    pub strict_reconfiguration: bool,
+    pub join: bool,
+    pub restore_snapshot: Option<PathBuf>,
+}
+
+impl ServerConfig {
+    /// Create a local, single-member configuration with an assigned loopback port.
+    pub fn single_node(dir: impl Into<PathBuf>) -> Self {
+        let address = "127.0.0.1:0";
+        Self {
+            id: 1,
+            cluster_id: "slatedb-raft-poc".into(),
+            dir: dir.into(),
+            listen: address.parse().unwrap(),
+            peer_listen: None,
+            peers: BTreeMap::from([(1, address.into())]),
+            client_peers: BTreeMap::from([(1, address.into())]),
+            allow_remote: false,
+            client_tls: crate::tls::Options::default(),
+            peer_tls: crate::tls::Options::default(),
+            object_store: crate::object::Config::Local,
+            snapshot_every: 1000,
+            log_memory: LogMemory::default(),
+            quota_bytes: 0,
+            auth_token: "simple".into(),
+            strict_reconfiguration: true,
+            join: false,
+            restore_snapshot: None,
+        }
+    }
+}
+
+/// An owned member. Call `shutdown` and await it before reusing its directory.
+///
+/// Dropping this handle requests shutdown. It cannot wait for background tasks.
+/// The host must keep its Tokio runtime alive until shutdown finishes.
+pub struct Server {
+    config: ServerConfig,
+    events: mpsc::Sender<Event>,
+    stop: watch::Sender<bool>,
+    task: Option<JoinHandle<Result<()>>>,
+}
+
+impl Server {
+    /// Bind all listeners and recover storage. This does not wait for a Raft quorum.
+    ///
+    /// The host owns logging, process signals, and the Tokio runtime.
+    pub async fn start(mut config: ServerConfig) -> Result<Self> {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        config.log_memory.validate()?;
+        ensure!(
+            !config.join || config.restore_snapshot.is_none(),
+            "join cannot restore a snapshot"
+        );
+        ensure!(
+            config.id != 0 && !config.peers.contains_key(&0),
+            "invalid member ID"
+        );
+        let client_tls = config.client_tls.server()?;
+        let peer_tls = config.peer_tls.server()?;
+        let transport = config.peer_tls.transport()?;
+        let tokens = crate::auth::TokenIssuer::parse(&config.auth_token)?;
+        ensure!(
+            config.peer_listen.is_some() || (client_tls.is_none() && peer_tls.is_none()),
+            "TLS requires a separate peer listener"
+        );
+        ensure!(
+            peer_tls.is_none() || config.peer_tls.client_auth,
+            "peer TLS requires mutual authentication"
+        );
+        if config.allow_remote {
+            ensure!(
+                config.peer_listen.is_some()
+                    && client_tls.is_some()
+                    && config.client_tls.client_auth
+                    && peer_tls.is_some(),
+                "remote mode requires separate listeners and mutual client and peer TLS"
+            );
+        }
+        ensure!(
+            config.allow_remote || config.listen.ip().is_loopback(),
+            "remote listeners require allow_remote"
+        );
+        let peer_address = config.peer_listen.unwrap_or(config.listen);
+        ensure!(
+            config.allow_remote || peer_address.ip().is_loopback(),
+            "remote peer listeners require allow_remote"
+        );
+        for address in config.peers.values() {
+            crate::tls::validate_url(address, config.allow_remote, peer_tls.is_some())?;
+        }
+        for address in config.client_peers.values() {
+            crate::tls::validate_url(address, config.allow_remote, client_tls.is_some())?;
+        }
+        ensure!(
+            !config.allow_remote
+                || config
+                    .peers
+                    .keys()
+                    .all(|id| config.client_peers.contains_key(id)),
+            "remote mode requires a client URL for every initial peer"
+        );
+        let own_peer = config.peers.get(&config.id).context("missing local peer")?;
+        let own_peer = reqwest::Url::parse(&crate::cluster::url(own_peer))?;
+        ensure!(
+            own_peer.port_or_known_default() == Some(peer_address.port()),
+            "peer listener differs from advertised peer port"
+        );
+        // Bind both sockets before opening storage or starting any member tasks.
+        let listener = TcpListener::bind(config.listen).await?;
+        config.listen = listener.local_addr()?;
+        let peer_listener = match config.peer_listen {
+            Some(address) => {
+                let listener = TcpListener::bind(address).await?;
+                config.peer_listen = Some(listener.local_addr()?);
+                Some(listener)
+            }
+            None => None,
+        };
+        resolve_port(
+            config.peers.get_mut(&config.id).unwrap(),
+            config.peer_listen.unwrap_or(config.listen),
+        )?;
+        if let Some(address) = config.client_peers.get_mut(&config.id) {
+            resolve_port(address, config.listen)?;
+        }
+        if let Some(backup) = config.restore_snapshot.take() {
+            let mut members = crate::cluster::Store::initial(&config.peers);
+            for (&id, address) in &config.client_peers {
+                if let Some(member) = members.members.get_mut(&id) {
+                    member.client_ur_ls = vec![crate::cluster::url(address)];
+                }
+            }
+            crate::state::StateMachine::restore_backup(
+                &backup,
+                &config.dir,
+                config.id,
+                &config.cluster_id,
+                &members,
+            )?;
+        }
+        let (events, receiver) = mpsc::channel(2048);
+        let grpc = crate::grpc::service(
+            config.id,
+            events.clone(),
+            &config.peers,
+            tokens,
+            transport.clone(),
+        )?;
+        let node = Node::open(
+            NodeOptions {
+                id: config.id,
+                cluster_id: config.cluster_id.clone(),
+                dir: config.dir.clone(),
+                peers: config.peers.clone(),
+                client_peers: config.client_peers.clone(),
+                snapshot_every: config.snapshot_every,
+                log_memory: config.log_memory,
+                quota_bytes: config.quota_bytes,
+                strict_reconfiguration: config.strict_reconfiguration,
+                join: config.join,
+                object_store: config.object_store.clone(),
+                require_peer_tls: config.allow_remote,
+                transport,
+            },
+            events.clone(),
+        )
+        .await?;
+        let diagnostics = router(ApiState {
+            events: events.clone(),
+            cluster_id: config.cluster_id.clone(),
+        });
+        let peer_app = diagnostics
+            .clone()
+            .fallback_service(grpc.clone().layer(axum::Extension(crate::tls::PeerServer)));
+        let client_app = if peer_listener.is_some() {
+            grpc.layer(axum::Extension(crate::tls::ClientServer))
+        } else {
+            diagnostics.fallback_service(grpc)
+        };
+        let (stop, _) = watch::channel(false);
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(node.run_until(receiver, stopped(stop.subscribe())));
+        tasks.spawn(crate::tls::serve_until(
+            listener,
+            client_app,
+            client_tls,
+            stopped(stop.subscribe()),
+        ));
+        if let Some(listener) = peer_listener {
+            tasks.spawn(crate::tls::serve_until(
+                listener,
+                peer_app,
+                peer_tls,
+                stopped(stop.subscribe()),
+            ));
+        }
+        let shutdown = stop.clone();
+        let task = tokio::spawn(async move {
+            let first = tasks.join_next().await.context("server has no tasks")?;
+            shutdown.send_replace(true);
+            let mut result = first.context("server task panicked").and_then(|r| r);
+            while let Some(next) = tasks.join_next().await {
+                result = result.and(next.context("server task panicked").and_then(|r| r));
+            }
+            result
+        });
+        Ok(Self {
+            config,
+            events,
+            stop,
+            task: Some(task),
+        })
+    }
+
+    /// Get the effective configuration, including assigned ports.
+    pub fn config(&self) -> &ServerConfig {
+        &self.config
+    }
+
+    /// Get the bound client socket address.
+    pub fn client_addr(&self) -> SocketAddr {
+        self.config.listen
+    }
+
+    /// Get the bound peer socket address.
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.config.peer_listen.unwrap_or(self.config.listen)
+    }
+
+    /// Get the local client endpoint. Remote hosts must use the advertised client URL.
+    pub fn client_url(&self) -> String {
+        let scheme = if self.config.client_tls.cert.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        format!("{scheme}://{}", self.client_addr())
+    }
+
+    /// Wait for a quorum-confirmed read and local apply progress within the given timeout.
+    ///
+    /// Readiness is a point-in-time result. It does not guarantee future availability.
+    pub async fn wait_ready(&self, timeout: Duration) -> Result<()> {
+        tokio::time::timeout(timeout, async {
+            loop {
+                ensure!(!*self.stop.borrow(), "server stopped");
+                let (tx, rx) = oneshot::channel();
+                // This internal read returns no user data and does not need client credentials.
+                let request = RequestOp {
+                    request: Some(request_op::Request::RequestRange(RangeRequest {
+                        key: vec![0],
+                        count_only: true,
+                        limit: 1,
+                        ..Default::default()
+                    })),
+                };
+                self.events
+                    .send(Event::LinearRead(request, tx))
+                    .await
+                    .context("server stopped")?;
+                if let Ok(value) = rx.await.context("server stopped")? {
+                    let outcome: crate::mvcc::Outcome = serde_json::from_value(value)?;
+                    if outcome.result.is_ok() {
+                        return Ok(());
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .context("server readiness timed out")?
+    }
+
+    /// Wait for termination and return any server failure. Cancellation leaves the handle usable.
+    pub async fn wait(&mut self) -> Result<()> {
+        let result = self
+            .task
+            .as_mut()
+            .context("server termination already collected")?
+            .await;
+        self.task.take();
+        result.context("server supervisor panicked")?
+    }
+
+    /// Stop connections and workers, then release the data directory lock.
+    ///
+    /// In-flight requests can fail with an unknown result. Acknowledged writes remain in Raft.
+    /// Storage I/O can delay shutdown. Keep this future running until it returns.
+    pub async fn shutdown(mut self) -> Result<()> {
+        self.stop.send_replace(true);
+        self.wait().await
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.stop.send_replace(true);
+    }
+}
+
+async fn stopped(mut stop: watch::Receiver<bool>) {
+    let _ = stop.wait_for(|value| *value).await;
+}
+
+fn resolve_port(address: &mut String, listener: SocketAddr) -> Result<()> {
+    let mut url = reqwest::Url::parse(&crate::cluster::url(address))?;
+    if url.port() == Some(0) {
+        url.set_port(Some(listener.port()))
+            .map_err(|_| anyhow::anyhow!("invalid service port"))?;
+        *address = url.as_str().trim_end_matches('/').to_owned();
+    }
+    Ok(())
+}

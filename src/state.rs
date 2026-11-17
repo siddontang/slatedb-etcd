@@ -115,6 +115,14 @@ impl StateMachine {
         })
     }
 
+    pub(crate) async fn close(&self) -> Result<()> {
+        // Raft keeps acknowledged writes durable. Shutdown does not require a new checkpoint.
+        self.db
+            .close_with_options(slatedb::config::CloseOptions { flush_type: None })
+            .await?;
+        Ok(())
+    }
+
     pub fn snapshot_conf(bytes: &[u8]) -> Result<Option<raft::eraftpb::ConfState>> {
         let data: SnapshotData = bincode::deserialize(bytes)?;
         for (key, value) in data.rows {
