@@ -6,11 +6,11 @@ SlateDB's native WAL is disabled. Raft protects acknowledged writes.
 
 The service has one Raft group, a configurable voter set, and one optional learner.
 It exposes etcd v3 gRPC APIs to the official etcd client.
-Each replica owns an independent local object directory and manifest.
+Each replica owns an independent local or S3 object namespace and manifest.
 
-**Status:** local research software. It is not a supported Kubernetes backend or a complete etcd
-replacement. All listeners use loopback. Remote object storage and cross-host operation are future
-work.
+**Status:** experimental research software. It is not a supported Kubernetes backend or a complete
+etcd replacement. S3 storage and remote mutual TLS are available for controlled validation.
+See [remote storage](docs/remote-storage.md) for ownership, recovery, and deployment limits.
 
 ## Start here
 
@@ -42,6 +42,7 @@ for Auth and separate TLS client and peer listeners.
 
 | Area | Implemented behavior |
 | --- | --- |
+| Embedding | Rust configuration, startup, quorum readiness, shutdown, and generated gRPC clients |
 | KV and Txn | Binary data, MVCC, historical reads, nested transactions, and Safe ReadIndex |
 | Watch and Lease | Durable event replay, progress, fragments, keepalive, expiry, and recovery |
 | Auth | Users, roles, range grants, bcrypt passwords, simple tokens, and RS256 JWT |
@@ -79,6 +80,7 @@ Raw logs and generated data stay outside tracked reports.
 ## Project guides
 
 - [Architecture and roadmap](docs/architecture.md): storage rules, execution, and future phases.
+- [Rust embedding](docs/embedding.md): run a member inside an existing application.
 - [Configuration](docs/configuration.md): all server flags and their defaults.
 - [Administration](docs/administration.md): authentication, TLS, membership, and backup restore.
 - [Operations](docs/operations.md): health, shutdown, disk use, and recovery diagnosis.
@@ -88,7 +90,7 @@ Raw logs and generated data stay outside tracked reports.
 - [Contributing](CONTRIBUTING.md): repository layout, checks, and upstream test imports.
 - [Security](SECURITY.md): trust boundaries and private issue reporting.
 
-The next work is remote object storage, cross-host faults, bounded state scans and snapshots,
+The next work is independent-host fault validation, bounded state scans and snapshots,
 and lease TTL checkpoints. The architecture document defines the phase exit criteria.
 
 ## License and provenance

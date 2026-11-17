@@ -1,8 +1,8 @@
 # Server configuration
 
 Run `target/release/slatedb-etcd --help` for the parser's current options.
-Arguments use bytes unless a table states otherwise. All bind addresses must use loopback IPs.
-Initial peer addresses also require loopback IPs; the command parser does not resolve DNS names.
+Arguments use bytes unless a table states otherwise. Listeners and initial peers use loopback IPs
+by default. `--allow-remote` permits remote IPs and DNS names with separate mutual TLS listeners.
 
 ## Identity and listeners
 
@@ -10,8 +10,9 @@ Initial peer addresses also require loopback IPs; the command parser does not re
 | --- | --- |
 | `--id` | Required nonzero member ID. Keep it with its existing data directory. |
 | `--listen` | Required client IP and port. |
+| `--allow-remote` | Permit remote addresses with mutual client and peer TLS. |
 | `--peer` | Required, repeatable `ID=IP:PORT` or `ID=URL`. Include the local member. |
-| `--dir` | Required data directory. Contains `raft/` and `objects/`. |
+| `--dir` | Required directory for Raft, object binding, and optional local objects. |
 | `--cluster-id` | Shared cluster identity; default `slatedb-raft-poc`. |
 | `--peer-listen` | Separate peer bind address. TLS requires this flag. |
 | `--client-peer` | Repeatable `ID=URL` for advertised client addresses. |
@@ -63,6 +64,19 @@ These flags do not bound process RSS, SlateDB, state scans, or snapshot buffers.
 The quota can be exceeded by one operation and does not reserve free disk space.
 Native backups and peer snapshot transfers have a 64 MiB limit.
 See [log pool accounting](architecture.md#bounded-log-pools) for admission and recovery rules.
+
+## S3 objects
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--s3-bucket` | None | Select an existing S3 bucket instead of local objects. |
+| `--s3-region` | `us-east-1` | Bucket region. |
+| `--s3-endpoint` | AWS endpoint | Compatible S3 origin URL. |
+| `--s3-prefix` | `slatedb-etcd` | Root prefix for isolated cluster and member namespaces. |
+| `--s3-allow-http` | Disabled | Permit plaintext to an isolated test object service. |
+
+See [remote storage](remote-storage.md) for credentials, ownership, retry bounds, and recovery.
+The local Raft log remains necessary. S3 does not replace quorum log durability.
 
 ## Environment
 

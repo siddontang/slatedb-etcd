@@ -1,0 +1,37 @@
+{
+  "created_at": "2026-11-17T20:09:51.965708+00:00",
+  "passed": true,
+  "replays_per_seed": 2,
+  "seeds": [
+    {
+      "seed": 1,
+      "trace": "<repo>/target/dst/seed-1.json",
+      "events": 3600,
+      "sha256": "3d34f6f28400465d657743c3f3b671ef8dad795e824c03fe3c64c3aa718cde57"
+    },
+    {
+      "seed": 2,
+      "trace": "<repo>/target/dst/seed-2.json",
+      "events": 3658,
+      "sha256": "cdc7c68954dc6950511559d25787f9d371e3b9dd59ddcf30c4e3a9b7a1b357bc"
+    },
+    {
+      "seed": 42,
+      "trace": "<repo>/target/dst/seed-42.json",
+      "events": 3573,
+      "sha256": "cc2ef378d63e06c611b6d56ff235c1af1296f375c0ed4b26cb96f76e66fc8d7b"
+    },
+    {
+      "seed": 7,
+      "trace": "<repo>/target/dst/seed-7.json",
+      "events": 3687,
+      "sha256": "d76b6760d33445ac416e085195cacbeb586f39a176f83fe9a29c55b00bd6c0fb"
+    },
+    {
+      "seed": 123,
+      "trace": "<repo>/target/dst/seed-123.json",
+      "events": 3625,
+      "sha256": "8ffd55e4c0b920168b6e31629c1c58da8e14ab4defc9d7a086c172bdb7979a92"
+    }
+  ]
+}

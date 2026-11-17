@@ -30,7 +30,7 @@ type testTLS struct {
 	config        *tls.Config
 }
 
-func makeTLS(t *testing.T, root, name, user string) testTLS {
+func makeTLS(t *testing.T, root, name, user string, hosts ...string) testTLS {
 	t.Helper()
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -50,7 +50,7 @@ func makeTLS(t *testing.T, root, name, user string) testTLS {
 	}
 	cert := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: user},
 		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(24 * time.Hour),
-		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, DNSNames: []string{"localhost"},
+		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, DNSNames: append([]string{"localhost"}, hosts...),
 		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}}
 	der, err := x509.CreateCertificate(rand.Reader, cert, ca, &key.PublicKey, caKey)
 	if err != nil {
@@ -207,4 +207,22 @@ func TestClientMetadataCannotImpersonate(t *testing.T) {
 	_, err = pb.NewKVClient(api.ActiveConnection()).Put(forged, &pb.PutRequest{Key: []byte("forged"), Value: []byte("must fail")})
 	require.Error(t, err)
 	require.Contains(t, []codes.Code{codes.Unauthenticated, codes.PermissionDenied, codes.InvalidArgument}, status.Code(err))
+}
+
+func TestRemoteMembershipRejectsPlaintext(t *testing.T) {
+	c := newClusterConfigured(t, 3, func(c *cluster) {
+		configureTLS(c, true, true, true)
+	}, "--allow-remote")
+	api, err := clientv3.New(clientv3.Config{Endpoints: c.addresses, TLS: c.tlsClient})
+	require.NoError(t, err)
+	defer api.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err = api.MemberAddAsLearner(ctx, []string{"http://" + address(t)})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	_, err = api.MemberUpdate(ctx, uint64(c.leader()), []string{"http://" + address(t)})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	members, err := api.MemberList(ctx)
+	require.NoError(t, err)
+	require.Len(t, members.Members, 3)
 }

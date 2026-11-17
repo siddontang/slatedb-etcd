@@ -15,8 +15,14 @@ Validate correctness before making claims about latency, cost, or deployment rea
 
 The current service has one Raft group, a configurable voter set, and one optional learner.
 It uses `raft-rs`, `raft-engine`, and SlateDB. It does not embed TiKV or use PD.
-All listeners and peers use loopback addresses. Each replica has its own storage directory.
-SlateDB currently uses `LocalFileSystem`, not a remote object store.
+
+The CLI and Rust hosts use one `server::Server` lifecycle.
+Startup binds listeners and opens storage.
+Readiness confirms quorum ReadIndex and local apply.
+Shutdown joins workers before releasing storage.
+See [Rust embedding](embedding.md) for the API contract and client examples.
+Each replica keeps its own durable Raft directory and local or S3 object namespace.
+Remote listeners require separate client and peer ports with mutual TLS.
 No replica shares its manifest or SST ownership with another replica.
 
 KV, Txn, Compact, Watch, Lease, Auth, and Cluster are implemented.
@@ -54,12 +60,14 @@ The diagnostic JSON API uses a separate keyspace from the etcd API.
 | Apply owner | Execute committed entries in order and maintain state metadata |
 | SlateDB | Store current values, history, event journals, leases, and the apply marker |
 | Snapshot builder | Flush and serialize a pinned state view |
+| Object binding | Bind local identity to an exclusive S3 namespace |
 | Test drivers | Compare etcd behavior and check recovery, histories, and schedules |
 
 ## Persistent layout
 
-Each node stores its Raft log under `<node-dir>/raft` and SlateDB objects under
-`<node-dir>/objects`.
+Each node stores its Raft log under `<node-dir>/raft`. Local objects use `<node-dir>/objects`.
+S3 objects use an owned cluster/member prefix. A synced binding prevents accidental backend changes.
+See [remote storage](remote-storage.md) for the namespace and claim protocol.
 SlateDB uses these logical keys:
 
 | Prefix or key | Content |
@@ -158,7 +166,7 @@ Mutating transactions, Lease operations, and the diagnostic JSON API retain thei
 Queued reads must receive service between apply batches, so continuous writes cannot starve them.
 
 A slow worker must delay client completion without delaying Raft heartbeats.
-Worker failure or panic must terminate the node. Node shutdown must cancel the worker.
+Worker failure or panic must terminate the node. Shutdown must stop the worker and wait for exit.
 The deterministic driver executes the same worker jobs under an explicit scheduler.
 
 ## ReadIndex protocol
@@ -348,8 +356,8 @@ Snapshots contain authentication, membership, alarms, leases, and revision metad
 
 ## Target storage and deployment architecture
 
-The first remote-store deployment will retain one independent SlateDB owner per replica.
-Each replica will use a separate object prefix and manifest.
+The S3 deployment retains one independent SlateDB owner per replica.
+Each replica uses a separate object prefix and manifest.
 This is the closest extension of the current recovery contract.
 It can create three copies of SST data and repeat object-store work.
 Cost reduction from shared SSTs is not established by this design.
@@ -380,7 +388,9 @@ Local JSON benchmarks do not establish remote-store latency or cost.
 Phases 1 and 2 now separate state work and log I/O from the Raft owner.
 The apply worker remains a Tokio task and shares CPU and disk resources with other process work.
 Large scans, full snapshots, and lease metadata copies still need bounded work and memory controls.
-Remote storage and object-reference snapshots remain future work.
+Phase 4 now includes S3, remote mutual TLS, object faults, and three-guest recovery tests.
+Independent physical hosts, availability zones, and object cost measurements remain open.
+Object-reference snapshots remain future work.
 Phase 3 now includes local administrative and secure transport tests.
 Its remaining format and deployment limits appear in [administration](administration.md).
 

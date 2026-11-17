@@ -1,0 +1,134 @@
+{
+  "created_at": "2026-11-17T19:57:56.271832+00:00",
+  "binary_sha256": "a4b1e9db0cddc1f2c81e2d26802bc85bc77c555358911f29f9e463999b656d87",
+  "reference_etcd": "3.6.5",
+  "client": "go.etcd.io/etcd/client/v3 v3.6.5",
+  "go": "go version go1.25.6 darwin/arm64",
+  "deployment": "three local service processes; one embedded reference etcd",
+  "suite": "compat",
+  "command": [
+    "go",
+    "test",
+    "-mod=readonly",
+    "-json",
+    "-count=1",
+    "-timeout=30m",
+    "-tags",
+    "failpoints",
+    "-run",
+    "^TestFailpointRecovery$",
+    "./..."
+  ],
+  "profile": "supported-capabilities",
+  "log": "<repo>/tmp/test-results/failpoints-embedded.jsonl",
+  "tests": [
+    {
+      "name": "TestFailpointRecovery/wal-before-sync",
+      "result": "pass",
+      "seconds": 1.54
+    },
+    {
+      "name": "TestFailpointRecovery/wal-after-sync",
+      "result": "pass",
+      "seconds": 1.55
+    },
+    {
+      "name": "TestFailpointRecovery/raft-before-advance",
+      "result": "pass",
+      "seconds": 1.05
+    },
+    {
+      "name": "TestFailpointRecovery/raft-before-leader-send",
+      "result": "pass",
+      "seconds": 2.85
+    },
+    {
+      "name": "TestFailpointRecovery/raft-before-follower-send",
+      "result": "pass",
+      "seconds": 1.36
+    },
+    {
+      "name": "TestFailpointRecovery/snapshot-before-save",
+      "result": "pass",
+      "seconds": 1.89
+    },
+    {
+      "name": "TestFailpointRecovery/snapshot-after-save",
+      "result": "pass",
+      "seconds": 1.56
+    },
+    {
+      "name": "TestFailpointRecovery/apply-before-entry",
+      "result": "pass",
+      "seconds": 1.16
+    },
+    {
+      "name": "TestFailpointRecovery/apply-after-entry",
+      "result": "pass",
+      "seconds": 1.35
+    },
+    {
+      "name": "TestFailpointRecovery/checkpoint-before-save",
+      "result": "pass",
+      "seconds": 1.45
+    },
+    {
+      "name": "TestFailpointRecovery/checkpoint-after-save",
+      "result": "pass",
+      "seconds": 1.35
+    },
+    {
+      "name": "TestFailpointRecovery/checkpoint-after-gc",
+      "result": "pass",
+      "seconds": 1.56
+    },
+    {
+      "name": "TestFailpointRecovery/snapshot-before-install",
+      "result": "pass",
+      "seconds": 1.47
+    },
+    {
+      "name": "TestFailpointRecovery/snapshot-after-install-write",
+      "result": "pass",
+      "seconds": 1.56
+    },
+    {
+      "name": "TestFailpointRecovery/snapshot-after-install-flush",
+      "result": "pass",
+      "seconds": 1.23
+    },
+    {
+      "name": "TestFailpointRecovery/compact-before-apply",
+      "result": "pass",
+      "seconds": 1.09
+    },
+    {
+      "name": "TestFailpointRecovery/compact-after-apply",
+      "result": "pass",
+      "seconds": 1.45
+    },
+    {
+      "name": "TestFailpointRecovery/watch-before-send",
+      "result": "pass",
+      "seconds": 1.65
+    },
+    {
+      "name": "TestFailpointRecovery/lease-before-expire",
+      "result": "pass",
+      "seconds": 3.15
+    },
+    {
+      "name": "TestFailpointRecovery",
+      "result": "pass",
+      "seconds": 30.27
+    }
+  ],
+  "counts": {
+    "pass": 20
+  },
+  "leaf_counts": {
+    "pass": 19
+  },
+  "passed": true,
+  "complete": true
+}

@@ -271,9 +271,10 @@ impl Executor {
 }
 
 pub(super) struct Worker {
+    database: std::sync::Arc<slatedb::Db>,
     work: mpsc::Sender<Work>,
     completed: mpsc::Receiver<Result<Completion>>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    task: Option<tokio::task::JoinHandle<Result<()>>>,
     #[cfg(test)]
     manual: Option<(Executor, mpsc::Receiver<Work>)>,
 }
@@ -290,6 +291,7 @@ impl Worker {
     pub fn start(state: StateMachine, events: mpsc::Sender<Event>, manual: bool) -> Self {
         let (work, mut jobs) = mpsc::channel::<Work>(1);
         let (done, completed) = mpsc::channel(1);
+        let database = state.db.clone();
         let mut executor = Executor {
             state,
             events,
@@ -298,6 +300,7 @@ impl Worker {
         #[cfg(test)]
         if manual {
             return Self {
+                database,
                 work,
                 completed,
                 task: None,
@@ -313,14 +316,38 @@ impl Worker {
                     break;
                 }
             }
+            if let Some(task) = executor.snapshot_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            executor.state.close().await
         });
         Self {
+            database,
             work,
             completed,
             task: Some(task),
             #[cfg(test)]
             manual: None,
         }
+    }
+
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.completed.close();
+        self.work = mpsc::channel(1).0;
+        if let Some(task) = self.task.take() {
+            match task.await {
+                Ok(result) => result?,
+                Err(error) => {
+                    let _ = self
+                        .database
+                        .close_with_options(slatedb::config::CloseOptions { flush_type: None })
+                        .await;
+                    return Err(error.into());
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn submit(&self, work: Work) -> Result<()> {
@@ -334,6 +361,11 @@ impl Worker {
             .recv()
             .await
             .context("apply worker stopped")?
+    }
+
+    #[cfg(test)]
+    pub fn database(&self) -> std::sync::Arc<slatedb::Db> {
+        self.database.clone()
     }
 
     #[cfg(test)]
@@ -409,6 +441,7 @@ async fn apply_entries(
         };
         let mut lease_command = None;
         let mut change = change;
+        crate::failpoint::hit("apply-before-entry");
         let reply = match command {
             RaftCommand::Secured { .. } => anyhow::bail!("nested secured command"),
             RaftCommand::Cluster {
@@ -469,6 +502,7 @@ async fn apply_entries(
                 Reply::Encoded(serde_json::to_value(outcome)?)
             }
         };
+        crate::failpoint::hit("apply-after-entry");
         replies.push(AppliedCommand {
             id: command.id().to_owned(),
             change,

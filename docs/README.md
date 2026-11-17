@@ -6,13 +6,15 @@ Commands use the repository root unless a guide states otherwise.
 | Task | Guide |
 | --- | --- |
 | Build and run a local service | [Quick start](getting-started.md) |
+| Embed a member in a Rust program | [Embedding](embedding.md) |
 | Select flags and memory limits | [Configuration](configuration.md) |
 | Enable Auth, TLS, and member changes | [Administration](administration.md) |
 | Check health, disk use, and recovery | [Operations](operations.md) |
 | Understand storage and the roadmap | [Architecture](architecture.md) |
 | Inspect current implementation details | [Implementation notes](internals.md) |
 | Use local diagnostics and injected faults | [Diagnostic APIs](diagnostics.md) |
-| Measure local write latency | [Benchmarks](benchmarks.md) |
+| Compare gRPC and local write latency | [Benchmarks](benchmarks.md) |
+| Configure S3 and remote hosts | [Remote storage](remote-storage.md) |
 | Assess etcd compatibility | [Compatibility report](../COMPATIBILITY.md) |
 | Run tests, Jepsen, fuzzing, and DST | [Test guide](../tests/README.md) |
 | Check the upstream test coverage map | [Upstream audit](../tests/upstream/README.md) |

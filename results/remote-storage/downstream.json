@@ -1,0 +1,1170 @@
+{
+  "created_at": "2026-11-17T19:58:04.003637+00:00",
+  "binary_sha256": "a4b1e9db0cddc1f2c81e2d26802bc85bc77c555358911f29f9e463999b656d87",
+  "reference_etcd": "3.6.5",
+  "client": "go.etcd.io/etcd/client/v3 v3.6.5",
+  "go": "go version go1.25.6 darwin/arm64",
+  "deployment": "three local service processes; one embedded reference etcd",
+  "suite": "downstream",
+  "command": [
+    "go",
+    "test",
+    "-mod=readonly",
+    "-json",
+    "-count=1",
+    "-timeout=30m",
+    "./..."
+  ],
+  "profile": "supported-capabilities",
+  "log": "<repo>/tmp/test-results/downstream-embedded.jsonl",
+  "tests": [
+    {
+      "name": "TestCoreDNSDiscovery/service",
+      "result": "pass",
+      "seconds": 1.18
+    },
+    {
+      "name": "TestCoreDNSDiscovery/etcd",
+      "result": "pass",
+      "seconds": 0.81
+    },
+    {
+      "name": "TestCoreDNSDiscovery",
+      "result": "pass",
+      "seconds": 1.99
+    },
+    {
+      "name": "TestKubernetesStorage/service/create/successful_create",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/create/create_with_ResourceVersion_set",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/create",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/create-ttl",
+      "result": "pass",
+      "seconds": 2.09
+    },
+    {
+      "name": "TestKubernetesStorage/service/create-existing",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/service/get/get_non-existing,_ignore_not_found",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/get/get_non-existing",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/get/get_existing",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/get/too_high_resource_version",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/get/current_object_resource_version,_match=NotOlderThan",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/get/latest_resource_version",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/get/resource_version_0",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/get/object_created_resource_version",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/get",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/service/delete/existing_key",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/delete/non-existing_key",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/delete",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/conditional-delete/UID_match",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/conditional-delete/UID_mismatch",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/conditional-delete",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/delete-conflict",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/Exact/NonRecursive_on_resource_prefix_doesn't_return_any_objects",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/Exact/Recursive_on_resource_prefix_returns_all_objects",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/Exact/NonRecursive_on_namespace_prefix_doesn't_return_any_objects",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/Exact/Recursive_on_resource_prefix_returns_objects_in_the_namespace",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/Exact/NonRecursive_on_object_key_(prefix)_returns_object_and_no_other_objects_with_the_same_prefix",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/Exact/Recursive_on_object_key_(prefix)_doesn't_return_anything",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/Exact/NonRecursive_on_object_key_(no-prefix)_return_object",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/Exact/Recursive_on_object_key_(no-prefix)_doesn't_return_anything",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/Exact",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/Consistent/NonRecursive_on_resource_prefix_doesn't_return_any_objects",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/Consistent/Recursive_on_resource_prefix_returns_all_objects",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/Consistent/NonRecursive_on_namespace_prefix_doesn't_return_any_objects",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/Consistent/Recursive_on_resource_prefix_returns_objects_in_the_namespace",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/Consistent/NonRecursive_on_object_key_(prefix)_returns_object_and_no_other_objects_with_the_same_prefix",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/Consistent/Recursive_on_object_key_(prefix)_doesn't_return_anything",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/Consistent/NonRecursive_on_object_key_(no-prefix)_return_object",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/Consistent/Recursive_on_object_key_(no-prefix)_doesn't_return_anything",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/Consistent",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/NotOlderThan/NonRecursive_on_resource_prefix_doesn't_return_any_objects",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/NotOlderThan/Recursive_on_resource_prefix_returns_all_objects",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/NotOlderThan/NonRecursive_on_namespace_prefix_doesn't_return_any_objects",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/NotOlderThan/Recursive_on_resource_prefix_returns_objects_in_the_namespace",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/NotOlderThan/NonRecursive_on_object_key_(prefix)_returns_object_and_no_other_objects_with_the_same_prefix",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/NotOlderThan/Recursive_on_object_key_(prefix)_doesn't_return_anything",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/NotOlderThan/NonRecursive_on_object_key_(no-prefix)_return_object",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/NotOlderThan/Recursive_on_object_key_(no-prefix)_doesn't_return_anything",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list/NotOlderThan",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/recursive-list",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/service/list-paging",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-list/request_without_namespace,_without_field_selector",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-list/request_without_namespace,_field_selector_with_metadata.namespace",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-list/request_without_namespace,_field_selector_with_spec.nodename",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-list/request_without_namespace,_field_selector_with_spec.nodename_to_filter_out",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-list/request_with_namespace,_without_field_selector",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-list/request_with_namespace,_field_selector_with_matched_metadata.namespace",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-list/request_with_namespace,_field_selector_with_non-matched_metadata.namespace",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-list/request_with_namespace,_field_selector_with_spec.nodename",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-list/request_with_namespace,_field_selector_with_spec.nodename_to_filter_out",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-list/request_without_namespace,_field_selector_with_metadata.name",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-list/request_without_namespace,_field_selector_with_metadata.name_and_metadata.namespace",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-list/request_without_namespace,_field_selector_with_metadata.name_and_spec.nodeName",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-list/request_without_namespace,_field_selector_with_metadata.name,_and_with_spec.nodeName_to_filter_out_watch",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-list/request_with_namespace,_with_field_selector_metadata.name",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-list/request_with_namespace,_with_field_selector_metadata.name_and_metadata.namespace",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-list/request_with_namespace,_with_field_selector_metadata.name,_metadata.namespace_and_spec.nodename",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-list/request_with_namespace,_with_field_selector_metadata.name,_metadata.namespace,_and_with_spec.nodename_to_filter_out",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-list",
+      "result": "pass",
+      "seconds": 0.04
+    },
+    {
+      "name": "TestKubernetesStorage/service/update-ttl",
+      "result": "pass",
+      "seconds": 2.01
+    },
+    {
+      "name": "TestKubernetesStorage/service/update-conflict",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/watch/create_a_key",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/watch/key_updated_to_match_predicate",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/watch/update",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/watch/delete_because_of_being_filtered",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/watch/filtering",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/service/watch/create_a_key#01",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/watch/key_updated_to_match_predicate#01",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/watch/update#01",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/watch/delete_because_of_being_filtered#01",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/watch/filtering#01",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/service/watch",
+      "result": "pass",
+      "seconds": 0.04
+    },
+    {
+      "name": "TestKubernetesStorage/service/watch-delete",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/watch-resume",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/watch-delay",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/service/watch-cancel",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/watch-delete-revision",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/service/cluster-watch/cluster-wide_watch,_request_without_name,_without_field_selector",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/cluster-watch/cluster-wide_watch,_request_without_name,_field_selector_with_spec.nodeName",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/cluster-watch/cluster-wide_watch,_request_without_name,_field_selector_with_spec.nodeName_to_filter_out_watch",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/cluster-watch/cluster-wide_watch,_request_with_name,_field_selector_with_metadata.name",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/cluster-watch/cluster-wide_watch,_request_with_name,_field_selector_with_metadata.name_and_spec.nodeName",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/service/cluster-watch/cluster-wide_watch,_request_with_name,_field_selector_with_metadata.name,_and_with_spec.nodeName_to_filter_out_watch",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/service/cluster-watch",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-watch/namespaced_watch,_request_without_name,_request_without_namespace,_without_field_selector",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-watch/namespaced_watch,_request_without_name,_request_without_namespace,_field_selector_with_metadata.namespace",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-watch/namespaced_watch,_request_without_name,_request_without_namespace,_field_selector_with_spec.nodename",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-watch/namespaced_watch,_request_without_name,_request_without_namespace,_field_selector_with_spec.nodename_to_filter_out_watch",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-watch/namespaced_watch,_request_without_name,_request_with_namespace,_without_field_selector",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-watch/namespaced_watch,_request_without_name,_request_with_namespace,_field_selector_with_matched_metadata.namespace",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-watch/namespaced_watch,_request_without_name,_request_with_namespace,_field_selector_with_non-matched_metadata.namespace",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-watch/namespaced_watch,_request_without_name,_request_with_namespace,_field_selector_with_spec.nodename",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-watch/namespaced_watch,_request_without_name,_request_with_namespace,_field_selector_with_spec.nodename_to_filter_out_watch",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-watch/namespaced_watch,_request_with_name,_request_without_namespace,_field_selector_with_metadata.name",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-watch/namespaced_watch,_request_with_name,_request_without_namespace,_field_selector_with_metadata.name_and_metadata.namespace",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-watch/namespaced_watch,_request_with_name,_request_without_namespace,_field_selector_with_metadata.name_and_spec.nodeName",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-watch/namespaced_watch,_request_with_name,_request_without_namespace,_field_selector_with_metadata.name,_and_with_spec.nodeName_to_filter_out_watch",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-watch/namespaced_watch,_request_with_name,_request_with_namespace,_with_field_selector_metadata.name",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-watch/namespaced_watch,_request_with_name,_request_with_namespace,_with_field_selector_metadata.name_and_metadata.namespace",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-watch/namespaced_watch,_request_with_name,_request_with_namespace,_with_field_selector_metadata.name,_metadata.namespace_and_spec.nodename",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-watch/namespaced_watch,_request_with_name,_request_with_namespace,_with_field_selector_metadata.name,_metadata.namespace,_and_with_spec.nodename_to_filter_out_watch",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/service/namespace-watch",
+      "result": "pass",
+      "seconds": 0.09
+    },
+    {
+      "name": "TestKubernetesStorage/service",
+      "result": "pass",
+      "seconds": 5.54
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/create/successful_create",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/create/create_with_ResourceVersion_set",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/create",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/create-ttl",
+      "result": "pass",
+      "seconds": 2.41
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/create-existing",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/get/latest_resource_version",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/get/current_object_resource_version,_match=NotOlderThan",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/get/get_existing",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/get/resource_version_0",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/get/too_high_resource_version",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/get/object_created_resource_version",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/get/get_non-existing",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/get/get_non-existing,_ignore_not_found",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/get",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/delete/existing_key",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/delete/non-existing_key",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/delete",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/conditional-delete/UID_match",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/conditional-delete/UID_mismatch",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/conditional-delete",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/delete-conflict",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/Exact/NonRecursive_on_resource_prefix_doesn't_return_any_objects",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/Exact/Recursive_on_resource_prefix_returns_all_objects",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/Exact/NonRecursive_on_namespace_prefix_doesn't_return_any_objects",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/Exact/Recursive_on_resource_prefix_returns_objects_in_the_namespace",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/Exact/NonRecursive_on_object_key_(prefix)_returns_object_and_no_other_objects_with_the_same_prefix",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/Exact/Recursive_on_object_key_(prefix)_doesn't_return_anything",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/Exact/NonRecursive_on_object_key_(no-prefix)_return_object",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/Exact/Recursive_on_object_key_(no-prefix)_doesn't_return_anything",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/Exact",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/Consistent/NonRecursive_on_resource_prefix_doesn't_return_any_objects",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/Consistent/Recursive_on_resource_prefix_returns_all_objects",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/Consistent/NonRecursive_on_namespace_prefix_doesn't_return_any_objects",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/Consistent/Recursive_on_resource_prefix_returns_objects_in_the_namespace",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/Consistent/NonRecursive_on_object_key_(prefix)_returns_object_and_no_other_objects_with_the_same_prefix",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/Consistent/Recursive_on_object_key_(prefix)_doesn't_return_anything",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/Consistent/NonRecursive_on_object_key_(no-prefix)_return_object",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/Consistent/Recursive_on_object_key_(no-prefix)_doesn't_return_anything",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/Consistent",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/NotOlderThan/NonRecursive_on_resource_prefix_doesn't_return_any_objects",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/NotOlderThan/Recursive_on_resource_prefix_returns_all_objects",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/NotOlderThan/NonRecursive_on_namespace_prefix_doesn't_return_any_objects",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/NotOlderThan/Recursive_on_resource_prefix_returns_objects_in_the_namespace",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/NotOlderThan/NonRecursive_on_object_key_(prefix)_returns_object_and_no_other_objects_with_the_same_prefix",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/NotOlderThan/Recursive_on_object_key_(prefix)_doesn't_return_anything",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/NotOlderThan/NonRecursive_on_object_key_(no-prefix)_return_object",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/NotOlderThan/Recursive_on_object_key_(no-prefix)_doesn't_return_anything",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list/NotOlderThan",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/recursive-list",
+      "result": "pass",
+      "seconds": 0.03
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/list-paging",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-list/request_without_namespace,_without_field_selector",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-list/request_without_namespace,_field_selector_with_metadata.namespace",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-list/request_without_namespace,_field_selector_with_spec.nodename",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-list/request_without_namespace,_field_selector_with_spec.nodename_to_filter_out",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-list/request_with_namespace,_without_field_selector",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-list/request_with_namespace,_field_selector_with_matched_metadata.namespace",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-list/request_with_namespace,_field_selector_with_non-matched_metadata.namespace",
+      "result": "pass",
+      "seconds": 0.03
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-list/request_with_namespace,_field_selector_with_spec.nodename",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-list/request_with_namespace,_field_selector_with_spec.nodename_to_filter_out",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-list/request_without_namespace,_field_selector_with_metadata.name",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-list/request_without_namespace,_field_selector_with_metadata.name_and_metadata.namespace",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-list/request_without_namespace,_field_selector_with_metadata.name_and_spec.nodeName",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-list/request_without_namespace,_field_selector_with_metadata.name,_and_with_spec.nodeName_to_filter_out_watch",
+      "result": "pass",
+      "seconds": 0.03
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-list/request_with_namespace,_with_field_selector_metadata.name",
+      "result": "pass",
+      "seconds": 0.03
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-list/request_with_namespace,_with_field_selector_metadata.name_and_metadata.namespace",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-list/request_with_namespace,_with_field_selector_metadata.name,_metadata.namespace_and_spec.nodename",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-list/request_with_namespace,_with_field_selector_metadata.name,_metadata.namespace,_and_with_spec.nodename_to_filter_out",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-list",
+      "result": "pass",
+      "seconds": 0.26
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/update-ttl",
+      "result": "pass",
+      "seconds": 2.11
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/update-conflict",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/watch/create_a_key",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/watch/key_updated_to_match_predicate",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/watch/update",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/watch/delete_because_of_being_filtered",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/watch/filtering",
+      "result": "pass",
+      "seconds": 0.03
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/watch/create_a_key#01",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/watch/key_updated_to_match_predicate#01",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/watch/update#01",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/watch/delete_because_of_being_filtered#01",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/watch/filtering#01",
+      "result": "pass",
+      "seconds": 0.04
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/watch",
+      "result": "pass",
+      "seconds": 0.18
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/watch-delete",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/watch-resume",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/watch-delay",
+      "result": "pass",
+      "seconds": 0.11
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/watch-cancel",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/watch-delete-revision",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/cluster-watch/cluster-wide_watch,_request_without_name,_without_field_selector",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/cluster-watch/cluster-wide_watch,_request_without_name,_field_selector_with_spec.nodeName",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/cluster-watch/cluster-wide_watch,_request_without_name,_field_selector_with_spec.nodeName_to_filter_out_watch",
+      "result": "pass",
+      "seconds": 0.03
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/cluster-watch/cluster-wide_watch,_request_with_name,_field_selector_with_metadata.name",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/cluster-watch/cluster-wide_watch,_request_with_name,_field_selector_with_metadata.name_and_spec.nodeName",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/cluster-watch/cluster-wide_watch,_request_with_name,_field_selector_with_metadata.name,_and_with_spec.nodeName_to_filter_out_watch",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/cluster-watch",
+      "result": "pass",
+      "seconds": 0.12
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-watch/namespaced_watch,_request_without_name,_request_without_namespace,_without_field_selector",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-watch/namespaced_watch,_request_without_name,_request_without_namespace,_field_selector_with_metadata.namespace",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-watch/namespaced_watch,_request_without_name,_request_without_namespace,_field_selector_with_spec.nodename",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-watch/namespaced_watch,_request_without_name,_request_without_namespace,_field_selector_with_spec.nodename_to_filter_out_watch",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-watch/namespaced_watch,_request_without_name,_request_with_namespace,_without_field_selector",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-watch/namespaced_watch,_request_without_name,_request_with_namespace,_field_selector_with_matched_metadata.namespace",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-watch/namespaced_watch,_request_without_name,_request_with_namespace,_field_selector_with_non-matched_metadata.namespace",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-watch/namespaced_watch,_request_without_name,_request_with_namespace,_field_selector_with_spec.nodename",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-watch/namespaced_watch,_request_without_name,_request_with_namespace,_field_selector_with_spec.nodename_to_filter_out_watch",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-watch/namespaced_watch,_request_with_name,_request_without_namespace,_field_selector_with_metadata.name",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-watch/namespaced_watch,_request_with_name,_request_without_namespace,_field_selector_with_metadata.name_and_metadata.namespace",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-watch/namespaced_watch,_request_with_name,_request_without_namespace,_field_selector_with_metadata.name_and_spec.nodeName",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-watch/namespaced_watch,_request_with_name,_request_without_namespace,_field_selector_with_metadata.name,_and_with_spec.nodeName_to_filter_out_watch",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-watch/namespaced_watch,_request_with_name,_request_with_namespace,_with_field_selector_metadata.name",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-watch/namespaced_watch,_request_with_name,_request_with_namespace,_with_field_selector_metadata.name_and_metadata.namespace",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-watch/namespaced_watch,_request_with_name,_request_with_namespace,_with_field_selector_metadata.name,_metadata.namespace_and_spec.nodename",
+      "result": "pass",
+      "seconds": 0.03
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-watch/namespaced_watch,_request_with_name,_request_with_namespace,_with_field_selector_metadata.name,_metadata.namespace,_and_with_spec.nodename_to_filter_out_watch",
+      "result": "pass",
+      "seconds": 0.03
+    },
+    {
+      "name": "TestKubernetesStorage/etcd/namespace-watch",
+      "result": "pass",
+      "seconds": 0.34
+    },
+    {
+      "name": "TestKubernetesStorage/etcd",
+      "result": "pass",
+      "seconds": 6.38
+    },
+    {
+      "name": "TestKubernetesStorage",
+      "result": "pass",
+      "seconds": 11.92
+    }
+  ],
+  "counts": {
+    "pass": 228
+  },
+  "leaf_counts": {
+    "pass": 200
+  },
+  "passed": true,
+  "complete": true
+}

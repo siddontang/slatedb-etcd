@@ -117,7 +117,15 @@ impl RaftStorage {
         if let Some(hs) = hard_state {
             batch.put_message(GROUP, HARD_STATE.to_vec(), hs)?;
         }
+        if snapshot.is_some() {
+            crate::failpoint::hit("snapshot-before-save");
+        }
+        crate::failpoint::hit("wal-before-sync");
         self.engine.write(&mut batch, true)?;
+        crate::failpoint::hit("wal-after-sync");
+        if snapshot.is_some() {
+            crate::failpoint::hit("snapshot-after-save");
+        }
         self.sync_writes += 1;
         if let Some(hs) = hard_state {
             self.hard_state = hs.clone();
@@ -166,10 +174,13 @@ impl RaftStorage {
         let mut batch = LogBatch::default();
         batch.put_message(GROUP, SNAPSHOT.to_vec(), &snapshot)?;
         batch.add_command(GROUP, EngineCommand::Compact { index: index + 1 });
+        crate::failpoint::hit("checkpoint-before-save");
         self.engine.write(&mut batch, true)?;
+        crate::failpoint::hit("checkpoint-after-save");
         self.sync_writes += 1;
         self.snapshot = snapshot;
         self.purge()?;
+        crate::failpoint::hit("checkpoint-after-gc");
         Ok(())
     }
 

@@ -79,13 +79,14 @@ These tests do not establish complete etcd compatibility or rolling binary upgra
 | Lease quorum and leader failure | Renewal rejection, streamed renewal, and expiry tests |
 | Watch issues 15271, 17247, 17529, 18089, 19179 | Exact upstream issue schedules remain unported |
 | Defrag issues 14370 and 14685 | API tests pass; exact bbolt failure schedules remain unported |
-| etcd gofail hooks around bbolt and WAL | Require equivalent Rust storage hooks; not yet ported |
+| etcd gofail hooks around bbolt and WAL | See the complete [fault map](fault-mapping.md). |
 | Disk exhaustion, corruption, and lost unsynced writes | Not yet covered by process SIGKILL |
 | Membership replacement | Learner join, promotion, leader transfer, removal, and restart tests |
 | Clock jumps | Not yet covered by the current service |
 
 Peer partitions use the service's bidirectional message-drop endpoint.
-They do not emulate kernel routing, packet latency, bandwidth limits, or cross-host outages.
+The process campaigns do not emulate kernel routing, packet latency, or bandwidth limits.
+Separate three-guest tests add kernel peer partitions, S3 outages, and VM crashes.
 Each process campaign applies one fault. Seeds select partition, kill, pause, or full restart.
 The workload continues during the fault and after recovery.
 Use four consecutive seeds to include all four fault types.
@@ -143,7 +144,8 @@ Partial traces remain available after an assertion failure.
 This is deterministic event scheduling, not a deterministic operating system.
 SlateDB background tasks and disk I/O remain real. Node drop is not a process crash.
 The process tests cover SIGKILL separately.
-Power-loss durability, object-store outages, and arbitrary storage completion schedules remain gaps.
+Object-store delays, failures, and lost replies now have scheduled coverage.
+Physical power loss and arbitrary OS or storage completion schedules remain gaps.
 
 ## Source review
 

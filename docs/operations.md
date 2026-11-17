@@ -1,7 +1,9 @@
 # Local operations
 
-This service supports local experiments. Cross-host operation and production recovery procedures
-remain unvalidated. Read [compatibility limits](../COMPATIBILITY.md) before storing valuable data.
+This service supports controlled local and remote experiments.
+Three local VMs passed recovery tests.
+Independent physical hosts and production recovery procedures remain unvalidated.
+Read [compatibility limits](../COMPATIBILITY.md) before storing valuable data.
 
 ## Health and shutdown
 
@@ -11,7 +13,9 @@ progress.
 Status and serializable member queries can work without quorum; they do not prove write
 availability.
 
-Use Ctrl-C for a foreground process. Each acknowledged write has quorum commit and leader apply.
+Use Ctrl-C for a foreground process. It stops connections and waits for storage workers.
+Rust hosts must await `Server::shutdown`; see [embedding](embedding.md).
+Each acknowledged write has quorum commit and leader apply.
 A terminated or timed-out request can have an unknown outcome. Check application state after
 recovery.
 Keep the member ID, cluster ID, data directory, and original bootstrap arguments on restart.

@@ -126,7 +126,8 @@ func (c *cluster) start(id int) {
 		c.t.Fatal(err)
 	}
 	cmd := exec.Command(c.binary, args...)
-	cmd.Env = append(os.Environ(), "RUST_LOG=slatedb_etcd=info,slatedb=warn")
+	cmd.Env = append(os.Environ(), "RUST_LOG=slatedb_etcd=info,slatedb=warn",
+		"SLATEDB_FAILPOINT_FILE="+filepath.Join(c.root, fmt.Sprintf("fault-%d", id)))
 	cmd.Stdout = file
 	cmd.Stderr = file
 	if err := cmd.Start(); err != nil {

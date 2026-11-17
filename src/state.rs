@@ -27,7 +27,7 @@ struct SnapshotData {
 }
 
 pub struct StateMachine {
-    db: Arc<Db>,
+    pub(crate) db: Arc<Db>,
     pub auth: crate::auth::Store,
     pub members: crate::cluster::Store,
     admin: slatedb::admin::Admin,
@@ -44,9 +44,17 @@ impl StateMachine {
     pub async fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let object_store = Arc::new(LocalFileSystem::new_with_prefix(dir)?);
+        Self::open_store(object_store, "state").await
+    }
+
+    pub async fn open_store(
+        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+        prefix: &str,
+    ) -> Result<Self> {
         let mut settings = Settings {
             wal_enabled: false,
             flush_interval: None,
+            object_store_max_retries: Some(3),
             manifest_poll_interval: Duration::from_millis(100),
             ..Settings::default()
         };
@@ -58,53 +66,71 @@ impl StateMachine {
                 worker.compactions_poll_interval = Duration::from_millis(100);
             }
         }
-        let admin = slatedb::admin::Admin::builder("state", object_store.clone()).build();
-        let db = Db::builder("state", object_store)
+        let admin = slatedb::admin::Admin::builder(prefix, object_store.clone()).build();
+        let db = Db::builder(prefix, object_store)
             .with_settings(settings)
             .build()
             .await?;
-        let applied = match db.get(APPLIED).await? {
-            Some(bytes) => {
-                u64::from_be_bytes(bytes.as_ref().try_into().context("invalid apply marker")?)
-            }
-            None => 0,
-        };
-        ensure!(
-            db.snapshot()?.seq() == applied,
-            "SlateDB sequence and apply marker differ"
-        );
-        let revision = read_revision(&db).await?;
-        let compact_revision = read_compact_revision(&db).await?;
-        ensure!(
-            compact_revision <= revision,
-            "compaction exceeds current revision"
-        );
-        let leases = crate::lease::load(&db).await?;
-        let auth = match db.get(crate::auth::KEY).await? {
-            Some(data) => serde_json::from_slice(&data)?,
-            None => crate::auth::Store::default(),
-        };
-        let alarms = match db.get(crate::maintenance::ALARMS).await? {
-            Some(data) => serde_json::from_slice(&data)?,
-            None => vec![],
-        };
-        let members = match db.get(crate::cluster::KEY).await? {
-            Some(data) => serde_json::from_slice(&data)?,
-            None => crate::cluster::Store::default(),
-        };
-        Ok(Self {
-            members,
-            admin,
-            quota: 0,
-            alarms,
-            auth,
-            db: Arc::new(db),
-            applied,
-            durable_applied: applied,
-            revision,
-            compact_revision,
-            leases,
-        })
+        let db = Arc::new(db);
+        let result = async {
+            let applied = match db.get(APPLIED).await? {
+                Some(bytes) => {
+                    u64::from_be_bytes(bytes.as_ref().try_into().context("invalid apply marker")?)
+                }
+                None => 0,
+            };
+            ensure!(
+                db.snapshot()?.seq() == applied,
+                "SlateDB sequence and apply marker differ"
+            );
+            let revision = read_revision(&db).await?;
+            let compact_revision = read_compact_revision(&db).await?;
+            ensure!(
+                compact_revision <= revision,
+                "compaction exceeds current revision"
+            );
+            let leases = crate::lease::load(&db).await?;
+            let auth = match db.get(crate::auth::KEY).await? {
+                Some(data) => serde_json::from_slice(&data)?,
+                None => crate::auth::Store::default(),
+            };
+            let alarms = match db.get(crate::maintenance::ALARMS).await? {
+                Some(data) => serde_json::from_slice(&data)?,
+                None => vec![],
+            };
+            let members = match db.get(crate::cluster::KEY).await? {
+                Some(data) => serde_json::from_slice(&data)?,
+                None => crate::cluster::Store::default(),
+            };
+            Ok(Self {
+                members,
+                admin,
+                quota: 0,
+                alarms,
+                auth,
+                db: Arc::clone(&db),
+                applied,
+                durable_applied: applied,
+                revision,
+                compact_revision,
+                leases,
+            })
+        }
+        .await;
+        if result.is_err() {
+            let _ = db
+                .close_with_options(slatedb::config::CloseOptions { flush_type: None })
+                .await;
+        }
+        result
+    }
+
+    pub(crate) async fn close(&self) -> Result<()> {
+        // Raft keeps acknowledged writes durable. Shutdown does not require a new checkpoint.
+        self.db
+            .close_with_options(slatedb::config::CloseOptions { flush_type: None })
+            .await?;
+        Ok(())
     }
 
     pub fn snapshot_conf(bytes: &[u8]) -> Result<Option<raft::eraftpb::ConfState>> {
@@ -448,6 +474,7 @@ impl StateMachine {
                 batch.put(b"etcd/hash-cache", serde_json::to_vec(&hashes)?);
             }
         }
+        crate::failpoint::hit("compact-before-apply");
         batch.put(APPLIED, index.to_be_bytes());
         self.db
             .write_with_options(batch, &WriteOptions { seqnum: index })
@@ -460,6 +487,7 @@ impl StateMachine {
                 self.durable_applied = self.applied;
             }
         }
+        crate::failpoint::hit("compact-after-apply");
         Ok(Outcome { result })
     }
 
@@ -482,6 +510,10 @@ impl StateMachine {
             "non-contiguous state machine apply"
         );
         use crate::lease::LeaseCommand as L;
+        if matches!(command, L::Expire { .. }) {
+            crate::failpoint::hit("lease-before-expire");
+        }
+
         let corrupt = self.alarms.iter().any(|a| a.alarm == 2)
             && matches!(
                 command,
@@ -620,12 +652,15 @@ impl StateMachine {
             );
             batch.put(key, value);
         }
+        crate::failpoint::hit("snapshot-before-install");
         batch.put(APPLIED, index.to_be_bytes());
         self.db
             .write_with_options(batch, &WriteOptions { seqnum: index })
             .await?;
+        crate::failpoint::hit("snapshot-after-install-write");
         // The durable Raft snapshot lets a restart repeat this atomic replacement.
         self.db.flush().await?;
+        crate::failpoint::hit("snapshot-after-install-flush");
         self.applied = index;
         self.durable_applied = index;
         self.revision = read_revision(&self.db).await?;

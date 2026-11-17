@@ -83,8 +83,9 @@ It checks memory limits, durable acknowledgements, revocation ordering, and reco
 ## Compatibility boundaries
 
 This milestone provides partial etcd v3 compatibility. It is not a supported Kubernetes backend.
-All listeners remain on loopback, and SlateDB uses local storage on each replica.
-Cross-host faults, remote object-store failures, power loss, and rolling binary upgrades remain
+S3 storage and remote mutual TLS now have controlled integration coverage.
+Three-guest tests cover VM crashes, peer partitions, object outages, and snapshot recovery.
+Independent physical host failures, physical power loss, and rolling binary upgrades remain
 untested.
 
 Native backup and backend Hash formats differ from etcd bbolt.
@@ -112,3 +113,11 @@ steps.
 The [upstream audit](tests/upstream/README.md) indexes 1,771 upstream functions without claiming
 that
 all of them run against the Rust implementation.
+
+## Downstream and fault additions
+
+The [fault map](tests/upstream/fault-mapping.md) accounts for all 41 named gofail hooks at etcd
+v3.6.5.
+Nineteen native crash boundaries and two TLS client failover cases have real process coverage.
+Selected original Kubernetes storage tests and the CoreDNS etcd plugin run against both backends.
+The [retained remote results](results/remote-storage/README.md) record the new evidence and limits.

@@ -47,7 +47,8 @@ Certificates must contain the advertised IP address or DNS name in their SAN ext
 Peer TLS requires client certificates. Keep peer and client trust roots separate.
 The peer listener carries Raft, forwarded requests, and trusted diagnostic controls.
 The client listener carries only gRPC services and cannot supply a forwarded peer identity.
-All listeners remain on loopback. Cross-host deployment and certificate reload are future work.
+Remote listeners require `--allow-remote` and mutual TLS on separate ports.
+See [remote storage](remote-storage.md). Certificate reload remains future work.
 The server does not generate automatic TLS certificates.
 
 ## Member changes

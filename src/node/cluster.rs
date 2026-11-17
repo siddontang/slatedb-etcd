@@ -94,6 +94,18 @@ impl Node {
     }
 
     fn check_membership(&self, request: &C) -> std::result::Result<(), KvError> {
+        let urls = match request {
+            C::Add(member) => &member.peer_ur_ls[..],
+            C::Update(member) => &member.peer_ur_ls[..],
+            _ => &[],
+        };
+        if self.options.require_peer_tls {
+            for url in urls {
+                crate::tls::validate_url(url, true, true).map_err(|_| {
+                    KvError::new(Code::InvalidArgument, "remote peers require an HTTPS URL")
+                })?;
+            }
+        }
         if matches!(request, C::List(_)) {
             return Ok(());
         }
@@ -170,6 +182,7 @@ impl Node {
             self.options.peers = peers;
             return;
         }
+        while self.transports.try_join_next().is_some() {}
         self.senders.retain(|id, _| peers.contains_key(id));
         for (&id, address) in &peers {
             if id == self.options.id {
@@ -186,7 +199,7 @@ impl Node {
             let (tx, rx) = mpsc::channel(256);
             self.senders.insert(id, tx);
             self.peer_health.remove(&id);
-            tokio::spawn(transport(
+            self.transports.spawn(transport(
                 id,
                 address.clone(),
                 self.options.cluster_id.clone(),

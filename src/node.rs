@@ -32,6 +32,7 @@ mod tests;
 pub type Response = oneshot::Sender<Result<Value, ApiError>>;
 
 pub enum Event {
+    SubscribeApply(oneshot::Sender<tokio::sync::watch::Receiver<u64>>),
     Authenticated(crate::auth::Credentials, Box<Event>),
     Auth(crate::auth::Command, Response),
     AuthLookup(String, Response),
@@ -82,6 +83,8 @@ pub struct NodeOptions {
     pub join: bool,
     pub client_peers: BTreeMap<u64, String>,
     pub transport: crate::tls::Transport,
+    pub object_store: crate::object::Config,
+    pub require_peer_tls: bool,
 }
 
 struct Pending {
@@ -102,6 +105,7 @@ struct LogTask {
 }
 
 pub struct Node {
+    applied_notify: tokio::sync::watch::Sender<u64>,
     transfers: Vec<(u64, Instant, Response)>,
     published_at: Option<Instant>,
     events: mpsc::Sender<Event>,
@@ -132,6 +136,7 @@ pub struct Node {
     apply_delay_ms: u64,
     options: NodeOptions,
     senders: BTreeMap<u64, mpsc::Sender<Message>>,
+    transports: tokio::task::JoinSet<()>,
     pending: HashMap<String, Pending>,
     blocked: BTreeSet<u64>,
     installed_snapshots: u64,
@@ -176,58 +181,84 @@ impl Node {
                 options.peers.keys().copied().collect()
             },
         )?;
-        let mut state = StateMachine::open(&options.dir.join("objects")).await?;
-        state.quota = options.quota_bytes;
-        ensure!(
-            state.applied <= storage.commit_index(),
-            "state is ahead of durable commit"
-        );
-        let recovered_from_index = state.applied;
-        state.install_snapshot(storage.recovery_snapshot()).await?;
-        if state.members.members.is_empty() && !options.join {
-            state.members = crate::cluster::Store::initial(&options.peers);
-            for (&id, address) in &options.client_peers {
-                if let Some(member) = state.members.members.get_mut(&id) {
-                    member.client_ur_ls = vec![crate::cluster::url(address)];
+        let mut state = options
+            .object_store
+            .open(&options.dir, &options.cluster_id, options.id)
+            .await?;
+        let recovered = async {
+            state.quota = options.quota_bytes;
+            ensure!(
+                state.applied <= storage.commit_index(),
+                "state is ahead of durable commit"
+            );
+            let recovered_from_index = state.applied;
+            state.install_snapshot(storage.recovery_snapshot()).await?;
+            if state.members.members.is_empty() && !options.join {
+                state.members = crate::cluster::Store::initial(&options.peers);
+                for (&id, address) in &options.client_peers {
+                    if let Some(member) = state.members.members.get_mut(&id) {
+                        member.client_ur_ls = vec![crate::cluster::url(address)];
+                    }
                 }
             }
-        }
-        let mut cache = match log::Cache::load(&storage, state.applied, options.log_memory) {
-            Ok(cache) => cache,
-            Err(error) if error.is::<cache::PendingQuota>() => {
-                apply::recover(
-                    &mut state,
-                    &storage,
-                    Header {
-                        cluster: 0,
-                        member: options.id,
-                        term: storage.initial_state()?.hard_state.term,
-                    },
-                )
-                .await?;
-                log::Cache::load(&storage, state.applied, options.log_memory)?
+            if options.require_peer_tls {
+                ensure!(
+                    options.transport.tls.is_some(),
+                    "remote peers require a TLS transport"
+                );
+                for member in state.members.members.values() {
+                    for address in &member.peer_ur_ls {
+                        crate::tls::validate_url(address, true, true)?;
+                    }
+                }
             }
-            Err(error) => return Err(error),
+            let mut cache = match log::Cache::load(&storage, state.applied, options.log_memory) {
+                Ok(cache) => cache,
+                Err(error) if error.is::<cache::PendingQuota>() => {
+                    apply::recover(
+                        &mut state,
+                        &storage,
+                        Header {
+                            cluster: 0,
+                            member: options.id,
+                            term: storage.initial_state()?.hard_state.term,
+                        },
+                    )
+                    .await?;
+                    log::Cache::load(&storage, state.applied, options.log_memory)?
+                }
+                Err(error) => return Err(error),
+            };
+            cache.initial_conf = Some(state.members.conf());
+            let config = Config {
+                id: options.id,
+                election_tick: 10,
+                heartbeat_tick: 1,
+                applied: state.applied,
+                check_quorum: true,
+                pre_vote: true,
+                read_only_option: raft::ReadOnlyOption::Safe,
+                max_size_per_msg: 1024 * 1024,
+                max_inflight_msgs: 64,
+                max_uncommitted_size: 16 * 1024 * 1024,
+                max_committed_size_per_ready: apply::BATCH_BYTES,
+                ..Config::default()
+            };
+            config.validate()?;
+            let logger = slog::Logger::root(slog::Discard, slog::o!());
+            let raw = RawNode::new(&config, cache, &logger)?;
+            anyhow::Ok((raw, recovered_from_index))
+        }
+        .await;
+        let (raw, recovered_from_index) = match recovered {
+            Ok(recovered) => recovered,
+            Err(error) => {
+                let _ = state.close().await;
+                return Err(error);
+            }
         };
-        cache.initial_conf = Some(state.members.conf());
-        let config = Config {
-            id: options.id,
-            election_tick: 10,
-            heartbeat_tick: 1,
-            applied: state.applied,
-            check_quorum: true,
-            pre_vote: true,
-            read_only_option: raft::ReadOnlyOption::Safe,
-            max_size_per_msg: 1024 * 1024,
-            max_inflight_msgs: 64,
-            max_uncommitted_size: 16 * 1024 * 1024,
-            max_committed_size_per_ready: apply::BATCH_BYTES,
-            ..Config::default()
-        };
-        config.validate()?;
-        let logger = slog::Logger::root(slog::Discard, slog::o!());
-        let raw = RawNode::new(&config, cache, &logger)?;
         let manual_apply = transport_override.is_some();
+        let mut transports = tokio::task::JoinSet::new();
         let senders = if let Some(senders) = transport_override {
             senders
         } else {
@@ -238,7 +269,7 @@ impl Node {
                 }
                 let (tx, rx) = mpsc::channel(256);
                 senders.insert(peer, tx);
-                tokio::spawn(transport(
+                transports.spawn(transport(
                     peer,
                     address.clone(),
                     options.cluster_id.clone(),
@@ -253,6 +284,7 @@ impl Node {
         let worker = Worker::start(state, events.clone(), manual_apply);
         let log_worker = log::Worker::start(storage, manual_apply)?;
         let mut node = Self {
+            applied_notify: tokio::sync::watch::channel(applied.applied).0,
             transfers: vec![],
             published_at: None,
             events,
@@ -283,6 +315,7 @@ impl Node {
             apply_delay_ms: 0,
             options,
             senders,
+            transports,
             pending: HashMap::new(),
             blocked: BTreeSet::new(),
             installed_snapshots: 0,
@@ -299,7 +332,27 @@ impl Node {
         Ok(node)
     }
 
-    pub async fn run(mut self, mut events: mpsc::Receiver<Event>) -> Result<()> {
+    pub async fn run(self, events: mpsc::Receiver<Event>) -> Result<()> {
+        self.run_until(events, std::future::pending()).await
+    }
+
+    pub(crate) async fn run_until(
+        mut self,
+        events: mpsc::Receiver<Event>,
+        stop: impl std::future::Future<Output = ()>,
+    ) -> Result<()> {
+        let result = tokio::select! {
+            result = self.run_loop(events) => result,
+            _ = stop => Ok(()),
+        };
+        self.transports.shutdown().await;
+        // Keep the Raft directory locked until the state worker has stopped.
+        let apply = self.worker.shutdown().await;
+        let log = self.log_worker.shutdown().await;
+        result.and(apply).and(log)
+    }
+
+    async fn run_loop(&mut self, mut events: mpsc::Receiver<Event>) -> Result<()> {
         // Schedule committed log recovery before accepting client work.
         self.drive_ready().await?;
         let mut ticks = tokio::time::interval(Duration::from_millis(100));
@@ -545,6 +598,9 @@ impl Node {
                     }
                 }
             }
+            Event::SubscribeApply(response) => {
+                let _ = response.send(self.applied_notify.subscribe());
+            }
             Event::Status(response) => {
                 let _ = response.send(Ok(self.status()?));
             }
@@ -746,6 +802,7 @@ impl Node {
             self.raw.on_entries_fetched(fetch.context);
         }
         if let Some(number) = task.ready {
+            crate::failpoint::hit("raft-before-advance");
             self.raw.on_persist_ready(number);
         }
         if let Some(index) = task.checkpoint {
@@ -861,6 +918,9 @@ impl Node {
             .durable_applied
             .max(completed.state.durable_applied);
         self.state = completed.state;
+        if *self.applied_notify.borrow() != self.state.applied {
+            self.applied_notify.send_replace(self.state.applied);
+        }
         self.state.durable_applied = durable;
         self.apply_busy = false;
 
@@ -1084,6 +1144,11 @@ impl Node {
 
     fn send(&mut self, messages: Vec<Message>) {
         for message in messages {
+            if self.raw.raft.state == StateRole::Leader {
+                crate::failpoint::hit("raft-before-leader-send");
+            } else {
+                crate::failpoint::hit("raft-before-follower-send");
+            }
             let peer = message.to;
             let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
             let sent = !self.blocked.contains(&peer)

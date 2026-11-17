@@ -113,6 +113,14 @@ impl Service {
         require_leader: bool,
         credentials: crate::auth::Credentials,
     ) -> Result<(), Status> {
+        let (subscribe, receiver) = oneshot::channel();
+        self.events
+            .send(Event::SubscribeApply(subscribe))
+            .await
+            .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?;
+        let mut applied = receiver
+            .await
+            .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?;
         let mut watchers = BTreeMap::<i64, Watcher>::new();
         let mut next_id = 0;
         let mut tick = tokio::time::interval(Duration::from_millis(50));
@@ -120,7 +128,13 @@ impl Service {
         loop {
             tokio::select! {
                 _ = tx.closed() => return Ok(()),
-                _ = tick.tick() => {
+                changed = async {
+                    tokio::select! {
+                        _ = tick.tick() => Ok(()),
+                        changed = applied.changed() => changed,
+                    }
+                } => {
+                    changed.map_err(|_| Status::unavailable("etcdserver: node unavailable"))?;
                     let mut canceled = vec![];
                     for (&id, watcher) in &mut watchers {
                         if !self.poll_watch(watcher, tx, require_leader, None).await? {
@@ -154,8 +168,11 @@ impl Service {
                                 ..Default::default() }).await?;
                             if !reason.is_empty() { continue; }
                             if request.start_revision <= 0 { request.start_revision = page.next_revision; }
-                            watchers.insert(request.watch_id,
-                                Watcher { request, progress: tokio::time::Instant::now(), credentials: credentials.clone() });
+                            let id = request.watch_id;
+                            let mut watcher = Watcher { request, progress: tokio::time::Instant::now(), credentials: credentials.clone() };
+                            if self.poll_watch(&mut watcher, tx, require_leader, None).await? {
+                                watchers.insert(id, watcher);
+                            }
                         }
                         Some(RequestUnion::CancelRequest(request)) => {
                             if watchers.remove(&request.watch_id).is_some() {
@@ -189,6 +206,9 @@ impl Service {
 }
 
 async fn send(tx: &Output, response: WatchResponse) -> Result<(), Status> {
+    if !response.events.is_empty() {
+        crate::failpoint::hit("watch-before-send");
+    }
     tx.send(Ok(response))
         .await
         .map_err(|_| Status::cancelled("watch stream closed"))

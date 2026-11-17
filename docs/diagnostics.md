@@ -1,7 +1,7 @@
 # Diagnostic and fault APIs
 
 These interfaces are trusted test controls. They bypass etcd Auth.
-Keep them on loopback and restrict peer credentials to trusted operators.
+Keep them on loopback or behind mutual peer TLS. Restrict peer credentials to trusted operators.
 With separate listeners, only the peer listener exposes these routes.
 
 ## Routes

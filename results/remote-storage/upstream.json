@@ -1,0 +1,2227 @@
+{
+  "created_at": "2026-11-17T19:57:56.273453+00:00",
+  "binary_sha256": "a4b1e9db0cddc1f2c81e2d26802bc85bc77c555358911f29f9e463999b656d87",
+  "reference_etcd": "3.6.5",
+  "client": "go.etcd.io/etcd/client/v3 v3.6.5",
+  "go": "go version go1.25.6 darwin/arm64",
+  "deployment": "three local service processes; one embedded reference etcd",
+  "suite": "compat",
+  "command": [
+    "go",
+    "test",
+    "-mod=readonly",
+    "-json",
+    "-count=1",
+    "-timeout=30m",
+    "-tags",
+    "upstream",
+    "./..."
+  ],
+  "profile": "all-capabilities",
+  "log": "<repo>/tmp/test-results/upstream-embedded.jsonl",
+  "tests": [
+    {
+      "name": "TestNativeExportPreservesExistingFile",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestNativeExportRejectsDamagedStreams/checksum",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestNativeExportRejectsDamagedStreams/truncated",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestNativeExportRejectsDamagedStreams/oversized",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestNativeExportRejectsDamagedStreams/read_failure",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestNativeExportRejectsDamagedStreams",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestAdminSnapshotAndPhysicalRecovery",
+      "result": "pass",
+      "seconds": 2.5
+    },
+    {
+      "name": "TestAuthLeaseAttachmentDifferential/slatedb",
+      "result": "pass",
+      "seconds": 0.18
+    },
+    {
+      "name": "TestAuthLeaseAttachmentDifferential/etcd",
+      "result": "pass",
+      "seconds": 0.26
+    },
+    {
+      "name": "TestAuthLeaseAttachmentDifferential",
+      "result": "pass",
+      "seconds": 2.37
+    },
+    {
+      "name": "TestNativeSnapshotRestore/existing-directory",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestNativeSnapshotRestore/bad-checksum",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestNativeSnapshotRestore",
+      "result": "pass",
+      "seconds": 4.87
+    },
+    {
+      "name": "TestMaintenanceAlarmDifferential/slatedb",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestMaintenanceAlarmDifferential/etcd",
+      "result": "pass",
+      "seconds": 0.07
+    },
+    {
+      "name": "TestMaintenanceAlarmDifferential",
+      "result": "pass",
+      "seconds": 1.32
+    },
+    {
+      "name": "TestSlowApplyKeepsRaftLive",
+      "result": "pass",
+      "seconds": 3.76
+    },
+    {
+      "name": "TestCommittedApplyBacklogSurvivesRestart",
+      "result": "pass",
+      "seconds": 2.52
+    },
+    {
+      "name": "TestSnapshotApplyKeepsPeerReplicationLive",
+      "result": "pass",
+      "seconds": 3.98
+    },
+    {
+      "name": "TestAdminCompatibility",
+      "result": "pass",
+      "seconds": 2
+    },
+    {
+      "name": "TestDifferentialHashKV",
+      "result": "pass",
+      "seconds": 2.43
+    },
+    {
+      "name": "TestOfficialClientWorkflows/service/mutex",
+      "result": "pass",
+      "seconds": 0.14
+    },
+    {
+      "name": "TestOfficialClientWorkflows/service/election",
+      "result": "pass",
+      "seconds": 0.11
+    },
+    {
+      "name": "TestOfficialClientWorkflows/service/stm-0",
+      "result": "pass",
+      "seconds": 0.03
+    },
+    {
+      "name": "TestOfficialClientWorkflows/service/stm-1",
+      "result": "pass",
+      "seconds": 0.04
+    },
+    {
+      "name": "TestOfficialClientWorkflows/service/stm-2",
+      "result": "pass",
+      "seconds": 0.03
+    },
+    {
+      "name": "TestOfficialClientWorkflows/service",
+      "result": "pass",
+      "seconds": 1.68
+    },
+    {
+      "name": "TestOfficialClientWorkflows/etcd/mutex",
+      "result": "pass",
+      "seconds": 0.66
+    },
+    {
+      "name": "TestOfficialClientWorkflows/etcd/election",
+      "result": "pass",
+      "seconds": 0.15
+    },
+    {
+      "name": "TestOfficialClientWorkflows/etcd/stm-0",
+      "result": "pass",
+      "seconds": 0.16
+    },
+    {
+      "name": "TestOfficialClientWorkflows/etcd/stm-1",
+      "result": "pass",
+      "seconds": 0.21
+    },
+    {
+      "name": "TestOfficialClientWorkflows/etcd/stm-2",
+      "result": "pass",
+      "seconds": 0.17
+    },
+    {
+      "name": "TestOfficialClientWorkflows/etcd",
+      "result": "pass",
+      "seconds": 2.32
+    },
+    {
+      "name": "TestOfficialClientWorkflows",
+      "result": "pass",
+      "seconds": 4
+    },
+    {
+      "name": "TestDifferentialCompaction/negative_revision",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/initial_boundary",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/zero_revision",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialCompaction/repeated_zero",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/empty_store",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/empty_boundary_read",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/stable_key",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/first_version",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/second_version",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/delete",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/recreate",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/newer_key",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/future_revision",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/future_compact_keeps_history",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/compact_middle",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/compacted_point",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/compacted_missing_key",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/compacted_count",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/boundary_point",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/boundary_range",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/stable_anchor",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/delete_history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/recreated_history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/current",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/negative_direct_read",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/negative_txn_read",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/txn_rollback",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/rollback_absent",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/inactive_compacted_branch",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/nested_boundary_read",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/repeat_boundary",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/older_boundary",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/compact_deleted_version",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/deleted_boundary_range",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/physical_compact_removes_history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/compact_current",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/current_boundary",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/write_after_compact",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/read_after_compact",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction",
+      "result": "pass",
+      "seconds": 2.34
+    },
+    {
+      "name": "TestCompactionRecovery",
+      "result": "pass",
+      "seconds": 6.38
+    },
+    {
+      "name": "TestDifferentialKV/initial_revision",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/create",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/same_value_increments_version",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/update_prev_kv",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/negative_revision_reads_latest",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/future_revision",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/binary_put",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/binary_get",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/empty_value",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/prefix_a",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/prefix_b",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/prefix_c",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/prefix_limit_more",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/sort_value",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/sort_key_desc",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/sort_mod",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/keys_only",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/count_only",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/revision_filter_count",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/create_revision_filters",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/all_keys",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/range_end",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/ignore_value",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/ignore_lease",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/missing_ignore_value",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/invalid_ignore_value",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/missing_lease",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/invalid_ignore_lease",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_one_revision",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_else",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_read_before_write",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_read_only",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_empty",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/missing_value_compare",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/range_compare",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/nested_base_predicates",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/nested_mutually_exclusive_writes",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/nested_negative_revision",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_rollback",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/rollback_absent",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_future_revision_rollback",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/duplicate_put",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/overlapping_put_delete",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/unselected_invalid_branch",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/delete_previous",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/deleted_history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/deleted_latest",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/delete_missing_no_revision",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/recreate_resets_version",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/recreated_metadata",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/overlapping_deletes",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/empty_key",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/too_many_operations",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/final_state",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV",
+      "result": "pass",
+      "seconds": 1.94
+    },
+    {
+      "name": "TestFailoverAndSnapshotRecovery",
+      "result": "pass",
+      "seconds": 4.83
+    },
+    {
+      "name": "TestConcurrentCompareAndSwap",
+      "result": "pass",
+      "seconds": 1.24
+    },
+    {
+      "name": "TestPartitionReadModes",
+      "result": "pass",
+      "seconds": 5
+    },
+    {
+      "name": "TestClientFailoverWithTLS/client-before-failure",
+      "result": "pass",
+      "seconds": 4.26
+    },
+    {
+      "name": "TestClientFailoverWithTLS/client-after-failure",
+      "result": "pass",
+      "seconds": 2.05
+    },
+    {
+      "name": "TestClientFailoverWithTLS",
+      "result": "pass",
+      "seconds": 6.32
+    },
+    {
+      "name": "TestBoundedLogCacheRecoversLaggingFollower/delayed-read",
+      "result": "pass",
+      "seconds": 3.78
+    },
+    {
+      "name": "TestBoundedLogCacheRecoversLaggingFollower/failed-read",
+      "result": "pass",
+      "seconds": 2.49
+    },
+    {
+      "name": "TestBoundedLogCacheRecoversLaggingFollower",
+      "result": "pass",
+      "seconds": 6.27
+    },
+    {
+      "name": "TestFollowerReadIndexWaitsForLocalApply",
+      "result": "pass",
+      "seconds": 3.46
+    },
+    {
+      "name": "TestForwardedWriteWaitsForLocalApply",
+      "result": "pass",
+      "seconds": 3.96
+    },
+    {
+      "name": "TestLearnerJoinPromoteRemoveAndRecover/ThreeVoters",
+      "result": "pass",
+      "seconds": 3.53
+    },
+    {
+      "name": "TestLearnerJoinPromoteRemoveAndRecover/SingleVoterStrict",
+      "result": "pass",
+      "seconds": 3.78
+    },
+    {
+      "name": "TestLearnerJoinPromoteRemoveAndRecover",
+      "result": "pass",
+      "seconds": 7.3
+    },
+    {
+      "name": "TestSerializableMemberListDuringPartition",
+      "result": "pass",
+      "seconds": 2.16
+    },
+    {
+      "name": "TestReadIndexAndNestedReadTxnDoNotWriteLogs",
+      "result": "pass",
+      "seconds": 1.2
+    },
+    {
+      "name": "TestReadIndexRejectsMinorityLeader",
+      "result": "pass",
+      "seconds": 2.78
+    },
+    {
+      "name": "TestSlowLogKeepsRaftLiveAndFencesReplies",
+      "result": "pass",
+      "seconds": 3.68
+    },
+    {
+      "name": "TestLogWriteFailureStopsNodeAndRecoversAcknowledgedState",
+      "result": "pass",
+      "seconds": 2.28
+    },
+    {
+      "name": "TestSlowCheckpointPublicationKeepsRaftLive",
+      "result": "pass",
+      "seconds": 4.69
+    },
+    {
+      "name": "TestTLSClientAndPeer/client",
+      "result": "pass",
+      "seconds": 1.87
+    },
+    {
+      "name": "TestTLSClientAndPeer/peer",
+      "result": "pass",
+      "seconds": 0.98
+    },
+    {
+      "name": "TestTLSClientAndPeer/mutual",
+      "result": "pass",
+      "seconds": 2.47
+    },
+    {
+      "name": "TestTLSClientAndPeer",
+      "result": "pass",
+      "seconds": 5.32
+    },
+    {
+      "name": "TestTLSCertificateIdentity",
+      "result": "pass",
+      "seconds": 0.97
+    },
+    {
+      "name": "TestClientMetadataCannotImpersonate",
+      "result": "pass",
+      "seconds": 1.31
+    },
+    {
+      "name": "TestRemoteMembershipRejectsPlaintext",
+      "result": "pass",
+      "seconds": 1.06
+    },
+    {
+      "name": "TestAlarm",
+      "result": "pass",
+      "seconds": 1.81
+    },
+    {
+      "name": "TestAlarmlistOnMemberRestart",
+      "result": "pass",
+      "seconds": 2.75
+    },
+    {
+      "name": "TestAuthEnable",
+      "result": "pass",
+      "seconds": 1.07
+    },
+    {
+      "name": "TestAuthDisable",
+      "result": "pass",
+      "seconds": 1.23
+    },
+    {
+      "name": "TestAuthGracefulDisable",
+      "result": "pass",
+      "seconds": 3.37
+    },
+    {
+      "name": "TestAuthStatus",
+      "result": "pass",
+      "seconds": 1.42
+    },
+    {
+      "name": "TestAuthRoleUpdate",
+      "result": "pass",
+      "seconds": 1.64
+    },
+    {
+      "name": "TestAuthUserDeleteDuringOps",
+      "result": "pass",
+      "seconds": 1.53
+    },
+    {
+      "name": "TestAuthRoleRevokeDuringOps",
+      "result": "pass",
+      "seconds": 1.99
+    },
+    {
+      "name": "TestAuthWriteKey",
+      "result": "pass",
+      "seconds": 1.37
+    },
+    {
+      "name": "TestAuthTxn/NoJWT",
+      "result": "pass",
+      "seconds": 2.05
+    },
+    {
+      "name": "TestAuthTxn/JWT",
+      "result": "pass",
+      "seconds": 1.99
+    },
+    {
+      "name": "TestAuthTxn",
+      "result": "pass",
+      "seconds": 4.03
+    },
+    {
+      "name": "TestAuthPrefixPerm",
+      "result": "pass",
+      "seconds": 1.56
+    },
+    {
+      "name": "TestAuthLeaseKeepAlive",
+      "result": "pass",
+      "seconds": 1.77
+    },
+    {
+      "name": "TestAuthRevokeWithDelete",
+      "result": "pass",
+      "seconds": 1.4
+    },
+    {
+      "name": "TestAuthLeaseTimeToLiveExpired",
+      "result": "pass",
+      "seconds": 4.93
+    },
+    {
+      "name": "TestAuthLeaseGrantLeases/NoJWT",
+      "result": "pass",
+      "seconds": 1.94
+    },
+    {
+      "name": "TestAuthLeaseGrantLeases/JWT",
+      "result": "pass",
+      "seconds": 1.37
+    },
+    {
+      "name": "TestAuthLeaseGrantLeases",
+      "result": "pass",
+      "seconds": 3.31
+    },
+    {
+      "name": "TestAuthMemberAdd",
+      "result": "pass",
+      "seconds": 1.52
+    },
+    {
+      "name": "TestAuthMemberRemove",
+      "result": "pass",
+      "seconds": 1.46
+    },
+    {
+      "name": "TestAuthTestInvalidMgmt",
+      "result": "pass",
+      "seconds": 1.63
+    },
+    {
+      "name": "TestAuthLeaseRevoke",
+      "result": "pass",
+      "seconds": 1.61
+    },
+    {
+      "name": "TestAuthRoleGet",
+      "result": "pass",
+      "seconds": 1.23
+    },
+    {
+      "name": "TestAuthUserGet",
+      "result": "pass",
+      "seconds": 1.13
+    },
+    {
+      "name": "TestAuthRoleList",
+      "result": "pass",
+      "seconds": 1.07
+    },
+    {
+      "name": "TestAuthJWTExpire",
+      "result": "pass",
+      "seconds": 10.39
+    },
+    {
+      "name": "TestAuthRevisionConsistency",
+      "result": "pass",
+      "seconds": 3.18
+    },
+    {
+      "name": "TestAuthTestCacheReload",
+      "result": "pass",
+      "seconds": 2.9
+    },
+    {
+      "name": "TestAuthLeaseTimeToLive",
+      "result": "pass",
+      "seconds": 1.66
+    },
+    {
+      "name": "TestCompact/NoPhysical",
+      "result": "pass",
+      "seconds": 0.97
+    },
+    {
+      "name": "TestCompact/Physical",
+      "result": "pass",
+      "seconds": 1.27
+    },
+    {
+      "name": "TestCompact",
+      "result": "pass",
+      "seconds": 2.24
+    },
+    {
+      "name": "TestDefragOnline",
+      "result": "pass",
+      "seconds": 2
+    },
+    {
+      "name": "TestEndpointStatus",
+      "result": "pass",
+      "seconds": 0.96
+    },
+    {
+      "name": "TestEndpointHashKV",
+      "result": "pass",
+      "seconds": 1.17
+    },
+    {
+      "name": "TestEndpointHealth",
+      "result": "pass",
+      "seconds": 1.24
+    },
+    {
+      "name": "TestKVPut/ThreeVoters",
+      "result": "pass",
+      "seconds": 0.96
+    },
+    {
+      "name": "TestKVPut/SingleVoter",
+      "result": "pass",
+      "seconds": 0.93
+    },
+    {
+      "name": "TestKVPut/PeerTLS",
+      "result": "pass",
+      "seconds": 1.15
+    },
+    {
+      "name": "TestKVPut/ClientTLS",
+      "result": "pass",
+      "seconds": 1.43
+    },
+    {
+      "name": "TestKVPut",
+      "result": "pass",
+      "seconds": 4.47
+    },
+    {
+      "name": "TestKVGet/ThreeVoters",
+      "result": "pass",
+      "seconds": 0.97
+    },
+    {
+      "name": "TestKVGet/SingleVoter",
+      "result": "pass",
+      "seconds": 1.34
+    },
+    {
+      "name": "TestKVGet/PeerTLS",
+      "result": "pass",
+      "seconds": 1.07
+    },
+    {
+      "name": "TestKVGet/ClientTLS",
+      "result": "pass",
+      "seconds": 1.13
+    },
+    {
+      "name": "TestKVGet",
+      "result": "pass",
+      "seconds": 4.51
+    },
+    {
+      "name": "TestKVDelete/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.29
+    },
+    {
+      "name": "TestKVDelete/SingleVoter",
+      "result": "pass",
+      "seconds": 1.14
+    },
+    {
+      "name": "TestKVDelete/PeerTLS",
+      "result": "pass",
+      "seconds": 1
+    },
+    {
+      "name": "TestKVDelete/ClientTLS",
+      "result": "pass",
+      "seconds": 0.94
+    },
+    {
+      "name": "TestKVDelete",
+      "result": "pass",
+      "seconds": 4.38
+    },
+    {
+      "name": "TestKVGetNoQuorum/Serializable",
+      "result": "pass",
+      "seconds": 1.36
+    },
+    {
+      "name": "TestKVGetNoQuorum/Linearizable",
+      "result": "pass",
+      "seconds": 2.35
+    },
+    {
+      "name": "TestKVGetNoQuorum",
+      "result": "pass",
+      "seconds": 3.71
+    },
+    {
+      "name": "TestLeaseGrantTimeToLive/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.06
+    },
+    {
+      "name": "TestLeaseGrantTimeToLive/SingleVoter",
+      "result": "pass",
+      "seconds": 1.12
+    },
+    {
+      "name": "TestLeaseGrantTimeToLive/PeerTLS",
+      "result": "pass",
+      "seconds": 1.06
+    },
+    {
+      "name": "TestLeaseGrantTimeToLive/ClientTLS",
+      "result": "pass",
+      "seconds": 1.44
+    },
+    {
+      "name": "TestLeaseGrantTimeToLive",
+      "result": "pass",
+      "seconds": 4.68
+    },
+    {
+      "name": "TestLeaseGrantAndList/ThreeVoters/no_leases",
+      "result": "pass",
+      "seconds": 1.06
+    },
+    {
+      "name": "TestLeaseGrantAndList/ThreeVoters/one_lease",
+      "result": "pass",
+      "seconds": 1.06
+    },
+    {
+      "name": "TestLeaseGrantAndList/ThreeVoters/many_leases",
+      "result": "pass",
+      "seconds": 0.97
+    },
+    {
+      "name": "TestLeaseGrantAndList/SingleVoter/no_leases",
+      "result": "pass",
+      "seconds": 0.94
+    },
+    {
+      "name": "TestLeaseGrantAndList/SingleVoter/one_lease",
+      "result": "pass",
+      "seconds": 0.94
+    },
+    {
+      "name": "TestLeaseGrantAndList/SingleVoter/many_leases",
+      "result": "pass",
+      "seconds": 1.44
+    },
+    {
+      "name": "TestLeaseGrantAndList/PeerTLS/no_leases",
+      "result": "pass",
+      "seconds": 1.17
+    },
+    {
+      "name": "TestLeaseGrantAndList/PeerTLS/one_lease",
+      "result": "pass",
+      "seconds": 1.27
+    },
+    {
+      "name": "TestLeaseGrantAndList/PeerTLS/many_leases",
+      "result": "pass",
+      "seconds": 1.08
+    },
+    {
+      "name": "TestLeaseGrantAndList/ClientTLS/no_leases",
+      "result": "pass",
+      "seconds": 1.34
+    },
+    {
+      "name": "TestLeaseGrantAndList/ClientTLS/one_lease",
+      "result": "pass",
+      "seconds": 1.64
+    },
+    {
+      "name": "TestLeaseGrantAndList/ClientTLS/many_leases",
+      "result": "pass",
+      "seconds": 1.35
+    },
+    {
+      "name": "TestLeaseGrantAndList",
+      "result": "pass",
+      "seconds": 14.25
+    },
+    {
+      "name": "TestLeaseGrantTimeToLiveExpired/ThreeVoters",
+      "result": "pass",
+      "seconds": 3.95
+    },
+    {
+      "name": "TestLeaseGrantTimeToLiveExpired/SingleVoter",
+      "result": "pass",
+      "seconds": 4.53
+    },
+    {
+      "name": "TestLeaseGrantTimeToLiveExpired/PeerTLS",
+      "result": "pass",
+      "seconds": 4.36
+    },
+    {
+      "name": "TestLeaseGrantTimeToLiveExpired/ClientTLS",
+      "result": "pass",
+      "seconds": 4.54
+    },
+    {
+      "name": "TestLeaseGrantTimeToLiveExpired",
+      "result": "pass",
+      "seconds": 17.38
+    },
+    {
+      "name": "TestLeaseGrantKeepAliveOnce/ThreeVoters",
+      "result": "pass",
+      "seconds": 3.07
+    },
+    {
+      "name": "TestLeaseGrantKeepAliveOnce/SingleVoter",
+      "result": "pass",
+      "seconds": 3.14
+    },
+    {
+      "name": "TestLeaseGrantKeepAliveOnce/PeerTLS",
+      "result": "pass",
+      "seconds": 3.38
+    },
+    {
+      "name": "TestLeaseGrantKeepAliveOnce/ClientTLS",
+      "result": "pass",
+      "seconds": 3.04
+    },
+    {
+      "name": "TestLeaseGrantKeepAliveOnce",
+      "result": "pass",
+      "seconds": 12.63
+    },
+    {
+      "name": "TestLeaseGrantRevoke/ThreeVoters",
+      "result": "pass",
+      "seconds": 0.95
+    },
+    {
+      "name": "TestLeaseGrantRevoke/SingleVoter",
+      "result": "pass",
+      "seconds": 1.13
+    },
+    {
+      "name": "TestLeaseGrantRevoke/PeerTLS",
+      "result": "pass",
+      "seconds": 1.27
+    },
+    {
+      "name": "TestLeaseGrantRevoke/ClientTLS",
+      "result": "pass",
+      "seconds": 1.54
+    },
+    {
+      "name": "TestLeaseGrantRevoke",
+      "result": "pass",
+      "seconds": 4.89
+    },
+    {
+      "name": "TestDefragmentWithNoAuth",
+      "result": "pass",
+      "seconds": 2.09
+    },
+    {
+      "name": "TestDefragmentWithInvalidAuth",
+      "result": "pass",
+      "seconds": 1.09
+    },
+    {
+      "name": "TestDefragmentWithRootAuth",
+      "result": "pass",
+      "seconds": 2.73
+    },
+    {
+      "name": "TestDefragmentWithUserAuth",
+      "result": "pass",
+      "seconds": 2.65
+    },
+    {
+      "name": "TestDowngradeWithNoAuth",
+      "result": "pass",
+      "seconds": 2.3
+    },
+    {
+      "name": "TestDowngradeWithInvalidAuth",
+      "result": "pass",
+      "seconds": 1.17
+    },
+    {
+      "name": "TestDowngradeWithRootAuth",
+      "result": "pass",
+      "seconds": 2.35
+    },
+    {
+      "name": "TestDowngradeWithUserAuth",
+      "result": "pass",
+      "seconds": 2.69
+    },
+    {
+      "name": "TestHashKVWithNoAuth",
+      "result": "pass",
+      "seconds": 2.3
+    },
+    {
+      "name": "TestHashKVWithInvalidAuth",
+      "result": "pass",
+      "seconds": 1.77
+    },
+    {
+      "name": "TestHashKVWithRootAuth",
+      "result": "pass",
+      "seconds": 2.32
+    },
+    {
+      "name": "TestHashKVWithUserAuth",
+      "result": "pass",
+      "seconds": 2.57
+    },
+    {
+      "name": "TestMoveLeaderWithNoAuth",
+      "result": "pass",
+      "seconds": 2.26
+    },
+    {
+      "name": "TestMoveLeaderWithInvalidAuth",
+      "result": "pass",
+      "seconds": 1.25
+    },
+    {
+      "name": "TestMoveLeaderWithRootAuth",
+      "result": "pass",
+      "seconds": 2.4
+    },
+    {
+      "name": "TestMoveLeaderWithUserAuth",
+      "result": "pass",
+      "seconds": 2.13
+    },
+    {
+      "name": "TestSnapshotWithNoAuth",
+      "result": "pass",
+      "seconds": 2.2
+    },
+    {
+      "name": "TestSnapshotWithInvalidAuth",
+      "result": "pass",
+      "seconds": 1.59
+    },
+    {
+      "name": "TestSnapshotWithRootAuth",
+      "result": "pass",
+      "seconds": 2.59
+    },
+    {
+      "name": "TestSnapshotWithUserAuth",
+      "result": "pass",
+      "seconds": 2.24
+    },
+    {
+      "name": "TestStatusWithNoAuth",
+      "result": "pass",
+      "seconds": 2.09
+    },
+    {
+      "name": "TestStatusWithInvalidAuth",
+      "result": "pass",
+      "seconds": 1.28
+    },
+    {
+      "name": "TestStatusWithRootAuth",
+      "result": "pass",
+      "seconds": 2.58
+    },
+    {
+      "name": "TestStatusWithUserAuth",
+      "result": "pass",
+      "seconds": 2.19
+    },
+    {
+      "name": "TestMemberList/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.18
+    },
+    {
+      "name": "TestMemberList/SingleVoter",
+      "result": "pass",
+      "seconds": 1.65
+    },
+    {
+      "name": "TestMemberList/PeerTLS",
+      "result": "pass",
+      "seconds": 1.19
+    },
+    {
+      "name": "TestMemberList/ClientTLS",
+      "result": "pass",
+      "seconds": 1.96
+    },
+    {
+      "name": "TestMemberList",
+      "result": "pass",
+      "seconds": 5.97
+    },
+    {
+      "name": "TestMemberAdd/NotLearner/StrictReconfigCheck/WaitForQuorum/ThreeVoters",
+      "result": "pass",
+      "seconds": 6.08
+    },
+    {
+      "name": "TestMemberAdd/NotLearner/StrictReconfigCheck/WaitForQuorum/SingleVoter",
+      "result": "pass",
+      "seconds": 6.46
+    },
+    {
+      "name": "TestMemberAdd/NotLearner/StrictReconfigCheck/WaitForQuorum/PeerTLS",
+      "result": "pass",
+      "seconds": 6.3
+    },
+    {
+      "name": "TestMemberAdd/NotLearner/StrictReconfigCheck/WaitForQuorum/ClientTLS",
+      "result": "pass",
+      "seconds": 6.15
+    },
+    {
+      "name": "TestMemberAdd/NotLearner/StrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.48
+    },
+    {
+      "name": "TestMemberAdd/NotLearner/StrictReconfigCheck/NoWaitForQuorum/SingleVoter",
+      "result": "pass",
+      "seconds": 1.64
+    },
+    {
+      "name": "TestMemberAdd/NotLearner/StrictReconfigCheck/NoWaitForQuorum/PeerTLS",
+      "result": "pass",
+      "seconds": 1.09
+    },
+    {
+      "name": "TestMemberAdd/NotLearner/StrictReconfigCheck/NoWaitForQuorum/ClientTLS",
+      "result": "pass",
+      "seconds": 0.95
+    },
+    {
+      "name": "TestMemberAdd/NotLearner/DisableStrictReconfigCheck/WaitForQuorum/ThreeVoters",
+      "result": "pass",
+      "seconds": 6.38
+    },
+    {
+      "name": "TestMemberAdd/NotLearner/DisableStrictReconfigCheck/WaitForQuorum/SingleVoter",
+      "result": "pass",
+      "seconds": 6.65
+    },
+    {
+      "name": "TestMemberAdd/NotLearner/DisableStrictReconfigCheck/WaitForQuorum/PeerTLS",
+      "result": "pass",
+      "seconds": 6.38
+    },
+    {
+      "name": "TestMemberAdd/NotLearner/DisableStrictReconfigCheck/WaitForQuorum/ClientTLS",
+      "result": "pass",
+      "seconds": 6.65
+    },
+    {
+      "name": "TestMemberAdd/NotLearner/DisableStrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.28
+    },
+    {
+      "name": "TestMemberAdd/NotLearner/DisableStrictReconfigCheck/NoWaitForQuorum/SingleVoter",
+      "result": "pass",
+      "seconds": 1.35
+    },
+    {
+      "name": "TestMemberAdd/NotLearner/DisableStrictReconfigCheck/NoWaitForQuorum/PeerTLS",
+      "result": "pass",
+      "seconds": 0.99
+    },
+    {
+      "name": "TestMemberAdd/NotLearner/DisableStrictReconfigCheck/NoWaitForQuorum/ClientTLS",
+      "result": "pass",
+      "seconds": 1.65
+    },
+    {
+      "name": "TestMemberAdd/Learner/StrictReconfigCheck/WaitForQuorum/ThreeVoters",
+      "result": "pass",
+      "seconds": 5.98
+    },
+    {
+      "name": "TestMemberAdd/Learner/StrictReconfigCheck/WaitForQuorum/SingleVoter",
+      "result": "pass",
+      "seconds": 6.56
+    },
+    {
+      "name": "TestMemberAdd/Learner/StrictReconfigCheck/WaitForQuorum/PeerTLS",
+      "result": "pass",
+      "seconds": 6.29
+    },
+    {
+      "name": "TestMemberAdd/Learner/StrictReconfigCheck/WaitForQuorum/ClientTLS",
+      "result": "pass",
+      "seconds": 6.35
+    },
+    {
+      "name": "TestMemberAdd/Learner/StrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+      "result": "pass",
+      "seconds": 0.98
+    },
+    {
+      "name": "TestMemberAdd/Learner/StrictReconfigCheck/NoWaitForQuorum/SingleVoter",
+      "result": "pass",
+      "seconds": 1.14
+    },
+    {
+      "name": "TestMemberAdd/Learner/StrictReconfigCheck/NoWaitForQuorum/PeerTLS",
+      "result": "pass",
+      "seconds": 1.49
+    },
+    {
+      "name": "TestMemberAdd/Learner/StrictReconfigCheck/NoWaitForQuorum/ClientTLS",
+      "result": "pass",
+      "seconds": 1.35
+    },
+    {
+      "name": "TestMemberAdd/Learner/DisableStrictReconfigCheck/WaitForQuorum/ThreeVoters",
+      "result": "pass",
+      "seconds": 6.29
+    },
+    {
+      "name": "TestMemberAdd/Learner/DisableStrictReconfigCheck/WaitForQuorum/SingleVoter",
+      "result": "pass",
+      "seconds": 6.25
+    },
+    {
+      "name": "TestMemberAdd/Learner/DisableStrictReconfigCheck/WaitForQuorum/PeerTLS",
+      "result": "pass",
+      "seconds": 5.98
+    },
+    {
+      "name": "TestMemberAdd/Learner/DisableStrictReconfigCheck/WaitForQuorum/ClientTLS",
+      "result": "pass",
+      "seconds": 6.15
+    },
+    {
+      "name": "TestMemberAdd/Learner/DisableStrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.05
+    },
+    {
+      "name": "TestMemberAdd/Learner/DisableStrictReconfigCheck/NoWaitForQuorum/SingleVoter",
+      "result": "pass",
+      "seconds": 1.54
+    },
+    {
+      "name": "TestMemberAdd/Learner/DisableStrictReconfigCheck/NoWaitForQuorum/PeerTLS",
+      "result": "pass",
+      "seconds": 1.49
+    },
+    {
+      "name": "TestMemberAdd/Learner/DisableStrictReconfigCheck/NoWaitForQuorum/ClientTLS",
+      "result": "pass",
+      "seconds": 1.75
+    },
+    {
+      "name": "TestMemberAdd",
+      "result": "pass",
+      "seconds": 122.09
+    },
+    {
+      "name": "TestMemberRemove/StrictReconfigCheck/WaitForQuorum/ThreeVoters",
+      "result": "pass",
+      "seconds": 8.49
+    },
+    {
+      "name": "TestMemberRemove/StrictReconfigCheck/WaitForQuorum/SingleVoter",
+      "result": "pass",
+      "seconds": 7.94
+    },
+    {
+      "name": "TestMemberRemove/StrictReconfigCheck/WaitForQuorum/PeerTLS",
+      "result": "pass",
+      "seconds": 8.27
+    },
+    {
+      "name": "TestMemberRemove/StrictReconfigCheck/WaitForQuorum/ClientTLS",
+      "result": "pass",
+      "seconds": 8.44
+    },
+    {
+      "name": "TestMemberRemove/StrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.38
+    },
+    {
+      "name": "TestMemberRemove/StrictReconfigCheck/NoWaitForQuorum/SingleVoter",
+      "result": "pass",
+      "seconds": 1.84
+    },
+    {
+      "name": "TestMemberRemove/StrictReconfigCheck/NoWaitForQuorum/PeerTLS",
+      "result": "pass",
+      "seconds": 1.27
+    },
+    {
+      "name": "TestMemberRemove/StrictReconfigCheck/NoWaitForQuorum/ClientTLS",
+      "result": "pass",
+      "seconds": 1.23
+    },
+    {
+      "name": "TestMemberRemove/DisableStrictReconfigCheck/WaitForQuorum/ThreeVoters",
+      "result": "pass",
+      "seconds": 8.26
+    },
+    {
+      "name": "TestMemberRemove/DisableStrictReconfigCheck/WaitForQuorum/PeerTLS",
+      "result": "pass",
+      "seconds": 7.98
+    },
+    {
+      "name": "TestMemberRemove/DisableStrictReconfigCheck/NoWaitForQuorum/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.08
+    },
+    {
+      "name": "TestMemberRemove/DisableStrictReconfigCheck/NoWaitForQuorum/PeerTLS",
+      "result": "pass",
+      "seconds": 1.38
+    },
+    {
+      "name": "TestMemberRemove",
+      "result": "pass",
+      "seconds": 57.57
+    },
+    {
+      "name": "TestRoleAdd_Simple/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.08
+    },
+    {
+      "name": "TestRoleAdd_Simple/SingleVoter",
+      "result": "pass",
+      "seconds": 0.95
+    },
+    {
+      "name": "TestRoleAdd_Simple/PeerTLS",
+      "result": "pass",
+      "seconds": 1.07
+    },
+    {
+      "name": "TestRoleAdd_Simple/ClientTLS",
+      "result": "pass",
+      "seconds": 1.03
+    },
+    {
+      "name": "TestRoleAdd_Simple",
+      "result": "pass",
+      "seconds": 4.13
+    },
+    {
+      "name": "TestRoleAdd_Error",
+      "result": "pass",
+      "seconds": 1.74
+    },
+    {
+      "name": "TestRootRole",
+      "result": "pass",
+      "seconds": 1.05
+    },
+    {
+      "name": "TestRoleGrantRevokePermission",
+      "result": "pass",
+      "seconds": 1.24
+    },
+    {
+      "name": "TestRoleDelete",
+      "result": "pass",
+      "seconds": 1.83
+    },
+    {
+      "name": "TestStatus/ThreeVoters",
+      "result": "pass",
+      "seconds": 0.95
+    },
+    {
+      "name": "TestStatus/SingleVoter",
+      "result": "pass",
+      "seconds": 1.83
+    },
+    {
+      "name": "TestStatus/PeerTLS",
+      "result": "pass",
+      "seconds": 1.08
+    },
+    {
+      "name": "TestStatus/ClientTLS",
+      "result": "pass",
+      "seconds": 1.65
+    },
+    {
+      "name": "TestStatus",
+      "result": "pass",
+      "seconds": 5.51
+    },
+    {
+      "name": "TestTxnSucc/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.27
+    },
+    {
+      "name": "TestTxnSucc/SingleVoter",
+      "result": "pass",
+      "seconds": 1.14
+    },
+    {
+      "name": "TestTxnSucc/PeerTLS",
+      "result": "pass",
+      "seconds": 1.38
+    },
+    {
+      "name": "TestTxnSucc/ClientTLS",
+      "result": "pass",
+      "seconds": 1.56
+    },
+    {
+      "name": "TestTxnSucc",
+      "result": "pass",
+      "seconds": 5.36
+    },
+    {
+      "name": "TestTxnFail/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.75
+    },
+    {
+      "name": "TestTxnFail/SingleVoter",
+      "result": "pass",
+      "seconds": 1.74
+    },
+    {
+      "name": "TestTxnFail/PeerTLS",
+      "result": "pass",
+      "seconds": 1.09
+    },
+    {
+      "name": "TestTxnFail/ClientTLS",
+      "result": "pass",
+      "seconds": 0.94
+    },
+    {
+      "name": "TestTxnFail",
+      "result": "pass",
+      "seconds": 5.53
+    },
+    {
+      "name": "TestUserAdd_Simple/ThreeVoters/empty_username_not_allowed",
+      "result": "pass",
+      "seconds": 1.03
+    },
+    {
+      "name": "TestUserAdd_Simple/ThreeVoters/no_password_with_noPassword_set",
+      "result": "pass",
+      "seconds": 1.28
+    },
+    {
+      "name": "TestUserAdd_Simple/ThreeVoters/no_password_without_noPassword_set",
+      "result": "pass",
+      "seconds": 1.33
+    },
+    {
+      "name": "TestUserAdd_Simple/ThreeVoters/regular_user_with_password",
+      "result": "pass",
+      "seconds": 1.1
+    },
+    {
+      "name": "TestUserAdd_Simple/SingleVoter/empty_username_not_allowed",
+      "result": "pass",
+      "seconds": 1.4
+    },
+    {
+      "name": "TestUserAdd_Simple/SingleVoter/no_password_with_noPassword_set",
+      "result": "pass",
+      "seconds": 1.33
+    },
+    {
+      "name": "TestUserAdd_Simple/SingleVoter/no_password_without_noPassword_set",
+      "result": "pass",
+      "seconds": 1.08
+    },
+    {
+      "name": "TestUserAdd_Simple/SingleVoter/regular_user_with_password",
+      "result": "pass",
+      "seconds": 1.27
+    },
+    {
+      "name": "TestUserAdd_Simple/PeerTLS/empty_username_not_allowed",
+      "result": "pass",
+      "seconds": 1
+    },
+    {
+      "name": "TestUserAdd_Simple/PeerTLS/no_password_with_noPassword_set",
+      "result": "pass",
+      "seconds": 1.34
+    },
+    {
+      "name": "TestUserAdd_Simple/PeerTLS/no_password_without_noPassword_set",
+      "result": "pass",
+      "seconds": 1.33
+    },
+    {
+      "name": "TestUserAdd_Simple/PeerTLS/regular_user_with_password",
+      "result": "pass",
+      "seconds": 1.04
+    },
+    {
+      "name": "TestUserAdd_Simple/ClientTLS/empty_username_not_allowed",
+      "result": "pass",
+      "seconds": 1
+    },
+    {
+      "name": "TestUserAdd_Simple/ClientTLS/no_password_with_noPassword_set",
+      "result": "pass",
+      "seconds": 1.13
+    },
+    {
+      "name": "TestUserAdd_Simple/ClientTLS/no_password_without_noPassword_set",
+      "result": "pass",
+      "seconds": 1.19
+    },
+    {
+      "name": "TestUserAdd_Simple/ClientTLS/regular_user_with_password",
+      "result": "pass",
+      "seconds": 1.81
+    },
+    {
+      "name": "TestUserAdd_Simple",
+      "result": "pass",
+      "seconds": 19.65
+    },
+    {
+      "name": "TestUserAdd_DuplicateUserNotAllowed/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.55
+    },
+    {
+      "name": "TestUserAdd_DuplicateUserNotAllowed/SingleVoter",
+      "result": "pass",
+      "seconds": 1.62
+    },
+    {
+      "name": "TestUserAdd_DuplicateUserNotAllowed/PeerTLS",
+      "result": "pass",
+      "seconds": 1.36
+    },
+    {
+      "name": "TestUserAdd_DuplicateUserNotAllowed/ClientTLS",
+      "result": "pass",
+      "seconds": 1.82
+    },
+    {
+      "name": "TestUserAdd_DuplicateUserNotAllowed",
+      "result": "pass",
+      "seconds": 6.36
+    },
+    {
+      "name": "TestUserList/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.11
+    },
+    {
+      "name": "TestUserList/SingleVoter",
+      "result": "pass",
+      "seconds": 1.68
+    },
+    {
+      "name": "TestUserList/PeerTLS",
+      "result": "pass",
+      "seconds": 1
+    },
+    {
+      "name": "TestUserList/ClientTLS",
+      "result": "pass",
+      "seconds": 1.08
+    },
+    {
+      "name": "TestUserList",
+      "result": "pass",
+      "seconds": 4.86
+    },
+    {
+      "name": "TestUserDelete/ThreeVoters",
+      "result": "pass",
+      "seconds": 1
+    },
+    {
+      "name": "TestUserDelete/SingleVoter",
+      "result": "pass",
+      "seconds": 0.98
+    },
+    {
+      "name": "TestUserDelete/PeerTLS",
+      "result": "pass",
+      "seconds": 1.41
+    },
+    {
+      "name": "TestUserDelete/ClientTLS",
+      "result": "pass",
+      "seconds": 1.48
+    },
+    {
+      "name": "TestUserDelete",
+      "result": "pass",
+      "seconds": 4.87
+    },
+    {
+      "name": "TestUserChangePassword/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.1
+    },
+    {
+      "name": "TestUserChangePassword/SingleVoter",
+      "result": "pass",
+      "seconds": 1.97
+    },
+    {
+      "name": "TestUserChangePassword/PeerTLS",
+      "result": "pass",
+      "seconds": 1.6
+    },
+    {
+      "name": "TestUserChangePassword/ClientTLS",
+      "result": "pass",
+      "seconds": 1.67
+    },
+    {
+      "name": "TestUserChangePassword",
+      "result": "pass",
+      "seconds": 6.33
+    },
+    {
+      "name": "TestWaitLeader/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.35
+    },
+    {
+      "name": "TestWaitLeader/SingleVoter",
+      "result": "pass",
+      "seconds": 1.12
+    },
+    {
+      "name": "TestWaitLeader/PeerTLS",
+      "result": "pass",
+      "seconds": 1.55
+    },
+    {
+      "name": "TestWaitLeader/ClientTLS",
+      "result": "pass",
+      "seconds": 1.43
+    },
+    {
+      "name": "TestWaitLeader",
+      "result": "pass",
+      "seconds": 5.45
+    },
+    {
+      "name": "TestWaitLeader_MemberStop/PeerTLS",
+      "result": "pass",
+      "seconds": 3.26
+    },
+    {
+      "name": "TestWaitLeader_MemberStop/PeerAutoTLS",
+      "result": "pass",
+      "seconds": 2.67
+    },
+    {
+      "name": "TestWaitLeader_MemberStop",
+      "result": "pass",
+      "seconds": 5.92
+    },
+    {
+      "name": "TestWatch/ThreeVoters",
+      "result": "pass",
+      "seconds": 1.36
+    },
+    {
+      "name": "TestWatch/SingleVoter",
+      "result": "pass",
+      "seconds": 1.43
+    },
+    {
+      "name": "TestWatch/PeerTLS",
+      "result": "pass",
+      "seconds": 0.97
+    },
+    {
+      "name": "TestWatch/ClientTLS",
+      "result": "pass",
+      "seconds": 0.93
+    },
+    {
+      "name": "TestWatch",
+      "result": "pass",
+      "seconds": 4.68
+    },
+    {
+      "name": "TestDifferentialLease/grant",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/duplicate",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/second",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/too_large",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/negative_id",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/minimum",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/revoke_minimum",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/attach_a",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/attach_b",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/keys",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/reassign",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/ignore_lease",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/old_keys",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/new_keys",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/compare",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/rollback",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/rollback_absent",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/detach",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/revoke_old",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/detached_survives",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/revoke_new",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/attached_deleted",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/missing_ttl",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/missing_revoke",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/list",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease",
+      "result": "pass",
+      "seconds": 1.9
+    },
+    {
+      "name": "TestDifferentialWatch/order_and_previous",
+      "result": "pass",
+      "seconds": 0.09
+    },
+    {
+      "name": "TestDifferentialWatch/no_put",
+      "result": "pass",
+      "seconds": 0.1
+    },
+    {
+      "name": "TestDifferentialWatch/no_delete",
+      "result": "pass",
+      "seconds": 0.1
+    },
+    {
+      "name": "TestDifferentialWatch/exact",
+      "result": "pass",
+      "seconds": 0.1
+    },
+    {
+      "name": "TestDifferentialWatch/range",
+      "result": "pass",
+      "seconds": 0.1
+    },
+    {
+      "name": "TestDifferentialWatch",
+      "result": "pass",
+      "seconds": 3.02
+    },
+    {
+      "name": "TestWatchLeaseRestartAndSnapshot",
+      "result": "pass",
+      "seconds": 4.31
+    },
+    {
+      "name": "TestWatchStreamControls/service",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestWatchStreamControls/etcd",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestWatchStreamControls",
+      "result": "pass",
+      "seconds": 1.86
+    },
+    {
+      "name": "TestWatchLeaseKeepAliveAndLeaderFailure",
+      "result": "pass",
+      "seconds": 18.38
+    },
+    {
+      "name": "TestWatchLeaseMinorityCannotRenew",
+      "result": "pass",
+      "seconds": 4.35
+    },
+    {
+      "name": "TestWatchCatchupProgressAndFragmentation",
+      "result": "pass",
+      "seconds": 1.28
+    },
+    {
+      "name": "FuzzKVSequence/seed#0",
+      "result": "pass",
+      "seconds": 1.95
+    },
+    {
+      "name": "FuzzKVSequence/seed#1",
+      "result": "pass",
+      "seconds": 2.58
+    },
+    {
+      "name": "FuzzKVSequence/seed#2",
+      "result": "pass",
+      "seconds": 2.05
+    },
+    {
+      "name": "FuzzKVSequence",
+      "result": "pass",
+      "seconds": 6.58
+    }
+  ],
+  "counts": {
+    "pass": 439
+  },
+  "leaf_counts": {
+    "pass": 395
+  },
+  "passed": true,
+  "complete": true
+}
