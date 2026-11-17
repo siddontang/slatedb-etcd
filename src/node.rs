@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -15,8 +15,13 @@ use crate::state::StateMachine;
 use crate::storage::RaftStorage;
 use crate::{ApiError, Command, RaftCommand, Request};
 
+mod apply;
+use apply::{AppliedState, Completion, Header, Job, Output, Query, Reply, Work, Worker};
+
 #[cfg(test)]
 mod dst;
+#[cfg(test)]
+mod tests;
 
 pub type Response = oneshot::Sender<Result<Value, ApiError>>;
 
@@ -42,6 +47,7 @@ pub enum Event {
         result: Result<Vec<u8>>,
     },
     SnapshotDelay(u64, Response),
+    ApplyDelay(u64, Response),
     NetworkResult {
         peer: u64,
         snapshot: bool,
@@ -60,11 +66,18 @@ pub struct NodeOptions {
 struct Pending {
     response: Response,
     started: Instant,
+    term: u64,
 }
 
 pub struct Node {
     raw: RawNode<RaftStorage>,
-    state: StateMachine,
+    state: AppliedState,
+    worker: Worker,
+    apply_busy: bool,
+    apply_target: u64,
+    queries: VecDeque<Query>,
+    prefer_query: bool,
+    apply_delay_ms: u64,
     options: NodeOptions,
     senders: BTreeMap<u64, mpsc::Sender<Message>>,
     pending: HashMap<String, Pending>,
@@ -72,7 +85,6 @@ pub struct Node {
     installed_snapshots: u64,
     recovered_from_index: u64,
     send_failures: Vec<(u64, bool)>,
-    events: mpsc::Sender<Event>,
     checkpoint_running: bool,
     checkpoint_waiters: Vec<(u64, Response)>,
     snapshot_delay_ms: u64,
@@ -128,11 +140,13 @@ impl Node {
             max_size_per_msg: 1024 * 1024,
             max_inflight_msgs: 64,
             max_uncommitted_size: 16 * 1024 * 1024,
+            max_committed_size_per_ready: apply::BATCH_BYTES,
             ..Config::default()
         };
         config.validate()?;
         let logger = slog::Logger::root(slog::Discard, slog::o!());
         let raw = RawNode::new(&config, storage, &logger)?;
+        let manual_apply = transport_override.is_some();
         let senders = if let Some(senders) = transport_override {
             senders
         } else {
@@ -153,9 +167,17 @@ impl Node {
             }
             senders
         };
+        let applied = AppliedState::from(&state);
+        let worker = Worker::start(state, events.clone(), manual_apply);
         Ok(Self {
             raw,
-            state,
+            apply_target: applied.applied,
+            state: applied,
+            worker,
+            apply_busy: false,
+            queries: VecDeque::new(),
+            prefer_query: false,
+            apply_delay_ms: 0,
             options,
             senders,
             pending: HashMap::new(),
@@ -163,7 +185,6 @@ impl Node {
             installed_snapshots: 0,
             recovered_from_index,
             send_failures: vec![],
-            events,
             checkpoint_running: false,
             checkpoint_waiters: vec![],
             snapshot_delay_ms: 0,
@@ -174,7 +195,7 @@ impl Node {
     }
 
     pub async fn run(mut self, mut events: mpsc::Receiver<Event>) -> Result<()> {
-        // Replay committed durable entries before this process accepts client work.
+        // Schedule committed log recovery before accepting client work.
         self.drive_ready().await?;
         let mut ticks = tokio::time::interval(Duration::from_millis(100));
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -187,6 +208,7 @@ impl Node {
             let mut step_responses = vec![];
             tokio::select! {
                 _ = ticks.tick() => { self.raw.tick(); self.expire_leases()?; }
+                completed = self.worker.next() => { self.complete_apply(completed?)?; }
                 event = events.recv() => {
                     let Some(event) = event else { return Ok(()); };
                     self.handle(event, &mut step_responses).await?;
@@ -247,9 +269,7 @@ impl Node {
                 )?;
             }
             Event::EtcdRead(request, response) => {
-                let mut outcome = self.state.read_etcd(&request).await?;
-                self.fill_etcd_header(&mut outcome);
-                let _ = response.send(Ok(serde_json::to_value(outcome)?));
+                self.enqueue_query(Query::Read(request, response));
             }
             Event::EtcdCompact(compact, response) => {
                 self.propose(
@@ -280,12 +300,7 @@ impl Node {
                 if require_leader && self.raw.raft.leader_id == 0 {
                     let _ = response.send(Err(self.error("no leader")));
                 } else {
-                    let mut page = self.state.watch(&request, through).await?;
-                    self.fill_header(page.header.as_mut());
-                    for response in &mut page.responses {
-                        self.fill_header(response.header.as_mut());
-                    }
-                    let _ = response.send(Ok(serde_json::to_value(page)?));
+                    self.enqueue_query(Query::Watch(request, require_leader, through, response));
                 }
             }
             Event::Step(message, response) => {
@@ -308,8 +323,13 @@ impl Node {
                 let _ = response.send(Ok(self.status()?));
             }
             Event::Checkpoint(response) => {
-                self.checkpoint_waiters.push((self.state.applied, response));
-                self.start_checkpoint()?;
+                if self.checkpoint_waiters.len() >= apply::MAX_QUERIES {
+                    let _ = response.send(Err(self.error("too many checkpoint requests")));
+                } else {
+                    self.checkpoint_waiters
+                        .push((self.raw.store().commit_index(), response));
+                    self.schedule_apply()?;
+                }
             }
             Event::SnapshotBuilt { index, result } => {
                 self.checkpoint_running = false;
@@ -328,11 +348,12 @@ impl Node {
                 self.snapshot_delay_ms = delay_ms.min(5000);
                 let _ = response.send(Ok(self.status()?));
             }
+            Event::ApplyDelay(delay_ms, response) => {
+                self.apply_delay_ms = delay_ms.min(5000);
+                let _ = response.send(Ok(self.status()?));
+            }
             Event::LocalValue(key, response) => {
-                let value = self.state.local_value(&key).await?;
-                let _ = response.send(Ok(
-                    json!({"value": value, "applied_index": self.state.applied}),
-                ));
+                self.enqueue_query(Query::Local(key, response));
             }
             Event::BlockPeers(peers, response) => {
                 self.blocked = peers;
@@ -368,21 +389,17 @@ impl Node {
             self.raw
                 .mut_store()
                 .persist(ready.entries(), ready.hs(), snapshot.as_ref())?;
-            if let Some(snapshot) = snapshot {
-                self.state.install_snapshot(&snapshot).await?;
-                self.installed_snapshots += 1;
-            }
             // This baseline persists before sending even the messages that Raft can send early.
             self.send(ready.take_messages());
             self.send(ready.take_persisted_messages());
-            self.apply(ready.take_committed_entries()).await?;
+            // The durable log holds apply backlog while the worker is busy.
+            drop(ready.take_committed_entries());
             let mut light = self.raw.advance_append(ready);
             if let Some(commit) = light.commit_index() {
                 self.raw.mut_store().persist_commit(commit)?;
             }
             self.send(light.take_messages());
-            self.apply(light.take_committed_entries()).await?;
-            self.raw.advance_apply_to(self.state.applied);
+            drop(light.take_committed_entries());
             // Report local send failures only after the Ready has been advanced.
             for (peer, snapshot) in std::mem::take(&mut self.send_failures) {
                 self.raw.report_unreachable(peer);
@@ -391,69 +408,159 @@ impl Node {
                 }
             }
         }
+        self.schedule_apply()?;
         Ok(())
     }
 
-    async fn apply(&mut self, entries: Vec<Entry>) -> Result<()> {
-        for entry in entries {
-            if entry.index <= self.state.applied {
-                continue;
+    fn enqueue_query(&mut self, query: Query) {
+        if self.queries.len() >= apply::MAX_QUERIES {
+            query.reject(self.error("too many queued state reads"));
+        } else {
+            self.queries.push_back(query);
+        }
+    }
+
+    fn submit_apply(&mut self, job: Job, target: u64) -> Result<()> {
+        ensure!(!self.apply_busy, "apply worker already has a job");
+        self.worker.submit(Work {
+            job,
+            header: self.header(),
+            delay: Duration::from_millis(self.apply_delay_ms),
+        })?;
+        self.apply_busy = true;
+        self.apply_target = target;
+        Ok(())
+    }
+
+    fn schedule_apply(&mut self) -> Result<()> {
+        if self.apply_busy {
+            return Ok(());
+        }
+        let snapshot_index = self.raw.store().snapshot_index();
+        if self.state.applied < snapshot_index {
+            return self.submit_apply(
+                Job::Snapshot(self.raw.store().recovery_snapshot().clone()),
+                snapshot_index,
+            );
+        }
+        let checkpoint_due = self
+            .checkpoint_waiters
+            .iter()
+            .any(|(index, _)| *index <= self.state.applied)
+            || (self.options.snapshot_every > 0
+                && self.state.applied.saturating_sub(snapshot_index)
+                    >= self.options.snapshot_every);
+        if checkpoint_due && !self.checkpoint_running && self.state.applied > snapshot_index {
+            return self.start_checkpoint();
+        }
+        if self.prefer_query {
+            if let Some(query) = self.queries.pop_front() {
+                self.prefer_query = false;
+                return self.submit_apply(Job::Query(query), self.state.applied);
             }
+        }
+        if self.state.applied < self.raw.store().commit_index() {
+            let low = self.state.applied + 1;
+            let high = (low + apply::BATCH_ENTRIES).min(self.raw.store().commit_index() + 1);
+            let entries = self.raw.store().entries(
+                low,
+                high,
+                Some(apply::BATCH_BYTES),
+                raft::GetEntriesContext::empty(false),
+            )?;
+            let target = entries.last().context("empty apply batch")?.index;
             ensure!(
-                entry.index <= self.raw.store().commit_index(),
+                target <= self.raw.store().commit_index(),
                 "apply exceeds durable commit"
             );
-            ensure!(
-                entry.get_entry_type() == EntryType::EntryNormal,
-                "membership changes are not supported"
-            );
-            if entry.data.is_empty() {
-                self.state.apply(entry.index, None).await?;
-                continue;
-            }
-            let command: RaftCommand = serde_json::from_slice(&entry.data)?;
-            let reply = match &command {
-                RaftCommand::Legacy(command) => {
-                    serde_json::to_value(self.state.apply(entry.index, Some(command)).await?)?
-                }
-                RaftCommand::Etcd { etcd, .. } => {
-                    let mut outcome = self.state.apply_etcd(entry.index, etcd).await?;
-                    self.fill_etcd_header(&mut outcome);
-                    serde_json::to_value(outcome)?
-                }
-                RaftCommand::Lease { lease, .. } => {
-                    let mut outcome = self.state.apply_lease(entry.index, lease).await?;
-                    if let LeaseCommand::Expire { id, generation } = lease {
-                        self.lease_expiring.remove(&(*id, *generation));
+            self.prefer_query = true;
+            return self.submit_apply(Job::Entries(entries), target);
+        }
+        if let Some(query) = self.queries.pop_front() {
+            return self.submit_apply(Job::Query(query), self.state.applied);
+        }
+        Ok(())
+    }
+
+    fn complete_apply(&mut self, completed: Completion) -> Result<()> {
+        ensure!(self.apply_busy, "unexpected apply completion");
+        ensure!(
+            completed.state.applied == self.apply_target,
+            "apply completion has the wrong index"
+        );
+        ensure!(
+            completed.state.applied >= self.state.applied,
+            "apply position regressed"
+        );
+        ensure!(
+            completed.state.applied <= self.raw.store().commit_index(),
+            "apply completion exceeds durable commit"
+        );
+        let durable = self
+            .state
+            .durable_applied
+            .max(completed.state.durable_applied);
+        self.state = completed.state;
+        self.state.durable_applied = durable;
+        self.apply_busy = false;
+        self.raw.advance_apply_to(self.state.applied);
+        self.sync_lease_deadlines();
+        self.expire_pending();
+        match completed.output {
+            Output::Entries(replies) => {
+                for command in replies {
+                    if let Some(LeaseCommand::Expire { id, generation }) = command.lease {
+                        self.lease_expiring.remove(&(id, generation));
                     }
-                    self.sync_lease_deadlines();
-                    if let Ok(response) = &mut outcome.result {
-                        if let LeaseReply::TimeToLive(response) = response {
-                            if response.ttl >= 0 {
-                                if let Some((_, deadline)) = self.lease_deadlines.get(&response.id)
-                                {
-                                    response.ttl = deadline
-                                        .saturating_duration_since(Instant::now())
-                                        .as_secs()
-                                        as i64;
+                    if let Some(pending) = self.pending.remove(&command.id) {
+                        let reply = match command.reply {
+                            Reply::Encoded(value) => value,
+                            Reply::Lease(mut outcome) => {
+                                if let Ok(response) = &mut outcome.result {
+                                    if let LeaseReply::TimeToLive(response) = response {
+                                        if response.ttl >= 0 {
+                                            if let Some((_, deadline)) =
+                                                self.lease_deadlines.get(&response.id)
+                                            {
+                                                response.ttl = deadline
+                                                    .saturating_duration_since(Instant::now())
+                                                    .as_secs()
+                                                    as i64;
+                                            }
+                                        }
+                                    }
+                                    self.fill_header(response.header_mut());
                                 }
+                                serde_json::to_value(outcome)?
                             }
-                        }
-                        self.fill_header(response.header_mut());
+                        };
+                        let _ = pending.response.send(Ok(reply));
                     }
-                    serde_json::to_value(outcome)?
                 }
-                RaftCommand::Compact { compact, .. } => {
-                    let mut outcome = self.state.apply_compaction(entry.index, compact).await?;
-                    if let Ok(response) = &mut outcome.result {
-                        self.fill_header(response.header.as_mut());
-                    }
-                    serde_json::to_value(outcome)?
-                }
-            };
-            if let Some(pending) = self.pending.remove(command.id()) {
-                let _ = pending.response.send(Ok(reply));
             }
+            Output::Snapshot => self.installed_snapshots += 1,
+            Output::Query {
+                response,
+                value,
+                require_leader,
+            } => {
+                let result = if require_leader && self.raw.raft.leader_id == 0 {
+                    Err(self.error("no leader"))
+                } else {
+                    Ok(value)
+                };
+                let _ = response.send(result);
+            }
+            Output::Checkpoint => {}
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn drain_apply(&mut self) -> Result<()> {
+        while let Some(completed) = self.worker.step().await? {
+            self.complete_apply(completed)?;
+            self.drive_ready().await?;
         }
         Ok(())
     }
@@ -485,6 +592,15 @@ impl Node {
 
     fn expire_leases(&mut self) -> Result<()> {
         self.sync_lease_deadlines();
+        if self
+            .raw
+            .store()
+            .commit_index()
+            .saturating_sub(self.state.applied)
+            >= apply::MAX_APPLY_LAG
+        {
+            return Ok(());
+        }
         let now = Instant::now();
         for (&id, &(generation, deadline)) in &self.lease_deadlines {
             if deadline > now || self.lease_expiring.contains(&(id, generation)) {
@@ -508,6 +624,14 @@ impl Node {
     fn propose(&mut self, command: RaftCommand, response: Response) -> Result<()> {
         if self.raw.raft.state != StateRole::Leader {
             let _ = response.send(Err(self.error("not leader")));
+        } else if self
+            .raw
+            .store()
+            .commit_index()
+            .saturating_sub(self.state.applied)
+            >= apply::MAX_APPLY_LAG
+        {
+            let _ = response.send(Err(self.error("state apply backlog is full")));
         } else if self.pending.len() >= 1024 {
             let _ = response.send(Err(self.error("too many pending requests")));
         } else {
@@ -518,6 +642,7 @@ impl Node {
                         Pending {
                             response,
                             started: Instant::now(),
+                            term: self.raw.raft.term,
                         },
                     );
                 }
@@ -529,24 +654,22 @@ impl Node {
         Ok(())
     }
 
-    fn fill_etcd_header(&self, outcome: &mut crate::mvcc::Outcome) {
-        if let Ok(response) = &mut outcome.result {
-            self.fill_header(crate::mvcc::response_header(response));
-        }
-    }
-
-    fn fill_header(&self, header: Option<&mut ResponseHeader>) {
-        if let Some(header) = header {
-            header.cluster_id = self
+    fn header(&self) -> Header {
+        Header {
+            cluster: self
                 .options
                 .cluster_id
                 .bytes()
                 .fold(0xcbf29ce484222325u64, |hash, byte| {
                     (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-                });
-            header.member_id = self.options.id;
-            header.raft_term = self.raw.raft.term;
+                }),
+            member: self.options.id,
+            term: self.raw.raft.term,
         }
+    }
+
+    fn fill_header(&self, header: Option<&mut ResponseHeader>) {
+        self.header().fill(header);
     }
 
     fn send(&mut self, messages: Vec<Message>) {
@@ -565,25 +688,17 @@ impl Node {
     }
 
     fn start_checkpoint(&mut self) -> Result<()> {
-        if self.checkpoint_running {
+        if self.checkpoint_running || self.apply_busy {
             return Ok(());
         }
         if self.state.applied <= self.raw.store().snapshot_index() {
-            self.raw.store().purge()?;
             return Ok(());
         }
-        let index = self.state.applied;
-        let job = self.state.snapshot_job()?;
-        let events = self.events.clone();
-        let delay = Duration::from_millis(self.snapshot_delay_ms);
+        self.submit_apply(
+            Job::Checkpoint(Duration::from_millis(self.snapshot_delay_ms)),
+            self.state.applied,
+        )?;
         self.checkpoint_running = true;
-        tokio::spawn(async move {
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
-            }
-            let result = job.await;
-            let _ = events.send(Event::SnapshotBuilt { index, result }).await;
-        });
         Ok(())
     }
 
@@ -593,7 +708,7 @@ impl Node {
             if response.is_closed() {
                 continue;
             }
-            if index <= self.raw.store().snapshot_index() {
+            if index <= self.raw.store().snapshot_index() && index <= self.state.applied {
                 let _ = response.send(Ok(self.status()?));
             } else {
                 waiting.push((index, response));
@@ -601,7 +716,7 @@ impl Node {
         }
         self.checkpoint_waiters = waiting;
         if !self.checkpoint_waiters.is_empty() {
-            self.start_checkpoint()?;
+            self.schedule_apply()?;
         }
         Ok(())
     }
@@ -613,7 +728,10 @@ impl Node {
             .pending
             .iter()
             .filter(|(_, p)| {
-                !is_leader || p.response.is_closed() || p.started.elapsed() > Duration::from_secs(5)
+                !is_leader
+                    || p.term != self.raw.raft.term
+                    || p.response.is_closed()
+                    || p.started.elapsed() > Duration::from_secs(5)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -644,6 +762,9 @@ impl Node {
             "recovered_from_index": self.recovered_from_index, "log": self.raw.store().log_stats()?,
             "checkpoint_running": self.checkpoint_running,
             "snapshot_delay_ms": self.snapshot_delay_ms,
+            "apply_busy": self.apply_busy, "apply_target": self.apply_target,
+            "apply_lag": self.raw.store().commit_index().saturating_sub(self.state.applied),
+            "queued_state_reads": self.queries.len(), "apply_delay_ms": self.apply_delay_ms,
             "revision": self.state.revision,
             "compact_revision": self.state.compact_revision,
         }))

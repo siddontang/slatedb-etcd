@@ -24,6 +24,7 @@ struct Simulation {
     committed_entries: BTreeMap<u64, Vec<u8>>,
     terms: BTreeMap<u64, u64>,
     isolated: Option<u64>,
+    paused_apply: Option<u64>,
     random: u64,
     next_request: u64,
     trace: Vec<String>,
@@ -55,6 +56,7 @@ impl Simulation {
             committed_entries: BTreeMap::new(),
             terms: BTreeMap::new(),
             isolated: None,
+            paused_apply: None,
             random: seed.max(1),
             next_request: 0,
             trace: vec![],
@@ -118,8 +120,11 @@ impl Simulation {
     }
 
     async fn drive(&mut self) {
-        for node in self.nodes.values_mut() {
+        for (&id, node) in &mut self.nodes {
             node.drive_ready().await.unwrap();
+            if self.paused_apply != Some(id) {
+                node.drain_apply().await.unwrap();
+            }
         }
         for link in self.links.values_mut() {
             while let Ok(message) = link.try_recv() {
@@ -263,7 +268,7 @@ impl Simulation {
             if index <= node.raw.store().snapshot_index() {
                 continue;
             }
-            let data = node.state.snapshot_data().await.unwrap();
+            let data = node.worker.state().snapshot_job().unwrap().await.unwrap();
             node.handle(
                 Event::SnapshotBuilt {
                     index,
@@ -313,6 +318,15 @@ impl Simulation {
         let mut offline = 0;
         for step in 0..400 {
             match step {
+                30 => {
+                    sim.paused_apply = sim.leader();
+                    sim.trace
+                        .push(format!("pause apply {:?}", sim.paused_apply));
+                }
+                60 => {
+                    sim.paused_apply = None;
+                    sim.trace.push("resume apply".into());
+                }
                 70 => sim.stop(3),
                 95 => sim.start(3).await,
                 140 => {
@@ -381,7 +395,7 @@ impl Simulation {
             };
             let mut events = vec![];
             loop {
-                let page = node.state.watch(&request, None).await.unwrap();
+                let page = node.worker.state().watch(&request, None).await.unwrap();
                 assert_eq!(page.compact_revision, 0);
                 for response in page.responses {
                     events.extend(response.events);
@@ -404,7 +418,8 @@ impl Simulation {
             }
             for (key, value) in &sim.acknowledged {
                 let outcome = node
-                    .state
+                    .worker
+                    .state()
                     .read_etcd(&RequestOp {
                         request: Some(Op::RequestRange(RangeRequest {
                             key: key.as_bytes().to_vec(),

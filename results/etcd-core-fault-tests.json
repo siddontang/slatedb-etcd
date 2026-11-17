@@ -2,11 +2,11 @@
   "mode": "test",
   "host": "macOS-27.2.1-arm64-arm-64bit",
   "machine": "arm64",
-  "created_at": "2026-11-16T17:49:20.327770+00:00",
+  "created_at": "2026-11-17T00:11:06.026426+00:00",
   "logical_cpus": 10,
-  "binary_sha256": "24f10d0b653160b2695930994533c76698e94ad05e0a8726a40b083329686e71",
+  "binary_sha256": "fee4428d466088964ab49e24a67e0dfd6bdc50f4cdcbb441ba064d630c83552e",
   "python": "3.9.6 (default, Apr 30 2025, 02:07:17) \n[Clang 17.0.0 (clang-1700.0.13.5)]",
-  "run_directory": "<tmp>/slatedb-raft-poc-4pp3il5q",
+  "run_directory": "<tmp>/slatedb-raft-poc-7kcxbbjt",
   "binary": "<repo>/target/release/slatedb-etcd",
   "deployment": "three processes on one host and disk; loopback HTTP; local object store",
   "durability": "raft-engine synchronous writes; process crashes tested, power loss not tested",
@@ -14,15 +14,15 @@
     {
       "name": "election_and_atomic_write",
       "passed": true,
-      "leader": 1,
+      "leader": 2,
       "index": 2
     },
     {
       "name": "leader_sigkill_and_follower_rejoin",
       "passed": true,
-      "old_leader": 1,
-      "new_leader": 2,
-      "failover_to_success_ms": 1022.1601250000001
+      "old_leader": 2,
+      "new_leader": 3,
+      "failover_to_success_ms": 1013.7302500000003
     },
     {
       "name": "all_processes_sigkill_and_wal_replay",
@@ -39,7 +39,7 @@
       "lagging_node": 1,
       "snapshot_index": 522,
       "reclaimed_files": 8,
-      "log_bytes_before": 2199792,
+      "log_bytes_before": 2199623,
       "log_bytes_after": 139670
     },
     {
@@ -57,99 +57,195 @@
     {
       "name": "slow_background_snapshot_keeps_heartbeats_and_writes",
       "passed": true,
-      "writes_during_snapshot": 125
+      "writes_during_snapshot": 122
     }
   ],
   "final_status": [
     {
-      "applied_index": 655,
+      "applied_index": 652,
+      "apply_busy": false,
+      "apply_delay_ms": 0,
+      "apply_lag": 0,
+      "apply_target": 652,
       "blocked_peers": [],
       "checkpoint_running": false,
-      "cluster_id": "poc-slatedb-raft-poc-4pp3il5q",
-      "commit_index": 655,
+      "cluster_id": "poc-slatedb-raft-poc-7kcxbbjt",
+      "commit_index": 652,
       "compact_revision": -1,
-      "durable_applied_index": 530,
-      "first_log_index": 531,
+      "durable_applied_index": 522,
+      "first_log_index": 523,
       "id": 1,
       "installed_snapshots": 0,
-      "last_log_index": 655,
-      "leader_id": 1,
+      "last_log_index": 652,
+      "leader_id": 2,
       "log": {
-        "bytes": 162569,
+        "bytes": 95662,
         "files": [
           "0000000000000001.raftlog"
         ]
       },
       "pending": 0,
+      "queued_state_reads": 0,
+      "recovered_from_index": 522,
+      "revision": 1,
+      "role": "Follower",
+      "snapshot_delay_ms": 0,
+      "snapshot_index": 522,
+      "sync_writes": 262,
+      "term": 5
+    },
+    {
+      "applied_index": 652,
+      "apply_busy": false,
+      "apply_delay_ms": 0,
+      "apply_lag": 0,
+      "apply_target": 652,
+      "blocked_peers": [],
+      "checkpoint_running": true,
+      "cluster_id": "poc-slatedb-raft-poc-7kcxbbjt",
+      "commit_index": 652,
+      "compact_revision": -1,
+      "durable_applied_index": 530,
+      "first_log_index": 531,
+      "id": 2,
+      "installed_snapshots": 0,
+      "last_log_index": 652,
+      "leader_id": 2,
+      "log": {
+        "bytes": 233519,
+        "files": [
+          "0000000000000009.raftlog"
+        ]
+      },
+      "pending": 0,
+      "queued_state_reads": 0,
       "recovered_from_index": 522,
       "revision": 1,
       "role": "Leader",
       "snapshot_delay_ms": 0,
       "snapshot_index": 530,
-      "sync_writes": 269,
+      "sync_writes": 263,
       "term": 5
     },
     {
-      "applied_index": 655,
+      "applied_index": 652,
+      "apply_busy": false,
+      "apply_delay_ms": 0,
+      "apply_lag": 0,
+      "apply_target": 652,
       "blocked_peers": [],
       "checkpoint_running": false,
-      "cluster_id": "poc-slatedb-raft-poc-4pp3il5q",
-      "commit_index": 655,
-      "compact_revision": -1,
-      "durable_applied_index": 522,
-      "first_log_index": 523,
-      "id": 2,
-      "installed_snapshots": 0,
-      "last_log_index": 655,
-      "leader_id": 1,
-      "log": {
-        "bytes": 167727,
-        "files": [
-          "0000000000000009.raftlog"
-        ]
-      },
-      "pending": 0,
-      "recovered_from_index": 522,
-      "revision": 1,
-      "role": "Follower",
-      "snapshot_delay_ms": 0,
-      "snapshot_index": 522,
-      "sync_writes": 268,
-      "term": 5
-    },
-    {
-      "applied_index": 655,
-      "blocked_peers": [],
-      "checkpoint_running": false,
-      "cluster_id": "poc-slatedb-raft-poc-4pp3il5q",
-      "commit_index": 655,
+      "cluster_id": "poc-slatedb-raft-poc-7kcxbbjt",
+      "commit_index": 652,
       "compact_revision": -1,
       "durable_applied_index": 522,
       "first_log_index": 523,
       "id": 3,
       "installed_snapshots": 0,
-      "last_log_index": 655,
-      "leader_id": 1,
+      "last_log_index": 652,
+      "leader_id": 2,
       "log": {
-        "bytes": 167544,
+        "bytes": 166908,
         "files": [
           "0000000000000009.raftlog"
         ]
       },
       "pending": 0,
+      "queued_state_reads": 0,
       "recovered_from_index": 522,
       "revision": 1,
       "role": "Follower",
       "snapshot_delay_ms": 0,
       "snapshot_index": 522,
-      "sync_writes": 266,
+      "sync_writes": 260,
       "term": 5
     }
   ],
   "passed": true,
   "node_log_summary": {
     "node-1": {
-      "completed_snapshots": 1,
+      "completed_snapshots": 0,
+      "last_snapshot_index": null,
+      "raft_state_changes": [
+        {
+          "role": "Follower",
+          "term": 1,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 1,
+          "leader_id": 2
+        },
+        {
+          "role": "Follower",
+          "term": 2,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 2,
+          "leader_id": 3
+        },
+        {
+          "role": "PreCandidate",
+          "term": 2,
+          "leader_id": 0
+        },
+        {
+          "role": "Candidate",
+          "term": 3,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 3,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 3,
+          "leader_id": 2
+        },
+        {
+          "role": "Follower",
+          "term": 3,
+          "leader_id": 2
+        },
+        {
+          "role": "PreCandidate",
+          "term": 3,
+          "leader_id": 0
+        },
+        {
+          "role": "Candidate",
+          "term": 4,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 4,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 4,
+          "leader_id": 3
+        },
+        {
+          "role": "Follower",
+          "term": 5,
+          "leader_id": 0
+        },
+        {
+          "role": "Follower",
+          "term": 5,
+          "leader_id": 2
+        }
+      ]
+    },
+    "node-2": {
+      "completed_snapshots": 2,
       "last_snapshot_index": 530,
       "raft_state_changes": [
         {
@@ -165,83 +261,12 @@
         {
           "role": "Leader",
           "term": 1,
-          "leader_id": 1
+          "leader_id": 2
         },
         {
           "role": "Follower",
           "term": 2,
-          "leader_id": 2
-        },
-        {
-          "role": "Follower",
-          "term": 3,
-          "leader_id": 0
-        },
-        {
-          "role": "Follower",
-          "term": 3,
-          "leader_id": 2
-        },
-        {
-          "role": "Follower",
-          "term": 3,
-          "leader_id": 2
-        },
-        {
-          "role": "Follower",
-          "term": 4,
-          "leader_id": 0
-        },
-        {
-          "role": "Follower",
-          "term": 4,
           "leader_id": 3
-        },
-        {
-          "role": "PreCandidate",
-          "term": 4,
-          "leader_id": 0
-        },
-        {
-          "role": "Candidate",
-          "term": 5,
-          "leader_id": 0
-        },
-        {
-          "role": "Leader",
-          "term": 5,
-          "leader_id": 1
-        }
-      ]
-    },
-    "node-2": {
-      "completed_snapshots": 1,
-      "last_snapshot_index": 522,
-      "raft_state_changes": [
-        {
-          "role": "Follower",
-          "term": 1,
-          "leader_id": 0
-        },
-        {
-          "role": "Follower",
-          "term": 1,
-          "leader_id": 1
-        },
-        {
-          "role": "PreCandidate",
-          "term": 1,
-          "leader_id": 0
-        },
-        {
-          "role": "Candidate",
-          "term": 2,
-          "leader_id": 0
-        },
-        {
-          "role": "Leader",
-          "term": 2,
-          "leader_id": 2
         },
         {
           "role": "PreCandidate",
@@ -269,14 +294,19 @@
           "leader_id": 3
         },
         {
-          "role": "Follower",
+          "role": "PreCandidate",
+          "term": 4,
+          "leader_id": 0
+        },
+        {
+          "role": "Candidate",
           "term": 5,
           "leader_id": 0
         },
         {
-          "role": "Follower",
+          "role": "Leader",
           "term": 5,
-          "leader_id": 1
+          "leader_id": 2
         }
       ]
     },
@@ -292,17 +322,22 @@
         {
           "role": "Follower",
           "term": 1,
-          "leader_id": 1
+          "leader_id": 2
         },
         {
-          "role": "Follower",
+          "role": "PreCandidate",
+          "term": 1,
+          "leader_id": 0
+        },
+        {
+          "role": "Candidate",
           "term": 2,
           "leader_id": 0
         },
         {
-          "role": "Follower",
+          "role": "Leader",
           "term": 2,
-          "leader_id": 2
+          "leader_id": 3
         },
         {
           "role": "Follower",
@@ -337,7 +372,7 @@
         {
           "role": "Follower",
           "term": 5,
-          "leader_id": 1
+          "leader_id": 2
         }
       ]
     }

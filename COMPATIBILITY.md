@@ -1,13 +1,13 @@
 # etcd v3 test results
 
-Run date: 2026-11-17, Asia/Singapore.
+Run date: 2026-11-16, America/Los_Angeles.
 The reference server, common suite, model, and official Go client use etcd v3.6.5.
 The test host uses ARM64 macOS. All three service replicas share one host and disk.
 
 Tested release binary SHA-256:
 
 ```text
-24f10d0b653160b2695930994533c76698e94ad05e0a8726a40b083329686e71
+fee4428d466088964ab49e24a67e0dfd6bdc50f4cdcbb441ba064d630c83552e
 ```
 
 ## Results
@@ -20,11 +20,12 @@ Tested release binary SHA-256:
 | Differential Watch history cases | 5 passed |
 | Watch stream control checks against real etcd | 2 passed |
 | Watch and Lease process and stream suites | 4 passed |
+| Apply isolation and backlog recovery suites | 3 passed |
 | Official client recovery and concurrency suites | 4 passed |
 | Fixed API fuzz corpus | 3 seeds passed |
 | Bounded API fuzz run | 10 completed inputs passed |
-| Supported profile with upstream common tests | 154 leaf tests passed; 73 skipped |
-| Rust state and storage recovery tests | 10 passed |
+| Supported profile with upstream common tests | 157 leaf tests passed; 73 skipped |
+| Rust node, state, and storage recovery tests | 17 passed |
 | Original process fault scenarios | 8 passed |
 | Native etcd model with process faults | 4 campaigns passed |
 | Jepsen register and Elle append checks | Both checkers passed all 4 campaigns |
@@ -51,6 +52,9 @@ Compaction stores the boundary, history deletion, and applied index in one state
 Watch checks cover filters, event order, previous values, compaction, progress, and fragments.
 Lease checks cover attachment, reassignment, renewal, revocation, expiry, and recovery.
 A minority cannot acknowledge a renewal. A stale expiry command cannot delete a renewed lease.
+Apply isolation tests delay state work beyond an election timeout without losing the leader.
+They check reply ordering, committed backlog recovery, and peer progress during snapshot
+installation.
 
 The process campaigns inject a leader partition, leader kill, leader pause, or full cluster restart.
 Traffic continues during each fault. Final reads check state after recovery.
@@ -87,6 +91,7 @@ It is not a claim that every upstream test passed or every fault was reproduced.
 DST uses real node storage with a simulated transport and logical Raft ticks.
 It requires repeatable event traces and checks acknowledged values after recovery.
 It also checks retained lease generations and complete Watch journals on each replica.
+The scheduler can pause apply jobs while it continues Raft message delivery.
 It does not control lease wall-clock expiry, operating system threads, or storage completion.
 SlateDB background scheduling remains outside its control.
 
@@ -94,8 +99,9 @@ The Jepsen integration uses real checkers with a local process driver.
 The upstream SSH deployment, clock faults, membership faults, bit flips, and lazyfs are not ported.
 Tests also exclude cross-host faults, object-store outages, power loss, and rolling upgrades.
 
-Historical reads scan stored history. Logical compaction also scans history on the node loop.
-Large scans can delay heartbeats. Physical SST reclamation remains asynchronous.
+Historical reads and logical compaction scan history on the apply worker.
+Large scans can delay state reads and write completion. Physical SST reclamation stays asynchronous.
+Raft log fsync and snapshot publication still run on the Raft owner.
 Snapshot transfers retain the 64 MiB peer limit.
 See [storage limits](README.md#mvcc-storage-and-recovery).
 

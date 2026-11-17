@@ -1,6 +1,6 @@
 {
-  "created_at": "2026-11-16T17:46:58.113128+00:00",
-  "binary_sha256": "24f10d0b653160b2695930994533c76698e94ad05e0a8726a40b083329686e71",
+  "created_at": "2026-11-17T00:08:38.309016+00:00",
+  "binary_sha256": "fee4428d466088964ab49e24a67e0dfd6bdc50f4cdcbb441ba064d630c83552e",
   "reference_etcd": "3.6.5",
   "client": "go.etcd.io/etcd/client/v3 v3.6.5",
   "go": "go version go1.25.6 darwin/arm64",
@@ -20,6 +20,21 @@
   "log": "<repo>/tmp/test-results/etcd-upstream.jsonl",
   "tests": [
     {
+      "name": "TestSlowApplyKeepsRaftLive",
+      "result": "pass",
+      "seconds": 3.57
+    },
+    {
+      "name": "TestCommittedApplyBacklogSurvivesRestart",
+      "result": "pass",
+      "seconds": 2.37
+    },
+    {
+      "name": "TestSnapshotApplyKeepsPeerReplicationLive",
+      "result": "pass",
+      "seconds": 3.75
+    },
+    {
       "name": "TestDifferentialCompaction/negative_revision",
       "result": "pass",
       "seconds": 0.01
@@ -27,7 +42,7 @@
     {
       "name": "TestDifferentialCompaction/initial_boundary",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialCompaction/zero_revision",
@@ -37,7 +52,7 @@
     {
       "name": "TestDifferentialCompaction/repeated_zero",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialCompaction/empty_store",
@@ -52,12 +67,12 @@
     {
       "name": "TestDifferentialCompaction/stable_key",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialCompaction/first_version",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialCompaction/second_version",
@@ -67,7 +82,7 @@
     {
       "name": "TestDifferentialCompaction/delete",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.04
     },
     {
       "name": "TestDifferentialCompaction/recreate",
@@ -77,12 +92,12 @@
     {
       "name": "TestDifferentialCompaction/newer_key",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialCompaction/future_revision",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0.03
     },
     {
       "name": "TestDifferentialCompaction/future_compact_keeps_history",
@@ -152,7 +167,7 @@
     {
       "name": "TestDifferentialCompaction/txn_rollback",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialCompaction/rollback_absent",
@@ -167,12 +182,12 @@
     {
       "name": "TestDifferentialCompaction/nested_boundary_read",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialCompaction/repeat_boundary",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialCompaction/older_boundary",
@@ -207,7 +222,7 @@
     {
       "name": "TestDifferentialCompaction/write_after_compact",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialCompaction/read_after_compact",
@@ -217,22 +232,22 @@
     {
       "name": "TestDifferentialCompaction",
       "result": "pass",
-      "seconds": 2.26
+      "seconds": 1.98
     },
     {
       "name": "TestCompactionRecovery",
       "result": "pass",
-      "seconds": 6.62
+      "seconds": 6.01
     },
     {
       "name": "TestDifferentialKV/initial_revision",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/create",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/same_value_increments_version",
@@ -272,12 +287,12 @@
     {
       "name": "TestDifferentialKV/empty_value",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/prefix_a",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/prefix_b",
@@ -287,7 +302,7 @@
     {
       "name": "TestDifferentialKV/prefix_c",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/prefix_limit_more",
@@ -372,12 +387,12 @@
     {
       "name": "TestDifferentialKV/txn_one_revision",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/txn_else",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/txn_read_before_write",
@@ -422,7 +437,7 @@
     {
       "name": "TestDifferentialKV/txn_rollback",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/rollback_absent",
@@ -452,7 +467,7 @@
     {
       "name": "TestDifferentialKV/delete_previous",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/deleted_history",
@@ -482,7 +497,7 @@
     {
       "name": "TestDifferentialKV/overlapping_deletes",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/empty_key",
@@ -502,22 +517,22 @@
     {
       "name": "TestDifferentialKV",
       "result": "pass",
-      "seconds": 1.62
+      "seconds": 2.48
     },
     {
       "name": "TestFailoverAndSnapshotRecovery",
       "result": "pass",
-      "seconds": 5.74
+      "seconds": 6.58
     },
     {
       "name": "TestConcurrentCompareAndSwap",
       "result": "pass",
-      "seconds": 1.44
+      "seconds": 1.72
     },
     {
       "name": "TestPartitionReadModes",
       "result": "pass",
-      "seconds": 4.55
+      "seconds": 4.16
     },
     {
       "name": "TestAlarm",
@@ -807,23 +822,23 @@
     {
       "name": "TestCompact/NoPhysical",
       "result": "pass",
-      "seconds": 2.95
+      "seconds": 1.07
     },
     {
       "name": "TestCompact/Physical",
       "result": "skip",
-      "seconds": 0.95,
+      "seconds": 0.96,
       "details": [
         "=== RUN   TestCompact/Physical",
-        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-3871778713",
+        "upstream_adapter_test.go:53: Process logs and data: <tmp>/slatedb-etcd-compat-1405385569",
         "upstream_client_test.go:100: unsupported capability: physical compaction",
-        "--- SKIP: TestCompact/Physical (0.95s)"
+        "--- SKIP: TestCompact/Physical (0.96s)"
       ]
     },
     {
       "name": "TestCompact",
       "result": "pass",
-      "seconds": 3.9
+      "seconds": 2.03
     },
     {
       "name": "TestDefragOnline",
@@ -868,37 +883,37 @@
     {
       "name": "TestKVPut/ThreeVoters",
       "result": "pass",
-      "seconds": 1.06
+      "seconds": 1.17
     },
     {
       "name": "TestKVPut",
       "result": "pass",
-      "seconds": 1.06
+      "seconds": 1.17
     },
     {
       "name": "TestKVGet/ThreeVoters",
       "result": "pass",
-      "seconds": 1.29
+      "seconds": 1.07
     },
     {
       "name": "TestKVGet",
       "result": "pass",
-      "seconds": 1.29
+      "seconds": 1.07
     },
     {
       "name": "TestKVDelete/ThreeVoters",
       "result": "pass",
-      "seconds": 1.08
+      "seconds": 1.19
     },
     {
       "name": "TestKVDelete",
       "result": "pass",
-      "seconds": 1.08
+      "seconds": 1.19
     },
     {
       "name": "TestKVGetNoQuorum/Serializable",
       "result": "pass",
-      "seconds": 1.26
+      "seconds": 1.17
     },
     {
       "name": "TestKVGetNoQuorum/Linearizable",
@@ -908,67 +923,67 @@
     {
       "name": "TestKVGetNoQuorum",
       "result": "pass",
-      "seconds": 3.43
+      "seconds": 3.34
     },
     {
       "name": "TestLeaseGrantTimeToLive/ThreeVoters",
       "result": "pass",
-      "seconds": 1.06
+      "seconds": 1.05
     },
     {
       "name": "TestLeaseGrantTimeToLive",
       "result": "pass",
-      "seconds": 1.06
+      "seconds": 1.05
     },
     {
       "name": "TestLeaseGrantAndList/ThreeVoters/no_leases",
       "result": "pass",
-      "seconds": 1.5
+      "seconds": 1.18
     },
     {
       "name": "TestLeaseGrantAndList/ThreeVoters/one_lease",
       "result": "pass",
-      "seconds": 1.51
+      "seconds": 0.96
     },
     {
       "name": "TestLeaseGrantAndList/ThreeVoters/many_leases",
       "result": "pass",
-      "seconds": 1.18
+      "seconds": 1.08
     },
     {
       "name": "TestLeaseGrantAndList",
       "result": "pass",
-      "seconds": 4.18
+      "seconds": 3.22
     },
     {
       "name": "TestLeaseGrantTimeToLiveExpired/ThreeVoters",
       "result": "pass",
-      "seconds": 4.16
+      "seconds": 4.64
     },
     {
       "name": "TestLeaseGrantTimeToLiveExpired",
       "result": "pass",
-      "seconds": 4.16
+      "seconds": 4.64
     },
     {
       "name": "TestLeaseGrantKeepAliveOnce/ThreeVoters",
       "result": "pass",
-      "seconds": 2.95
+      "seconds": 4.36
     },
     {
       "name": "TestLeaseGrantKeepAliveOnce",
       "result": "pass",
-      "seconds": 2.95
+      "seconds": 4.36
     },
     {
       "name": "TestLeaseGrantRevoke/ThreeVoters",
       "result": "pass",
-      "seconds": 1.17
+      "seconds": 0.95
     },
     {
       "name": "TestLeaseGrantRevoke",
       "result": "pass",
-      "seconds": 1.17
+      "seconds": 0.95
     },
     {
       "name": "TestDefragmentWithNoAuth",
@@ -1303,12 +1318,12 @@
     {
       "name": "TestTxnSucc/ThreeVoters",
       "result": "pass",
-      "seconds": 1.28
+      "seconds": 1.06
     },
     {
       "name": "TestTxnSucc",
       "result": "pass",
-      "seconds": 1.28
+      "seconds": 1.06
     },
     {
       "name": "TestTxnFail/ThreeVoters",
@@ -1408,12 +1423,12 @@
     {
       "name": "TestWatch/ThreeVoters",
       "result": "pass",
-      "seconds": 1.8
+      "seconds": 1.38
     },
     {
       "name": "TestWatch",
       "result": "pass",
-      "seconds": 1.8
+      "seconds": 1.38
     },
     {
       "name": "TestDifferentialLease/grant",
@@ -1478,7 +1493,7 @@
     {
       "name": "TestDifferentialLease/old_keys",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialLease/new_keys",
@@ -1533,7 +1548,7 @@
     {
       "name": "TestDifferentialLease/missing_revoke",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialLease/list",
@@ -1543,12 +1558,12 @@
     {
       "name": "TestDifferentialLease",
       "result": "pass",
-      "seconds": 2.02
+      "seconds": 2
     },
     {
       "name": "TestDifferentialWatch/order_and_previous",
       "result": "pass",
-      "seconds": 0.09
+      "seconds": 0.1
     },
     {
       "name": "TestDifferentialWatch/no_put",
@@ -1573,12 +1588,12 @@
     {
       "name": "TestDifferentialWatch",
       "result": "pass",
-      "seconds": 2.35
+      "seconds": 2.76
     },
     {
       "name": "TestWatchLeaseRestartAndSnapshot",
       "result": "pass",
-      "seconds": 4.57
+      "seconds": 4.84
     },
     {
       "name": "TestWatchStreamControls/service",
@@ -1588,55 +1603,55 @@
     {
       "name": "TestWatchStreamControls/etcd",
       "result": "pass",
-      "seconds": 0.02
+      "seconds": 0.01
     },
     {
       "name": "TestWatchStreamControls",
       "result": "pass",
-      "seconds": 1.61
+      "seconds": 2
     },
     {
       "name": "TestWatchLeaseKeepAliveAndLeaderFailure",
       "result": "pass",
-      "seconds": 18.38
+      "seconds": 18.07
     },
     {
       "name": "TestWatchLeaseMinorityCannotRenew",
       "result": "pass",
-      "seconds": 4.59
+      "seconds": 4.57
     },
     {
       "name": "TestWatchCatchupProgressAndFragmentation",
       "result": "pass",
-      "seconds": 1.14
+      "seconds": 1.67
     },
     {
       "name": "FuzzKVSequence/seed#0",
       "result": "pass",
-      "seconds": 1.96
+      "seconds": 1.3
     },
     {
       "name": "FuzzKVSequence/seed#1",
       "result": "pass",
-      "seconds": 1.97
+      "seconds": 2.15
     },
     {
       "name": "FuzzKVSequence/seed#2",
       "result": "pass",
-      "seconds": 2.17
+      "seconds": 2.77
     },
     {
       "name": "FuzzKVSequence",
       "result": "pass",
-      "seconds": 6.11
+      "seconds": 6.22
     }
   ],
   "counts": {
-    "pass": 176,
+    "pass": 179,
     "skip": 73
   },
   "leaf_counts": {
-    "pass": 154,
+    "pass": 157,
     "skip": 73
   },
   "passed": true,

@@ -1,6 +1,6 @@
 {
-  "created_at": "2026-11-16T17:45:53.091694+00:00",
-  "binary_sha256": "24f10d0b653160b2695930994533c76698e94ad05e0a8726a40b083329686e71",
+  "created_at": "2026-11-17T00:07:19.485334+00:00",
+  "binary_sha256": "fee4428d466088964ab49e24a67e0dfd6bdc50f4cdcbb441ba064d630c83552e",
   "reference_etcd": "3.6.5",
   "client": "go.etcd.io/etcd/client/v3 v3.6.5",
   "go": "go version go1.25.6 darwin/arm64",
@@ -18,6 +18,21 @@
   "log": "<repo>/tmp/test-results/etcd-compatibility.jsonl",
   "tests": [
     {
+      "name": "TestSlowApplyKeepsRaftLive",
+      "result": "pass",
+      "seconds": 4.23
+    },
+    {
+      "name": "TestCommittedApplyBacklogSurvivesRestart",
+      "result": "pass",
+      "seconds": 2.1
+    },
+    {
+      "name": "TestSnapshotApplyKeepsPeerReplicationLive",
+      "result": "pass",
+      "seconds": 3.62
+    },
+    {
       "name": "TestDifferentialCompaction/negative_revision",
       "result": "pass",
       "seconds": 0.01
@@ -25,22 +40,22 @@
     {
       "name": "TestDifferentialCompaction/initial_boundary",
       "result": "pass",
-      "seconds": 0.03
+      "seconds": 0
     },
     {
       "name": "TestDifferentialCompaction/zero_revision",
       "result": "pass",
-      "seconds": 0.05
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialCompaction/repeated_zero",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialCompaction/empty_store",
       "result": "pass",
-      "seconds": 0.03
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialCompaction/empty_boundary_read",
@@ -80,7 +95,7 @@
     {
       "name": "TestDifferentialCompaction/future_revision",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialCompaction/future_compact_keeps_history",
@@ -90,7 +105,7 @@
     {
       "name": "TestDifferentialCompaction/compact_middle",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0.02
     },
     {
       "name": "TestDifferentialCompaction/compacted_point",
@@ -165,7 +180,7 @@
     {
       "name": "TestDifferentialCompaction/nested_boundary_read",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialCompaction/repeat_boundary",
@@ -215,12 +230,12 @@
     {
       "name": "TestDifferentialCompaction",
       "result": "pass",
-      "seconds": 2.09
+      "seconds": 2.02
     },
     {
       "name": "TestCompactionRecovery",
       "result": "pass",
-      "seconds": 6.86
+      "seconds": 6.91
     },
     {
       "name": "TestDifferentialKV/initial_revision",
@@ -235,7 +250,7 @@
     {
       "name": "TestDifferentialKV/same_value_increments_version",
       "result": "pass",
-      "seconds": 0.02
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/update_prev_kv",
@@ -260,7 +275,7 @@
     {
       "name": "TestDifferentialKV/binary_put",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/binary_get",
@@ -270,7 +285,7 @@
     {
       "name": "TestDifferentialKV/empty_value",
       "result": "pass",
-      "seconds": 0
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialKV/prefix_a",
@@ -280,12 +295,12 @@
     {
       "name": "TestDifferentialKV/prefix_b",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/prefix_c",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/prefix_limit_more",
@@ -340,12 +355,12 @@
     {
       "name": "TestDifferentialKV/ignore_value",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/ignore_lease",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/missing_ignore_value",
@@ -360,7 +375,7 @@
     {
       "name": "TestDifferentialKV/missing_lease",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/invalid_ignore_lease",
@@ -370,12 +385,12 @@
     {
       "name": "TestDifferentialKV/txn_one_revision",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/txn_else",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/txn_read_before_write",
@@ -395,7 +410,7 @@
     {
       "name": "TestDifferentialKV/missing_value_compare",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/range_compare",
@@ -405,12 +420,12 @@
     {
       "name": "TestDifferentialKV/nested_base_predicates",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/nested_mutually_exclusive_writes",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/nested_negative_revision",
@@ -430,7 +445,7 @@
     {
       "name": "TestDifferentialKV/txn_future_revision_rollback",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/duplicate_put",
@@ -450,7 +465,7 @@
     {
       "name": "TestDifferentialKV/delete_previous",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/deleted_history",
@@ -480,7 +495,7 @@
     {
       "name": "TestDifferentialKV/overlapping_deletes",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialKV/empty_key",
@@ -500,32 +515,32 @@
     {
       "name": "TestDifferentialKV",
       "result": "pass",
-      "seconds": 2.11
+      "seconds": 1.79
     },
     {
       "name": "TestFailoverAndSnapshotRecovery",
       "result": "pass",
-      "seconds": 5.6
+      "seconds": 6.28
     },
     {
       "name": "TestConcurrentCompareAndSwap",
       "result": "pass",
-      "seconds": 1.87
+      "seconds": 1.39
     },
     {
       "name": "TestPartitionReadModes",
       "result": "pass",
-      "seconds": 4.28
+      "seconds": 8.74
     },
     {
       "name": "TestDifferentialLease/grant",
       "result": "pass",
-      "seconds": 0.02
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialLease/duplicate",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialLease/second",
@@ -540,12 +555,12 @@
     {
       "name": "TestDifferentialLease/negative_id",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialLease/minimum",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialLease/revoke_minimum",
@@ -555,12 +570,12 @@
     {
       "name": "TestDifferentialLease/attach_a",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialLease/attach_b",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialLease/keys",
@@ -570,12 +585,12 @@
     {
       "name": "TestDifferentialLease/reassign",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialLease/ignore_lease",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialLease/old_keys",
@@ -590,12 +605,12 @@
     {
       "name": "TestDifferentialLease/compare",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialLease/rollback",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialLease/rollback_absent",
@@ -605,12 +620,12 @@
     {
       "name": "TestDifferentialLease/detach",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0
     },
     {
       "name": "TestDifferentialLease/revoke_old",
       "result": "pass",
-      "seconds": 0.02
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialLease/detached_survives",
@@ -645,12 +660,12 @@
     {
       "name": "TestDifferentialLease",
       "result": "pass",
-      "seconds": 1.87
+      "seconds": 1.42
     },
     {
       "name": "TestDifferentialWatch/order_and_previous",
       "result": "pass",
-      "seconds": 0.09
+      "seconds": 0.01
     },
     {
       "name": "TestDifferentialWatch/no_put",
@@ -675,12 +690,12 @@
     {
       "name": "TestDifferentialWatch",
       "result": "pass",
-      "seconds": 2.67
+      "seconds": 2.37
     },
     {
       "name": "TestWatchLeaseRestartAndSnapshot",
       "result": "pass",
-      "seconds": 4.42
+      "seconds": 4.59
     },
     {
       "name": "TestWatchStreamControls/service",
@@ -695,49 +710,49 @@
     {
       "name": "TestWatchStreamControls",
       "result": "pass",
-      "seconds": 2.27
+      "seconds": 1.55
     },
     {
       "name": "TestWatchLeaseKeepAliveAndLeaderFailure",
       "result": "pass",
-      "seconds": 18.16
+      "seconds": 18.06
     },
     {
       "name": "TestWatchLeaseMinorityCannotRenew",
       "result": "pass",
-      "seconds": 5.06
+      "seconds": 4.53
     },
     {
       "name": "TestWatchCatchupProgressAndFragmentation",
       "result": "pass",
-      "seconds": 1.46
+      "seconds": 1.14
     },
     {
       "name": "FuzzKVSequence/seed#0",
       "result": "pass",
-      "seconds": 1.47
+      "seconds": 2.18
     },
     {
       "name": "FuzzKVSequence/seed#1",
       "result": "pass",
-      "seconds": 1.41
+      "seconds": 1.56
     },
     {
       "name": "FuzzKVSequence/seed#2",
       "result": "pass",
-      "seconds": 1.83
+      "seconds": 1.98
     },
     {
       "name": "FuzzKVSequence",
       "result": "pass",
-      "seconds": 4.7
+      "seconds": 5.71
     }
   ],
   "counts": {
-    "pass": 143
+    "pass": 146
   },
   "leaf_counts": {
-    "pass": 137
+    "pass": 140
   },
   "passed": true,
   "complete": true

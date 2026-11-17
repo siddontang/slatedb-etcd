@@ -1,5 +1,8 @@
 # Three-replica PoC results
 
+This is a historical experiment. Its next-step list predates the current etcd API support.
+See the [architecture and roadmap](docs/architecture.md) for the current design and plan.
+
 Run date: 2026-11-15, Asia/Shanghai. Branch: `codex/raft-cluster-poc`.
 SlateDB base: `8b68800252064164397ca6ce53e5883dcfbc37b9`.
 Versions: SlateDB 0.18.1, raft-rs 0.7.0, raft-engine 0.4.2, Rust 1.91.1.

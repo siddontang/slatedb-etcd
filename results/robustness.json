@@ -1,7 +1,7 @@
 {
-  "created_at": "2026-11-16T17:48:34.590666+00:00",
+  "created_at": "2026-11-17T00:10:18.398798+00:00",
   "passed": true,
-  "binary_sha256": "24f10d0b653160b2695930994533c76698e94ad05e0a8726a40b083329686e71",
+  "binary_sha256": "fee4428d466088964ab49e24a67e0dfd6bdc50f4cdcbb441ba064d630c83552e",
   "jepsen_requested": true,
   "runs": [
     {
@@ -14,20 +14,20 @@
           {
             "fault": "partition-leader",
             "member": 2,
-            "time_ns": 307779125
+            "time_ns": 305905208
           },
           {
             "fault": "heal",
             "member": 0,
-            "time_ns": 1812253500
+            "time_ns": 1809023958
           }
         ],
-        "operations": 242,
-        "process_logs": "<tmp>/slatedb-etcd-compat-3740807159",
+        "operations": 243,
+        "process_logs": "<tmp>/slatedb-etcd-compat-840435060",
         "result": "Ok",
         "seed": 1,
         "successful_operations": [
-          57,
+          58,
           67,
           58
         ],
@@ -45,17 +45,17 @@
           {
             "fault": "kill-leader",
             "member": 3,
-            "time_ns": 309108417
+            "time_ns": 305284334
           }
         ],
-        "operations": 248,
-        "process_logs": "<tmp>/slatedb-etcd-compat-489196068",
+        "operations": 247,
+        "process_logs": "<tmp>/slatedb-etcd-compat-1851949958",
         "result": "Ok",
         "seed": 2,
         "successful_operations": [
           69,
-          70,
-          43
+          72,
+          39
         ],
         "watch_replicas": 3
       },
@@ -70,23 +70,23 @@
         "faults": [
           {
             "fault": "pause-leader",
-            "member": 2,
-            "time_ns": 306314250
+            "member": 3,
+            "time_ns": 303618583
           },
           {
             "fault": "resume",
-            "member": 2,
-            "time_ns": 1806731333
+            "member": 3,
+            "time_ns": 1804340917
           }
         ],
-        "operations": 244,
-        "process_logs": "<tmp>/slatedb-etcd-compat-2104247867",
+        "operations": 261,
+        "process_logs": "<tmp>/slatedb-etcd-compat-309107020",
         "result": "Ok",
         "seed": 3,
         "successful_operations": [
-          58,
-          58,
-          67
+          69,
+          69,
+          59
         ],
         "watch_replicas": 3
       },
@@ -102,22 +102,22 @@
           {
             "fault": "kill-all",
             "member": 0,
-            "time_ns": 303645459
+            "time_ns": 302898500
           },
           {
             "fault": "restart-all",
             "member": 0,
-            "time_ns": 1766064042
+            "time_ns": 1764863125
           }
         ],
-        "operations": 251,
-        "process_logs": "<tmp>/slatedb-etcd-compat-2580508300",
+        "operations": 264,
+        "process_logs": "<tmp>/slatedb-etcd-compat-3242413039",
         "result": "Ok",
         "seed": 4,
         "successful_operations": [
           57,
-          70,
-          57
+          71,
+          66
         ],
         "watch_replicas": 3
       },

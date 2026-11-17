@@ -117,13 +117,14 @@ The upstream source pin lets future adapters reuse those workloads without losin
 `src/node/dst.rs` runs the real node, Raft storage, SlateDB apply, and snapshot code.
 It replaces network transport with a message queue and advances a logical Raft clock.
 A seed controls message order, drops, duplicates, and tick selection.
-The schedule includes restart, partition, log truncation, and follower snapshot installation.
+The schedule includes restart, partition, delayed apply, log truncation, and snapshot installation.
 Every seed runs twice. The test requires identical event traces.
 
 The test checks one leader per term, stable committed entries, and valid apply boundaries.
 It requires snapshot transfer and checks every acknowledged value on all replicas after recovery.
 Writes carry a lease. A seeded prelude renews that lease and submits an obsolete expiry command.
 The test compares the retained lease and complete Watch journal across all replicas.
+It runs the same apply jobs through a manual scheduler and can pause their completion.
 Lease wall-clock expiry is outside this schedule; process tests cover it separately.
 Partial traces remain available after an assertion failure.
 

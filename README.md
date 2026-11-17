@@ -8,6 +8,7 @@ MVCC history.
 The original JSON API remains available in a separate diagnostic keyspace.
 All endpoints bind to loopback. There is no authentication or dynamic membership.
 
+See the [architecture and roadmap](docs/architecture.md) for design rules and implementation phases.
 See [compatibility results](COMPATIBILITY.md) for the etcd checks.
 See [test commands](tests/README.md) for upstream tests, fault checks, Jepsen, fuzzing, and DST.
 The [upstream audit](tests/upstream/README.md) maps the source suites and lists coverage gaps.
@@ -185,9 +186,10 @@ is safe: startup can repeat the state replacement from the durable snapshot payl
 
 Full snapshots deliberately duplicate state in raft-engine. This makes recovery independent of
 uncopied local object files, but limits the PoC to small data sets. Snapshots use the peer HTTP body
-limit of 64 MiB. Snapshot creation runs in the background. Snapshot persistence, installation, and
-state apply still run on the node loop and can raise tail latency. Production use needs separate
-apply workers and bounded snapshot transfer.
+limit of 64 MiB. Snapshot creation runs in the background. Snapshot persistence still runs on the
+Raft owner and can raise tail latency.
+A separate apply task owns SlateDB, installs snapshots, and executes committed state changes.
+Production use still needs bounded snapshot transfer and separate log I/O.
 
 The local PoC polls compaction and manifest updates every 100 ms. The default slower polling caused
 L0 backpressure during repeated checkpoints in an earlier run. That run is retained in
@@ -199,6 +201,26 @@ SlateDB flushes can advance storage beyond it. `snapshot_index` is the durable l
 
 Each replica owns an independent object-store directory and manifest. The PoC does not let three
 writers share a manifest. A shared SST design needs a separate ownership and reference-GC protocol.
+
+## Raft and apply execution
+
+The Raft owner persists and replicates entries while one apply task owns SlateDB.
+Only worker completion advances `applied_index` or permits a successful write response.
+Committed work stays in the durable log until the worker can accept it.
+A batch has at most 32 entries and a 512 KiB target. One larger entry can exceed the byte target.
+The worker also handles serializable reads, Watch scans, snapshot installation, and checkpoint pins.
+Local reads receive service between entry batches. They can lag durable commit.
+
+The owner queues at most 64 local reads and 64 checkpoint requests.
+It rejects new proposals at 1,024 committed but unapplied entries.
+Worker failure or panic stops the node. Shutdown cancels the worker and its snapshot builder.
+Raft log persistence and checkpoint publication still use synchronous local storage on the owner.
+The apply task shares the process runtime; this change does not isolate CPU or disk resources.
+
+Status reports `apply_lag`, `apply_busy`, `apply_target`, and `queued_state_reads`.
+`POST /debug/apply-delay` accepts `{"delay_ms":2500}` to delay entry apply and snapshot
+installation.
+This loopback test hook has a five-second limit. Set the delay to zero to restore normal operation.
 
 ## MVCC storage and recovery
 
@@ -221,8 +243,9 @@ It keeps all newer versions. Current keys and their revision metadata remain unc
 Restart and snapshot installation restore the boundary with the retained history.
 Raft log GC remains separate from MVCC compaction.
 
-Compaction scans all history and builds one deletion batch on the node loop. Large histories can
-delay heartbeats and requests. SlateDB reclaims old SST data in the background; pinned snapshots can
+Compaction scans all history and builds one deletion batch on the apply worker.
+Large histories can delay state reads and write completion. Raft keeps processing ticks and peers.
+SlateDB reclaims old SST data in the background; pinned snapshots can
 retain older data. The service rejects `physical=true` because it cannot yet wait for that
 reclamation.
 Do not downgrade to an older binary after compaction; older binaries do not enforce its boundary.
@@ -261,11 +284,11 @@ The service does not checkpoint remaining TTL. Repeated leader changes can exten
 lifetime.
 Loss of quorum delays deletion until a majority can commit it. Clients must not treat TTL as a
 maximum lifetime or use lease expiry alone to fence external writes.
-Lease key lookup and revocation scan current keys. Large leases can delay the node loop.
+Lease key lookup and revocation scan current keys. Large leases can delay the apply worker.
 
 ## Next steps
 
-1. Add ReadIndex-based linearizable reads and separate state-apply workers.
+1. Add ReadIndex-based linearizable reads and separate Raft log I/O.
 2. Bound compaction work and range scans, and use checkpoint references for large snapshots.
 3. Add lease TTL checkpoints and a key index for leases. Bound Watch catch-up work.
 4. Add membership changes, TLS, authentication, quotas, maintenance APIs, and operational metrics.
