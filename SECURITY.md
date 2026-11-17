@@ -37,8 +37,8 @@ Protect them with operating system permissions and storage controls.
 
 Tests generate fresh TLS and JWT keys in temporary directories.
 No private key is needed in the current repository files.
-Two historical commits contain an unchanged public etcd test key.
-The [publication review](docs/publication.md) records its origin and exact scan exceptions.
+The rewritten history removes the former public etcd test key. No scan exceptions remain.
+The [publication review](docs/publication.md) records the audit and remote retention limits.
 Never use a test key or test password as a deployment credential.
 
 Run the secret scan before publishing commits or attaching reports.

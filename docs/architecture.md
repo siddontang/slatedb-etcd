@@ -1,8 +1,8 @@
 # Architecture and implementation plan
 
 This document defines the storage contract, execution model, and project roadmap.
-The baseline is commit `0b1509e`, which added Watch and Lease support.
-Commit `fc967ed` completed phase 1. Commit `c14308a` added ReadIndex and separate log I/O.
+The baseline is commit `327c617`, which added Watch and Lease support.
+Commit `f1ff0b2` completed phase 1. Commit `3365292` added ReadIndex and separate log I/O.
 The implementation also has bounded log pools, asynchronous entry reads, and follower read barriers.
 The administration milestone adds replicated Auth, membership, alarms, and secure transport.
 Sections marked as targets describe work that is not implemented yet.

@@ -2,7 +2,6 @@
 """Scan fetched Git history and current publishable files with Gitleaks."""
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,10 +11,6 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = "8.30.1"
-FIXTURE = "tests/fixtures/server.key.insecure"
-FIXTURE_SHA256 = "3bf06e3687fce3cdd050e32b6f9dfa4eeb0787ee5fd514840b50bae167db3874"
-FIXTURE_COMMITS = ["c7280fb695b06df1a8cfd434584b42bacf53dbe6",
-                   "b44fbb52d5aa6f6252db3f55ee4e6d2035eb76c2"]
 
 
 def git(*args):
@@ -50,21 +45,6 @@ def scan(scanner, mode, path, folder, ignore, log_options=None, input_data=None)
     return findings
 
 
-def validate_exceptions():
-    expected = {f"{commit}:{FIXTURE}:private-key:1" for commit in FIXTURE_COMMITS}
-    actual = {line.strip() for line in (ROOT / ".gitleaksignore").read_text().splitlines()
-              if line.strip() and not line.startswith("#")}
-    if actual != expected:
-        raise RuntimeError("Secret exceptions must match the two reviewed historical fixtures")
-    for commit in FIXTURE_COMMITS:
-        available = subprocess.run(["git", "cat-file", "-e", commit], cwd=ROOT,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if available.returncode == 0:
-            data = git("show", f"{commit}:{FIXTURE}")
-            if hashlib.sha256(data).hexdigest() != FIXTURE_SHA256:
-                raise RuntimeError("The historical fixture differs from the public upstream key")
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gitleaks", default=os.environ.get("GITLEAKS", "gitleaks"))
@@ -77,7 +57,6 @@ def main():
         parser.error(f"Expected Gitleaks {VERSION}; found {version}")
     if git("rev-parse", "--is-shallow-repository").strip() == b"true":
         parser.error("Fetch the complete history before scanning")
-    validate_exceptions()
     names = set(git("ls-files", "-z", "--cached", "--others", "--exclude-standard")
                 .decode().split("\0")) - {""}
     with tempfile.TemporaryDirectory(prefix="slatedb-secret-scan-") as name:
@@ -97,7 +76,7 @@ def main():
         empty = folder / "empty.ignore"
         empty.write_text("")
         current = scan(scanner, "dir", snapshot, folder, empty)
-        history = scan(scanner, "git", ROOT, folder, ROOT / ".gitleaksignore",
+        history = scan(scanner, "git", ROOT, folder, empty,
                        "--all --full-history")
         messages = git("log", "--all", "--format=%B")
         messages += git("for-each-ref", "--format=%(contents)", "refs/tags")
@@ -108,7 +87,7 @@ def main():
                       "current_files": count, "commits": int(git("rev-list", "--all", "--count")),
                       "current_findings": len(current), "history_findings": len(history),
                       "message_findings": len(metadata),
-                      "reviewed_historical_exceptions": len(FIXTURE_COMMITS)}))
+                      "historical_exceptions": 0}))
     raise SystemExit(0 if passed else 1)
 
 

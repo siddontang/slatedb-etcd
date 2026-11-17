@@ -33,6 +33,8 @@ scripts/cargo.sh fmt --check
 scripts/cargo.sh clippy --locked --all-targets -- -D warnings
 scripts/cargo.sh test --locked
 python3 scripts/check-public.py
+python3 scripts/test_history.py
+python3 scripts/check-history.py
 python3 scripts/test_reporting.py
 python3 scripts/check-secrets.py
 ```
@@ -46,6 +48,23 @@ Do not mark a failing behavior as supported by skipping its test.
 Use concise English, active voice, and lines of at most 100 characters in prose and comments.
 Keep sentences below 30 words. Follow `AGENTS.md` and the pull request template.
 State the concrete behavior, validation results, and remaining limits.
+
+Use a GitHub public email in author and committer fields.
+The owner requires this exact trailer on every project commit:
+
+```text
+Signed-off-by: siddontang <siddontang@gmail.com>
+```
+
+For an owner-approved commit, add the trailer explicitly:
+
+```sh
+git commit --trailer "Signed-off-by: siddontang <siddontang@gmail.com>"
+```
+
+The owner email remains public in this trailer by request.
+A sign-off records approval under the project policy. It is not a cryptographic signature.
+Do not add another person's sign-off without their authorization.
 Do not claim full etcd or Jepsen coverage from the imported common suite.
 
 ## Import upstream tests

@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Check fetched history for private metadata, local paths, and missing sign-offs."""
+
+import argparse
+import json
+from pathlib import Path
+import re
+import subprocess
+
+ROOT = Path(__file__).resolve().parents[1]
+SIGN_OFF = b"Signed-off-by: siddontang <siddontang@gmail.com>"
+PUBLIC_EMAIL = re.compile(rb"(?:[\w.+-]+@users\.noreply\.github\.com|noreply@github\.com)\Z")
+EMAIL = re.compile(rb"[\w.+%-]+@[\w.-]+\.[A-Za-z]{2,}")
+HOME = re.compile(rb"(?<![\w./<>-])/(?:Users|home)/([^/\s\"'<>]+)")
+TEMP = re.compile(rb"/(?:private/)?var/folders/[^/\s]+/[^/\s]+")
+WINDOWS_HOME = re.compile(rb"[A-Za-z]:\\Users\\[^\\\s\"'<>]+", re.IGNORECASE)
+
+
+def git(root, *args, data=None):
+    return subprocess.check_output(["git", *args], cwd=root, input=data)
+
+
+def path_errors(data, name=""):
+    errors = []
+    for match in HOME.finditer(data):
+        if name == "scripts/test_reporting.py" and match[1] == b"example":
+            continue
+        errors.append("workstation home path")
+    if TEMP.search(data) or WINDOWS_HOME.search(data):
+        errors.append("workstation temporary or Windows path")
+    if re.search(rb"(?:codex|plugin|skill)://", data):
+        # The checker stores escaped patterns, not private application links.
+        errors.append("private application link")
+    return sorted(set(errors))
+
+
+def commit_errors(root, raw):
+    headers, message = raw.split(b"\n\n", 1)
+    errors = path_errors(message)
+    for field in (b"author", b"committer"):
+        match = re.search(rb"(?m)^" + field + rb" .* <([^<>]+)> ", headers)
+        if match is None or PUBLIC_EMAIL.fullmatch(match[1]) is None:
+            errors.append(field.decode() + " must use a GitHub public email")
+    trailers = git(root, "interpret-trailers", "--parse", data=message).splitlines()
+    if trailers.count(SIGN_OFF) != 1 or message.splitlines().count(SIGN_OFF) != 1:
+        errors.append("missing or repeated owner sign-off")
+    remaining = b"\n".join(line for line in message.splitlines() if line != SIGN_OFF)
+    if any(PUBLIC_EMAIL.fullmatch(address) is None for address in EMAIL.findall(remaining)):
+        errors.append("personal email outside the owner sign-off")
+    return errors
+
+
+def audit(root):
+    if git(root, "rev-parse", "--is-shallow-repository").strip() == b"true":
+        raise RuntimeError("Fetch complete history before checking commit metadata")
+    failures, counts = [], {"commits": 0, "blobs": 0, "tags": 0}
+    rows = git(root, "rev-list", "--objects", "--all").splitlines()
+    for row in rows:
+        oid, _, name = row.partition(b" ")
+        kind = git(root, "cat-file", "-t", oid.decode()).strip()
+        if kind not in (b"commit", b"blob", b"tag"):
+            continue
+        data = git(root, "cat-file", kind.decode(), oid.decode())
+        errors = []
+        if kind == b"commit":
+            counts["commits"] += 1
+            errors = commit_errors(root, data)
+        elif kind == b"blob":
+            counts["blobs"] += 1
+            errors = path_errors(data, name.decode())
+        else:
+            counts["tags"] += 1
+            errors = path_errors(data)
+            match = re.search(rb"(?m)^tagger .* <([^<>]+)> ", data)
+            if match and PUBLIC_EMAIL.fullmatch(match[1]) is None:
+                errors.append("tagger must use a GitHub public email")
+            message = data.partition(b"\n\n")[2]
+            if any(PUBLIC_EMAIL.fullmatch(value) is None for value in EMAIL.findall(message)):
+                errors.append("personal email in tag message")
+        for error in errors:
+            failures.append({"object": oid.decode(), "path": name.decode(), "error": error})
+    return counts, failures
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", type=Path, default=ROOT)
+    args = parser.parse_args()
+    counts, failures = audit(args.repo)
+    for failure in failures:
+        print(json.dumps(failure))
+    print(json.dumps({**counts, "passed": not failures, "findings": len(failures)}))
+    raise SystemExit(bool(failures))
+
+
+if __name__ == "__main__":
+    main()

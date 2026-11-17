@@ -1,10 +1,8 @@
-# Temporary test keys
+# Temporary test credentials
 
-TLS tests generate fresh certificates and separate trust roots for every cluster.
-JWT tests generate a fresh RSA key pair in a test temporary directory.
-Private key files have mode 0600. Test cleanup removes the files.
-No committed certificate or private key is required.
+Tests generate TLS certificates and JWT keys in temporary directories.
+Each JWT cluster uses a new RSA key pair. Test cleanup removes the files.
 
-Earlier commits used the public etcd v3.6.5 `server.crt` and `server.key.insecure` fixtures.
-See the [publication review](../../docs/publication.md) for their provenance and historical scan
-exceptions. Never use a test key as a deployment credential.
+The historical key and certificate came from the public etcd v3.6.5 test fixtures.
+The publication cleanup removed both files from the rewritten project history.
+Do not use upstream test credentials in a deployment.

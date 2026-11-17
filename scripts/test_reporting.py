@@ -25,6 +25,11 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(result["runs"][0]["trace"], "<tmp>/trace.json")
         self.assertEqual(result["runs"][0]["error"], "failed at <home>/project/src.rs:12")
 
+    def test_other_macos_temporary_roots_are_removed(self):
+        root = "/var/" + "folders/xx/example/T"
+        self.assertEqual(portable(root + "/trace.json"), "<tmp>/trace.json")
+        self.assertEqual(portable("/private" + root + "/trace.json"), "<tmp>/trace.json")
+
     def test_relative_paths_and_public_urls_remain(self):
         values = ["results/dst.json", "https://github.com/etcd-io/etcd", None, 0, True]
         self.assertEqual(portable(values), values)

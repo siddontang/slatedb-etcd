@@ -14,20 +14,18 @@ SPEC.loader.exec_module(SCAN)
 
 
 class SecretScanTests(unittest.TestCase):
-    def test_new_key_cannot_use_historical_exception(self):
+    def test_new_key_is_rejected_in_files_history_and_messages(self):
         scanner = shutil.which(os.environ.get("GITLEAKS", "gitleaks"))
         self.assertIsNotNone(scanner, "Gitleaks is required for this negative control")
         with tempfile.TemporaryDirectory(prefix="slatedb-secret-control-") as directory:
             root = Path(directory)
             repository = root / "repo"
-            key = repository / SCAN.FIXTURE
+            key = repository / "tests/fixtures/server.key.insecure"
             key.parent.mkdir(parents=True)
             generated = subprocess.check_output(["openssl", "genrsa", "2048"],
                                                 stderr=subprocess.DEVNULL)
             key.write_bytes(generated)
             key.chmod(0o600)
-            ignore = repository / ".gitleaksignore"
-            shutil.copyfile(SCAN.ROOT / ".gitleaksignore", ignore)
             empty = root / "empty.ignore"
             empty.write_text("")
             findings = SCAN.scan(scanner, "dir", repository, root, empty)
@@ -37,7 +35,11 @@ class SecretScanTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(repository), "-c", "user.name=Scan Test",
                             "-c", "user.email=scan@example.invalid", "-c", "commit.gpgsign=false",
                             "commit", "-qm", "Add a temporary negative control"], check=True)
-            findings = SCAN.scan(scanner, "git", repository, root, ignore, "--all --full-history")
+            findings = SCAN.scan(scanner, "git", repository, root, empty, "--all --full-history")
+            self.assertTrue(any(item["RuleID"] == "private-key" for item in findings))
+
+            findings = SCAN.scan(scanner, "stdin", repository, root, empty,
+                                 input_data=generated.decode())
             self.assertTrue(any(item["RuleID"] == "private-key" for item in findings))
 
 

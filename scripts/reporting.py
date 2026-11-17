@@ -19,6 +19,8 @@ def portable(value):
             pattern = r"(?<![\w./<>-])" + re.escape(str(path)) + r"(?=/|$)"
             value = re.sub(pattern, label, value)
         value = re.sub(r"(?<![\w./<>-])/(?:Users|home)/[^/\s\"'<>]+", "<home>", value)
+        value = re.sub(r"(?<![\w./<>-])/(?:private/)?var/folders/[^/\s]+/[^/\s]+/T(?=/|$)",
+                       "<tmp>", value)
         return value
     return value
 
