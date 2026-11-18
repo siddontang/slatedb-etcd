@@ -107,10 +107,11 @@ impl StateMachine {
         let Some(delta) = previous.filter(|d| d.base == base.get_metadata().index) else {
             return Ok(Box::pin(self.snapshot_job()?));
         };
+        let metrics = self.metrics.clone();
         let db = self.db.clone();
         let members = self.members.clone();
         Ok(Box::pin(async move {
-            db.flush().await?;
+            metrics.flush_db(&db).await?;
             tokio::task::spawn_blocking(move || {
                 delta.merge(&base.data, applied, &serde_json::to_vec(members.as_ref())?)
             })

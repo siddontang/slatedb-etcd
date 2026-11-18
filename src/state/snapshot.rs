@@ -13,6 +13,7 @@ impl StateMachine {
     ) -> Result<impl std::future::Future<Output = Result<Vec<u8>>> + Send + 'static> {
         let snapshot = self.db.snapshot()?;
         let db = Arc::clone(&self.db);
+        let metrics = self.metrics.clone();
         let applied = self.applied;
         let members = serde_json::to_vec(self.members.as_ref())?;
         ensure!(
@@ -20,7 +21,7 @@ impl StateMachine {
             "snapshot does not match the apply marker"
         );
         Ok(async move {
-            db.flush().await?;
+            metrics.flush_db(&db).await?;
             let mut data = bincode::serialize(&(STORAGE_FORMAT, applied))?;
             let count_offset = data.len();
             bincode::serialize_into(&mut data, &0_u64)?;
@@ -69,7 +70,7 @@ impl StateMachine {
         self.write_batch(batch, index).await?;
         crate::failpoint::hit("snapshot-after-install-write");
         // The durable Raft snapshot lets a restart repeat this atomic replacement.
-        self.db.flush().await?;
+        self.metrics.flush_db(&self.db).await?;
         crate::failpoint::hit("snapshot-after-install-flush");
         self.applied = index;
         self.durable_applied = index;

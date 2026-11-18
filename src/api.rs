@@ -96,7 +96,7 @@ async fn raft_message(State(state): State<ApiState>, headers: HeaderMap, body: B
         return StatusCode::FORBIDDEN.into_response();
     }
     match Message::parse_from_bytes(&body) {
-        Ok(message) => dispatch(state, |tx| Event::Step(message, tx))
+        Ok(message) => dispatch(state, |tx| Event::PeerFrame(message, body.len(), tx))
             .await
             .into_response(),
         Err(_) => StatusCode::BAD_REQUEST.into_response(),

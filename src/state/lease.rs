@@ -58,31 +58,43 @@ impl StateMachine {
                 }),
             });
         }
-        let (result, mut batch, revision, change) = match crate::lease::prepare(
-            &self.db,
-            self.revision,
-            self.compact_revision,
-            index,
-            &self.leases,
-            command,
-        )
-        .await
-        {
-            Ok((reply, batch, revision, change)) => (Ok(reply), batch, revision, change),
-            Err(error) => {
-                ensure!(
-                    error.code != tonic::Code::Internal as i32,
-                    "{}",
-                    error.message
-                );
-                (Err(error), WriteBatch::new(), self.revision, None)
-            }
-        };
+        let (result, mut batch, revision, change, deletes) =
+            match crate::lease::prepare_with_counts(
+                &self.db,
+                self.revision,
+                self.compact_revision,
+                index,
+                &self.leases,
+                command,
+            )
+            .await
+            {
+                Ok(((reply, batch, revision, change), deletes)) => {
+                    (Ok(reply), batch, revision, change, deletes)
+                }
+                Err(error) => {
+                    ensure!(
+                        error.code != tonic::Code::Internal as i32,
+                        "{}",
+                        error.message
+                    );
+                    (Err(error), WriteBatch::new(), self.revision, None, 0)
+                }
+            };
         batch.put(APPLIED, index.to_be_bytes());
         self.write_batch(batch, index).await?;
         self.applied = index;
         self.revision = revision;
+        if deletes > 0 {
+            self.metrics.deletes.inc_by(deletes);
+        }
         if let Some((id, record)) = change {
+            if let (L::Grant { .. }, Some(lease)) = (command, &record) {
+                self.metrics.grants.inc();
+                self.metrics.ttl.observe(lease.ttl as f64);
+            } else if record.is_none() {
+                self.metrics.revokes.inc();
+            }
             let leases = Arc::make_mut(&mut self.leases);
             if let Some(record) = record {
                 leases.insert(id, record);

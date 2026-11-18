@@ -436,6 +436,12 @@ Compactor failures return RPC errors; they do not stop the Raft owner.
 Native snapshot export includes SHA-256 and uses bounded response chunks, but builds a full buffer.
 Snapshots contain authentication, membership, alarms, leases, and revision metadata together.
 
+## Monitoring
+
+Each member owns a Prometheus registry. Scrapes take a short Raft sample and read the manifest
+outside the Raft loop. File handles measure actual WAL I/O. The client listener counts gRPC
+messages and final statuses. See the [metrics contract](metrics.md).
+
 ## Target storage and deployment architecture
 
 The S3 deployment retains one independent SlateDB owner per replica.

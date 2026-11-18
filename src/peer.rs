@@ -94,6 +94,7 @@ pub(crate) async fn transport(
     mut messages: mpsc::Receiver<Message>,
     events: mpsc::Sender<Event>,
     transport: crate::tls::Transport,
+    traffic: std::sync::Arc<crate::metrics::PeerTraffic>,
 ) {
     let Ok(channel) = transport.channel(&address) else {
         report(&events, peer, false, false).await;
@@ -102,7 +103,7 @@ pub(crate) async fn transport(
     let url = format!("{}/raft", crate::cluster::url(&address));
     while let Some(first) = messages.recv().await {
         if first.get_msg_type() == MessageType::MsgSnapshot {
-            let success = post_snapshot(&transport.http, &url, &cluster_id, first).await;
+            let success = post_snapshot(&transport.http, &url, &cluster_id, first, &traffic).await;
             report(&events, peer, true, success).await;
             continue;
         }
@@ -145,7 +146,7 @@ pub(crate) async fn transport(
             loop {
                 if acknowledged == sent {
                     if let Some(message) = snapshot.take() {
-                        let success = post_snapshot(&transport.http, &url, &cluster_id, message).await;
+                        let success = post_snapshot(&transport.http, &url, &cluster_id, message, &traffic).await;
                         report(&events, peer, true, success).await;
                         healthy = success;
                     }
@@ -156,7 +157,9 @@ pub(crate) async fn transport(
                         ensure!(Some(receipt.sequence) == acknowledged.checked_add(1) && receipt.sequence <= sent,
                             "peer receipt is out of order");
                         acknowledged = receipt.sequence;
-                        outstanding_bytes -= sizes.pop_front().context("unexpected peer receipt")?;
+                        let bytes = sizes.pop_front().context("unexpected peer receipt")?;
+                        outstanding_bytes -= bytes;
+                        traffic.sent.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
                         deadline = Instant::now() + PROGRESS_TIMEOUT;
                         if !healthy { report(&events, peer, false, true).await; healthy = true; }
                     }
@@ -192,13 +195,16 @@ async fn post_snapshot(
     url: &str,
     cluster: &str,
     message: Message,
+    traffic: &crate::metrics::PeerTraffic,
 ) -> bool {
     let result: Result<()> = async {
+        let payload = message.write_to_bytes()?;
+        let size = payload.len();
         let response = client
             .post(url)
             .header("x-cluster-id", cluster)
             .timeout(Duration::from_secs(30))
-            .body(message.write_to_bytes()?)
+            .body(payload)
             .send()
             .await?;
         ensure!(
@@ -207,6 +213,9 @@ async fn post_snapshot(
             response.status()
         );
         response.bytes().await.context("read snapshot response")?;
+        traffic
+            .sent
+            .fetch_add(size as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
     .await;

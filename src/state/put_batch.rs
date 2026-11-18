@@ -8,6 +8,7 @@ pub(crate) struct Put<'a> {
 }
 
 pub(crate) struct PreparedPuts {
+    counts: crate::metrics::Writes,
     first: u64,
     pub last: u64,
     writes: WriteBatch,
@@ -35,6 +36,7 @@ impl StateMachine {
         let mut size = self.logical_bytes;
         let mut alarms = self.alarms.clone();
         let mut replies = Vec::with_capacity(puts.len());
+        let mut counts = crate::metrics::Writes::default();
         for (offset, put) in puts.iter().enumerate() {
             ensure!(
                 put.index == self.applied + offset as u64 + 1,
@@ -78,6 +80,12 @@ impl StateMachine {
                             size = writes
                                 .logical_size_after(&self.db, Some(&batch), size)
                                 .await?;
+                            if let Some(
+                                crate::proto::etcdserverpb::request_op::Request::RequestPut(p),
+                            ) = &put.request.request
+                            {
+                                counts.put(&p.key, &p.value);
+                            }
                             batch.extend(writes);
                             revision = next;
                             Ok(reply)
@@ -99,6 +107,7 @@ impl StateMachine {
         batch.put(APPLIED, last.to_be_bytes());
         Ok((
             PreparedPuts {
+                counts,
                 first: puts[0].index,
                 last,
                 writes: batch,
@@ -112,6 +121,7 @@ impl StateMachine {
 
     pub(crate) async fn publish_puts(&mut self, prepared: PreparedPuts) -> Result<()> {
         let PreparedPuts {
+            counts,
             first,
             last,
             writes,
@@ -130,6 +140,7 @@ impl StateMachine {
         self.applied = last;
         self.revision = revision;
         self.logical_bytes = size;
+        counts.publish(&self.metrics);
         self.alarms = alarms;
         for _ in first..=last {
             crate::failpoint::hit("apply-after-entry");

@@ -2,6 +2,7 @@ use super::*;
 
 /// Pin data and authorization metadata at one applied position.
 pub(crate) struct ReadView {
+    metrics: Arc<crate::metrics::StateMeters>,
     pub snapshot: Arc<slatedb::DbSnapshot>,
     pub revision: i64,
     pub compact_revision: i64,
@@ -17,6 +18,7 @@ impl StateMachine {
             "read view does not match applied state"
         );
         Ok(Arc::new(ReadView {
+            metrics: self.metrics.clone(),
             snapshot,
             revision: self.revision,
             compact_revision: self.compact_revision,
@@ -37,6 +39,11 @@ impl ReadView {
                 return Ok(Outcome { result: Err(error) });
             }
         }
+        let start = matches!(
+            request.request,
+            Some(crate::proto::etcdserverpb::request_op::Request::RequestRange(_))
+        )
+        .then(std::time::Instant::now);
         let result = mvcc::read_snapshot(
             &self.snapshot,
             self.revision,
@@ -45,6 +52,14 @@ impl ReadView {
             &self.leases,
         )
         .await;
+        if let Some(start) = start {
+            let histogram = if result.is_ok() {
+                &self.metrics.range_ok
+            } else {
+                &self.metrics.range_error
+            };
+            histogram.observe(start.elapsed().as_secs_f64());
+        }
         if let Err(error) = &result {
             ensure!(
                 error.code != tonic::Code::Internal as i32,

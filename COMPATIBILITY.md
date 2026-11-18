@@ -1,5 +1,7 @@
 # etcd v3 compatibility milestone
 
+See the [metrics inventory](docs/metrics.md) for Prometheus compatibility with etcd v3.6.5.
+
 Run date: 2026-11-17, Asia/Singapore.
 The reference server, imported common suite, model, and Go client use etcd v3.6.5.
 Local tests use ARM64 macOS. The PR workflow repeats validation on Linux.

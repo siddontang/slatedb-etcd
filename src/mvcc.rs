@@ -245,6 +245,7 @@ impl ReadDb<'_> {
 }
 
 struct View<'a> {
+    writes: crate::metrics::Writes,
     db: ReadDb<'a>,
     revision: i64,
     compact_revision: i64,
@@ -551,6 +552,7 @@ impl View<'_> {
                     let old = self.point(&p.key, true).await?;
                     let revision = self.revision + 1;
                     let kv = put::value(&p, old.as_ref(), revision);
+                    self.writes.put(&kv.key, &kv.value);
                     self.events.push(crate::proto::mvccpb::Event {
                         r#type: 0,
                         kv: Some(kv.clone()),
@@ -565,6 +567,7 @@ impl View<'_> {
                 Plan::Op(Op::RequestDeleteRange(d)) => {
                     let rows = self.latest(&d.key, &d.range_end, true).await?;
                     let deleted = rows.len() as i64;
+                    self.writes.deletes += 1;
                     for (key, old) in &rows {
                         self.events.push(crate::proto::mvccpb::Event {
                             r#type: 1,
@@ -640,6 +643,7 @@ async fn read_from(
         return Err(KvError::invalid("read request contains a write"));
     }
     let mut view = View {
+        writes: Default::default(),
         db,
         revision,
         compact_revision,
@@ -663,8 +667,21 @@ pub async fn prepare(
     request: &RequestOp,
     leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
 ) -> KvResult<(ResponseOp, WriteBatch, i64)> {
+    let (response, batch, next, _) =
+        prepare_with_counts(db, revision, compact_revision, request, leases).await?;
+    Ok((response, batch, next))
+}
+
+pub(crate) async fn prepare_with_counts(
+    db: &Db,
+    revision: i64,
+    compact_revision: i64,
+    request: &RequestOp,
+    leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
+) -> KvResult<(ResponseOp, WriteBatch, i64, crate::metrics::Writes)> {
     validate(request)?;
     let mut view = View {
+        writes: Default::default(),
         db: ReadDb::Live(db),
         revision,
         compact_revision,
@@ -686,7 +703,7 @@ pub async fn prepare(
         put::record_version(&mut batch, key, value, next);
     }
     batch.put(REVISION, next.to_be_bytes());
-    Ok((response, batch, next))
+    Ok((response, batch, next, view.writes))
 }
 
 pub(crate) fn batchable_put(request: &RequestOp) -> bool {
@@ -781,8 +798,9 @@ pub(crate) async fn revoke_keys(
     compact_revision: i64,
     id: i64,
     leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
-) -> KvResult<(WriteBatch, i64)> {
+) -> KvResult<(WriteBatch, i64, u64)> {
     let mut view = View {
+        writes: Default::default(),
         db: ReadDb::Live(db),
         revision,
         compact_revision,
@@ -818,5 +836,5 @@ pub(crate) async fn revoke_keys(
     }
     crate::watch::record(next, view.events, &mut batch);
     batch.put(REVISION, next.to_be_bytes());
-    Ok((batch, next))
+    Ok((batch, next, view.writes.deletes))
 }

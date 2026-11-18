@@ -73,6 +73,20 @@ pub async fn prepare(
     leases: &BTreeMap<i64, LeaseRecord>,
     command: &LeaseCommand,
 ) -> Result<PreparedLease, KvError> {
+    let (prepared, _) =
+        prepare_with_counts(db, revision, compact_revision, index, leases, command).await?;
+    Ok(prepared)
+}
+
+pub(crate) async fn prepare_with_counts(
+    db: &Db,
+    revision: i64,
+    compact_revision: i64,
+    index: u64,
+    leases: &BTreeMap<i64, LeaseRecord>,
+    command: &LeaseCommand,
+) -> Result<(PreparedLease, u64), KvError> {
+    let mut deletes = 0;
     let mut batch = WriteBatch::new();
     let mut next = revision;
     let mut change = None;
@@ -128,7 +142,7 @@ pub async fn prepare(
                 return Err(KvError::new(Code::NotFound, "requested lease not found"));
             }
             if valid {
-                (batch, next) =
+                (batch, next, deletes) =
                     mvcc::revoke_keys(db, revision, compact_revision, id, leases).await?;
                 change = Some((id, None));
             }
@@ -165,5 +179,5 @@ pub async fn prepare(
             batch.delete(key(*id));
         }
     }
-    Ok((reply, batch, next, change))
+    Ok(((reply, batch, next, change), deletes))
 }

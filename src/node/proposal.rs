@@ -84,6 +84,7 @@ impl Node {
         let started = Instant::now();
         for (id, response) in group.clients {
             if let Err(ref error) = result {
+                self.metrics.failed_proposals.inc();
                 let _ = response.send(Err(self.error(&error.to_string())));
                 continue;
             }

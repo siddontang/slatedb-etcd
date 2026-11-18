@@ -41,7 +41,7 @@ pub(super) async fn run(
                     return Err(Status::invalid_argument("snapshots require the durable endpoint"));
                 }
                 let (response, completed) = oneshot::channel();
-                events.try_send(Event::Step(message, response))
+                events.try_send(Event::PeerFrame(message, frame.payload.len(), response))
                     .map_err(|_| Status::unavailable("peer queue is unavailable"))?;
                 bytes += frame.payload.len();
                 pending.push_back(Pending {

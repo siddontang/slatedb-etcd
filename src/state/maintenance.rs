@@ -38,6 +38,7 @@ impl StateMachine {
             }
             Command::Hash(revision) => self.hash_kv(*revision).await,
             Command::HashAll => {
+                let _timer = self.metrics.hash.start_timer();
                 let mut hash = 0;
                 let mut rows = self.db.scan_prefix(b"etcd/", ..).await?;
                 while let Some(row) = rows.next().await? {
@@ -52,6 +53,7 @@ impl StateMachine {
                 .map_err(KvError::storage)
                 .map(|()| json!({"header": mvcc::header(self.revision)})),
             Command::Snapshot => {
+                let _timer = self.metrics.snapshot.start_timer();
                 let bytes = self.snapshot_data().await?;
                 if bytes.len() + 32 > 64 * 1024 * 1024 {
                     Err(KvError::new(
@@ -135,8 +137,11 @@ impl StateMachine {
     }
 
     async fn physical_size(&self) -> Result<u64> {
-        let manifest = self
-            .admin
+        Self::manifest_size(&self.admin).await
+    }
+
+    pub(crate) async fn manifest_size(admin: &slatedb::admin::Admin) -> Result<u64> {
+        let manifest = admin
             .read_manifest(None)
             .await?
             .context("missing manifest")?;
@@ -147,7 +152,9 @@ impl StateMachine {
     }
 
     async fn defragment(&mut self) -> Result<()> {
-        self.db.flush().await?;
+        let _timer = self.metrics.defrag.start_timer();
+        let _active = crate::metrics::Active::new(&self.metrics.defrag_active);
+        self.metrics.flush_db(&self.db).await?;
         self.durable_applied = self.applied;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         loop {
@@ -195,6 +202,7 @@ impl StateMachine {
     }
 
     pub(super) async fn hash_kv(&self, revision: i64) -> std::result::Result<Value, KvError> {
+        let _timer = self.metrics.hash_rev.start_timer();
         if revision > 0 {
             for mut cached in self.hash_cache().await.map_err(KvError::storage)? {
                 if cached["hash_revision"].as_i64() == Some(revision) {
