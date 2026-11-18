@@ -197,6 +197,8 @@ Restart and snapshot installation restore the boundary with the retained history
 Raft log GC remains separate from MVCC compaction.
 
 Compaction scans all history and builds one deletion batch on the apply worker.
+Quota accounting uses the stored lengths from the history, Watch, and HashKV scans.
+Each deleted row contributes its original size once.
 Large histories can delay state reads and write completion. Raft keeps processing ticks and peers.
 Physical Compact waits for the deletion batch to flush before it returns.
 Defragment rewrites the current SST set and waits for manifest publication.

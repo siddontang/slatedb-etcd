@@ -41,6 +41,10 @@ func TestFailpointRecovery(t *testing.T) {
 			if strings.HasPrefix(point, "snapshot-") || strings.HasPrefix(point, "checkpoint-") {
 				anchor = strings.Repeat("checkpoint", 8192)
 			}
+			if strings.HasPrefix(point, "compact-") {
+				mustCall(t, api, clientv3.OpPut("anchor", strings.Repeat("x", 4096)))
+				mustCall(t, api, clientv3.OpDelete("anchor"))
+			}
 			base := mustCall(t, api, clientv3.OpPut("anchor", anchor)).(*pb.PutResponse)
 			for _, endpoint := range c.addresses {
 				mustCall(t, client(t, []string{endpoint}), clientv3.OpGet("anchor"))

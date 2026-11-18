@@ -158,6 +158,8 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
             driver = subprocess.Popen([str(tools / "benchmark"), "--endpoints", ",".join(clients),
                 "--requests", str(args.read_requests if reads == 100 and args.read_requests else args.requests), "--keys", str(args.keys), "--value-size", str(args.value_size),
                 "--concurrency", str(concurrency), "--read-percent", str(reads), "--warmup", str(args.warmup),
+                "--compact-every", str(getattr(args, "compact_every", 0)),
+                "--retain-revisions", str(getattr(args, "retain_revisions", 1000)),
                 "--value-pattern", getattr(args, "value_pattern", "repeat"),
                 "--rate", str(getattr(args, "rate", 0)),
                 "--seed", str(args.seed+repeat), "--control-dir", str(root), "--output", str(result_path)],
@@ -243,6 +245,8 @@ def main():
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 8, 32])
     parser.add_argument("--read-percent", type=int, nargs="+", default=[0, 50, 100])
     parser.add_argument("--keys", type=int, default=1000)
+    parser.add_argument("--compact-every", type=int, default=0)
+    parser.add_argument("--retain-revisions", type=int, default=1000)
     parser.add_argument("--value-pattern", choices=("repeat", "binary", "metadata"), default="repeat")
     parser.add_argument("--value-size", type=int, default=256)
     parser.add_argument("--warmup", type=int, default=100)
@@ -264,6 +268,8 @@ def main():
     if min(args.requests, args.keys, args.value_size, args.timeout_seconds, args.repeat,
            args.snapshot_entries, args.quota_bytes, *args.concurrency) < 1 or args.warmup < 0:
         parser.error("Counts, sizes, quotas, and timeouts must be positive; warmup can be zero")
+    if args.compact_every < 0 or args.retain_revisions < 0:
+        parser.error("Compaction count and retention must be nonnegative")
     if args.value_pattern == "metadata" and args.value_size < 256:
         parser.error("Metadata values require at least 256 bytes")
     if args.rate < 0:

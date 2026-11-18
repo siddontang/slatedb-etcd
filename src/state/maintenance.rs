@@ -326,11 +326,12 @@ pub(crate) async fn compact_hash(
         }
         let kv =
             crate::proto::mvccpb::KeyValue::decode(row.value.clone()).map_err(KvError::storage)?;
-        if let Some(old) = latest.insert(kv.key, row.key.clone()) {
-            batch.delete(old);
+        let len = row.value.len();
+        if let Some((old, old_len)) = latest.insert(kv.key, (row.key.clone(), len)) {
+            batch.delete_known(old, old_len);
         }
         if row.key.len() == HASH.len() + 18 && main < revision {
-            batch.delete(row.key);
+            batch.delete_known(row.key, len);
         }
     }
     Ok(())

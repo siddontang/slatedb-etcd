@@ -92,6 +92,10 @@ CI also compares all three builds at 1,000 scheduled puts per second with 32 cli
 Use `--rate` to set a target for the measured phase. Zero selects the unpaced workload.
 Paced latency starts at the scheduled arrival and includes time waiting for a client worker.
 Compare achieved throughput before comparing resource use at a fixed rate.
+Use `--compact-every 5000 --retain-revisions 1000` to test physical compaction during writes.
+Every 5,000th successful measured Put asks the cluster to compact. The last 1,000 revisions stay.
+The caller waits for Compact. Other workers continue to issue requests.
+The report includes completed compactions and their durations. Put latency includes these waits.
 macOS sampling reads `ps` counters. Both exclude child processes and the controller.
 
 Use `--s3-bucket`, `--s3-endpoint`, and optional `--s3-allow-http` to measure remote state storage.

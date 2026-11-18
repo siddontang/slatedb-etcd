@@ -46,6 +46,11 @@ impl WriteBatch {
         self.change(key.as_ref(), None, Original::Read);
     }
 
+    /// Delete a row whose stored length is known from the compaction scan.
+    pub(crate) fn delete_known(&mut self, key: Bytes, old_len: usize) {
+        self.insert(key, None, Original::Known(Some(old_len)));
+    }
+
     /// Keep the size from the MVCC lookup for quota accounting.
     pub(crate) fn put_known(
         &mut self,
