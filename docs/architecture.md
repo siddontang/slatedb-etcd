@@ -109,6 +109,33 @@ This removes a separate SlateDB WAL write from the normal commit path.
 It does not remove local disk writes or the need for a quorum.
 A timeout or leader change can leave a request's result unknown. There is no retry deduplication.
 
+## Thread model
+
+Each standalone member uses one process and one Raft group.
+The main thread starts and supervises a Tokio runtime. Its default is two async worker threads.
+`--runtime-workers` sets this count. An embedded member uses the caller's Tokio runtime.
+Each task can resume on another runtime worker after it yields.
+
+| Work | Execution and ownership |
+| --- | --- |
+| Client and peer I/O | Tokio tasks handle connections, RPCs, streams, and peer transport. |
+| Raft | One task owns RawNode. It orders events, advances consensus, and dispatches work. |
+| WAL | One dedicated `raft-log-io` OS thread per member writes, syncs, and reads the log. |
+| Apply | One Tokio task per member writes SlateDB and publishes revisions in log order. |
+| KV reads | Up to four Tokio tasks read pinned views. At most one wide read runs at a time. |
+| Checkpoint | An async builder prepares the image. A blocking worker merges the frozen delta. |
+| Other work | Blocking workers handle password checks, metrics encoding, and local object I/O. |
+
+The client and peer tasks submit events through a queue with 2,048 slots.
+The owner sends ordered work to WAL and apply. Each worker sends its result back to the owner.
+Leader replication can proceed while the WAL thread waits for the disk.
+A linear read obtains a quorum proof and waits for local apply before it uses a pinned view.
+
+`--runtime-workers` counts only async scheduler threads. Tokio can add blocking threads on demand.
+Raft Engine also starts a metrics thread. Actual OS thread counts depend on load and storage.
+One Linux three-member write run observed 12 to 33 OS threads per member with the default settings.
+The count includes waiting threads. It does not measure the number of busy CPU cores.
+
 ## Apply isolation design
 
 The Raft owner retains RawNode, an in-memory log view, peer transport, and pending proposals.

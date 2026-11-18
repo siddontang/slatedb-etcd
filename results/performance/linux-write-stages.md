@@ -79,3 +79,26 @@ for bytes in 1024 4096; do
   for mode in sync ring ring sync sync ring; do /tmp/wal-sync "$mode" "$bytes"; done
 done
 ```
+
+## Three-member WAL experiment
+
+A separate Linux ARM64 test build used linked writes for a single synced raft-engine writer group.
+It returned credit for the final sync only after both completions succeeded on the same descriptor.
+Other writer groups, file rotation, directory syncs, and checkpoint files kept their normal paths.
+The production executable kept the direct WAL system calls.
+
+Five rounds ran 12,000 writes per sample. Each round shuffled the servers and concurrency levels.
+CPU measures server microseconds per operation. RSS measures the peak for all three members.
+
+| C | Server | Writes/s | p99 ms | CPU | RSS MiB |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 8 | Direct WAL | 6,477 | 6.13 | 314 | 294.7 |
+| 8 | Linked ring | 6,224 | 6.33 | 332 | 269.5 |
+| 8 | etcd v3.6.5 | 8,693 | 2.15 | 184 | 166.4 |
+| 32 | Direct WAL | 11,120 | 23.72 | 183 | 250.8 |
+| 32 | Linked ring | 11,015 | 21.91 | 187 | 258.6 |
+| 32 | etcd v3.6.5 | 18,628 | 4.46 | 90 | 167.9 |
+
+A separate 4,000-write trace counted 4,962 ring entry calls and 54 direct data sync calls.
+The direct executable made zero ring entry calls and 5,036 direct data sync calls.
+The linked build passed the process test for leader loss after an early quorum Put reply.
