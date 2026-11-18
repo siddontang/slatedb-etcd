@@ -36,6 +36,12 @@ Set `SLATEDB_KEEP_DATA=1` to retain successful ordinary test data too.
 Reports count skipped tests separately. Checker timeouts and unknown results fail the run.
 See the [audit and capability gaps](upstream/README.md) before interpreting a passing report.
 
+Watch has local apply semantics under the [etcd API contract][watch-guarantees].
+The compaction comparison waits for a linearizable read on each endpoint before expecting rejection.
+A partition test replays retained history on a lagging member, then checks rejection after recovery.
+
+[watch-guarantees]: https://etcd.io/docs/v3.6/learning/api_guarantees/#watch-apis
+
 ## Repeat a saved history
 
 ```sh
