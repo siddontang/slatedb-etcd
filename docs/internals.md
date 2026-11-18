@@ -60,6 +60,10 @@ is safe: startup can repeat the state replacement from the durable snapshot payl
 The checkpoint file contains a full copy of the state. This makes recovery independent of
 uncopied local object files, but limits the PoC to small data sets. Snapshots use the peer HTTP body
 limit of 64 MiB. Snapshot creation runs in the background.
+The file writer samples four 4 KiB regions in images of at least 64 KiB.
+It selects LZ4 when the sample shrinks by more than half. Other images use the original bytes.
+The encoder uses 64 KiB blocks. The WAL records the stored length for compressed files.
+Recovery checks both lengths and the CRC of the decoded image. Peer transfers use the full image.
 Members use different positions in each automatic checkpoint interval.
 Their rank in the configured peer list sets the position. Manual checkpoints bypass this schedule.
 Incoming peer snapshots use the ordered WAL thread for both file preparation and publication.

@@ -1,9 +1,11 @@
 //! Publish checkpoint bytes before the WAL can reference them or discard covered entries.
 
+mod encoding;
+
 use super::{Engine, LogBatch, LogFileSystem, Snapshot, GROUP, SNAPSHOT};
 use anyhow::{ensure, Context, Result};
 use std::fs::{self, File};
-use std::io::{ErrorKind, Write};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 const REFERENCE: &[u8] = b"checkpoint-file";
@@ -29,6 +31,7 @@ pub struct PreparedCheckpoint {
     pub(crate) data: bytes::Bytes,
     file: tempfile::NamedTempFile,
     checksum: u32,
+    compressed_len: Option<u64>,
 }
 
 impl PreparedCheckpoint {
@@ -38,7 +41,7 @@ impl PreparedCheckpoint {
             .suffix(STAGING_SUFFIX)
             .rand_bytes(RANDOM_CHARS)
             .tempfile_in(dir)?;
-        file.write_all(&data)?;
+        let compressed_len = encoding::write(file.as_file_mut(), &data)?;
         file.as_file().sync_all()?;
         let checksum = crc32c::crc32c(&data);
         crate::failpoint::hit("checkpoint-after-file-sync");
@@ -46,6 +49,7 @@ impl PreparedCheckpoint {
             data,
             file,
             checksum,
+            compressed_len,
         })
     }
 
@@ -62,6 +66,9 @@ impl PreparedCheckpoint {
 
         let mut reference = (self.data.len() as u64).to_le_bytes().to_vec();
         reference.extend_from_slice(&self.checksum.to_le_bytes());
+        if let Some(len) = self.compressed_len {
+            reference.extend_from_slice(&len.to_le_bytes());
+        }
         let mut metadata = snapshot.clone();
         metadata.data = bytes::Bytes::new();
         batch.put_message(GROUP, SNAPSHOT.to_vec(), &metadata)?;
@@ -83,20 +90,15 @@ pub(super) fn load(
 ) -> Result<Option<u64>> {
     if let Some(reference) = engine.get(GROUP, REFERENCE) {
         ensure!(
-            reference.len() == 12 && snapshot.data.is_empty(),
+            matches!(reference.len(), 12 | 20) && snapshot.data.is_empty(),
             "invalid checkpoint reference"
         );
         let len = u64::from_le_bytes(reference[..8].try_into()?);
-        let checksum = u32::from_le_bytes(reference[8..].try_into()?);
-        let file = path(dir, snapshot.get_metadata().index);
-        ensure!(
-            fs::metadata(&file)
-                .context("missing checkpoint file")?
-                .len()
-                == len,
-            "checkpoint length mismatch"
-        );
-        let data = fs::read(file)?;
+        let checksum = u32::from_le_bytes(reference[8..12].try_into()?);
+        let compressed_len = reference[12..].try_into().ok().map(u64::from_le_bytes);
+        let file = File::open(path(dir, snapshot.get_metadata().index))
+            .context("missing checkpoint file")?;
+        let data = encoding::read(file, len, compressed_len)?;
         ensure!(
             crc32c::crc32c(&data) == checksum,
             "checkpoint checksum mismatch"

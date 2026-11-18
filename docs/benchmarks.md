@@ -53,6 +53,10 @@ Run the one-member and three-member comparisons separately.
 Each workload starts with a fresh cluster.
 Both use the same official gRPC client, key count, value size, request count, and concurrency.
 All reads are linearizable. Both retain normal Raft sync behavior.
+The default value repeats one byte. Use `--value-pattern binary` for generated binary values.
+Use `--value-pattern metadata` for generated JSON records of at least 256 bytes.
+The client builds its value pool before measurement. Pure writes change values on each operation.
+Mixed workloads keep values stable per key so the client can check each read.
 Both use a 2 GiB quota setting and a 1,000-entry snapshot setting. Their accounting and retention
 implementations differ. Equal settings do not mean equal storage overhead.
 

@@ -311,3 +311,49 @@ fn checkpoint_recovery_requires_the_referenced_bytes_and_discards_only_orphans()
     assert!(current.exists() && unrelated.exists());
     assert!(!older.exists() && !future.exists() && !pending.exists());
 }
+
+#[test]
+fn checkpoint_reopens_plain_and_compressed_images_and_rejects_damage() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut bits = 42_u64;
+    let random: Vec<u8> = (0..16_384)
+        .flat_map(|_| {
+            bits ^= bits << 13;
+            bits ^= bits >> 7;
+            bits ^= bits << 17;
+            bits.to_le_bytes()
+        })
+        .collect();
+    let repeated = vec![0x31; random.len()];
+    let path = |index| root.join(format!("checkpoint-{index:016x}.data"));
+    let mut store = storage(root);
+    let hs = HardState {
+        term: 1,
+        vote: 1,
+        commit: 2,
+        ..Default::default()
+    };
+    store
+        .persist(&[entry(1, 1), entry(2, 1)], Some(&hs), None)
+        .unwrap();
+    store.checkpoint(1, random.clone()).unwrap();
+    drop(store);
+    assert_eq!(std::fs::read(path(1)).unwrap(), random);
+    let mut store = storage(root);
+    assert_eq!(store.recovery_snapshot().data.as_ref(), random);
+    store.checkpoint(2, repeated.clone()).unwrap();
+    drop(store);
+    let original = std::fs::read(path(2)).unwrap();
+    assert!(original.len() < repeated.len() / 2);
+    assert_eq!(storage(root).recovery_snapshot().data.as_ref(), repeated);
+
+    std::fs::write(path(2), &original[..original.len() - 1]).unwrap();
+    assert!(RaftStorage::open(root, 1, "test", vec![1, 2, 3]).is_err());
+    let mut damaged = original.clone();
+    damaged[0] ^= 1;
+    std::fs::write(path(2), damaged).unwrap();
+    assert!(RaftStorage::open(root, 1, "test", vec![1, 2, 3]).is_err());
+    std::fs::write(path(2), original).unwrap();
+    assert_eq!(storage(root).recovery_snapshot().data.as_ref(), repeated);
+}

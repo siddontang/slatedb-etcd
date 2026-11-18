@@ -37,7 +37,11 @@ func TestFailpointRecovery(t *testing.T) {
 				target = leader
 			}
 			api := client(t, []string{c.addresses[leader-1]})
-			base := mustCall(t, api, clientv3.OpPut("anchor", "acknowledged")).(*pb.PutResponse)
+			anchor := "acknowledged"
+			if strings.HasPrefix(point, "snapshot-") || strings.HasPrefix(point, "checkpoint-") {
+				anchor = strings.Repeat("checkpoint", 8192)
+			}
+			base := mustCall(t, api, clientv3.OpPut("anchor", anchor)).(*pb.PutResponse)
 			for _, endpoint := range c.addresses {
 				mustCall(t, client(t, []string{endpoint}), clientv3.OpGet("anchor"))
 			}
@@ -120,7 +124,7 @@ func TestFailpointRecovery(t *testing.T) {
 			recovered := client(t, []string{c.addresses[target-1]})
 			got := mustCall(t, recovered, clientv3.OpGet("anchor")).(*pb.RangeResponse)
 			require.Len(t, got.Kvs, 1)
-			require.Equal(t, "acknowledged", string(got.Kvs[0].Value))
+			require.Equal(t, anchor, string(got.Kvs[0].Value))
 			require.GreaterOrEqual(t, got.Header.Revision, base.Header.Revision)
 			for key, revision := range batched {
 				got := mustCall(t, recovered, clientv3.OpGet(key)).(*pb.RangeResponse)
