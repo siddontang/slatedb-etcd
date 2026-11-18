@@ -1029,6 +1029,86 @@ impl Simulation {
         self.trace.push("batched put history recovered".into());
     }
 
+    async fn crash_after_quorum_reply(&mut self) {
+        let leader = self.leader().unwrap();
+        let revision = self.nodes[&leader].state.revision + 1;
+        let (tx, mut rx) = oneshot::channel();
+        self.paused_log = Some(leader);
+        let node = self.nodes.get_mut(&leader).unwrap();
+        node.propose(
+            RaftCommand::Etcd {
+                id: "quorum-crash".into(),
+                origin: leader,
+                etcd: RequestOp {
+                    request: Some(Op::RequestPut(PutRequest {
+                        key: b"quorum-crash".to_vec(),
+                        value: b"committed".to_vec(),
+                        ..Default::default()
+                    })),
+                },
+            },
+            ClientResponse::Kv(tx),
+        )
+        .unwrap();
+        self.drive().await;
+        for _ in 0..100 {
+            self.deliver(false).await;
+        }
+        let Some(Resp::ResponsePut(put)) = rx.try_recv().unwrap().unwrap().result.unwrap().response
+        else {
+            panic!("expected a quorum Put reply");
+        };
+        assert_eq!(put.header.unwrap().revision, revision);
+        let node = &self.nodes[&leader];
+        let index = node.quorum_reply_index;
+        assert!(index > node.log_worker.storage().last_index().unwrap());
+        assert!(index > node.state.applied);
+        for (&id, node) in &self.nodes {
+            if id != leader {
+                assert!(node.log_worker.storage().last_index().unwrap() >= index);
+            }
+        }
+        self.trace.push(format!(
+            "crash after quorum reply {leader} {index} {revision}"
+        ));
+        for id in 1..=3 {
+            self.stop(id);
+        }
+        self.paused_log = None;
+        for id in 1..=3 {
+            self.start(id).await;
+        }
+        for _ in 0..35 {
+            for id in 1..=3 {
+                self.tick(id).await;
+            }
+            for _ in 0..30 {
+                self.deliver(false).await;
+            }
+        }
+        for node in self.nodes.values() {
+            let read = RequestOp {
+                request: Some(Op::RequestRange(RangeRequest {
+                    key: b"quorum-crash".to_vec(),
+                    ..Default::default()
+                })),
+            };
+            let result = node
+                .worker
+                .state()
+                .read_etcd(&read)
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            let Some(Resp::ResponseRange(range)) = result.response else {
+                panic!("expected range");
+            };
+            assert_eq!(range.kvs[0].mod_revision, revision);
+            assert_eq!(range.kvs[0].value, b"committed");
+        }
+    }
+
     async fn run(seed: u64) -> Vec<String> {
         let mut sim = Self::new(seed).await;
         for _ in 0..100 {
@@ -1326,6 +1406,7 @@ impl Simulation {
             }
         }
         sim.batch_and_pinned_reads().await;
+        sim.crash_after_quorum_reply().await;
         sim.admin_recovery().await;
         sim.trace.clone()
     }

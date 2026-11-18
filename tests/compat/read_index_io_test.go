@@ -126,7 +126,10 @@ func TestSlowLogKeepsRaftLiveAndFencesReplies(t *testing.T) {
 	require.NoError(t, err)
 	logFault(t, c, leader, 2500, false)
 	written := make(chan error, 1)
-	go func() { _, err := api.Put(ctx, "disk", "after"); written <- err }()
+	go func() {
+		_, err := api.Txn(ctx).Then(clientv3.OpPut("disk", "after")).Commit()
+		written <- err
+	}()
 	var target float64
 	require.Eventually(t, func() bool {
 		state, err := c.http(leader, "/status", nil)
@@ -241,4 +244,56 @@ func TestSlowCheckpointPublicationKeepsRaftLive(t *testing.T) {
 	result, err := client(t, []string{c.addresses[recoveredLeader-1]}).Get(ctx, "checkpoint-io")
 	require.NoError(t, err)
 	require.Equal(t, "value", string(result.Kvs[0].Value))
+}
+
+func TestQuorumPutSurvivesLeaderLossBeforeLocalSync(t *testing.T) {
+	c := newCluster(t)
+	leader := c.leader()
+	api := client(t, []string{c.addresses[leader-1]})
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	first, err := api.Put(ctx, "quorum-put", "before")
+	require.NoError(t, err)
+	_, err = api.Get(ctx, "quorum-put")
+	require.NoError(t, err)
+	logFault(t, c, leader, 5000, false)
+	short, stop := context.WithTimeout(ctx, 4*time.Second)
+	reply, err := api.Put(short, "quorum-put", "after", clientv3.WithPrevKV())
+	stop()
+	require.NoError(t, err)
+	require.NotNil(t, reply.PrevKv)
+	require.Equal(t, first.Header.Revision, reply.PrevKv.ModRevision)
+	require.Equal(t, "before", string(reply.PrevKv.Value))
+	state, err := c.http(leader, "/status", nil)
+	require.NoError(t, err)
+	target := state["quorum_reply_index"].(float64)
+	require.Greater(t, target, state["last_log_index"].(float64))
+	require.Greater(t, target, state["applied_index"].(float64))
+	require.LessOrEqual(t, target, state["raft_commit_index"].(float64))
+	// Stop all three processes. Elect a leader from the two durable followers.
+	for id := 1; id <= 3; id++ {
+		c.stop(id)
+	}
+	for id := 1; id <= 3; id++ {
+		if id != leader {
+			c.start(id)
+		}
+	}
+	replacement := c.leader()
+	fresh := client(t, []string{c.addresses[replacement-1]})
+	read, err := fresh.Get(ctx, "quorum-put")
+	require.NoError(t, err)
+	require.Len(t, read.Kvs, 1)
+	require.Equal(t, "after", string(read.Kvs[0].Value))
+	require.Equal(t, reply.Header.Revision, read.Kvs[0].ModRevision)
+	events := collectWatch(t, fresh, "quorum-put", 1, clientv3.WithRev(reply.Header.Revision),
+		clientv3.WithPrevKV())
+	require.Equal(t, reply.Header.Revision, events[0].Kv.ModRevision)
+	require.Equal(t, "before", string(events[0].PrevKv.Value))
+	c.start(leader)
+	local := client(t, []string{c.addresses[leader-1]})
+	require.Eventually(t, func() bool {
+		got, err := local.Get(ctx, "quorum-put", clientv3.WithSerializable())
+		return err == nil && len(got.Kvs) == 1 && got.Kvs[0].ModRevision == reply.Header.Revision
+	}, 5*time.Second, 20*time.Millisecond)
 }

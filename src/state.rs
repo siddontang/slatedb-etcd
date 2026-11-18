@@ -17,6 +17,7 @@ use crate::{Command, Operation, Reply, STORAGE_FORMAT};
 
 mod auth;
 mod backup;
+mod checkpoint;
 mod cluster;
 mod diagnostic;
 mod kv;
@@ -42,10 +43,11 @@ struct SnapshotData {
 pub struct StateMachine {
     pub(crate) db: Arc<Db>,
     pub auth: Arc<crate::auth::Store>,
-    pub members: crate::cluster::Store,
+    pub members: Arc<crate::cluster::Store>,
     admin: slatedb::admin::Admin,
     pub quota: u64,
     logical_bytes: u64,
+    checkpoint_delta: Option<checkpoint::Delta>,
     pub(crate) write_batches: u64,
     pub alarms: Vec<crate::proto::etcdserverpb::AlarmMember>,
     pub applied: u64,
@@ -125,9 +127,10 @@ impl StateMachine {
                 None => crate::cluster::Store::default(),
             };
             Ok(Self {
-                members,
+                members: Arc::new(members),
                 admin,
                 quota: 0,
+                checkpoint_delta: None,
                 logical_bytes: maintenance::count_logical_size(&db).await?,
                 write_batches: 0,
                 alarms,
@@ -151,11 +154,21 @@ impl StateMachine {
 
     async fn write_batch(&mut self, batch: WriteBatch, index: u64) -> Result<()> {
         let size = batch.logical_size(&self.db, self.logical_bytes).await?;
+        self.store_batch(batch, index).await?;
+        self.logical_bytes = size;
+        Ok(())
+    }
+
+    async fn store_batch(&mut self, batch: WriteBatch, index: u64) -> Result<()> {
         self.db
-            .write_with_options(batch.into_storage(), &WriteOptions { seqnum: index })
+            .write_with_options(batch.to_storage(), &WriteOptions { seqnum: index })
             .await?;
         self.write_batches += 1;
-        self.logical_bytes = size;
+        if let Some(delta) = &mut self.checkpoint_delta {
+            if !delta.record(batch) {
+                self.checkpoint_delta = None;
+            }
+        }
         Ok(())
     }
 

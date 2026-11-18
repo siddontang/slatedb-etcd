@@ -111,8 +111,9 @@ It still requires quorum commit, Ready delivery, and durable local entries befor
 Modern TiKV also supports applying committed entries before local entry persistence.
 The [configuration reference] documents the separate `max-apply-unpersisted-log-limit` control.
 The [peer implementation] disables and later restores this mode around unsafe transitions.
-This is a broader recovery change. The current service does not enable it.
-Its restart proof, checkpoint truncation, snapshots, and state flush rules must change together.
+This service uses the durable quorum to prepare ordinary Put results in memory.
+Local state publication still waits for the log. This preserves the existing restart proof.
+The [ordering contract](architecture.md#state-write-groups) lists the eligibility rules.
 
 ## Cross-check with etcd
 

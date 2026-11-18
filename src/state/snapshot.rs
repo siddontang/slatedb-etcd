@@ -14,7 +14,7 @@ impl StateMachine {
         let snapshot = self.db.snapshot()?;
         let db = Arc::clone(&self.db);
         let applied = self.applied;
-        let members = serde_json::to_vec(&self.members)?;
+        let members = serde_json::to_vec(self.members.as_ref())?;
         ensure!(
             snapshot.seq() == applied,
             "snapshot does not match the apply marker"
@@ -46,6 +46,7 @@ impl StateMachine {
         if index <= self.applied {
             return Ok(());
         }
+        self.checkpoint_delta = None;
         let data: SnapshotData = bincode::deserialize(snapshot.get_data())?;
         ensure!(
             data.version == STORAGE_FORMAT && data.applied == index,
@@ -79,10 +80,10 @@ impl StateMachine {
             Some(data) => serde_json::from_slice(&data)?,
             None => vec![],
         };
-        self.members = match self.db.get(crate::cluster::KEY).await? {
+        self.members = Arc::new(match self.db.get(crate::cluster::KEY).await? {
             Some(data) => serde_json::from_slice(&data)?,
             None => crate::cluster::Store::default(),
-        };
+        });
         self.auth = Arc::new(match self.db.get(crate::auth::KEY).await? {
             Some(data) => serde_json::from_slice(&data)?,
             None => crate::auth::Store::default(),

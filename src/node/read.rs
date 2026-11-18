@@ -156,6 +156,9 @@ impl Node {
     }
 
     pub(super) fn schedule_reads(&mut self) {
+        if self.state.applied < self.quorum_reply_index {
+            return;
+        }
         for (id, read) in &mut self.reads {
             if self.read_queries.len() >= apply::MAX_QUERIES {
                 break;

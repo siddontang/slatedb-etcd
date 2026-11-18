@@ -92,10 +92,10 @@ The full snapshot preserves these keys together. A checkpoint has one pinned app
 The service must preserve these rules across every implementation phase:
 
 1. Persist terms, votes, and entries before sending dependent vote or append acknowledgements.
-2. Persist the commit position before submitting entries to the state machine.
+2. Persist the commit position before writing those entries to SlateDB.
 3. Apply a committed prefix in index order. Never apply an uncommitted entry.
 4. Store each state change and the covered final apply marker in one SlateDB batch.
-5. Reply with write success only after quorum commit, local log persistence, and local apply.
+5. Require quorum commit and an exact state-machine result for every successful write reply.
 6. Advance RawNode's applied position only after the apply owner reports completion.
 7. Reclaim log entries only after a durable snapshot covers them.
 8. Stop the node after a state storage failure. Do not continue from uncertain state.
@@ -312,7 +312,22 @@ One large entry can exceed the byte target. The pending log limit still bounds t
 Each request reads earlier puts from a temporary overlay and retains its own etcd revision.
 Quota accounting includes each successful request before it checks the next request.
 The storage write includes all mutations and the last covered apply marker at one SlateDB sequence.
-The owner publishes replies and the matching read view only after that write completes.
+The owner publishes the read view after the storage write. Most replies also wait for that write.
+
+A leader can prepare ordinary Put results when Raft commits an entry above its local persisted
+index. Raft counts the leader only after its sync completes. In a three-voter cluster, both other
+voters must therefore persist the entry. A stream receipt, a learner, or a duplicate reply
+cannot supply a missing vote. Raft applies its current-term and membership rules.
+
+The worker evaluates one contiguous group against the applied state and earlier puts in the group.
+The group must contain a pending client request. Each entry must belong to the current term.
+A pending configuration change blocks preparation. The group fits 32 entries and 512 KiB of log
+payload. Previous values and encoded mutations can use additional memory.
+The owner can return these results while it holds the prepared changes in memory.
+It waits for local log persistence and committed Ready delivery before writing them to SlateDB.
+While the prepared result is ahead of local state, new KV reads wait for local publication.
+A crash discards this temporary group. The durable quorum supplies the same entries on recovery.
+Transactions and administrative operations always use the ordinary apply boundary.
 
 Transactions, Lease changes, Auth changes, membership, compaction, and empty entries end a group.
 Puts with a lease or ignore flags also use the individual path.
@@ -321,8 +336,12 @@ Broad transaction batching needs an overlay that also merges scans and historica
 ## Snapshot order and recovery
 
 A checkpoint request waits for the Raft commit index observed when the request arrived.
-It then pins the exact applied view and its index.
-The builder flushes SlateDB, then serializes that pinned view.
+The first builder pins the applied view and scans its rows. Later builders track changed rows.
+Each builder flushes SlateDB. With a matching base, it copies unchanged rows from the last full
+snapshot and merges replacements and deletes. It writes a complete, independently usable snapshot.
+The apply owner charges keys, values, and 128 bytes per change against an 8 MiB tracking budget.
+Overflow, restart, or installation of a new snapshot selects a fresh pinned scan.
+One frozen change set and one active change set can coexist. The builder also needs output space.
 The log worker saves the snapshot and truncates its covered log prefix in one synchronous batch.
 Only then can raft-engine reclaim obsolete log files.
 
@@ -469,7 +488,7 @@ Read histories must contain every write acknowledged before each read began.
 The phase 1 tests cover:
 
 - Commit moving ahead of apply while heartbeat and status requests continue.
-- No successful write response before apply completes.
+- Early Put success requires a durable quorum and the result for the entire preceding prefix.
 - Recovery after process death with a committed but unapplied backlog.
 - Snapshot installation followed by later entries, without index regression.
 - Bounded local query queues and proposal rejection under sustained lag.

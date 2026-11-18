@@ -14,6 +14,9 @@ use crate::proto::etcdserverpb::*;
 use crate::proto::mvccpb::KeyValue;
 use crate::proto::state::Version;
 
+mod put;
+pub(crate) use put::prepare_put;
+
 const CURRENT: &[u8] = b"etcd/current/";
 const HISTORY: &[u8] = b"etcd/history/";
 pub const REVISION: &[u8] = b"etcd/revision";
@@ -243,7 +246,6 @@ impl ReadDb<'_> {
 
 struct View<'a> {
     db: ReadDb<'a>,
-    previous: Option<&'a WriteBatch>,
     revision: i64,
     compact_revision: i64,
     changes: BTreeMap<Vec<u8>, Option<KeyValue>>,
@@ -252,20 +254,14 @@ struct View<'a> {
 }
 
 impl View<'_> {
-    async fn get(&self, key: Vec<u8>) -> Result<Option<bytes::Bytes>, slatedb::Error> {
-        if let Some(value) = self.previous.and_then(|batch| batch.get(&key)) {
-            return Ok(value);
-        }
-        self.db.get(key).await
-    }
-
     async fn point(&self, key: &[u8], overlay: bool) -> KvResult<Option<KeyValue>> {
         if overlay {
             if let Some(value) = self.changes.get(key) {
                 return Ok(value.clone());
             }
         }
-        self.get(current_key(key))
+        self.db
+            .get(current_key(key))
             .await
             .map_err(KvError::storage)?
             .map(|value| KeyValue::decode(value).map_err(KvError::storage))
@@ -293,7 +289,12 @@ impl View<'_> {
     async fn latest(&self, key: &[u8], end: &[u8], overlay: bool) -> KvResult<Rows> {
         let mut rows = BTreeMap::new();
         if end.is_empty() {
-            if let Some(value) = self.get(current_key(key)).await.map_err(KvError::storage)? {
+            if let Some(value) = self
+                .db
+                .get(current_key(key))
+                .await
+                .map_err(KvError::storage)?
+            {
                 rows.insert(
                     key.to_vec(),
                     KeyValue::decode(value).map_err(KvError::storage)?,
@@ -549,22 +550,7 @@ impl View<'_> {
                 Plan::Op(Op::RequestPut(p)) => {
                     let old = self.point(&p.key, true).await?;
                     let revision = self.revision + 1;
-                    let kv = KeyValue {
-                        key: p.key.clone(),
-                        value: if p.ignore_value {
-                            old.as_ref().unwrap().value.clone()
-                        } else {
-                            p.value
-                        },
-                        version: old.as_ref().map_or(1, |v| v.version + 1),
-                        create_revision: old.as_ref().map_or(revision, |v| v.create_revision),
-                        mod_revision: revision,
-                        lease: if p.ignore_lease {
-                            old.as_ref().unwrap().lease
-                        } else {
-                            p.lease
-                        },
-                    };
+                    let kv = put::value(&p, old.as_ref(), revision);
                     self.events.push(crate::proto::mvccpb::Event {
                         r#type: 0,
                         kv: Some(kv.clone()),
@@ -655,7 +641,6 @@ async fn read_from(
     }
     let mut view = View {
         db,
-        previous: None,
         revision,
         compact_revision,
         changes: BTreeMap::new(),
@@ -678,48 +663,9 @@ pub async fn prepare(
     request: &RequestOp,
     leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
 ) -> KvResult<(ResponseOp, WriteBatch, i64)> {
-    prepare_inner(db, revision, compact_revision, request, leases, None).await
-}
-
-pub(crate) fn batchable_put(request: &RequestOp) -> bool {
-    matches!(&request.request, Some(Op::RequestPut(p))
-        if p.lease == 0 && !p.ignore_lease && !p.ignore_value)
-}
-
-pub(crate) async fn prepare_put(
-    db: &Db,
-    revision: i64,
-    compact_revision: i64,
-    request: &RequestOp,
-    leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
-    previous: &WriteBatch,
-) -> KvResult<(ResponseOp, WriteBatch, i64)> {
-    if !batchable_put(request) {
-        return Err(KvError::invalid("batch requires an ordinary put"));
-    }
-    prepare_inner(
-        db,
-        revision,
-        compact_revision,
-        request,
-        leases,
-        Some(previous),
-    )
-    .await
-}
-
-async fn prepare_inner(
-    db: &Db,
-    revision: i64,
-    compact_revision: i64,
-    request: &RequestOp,
-    leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
-    previous: Option<&WriteBatch>,
-) -> KvResult<(ResponseOp, WriteBatch, i64)> {
     validate(request)?;
     let mut view = View {
         db: ReadDb::Live(db),
-        previous,
         revision,
         compact_revision,
         changes: BTreeMap::new(),
@@ -737,17 +683,15 @@ async fn prepare_inner(
         } else {
             batch.delete(current_key(&key));
         }
-        let mut history_key = history_prefix(&key);
-        history_key.extend_from_slice(&next.to_be_bytes());
-        let version = Version {
-            key,
-            revision: next,
-            value,
-        };
-        batch.put_new(history_key, version.encode_to_vec());
+        put::record_version(&mut batch, key, value, next);
     }
     batch.put(REVISION, next.to_be_bytes());
     Ok((response, batch, next))
+}
+
+pub(crate) fn batchable_put(request: &RequestOp) -> bool {
+    matches!(&request.request, Some(Op::RequestPut(p))
+        if p.lease == 0 && !p.ignore_lease && !p.ignore_value)
 }
 
 /// Remove older versions while retaining each key's value at the compaction boundary.
@@ -840,7 +784,6 @@ pub(crate) async fn revoke_keys(
 ) -> KvResult<(WriteBatch, i64)> {
     let mut view = View {
         db: ReadDb::Live(db),
-        previous: None,
         revision,
         compact_revision,
         changes: BTreeMap::new(),
