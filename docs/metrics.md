@@ -16,12 +16,14 @@ The Rust configuration uses `ServerConfig::listen_metrics_urls`.
 ## Compatibility with etcd v3.6.5
 
 The [inventory] records names, Prometheus types, label keys, and histogram buckets.
-It contains the union of three real member scrapes after KV, Lease, and Status requests on macOS.
-The workload found 122 families. Other platforms and operations can expose additional families.
+It combines real macOS member scrapes after KV, Lease, Status, and a peer failure.
+Basic mode exposed 122 families in the first workload.
+Extensive mode and a failed peer added four families. The combined workload found 126.
+Other platforms and operations can expose additional families.
 
 | Inventory class | Families | Behavior |
 | --- | ---: | --- |
-| Exported | 50 | The service measures the corresponding operations or state. |
+| Exported | 54 | The service measures the corresponding operations or state. |
 | Pending | 29 | The service omits these families. |
 | Go runtime and Go version | 30 | The service runs as a native Rust process. |
 | V2 store or gRPC proxy | 10 | The service implements the v3 member API. |
@@ -41,8 +43,8 @@ Use the inventory to check dashboards before deployment. An absent series repres
 | MVCC | Current and compacted revisions, applied puts, deleted ranges, and Put bytes |
 | Watch | Open streams, active watchers, and events sent |
 | Lease | Grants, revocations, and granted TTL |
-| gRPC | Per-method calls, messages, terminal status, client version, and payload bytes |
-| Peers | Known and active peers, received bytes, and bytes with a transport receipt |
+| gRPC | Calls, messages, status, payload bytes, client version, and optional handling time |
+| Peers | Peer state, disconnects, failed sends, payload bytes, and sampled round trips |
 
 Monitoring can use the same queries as etcd for these signals.
 
@@ -66,12 +68,38 @@ It predefines all standard gRPC status codes. An abandoned response body counts 
 Client version labels accept one or two digits after `3.`. Other values use `other`.
 An absent version uses `unknown`.
 The version gauges match the version reported by Maintenance Status.
+The quota gauge reports 2 GiB for zero, the configured capacity for a positive number,
+and the configured negative number when quota enforcement is off.
+Maintenance Status returns the configured value, as etcd does.
 
 The Raft owner snapshots local state for a scrape. The HTTP task reads the manifest.
 A blocking worker formats the result outside the Raft owner.
 Each member permits two concurrent scrapes and returns HTTP 503 on overload or timeout.
 A scrape can read one remote manifest when the member uses an object store.
 If this read fails or takes more than one second, the scrape omits only the physical size gauge.
+
+## Upstream alerts and dashboard
+
+The v3.6.5 [alerts] contain 15 rules. The [dashboard] defines 16 query targets.
+On Linux their metric inputs exist with extensive metrics and the matching scrape labels.
+Prometheus supplies the `up` series. Its default job label must match the etcd selector.
+Set the dashboard cluster variable to that job. The dashboard reads native RSS on Linux.
+
+Use `--metrics extensive` to enable `grpc_server_handling_seconds`.
+The embedded API uses `ServerConfig::metrics`. Basic mode omits this histogram.
+Extensive mode times each RPC until its terminal status, including errors and canceled streams.
+The gRPC latency alert requires extensive mode on both this service and etcd.
+
+Each active peer stream samples the time from a Raft data frame to its receipt.
+It takes an initial sample and samples subsequent traffic at most once per five seconds.
+Etcd probes peer URLs separately and observes a smoothed RTT. Compare the trends across systems.
+A send failure increments the destination counter. Losing an active connection counts once.
+The failure series appears after a failure. Removing the member removes its peer series.
+
+[alerts]: https://github.com/etcd-io/etcd/blob/v3.6.5/contrib/mixin/alerts/alerts.libsonnet
+[dashboard]: https://github.com/etcd-io/etcd/blob/v3.6.5/contrib/mixin/dashboards/targets.libsonnet
+
+## Remaining coverage
 
 The pending families include MVCC range and transaction counters, slow apply, and several
 compaction and snapshot histograms. These require matching upstream operation boundaries.

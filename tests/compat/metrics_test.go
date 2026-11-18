@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -20,10 +22,11 @@ import (
 )
 
 type metricShape struct {
-	Type     string
-	Labels   []string
-	Buckets  []float64
-	Coverage string
+	Type      string
+	Labels    []string
+	Buckets   []float64
+	Coverage  string
+	Condition string
 }
 
 func scrapeMetrics(t *testing.T, address string) map[string]*dto.MetricFamily {
@@ -60,16 +63,17 @@ func metricShapeOf(t *testing.T, f *dto.MetricFamily) metricShape {
 }
 
 // Upstream gRPC metrics use a process registry. Start a fresh reference process for each test.
-func metricsReference(t *testing.T) *clientv3.Client {
+func metricsReference(t *testing.T, options ...string) *clientv3.Client {
 	t.Helper()
 	dir := t.TempDir()
 	binary := filepath.Join(dir, "etcd")
 	output, err := exec.Command("go", "build", "-mod=readonly", "-o", binary, "./cmd/reference-etcd").CombinedOutput()
 	require.NoError(t, err, string(output))
 	api, peer := "http://"+address(t), "http://"+address(t)
-	cmd := exec.Command(binary, "--data-dir", filepath.Join(dir, "data"), "--name", "ref", "--listen-client-urls", api,
+	args := []string{"--data-dir", filepath.Join(dir, "data"), "--name", "ref", "--listen-client-urls", api,
 		"--advertise-client-urls", api, "--listen-peer-urls", peer, "--initial-advertise-peer-urls", peer,
-		"--initial-cluster", "ref="+peer, "--log-level", "error")
+		"--initial-cluster", "ref=" + peer, "--log-level", "error"}
+	cmd := exec.Command(binary, append(args, options...)...)
 	require.NoError(t, cmd.Start())
 	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
 	cli := client(t, []string{api})
@@ -129,7 +133,7 @@ func TestMetricsMatchEtcd(t *testing.T) {
 	var inventory map[string]metricShape
 	require.NoError(t, json.Unmarshal(data, &inventory))
 	for name, shape := range inventory {
-		if shape.Coverage != "exported" || name == "etcd_network_active_peers" ||
+		if shape.Coverage != "exported" || shape.Condition != "" || name == "etcd_network_active_peers" ||
 			name == "etcd_network_peer_sent_bytes_total" || name == "etcd_network_peer_received_bytes_total" {
 			continue
 		}
@@ -137,6 +141,13 @@ func TestMetricsMatchEtcd(t *testing.T) {
 		require.Equal(t, shape, metricShapeOf(t, actual[name]), name)
 		require.Equal(t, shape, metricShapeOf(t, expected[name]), name)
 	}
+	if runtime.GOOS == "linux" {
+		rss := actual["process_resident_memory_bytes"]
+		require.Equal(t, "gauge", metricShapeOf(t, rss).Type)
+		require.Greater(t, rss.Metric[0].GetGauge().GetValue(), float64(0))
+	}
+	require.Nil(t, actual["grpc_server_handling_seconds"])
+	require.Nil(t, expected["grpc_server_handling_seconds"])
 	for name := range actual {
 		if strings.HasPrefix(name, "go_") {
 			t.Fatalf("unexpected Go runtime metric %s", name)
@@ -248,5 +259,113 @@ func TestMetricsCountAppliedWrites(t *testing.T) {
 		const bytes = "etcd_debugging_mvcc_total_put_size_in_bytes"
 		require.Equal(t, 10.0, after[bytes].Metric[0].GetGauge().GetValue()-baseline[bytes].Metric[0].GetGauge().GetValue())
 		cancel()
+	}
+}
+
+func alertMetricShape(t *testing.T, m map[string]*dto.MetricFamily, name string) {
+	t.Helper()
+	data, err := os.ReadFile("testdata/metrics-v3.6.5.json")
+	require.NoError(t, err)
+	var inventory map[string]metricShape
+	require.NoError(t, json.Unmarshal(data, &inventory))
+	expected := inventory[name]
+	require.NotEmpty(t, expected.Condition)
+	expected.Coverage, expected.Condition = "", ""
+	require.Equal(t, expected, metricShapeOf(t, m[name]), name)
+}
+
+func TestMetricsExtensiveMatchesEtcd(t *testing.T) {
+	c := newClusterSize(t, 1, "--metrics=extensive")
+	for _, cli := range []*clientv3.Client{metricsReference(t, "--metrics=extensive"), client(t, c.addresses)} {
+		const name = "grpc_server_handling_seconds"
+		putCount := func() uint64 {
+			m := scrapeMetrics(t, cli.Endpoints()[0])
+			alertMetricShape(t, m, name)
+			for _, row := range m[name].Metric {
+				for _, l := range row.Label {
+					if l.GetName() == "grpc_method" && l.GetValue() == "Put" {
+						return row.GetHistogram().GetSampleCount()
+					}
+				}
+			}
+			t.Fatal("missing Put duration")
+			return 0
+		}
+		before := putCount()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, err := cli.Put(ctx, "timed", "value")
+		require.NoError(t, err)
+		_, err = cli.Put(ctx, "", "invalid")
+		require.Error(t, err)
+		cancel()
+		require.Equal(t, before+2, putCount())
+	}
+}
+
+func TestMetricsReportPeerFailure(t *testing.T) {
+	c := newCluster(t)
+	leader := c.leader()
+	follower := leader%3 + 1
+	target := strconv.FormatInt(int64(follower), 16)
+	addr := c.addresses[leader-1]
+	const rtt = "etcd_network_peer_round_trip_time_seconds"
+	const failed = "etcd_network_peer_sent_failures_total"
+	const disconnected = "etcd_network_disconnected_peers_total"
+	metric := func(m map[string]*dto.MetricFamily, name, label string) *dto.Metric {
+		for _, row := range m[name].GetMetric() {
+			for _, v := range row.Label {
+				if v.GetName() == label && v.GetValue() == target {
+					return row
+				}
+			}
+		}
+		return nil
+	}
+	require.Eventually(t, func() bool {
+		row := metric(scrapeMetrics(t, addr), rtt, "To")
+		return row.GetHistogram().GetSampleCount() > 0 && row.GetHistogram().GetSampleSum() > 0
+	}, 10*time.Second, 50*time.Millisecond)
+	before := scrapeMetrics(t, addr)
+	failures := metric(before, failed, "To").GetCounter().GetValue()
+	losses := metric(before, disconnected, "Remote").GetCounter().GetValue()
+	c.stop(follower)
+	require.Eventually(t, func() bool {
+		m := scrapeMetrics(t, addr)
+		return metric(m, failed, "To").GetCounter().GetValue() > failures &&
+			metric(m, disconnected, "Remote").GetCounter().GetValue() > losses
+	}, 10*time.Second, 50*time.Millisecond)
+	after := scrapeMetrics(t, addr)
+	for _, name := range []string{rtt, failed, disconnected} {
+		alertMetricShape(t, after, name)
+	}
+}
+
+func TestMetricsBackendQuotaMatchesEtcd(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		flags     []string
+		effective float64
+	}{
+		{"default", nil, 2 * 1024 * 1024 * 1024},
+		{"zero", []string{"--quota-backend-bytes=0"}, 2 * 1024 * 1024 * 1024},
+		{"disabled", []string{"--quota-backend-bytes=-3"}, -3},
+		{"custom", []string{"--quota-backend-bytes=16777216"}, 16777216},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newClusterSize(t, 1, tc.flags...)
+			actual := client(t, c.addresses)
+			ref := metricsReference(t, tc.flags...)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var values []int64
+			for _, cli := range []*clientv3.Client{ref, actual} {
+				m := scrapeMetrics(t, cli.Endpoints()[0])
+				require.Equal(t, tc.effective, m["etcd_server_quota_backend_bytes"].Metric[0].GetGauge().GetValue())
+				status, err := cli.Status(ctx, cli.Endpoints()[0])
+				require.NoError(t, err)
+				values = append(values, status.DbSizeQuota)
+			}
+			require.Equal(t, values[0], values[1])
+		})
 	}
 }

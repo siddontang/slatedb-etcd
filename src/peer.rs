@@ -73,6 +73,8 @@ async fn failed(
     peer: u64,
     messages: &mut mpsc::Receiver<Message>,
     mut snapshot: bool,
+    mut undelivered: usize,
+    traffic: &crate::metrics::PeerTraffic,
 ) {
     // Drop the old backlog before reporting failure. Raft will retry on the new connection.
     for _ in 0..256 {
@@ -80,7 +82,9 @@ async fn failed(
             break;
         };
         snapshot |= message.get_msg_type() == MessageType::MsgSnapshot;
+        undelivered += 1;
     }
+    traffic.failed(undelivered);
     report(events, peer, false, false).await;
     if snapshot {
         report(events, peer, true, false).await;
@@ -118,13 +122,17 @@ pub(crate) async fn transport(
         request.metadata_mut().insert("x-cluster-id", cluster);
         let result = tokio::time::timeout(PROGRESS_TIMEOUT, client.exchange(request)).await;
         let Ok(Ok(response)) = result else {
-            failed(&events, peer, &mut messages, false).await;
+            failed(&events, peer, &mut messages, false, 1, &traffic).await;
             continue;
         };
         let mut receipts = response.into_inner();
         let mut sent = 0;
         let mut acknowledged = 0_u64;
-        let mut deadline = Instant::now() + PROGRESS_TIMEOUT;
+        let start = Instant::now();
+        let mut deadline = start + PROGRESS_TIMEOUT;
+        let mut probe = Some((1, start));
+        let mut next_probe = start + Duration::from_secs(5);
+        let mut probe_due = false;
         let mut snapshot = None;
         let mut healthy = false;
         let mut closed = false;
@@ -139,7 +147,7 @@ pub(crate) async fn transport(
                     .map_err(|_| anyhow::anyhow!("peer stream queue is unavailable"))?;
                 Ok(bytes)
             };
-            let bytes = send(first, 1)?;
+            let bytes = send(first, 1).inspect_err(|_| traffic.failed(1))?;
             sizes.push_back(bytes);
             outstanding_bytes += bytes;
             sent += 1;
@@ -160,7 +168,15 @@ pub(crate) async fn transport(
                         let bytes = sizes.pop_front().context("unexpected peer receipt")?;
                         outstanding_bytes -= bytes;
                         traffic.sent.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
-                        deadline = Instant::now() + PROGRESS_TIMEOUT;
+                        let now = Instant::now();
+                        deadline = now + PROGRESS_TIMEOUT;
+                        if let Some((sequence, started)) = probe {
+                            if acknowledged == sequence {
+                                traffic.observe_rtt(peer, now - started);
+                                probe = None;
+                            }
+                        }
+                        probe_due |= now >= next_probe;
                         if !healthy { report(&events, peer, false, true).await; healthy = true; }
                     }
                     message = messages.recv(), if sizes.len() < WINDOW && outstanding_bytes < BYTE_TARGET && snapshot.is_none() => {
@@ -170,7 +186,13 @@ pub(crate) async fn transport(
                         } else {
                             if sent == acknowledged { deadline = Instant::now() + PROGRESS_TIMEOUT; }
                             sent = sent.checked_add(1).context("peer sequence exhausted")?;
-                            let bytes = send(message, sent)?;
+                            if probe_due && probe.is_none() {
+                                let now = Instant::now();
+                                probe = Some((sent, now));
+                                next_probe = now + Duration::from_secs(5);
+                                probe_due = false;
+                            }
+                            let bytes = send(message, sent).inspect_err(|_| traffic.failed(1))?;
                             sizes.push_back(bytes);
                             outstanding_bytes += bytes;
                         }
@@ -185,7 +207,16 @@ pub(crate) async fn transport(
             return;
         }
         if result.is_err() {
-            failed(&events, peer, &mut messages, snapshot.is_some()).await;
+            let lost = sizes.len() + usize::from(snapshot.is_some());
+            failed(
+                &events,
+                peer,
+                &mut messages,
+                snapshot.is_some(),
+                lost,
+                &traffic,
+            )
+            .await;
         }
     }
 }
@@ -219,6 +250,9 @@ async fn post_snapshot(
         Ok(())
     }
     .await;
+    if result.is_err() {
+        traffic.failed(1);
+    }
     result.is_ok()
 }
 

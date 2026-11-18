@@ -27,7 +27,6 @@ impl StateMachine {
                 let size = self.logical_size();
                 status.db_size_in_use = size as i64;
                 status.db_size = self.physical_size().await?.max(size) as i64;
-                status.db_size_quota = self.quota as i64;
                 status.raft_applied_index = self.applied;
                 status.errors = self
                     .alarms

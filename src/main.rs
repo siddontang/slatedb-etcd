@@ -30,6 +30,9 @@ struct Args {
     /// Comma-separated HTTP or HTTPS listeners for Prometheus scrapes.
     #[arg(long, value_delimiter = ',')]
     listen_metrics_urls: Vec<String>,
+    /// Select extensive to measure gRPC handling duration by method.
+    #[arg(long, value_enum, default_value = "basic")]
+    metrics: slatedb_etcd::server::MetricsLevel,
     /// Advertised client URL. Repeat as --client-peer ID=URL.
     #[arg(long = "client-peer")]
     client_peers: Vec<String>,
@@ -69,9 +72,9 @@ struct Args {
     /// Log entry cache budget in bytes.
     #[arg(long, default_value_t = 8 * 1024 * 1024)]
     log_cache_bytes: usize,
-    /// Logical data quota in bytes. Zero disables the quota.
-    #[arg(long, default_value_t = 0)]
-    quota_backend_bytes: u64,
+    /// Logical quota in bytes. Zero selects 2 GiB. A negative value disables the quota.
+    #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
+    quota_backend_bytes: i64,
     /// Token mode: simple, or jwt with RS256 public-key and private-key paths.
     #[arg(long, default_value = "simple")]
     auth_token: String,
@@ -118,6 +121,7 @@ async fn run(args: Args) -> Result<()> {
         listen: args.listen,
         peer_listen: args.peer_listen,
         listen_metrics_urls: args.listen_metrics_urls,
+        metrics: args.metrics,
         peers: parse_peers(args.peers)?,
         client_peers: parse_peers(args.client_peers)?,
         allow_remote: args.allow_remote,

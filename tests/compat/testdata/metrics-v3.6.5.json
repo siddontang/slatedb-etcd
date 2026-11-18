@@ -552,6 +552,15 @@
     "labels": [],
     "coverage": "exported"
   },
+  "etcd_network_disconnected_peers_total": {
+    "type": "counter",
+    "labels": [
+      "Local",
+      "Remote"
+    ],
+    "coverage": "exported",
+    "condition": "failed-peer"
+  },
   "etcd_network_known_peers": {
     "type": "gauge",
     "labels": [
@@ -567,12 +576,46 @@
     ],
     "coverage": "exported"
   },
+  "etcd_network_peer_round_trip_time_seconds": {
+    "type": "histogram",
+    "labels": [
+      "To"
+    ],
+    "buckets": [
+      0.0001,
+      0.0002,
+      0.0004,
+      0.0008,
+      0.0016,
+      0.0032,
+      0.0064,
+      0.0128,
+      0.0256,
+      0.0512,
+      0.1024,
+      0.2048,
+      0.4096,
+      0.8192,
+      1.6384,
+      3.2768
+    ],
+    "coverage": "exported",
+    "condition": "peer"
+  },
   "etcd_network_peer_sent_bytes_total": {
     "type": "counter",
     "labels": [
       "To"
     ],
     "coverage": "exported"
+  },
+  "etcd_network_peer_sent_failures_total": {
+    "type": "counter",
+    "labels": [
+      "To"
+    ],
+    "coverage": "exported",
+    "condition": "failed-peer"
   },
   "etcd_server_apply_duration_seconds": {
     "type": "histogram",
@@ -971,6 +1014,29 @@
       "grpc_type"
     ],
     "coverage": "exported"
+  },
+  "grpc_server_handling_seconds": {
+    "type": "histogram",
+    "labels": [
+      "grpc_method",
+      "grpc_service",
+      "grpc_type"
+    ],
+    "buckets": [
+      0.005,
+      0.01,
+      0.025,
+      0.05,
+      0.1,
+      0.25,
+      0.5,
+      1.0,
+      2.5,
+      5.0,
+      10.0
+    ],
+    "coverage": "exported",
+    "condition": "extensive"
   },
   "grpc_server_msg_received_total": {
     "type": "counter",

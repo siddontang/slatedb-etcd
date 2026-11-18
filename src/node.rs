@@ -95,13 +95,22 @@ pub struct NodeOptions {
     pub dir: PathBuf,
     pub snapshot_every: u64,
     pub log_memory: LogMemory,
-    pub quota_bytes: u64,
+    pub quota_bytes: i64,
     pub strict_reconfiguration: bool,
     pub join: bool,
     pub client_peers: BTreeMap<u64, String>,
     pub transport: crate::tls::Transport,
     pub object_store: crate::object::Config,
     pub require_peer_tls: bool,
+}
+
+impl NodeOptions {
+    fn effective_quota(&self) -> i64 {
+        match self.quota_bytes {
+            0 => 2 * 1024 * 1024 * 1024,
+            limit => limit,
+        }
+    }
 }
 
 struct Pending {
@@ -223,7 +232,7 @@ impl Node {
             .open(&options.dir, &options.cluster_id, options.id)
             .await?;
         let recovered = async {
-            state.quota = options.quota_bytes;
+            state.quota = options.effective_quota().max(0) as u64;
             // Flushed state proves this prefix was committed, even if its commit marker was lost.
             if state.applied > storage.commit_index() {
                 storage.persist_commit(state.applied)?;
@@ -557,6 +566,7 @@ impl Node {
                                 .members
                                 .get(&self.options.id)
                                 .is_some_and(|member| member.is_learner),
+                            db_size_quota: self.options.quota_bytes,
                             leader: self.raw.raft.leader_id,
                             raft_index: self.raw.store().commit_index(),
                             raft_term: self.raw.raft.term,
@@ -726,7 +736,7 @@ impl Node {
                     committed: self.raw.raft.raft_log.committed,
                     applied: self.state.applied,
                     pending: self.pending.len(),
-                    quota: self.options.quota_bytes,
+                    quota: self.options.effective_quota(),
                     used: self.state.logical_size,
                     revision: self.state.revision,
                     compact: if self.state.compact_revision == 0 {
@@ -738,13 +748,7 @@ impl Node {
                     traffic: self
                         .traffic
                         .iter()
-                        .map(|(&id, m)| {
-                            (
-                                id,
-                                m.sent.load(std::sync::atomic::Ordering::Relaxed),
-                                m.received.load(std::sync::atomic::Ordering::Relaxed),
-                            )
-                        })
+                        .map(|(&id, meter)| (id, meter.clone()))
                         .collect(),
                     peers: self
                         .state
@@ -810,8 +814,12 @@ impl Node {
             } => {
                 if success {
                     self.peer_health.entry(peer).or_insert_with(Instant::now);
-                } else {
-                    self.peer_health.remove(&peer);
+                } else if self.peer_health.remove(&peer).is_some() {
+                    if let Some(meter) = self.traffic.get(&peer) {
+                        meter
+                            .disconnected
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 if snapshot {
                     self.raw.report_snapshot(
@@ -931,6 +939,9 @@ impl Node {
                     .get(&peer)
                     .is_some_and(|sender| sender.try_send(message).is_ok());
             if !sent {
+                if let Some(meter) = self.traffic.get(&peer) {
+                    meter.failed(1);
+                }
                 self.send_failures.push((peer, snapshot));
             }
         }
