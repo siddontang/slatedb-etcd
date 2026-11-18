@@ -50,3 +50,6 @@ tonic-build = "0.12"
 async-trait = "0.1"
 futures = "0.3"
 tempfile = "3"
+
+[patch.crates-io]
+raft-engine = { path = "third_party/raft-engine" }

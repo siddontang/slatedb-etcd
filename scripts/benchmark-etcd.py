@@ -138,6 +138,8 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
             all_processes = processes + [driver]
             deadline = time.monotonic() + args.timeout_seconds
             wait_file(root / "ready", all_processes, deadline)
+            # Give both backends one idle second after preload and warmup.
+            time.sleep(1)
             with observer(processes) if observer else nullcontext():
                 before = resources(all_processes)
                 sample["startup_preload_warmup_server_cpu_seconds"] = sum(row[0] for row in before[:members])
@@ -186,6 +188,11 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
         return sample
 
 
+def workload_cases(kinds, concurrency, reads, baseline_concurrency=None):
+    return [(kind, count, percent) for kind in kinds for count in concurrency for percent in reads
+            if kind != "baseline" or baseline_concurrency is None or count in baseline_concurrency]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--members", type=int, choices=[1, 3], default=3)
@@ -205,6 +212,8 @@ def main():
     parser.add_argument("--output", type=Path, default=ROOT / "results/benchmark-etcd.json")
     parser.add_argument("--binary", type=Path, default=ROOT / "target/release/slatedb-etcd")
     parser.add_argument("--baseline-binary", type=Path)
+    parser.add_argument("--baseline-concurrency", type=int, nargs="+",
+                        help="Restrict baseline cases to these selected concurrency levels")
     parser.add_argument("--backends", nargs="+", choices=["baseline", "service", "etcd"])
     parser.add_argument("--s3-bucket")
     parser.add_argument("--s3-endpoint")
@@ -227,12 +236,18 @@ def main():
         parser.error("The baseline backend requires --baseline-binary")
     if len(set(kinds)) != len(kinds):
         parser.error("Backend names must be distinct")
-    expected = len(kinds)*len(args.concurrency)*len(args.read_percent)*args.repeat
+    if args.baseline_concurrency is not None and (
+            "baseline" not in kinds or not set(args.baseline_concurrency) <= set(args.concurrency)):
+        parser.error("Baseline concurrency must select measured levels and requires a baseline")
+    cases = workload_cases(kinds, args.concurrency, args.read_percent, args.baseline_concurrency)
+    expected = len(cases)*args.repeat
     report = {"schema_version": 2, "passed": False, "complete": False, "samples": [],
               "created_at": datetime.now(timezone.utc).isoformat(), "expected_samples": expected,
               "platform": platform.system(), "architecture": platform.machine(), "logical_cpus": os.cpu_count(),
               "members": args.members,
               "service_runtime_workers": args.service_runtime_workers,
+              "baseline_concurrency": args.baseline_concurrency,
+              "settle_seconds_after_warmup": 1,
               "deployment": f"{args.members} processes per backend; shared host and disk; loopback plaintext",
               "reference_etcd": "v3.6.5", "state_backend": "s3" if args.s3_bucket else "local",
               "raft_snapshot_entries": args.snapshot_entries, "quota_bytes": args.quota_bytes,
@@ -259,10 +274,9 @@ def main():
     for kind in kinds:
         report["binaries"][kind] = hashlib.sha256(binaries[kind].read_bytes()).hexdigest()
     for repeat in range(args.repeat):
-        cases = [(kind, concurrency, reads) for kind in kinds
-                 for concurrency in args.concurrency for reads in args.read_percent]
-        random.Random(args.seed+repeat).shuffle(cases)
-        for kind, concurrency, reads in cases:
+        shuffled = cases.copy()
+        random.Random(args.seed+repeat).shuffle(shuffled)
+        for kind, concurrency, reads in shuffled:
             sample = run_sample(args, tools, binaries[kind], kind, concurrency, reads, repeat)
             report["samples"].append(sample)
             report["complete"] = len(report["samples"]) == expected

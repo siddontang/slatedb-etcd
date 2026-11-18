@@ -29,6 +29,16 @@ class BenchmarkTests(unittest.TestCase):
             self.assertEqual(measured["peak_process_rss_bytes"], members * 300)
             self.assertEqual(measured["peak_client_rss_bytes"], 900)
 
+    def test_baseline_subset_keeps_all_reference_and_service_cases(self):
+        cases = benchmark.workload_cases(["baseline", "service", "etcd"], [1, 8, 32],
+                                         [0, 50, 100], [8])
+        self.assertEqual(len(cases), 21)
+        self.assertEqual(len(set(cases)), 21)
+        for kind in ["service", "etcd"]:
+            self.assertEqual(sum(case[0] == kind for case in cases), 9)
+        self.assertEqual([case for case in cases if case[0] == "baseline"],
+                         [("baseline", 8, percent) for percent in [0, 50, 100]])
+
     def test_cluster_addresses_are_distinct(self):
         ports = benchmark.addresses(6)
         self.assertEqual(len(ports), len(set(ports)))

@@ -217,7 +217,7 @@ Errors or worker panic stop the node.
 
 Raft permits leaders to send replication messages before their own local persistence completes.
 Follower vote and append acknowledgements remain behind their persistence barrier.
-Ordinary HTTP receipt only confirms message delivery. It does not confirm Raft persistence.
+Ordinary stream receipt only confirms message delivery. It does not confirm Raft persistence.
 Holding that receipt behind disk I/O would block the peer's subsequent heartbeat responses.
 Snapshot HTTP receipt remains behind durable snapshot storage, before state installation.
 
@@ -228,6 +228,25 @@ The owner rejects new proposals when this queue or the apply backlog reaches its
 A worker failure stops progress instead of reporting an uncertain write as durable.
 Shutdown cancels queued work and injected delays. A running kernel I/O call must finish before
 its thread releases the storage lock.
+
+### Peer streams
+
+Ordinary Raft messages share one bidirectional gRPC stream per peer.
+Each direction checks message order with a connection-local sequence number.
+The receiver checks the cluster identity before accepting messages.
+TLS and separate listener rules also apply to this private route.
+
+Each sender admits at most 64 unacknowledged messages and targets 16 MiB of encoded payload.
+One message can exceed the byte target. Each encoded frame must fit 8 MiB plus 1 KiB.
+These limits cover stream payloads, not all transport buffers or the existing Raft message queue.
+A two-second progress timeout closes stalled streams. Raft retries after connection failure.
+The sender discards the old queue and reports any pending snapshot failure before reconnecting.
+
+Snapshots retain the separate durable HTTP endpoint.
+The sender waits for earlier stream receipts before sending a snapshot.
+Later messages wait for the snapshot result. A stream receipt cannot confirm snapshot persistence.
+Socket tests cover ordering, both admission limits, cancellation, failure, and reconnection.
+DST controls Raft messages directly; it does not model HTTP/2 framing.
 
 ### Bounded log pools
 
@@ -466,6 +485,12 @@ Update this document when an ownership boundary, recovery rule, or roadmap phase
 ## Linux CPU work
 
 ReadIndex batches reduce quorum messages without reusing a proof for later requests.
+Local read tracking uses integer identifiers. Each quorum proof adds the process nonce once.
+The apply worker groups up to 16 adjacent point queries without a batching timer.
+Read completions omit unchanged member, Auth, and Lease metadata.
+Maintenance completions retain metadata because they can advance the durable apply index.
+The gRPC KV response path uses typed values through apply and the Raft owner.
+Point reads avoid building an unused mutation plan. They retain MVCC and permission checks.
 Forwarded KV writes wait for local revision progress without another quorum round.
 Append-only MVCC, Watch, and hash records skip quota lookups for keys absent before the batch.
 Other mutations still read prior values. Final mutations determine the byte counter.

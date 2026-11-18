@@ -573,10 +573,7 @@ impl Simulation {
             }
         }
         // A successful PUT with a lost reply must keep the same immutable object.
-        self.propose().await;
-        for _ in 0..100 {
-            self.deliver(false).await;
-        }
+        self.propose_before_object_fault(id).await;
         let before = self.nodes[&id].raw.store().snapshot_index();
         while let Ok(permit) = store.entered.try_acquire() {
             permit.forget();
@@ -590,13 +587,10 @@ impl Simulation {
             .await
             .unwrap();
         assert_eq!(self.nodes[&id].raw.store().snapshot_index(), before);
-        assert!(store.entered.try_acquire().is_ok());
+        store.entered.try_acquire().unwrap().forget();
         self.trace
             .push(format!("recover lost object put reply {id}"));
-        self.propose().await;
-        for _ in 0..100 {
-            self.deliver(false).await;
-        }
+        self.propose_before_object_fault(id).await;
         let before = self.nodes[&id].raw.store().snapshot_index();
         let first = self.nodes[&id].raw.store().first_index().unwrap();
         store.set(FAIL_PUT);
@@ -607,6 +601,7 @@ impl Simulation {
         .await
         .unwrap();
         assert!(result.is_err());
+        store.entered.try_acquire().unwrap().forget();
         assert_eq!(self.nodes[&id].raw.store().snapshot_index(), before);
         assert_eq!(self.nodes[&id].raw.store().first_index().unwrap(), first);
         self.trace
@@ -640,6 +635,32 @@ impl Simulation {
             assert_eq!(response.kvs.len(), 1);
             assert_eq!(response.kvs[0].value, value.as_bytes());
         }
+    }
+
+    async fn propose_before_object_fault(&mut self, id: u64) {
+        let leader = self.leader().unwrap();
+        self.propose().await;
+        let index = self.nodes[&leader].raw.raft.raft_log.last_index();
+        let key = format!("key-{}", self.next_request);
+        for _ in 0..100 {
+            self.deliver(false).await;
+        }
+        // Reordered appends can leave the follower waiting for a heartbeat with the commit index.
+        // A clean state flush does not PUT an object and cannot exercise a PUT fault.
+        for _ in 0..100 {
+            if self.nodes[&id].state.applied >= index && self.acknowledged.contains_key(&key) {
+                self.trace
+                    .push(format!("object fault apply barrier {id} {index}"));
+                return;
+            }
+            for member in 1..=3 {
+                self.tick(member).await;
+            }
+            for _ in 0..30 {
+                self.deliver(false).await;
+            }
+        }
+        panic!("object fault setup did not apply {key} at index {index} on node {id}");
     }
 
     async fn lease(&mut self, lease: LeaseCommand) {
@@ -1177,7 +1198,7 @@ impl Simulation {
 
 #[tokio::test]
 async fn seeded_fault_schedules_replay_identically() {
-    let seeds = std::env::var("SLATEDB_DST_SEEDS").unwrap_or_else(|_| "1,2,42".into());
+    let seeds = std::env::var("SLATEDB_DST_SEEDS").unwrap_or_else(|_| "1,2,42,58,70".into());
     for seed in seeds.split(',').map(|s| s.parse::<u64>().unwrap()) {
         eprintln!("DST seed {seed}: starting");
         let first = Simulation::run(seed).await;

@@ -116,11 +116,13 @@ def main():
         observer=lambda processes: record(processes, args.output, args.frequency))
     report["sample"] = sample
     if sample["passed"]:
-        for name, children in [("self.txt", "--no-children"), ("stacks.txt", "--children")]:
+        views = [("self.txt", "--no-children", "--no-inline", "none"),
+                 ("stacks.txt", "--children", "--no-inline", "graph"),
+                 ("inline.txt", "--children", "--inline", "none")]
+        for name, children, inline, graph in views:
             with (args.output / name).open("w") as output:
-                subprocess.run(["perf", "report", "--stdio", "--no-inline", children,
-                                "--sort", "symbol", "--call-graph",
-                                "none" if name == "self.txt" else "graph",
+                subprocess.run(["perf", "report", "--stdio", inline, children,
+                                "--sort", "symbol", "--call-graph", graph,
                                 "--percent-limit", "0.5", "--input",
                                 str(args.output / "perf.data")],
                                stdout=output, check=True)
