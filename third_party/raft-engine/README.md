@@ -14,6 +14,8 @@ The crate archive has SHA-256:
 
 ## Changed runtime files
 
+Read [local.patch](local.patch) for the complete runtime delta against the published crate.
+
 - `src/pipe_log.rs` adds an optional cache identity. Unknown implementations bypass the block cache.
 - `src/file_pipe_log/pipe.rs` assigns a unique identity to each open log, including reopened logs.
 - `src/engine.rs` includes that identity in both decoded-entry and raw-entry cache keys.

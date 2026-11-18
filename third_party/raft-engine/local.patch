@@ -1,0 +1,76 @@
+--- a/src/engine.rs
++++ b/src/engine.rs
+@@ -22 +22 @@
+-use crate::pipe_log::{FileBlockHandle, FileId, LogQueue, PipeLog};
++use crate::pipe_log::{FileBlockHandle, LogQueue, PipeLog};
+@@ -141,0 +142,4 @@
++            // Modified by slatedb-etcd: an explicit sync must reach the log file.
++            if sync {
++                self.sync()?;
++            }
+@@ -233,2 +237 @@
+-        self.write(&mut LogBatch::default(), true)?;
+-        Ok(())
++        self.pipe_log.sync(LogQueue::Append)
+@@ -554 +557,2 @@
+-    key: Cell<FileBlockHandle>,
++    // Modified by slatedb-etcd: include the open log instance in each cache key.
++    key: Cell<Option<(u64, FileBlockHandle)>>,
+@@ -561,5 +565 @@
+-            key: Cell::new(FileBlockHandle {
+-                id: FileId::new(LogQueue::Append, 0),
+-                offset: 0,
+-                len: 0,
+-            }),
++            key: Cell::new(None),
+@@ -570 +570 @@
+-    fn insert(&self, key: FileBlockHandle, block: Vec<u8>) {
++    fn insert(&self, key: Option<(u64, FileBlockHandle)>, block: Vec<u8>) {
+@@ -586 +586,2 @@
+-        if cache.key.get() != idx.entries.unwrap() {
++        let key = pipe_log.cache_id().map(|id| (id, idx.entries.unwrap()));
++        if key.is_none() || cache.key.get() != key {
+@@ -588 +589 @@
+-                idx.entries.unwrap(),
++                key,
+@@ -610 +611,2 @@
+-        if cache.key.get() != idx.entries.unwrap() {
++        let key = pipe_log.cache_id().map(|id| (id, idx.entries.unwrap()));
++        if key.is_none() || cache.key.get() != key {
+@@ -612 +614 @@
+-                idx.entries.unwrap(),
++                key,
+@@ -632 +634 @@
+-    use crate::pipe_log::Version;
++    use crate::pipe_log::{FileId, Version};
+--- a/src/file_pipe_log/pipe.rs
++++ b/src/file_pipe_log/pipe.rs
+@@ -5,0 +6 @@
++use std::sync::atomic::{AtomicU64, Ordering};
+@@ -466,0 +468,2 @@
++    cache_id: u64,
++
+@@ -483,0 +487,7 @@
++            // Modified by slatedb-etcd: never reuse a block-cache identity after reopening a log.
++            cache_id: {
++                static NEXT_CACHE_ID: AtomicU64 = AtomicU64::new(1);
++                NEXT_CACHE_ID
++                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
++                    .expect("log cache identity exhausted")
++            },
+@@ -494,0 +505,4 @@
++    fn cache_id(&self) -> Option<u64> {
++        Some(self.cache_id)
++    }
++
+--- a/src/pipe_log.rs
++++ b/src/pipe_log.rs
+@@ -1,0 +2 @@
++// Modified by slatedb-etcd: isolate cached blocks across open log instances.
+@@ -166,0 +168,6 @@
++    /// Return a process-unique identity for this open log instance.
++    /// Return None to disable block caching for implementations without an identity.
++    fn cache_id(&self) -> Option<u64> {
++        None
++    }
++

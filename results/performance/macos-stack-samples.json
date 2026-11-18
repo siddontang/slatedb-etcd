@@ -1,0 +1,674 @@
+{
+  "passed": true,
+  "method": "macOS sample; wall-clock thread stacks, including waits; these counts are not CPU percentages",
+  "limits": "Profiled throughput is excluded from performance claims. Raw stacks remain local.",
+  "profiles": [
+    {
+      "label": "single-read-profile",
+      "binary_sha256": "9889f80a4c6257f05688c1eea0358664dfefe8a4ed8b56751ca05728fd1bf8b9",
+      "members": 1,
+      "concurrency": 8,
+      "read_percent": 100,
+      "requests": 700000,
+      "profiled_seconds": 15.332252958,
+      "sampled_seconds": 5,
+      "interval_ms": 1,
+      "top_leaf_stacks": [
+        {
+          "symbol": "__psynch_cvwait",
+          "image": "libsystem_kernel.dylib",
+          "samples": 24879
+        },
+        {
+          "symbol": "semaphore_timedwait_trap",
+          "image": "libsystem_kernel.dylib",
+          "samples": 2720
+        },
+        {
+          "symbol": "kevent",
+          "image": "libsystem_kernel.dylib",
+          "samples": 1993
+        },
+        {
+          "symbol": "__psynch_mutexwait",
+          "image": "libsystem_kernel.dylib",
+          "samples": 761
+        },
+        {
+          "symbol": "writev",
+          "image": "libsystem_kernel.dylib",
+          "samples": 663
+        },
+        {
+          "symbol": "_xzm_free_main",
+          "image": "libsystem_malloc.dylib",
+          "samples": 284
+        },
+        {
+          "symbol": "_xzm_xzone_malloc_tiny",
+          "image": "libsystem_malloc.dylib",
+          "samples": 283
+        },
+        {
+          "symbol": "_platform_memmove",
+          "image": "libsystem_platform.dylib",
+          "samples": 206
+        },
+        {
+          "symbol": "__recvfrom",
+          "image": "libsystem_kernel.dylib",
+          "samples": 178
+        },
+        {
+          "symbol": "mach_absolute_time",
+          "image": "libsystem_kernel.dylib",
+          "samples": 164
+        },
+        {
+          "symbol": "__psynch_mutexdrop",
+          "image": "libsystem_kernel.dylib",
+          "samples": 148
+        },
+        {
+          "symbol": "__psynch_cvsignal",
+          "image": "libsystem_kernel.dylib",
+          "samples": 131
+        },
+        {
+          "symbol": "<deduplicated_symbol>",
+          "image": "libsystem_malloc.dylib",
+          "samples": 95
+        },
+        {
+          "symbol": "_malloc_zone_malloc",
+          "image": "libsystem_malloc.dylib",
+          "samples": 79
+        },
+        {
+          "symbol": "serde_json::value::de::_$LT$impl$u20$serde_core..de..Deserializer$u20$for$u20$serde_json..value..Value$GT$::deserialize_u8::hd2fcb90beec463bb",
+          "image": "baseline",
+          "samples": 66
+        },
+        {
+          "symbol": "serde_core::ser::Serializer::collect_seq::h154d62cef066d443",
+          "image": "baseline",
+          "samples": 56
+        },
+        {
+          "symbol": "<deduplicated_symbol>",
+          "image": "baseline",
+          "samples": 54
+        },
+        {
+          "symbol": "_free",
+          "image": "libsystem_malloc.dylib",
+          "samples": 53
+        },
+        {
+          "symbol": "_$LT$serde_core..de..impls..$LT$impl$u20$serde_core..de..Deserialize$u20$for$u20$alloc..vec..Vec$LT$T$GT$$GT$..deserialize..VecVisitor$LT$T$GT$$u20$as$u20$serde_core..de..Visitor$GT$::visit_seq::h747a1059aa885245",
+          "image": "baseline",
+          "samples": 48
+        },
+        {
+          "symbol": "_$LT$slatedb_etcd..proto..etcdserverpb..kv_server..KvServer$LT$T$GT$$u20$as$u20$tower_service..Service$LT$http..request..Request$LT$B$GT$$GT$$GT$::call::_$u7b$$u7b$closure$u7d$$u7d$::h135fdd66863f4406",
+          "image": "baseline",
+          "samples": 46
+        },
+        {
+          "symbol": "pthread_mutex_unlock",
+          "image": "libsystem_pthread.dylib",
+          "samples": 34
+        },
+        {
+          "symbol": "pthread_mutex_lock",
+          "image": "libsystem_pthread.dylib",
+          "samples": 30
+        },
+        {
+          "symbol": "bytes::bytes::shared_drop::ha78596f4a0caa5fc",
+          "image": "baseline",
+          "samples": 28
+        },
+        {
+          "symbol": "tokio::runtime::scheduler::multi_thread::park::Parker::park::habaae7c06ac19c3f",
+          "image": "baseline",
+          "samples": 28
+        },
+        {
+          "symbol": "tokio::runtime::scheduler::multi_thread::worker::Context::run::h86263616e7ca852a",
+          "image": "baseline",
+          "samples": 27
+        },
+        {
+          "symbol": "_$LT$core..future..poll_fn..PollFn$LT$F$GT$$u20$as$u20$core..future..future..Future$GT$::poll::h1b98705f5caa041e",
+          "image": "baseline",
+          "samples": 26
+        },
+        {
+          "symbol": "_platform_memcmp",
+          "image": "libsystem_platform.dylib",
+          "samples": 26
+        },
+        {
+          "symbol": "_RNvCskdKJRKLKjqM_7___rustc11___rdl_alloc",
+          "image": "baseline",
+          "samples": 23
+        },
+        {
+          "symbol": "DYLD-STUB$$free",
+          "image": "baseline",
+          "samples": 21
+        },
+        {
+          "symbol": "h2::proto::connection::Connection$LT$T$C$P$C$B$GT$::poll::hd11ba434676ab750",
+          "image": "baseline",
+          "samples": 21
+        },
+        {
+          "symbol": "DYLD-STUB$$memcpy",
+          "image": "baseline",
+          "samples": 20
+        },
+        {
+          "symbol": "slatedb_etcd::grpc::Service::execute::_$u7b$$u7b$closure$u7d$$u7d$::heb6f847f3280d525",
+          "image": "baseline",
+          "samples": 19
+        },
+        {
+          "symbol": "alloc::collections::btree::map::BTreeMap$LT$K$C$V$C$A$GT$::insert::hfb5f767bd1544db5",
+          "image": "baseline",
+          "samples": 17
+        },
+        {
+          "symbol": "_$LT$bytes..bytes..Bytes$u20$as$u20$bytes..buf..buf_impl..Buf$GT$::copy_to_bytes::hb2bddc60a0c23726",
+          "image": "baseline",
+          "samples": 16
+        },
+        {
+          "symbol": "slatedb::format::row_codec_v2::SstRowCodecV2::decode::h86b7be025cdfe0f9",
+          "image": "baseline",
+          "samples": 16
+        },
+        {
+          "symbol": "slatedb::reader::Reader::build_iterator_sources::_$u7b$$u7b$closure$u7d$$u7d$::h619c193721380d06",
+          "image": "baseline",
+          "samples": 15
+        },
+        {
+          "symbol": "slatedb_etcd::node::apply::Worker::start::_$u7b$$u7b$closure$u7d$$u7d$::h0b4a781041530d6e",
+          "image": "baseline",
+          "samples": 15
+        },
+        {
+          "symbol": "_$LT$h2..codec..framed_read..FramedRead$LT$T$GT$$u20$as$u20$futures_core..stream..Stream$GT$::poll_next::h1e6c370e887cf146",
+          "image": "baseline",
+          "samples": 14
+        },
+        {
+          "symbol": "_$LT$tower..util..oneshot..Oneshot$LT$S$C$Req$GT$$u20$as$u20$core..future..future..Future$GT$::poll::hba50939de39312cb",
+          "image": "baseline",
+          "samples": 14
+        },
+        {
+          "symbol": "h2::frame::headers::HeaderBlock::load::_$u7b$$u7b$closure$u7d$$u7d$::h628311b33a92b5db",
+          "image": "baseline",
+          "samples": 14
+        }
+      ]
+    },
+    {
+      "label": "single-write-profile",
+      "binary_sha256": "9889f80a4c6257f05688c1eea0358664dfefe8a4ed8b56751ca05728fd1bf8b9",
+      "members": 1,
+      "concurrency": 8,
+      "read_percent": 0,
+      "requests": 6000,
+      "profiled_seconds": 11.607778458,
+      "sampled_seconds": 5,
+      "interval_ms": 1,
+      "top_leaf_stacks": [
+        {
+          "symbol": "__psynch_cvwait",
+          "image": "libsystem_kernel.dylib",
+          "samples": 24030
+        },
+        {
+          "symbol": "semaphore_timedwait_trap",
+          "image": "libsystem_kernel.dylib",
+          "samples": 2202
+        },
+        {
+          "symbol": "__fcntl",
+          "image": "libsystem_kernel.dylib",
+          "samples": 2138
+        },
+        {
+          "symbol": "kevent",
+          "image": "libsystem_kernel.dylib",
+          "samples": 2120
+        },
+        {
+          "symbol": "write",
+          "image": "libsystem_kernel.dylib",
+          "samples": 30
+        },
+        {
+          "symbol": "pwrite",
+          "image": "libsystem_kernel.dylib",
+          "samples": 22
+        },
+        {
+          "symbol": "_xzm_xzone_malloc_tiny",
+          "image": "libsystem_malloc.dylib",
+          "samples": 19
+        },
+        {
+          "symbol": "_platform_memmove",
+          "image": "libsystem_platform.dylib",
+          "samples": 17
+        },
+        {
+          "symbol": "__psynch_mutexwait",
+          "image": "libsystem_kernel.dylib",
+          "samples": 15
+        },
+        {
+          "symbol": "_xzm_free_main",
+          "image": "libsystem_malloc.dylib",
+          "samples": 12
+        },
+        {
+          "symbol": "__psynch_cvsignal",
+          "image": "libsystem_kernel.dylib",
+          "samples": 9
+        },
+        {
+          "symbol": "mach_absolute_time",
+          "image": "libsystem_kernel.dylib",
+          "samples": 9
+        },
+        {
+          "symbol": "__open",
+          "image": "libsystem_kernel.dylib",
+          "samples": 7
+        },
+        {
+          "symbol": "__recvfrom",
+          "image": "libsystem_kernel.dylib",
+          "samples": 6
+        },
+        {
+          "symbol": "slatedb::format::row_codec_v2::SstRowCodecV2::decode::h86b7be025cdfe0f9",
+          "image": "baseline",
+          "samples": 5
+        },
+        {
+          "symbol": "writev",
+          "image": "libsystem_kernel.dylib",
+          "samples": 5
+        }
+      ]
+    },
+    {
+      "label": "final-single-read-profile",
+      "binary_sha256": "ad2d4fe46d8e4acd67067ace28a71239efe25a93d077f11522dd34faba6ce00c",
+      "members": 1,
+      "concurrency": 8,
+      "read_percent": 100,
+      "requests": 700000,
+      "profiled_seconds": 11.878117834,
+      "sampled_seconds": 5,
+      "interval_ms": 1,
+      "top_leaf_stacks": [
+        {
+          "symbol": "__psynch_cvwait",
+          "image": "libsystem_kernel.dylib",
+          "samples": 16892
+        },
+        {
+          "symbol": "semaphore_timedwait_trap",
+          "image": "libsystem_kernel.dylib",
+          "samples": 3334
+        },
+        {
+          "symbol": "kevent",
+          "image": "libsystem_kernel.dylib",
+          "samples": 1384
+        },
+        {
+          "symbol": "writev",
+          "image": "libsystem_kernel.dylib",
+          "samples": 899
+        },
+        {
+          "symbol": "__psynch_mutexwait",
+          "image": "libsystem_kernel.dylib",
+          "samples": 433
+        },
+        {
+          "symbol": "_xzm_xzone_malloc_tiny",
+          "image": "libsystem_malloc.dylib",
+          "samples": 248
+        },
+        {
+          "symbol": "_platform_memmove",
+          "image": "libsystem_platform.dylib",
+          "samples": 231
+        },
+        {
+          "symbol": "__recvfrom",
+          "image": "libsystem_kernel.dylib",
+          "samples": 228
+        },
+        {
+          "symbol": "_xzm_free_main",
+          "image": "libsystem_malloc.dylib",
+          "samples": 193
+        },
+        {
+          "symbol": "mach_absolute_time",
+          "image": "libsystem_kernel.dylib",
+          "samples": 148
+        },
+        {
+          "symbol": "<deduplicated_symbol>",
+          "image": "libsystem_malloc.dylib",
+          "samples": 78
+        },
+        {
+          "symbol": "__psynch_mutexdrop",
+          "image": "libsystem_kernel.dylib",
+          "samples": 67
+        },
+        {
+          "symbol": "_malloc_zone_malloc",
+          "image": "libsystem_malloc.dylib",
+          "samples": 60
+        },
+        {
+          "symbol": "_free",
+          "image": "libsystem_malloc.dylib",
+          "samples": 58
+        },
+        {
+          "symbol": "_platform_memcmp",
+          "image": "libsystem_platform.dylib",
+          "samples": 35
+        },
+        {
+          "symbol": "bytes::bytes::shared_drop::ha78596f4a0caa5fc",
+          "image": "compact-read",
+          "samples": 34
+        },
+        {
+          "symbol": "pthread_mutex_lock",
+          "image": "libsystem_pthread.dylib",
+          "samples": 29
+        },
+        {
+          "symbol": "_$LT$slatedb_etcd..proto..etcdserverpb..kv_server..KvServer$LT$T$GT$$u20$as$u20$tower_service..Service$LT$http..request..Request$LT$B$GT$$GT$$GT$::call::_$u7b$$u7b$closure$u7d$$u7d$::h135fdd66863f4406",
+          "image": "compact-read",
+          "samples": 25
+        },
+        {
+          "symbol": "slatedb::partitioned_keyspace::partitions_covering_range::hd020ed82823a9e99",
+          "image": "compact-read",
+          "samples": 24
+        },
+        {
+          "symbol": "slatedb_etcd::node::apply::Executor::read_query::_$u7b$$u7b$closure$u7d$$u7d$::hea09949346371c9a",
+          "image": "compact-read",
+          "samples": 24
+        },
+        {
+          "symbol": "_$LT$core..future..poll_fn..PollFn$LT$F$GT$$u20$as$u20$core..future..future..Future$GT$::poll::h0366a9cdb140bf2f",
+          "image": "compact-read",
+          "samples": 23
+        },
+        {
+          "symbol": "pthread_mutex_unlock",
+          "image": "libsystem_pthread.dylib",
+          "samples": 23
+        },
+        {
+          "symbol": "slatedb_etcd::grpc::Service::execute::_$u7b$$u7b$closure$u7d$$u7d$::heb6f847f3280d525",
+          "image": "compact-read",
+          "samples": 22
+        },
+        {
+          "symbol": "DYLD-STUB$$free",
+          "image": "compact-read",
+          "samples": 20
+        },
+        {
+          "symbol": "DYLD-STUB$$memcpy",
+          "image": "compact-read",
+          "samples": 20
+        },
+        {
+          "symbol": "_$LT$slatedb..block_iterator_v2..BlockIteratorV2$LT$B$GT$$u20$as$u20$slatedb..iter..RowEntryIterator$GT$::seek::_$u7b$$u7b$closure$u7d$$u7d$::h3632917c82aa3eb3",
+          "image": "compact-read",
+          "samples": 20
+        },
+        {
+          "symbol": "h2::hpack::table::Table::index::h4746f1614575358e",
+          "image": "compact-read",
+          "samples": 19
+        },
+        {
+          "symbol": "h2::proto::connection::Connection$LT$T$C$P$C$B$GT$::poll::hd11ba434676ab750",
+          "image": "compact-read",
+          "samples": 19
+        },
+        {
+          "symbol": "_RNvCskdKJRKLKjqM_7___rustc11___rdl_alloc",
+          "image": "compact-read",
+          "samples": 18
+        },
+        {
+          "symbol": "slatedb::format::row_codec_v2::SstRowCodecV2::decode::h86b7be025cdfe0f9",
+          "image": "compact-read",
+          "samples": 18
+        },
+        {
+          "symbol": "_RNvCskdKJRKLKjqM_7___rustc35___rust_no_alloc_shim_is_unstable_v2",
+          "image": "compact-read",
+          "samples": 17
+        },
+        {
+          "symbol": "_$LT$bytes..bytes_mut..BytesMut$u20$as$u20$bytes..buf..buf_mut..BufMut$GT$::put_slice::h74dc999ec3b56163",
+          "image": "compact-read",
+          "samples": 16
+        },
+        {
+          "symbol": "_$LT$slatedb_etcd..grpc..Service$u20$as$u20$slatedb_etcd..proto..etcdserverpb..kv_server..Kv$GT$::range::_$u7b$$u7b$closure$u7d$$u7d$::hfd99834fd6fe67dd",
+          "image": "compact-read",
+          "samples": 16
+        },
+        {
+          "symbol": "bytes::bytes::shared_clone::hf8d7222e37650ecb",
+          "image": "compact-read",
+          "samples": 16
+        },
+        {
+          "symbol": "clock_gettime_nsec_np",
+          "image": "libsystem_c.dylib",
+          "samples": 16
+        },
+        {
+          "symbol": "tokio::runtime::scheduler::multi_thread::park::Parker::park::habaae7c06ac19c3f",
+          "image": "compact-read",
+          "samples": 16
+        },
+        {
+          "symbol": "_$LT$h2..codec..framed_read..FramedRead$LT$T$GT$$u20$as$u20$futures_core..stream..Stream$GT$::poll_next::h1e6c370e887cf146",
+          "image": "compact-read",
+          "samples": 15
+        },
+        {
+          "symbol": "h2::hpack::decoder::Decoder::decode::hfc8a94d59d8d0921",
+          "image": "compact-read",
+          "samples": 15
+        },
+        {
+          "symbol": "tokio::runtime::scheduler::multi_thread::worker::Context::run::h86263616e7ca852a",
+          "image": "compact-read",
+          "samples": 15
+        },
+        {
+          "symbol": "_$LT$h2..proto..streams..store..Ptr$u20$as$u20$core..ops..deref..Deref$GT$::deref::h5b2bdb64fd4b5cef",
+          "image": "compact-read",
+          "samples": 14
+        }
+      ]
+    },
+    {
+      "label": "final-single-write-profile",
+      "binary_sha256": "ad2d4fe46d8e4acd67067ace28a71239efe25a93d077f11522dd34faba6ce00c",
+      "members": 1,
+      "concurrency": 8,
+      "read_percent": 0,
+      "requests": 8000,
+      "profiled_seconds": 8.3773175,
+      "sampled_seconds": 5,
+      "interval_ms": 1,
+      "top_leaf_stacks": [
+        {
+          "symbol": "__psynch_cvwait",
+          "image": "libsystem_kernel.dylib",
+          "samples": 29393
+        },
+        {
+          "symbol": "semaphore_timedwait_trap",
+          "image": "libsystem_kernel.dylib",
+          "samples": 2196
+        },
+        {
+          "symbol": "kevent",
+          "image": "libsystem_kernel.dylib",
+          "samples": 2080
+        },
+        {
+          "symbol": "__fcntl",
+          "image": "libsystem_kernel.dylib",
+          "samples": 1994
+        },
+        {
+          "symbol": "write",
+          "image": "libsystem_kernel.dylib",
+          "samples": 52
+        },
+        {
+          "symbol": "__open",
+          "image": "libsystem_kernel.dylib",
+          "samples": 41
+        },
+        {
+          "symbol": "pwrite",
+          "image": "libsystem_kernel.dylib",
+          "samples": 33
+        },
+        {
+          "symbol": "_xzm_xzone_malloc_tiny",
+          "image": "libsystem_malloc.dylib",
+          "samples": 30
+        },
+        {
+          "symbol": "_platform_memmove",
+          "image": "libsystem_platform.dylib",
+          "samples": 25
+        },
+        {
+          "symbol": "_xzm_free_main",
+          "image": "libsystem_malloc.dylib",
+          "samples": 17
+        },
+        {
+          "symbol": "mach_absolute_time",
+          "image": "libsystem_kernel.dylib",
+          "samples": 14
+        },
+        {
+          "symbol": "writev",
+          "image": "libsystem_kernel.dylib",
+          "samples": 12
+        },
+        {
+          "symbol": "__psynch_mutexwait",
+          "image": "libsystem_kernel.dylib",
+          "samples": 10
+        },
+        {
+          "symbol": "__rename",
+          "image": "libsystem_kernel.dylib",
+          "samples": 10
+        },
+        {
+          "symbol": "_free",
+          "image": "libsystem_malloc.dylib",
+          "samples": 10
+        },
+        {
+          "symbol": "_$LT$alloc..boxed..Box$LT$dyn$u20$slatedb..iter..RowEntryIterator$GT$$u20$as$u20$slatedb..iter..RowEntryIterator$GT$::next::_$u7b$$u7b$closure$u7d$$u7d$::h1fc89f8ea018231d",
+          "image": "compact-read",
+          "samples": 9
+        },
+        {
+          "symbol": "__recvfrom",
+          "image": "libsystem_kernel.dylib",
+          "samples": 9
+        },
+        {
+          "symbol": "__unlink",
+          "image": "libsystem_kernel.dylib",
+          "samples": 7
+        },
+        {
+          "symbol": "_platform_memcmp",
+          "image": "libsystem_platform.dylib",
+          "samples": 7
+        },
+        {
+          "symbol": "close",
+          "image": "libsystem_kernel.dylib",
+          "samples": 7
+        },
+        {
+          "symbol": "slatedb::merge_iterator::MergeIterator::advance::_$u7b$$u7b$closure$u7d$$u7d$::hd2e7b0eedc9d4ed6",
+          "image": "compact-read",
+          "samples": 7
+        },
+        {
+          "symbol": "_$LT$slatedb..retention_iterator..RetentionIterator$LT$T$GT$$u20$as$u20$slatedb..iter..RowEntryIterator$GT$::next::_$u7b$$u7b$closure$u7d$$u7d$::h5ceb06e3d0dcf1b7",
+          "image": "compact-read",
+          "samples": 6
+        },
+        {
+          "symbol": "core::ptr::drop_in_place$LT$serde_core..private..content..Content$GT$::h38e2e07647ea29bb",
+          "image": "compact-read",
+          "samples": 6
+        },
+        {
+          "symbol": "serde_core::ser::Serializer::collect_seq::h9f32accabd77aa0e",
+          "image": "compact-read",
+          "samples": 6
+        },
+        {
+          "symbol": "_malloc_zone_malloc",
+          "image": "libsystem_malloc.dylib",
+          "samples": 5
+        },
+        {
+          "symbol": "getentropy",
+          "image": "libsystem_kernel.dylib",
+          "samples": 5
+        },
+        {
+          "symbol": "serde::private::de::content::content_clone::h3faae7411714aa4f",
+          "image": "compact-read",
+          "samples": 5
+        }
+      ]
+    }
+  ]
+}

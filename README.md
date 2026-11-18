@@ -70,7 +70,7 @@ See [test commands](tests/README.md) and the [upstream audit](tests/upstream/REA
 ```sh
 scripts/cargo.sh test --locked
 python3 scripts/check-compat.py --output tmp/test-results/compatibility.json
-python3 scripts/check-dst.py --seeds 1,2,42 --output tmp/test-results/dst.json
+python3 scripts/check-dst.py --seeds 1,2,42,58,70 --output tmp/test-results/dst.json
 ```
 
 CI runs formatting, Clippy, Rust tests, compatibility, faults, Jepsen controls, and bounded fuzzing.
@@ -87,6 +87,7 @@ Raw logs and generated data stay outside tracked reports.
 - [Implementation notes](docs/internals.md): current MVCC, Watch, Lease, and log behavior.
 - [Diagnostic APIs](docs/diagnostics.md): trusted local controls and fault injection.
 - [Benchmarks](docs/benchmarks.md): gRPC comparisons, resource measurements, and limits.
+- [Native macOS results](results/performance/macos.md): one member and three local processes.
 - [Contributing](CONTRIBUTING.md): repository layout, checks, and upstream test imports.
 - [Security](SECURITY.md): trust boundaries and private issue reporting.
 

@@ -2,8 +2,11 @@
 
 Run these commands from the repository root.
 
-See the [Linux CPU report](../results/performance/linux-cpu.md) for ReadIndex and apply results.
+See the [native macOS report](../results/performance/macos.md) for one-member and three-member
+results.
+The [Linux CPU report](../results/performance/linux-cpu.md) covers earlier ReadIndex and apply work.
 The [earlier report](../results/performance/README.md) covers quota and state-cache changes.
+The [etcd and TiKV review](raft-performance-notes.md) maps upstream techniques to this service.
 
 ## Measure write latency
 
@@ -52,6 +55,8 @@ implementations differ. Equal settings do not mean equal storage overhead.
 The report records successful throughput, error counts, p50/p95/p99/p999 latency, CPU seconds,
 peak combined server RSS, allocated local data bytes, and server binary hashes.
 Schema version 2 separates startup, preload, warmup, and measurement with client barriers.
+Both backends receive one idle second after warmup, before the measured phase.
+This reduces overlap with background work from preload. It does not stop background work.
 CPU deltas and peak RSS cover the measured phase. RSS still includes retained preload memory.
 The report separates client resources from the sum of all server processes.
 CPU per successful operation measures work. Average CPU cores measure utilization.
@@ -81,6 +86,8 @@ Startup rebuilds this counter from stored state. No storage format change is req
 The previous implementation scanned all logical etcd state before each quota-limited write.
 
 Use `--baseline-binary` to compare a saved release binary with the current service and etcd.
+Use `--baseline-concurrency 8` to limit baseline cost while retaining all service and etcd cases.
+The selected baseline cases still share the shuffled measurement order.
 Use `--read-requests` for longer read-only samples, and `--warmup` to set unmeasured operations.
 The driver shuffles backend and workload order for each repeat.
 Use `--service-runtime-workers` for explicit service worker comparisons.
@@ -129,6 +136,7 @@ A perf control acknowledgment starts sampling before the client enters its measu
 The controller stops sampling after the client finishes. It excludes client CPU stacks.
 The default uses `cpu-clock` at 99 Hz with 16 KiB DWARF call stacks.
 Reports retain self and inclusive symbol costs. Inclusive percentages overlap; do not add them.
+The extra `inline.txt` view includes compiler-inlined functions when symbols are available.
 Empty profiles, unresolved user symbols, lost samples, and failed requests fail validation.
 
 Use `--backend etcd --binary tmp/benchmark-tools/etcd` to profile the reference process.

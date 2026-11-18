@@ -43,6 +43,11 @@ This project uses bounded entry, pending, result, and term pools and validates s
 Its reads and writes still share one log worker. Separate readers may help slow-follower catch-up,
 but the current hot-cache matrix does not measure that benefit.
 
+The extended DST run also exposed a dependency cache collision across log instances.
+Cache keys must identify the open log as well as the file position.
+The [local dependency notes](../third_party/raft-engine/README.md) describe this fix and an explicit
+sync fix. Both have regressions that fail with the published Raft Engine 0.4.2 crate.
+
 ## Batch at distinct boundaries
 
 TiKV's [proposal builder] combines compatible Put and Delete requests.
