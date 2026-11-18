@@ -13,6 +13,8 @@ Historical articles explain the original designs. The pinned source defines the 
 | --- | --- | --- |
 | Separate Raft, log I/O, and apply | Implemented | Measure each queue and execution stage |
 | Share log writes | Implemented for adjacent Ready jobs | Measure batch size before adding waits |
+| Replicate during leader log I/O | Leader sends Append early | Keep follower replies durable |
+| Reply on a durable quorum | Ordinary eligible puts | Measure isolated leader I/O delays |
 | Avoid commit-only sync | Implemented with recovery checks | Preserve entry and vote barriers |
 | Reuse peer streams | Implemented with count and byte limits | Test bounded message batches |
 | Batch quorum reads | Implemented with frozen batches | Later requests need a new proof |
@@ -118,6 +120,7 @@ The [peer implementation] disables and later restores this mode around unsafe tr
 This service uses the durable quorum to prepare ordinary Put results in memory.
 Local state publication still waits for the log. This preserves the existing restart proof.
 The [ordering contract](architecture.md#state-write-groups) lists the eligibility rules.
+The [slow-leader experiment](../results/performance/quorum-put/README.md) measures this path.
 
 ## Cross-check with etcd
 

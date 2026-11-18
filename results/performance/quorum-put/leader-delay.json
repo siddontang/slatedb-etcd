@@ -1,0 +1,95 @@
+{
+  "injected_leader_delay_ms": 250,
+  "samples": [
+    {
+      "binary": "base",
+      "repeat": 0,
+      "elapsed_ms": 536.49,
+      "commit": 3,
+      "local_log": 3,
+      "applied": 3,
+      "revision": 3
+    },
+    {
+      "binary": "head",
+      "repeat": 0,
+      "elapsed_ms": 16.07,
+      "commit": 3,
+      "local_log": 2,
+      "applied": 2,
+      "revision": 3
+    },
+    {
+      "binary": "head",
+      "repeat": 1,
+      "elapsed_ms": 16.31,
+      "commit": 3,
+      "local_log": 2,
+      "applied": 2,
+      "revision": 3
+    },
+    {
+      "binary": "base",
+      "repeat": 1,
+      "elapsed_ms": 534.02,
+      "commit": 3,
+      "local_log": 3,
+      "applied": 3,
+      "revision": 3
+    },
+    {
+      "binary": "head",
+      "repeat": 2,
+      "elapsed_ms": 13.8,
+      "commit": 3,
+      "local_log": 2,
+      "applied": 2,
+      "revision": 3
+    },
+    {
+      "binary": "base",
+      "repeat": 2,
+      "elapsed_ms": 535.09,
+      "commit": 3,
+      "local_log": 3,
+      "applied": 3,
+      "revision": 3
+    },
+    {
+      "binary": "head",
+      "repeat": 3,
+      "elapsed_ms": 15.44,
+      "commit": 3,
+      "local_log": 2,
+      "applied": 2,
+      "revision": 3
+    },
+    {
+      "binary": "base",
+      "repeat": 3,
+      "elapsed_ms": 537.83,
+      "commit": 3,
+      "local_log": 3,
+      "applied": 3,
+      "revision": 3
+    },
+    {
+      "binary": "head",
+      "repeat": 4,
+      "elapsed_ms": 15.78,
+      "commit": 3,
+      "local_log": 2,
+      "applied": 2,
+      "revision": 3
+    },
+    {
+      "binary": "base",
+      "repeat": 4,
+      "elapsed_ms": 531.43,
+      "commit": 3,
+      "local_log": 3,
+      "applied": 3,
+      "revision": 3
+    }
+  ]
+}
