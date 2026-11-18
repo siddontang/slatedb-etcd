@@ -509,7 +509,7 @@ impl Simulation {
                 Event::SnapshotBuilt {
                     index,
                     conf: node.worker.state().members.conf(),
-                    result: Ok(data),
+                    result: PreparedCheckpoint::write(&node.options.dir.join("raft"), data.into()),
                 },
                 &mut vec![],
             )
@@ -528,8 +528,14 @@ impl Simulation {
         let saved = storage.recovery_snapshot().clone();
         let index = saved.get_metadata().index;
         assert!(index > 0);
-        self.stop(id);
+        // Keep a synced local image pending while Raft processes more messages.
         let dir = self.root.path().join(id.to_string()).join("raft");
+        let staged = PreparedCheckpoint::write(&dir, saved.data.clone()).unwrap();
+        self.read().await;
+        self.drive().await;
+        assert_eq!(self.nodes[&id].raw.store().snapshot_index(), index);
+        drop(staged);
+        self.stop(id);
         let orphan = dir.join(format!("checkpoint-{:016x}.data", index + 1));
         std::fs::write(&orphan, b"unpublished snapshot").unwrap();
         self.start(id).await;
@@ -570,6 +576,9 @@ impl Simulation {
         assert_eq!(self.nodes[&id].raw.store().first_index().unwrap(), first);
         store.release.add_permits(1);
         let data = job.await.unwrap().unwrap();
+        let staged =
+            PreparedCheckpoint::write(&self.nodes[&id].options.dir.join("raft"), data.into())
+                .unwrap();
         if self.choose(2) == 0 {
             self.nodes
                 .get_mut(&id)
@@ -578,7 +587,7 @@ impl Simulation {
                     Event::SnapshotBuilt {
                         index,
                         conf,
-                        result: Ok(data),
+                        result: Ok(staged),
                     },
                     &mut vec![],
                 )

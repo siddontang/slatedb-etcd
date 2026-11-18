@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::lease::{LeaseCommand, LeaseReply};
 use crate::proto::etcdserverpb::{CompactionRequest, RequestOp, ResponseHeader};
 use crate::state::StateMachine;
-use crate::storage::RaftStorage;
+use crate::storage::{PreparedCheckpoint, RaftStorage};
 use crate::{ApiError, Command, RaftCommand, Request};
 
 mod apply;
@@ -75,7 +75,7 @@ pub enum Event {
     SnapshotBuilt {
         index: u64,
         conf: raft::eraftpb::ConfState,
-        result: Result<Vec<u8>>,
+        result: Result<PreparedCheckpoint>,
     },
     SnapshotDelay(u64, Response),
     ApplyDelay(u64, Response),
@@ -105,6 +105,23 @@ pub struct NodeOptions {
 }
 
 impl NodeOptions {
+    fn next_checkpoint(&self, saved: u64) -> Option<u64> {
+        let interval = self.snapshot_every;
+        if interval == 0 {
+            return None;
+        }
+        // Each configured member gets one position in the same log interval.
+        let position = self.peers.range(..self.id).count() as u128;
+        let phase = (u128::from(interval) * position / self.peers.len() as u128) as u64;
+        let remainder = saved % interval;
+        let distance = if remainder < phase {
+            phase - remainder
+        } else {
+            interval - (remainder - phase)
+        };
+        saved.checked_add(distance)
+    }
+
     fn effective_quota(&self) -> i64 {
         match self.quota_bytes {
             0 => 2 * 1024 * 1024 * 1024,
@@ -162,7 +179,7 @@ pub struct Node {
     log_read_delay_ms: u64,
     log_read_fail: bool,
     peer_waiters: Vec<Response>,
-    built_checkpoint: Option<(u64, raft::eraftpb::ConfState, Vec<u8>)>,
+    built_checkpoint: Option<(u64, raft::eraftpb::ConfState, PreparedCheckpoint)>,
     read_executor: read::executor::Executor,
     read_queries: VecDeque<Query>,
     reads: BTreeMap<u64, read::PendingRead>,
@@ -189,6 +206,7 @@ pub struct Node {
     recovered_from_index: u64,
     send_failures: Vec<(u64, bool)>,
     checkpoint_running: bool,
+    next_checkpoint: Option<u64>,
     checkpoint_waiters: Vec<(u64, Response)>,
     snapshot_delay_ms: u64,
     lease_term: u64,
@@ -337,6 +355,7 @@ impl Node {
         )?);
         let worker = Worker::start(state, events.clone(), manual_apply);
         let log_worker = log::Worker::start(storage, manual_apply)?;
+        let next_checkpoint = options.next_checkpoint(raw.store().snapshot_index());
         let mut node = Self {
             metrics,
             last_observed_leader: 0,
@@ -388,6 +407,7 @@ impl Node {
             recovered_from_index,
             send_failures: vec![],
             checkpoint_running: false,
+            next_checkpoint,
             checkpoint_waiters: vec![],
             snapshot_delay_ms: 0,
             lease_term: 0,
@@ -472,15 +492,6 @@ impl Node {
                 tracing::info!(node = self.options.id, role = ?role.0, term = role.1,
                     leader = role.2, "Raft state changed");
                 old_role = role;
-            }
-            if self.options.snapshot_every > 0
-                && self
-                    .state
-                    .applied
-                    .saturating_sub(self.raw.store().snapshot_index())
-                    >= self.options.snapshot_every
-            {
-                self.start_checkpoint()?;
             }
             self.finish_checkpoint_waiters()?;
         }
@@ -963,6 +974,7 @@ impl Node {
             Job::Checkpoint(
                 Duration::from_millis(self.snapshot_delay_ms),
                 self.raw.store().recovery_snapshot().clone(),
+                self.options.dir.join("raft"),
             ),
             self.state.applied,
         )?;

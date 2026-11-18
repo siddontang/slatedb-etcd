@@ -323,6 +323,30 @@ async fn invalid_state_snapshot_stops_the_node() {
     assert!(result.is_err());
 }
 
+#[test]
+fn automatic_checkpoints_rotate_across_members_without_wrapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = options(dir.path());
+    config.peers = [
+        (11, String::new()),
+        (55, String::new()),
+        (99, String::new()),
+    ]
+    .into();
+    config.snapshot_every = 10;
+    for (id, first) in [(11, 10), (55, 3), (99, 6)] {
+        config.id = id;
+        assert_eq!(config.next_checkpoint(0), Some(first));
+        assert_eq!(config.next_checkpoint(first - 1), Some(first));
+        assert_eq!(config.next_checkpoint(first + 1), Some(first + 10));
+        assert_eq!(config.next_checkpoint(u64::MAX), None);
+    }
+    config.snapshot_every = 1;
+    assert_eq!(config.next_checkpoint(3), Some(4));
+    config.snapshot_every = 0;
+    assert_eq!(config.next_checkpoint(0), None);
+}
+
 #[tokio::test]
 async fn future_checkpoint_and_automatic_checkpoints_do_not_stop_apply() {
     let dir = tempfile::tempdir().unwrap();
@@ -1022,7 +1046,8 @@ async fn checkpoint_memory_does_not_use_the_entry_admission_budget() {
         log::Job::Checkpoint {
             conf: node.state.members.conf(),
             index: node.state.applied,
-            data: vec![0; size],
+            image: PreparedCheckpoint::write(&node.options.dir.join("raft"), vec![0; size].into())
+                .unwrap(),
         },
         None,
         None,

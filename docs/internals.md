@@ -47,9 +47,10 @@ For a checkpoint, the node:
 
 1. Freezes tracked changes at the applied index or pins a full SlateDB scan.
 2. Flushes SlateDB and builds a complete snapshot from the prior image or the pinned scan.
-3. Writes the checkpoint file, syncs it, renames it, and syncs the parent directory.
-4. Syncs its reference, checksum, metadata, commit marker, and truncation in one WAL batch.
-5. Removes the prior file and asks raft-engine to reclaim obsolete WAL segments.
+3. Writes and syncs a private temporary file on a blocking worker. The worker computes its CRC.
+4. Renames the complete image and syncs its directory on the WAL thread.
+5. Syncs its reference, checksum, metadata, commit marker, and truncation in one WAL batch.
+6. Removes the prior file and asks raft-engine to reclaim obsolete WAL segments.
 
 The saved snapshot retains the boundary term and membership at the same applied index. On snapshot
 receipt,
@@ -59,7 +60,9 @@ is safe: startup can repeat the state replacement from the durable snapshot payl
 The checkpoint file contains a full copy of the state. This makes recovery independent of
 uncopied local object files, but limits the PoC to small data sets. Snapshots use the peer HTTP body
 limit of 64 MiB. Snapshot creation runs in the background.
-A dedicated log I/O thread persists snapshots.
+Members use different positions in each automatic checkpoint interval.
+Their rank in the configured peer list sets the position. Manual checkpoints bypass this schedule.
+Incoming peer snapshots use the ordered WAL thread for both file preparation and publication.
 Slow persistence can still raise client tail latency.
 A separate apply task owns SlateDB, installs snapshots, and executes committed state changes.
 Production use still needs bounded snapshot transfer and bounded state scans.

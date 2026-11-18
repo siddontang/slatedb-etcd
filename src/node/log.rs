@@ -38,7 +38,7 @@ pub(super) enum Job {
     Checkpoint {
         conf: raft::eraftpb::ConfState,
         index: u64,
-        data: Vec<u8>,
+        image: super::PreparedCheckpoint,
     },
     #[cfg(test)]
     Panic,
@@ -101,7 +101,7 @@ impl Job {
                 snapshot: Some(snapshot),
                 ..
             } => snapshot.data.len(),
-            Self::Checkpoint { data, .. } => data.len(),
+            Self::Checkpoint { image, .. } => image.data.len(),
             _ => 0,
         }
     }
@@ -166,9 +166,9 @@ impl Executor {
             } => self
                 .storage
                 .persist(&entries, hs.as_ref(), snapshot.as_ref())?,
-            Job::Checkpoint { index, data, conf } => {
+            Job::Checkpoint { index, image, conf } => {
                 if index > self.storage.snapshot_index() {
-                    self.storage.checkpoint_with_conf(index, data, conf)?;
+                    self.storage.publish_checkpoint(index, image, conf)?;
                 }
             }
             #[cfg(test)]

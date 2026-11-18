@@ -7,6 +7,7 @@ use raft_engine::{Command as EngineCommand, Config, Engine, LogBatch, MessageExt
 use serde::Serialize;
 
 mod checkpoint;
+pub use checkpoint::PreparedCheckpoint;
 mod filesystem;
 use filesystem::LogFileSystem;
 
@@ -148,7 +149,8 @@ impl RaftStorage {
                 hs.commit >= snapshot.get_metadata().index,
                 "snapshot exceeds commit"
             );
-            checkpoint::stage(&self.dir, snapshot, &mut batch)?;
+            PreparedCheckpoint::write(&self.dir, snapshot.data.clone())?
+                .publish(&self.dir, snapshot, &mut batch)?;
         }
         batch.add_entries::<EntryCodec>(GROUP, entries)?;
         if let Some(hs) = hard_state {
@@ -209,6 +211,16 @@ impl RaftStorage {
         data: Vec<u8>,
         conf: ConfState,
     ) -> Result<()> {
+        let prepared = PreparedCheckpoint::write(&self.dir, data.into())?;
+        self.publish_checkpoint(index, prepared, conf)
+    }
+
+    pub(crate) fn publish_checkpoint(
+        &mut self,
+        index: u64,
+        prepared: PreparedCheckpoint,
+        conf: ConfState,
+    ) -> Result<()> {
         ensure!(
             index <= self.hard_state.commit,
             "cannot snapshot uncommitted data"
@@ -218,9 +230,9 @@ impl RaftStorage {
         snapshot.mut_metadata().index = index;
         snapshot.mut_metadata().term = self.term(index)?;
         snapshot.mut_metadata().set_conf_state(conf);
-        snapshot.data = data.into();
+        snapshot.data = prepared.data.clone();
         let mut batch = LogBatch::default();
-        checkpoint::stage(&self.dir, &snapshot, &mut batch)?;
+        prepared.publish(&self.dir, &snapshot, &mut batch)?;
         batch.put(GROUP, IDENTITY.to_vec(), self.identity.clone())?;
         batch.put_message(GROUP, HARD_STATE.to_vec(), &self.hard_state)?;
         batch.add_command(GROUP, EngineCommand::Compact { index: index + 1 });

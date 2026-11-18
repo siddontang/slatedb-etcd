@@ -14,23 +14,40 @@ impl RaftCommand {
             } if id == command.id() => (command.as_ref(), Some(credentials)),
             _ => (self, None),
         };
-        let payload = match inner {
-            Self::Etcd { id, origin, etcd } => Payload::Kv(Kv {
-                id: id.clone(),
-                origin: *origin,
-                request: Some(etcd.clone()),
-                credentials: credentials.map(|auth| Credentials {
-                    identity: auth.user.clone().map(Identity::User),
-                    token: auth.token.clone(),
-                    time: auth.time,
-                }),
-            }),
-            _ => Payload::Json(serde_json::to_vec(self)?),
-        };
+        if let Self::Etcd { id, origin, etcd } = inner {
+            return Ok(Self::encode_kv(
+                id.clone(),
+                *origin,
+                etcd.clone(),
+                credentials.cloned(),
+            ));
+        }
         Ok(Envelope {
-            payload: Some(payload),
+            payload: Some(Payload::Json(serde_json::to_vec(self)?)),
         }
         .encode_to_vec())
+    }
+
+    pub(crate) fn encode_kv(
+        id: String,
+        origin: u64,
+        request: crate::proto::etcdserverpb::RequestOp,
+        credentials: Option<crate::auth::Credentials>,
+    ) -> Vec<u8> {
+        let kv = Kv {
+            id,
+            origin,
+            request: Some(request),
+            credentials: credentials.map(|auth| Credentials {
+                identity: auth.user.map(Identity::User),
+                token: auth.token,
+                time: auth.time,
+            }),
+        };
+        Envelope {
+            payload: Some(Payload::Kv(kv)),
+        }
+        .encode_to_vec()
     }
 
     pub(crate) fn decode(data: &[u8]) -> Result<Self> {

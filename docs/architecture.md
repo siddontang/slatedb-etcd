@@ -123,10 +123,12 @@ Each task can resume on another runtime worker after it yields.
 | WAL | One dedicated `raft-log-io` OS thread per member writes, syncs, and reads the log. |
 | Apply | One Tokio task per member writes SlateDB and publishes revisions in log order. |
 | KV reads | Up to four Tokio tasks read pinned views. At most one wide read runs at a time. |
-| Checkpoint | An async builder prepares the image. A blocking worker merges the frozen delta. |
+| Checkpoint | The builder uses blocking workers to merge changes and sync the image. |
 | Other work | Blocking workers handle password checks, metrics encoding, and local object I/O. |
 
 The client and peer tasks submit events through a queue with 2,048 slots.
+The WAL thread publishes a synced local checkpoint file and syncs the log truncation.
+It prepares incoming peer snapshots in order before reporting durable completion.
 The owner sends ordered work to WAL and apply. Each worker sends its result back to the owner.
 Leader replication can proceed while the WAL thread waits for the disk.
 A linear read obtains a quorum proof and waits for local apply before it uses a pinned view.
@@ -159,7 +161,7 @@ flowchart LR
     Raft -->|Confirmed reads| Reads[Bounded read tasks]
     Reads -->|Pinned snapshot| DB
     Apply -->|Pinned view| Builder[Snapshot builder]
-    Builder -->|Snapshot bytes| Raft
+    Builder -->|Synced image| Raft
 ```
 
 The Raft owner must not wait for a full apply queue.
@@ -376,7 +378,8 @@ snapshot and merges replacements and deletes. It writes a complete, independentl
 The apply owner charges keys, values, and 128 bytes per change against an 8 MiB tracking budget.
 Overflow, restart, or installation of a new snapshot selects a fresh pinned scan.
 One frozen change set and one active change set can coexist. The builder also needs output space.
-The WAL worker writes a separate checkpoint file, syncs it, renames it, and syncs its directory.
+A blocking worker writes and syncs each local image under a unique temporary name.
+The WAL worker renames the image and syncs its directory before it publishes the reference.
 One synced WAL batch publishes its index, size, CRC32C, and metadata with log truncation.
 The worker can then retire the previous file and reclaim covered WAL segments.
 On restart, the worker verifies the referenced file before removing unpublished or retired files.

@@ -90,7 +90,11 @@ fn field<'a>(input: &mut &'a [u8]) -> Result<&'a [u8]> {
 
 fn write_row(out: &mut Vec<u8>, key: &[u8], value: Option<&[u8]>) -> Result<u64> {
     if let Some(value) = value {
-        bincode::serialize_into(out, &(key, value))?;
+        // Bincode prefixes each byte sequence with its length.
+        for field in [key, value] {
+            bincode::serialize_into(&mut *out, &(field.len() as u64))?;
+            out.extend_from_slice(field);
+        }
         return Ok(1);
     }
     Ok(0)

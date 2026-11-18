@@ -117,7 +117,7 @@ pub(super) enum Job {
     PublishPuts(crate::state::put_batch::PreparedPuts),
     Snapshot(Snapshot),
     Query(Query),
-    Checkpoint(Duration, Snapshot),
+    Checkpoint(Duration, Snapshot, PathBuf),
 }
 
 pub(super) struct Work {
@@ -283,7 +283,7 @@ impl Executor {
                     }
                 }
             },
-            Job::Checkpoint(delay, base) => {
+            Job::Checkpoint(delay, base, dir) => {
                 let index = self.state.applied;
                 let conf = self.state.members.conf();
                 let job = self.state.checkpoint_job(base)?;
@@ -292,7 +292,14 @@ impl Executor {
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
                     }
-                    let result = job.await;
+                    let result = async {
+                        let data = job.await?;
+                        tokio::task::spawn_blocking(move || {
+                            PreparedCheckpoint::write(&dir, data.into())
+                        })
+                        .await?
+                    }
+                    .await;
                     let _ = events
                         .send(Event::SnapshotBuilt {
                             index,

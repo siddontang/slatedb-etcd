@@ -62,9 +62,9 @@ impl Node {
                 .checkpoint_waiters
                 .iter()
                 .any(|(index, _)| *index <= self.state.applied)
-            || (self.options.snapshot_every > 0
-                && self.state.applied.saturating_sub(snapshot_index)
-                    >= self.options.snapshot_every);
+            || self
+                .next_checkpoint
+                .is_some_and(|index| self.state.applied >= index);
         if checkpoint_due && !self.checkpoint_running && self.state.applied > snapshot_index {
             return self.start_checkpoint();
         }
