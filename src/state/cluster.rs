@@ -16,7 +16,7 @@ impl StateMachine {
         } else {
             self.auth.admin(credentials)
         };
-        let mut members = self.members.clone();
+        let mut members = self.members.as_ref().clone();
         let result = allowed.and_then(|()| members.validate(request)).map(|()| {
             members.apply(request);
             let mut response = serde_json::json!({"header": mvcc::header(self.revision),
@@ -30,7 +30,7 @@ impl StateMachine {
         batch.put(crate::cluster::KEY, serde_json::to_vec(&members)?);
         batch.put(APPLIED, index.to_be_bytes());
         self.write_batch(batch, index).await?;
-        self.members = members;
+        self.members = Arc::new(members);
         self.applied = index;
         Ok(Outcome { result })
     }

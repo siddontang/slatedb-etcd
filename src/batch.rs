@@ -15,7 +15,13 @@ pub struct WriteBatch {
 #[derive(Clone, Debug)]
 struct Mutation {
     value: Option<Bytes>,
-    absent: bool,
+    original: Original,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Original {
+    Read,
+    Known(Option<usize>),
 }
 
 impl WriteBatch {
@@ -27,7 +33,7 @@ impl WriteBatch {
         self.change(
             key.as_ref(),
             Some(Bytes::copy_from_slice(value.as_ref())),
-            false,
+            Original::Read,
         );
     }
 
@@ -36,20 +42,29 @@ impl WriteBatch {
         self.change(
             key.as_ref(),
             Some(Bytes::copy_from_slice(value.as_ref())),
-            true,
+            Original::Known(None),
         );
     }
 
     pub fn delete(&mut self, key: impl AsRef<[u8]>) {
-        self.change(key.as_ref(), None, false);
+        self.change(key.as_ref(), None, Original::Read);
     }
 
-    fn change(&mut self, key: &[u8], value: Option<Bytes>, absent: bool) {
+    /// Keep the size from the MVCC lookup for quota accounting.
+    pub(crate) fn put_known(&mut self, key: Vec<u8>, value: Vec<u8>, old_len: Option<usize>) {
+        self.insert(key.into(), Some(value.into()), Original::Known(old_len));
+    }
+
+    fn change(&mut self, key: &[u8], value: Option<Bytes>, original: Original) {
+        self.insert(Bytes::copy_from_slice(key), value, original);
+    }
+
+    fn insert(&mut self, key: Bytes, value: Option<Bytes>, original: Original) {
         // Keep the first mutation's knowledge of storage across later batch mutations.
         self.changes
-            .entry(Bytes::copy_from_slice(key))
+            .entry(key)
             .and_modify(|change| change.value = value.clone())
-            .or_insert(Mutation { value, absent });
+            .or_insert(Mutation { value, original });
     }
 
     pub fn is_empty(&self) -> bool {
@@ -83,15 +98,16 @@ impl WriteBatch {
             if !key.starts_with(b"etcd/") {
                 continue;
             }
-            if let Some(old) = if change.absent {
-                None
-            } else if let Some(value) = previous.and_then(|batch| batch.get(key)) {
-                value
-            } else {
-                db.get(key).await?
-            } {
+            let old_len = match change.original {
+                Original::Known(length) => length,
+                Original::Read => match previous.and_then(|batch| batch.get(key)) {
+                    Some(value) => value.map(|v| v.len()),
+                    None => db.get(key).await?.map(|v| v.len()),
+                },
+            };
+            if let Some(length) = old_len {
                 size = size
-                    .checked_sub((key.len() + old.len()) as u64)
+                    .checked_sub((key.len() + length) as u64)
                     .context("logical size counter underflow")?;
             }
             if let Some(value) = &change.value {
@@ -103,11 +119,17 @@ impl WriteBatch {
         Ok(size)
     }
 
-    pub(crate) fn into_storage(self) -> slatedb::WriteBatch {
+    pub(crate) fn into_rows(self) -> impl Iterator<Item = (Bytes, Option<Bytes>)> {
+        self.changes
+            .into_iter()
+            .map(|(key, change)| (key, change.value))
+    }
+
+    pub(crate) fn to_storage(&self) -> slatedb::WriteBatch {
         let mut batch = slatedb::WriteBatch::new();
-        for (key, change) in self.changes {
-            if let Some(value) = change.value {
-                batch.put_bytes(key, value);
+        for (key, change) in &self.changes {
+            if let Some(value) = &change.value {
+                batch.put_bytes(key.clone(), value.clone());
             } else {
                 batch.delete(key);
             }

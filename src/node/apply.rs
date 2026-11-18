@@ -11,7 +11,7 @@ pub(super) const MAX_APPLY_LAG: u64 = 1024;
 pub(super) struct AppliedState {
     pub applied: u64,
     pub durable_applied: u64,
-    pub members: crate::cluster::Store,
+    pub members: std::sync::Arc<crate::cluster::Store>,
     pub read: std::sync::Arc<crate::state::ReadView>,
     pub write_batches: u64,
 }
@@ -111,9 +111,11 @@ pub(super) enum Job {
     #[cfg(test)]
     Panic,
     Entries(Vec<Entry>),
+    PreparePuts(Vec<(u64, RaftCommand)>),
+    PublishPuts(crate::state::put_batch::PreparedPuts),
     Snapshot(Snapshot),
     Query(Query),
-    Checkpoint(Duration),
+    Checkpoint(Duration, Snapshot),
 }
 
 pub(super) struct Work {
@@ -146,6 +148,7 @@ pub(super) enum Output {
         outcome: Outcome,
     },
     Entries(Vec<AppliedCommand>),
+    PreparedPuts(crate::state::put_batch::PreparedPuts, Vec<AppliedCommand>),
     Snapshot,
     Query {
         response: Response,
@@ -177,9 +180,12 @@ impl Drop for Executor {
 
 impl Executor {
     async fn execute(&mut self, work: Work) -> Result<Completion> {
-        let changes_state = matches!(work.job, Job::Entries(_) | Job::Snapshot(_));
+        let changes_state = matches!(
+            work.job,
+            Job::Entries(_) | Job::Snapshot(_) | Job::PublishPuts(_)
+        );
         let copy_state = changes_state || matches!(work.job, Job::Query(Query::Maintenance(..)));
-        if changes_state && !work.delay.is_zero() {
+        if (changes_state || matches!(work.job, Job::PreparePuts(_))) && !work.delay.is_zero() {
             tokio::time::sleep(work.delay).await;
         }
         let output = match work.job {
@@ -187,6 +193,15 @@ impl Executor {
             Job::Panic => panic!("injected apply worker panic"),
             Job::Entries(entries) => {
                 Output::Entries(apply_entries(&mut self.state, entries, work.header).await?)
+            }
+            Job::PreparePuts(commands) => {
+                let (batch, replies) =
+                    super::quorum_put::prepare(&self.state, &commands, work.header).await?;
+                Output::PreparedPuts(batch, replies)
+            }
+            Job::PublishPuts(batch) => {
+                self.state.publish_puts(batch).await?;
+                Output::Entries(Vec::new())
             }
             Job::Snapshot(snapshot) => {
                 self.state.install_snapshot(&snapshot).await?;
@@ -258,10 +273,10 @@ impl Executor {
                     }
                 }
             },
-            Job::Checkpoint(delay) => {
+            Job::Checkpoint(delay, base) => {
                 let index = self.state.applied;
                 let conf = self.state.members.conf();
-                let job = self.state.snapshot_job()?;
+                let job = self.state.checkpoint_job(base)?;
                 let events = self.events.clone();
                 self.snapshot_task = Some(tokio::spawn(async move {
                     if !delay.is_zero() {
@@ -408,25 +423,6 @@ impl Worker {
     }
 }
 
-fn put_command(
-    command: &RaftCommand,
-) -> Option<(&RequestOp, Option<&crate::auth::Credentials>, u64)> {
-    let (command, credentials) = match command {
-        RaftCommand::Secured {
-            command,
-            credentials,
-            ..
-        } => (command.as_ref(), Some(credentials)),
-        command => (command, None),
-    };
-    match command {
-        RaftCommand::Etcd { etcd, origin, .. } if crate::mvcc::batchable_put(etcd) => {
-            Some((etcd, credentials, *origin))
-        }
-        _ => None,
-    }
-}
-
 async fn apply_entries(
     state: &mut StateMachine,
     entries: Vec<Entry>,
@@ -455,39 +451,21 @@ async fn apply_entries(
                 .as_ref()
                 .map_or(entry.data.as_ref(), |change| change.context.as_ref()),
         )?;
-        if change.is_none() && put_command(&command).is_some() {
+        if change.is_none() && super::quorum_put::put_command(&command).is_some() {
             let mut commands = vec![(entry.index, command)];
             while let Some(next) = entries.peek() {
                 if next.get_entry_type() != EntryType::EntryNormal || next.data.is_empty() {
                     break;
                 }
                 let command = RaftCommand::decode(&next.data)?;
-                if put_command(&command).is_none() {
+                if super::quorum_put::put_command(&command).is_none() {
                     break;
                 }
                 commands.push((entries.next().unwrap().index, command));
             }
-            let puts: Vec<_> = commands
-                .iter()
-                .map(|(index, command)| {
-                    let (request, credentials, origin) = put_command(command).unwrap();
-                    crate::state::put_batch::Put {
-                        index: *index,
-                        request,
-                        credentials,
-                        origin,
-                    }
-                })
-                .collect();
-            for ((_, command), mut outcome) in commands.iter().zip(state.apply_puts(&puts).await?) {
-                header.outcome(&mut outcome);
-                replies.push(AppliedCommand {
-                    id: command.id().to_owned(),
-                    change: None,
-                    lease: None,
-                    reply: Reply::Kv(outcome),
-                });
-            }
+            let (batch, outcomes) = super::quorum_put::prepare(state, &commands, header).await?;
+            state.publish_puts(batch).await?;
+            replies.extend(outcomes);
             continue;
         }
         let id = command.id().to_owned();

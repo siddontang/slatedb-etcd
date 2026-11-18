@@ -22,6 +22,7 @@ mod cluster;
 mod lease;
 mod log;
 mod maintenance;
+mod quorum_put;
 mod read;
 mod ready;
 mod response;
@@ -155,6 +156,8 @@ pub struct Node {
     apply_busy: bool,
     apply_target: u64,
     committed_ready: u64,
+    prepared_puts: Option<crate::state::put_batch::PreparedPuts>,
+    quorum_reply_index: u64,
     queries: VecDeque<Query>,
     prefer_query: bool,
     apply_delay_ms: u64,
@@ -218,12 +221,13 @@ impl Node {
             let recovered_from_index = state.applied;
             state.install_snapshot(storage.recovery_snapshot()).await?;
             if state.members.members.is_empty() && !options.join {
-                state.members = crate::cluster::Store::initial(&options.peers);
+                let mut members = crate::cluster::Store::initial(&options.peers);
                 for (&id, address) in &options.client_peers {
-                    if let Some(member) = state.members.members.get_mut(&id) {
+                    if let Some(member) = members.members.get_mut(&id) {
                         member.client_ur_ls = vec![crate::cluster::url(address)];
                     }
                 }
+                state.members = std::sync::Arc::new(members);
             }
             if options.require_peer_tls {
                 ensure!(
@@ -336,6 +340,8 @@ impl Node {
             read_sequence: 0,
             apply_target: applied.applied,
             committed_ready: applied.applied,
+            prepared_puts: None,
+            quorum_reply_index: 0,
             state: applied,
             worker,
             apply_busy: false,
@@ -845,14 +851,17 @@ impl Node {
     }
 
     fn start_checkpoint(&mut self) -> Result<()> {
-        if self.checkpoint_running || self.apply_busy {
+        if self.checkpoint_running || self.apply_busy || self.prepared_puts.is_some() {
             return Ok(());
         }
         if self.state.applied <= self.raw.store().snapshot_index() {
             return Ok(());
         }
         self.submit_apply(
-            Job::Checkpoint(Duration::from_millis(self.snapshot_delay_ms)),
+            Job::Checkpoint(
+                Duration::from_millis(self.snapshot_delay_ms),
+                self.raw.store().recovery_snapshot().clone(),
+            ),
             self.state.applied,
         )?;
         self.checkpoint_running = true;
@@ -909,7 +918,7 @@ impl Node {
     }
 
     fn status(&self) -> Result<Value> {
-        Ok(json!({
+        let mut status = json!({
             "id": self.options.id, "cluster_id": self.options.cluster_id,
             "role": format!("{:?}", self.raw.raft.state), "leader_id": self.raw.raft.leader_id,
             "term": self.raw.raft.term, "commit_index": self.raw.store().commit_index(),
@@ -937,6 +946,8 @@ impl Node {
             "log_read_delay_ms": self.log_read_delay_ms, "log_read_fail": self.log_read_fail,
             "revision": self.state.revision,
             "compact_revision": self.state.compact_revision,
-        }))
+        });
+        status["quorum_reply_index"] = self.quorum_reply_index.into();
+        Ok(status)
     }
 }

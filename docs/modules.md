@@ -15,6 +15,8 @@ The CLI and embedded API share the same lifecycle and runtime paths.
 | `node/log` and `node/cache` | Isolate disk work and bound retained log memory |
 | `node/schedule` | Dispatch state work and publish completed apply positions |
 | `node/apply` | Apply committed entries in order and group ordinary puts |
+| `node/quorum_put` | Prepare exact Put results after quorum commit |
+| `state/checkpoint` | Merge bounded row changes into a complete checkpoint |
 | `node/read` | Confirm Safe ReadIndex and reject obsolete proofs |
 | `node/read/executor` | Run bounded reads on immutable applied views |
 | `node/lease` | Schedule leader lease expiry from replicated generations |
@@ -32,7 +34,7 @@ The CLI and embedded API share the same lifecycle and runtime paths.
 Domain modules extend the same StateMachine. They do not add independent mutable state owners.
 The read view contains immutable metadata and a pinned SlateDB snapshot.
 Only completed apply work can publish a new view.
-Views share unchanged Auth and Lease maps.
+Views share unchanged Auth and Lease maps. Apply completions also share membership metadata.
 Their mutation paths copy retained maps before changing them.
 
 ## Request paths
@@ -41,7 +43,8 @@ A write enters gRPC, passes admission, and becomes a Raft command.
 The leader replicates it. The apply worker waits for quorum commit and durable local entries.
 Compatible consecutive puts share one storage batch. Each request keeps its own revision and result.
 Transactions, Lease, Auth, membership, compaction, and snapshots form batch boundaries.
-The owner returns success after apply completion.
+A leader can return ordinary Put results after a durable quorum commits them.
+The prepared changes stay in memory until the local log covers their publication.
 
 A linearizable read first obtains a Safe ReadIndex proof.
 The owner waits for local apply to cover that index, then captures the current immutable view.
@@ -49,7 +52,7 @@ A read task evaluates the request. The owner checks the proof again before retur
 Serializable reads use a local view without a quorum proof.
 Watch and administrative scans still use the apply owner.
 
-A checkpoint pins one applied prefix. The builder flushes and encodes that view outside Raft.
+A checkpoint freezes one applied prefix. The builder flushes and encodes that prefix outside Raft.
 The log worker saves the snapshot and truncates its covered entries in one synced batch.
 Restart installs a newer durable snapshot, then replays the remaining committed entries.
 

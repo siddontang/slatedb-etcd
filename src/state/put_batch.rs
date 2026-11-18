@@ -7,9 +7,28 @@ pub(crate) struct Put<'a> {
     pub origin: u64,
 }
 
+pub(crate) struct PreparedPuts {
+    first: u64,
+    pub last: u64,
+    writes: WriteBatch,
+    revision: i64,
+    size: u64,
+    alarms: Vec<crate::proto::etcdserverpb::AlarmMember>,
+}
+
 impl StateMachine {
     /// Commit ordinary puts together. Each request keeps its own result and revision.
+    #[cfg(test)]
     pub(crate) async fn apply_puts(&mut self, puts: &[Put<'_>]) -> Result<Vec<Outcome>> {
+        let (batch, replies) = self.prepare_puts(puts).await?;
+        self.publish_puts(batch).await?;
+        Ok(replies)
+    }
+
+    pub(crate) async fn prepare_puts(
+        &self,
+        puts: &[Put<'_>],
+    ) -> Result<(PreparedPuts, Vec<Outcome>)> {
         ensure!(!puts.is_empty(), "empty put batch");
         let mut batch = WriteBatch::new();
         let mut revision = self.revision;
@@ -54,16 +73,7 @@ impl StateMachine {
                         )
                     })
                 } else {
-                    match mvcc::prepare_put(
-                        &self.db,
-                        revision,
-                        self.compact_revision,
-                        put.request,
-                        &self.leases,
-                        &batch,
-                    )
-                    .await
-                    {
+                    match mvcc::prepare_put(&self.db, revision, put.request, &batch).await {
                         Ok((reply, writes, next)) => {
                             size = writes
                                 .logical_size_after(&self.db, Some(&batch), size)
@@ -87,24 +97,44 @@ impl StateMachine {
         }
         let last = puts.last().unwrap().index;
         batch.put(APPLIED, last.to_be_bytes());
-        if puts.len() > 1 {
+        Ok((
+            PreparedPuts {
+                first: puts[0].index,
+                last,
+                writes: batch,
+                revision,
+                size,
+                alarms,
+            },
+            replies,
+        ))
+    }
+
+    pub(crate) async fn publish_puts(&mut self, prepared: PreparedPuts) -> Result<()> {
+        let PreparedPuts {
+            first,
+            last,
+            writes,
+            revision,
+            size,
+            alarms,
+        } = prepared;
+        ensure!(first == self.applied + 1, "prepared puts lost their base");
+        if first < last {
             crate::failpoint::hit("apply-batch-before-write");
         }
-        self.db
-            .write_with_options(batch.into_storage(), &WriteOptions { seqnum: last })
-            .await?;
-        if puts.len() > 1 {
+        self.store_batch(writes, last).await?;
+        if first < last {
             crate::failpoint::hit("apply-batch-after-write");
         }
-        self.write_batches += 1;
         self.applied = last;
         self.revision = revision;
         self.logical_bytes = size;
         self.alarms = alarms;
-        for _ in puts {
+        for _ in first..=last {
             crate::failpoint::hit("apply-after-entry");
         }
-        Ok(replies)
+        Ok(())
     }
 }
 

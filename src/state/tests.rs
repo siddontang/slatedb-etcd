@@ -233,7 +233,7 @@ async fn streamed_snapshot_matches_the_complete_state_encoding() {
     }
     rows.push((
         crate::cluster::KEY.to_vec(),
-        serde_json::to_vec(&state.members).unwrap(),
+        serde_json::to_vec(state.members.as_ref()).unwrap(),
     ));
     assert!(rows.len() > 255);
     let expected = bincode::serialize(&SnapshotData {

@@ -39,10 +39,22 @@ impl Node {
         }
         let snapshot_index = self.raw.store().snapshot_index();
         if self.state.applied < snapshot_index {
+            // The incoming snapshot covers the prepared prefix or establishes a new base.
+            // Apply any remaining suffix through the normal committed log path.
+            self.prepared_puts.take();
             return self.submit_apply(
                 Job::Snapshot(self.raw.store().recovery_snapshot().clone()),
                 snapshot_index,
             );
+        }
+        let committed = self.raw.store().commit_index().min(self.committed_ready);
+        if let Some(batch) = &self.prepared_puts {
+            let last = batch.last;
+            if last <= committed {
+                let batch = self.prepared_puts.take().unwrap();
+                return self.submit_apply(Job::PublishPuts(batch), last);
+            }
+            return Ok(());
         }
         let checkpoint_due = (self.membership_checkpoint > snapshot_index
             && self.state.applied >= self.membership_checkpoint)
@@ -62,7 +74,6 @@ impl Node {
                 return self.submit_apply(job, self.state.applied);
             }
         }
-        let committed = self.raw.store().commit_index().min(self.committed_ready);
         if self.state.applied < committed {
             let low = self.state.applied + 1;
             let high = (low + apply::BATCH_ENTRIES).min(committed + 1);
@@ -79,6 +90,9 @@ impl Node {
             );
             self.prefer_query = true;
             return self.submit_apply(Job::Entries(entries), target);
+        }
+        if self.prepare_quorum_puts()? {
+            return Ok(());
         }
         if let Some(job) = self.next_query_job() {
             return self.submit_apply(job, self.state.applied);
@@ -110,6 +124,7 @@ impl Node {
             return self.finish_output(completed.output);
         };
         let durable = self.state.durable_applied.max(state.durable_applied);
+        let membership_changed = !std::sync::Arc::ptr_eq(&self.state.members, &state.members);
         self.state = state;
         if *self.applied_notify.borrow() != self.state.applied {
             self.applied_notify.send_replace(self.state.applied);
@@ -122,7 +137,9 @@ impl Node {
         self.finish_output(completed.output)?;
         self.raw.advance_apply_to(self.state.applied);
         self.raw.mut_store().applied_to(self.state.applied);
-        self.sync_members();
+        if membership_changed {
+            self.sync_members();
+        }
         Ok(())
     }
 
@@ -132,6 +149,12 @@ impl Node {
                 for read in reads {
                     self.finish_output(read)?;
                 }
+            }
+            Output::PreparedPuts(batch, replies) => {
+                self.quorum_reply_index = batch.last;
+                self.prepared_puts = Some(batch);
+                self.expire_pending();
+                self.finish_output(Output::Entries(replies))?;
             }
             Output::Entries(replies) => {
                 for command in replies {

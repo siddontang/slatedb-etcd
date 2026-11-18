@@ -20,8 +20,9 @@ Vote and append acknowledgements wait for their dependent writes.
 The node writes commit progress before applying entries. Commit-only updates need no device sync.
 This follows Raft's persistence rule, which requires stable entries, terms, and votes.
 
-The leader replies only after quorum commit and local apply. Followers apply the same committed
-commands in order. Consecutive ordinary puts can share one SlateDB write.
+The leader returns a computed result after quorum commit. Followers apply the same prefix.
+An ordinary Put can use the bounded preparation path in the [Raft design](architecture.md).
+Consecutive ordinary puts can share one SlateDB write.
 Each request retains its own etcd revision, Watch events, quota result, and response.
 The batch stores its final `meta/applied` marker with all mutations.
 The SlateDB sequence is that final Raft index. Even an empty Raft entry advances the apply marker.
@@ -44,8 +45,8 @@ Regressions check cross-engine values and count the underlying sync calls.
 
 For a checkpoint, the node:
 
-1. Pins a SlateDB snapshot at the current applied index.
-2. Flushes SlateDB and streams that pinned view into one output buffer in a background task.
+1. Freezes tracked changes at the applied index or pins a full SlateDB scan.
+2. Flushes SlateDB and builds a complete snapshot from the prior image or the pinned scan.
 3. Saves the snapshot and log truncation command in one synchronous raft-engine batch.
 4. Calls raft-engine's purge routine to reclaim obsolete files.
 
@@ -79,7 +80,7 @@ The Raft owner stages and replicates entries. A dedicated thread persists them i
 One apply task owns SlateDB.
 The standalone server defaults to two async workers. `--runtime-workers` can change this count.
 Embedded servers use their caller's runtime.
-Only worker completion advances `applied_index` or permits a successful write response.
+Only a completed state write advances `applied_index`. Quorum Put preparation is memory-only.
 Committed work stays in the durable log until the worker can accept it.
 A batch has at most 32 entries and a 512 KiB target. One larger entry can exceed the byte target.
 The worker also handles Watch scans, snapshot installation, and checkpoint pins.

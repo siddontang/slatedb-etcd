@@ -470,7 +470,7 @@ async fn dropping_the_node_cancels_an_active_worker() {
     .unwrap();
 }
 
-async fn leader_node(dir: &std::path::Path) -> Node {
+pub(super) async fn leader_node(dir: &std::path::Path) -> Node {
     seed_log(dir, 1);
     let (events, _) = mpsc::channel(256);
     let mut node = Node::open_with_transport(options(dir), events, Some(BTreeMap::new()))
@@ -504,7 +504,7 @@ async fn leader_node(dir: &std::path::Path) -> Node {
     node
 }
 
-fn range_request() -> RequestOp {
+pub(super) fn range_request() -> RequestOp {
     RequestOp {
         request: Some(
             crate::proto::etcdserverpb::request_op::Request::RequestRange(
