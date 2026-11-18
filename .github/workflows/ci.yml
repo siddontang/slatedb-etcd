@@ -205,6 +205,14 @@ jobs:
             --baseline-binary tmp/performance/base --rate 1000 --concurrency 32 --read-percent 0 \
             --requests 6000 --keys 1000 --value-size 256 --warmup 200 --repeat 3 \
             --output results/ci/benchmark-paced.json
+      - name: Compare binary and metadata writes
+        run: |
+          for pattern in binary metadata; do
+            python3 scripts/benchmark-etcd.py --binary tmp/performance/head \
+              --baseline-binary tmp/performance/base --concurrency 32 --read-percent 0 \
+              --value-pattern "$pattern" --requests 12000 --keys 1000 --value-size 256 \
+              --warmup 200 --repeat 3 --output "results/ci/benchmark-$pattern.json"
+          done
       - name: Sample Linux CPU stacks after warmup
         run: |
           for backend in base head; do

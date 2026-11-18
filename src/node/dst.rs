@@ -530,6 +530,8 @@ impl Simulation {
         assert!(index > 0);
         // Keep a synced local image pending while Raft processes more messages.
         let dir = self.root.path().join(id.to_string()).join("raft");
+        let file = dir.join(format!("checkpoint-{index:016x}.data"));
+        assert!(std::fs::metadata(file).unwrap().len() < saved.data.len() as u64);
         let staged = PreparedCheckpoint::write(&dir, saved.data.clone()).unwrap();
         self.read().await;
         self.drive().await;
@@ -962,6 +964,14 @@ impl Simulation {
         self.paused_apply = Some(leader);
         let before = self.nodes[&leader].state.write_batches;
         let mut replies = vec![];
+        // Keep one large value through Watch replay, compaction, and checkpoint recovery.
+        let batch_value = |index: usize| {
+            if index == 15 {
+                vec![b'v'; 64 * 1024]
+            } else {
+                format!("v{index}").into_bytes()
+            }
+        };
         for index in 0..16 {
             let (tx, rx) = oneshot::channel();
             self.nodes
@@ -974,7 +984,7 @@ impl Simulation {
                         etcd: RequestOp {
                             request: Some(Op::RequestPut(PutRequest {
                                 key: b"batch-key".to_vec(),
-                                value: format!("v{index}").into_bytes(),
+                                value: batch_value(index),
                                 prev_kv: true,
                                 ..Default::default()
                             })),
@@ -1008,7 +1018,7 @@ impl Simulation {
             );
             assert_eq!(
                 value.prev_kv.map(|kv| kv.value),
-                offset.checked_sub(1).map(|i| format!("v{i}").into_bytes())
+                offset.checked_sub(1).map(batch_value)
             );
         }
         self.paused_reads = None;
@@ -1052,7 +1062,7 @@ impl Simulation {
             for (offset, event) in events.iter().enumerate() {
                 let kv = event.kv.as_ref().unwrap();
                 assert_eq!(kv.mod_revision, old_revision + offset as i64 + 1);
-                assert_eq!(kv.value, format!("v{offset}").as_bytes());
+                assert_eq!(kv.value, batch_value(offset));
             }
             assert_eq!(
                 state.logical_size(),

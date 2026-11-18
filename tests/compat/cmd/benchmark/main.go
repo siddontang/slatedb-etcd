@@ -60,6 +60,7 @@ func main() {
 	rate := flag.Int("rate", 0, "Target operations per second during measurement; zero runs at capacity")
 	reads := flag.Int("read-percent", 50, "Linearizable read percentage")
 	keys := flag.Int("keys", 1000, "Preloaded keys")
+	pattern := flag.String("value-pattern", "repeat", "Value pattern: repeat, binary, or metadata")
 	size := flag.Int("value-size", 256, "Value size in bytes")
 	warmup := flag.Int("warmup", 100, "Unmeasured operations after preload")
 	seed := flag.Uint64("seed", 42, "Deterministic workload seed")
@@ -91,10 +92,14 @@ func main() {
 			time.Sleep(25 * time.Millisecond)
 		}
 	}
-	value := strings.Repeat("v", *size)
+	values, err := makeValues(*pattern, *size, *keys+*requests+*warmup)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 	for i := 0; i < *keys; i++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		_, err := client.Put(ctx, fmt.Sprintf("bench/%08d", i), value)
+		_, err := client.Put(ctx, fmt.Sprintf("bench/%08d", i), values[i%len(values)])
 		cancel()
 		if err != nil {
 			panic(err)
@@ -102,7 +107,12 @@ func main() {
 	}
 	isRead := func(i int) bool { return mix(uint64(i)^*seed)%100 < uint64(*reads) }
 	operation := func(i int) error {
-		key := fmt.Sprintf("bench/%08d", mix(uint64(i)^*seed^0x51ed270b)%uint64(*keys))
+		keyIndex := int(mix(uint64(i)^*seed^0x51ed270b) % uint64(*keys))
+		key := fmt.Sprintf("bench/%08d", keyIndex)
+		value := values[keyIndex%len(values)]
+		if *reads == 0 {
+			value = values[(*keys+i)%len(values)]
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if isRead(i) {
@@ -180,7 +190,7 @@ func main() {
 	report := map[string]any{"passed": len(samples) == *requests, "requests": *requests,
 		"successes": len(samples), "errors": errors, "concurrency": *concurrency,
 		"read_percent": *reads, "read_requests": readCount, "write_requests": *requests - readCount,
-		"keys": *keys, "value_bytes": *size, "warmup_operations": *warmup, "seed": *seed, "target_ops_per_second": *rate,
+		"keys": *keys, "value_bytes": *size, "value_pattern": *pattern, "warmup_operations": *warmup, "seed": *seed, "target_ops_per_second": *rate,
 		"seconds": elapsed, "successful_ops_per_second": float64(len(samples)) / elapsed,
 		"latency_ms": percentiles(samples), "read_latency_ms": percentiles(getSamples),
 		"write_latency_ms": percentiles(putSamples),
