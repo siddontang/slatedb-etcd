@@ -15,6 +15,10 @@ fn key(revision: i64) -> Vec<u8> {
 
 pub fn record(revision: i64, events: Vec<Event>, batch: &mut WriteBatch) {
     crate::state::maintenance::record_hash(revision, &events, batch);
+    record_journal(revision, events, batch);
+}
+
+pub(crate) fn record_journal(revision: i64, events: Vec<Event>, batch: &mut WriteBatch) {
     if !events.is_empty() {
         batch.put_new(
             key(revision),

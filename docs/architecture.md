@@ -311,6 +311,9 @@ Apply cannot select entries from a cache prefix that the new snapshot removed.
 
 ## State write groups
 
+Ordinary puts share one immutable encoded value between the current row and the HashKV index.
+History and Watch keep their own records. Both indexes count their full logical size for quota.
+
 The apply worker groups ordinary unleased puts within its 32-entry, 512 KiB job target.
 One large entry can exceed the byte target. The pending log limit still bounds that entry.
 Each request reads earlier puts from a temporary overlay and retains its own etcd revision.

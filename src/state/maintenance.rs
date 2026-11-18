@@ -282,20 +282,31 @@ pub(crate) fn record_hash(
     batch: &mut WriteBatch,
 ) {
     for (sub, event) in events.iter().enumerate() {
-        let mut key = HASH.to_vec();
-        key.extend_from_slice(&revision.to_be_bytes());
-        key.push(b'_');
-        key.extend_from_slice(&(sub as i64).to_be_bytes());
-        let mut kv = event.kv.clone().unwrap();
-        if event.r#type == 1 {
-            key.push(b't');
-            kv = crate::proto::mvccpb::KeyValue {
-                key: kv.key,
+        let kv = event.kv.as_ref().unwrap();
+        let deleted = event.r#type == 1;
+        let value = if deleted {
+            crate::proto::mvccpb::KeyValue {
+                key: kv.key.clone(),
                 ..Default::default()
-            };
-        }
-        batch.put_new(key, kv.encode_to_vec());
+            }
+            .encode_to_vec()
+        } else {
+            kv.encode_to_vec()
+        };
+        batch.put_new(hash_key(revision, sub as i64, deleted), value);
     }
+}
+
+pub(crate) fn hash_key(revision: i64, sub: i64, deleted: bool) -> Vec<u8> {
+    let mut key = Vec::with_capacity(HASH.len() + 18);
+    key.extend_from_slice(HASH);
+    key.extend_from_slice(&revision.to_be_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&sub.to_be_bytes());
+    if deleted {
+        key.push(b't');
+    }
+    key
 }
 
 pub(crate) async fn compact_hash(
