@@ -23,19 +23,17 @@ impl Delta {
         }
     }
 
-    pub(super) fn record(&mut self, batch: WriteBatch) -> bool {
-        for (key, value) in batch.into_rows() {
-            if key == crate::cluster::KEY {
-                continue;
-            }
-            self.charged = self
-                .charged
-                .saturating_add(key.len() + value.as_ref().map_or(0, Bytes::len) + ROW_OVERHEAD);
-            if self.charged > DELTA_BYTES {
-                return false;
-            }
-            self.rows.insert(key, value);
+    pub(super) fn record(&mut self, key: Bytes, value: Option<Bytes>) -> bool {
+        if key == crate::cluster::KEY {
+            return true;
         }
+        self.charged = self
+            .charged
+            .saturating_add(key.len() + value.as_ref().map_or(0, Bytes::len) + ROW_OVERHEAD);
+        if self.charged > DELTA_BYTES {
+            return false;
+        }
+        self.rows.insert(key, value);
         true
     }
 
@@ -174,9 +172,10 @@ mod tests {
     fn dropping_a_delta_at_its_limit_bounds_repeated_writes() {
         let mut delta = Delta::new(7);
         for i in 0..9 {
-            let mut batch = WriteBatch::new();
-            batch.put(b"key", vec![1; 1024 * 1024]);
-            if !delta.record(batch) {
+            if !delta.record(
+                Bytes::from_static(b"key"),
+                Some(vec![1; 1024 * 1024].into()),
+            ) {
                 assert_eq!(i, 7);
                 return;
             }

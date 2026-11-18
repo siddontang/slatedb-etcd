@@ -23,7 +23,7 @@ func TestFailpointRecovery(t *testing.T) {
 		"raft-before-advance", "raft-before-leader-send", "raft-before-follower-send",
 		"snapshot-before-save", "snapshot-after-save", "apply-before-entry", "apply-after-entry",
 		"apply-batch-before-write", "apply-batch-after-write",
-		"checkpoint-before-save", "checkpoint-after-save", "checkpoint-after-gc",
+		"checkpoint-file-before-reference", "checkpoint-before-save", "checkpoint-after-save", "checkpoint-after-gc",
 		"snapshot-before-install", "snapshot-after-install-write", "snapshot-after-install-flush",
 		"compact-before-apply", "compact-after-apply", "watch-before-send", "lease-before-expire",
 	}

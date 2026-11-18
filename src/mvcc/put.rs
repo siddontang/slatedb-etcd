@@ -42,6 +42,7 @@ pub(crate) async fn prepare_put(
     revision: i64,
     request: &RequestOp,
     previous: &WriteBatch,
+    current: &crate::state::current::CurrentRows,
 ) -> KvResult<(ResponseOp, WriteBatch, i64)> {
     let Some(Op::RequestPut(p)) = &request.request else {
         return Err(KvError::invalid("expected an ordinary put"));
@@ -50,7 +51,10 @@ pub(crate) async fn prepare_put(
     let key = current_key(&p.key);
     let raw = match previous.get(&key) {
         Some(value) => value,
-        None => db.get(&key).await.map_err(KvError::storage)?,
+        None => match current.get(&key) {
+            Some(value) => Some(value),
+            None => db.get(&key).await.map_err(KvError::storage)?,
+        },
     };
     let old_len = raw.as_ref().map(|v| v.len());
     let old = raw
@@ -104,10 +108,15 @@ mod tests {
                 ..Default::default()
             })),
         };
-        let (_, batch, revision) =
-            prepare_put(&state.db, state.revision, &request, &WriteBatch::new())
-                .await
-                .unwrap();
+        let (_, batch, revision) = prepare_put(
+            &state.db,
+            state.revision,
+            &request,
+            &WriteBatch::new(),
+            &state.current,
+        )
+        .await
+        .unwrap();
         let current = batch.get(&current_key(b"key")).unwrap().unwrap();
         let hash = batch
             .get(&crate::state::maintenance::hash_key(revision, 0, false))

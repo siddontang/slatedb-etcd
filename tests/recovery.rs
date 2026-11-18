@@ -269,3 +269,45 @@ async fn background_snapshot_excludes_later_writes() {
         Some("after")
     );
 }
+
+#[test]
+fn checkpoint_recovery_requires_the_referenced_bytes_and_discards_only_orphans() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let current = root.join("checkpoint-0000000000000002.data");
+    let older = root.join("checkpoint-0000000000000001.data");
+    let future = root.join("checkpoint-0000000000000003.data");
+    let pending = root.join("checkpoint.pending");
+    let unrelated = root.join("checkpoint-manual.data");
+    {
+        let mut store = storage(root);
+        let hs = HardState {
+            term: 1,
+            vote: 1,
+            commit: 2,
+            ..Default::default()
+        };
+        store
+            .persist(&[entry(1, 1), entry(2, 1)], Some(&hs), None)
+            .unwrap();
+        store.checkpoint(1, b"old".to_vec()).unwrap();
+        store.checkpoint(2, b"new".to_vec()).unwrap();
+        assert!(!older.exists());
+    }
+    for path in [&older, &future, &pending, &unrelated] {
+        std::fs::write(path, b"orphan").unwrap();
+    }
+    for bad in [Some(b"bad".as_slice()), Some(b"shorter".as_slice()), None] {
+        match bad {
+            Some(data) => std::fs::write(&current, data).unwrap(),
+            None => std::fs::remove_file(&current).unwrap(),
+        }
+        assert!(RaftStorage::open(root, 1, "test", vec![1, 2, 3]).is_err());
+        assert!(older.exists() && future.exists());
+    }
+    std::fs::write(&current, b"new").unwrap();
+    let store = storage(root);
+    assert_eq!(store.recovery_snapshot().data.as_ref(), b"new");
+    assert!(current.exists() && unrelated.exists());
+    assert!(!older.exists() && !future.exists() && !pending.exists());
+}

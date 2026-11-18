@@ -349,13 +349,15 @@ snapshot and merges replacements and deletes. It writes a complete, independentl
 The apply owner charges keys, values, and 128 bytes per change against an 8 MiB tracking budget.
 Overflow, restart, or installation of a new snapshot selects a fresh pinned scan.
 One frozen change set and one active change set can coexist. The builder also needs output space.
-The log worker saves the snapshot and truncates its covered log prefix in one synchronous batch.
-Only then can raft-engine reclaim obsolete log files.
+The WAL worker writes a separate checkpoint file, syncs it, renames it, and syncs its directory.
+One synced WAL batch publishes its index, size, CRC32C, and metadata with log truncation.
+The worker can then retire the previous file and reclaim covered WAL segments.
+On restart, the worker verifies the referenced file before removing unpublished or retired files.
 
-The current snapshot includes all logical state and duplicates that data in raft-engine.
+The local checkpoint and the peer snapshot contain the full logical state.
 The peer transport has a 64 MiB limit. Large deployments need a different transfer design.
 
-On receipt, persist a remote snapshot in raft-engine before installing it in SlateDB.
+On receipt, persist the file and its WAL reference before installing the snapshot in SlateDB.
 The worker must install it before applying later entries.
 An older active batch can finish before installation, but it must not move state past the snapshot.
 Status must distinguish durable snapshot receipt from completed state installation.

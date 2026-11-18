@@ -195,3 +195,6 @@ Use process histories with the etcd model and Jepsen checks before merging.
 [etcd WAL]: https://github.com/etcd-io/etcd/blob/v3.6.5/server/storage/wal/wal.go
 [etcd Raft loop]: https://github.com/etcd-io/etcd/blob/v3.6.5/server/etcdserver/raft.go
 [etcd read path]: https://github.com/etcd-io/etcd/blob/v3.6.5/server/etcdserver/v3_server.go
+
+The [Linux write measurements](../results/performance/linux-write-stages.md) cover stage wakes,
+allocation requests, and a linked io_uring write and sync experiment.

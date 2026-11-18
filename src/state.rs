@@ -19,6 +19,7 @@ mod auth;
 mod backup;
 mod checkpoint;
 mod cluster;
+pub(crate) mod current;
 mod diagnostic;
 mod kv;
 mod lease;
@@ -48,6 +49,7 @@ pub struct StateMachine {
     pub(crate) admin: Arc<slatedb::admin::Admin>,
     pub quota: u64,
     logical_bytes: u64,
+    pub(crate) current: current::CurrentRows,
     checkpoint_delta: Option<checkpoint::Delta>,
     pub(crate) write_batches: u64,
     pub alarms: Vec<crate::proto::etcdserverpb::AlarmMember>,
@@ -132,6 +134,7 @@ impl StateMachine {
                 admin: Arc::new(admin),
                 metrics: Arc::new(crate::metrics::StateMeters::new()?),
                 quota: 0,
+                current: current::CurrentRows::default(),
                 checkpoint_delta: None,
                 logical_bytes: maintenance::count_logical_size(&db).await?,
                 write_batches: 0,
@@ -166,9 +169,12 @@ impl StateMachine {
             .write_with_options(batch.to_storage(), &WriteOptions { seqnum: index })
             .await?;
         self.write_batches += 1;
-        if let Some(delta) = &mut self.checkpoint_delta {
-            if !delta.record(batch) {
-                self.checkpoint_delta = None;
+        for (key, value) in batch.into_rows() {
+            self.current.publish(&key, value.as_ref());
+            if let Some(delta) = &mut self.checkpoint_delta {
+                if !delta.record(key, value) {
+                    self.checkpoint_delta = None;
+                }
             }
         }
         Ok(())
