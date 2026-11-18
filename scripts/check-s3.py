@@ -48,6 +48,26 @@ def create_bucket(endpoint, bucket, access, secret):
         assert response.status == 200
 
 
+def wait_for_bucket(process, endpoint, bucket, access, secret):
+    """Start tests after the local S3 service accepts a signed write."""
+    deadline = time.monotonic() + 20
+    while process.poll() is None:
+        try:
+            create_bucket(endpoint, bucket, access, secret)
+            return
+        except urllib.error.HTTPError as error:
+            error.close()
+            if error.code != 503:
+                raise
+        except urllib.error.URLError as error:
+            if not isinstance(error.reason, ConnectionRefusedError):
+                raise
+        if time.monotonic() >= deadline:
+            raise RuntimeError("MinIO did not accept the test bucket before the deadline")
+        time.sleep(0.1)
+    raise RuntimeError("MinIO exited before it accepted the test bucket")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "results/s3-recovery.json")
@@ -74,17 +94,7 @@ def main():
                                        env=dict(os.environ, MINIO_ROOT_USER=access,
                                                 MINIO_ROOT_PASSWORD=secret, MINIO_BROWSER="off"))
             try:
-                for _ in range(200):
-                    if process.poll() is not None:
-                        raise RuntimeError("MinIO exited before it became ready")
-                    try:
-                        with urllib.request.urlopen(endpoint + "/minio/health/live", timeout=1):
-                            break
-                    except (OSError, urllib.error.URLError):
-                        time.sleep(0.1)
-                else:
-                    raise RuntimeError("MinIO startup timed out")
-                create_bucket(endpoint, bucket, access, secret)
+                wait_for_bucket(process, endpoint, bucket, access, secret)
                 env = dict(os.environ, AWS_ACCESS_KEY_ID=access, AWS_SECRET_ACCESS_KEY=secret,
                            SLATEDB_S3_TEST_ENDPOINT=endpoint, SLATEDB_S3_TEST_BUCKET=bucket)
                 env.pop("AWS_SESSION_TOKEN", None)
