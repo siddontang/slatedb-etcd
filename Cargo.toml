@@ -20,7 +20,7 @@ jsonwebtoken = "9"
 clap = { version = "4", features = ["derive"] }
 protobuf = "2.28"
 raft = { version = "0.7", default-features = false, features = ["protobuf-codec"] }
-raft-engine = { version = "0.4", default-features = false }
+raft-engine = { path = "third_party/raft-engine", version = "0.4.2", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -50,6 +50,3 @@ tonic-build = "0.12"
 async-trait = "0.1"
 futures = "0.3"
 tempfile = "3"
-
-[patch.crates-io]
-raft-engine = { path = "third_party/raft-engine" }

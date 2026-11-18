@@ -2,7 +2,8 @@
 
 This directory contains the runtime, examples, and tests from the published `raft-engine` 0.4.2
 crate.
-Cargo selects this copy through `[patch.crates-io]`. It keeps the 0.4.2 storage format and API.
+Cargo selects this copy through a direct path dependency. It keeps the 0.4.2 storage format and API.
+This selection also applies when another program embeds the service as a dependency.
 The original [README](README.upstream) and [Apache-2.0 license](LICENSE) remain here.
 
 The crate archive has SHA-256:
