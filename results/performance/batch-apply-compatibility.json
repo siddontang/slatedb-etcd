@@ -1,0 +1,1042 @@
+{
+  "created_at": "2026-11-18T08:57:06.287007+00:00",
+  "binary_sha256": "f234673e1be46d06b69b43bf32e563fcaa8eef86584136029b8085d6a50ca383",
+  "reference_etcd": "3.6.5",
+  "client": "go.etcd.io/etcd/client/v3 v3.6.5",
+  "go": "go version go1.25.6 darwin/arm64",
+  "deployment": "three local service processes; one embedded reference etcd",
+  "suite": "compat",
+  "command": [
+    "go",
+    "test",
+    "-mod=readonly",
+    "-json",
+    "-count=1",
+    "-timeout=30m",
+    "./..."
+  ],
+  "profile": "supported-capabilities",
+  "log": "<repo>/tmp/test-results/portable-compat-fixed.jsonl",
+  "tests": [
+    {
+      "name": "TestNativeExportPreservesExistingFile",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestNativeExportRejectsDamagedStreams/checksum",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestNativeExportRejectsDamagedStreams/truncated",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestNativeExportRejectsDamagedStreams/oversized",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestNativeExportRejectsDamagedStreams/read_failure",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestNativeExportRejectsDamagedStreams",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestAdminSnapshotAndPhysicalRecovery",
+      "result": "pass",
+      "seconds": 2.59
+    },
+    {
+      "name": "TestAuthLeaseAttachmentDifferential/slatedb",
+      "result": "pass",
+      "seconds": 0.33
+    },
+    {
+      "name": "TestAuthLeaseAttachmentDifferential/etcd",
+      "result": "pass",
+      "seconds": 0.24
+    },
+    {
+      "name": "TestAuthLeaseAttachmentDifferential",
+      "result": "pass",
+      "seconds": 2.84
+    },
+    {
+      "name": "TestNativeSnapshotRestore/existing-directory",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestNativeSnapshotRestore/bad-checksum",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestNativeSnapshotRestore",
+      "result": "pass",
+      "seconds": 5.79
+    },
+    {
+      "name": "TestMaintenanceAlarmDifferential/slatedb",
+      "result": "pass",
+      "seconds": 0.13
+    },
+    {
+      "name": "TestMaintenanceAlarmDifferential/etcd",
+      "result": "pass",
+      "seconds": 0.07
+    },
+    {
+      "name": "TestMaintenanceAlarmDifferential",
+      "result": "pass",
+      "seconds": 2.28
+    },
+    {
+      "name": "TestSlowApplyKeepsRaftLive",
+      "result": "pass",
+      "seconds": 3.53
+    },
+    {
+      "name": "TestCommittedApplyBacklogSurvivesRestart",
+      "result": "pass",
+      "seconds": 2.5
+    },
+    {
+      "name": "TestSnapshotApplyKeepsPeerReplicationLive",
+      "result": "pass",
+      "seconds": 4.11
+    },
+    {
+      "name": "TestAdminCompatibility",
+      "result": "pass",
+      "seconds": 1.9
+    },
+    {
+      "name": "TestDifferentialHashKV",
+      "result": "pass",
+      "seconds": 2.27
+    },
+    {
+      "name": "TestOfficialClientWorkflows/service/mutex",
+      "result": "pass",
+      "seconds": 0.43
+    },
+    {
+      "name": "TestOfficialClientWorkflows/service/election",
+      "result": "pass",
+      "seconds": 0.17
+    },
+    {
+      "name": "TestOfficialClientWorkflows/service/stm-0",
+      "result": "pass",
+      "seconds": 0.45
+    },
+    {
+      "name": "TestOfficialClientWorkflows/service/stm-1",
+      "result": "pass",
+      "seconds": 0.5
+    },
+    {
+      "name": "TestOfficialClientWorkflows/service/stm-2",
+      "result": "pass",
+      "seconds": 0.31
+    },
+    {
+      "name": "TestOfficialClientWorkflows/service",
+      "result": "pass",
+      "seconds": 3.54
+    },
+    {
+      "name": "TestOfficialClientWorkflows/etcd/mutex",
+      "result": "pass",
+      "seconds": 0.65
+    },
+    {
+      "name": "TestOfficialClientWorkflows/etcd/election",
+      "result": "pass",
+      "seconds": 0.15
+    },
+    {
+      "name": "TestOfficialClientWorkflows/etcd/stm-0",
+      "result": "pass",
+      "seconds": 0.19
+    },
+    {
+      "name": "TestOfficialClientWorkflows/etcd/stm-1",
+      "result": "pass",
+      "seconds": 0.17
+    },
+    {
+      "name": "TestOfficialClientWorkflows/etcd/stm-2",
+      "result": "pass",
+      "seconds": 0.15
+    },
+    {
+      "name": "TestOfficialClientWorkflows/etcd",
+      "result": "pass",
+      "seconds": 1.59
+    },
+    {
+      "name": "TestOfficialClientWorkflows",
+      "result": "pass",
+      "seconds": 5.13
+    },
+    {
+      "name": "TestDifferentialCompaction/negative_revision",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/initial_boundary",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/zero_revision",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/repeated_zero",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/empty_store",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialCompaction/empty_boundary_read",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/stable_key",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/first_version",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/second_version",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/delete",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/recreate",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/newer_key",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/future_revision",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/future_compact_keeps_history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/compact_middle",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/compacted_point",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/compacted_missing_key",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/compacted_count",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/boundary_point",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/boundary_range",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/stable_anchor",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/delete_history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/recreated_history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/current",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/negative_direct_read",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/negative_txn_read",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/txn_rollback",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/rollback_absent",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/inactive_compacted_branch",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/nested_boundary_read",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/repeat_boundary",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/older_boundary",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/compact_deleted_version",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/deleted_boundary_range",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/physical_compact_removes_history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/compact_current",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialCompaction/current_boundary",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction/write_after_compact",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialCompaction/read_after_compact",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialCompaction",
+      "result": "pass",
+      "seconds": 1.86
+    },
+    {
+      "name": "TestCompactionRecovery",
+      "result": "pass",
+      "seconds": 6.48
+    },
+    {
+      "name": "TestDifferentialKV/initial_revision",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/create",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/same_value_increments_version",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialKV/update_prev_kv",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/negative_revision_reads_latest",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/future_revision",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/binary_put",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/binary_get",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/empty_value",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialKV/prefix_a",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialKV/prefix_b",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialKV/prefix_c",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/prefix_limit_more",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/sort_value",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/sort_key_desc",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/sort_mod",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/keys_only",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/count_only",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/revision_filter_count",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/create_revision_filters",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/all_keys",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/range_end",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/ignore_value",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/ignore_lease",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/missing_ignore_value",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/invalid_ignore_value",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/missing_lease",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialKV/invalid_ignore_lease",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_one_revision",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialKV/txn_else",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialKV/txn_read_before_write",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/txn_read_only",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_empty",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/missing_value_compare",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/range_compare",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/nested_base_predicates",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/nested_mutually_exclusive_writes",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/nested_negative_revision",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_rollback",
+      "result": "pass",
+      "seconds": 0.03
+    },
+    {
+      "name": "TestDifferentialKV/rollback_absent",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/txn_future_revision_rollback",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/duplicate_put",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/overlapping_put_delete",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/unselected_invalid_branch",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/delete_previous",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/deleted_history",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/deleted_latest",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/delete_missing_no_revision",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/recreate_resets_version",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialKV/recreated_metadata",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/overlapping_deletes",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialKV/empty_key",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/too_many_operations",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV/final_state",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialKV",
+      "result": "pass",
+      "seconds": 2.28
+    },
+    {
+      "name": "TestFailoverAndSnapshotRecovery",
+      "result": "pass",
+      "seconds": 5.62
+    },
+    {
+      "name": "TestConcurrentCompareAndSwap",
+      "result": "pass",
+      "seconds": 4.55
+    },
+    {
+      "name": "TestPartitionReadModes",
+      "result": "pass",
+      "seconds": 4.6
+    },
+    {
+      "name": "TestClientFailoverWithTLS/client-before-failure",
+      "result": "pass",
+      "seconds": 2.78
+    },
+    {
+      "name": "TestClientFailoverWithTLS/client-after-failure",
+      "result": "pass",
+      "seconds": 2.99
+    },
+    {
+      "name": "TestClientFailoverWithTLS",
+      "result": "pass",
+      "seconds": 5.77
+    },
+    {
+      "name": "TestBoundedLogCacheRecoversLaggingFollower/delayed-read",
+      "result": "pass",
+      "seconds": 4.11
+    },
+    {
+      "name": "TestBoundedLogCacheRecoversLaggingFollower/failed-read",
+      "result": "pass",
+      "seconds": 3.47
+    },
+    {
+      "name": "TestBoundedLogCacheRecoversLaggingFollower",
+      "result": "pass",
+      "seconds": 7.57
+    },
+    {
+      "name": "TestFollowerReadIndexWaitsForLocalApply",
+      "result": "pass",
+      "seconds": 3.51
+    },
+    {
+      "name": "TestForwardedWriteWaitsForLocalApply",
+      "result": "pass",
+      "seconds": 4.53
+    },
+    {
+      "name": "TestLearnerJoinPromoteRemoveAndRecover/ThreeVoters",
+      "result": "pass",
+      "seconds": 3.6
+    },
+    {
+      "name": "TestLearnerJoinPromoteRemoveAndRecover/SingleVoterStrict",
+      "result": "pass",
+      "seconds": 4.68
+    },
+    {
+      "name": "TestLearnerJoinPromoteRemoveAndRecover",
+      "result": "pass",
+      "seconds": 8.28
+    },
+    {
+      "name": "TestSerializableMemberListDuringPartition",
+      "result": "pass",
+      "seconds": 2.1
+    },
+    {
+      "name": "TestReadIndexAndNestedReadTxnDoNotWriteLogs",
+      "result": "pass",
+      "seconds": 1.66
+    },
+    {
+      "name": "TestReadIndexRejectsMinorityLeader",
+      "result": "pass",
+      "seconds": 3.59
+    },
+    {
+      "name": "TestSlowLogKeepsRaftLiveAndFencesReplies",
+      "result": "pass",
+      "seconds": 3.64
+    },
+    {
+      "name": "TestLogWriteFailureStopsNodeAndRecoversAcknowledgedState",
+      "result": "pass",
+      "seconds": 2.1
+    },
+    {
+      "name": "TestSlowCheckpointPublicationKeepsRaftLive",
+      "result": "pass",
+      "seconds": 5.34
+    },
+    {
+      "name": "TestTLSClientAndPeer/client",
+      "result": "pass",
+      "seconds": 1.82
+    },
+    {
+      "name": "TestTLSClientAndPeer/peer",
+      "result": "pass",
+      "seconds": 1.52
+    },
+    {
+      "name": "TestTLSClientAndPeer/mutual",
+      "result": "pass",
+      "seconds": 2.23
+    },
+    {
+      "name": "TestTLSClientAndPeer",
+      "result": "pass",
+      "seconds": 5.58
+    },
+    {
+      "name": "TestTLSCertificateIdentity",
+      "result": "pass",
+      "seconds": 1.05
+    },
+    {
+      "name": "TestClientMetadataCannotImpersonate",
+      "result": "pass",
+      "seconds": 1.51
+    },
+    {
+      "name": "TestRemoteMembershipRejectsPlaintext",
+      "result": "pass",
+      "seconds": 1.51
+    },
+    {
+      "name": "TestDifferentialLease/grant",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/duplicate",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/second",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/too_large",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialLease/negative_id",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/minimum",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialLease/revoke_minimum",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialLease/attach_a",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/attach_b",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialLease/keys",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/reassign",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialLease/ignore_lease",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialLease/old_keys",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/new_keys",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/compare",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/rollback",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/rollback_absent",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/detach",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/revoke_old",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialLease/detached_survives",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/revoke_new",
+      "result": "pass",
+      "seconds": 0.02
+    },
+    {
+      "name": "TestDifferentialLease/attached_deleted",
+      "result": "pass",
+      "seconds": 0
+    },
+    {
+      "name": "TestDifferentialLease/missing_ttl",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/missing_revoke",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease/list",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestDifferentialLease",
+      "result": "pass",
+      "seconds": 1.81
+    },
+    {
+      "name": "TestDifferentialWatch/order_and_previous",
+      "result": "pass",
+      "seconds": 0.05
+    },
+    {
+      "name": "TestDifferentialWatch/no_put",
+      "result": "pass",
+      "seconds": 0.1
+    },
+    {
+      "name": "TestDifferentialWatch/no_delete",
+      "result": "pass",
+      "seconds": 0.1
+    },
+    {
+      "name": "TestDifferentialWatch/exact",
+      "result": "pass",
+      "seconds": 0.1
+    },
+    {
+      "name": "TestDifferentialWatch/range",
+      "result": "pass",
+      "seconds": 0.1
+    },
+    {
+      "name": "TestDifferentialWatch",
+      "result": "pass",
+      "seconds": 2.61
+    },
+    {
+      "name": "TestWatchCompactionUsesLocalApply",
+      "result": "pass",
+      "seconds": 1.64
+    },
+    {
+      "name": "TestWatchLeaseRestartAndSnapshot",
+      "result": "pass",
+      "seconds": 4.64
+    },
+    {
+      "name": "TestWatchStreamControls/service",
+      "result": "pass",
+      "seconds": 0.03
+    },
+    {
+      "name": "TestWatchStreamControls/etcd",
+      "result": "pass",
+      "seconds": 0.01
+    },
+    {
+      "name": "TestWatchStreamControls",
+      "result": "pass",
+      "seconds": 1.82
+    },
+    {
+      "name": "TestWatchLeaseKeepAliveAndLeaderFailure",
+      "result": "pass",
+      "seconds": 18.19
+    },
+    {
+      "name": "TestWatchLeaseMinorityCannotRenew",
+      "result": "pass",
+      "seconds": 5.18
+    },
+    {
+      "name": "TestWatchCatchupProgressAndFragmentation",
+      "result": "pass",
+      "seconds": 1.82
+    },
+    {
+      "name": "FuzzKVSequence/seed#0",
+      "result": "pass",
+      "seconds": 1.77
+    },
+    {
+      "name": "FuzzKVSequence/seed#1",
+      "result": "pass",
+      "seconds": 1.68
+    },
+    {
+      "name": "FuzzKVSequence/seed#2",
+      "result": "pass",
+      "seconds": 1.85
+    },
+    {
+      "name": "FuzzKVSequence",
+      "result": "pass",
+      "seconds": 5.31
+    }
+  ],
+  "counts": {
+    "pass": 202
+  },
+  "leaf_counts": {
+    "pass": 185
+  },
+  "passed": true,
+  "complete": true,
+  "source_commit": "ce487b2bf7d63cc9fddc97f152a7c30395c51d4b",
+  "runtime_source_commit": "c7d9661ca2716fa0faced433fe20ced3d7071359"
+}

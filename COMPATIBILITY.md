@@ -5,6 +5,9 @@ The reference server, imported common suite, model, and Go client use etcd v3.6.
 Local tests use ARM64 macOS. The PR workflow repeats validation on Linux.
 Each JSON report records its command, date, and tested binary hash.
 
+See the [read and apply report](results/performance/linux-batch-apply.md) for later runtime checks
+and Linux measurements.
+
 ## Results
 
 | Check | Result |
