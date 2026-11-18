@@ -895,3 +895,28 @@ async fn checkpoint_memory_does_not_use_the_entry_admission_budget() {
     .unwrap();
     assert!(rx.await.unwrap().unwrap_err().error.contains("backlog"));
 }
+
+#[tokio::test]
+async fn a_full_log_queue_cannot_let_apply_pass_the_ready_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_log(dir.path(), 128);
+    let (events, _) = mpsc::channel(256);
+    let mut node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    node.raw.raft.max_committed_size_per_ready = 1;
+    for _ in 0..log::MAX_JOBS - 1 {
+        node.queue_log(log::Job::Stats, None, None, vec![], vec![]);
+    }
+    node.drive_ready().await.unwrap();
+    assert_eq!(node.committed_ready, 1);
+    assert_eq!(
+        node.apply_target, 1,
+        "apply passed the bounded Ready delivery"
+    );
+    let completed = node.worker.step().await.unwrap().unwrap();
+    node.complete_apply(completed).unwrap();
+    node.drain_log().await.unwrap();
+    node.drain_apply().await.unwrap();
+    assert_eq!(node.state.applied, 128);
+}
