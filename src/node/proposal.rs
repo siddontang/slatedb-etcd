@@ -26,7 +26,11 @@ impl Node {
             let _ = response.send(Err(self.error("not leader")));
             return Ok(());
         }
-        if self.backlogged() || self.pending.len() + self.put_proposals.clients.len() >= 1024 {
+        if self.backlogged() {
+            let _ = response.send(Err(self.error("state apply backlog is full")));
+            return Ok(());
+        }
+        if self.pending.len() + self.put_proposals.clients.len() >= 1024 {
             let _ = response.send(Err(self.error("too many pending requests")));
             return Ok(());
         }

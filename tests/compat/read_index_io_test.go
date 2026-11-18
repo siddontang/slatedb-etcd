@@ -122,6 +122,8 @@ func TestSlowLogKeepsRaftLiveAndFencesReplies(t *testing.T) {
 	defer cancel()
 	_, err := api.Put(ctx, "disk", "before")
 	require.NoError(t, err)
+	_, err = api.Get(ctx, "disk")
+	require.NoError(t, err)
 	before, err := c.http(leader, "/status", nil)
 	require.NoError(t, err)
 	logFault(t, c, leader, 2500, false)

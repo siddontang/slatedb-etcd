@@ -527,6 +527,7 @@ impl Node {
                                 .members
                                 .get(&self.options.id)
                                 .is_some_and(|member| member.is_learner),
+                            leader: self.raw.raft.leader_id,
                             raft_index: self.raw.store().commit_index(),
                             raft_term: self.raw.raft.term,
                             version: "3.6.5".into(),
