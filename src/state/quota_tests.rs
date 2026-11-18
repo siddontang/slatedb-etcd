@@ -361,10 +361,10 @@ async fn append_accounting_keeps_original_absence_through_batch_rewrites() {
     let dir = tempfile::tempdir().unwrap();
     let mut state = StateMachine::open(dir.path()).await.unwrap();
     let mut batch = WriteBatch::new();
-    batch.put_new(b"etcd/new", b"temporary");
+    batch.put_new("etcd/new", "temporary");
     batch.delete(b"etcd/new");
     batch.put(b"etcd/new", b"final");
-    batch.put_new(b"etcd/deleted", b"gone");
+    batch.put_new("etcd/deleted", "gone");
     batch.delete(b"etcd/deleted");
     state.write_batch(batch, 1).await.unwrap();
     check(&state).await;

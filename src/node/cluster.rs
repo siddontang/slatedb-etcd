@@ -177,6 +177,7 @@ impl Node {
             .values()
             .filter_map(|m| m.peer_ur_ls.first().map(|url| (m.id, url.clone())))
             .collect();
+        self.forwarding.update_peers(&peers);
         if self.manual_transport {
             // DST controls the senders but uses the same membership admission checks.
             self.options.peers = peers;

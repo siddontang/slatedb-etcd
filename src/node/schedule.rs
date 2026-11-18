@@ -126,6 +126,7 @@ impl Node {
         let durable = self.state.durable_applied.max(state.durable_applied);
         let membership_changed = !std::sync::Arc::ptr_eq(&self.state.members, &state.members);
         self.state = state;
+        self.forwarding.apply(self.state.revision);
         if *self.applied_notify.borrow() != self.state.applied {
             self.applied_notify.send_replace(self.state.applied);
         }

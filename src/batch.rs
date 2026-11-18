@@ -38,12 +38,8 @@ impl WriteBatch {
     }
 
     /// Add a key that the current revision has not stored before.
-    pub(crate) fn put_new(&mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) {
-        self.change(
-            key.as_ref(),
-            Some(Bytes::copy_from_slice(value.as_ref())),
-            Original::Known(None),
-        );
+    pub(crate) fn put_new(&mut self, key: impl Into<Bytes>, value: impl Into<Bytes>) {
+        self.insert(key.into(), Some(value.into()), Original::Known(None));
     }
 
     pub fn delete(&mut self, key: impl AsRef<[u8]>) {
@@ -51,7 +47,12 @@ impl WriteBatch {
     }
 
     /// Keep the size from the MVCC lookup for quota accounting.
-    pub(crate) fn put_known(&mut self, key: Vec<u8>, value: Vec<u8>, old_len: Option<usize>) {
+    pub(crate) fn put_known(
+        &mut self,
+        key: impl Into<Bytes>,
+        value: impl Into<Bytes>,
+        old_len: Option<usize>,
+    ) {
         self.insert(key.into(), Some(value.into()), Original::Known(old_len));
     }
 
@@ -61,10 +62,12 @@ impl WriteBatch {
 
     fn insert(&mut self, key: Bytes, value: Option<Bytes>, original: Original) {
         // Keep the first mutation's knowledge of storage across later batch mutations.
-        self.changes
-            .entry(key)
-            .and_modify(|change| change.value = value.clone())
-            .or_insert(Mutation { value, original });
+        match self.changes.entry(key) {
+            std::collections::btree_map::Entry::Occupied(mut old) => old.get_mut().value = value,
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(Mutation { value, original });
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -77,10 +80,7 @@ impl WriteBatch {
 
     pub(crate) fn extend(&mut self, other: Self) {
         for (key, change) in other.changes {
-            self.changes
-                .entry(key)
-                .and_modify(|old| old.value = change.value.clone())
-                .or_insert(change);
+            self.insert(key, change.value, change.original);
         }
     }
 

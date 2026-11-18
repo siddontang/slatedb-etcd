@@ -60,9 +60,11 @@ pub(crate) async fn prepare_put(
     let next = revision + 1;
     let kv = value(p, old.as_ref(), next);
     let mut batch = WriteBatch::new();
-    batch.put_known(key, kv.encode_to_vec(), old_len);
+    let encoded = bytes::Bytes::from(kv.encode_to_vec());
+    batch.put_known(key, encoded.clone(), old_len);
+    batch.put_new(crate::state::maintenance::hash_key(next, 0, false), encoded);
     let prev_kv = if p.prev_kv { old.clone() } else { None };
-    crate::watch::record(
+    crate::watch::record_journal(
         next,
         vec![crate::proto::mvccpb::Event {
             r#type: 0,
@@ -73,7 +75,7 @@ pub(crate) async fn prepare_put(
     );
     record_version(&mut batch, p.key.clone(), Some(kv), next);
     if revision > 1 {
-        batch.put_known(REVISION.to_vec(), next.to_be_bytes().to_vec(), Some(8));
+        batch.put_known(REVISION, next.to_be_bytes().to_vec(), Some(8));
     } else {
         batch.put(REVISION, next.to_be_bytes());
     }
@@ -85,4 +87,34 @@ pub(crate) async fn prepare_put(
         batch,
         next,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ordinary_put_shares_the_current_and_hash_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::StateMachine::open(dir.path()).await.unwrap();
+        let request = RequestOp {
+            request: Some(Op::RequestPut(PutRequest {
+                key: b"key".to_vec(),
+                value: vec![b'v'; 4096],
+                ..Default::default()
+            })),
+        };
+        let (_, batch, revision) =
+            prepare_put(&state.db, state.revision, &request, &WriteBatch::new())
+                .await
+                .unwrap();
+        let current = batch.get(&current_key(b"key")).unwrap().unwrap();
+        let hash = batch
+            .get(&crate::state::maintenance::hash_key(revision, 0, false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.as_ptr(), hash.as_ptr());
+        assert_eq!(KeyValue::decode(hash).unwrap().value.len(), 4096);
+        state.close().await.unwrap();
+    }
 }

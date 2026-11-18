@@ -15,7 +15,7 @@ impl Service {
         R: Message + Default + Send + Sync + serde::Serialize + DeserializeOwned + 'static,
     {
         let channel = self.peer_channel(leader).await?;
-        let mut client = tonic::client::Grpc::new(channel.clone());
+        let mut client = tonic::client::Grpc::new(channel);
         client
             .ready()
             .await

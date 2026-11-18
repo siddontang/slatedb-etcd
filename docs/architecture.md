@@ -186,6 +186,10 @@ Unconfirmed requests retry every two Raft ticks until confirmation, cancellation
 Retries cover lost messages and reads dropped before a new leader commits its first entry.
 
 Forwarded KV results wait for local apply through the revision in the leader response.
+The follower resolves routes from its applied membership. It subscribes once per server.
+A local revision counter advances after the apply worker installs the state.
+A caught-up follower can return the result without another Raft owner event.
+If the follower lags, the owner checks the revision again and waits for apply.
 At most 64 revision waiters can wait, with a five-second timeout and client cancellation.
 Lease and Compact results still use a local ReadIndex barrier.
 Compaction can change state without increasing the MVCC revision.
@@ -306,6 +310,9 @@ Entry selection pauses until that snapshot becomes durable.
 Apply cannot select entries from a cache prefix that the new snapshot removed.
 
 ## State write groups
+
+Ordinary puts share one immutable encoded value between the current row and the HashKV index.
+History and Watch keep their own records. Both indexes count their full logical size for quota.
 
 The apply worker groups ordinary unleased puts within its 32-entry, 512 KiB job target.
 One large entry can exceed the byte target. The pending log limit still bounds that entry.

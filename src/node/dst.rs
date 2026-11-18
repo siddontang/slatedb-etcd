@@ -244,7 +244,12 @@ impl Simulation {
                     let revision = crate::mvcc::response_header(&mut result).unwrap().revision;
                     for (&id, node) in &mut self.nodes {
                         let (tx, rx) = oneshot::channel();
-                        node.wait_revision(revision, tx);
+                        if node.forwarding.subscribe().applied(revision) {
+                            assert!(node.state.revision >= revision);
+                            tx.send(Ok(Value::Null)).unwrap();
+                        } else {
+                            node.wait_revision(revision, tx);
+                        }
                         self.revisions.push(RevisionRequest {
                             node: id,
                             revision,
@@ -1063,6 +1068,7 @@ impl Simulation {
         let index = node.quorum_reply_index;
         assert!(index > node.log_worker.storage().last_index().unwrap());
         assert!(index > node.state.applied);
+        assert!(!node.forwarding.subscribe().applied(revision));
         for (&id, node) in &self.nodes {
             if id != leader {
                 assert!(node.log_worker.storage().last_index().unwrap() >= index);
