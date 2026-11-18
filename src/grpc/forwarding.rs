@@ -54,11 +54,12 @@ impl Service {
         let address = routes
             .get(&id)
             .ok_or_else(|| Status::unavailable("etcdserver: no leader"))?;
-        let mut channels = self
-            .forwarding
-            .channels
-            .lock()
-            .map_err(|_| Status::internal("peer channel lock failed"))?;
+        let cache = &self.forwarding.channels;
+        #[cfg(feature = "write-profile")]
+        let guard = crate::write_profile::Lock::Forwarding.acquire(cache);
+        #[cfg(not(feature = "write-profile"))]
+        let guard = cache.lock();
+        let mut channels = guard.map_err(|_| Status::internal("peer channel lock failed"))?;
         if let Some((old, channel)) = channels.get(&id) {
             if old == address {
                 return Ok(channel.clone());

@@ -66,6 +66,8 @@ SlateDB's garbage collector removes objects after their retention rules permit i
 Inspect alarms before retrying failed writes. A NOSPACE alarm rejects writes and lease grants.
 Deletion and compaction remain available for cleanup. Disarm the alarm after resolving the cause.
 The quota counts logical stored bytes; it does not reserve disk capacity.
+Keep the entire Raft directory, including its checkpoint data file, when moving a member.
+Older binaries reject the Raft identity after the first checkpoint in the new layout.
 Do not delete Raft log files, manifests, or individual SST objects by hand.
 Use native backups and a new cluster if storage must move.
 

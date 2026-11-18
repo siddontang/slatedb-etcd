@@ -75,7 +75,9 @@ impl StateMachine {
                         )
                     })
                 } else {
-                    match mvcc::prepare_put(&self.db, revision, put.request, &batch).await {
+                    match mvcc::prepare_put(&self.db, revision, put.request, &batch, &self.current)
+                        .await
+                    {
                         Ok((reply, writes, next)) => {
                             size = writes
                                 .logical_size_after(&self.db, Some(&batch), size)

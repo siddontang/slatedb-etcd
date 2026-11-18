@@ -20,6 +20,8 @@ pub mod state;
 pub mod storage;
 pub mod tls;
 pub mod watch;
+#[cfg(feature = "write-profile")]
+pub mod write_profile;
 
 use serde::{Deserialize, Serialize};
 

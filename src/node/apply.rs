@@ -182,6 +182,14 @@ impl Drop for Executor {
 
 impl Executor {
     async fn execute(&mut self, work: Work) -> Result<Completion> {
+        #[cfg(feature = "write-profile")]
+        match &work.job {
+            Job::Entries(entries) => crate::write_profile::Stage::Apply.batch(entries.len()),
+            Job::PublishPuts(batch) => {
+                crate::write_profile::Stage::Apply.batch((batch.last - self.state.applied) as usize)
+            }
+            _ => {}
+        }
         let changes_state = matches!(
             work.job,
             Job::Entries(_) | Job::Snapshot(_) | Job::PublishPuts(_)
@@ -344,7 +352,7 @@ impl Worker {
             };
         }
         assert!(!manual, "manual apply is only available in tests");
-        let task = tokio::spawn(async move {
+        let worker = async move {
             while let Some(work) = jobs.recv().await {
                 let result = executor.execute(work).await;
                 let failed = result.is_err();
@@ -357,7 +365,14 @@ impl Worker {
                 let _ = task.await;
             }
             executor.state.close().await
-        });
+        };
+        #[cfg(feature = "write-profile")]
+        let worker = async move {
+            crate::write_profile::Probe::new(crate::write_profile::Stage::Apply)
+                .run(worker)
+                .await
+        };
+        let task = tokio::spawn(worker);
         Self {
             database,
             work,

@@ -47,15 +47,16 @@ For a checkpoint, the node:
 
 1. Freezes tracked changes at the applied index or pins a full SlateDB scan.
 2. Flushes SlateDB and builds a complete snapshot from the prior image or the pinned scan.
-3. Saves the snapshot and log truncation command in one synchronous raft-engine batch.
-4. Calls raft-engine's purge routine to reclaim obsolete files.
+3. Writes the checkpoint file, syncs it, renames it, and syncs the parent directory.
+4. Syncs its reference, checksum, metadata, commit marker, and truncation in one WAL batch.
+5. Removes the prior file and asks raft-engine to reclaim obsolete WAL segments.
 
 The saved snapshot retains the boundary term and membership at the same applied index. On snapshot
 receipt,
 the node atomically replaces its persistent Raft state before changing SlateDB. A crash in between
 is safe: startup can repeat the state replacement from the durable snapshot payload.
 
-Full snapshots deliberately duplicate state in raft-engine. This makes recovery independent of
+The checkpoint file contains a full copy of the state. This makes recovery independent of
 uncopied local object files, but limits the PoC to small data sets. Snapshots use the peer HTTP body
 limit of 64 MiB. Snapshot creation runs in the background.
 A dedicated log I/O thread persists snapshots.

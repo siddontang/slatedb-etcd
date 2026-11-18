@@ -17,7 +17,7 @@ use crate::proto::state::Version;
 mod put;
 pub(crate) use put::prepare_put;
 
-const CURRENT: &[u8] = b"etcd/current/";
+pub(crate) const CURRENT: &[u8] = b"etcd/current/";
 const HISTORY: &[u8] = b"etcd/history/";
 pub const REVISION: &[u8] = b"etcd/revision";
 pub const COMPACT_REVISION: &[u8] = b"etcd/compact-revision";

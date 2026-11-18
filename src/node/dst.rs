@@ -521,6 +521,27 @@ impl Simulation {
         self.drive().await;
     }
 
+    async fn restart_between_checkpoint_file_and_reference(&mut self) {
+        self.checkpoint().await;
+        let id = self.choose(3) as u64 + 1;
+        let storage = self.nodes[&id].log_worker.storage();
+        let saved = storage.recovery_snapshot().clone();
+        let index = saved.get_metadata().index;
+        assert!(index > 0);
+        self.stop(id);
+        let dir = self.root.path().join(id.to_string()).join("raft");
+        let orphan = dir.join(format!("checkpoint-{:016x}.data", index + 1));
+        std::fs::write(&orphan, b"unpublished snapshot").unwrap();
+        self.start(id).await;
+        assert_eq!(
+            self.nodes[&id].log_worker.storage().recovery_snapshot(),
+            &saved
+        );
+        assert!(!orphan.exists());
+        self.trace
+            .push(format!("reject unpublished checkpoint {id} {index}"));
+    }
+
     async fn object_faults(&mut self) {
         use crate::object::faults::{FAIL_GET, FAIL_PUT, LOSE_PUT_REPLY, PAUSE_PUT};
         let id = self.choose(3) as u64 + 1;
@@ -1414,6 +1435,7 @@ impl Simulation {
         sim.batch_and_pinned_reads().await;
         sim.crash_after_quorum_reply().await;
         sim.admin_recovery().await;
+        sim.restart_between_checkpoint_file_and_reference().await;
         sim.trace.clone()
     }
 }

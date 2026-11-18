@@ -6,6 +6,7 @@ use raft::{GetEntriesContext, RaftState, Storage, StorageError};
 use raft_engine::{Command as EngineCommand, Config, Engine, LogBatch, MessageExt, ReadableSize};
 use serde::Serialize;
 
+mod checkpoint;
 mod filesystem;
 use filesystem::LogFileSystem;
 
@@ -32,6 +33,7 @@ pub struct RaftStorage {
     snapshot: Snapshot,
     identity: Vec<u8>,
     dir: PathBuf,
+    ready_batch: Option<LogBatch>,
     pub sync_writes: u64,
 }
 
@@ -56,14 +58,27 @@ impl RaftStorage {
             config,
             std::sync::Arc::new(LogFileSystem(wal_metrics.clone())),
         )?;
-        let identity = serde_json::to_vec(&(crate::STORAGE_FORMAT, node_id, cluster_id, &voters))?;
+        let identity = serde_json::to_vec(&(
+            crate::STORAGE_FORMAT,
+            node_id,
+            cluster_id,
+            &voters,
+            "checkpoint-files",
+        ))?;
         let stored = engine.get(GROUP, IDENTITY);
         let mut snapshot = engine
             .get_message::<Snapshot>(GROUP, SNAPSHOT)?
             .unwrap_or_default();
         if let Some(stored) = stored {
             ensure!(
-                stored == identity,
+                stored == identity
+                    || stored
+                        == serde_json::to_vec(&(
+                            crate::STORAGE_FORMAT,
+                            node_id,
+                            cluster_id,
+                            &voters
+                        ))?,
                 "data directory has another format, node, or cluster"
             );
         } else {
@@ -76,6 +91,7 @@ impl RaftStorage {
             batch.put_message(GROUP, SNAPSHOT.to_vec(), &snapshot)?;
             engine.write(&mut batch, true)?;
         }
+        let referenced = checkpoint::load(dir, &engine, &mut snapshot)?;
         let hard_state = engine.get_message(GROUP, HARD_STATE)?.unwrap_or_default();
         let this = Self {
             engine,
@@ -84,6 +100,7 @@ impl RaftStorage {
             snapshot,
             identity,
             dir: dir.to_owned(),
+            ready_batch: None,
             sync_writes: 0,
         };
         ensure!(
@@ -94,6 +111,7 @@ impl RaftStorage {
             this.hard_state.commit <= this.last_index()?,
             "commit exceeds durable log"
         );
+        checkpoint::remove_orphans(dir, referenced)?;
         Ok(this)
     }
 
@@ -113,7 +131,10 @@ impl RaftStorage {
             || hard_state.is_some_and(|hs| {
                 hs.term != self.hard_state.term || hs.vote != self.hard_state.vote
             });
-        let mut batch = LogBatch::default();
+        let mut batch = self
+            .ready_batch
+            .take()
+            .unwrap_or_else(|| LogBatch::with_capacity(4));
         if let Some(snapshot) = snapshot {
             ensure!(
                 snapshot.get_metadata().index > self.snapshot_index(),
@@ -122,12 +143,12 @@ impl RaftStorage {
             // Replacing a snapshot discards the old log, including its divergent suffix.
             batch.add_command(GROUP, EngineCommand::Clean);
             batch.put(GROUP, IDENTITY.to_vec(), self.identity.clone())?;
-            batch.put_message(GROUP, SNAPSHOT.to_vec(), snapshot)?;
             let hs = hard_state.context("snapshot Ready has no HardState")?;
             ensure!(
                 hs.commit >= snapshot.get_metadata().index,
                 "snapshot exceeds commit"
             );
+            checkpoint::stage(&self.dir, snapshot, &mut batch)?;
         }
         batch.add_entries::<EntryCodec>(GROUP, entries)?;
         if let Some(hs) = hard_state {
@@ -139,7 +160,10 @@ impl RaftStorage {
         if must_sync {
             crate::failpoint::hit("wal-before-sync");
         }
-        self.engine.write(&mut batch, must_sync)?;
+        let written = self.engine.write(&mut batch, must_sync)?;
+        if written <= 512 * 1024 {
+            self.ready_batch = Some(batch);
+        }
         if must_sync {
             crate::failpoint::hit("wal-after-sync");
             self.sync_writes += 1;
@@ -151,6 +175,7 @@ impl RaftStorage {
             self.hard_state = hs.clone();
         }
         if let Some(snapshot) = snapshot {
+            checkpoint::retire(&self.dir, self.snapshot_index())?;
             self.snapshot = snapshot.clone();
         }
         Ok(())
@@ -195,13 +220,15 @@ impl RaftStorage {
         snapshot.mut_metadata().set_conf_state(conf);
         snapshot.data = data.into();
         let mut batch = LogBatch::default();
-        batch.put_message(GROUP, SNAPSHOT.to_vec(), &snapshot)?;
+        checkpoint::stage(&self.dir, &snapshot, &mut batch)?;
+        batch.put(GROUP, IDENTITY.to_vec(), self.identity.clone())?;
         batch.put_message(GROUP, HARD_STATE.to_vec(), &self.hard_state)?;
         batch.add_command(GROUP, EngineCommand::Compact { index: index + 1 });
         crate::failpoint::hit("checkpoint-before-save");
         self.engine.write(&mut batch, true)?;
         crate::failpoint::hit("checkpoint-after-save");
         self.sync_writes += 1;
+        checkpoint::retire(&self.dir, self.snapshot_index())?;
         self.snapshot = snapshot;
         self.purge()?;
         crate::failpoint::hit("checkpoint-after-gc");
@@ -230,11 +257,12 @@ impl RaftStorage {
             files: vec![],
             bytes: 0,
         };
+        let data_file = checkpoint::path(&self.dir, self.snapshot_index());
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
             if entry.file_type()?.is_file() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.ends_with(".raftlog") {
+                if name.ends_with(".raftlog") || entry.path() == data_file {
                     stats.bytes += entry.metadata()?.len();
                     stats.files.push(name);
                 }
@@ -322,5 +350,47 @@ impl Storage for RaftStorage {
             return Err(StorageError::SnapshotTemporarilyUnavailable.into());
         }
         Ok(self.snapshot.clone())
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn an_inline_checkpoint_upgrades_with_the_first_file_reference() {
+        let root = tempfile::tempdir().unwrap();
+        let open = || RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
+        let store = open();
+        let old_id = serde_json::to_vec(&(crate::STORAGE_FORMAT, 1, "test", vec![1])).unwrap();
+        let mut old = store.recovery_snapshot().clone();
+        old.mut_metadata().index = 1;
+        old.mut_metadata().term = 1;
+        old.data = bytes::Bytes::from_static(b"inline");
+        let hs = HardState {
+            commit: 1,
+            term: 1,
+            ..Default::default()
+        };
+        let mut batch = LogBatch::default();
+        batch.put(GROUP, IDENTITY.to_vec(), old_id.clone()).unwrap();
+        batch.put_message(GROUP, SNAPSHOT.to_vec(), &old).unwrap();
+        batch.put_message(GROUP, HARD_STATE.to_vec(), &hs).unwrap();
+        store.engine.write(&mut batch, true).unwrap();
+        drop(store);
+        let mut store = open();
+        assert_eq!(store.recovery_snapshot(), &old);
+        let entry = Entry {
+            index: 2,
+            term: 1,
+            ..Default::default()
+        };
+        store
+            .persist(&[entry], Some(&HardState { commit: 2, ..hs }), None)
+            .unwrap();
+        store.checkpoint(2, b"separate".to_vec()).unwrap();
+        assert_ne!(store.engine.get(GROUP, IDENTITY).unwrap(), old_id);
+        drop(store);
+        assert_eq!(open().recovery_snapshot().data.as_ref(), b"separate");
     }
 }

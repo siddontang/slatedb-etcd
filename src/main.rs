@@ -1,3 +1,8 @@
+#[cfg(feature = "write-profile")]
+#[global_allocator]
+static ALLOCATOR: slatedb_etcd::write_profile::StageAllocator =
+    slatedb_etcd::write_profile::StageAllocator;
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;

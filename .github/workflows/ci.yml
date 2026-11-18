@@ -104,6 +104,7 @@ jobs:
         run: |
           cargo fmt --check
           scripts/cargo.sh clippy --locked --all-targets --all-features -- -D warnings
+          scripts/cargo.sh test --locked --features write-profile --lib write_profile::tests
           scripts/cargo.sh test --locked -- --skip seeded_fault_schedules_replay_identically
           python3 scripts/check-dst.py --seeds "$SLATEDB_DST_SEEDS" --output results/ci/dst.json
           scripts/cargo.sh build --locked --release

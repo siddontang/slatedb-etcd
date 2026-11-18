@@ -1,0 +1,23 @@
+/* Count kernel lock contention and completed futex waits for three member processes. */
+BEGIN { printf("READY\n"); }
+tracepoint:syscalls:sys_enter_futex /(pid == $1 || pid == $2 || pid == $3) && ((args->op & 127) == 0 || (args->op & 127) == 9)/ {
+    @start[tid] = nsecs;
+    @site[tid] = ustack(16);
+}
+tracepoint:syscalls:sys_exit_futex /@start[tid]/ {
+    if (args->ret == 0) {
+        @futex_waits[@site[tid]] = count();
+        @futex_us[@site[tid]] = sum((nsecs - @start[tid]) / 1000);
+    } else { @other_futex_returns[args->ret] = count(); }
+    delete(@start[tid]); delete(@site[tid]);
+}
+tracepoint:lock:contention_begin /pid == $1 || pid == $2 || pid == $3/ {
+    @kstart[tid] = nsecs;
+    @ksite[tid] = kstack(8);
+}
+tracepoint:lock:contention_end /@kstart[tid]/ {
+    @kernel_waits[@ksite[tid]] = count();
+    @kernel_us[@ksite[tid]] = sum((nsecs - @kstart[tid]) / 1000);
+    delete(@kstart[tid]); delete(@ksite[tid]);
+}
+END { clear(@start); clear(@site); clear(@kstart); clear(@ksite); }
