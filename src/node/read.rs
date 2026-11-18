@@ -170,19 +170,25 @@ impl Node {
                 }
             }
         }
-        while self
-            .read_queries
-            .front()
-            .is_some_and(|query| self.read_executor.can_submit(query))
-        {
-            let first = self.read_queries.pop_front().unwrap();
+        while self.read_executor.has_capacity() {
+            let Some(position) = self
+                .read_queries
+                .iter()
+                .position(|query| self.read_executor.can_submit(query))
+            else {
+                break;
+            };
+            let first = self.read_queries.remove(position).unwrap();
             let point = first.is_point_read();
             let mut queries = vec![first];
             while point
                 && queries.len() < apply::READ_BATCH
-                && self.read_queries.front().is_some_and(Query::is_point_read)
+                && self
+                    .read_queries
+                    .get(position)
+                    .is_some_and(Query::is_point_read)
             {
-                queries.push(self.read_queries.pop_front().unwrap());
+                queries.push(self.read_queries.remove(position).unwrap());
             }
             self.read_executor
                 .submit(self.state.read.clone(), queries, self.header());

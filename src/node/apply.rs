@@ -87,7 +87,7 @@ impl Query {
         matches!(
             &request.request,
             Some(crate::proto::etcdserverpb::request_op::Request::RequestRange(range))
-                if range.range_end.is_empty()
+                if range.range_end.is_empty() && range.revision <= 0
         )
     }
 

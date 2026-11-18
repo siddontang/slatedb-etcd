@@ -87,7 +87,8 @@ KV reads use separate bounded tasks. Diagnostic queries still receive service be
 
 The owner queues at most 64 state queries, 64 KV reads, and 64 checkpoint requests.
 At most four KV read jobs run. Each point-read job contains at most 16 requests.
-Only one range scan or read-only transaction runs at a time. Each job has a five-second deadline.
+Only one range scan, historical read, or read-only transaction runs at a time.
+Current point reads can pass queued scans. Each job has a five-second deadline.
 These bounds limit tasks and retained views, not total response bytes.
 It rejects new proposals at 1,024 committed but unapplied entries.
 Worker failure or panic stops the node. Shutdown joins reads before closing state storage.

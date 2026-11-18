@@ -176,6 +176,7 @@ The read executor evaluates the entire read-only transaction against one pinned 
 That view includes matching revision, compaction, Auth, and Lease metadata.
 Later apply and snapshot installation cannot change the selected view.
 Four read jobs can run, with at most 16 point reads per job and one wide read in total.
+Historical reads use the wide-read slot. Current point reads can pass queued wide reads.
 The queue holds at most 64 requests. Each running job has a five-second deadline.
 Shutdown stops these jobs before closing the state database.
 The owner checks the term, role, and leader identity again before returning the result.

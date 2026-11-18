@@ -145,7 +145,7 @@ async fn queued_state_reads_are_bounded_and_complete_without_raft_writes() {
 }
 
 #[tokio::test]
-async fn point_read_batches_stop_at_the_limit_and_before_a_range() {
+async fn point_read_batches_stop_before_scans_and_historical_reads() {
     use crate::proto::etcdserverpb::request_op::Request as Op;
     use crate::proto::etcdserverpb::RangeRequest;
 
@@ -167,6 +167,7 @@ async fn point_read_batches_stop_at_the_limit_and_before_a_range() {
                         vec![]
                     },
                     serializable: true,
+                    revision: i64::from(index == apply::READ_BATCH + 6),
                     ..Default::default()
                 })),
             },
@@ -175,7 +176,7 @@ async fn point_read_batches_stop_at_the_limit_and_before_a_range() {
         ));
         replies.push(rx);
     }
-    for count in [apply::READ_BATCH, 4, 1, 2] {
+    for count in [apply::READ_BATCH, 4, 1, 1, 1] {
         node.drive_ready().await.unwrap();
         let completion = node.read_executor.step().await.unwrap().unwrap();
         match &completion {
@@ -190,6 +191,44 @@ async fn point_read_batches_stop_at_the_limit_and_before_a_range() {
         assert!(reply.await.unwrap().unwrap().result.is_ok());
     }
     assert_eq!(node.raw.store().last_index().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn waiting_scans_do_not_block_current_point_reads() {
+    use crate::proto::etcdserverpb::request_op::Request as Op;
+    use crate::proto::etcdserverpb::RangeRequest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (events, _) = mpsc::channel(256);
+    let mut node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    let mut replies = vec![];
+    for revision in [1, 1, 0] {
+        let (tx, rx) = oneshot::channel();
+        node.enqueue_query(Query::Read(
+            RequestOp {
+                request: Some(Op::RequestRange(RangeRequest {
+                    key: b"key".to_vec(),
+                    revision,
+                    serializable: true,
+                    ..Default::default()
+                })),
+            },
+            None,
+            ClientResponse::Kv(tx),
+        ));
+        replies.push(rx);
+    }
+    node.drive_ready().await.unwrap();
+    assert_eq!(node.read_executor.len(), 2);
+    assert_eq!(node.read_queries.len(), 1);
+    assert!(!node.read_queries[0].is_point_read());
+    node.drain_reads().await.unwrap();
+    assert!(node.read_queries.is_empty());
+    for reply in replies {
+        assert!(reply.await.unwrap().unwrap().result.is_ok());
+    }
 }
 
 #[tokio::test]
