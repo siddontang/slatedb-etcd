@@ -1,11 +1,10 @@
 # Architecture and implementation plan
 
 This document defines the storage contract, execution model, and project roadmap.
-The baseline is commit `327c617`, which added Watch and Lease support.
-Commit `f1ff0b2` completed phase 1. Commit `3365292` added ReadIndex and separate log I/O.
-The implementation also has bounded log pools, asynchronous entry reads, and follower read barriers.
-The administration milestone adds replicated Auth, membership, alarms, and secure transport.
+The current service separates Raft, log I/O, state apply, and pinned KV reads.
+It groups ordinary Put entries and stores KV logs, history, and Watch journals as protobuf.
 Sections marked as targets describe work that is not implemented yet.
+See [module boundaries](modules.md) for the code map and change rules.
 
 ## Purpose and scope
 
@@ -88,17 +87,6 @@ SlateDB uses these logical keys:
 
 The full snapshot preserves these keys together. A checkpoint has one pinned apply boundary.
 
-## Baseline execution model
-
-At the baseline commit, one node loop owns both RawNode and StateMachine.
-That loop persists Raft updates, applies entries, reads state, and installs snapshots.
-Snapshot creation already runs in a background task after it pins an applied view.
-
-This model preserves order, but slow state work can delay Raft ticks and peer responses.
-History scans, lease key scans, compaction, and snapshot installation can all cause this delay.
-A past checkpoint stall caused leader changes during local benchmarks.
-See [the original experiment](../RESULTS.md#failure-found-during-development).
-
 ## Durability and ordering contract
 
 The service must preserve these rules across every implementation phase:
@@ -125,8 +113,9 @@ A timeout or leader change can leave a request's result unknown. There is no ret
 
 The Raft owner retains RawNode, an in-memory log view, peer transport, and pending proposals.
 A dedicated operating-system thread owns raft-engine and all steady-state log I/O.
-One apply worker owns StateMachine. State reads and mutations run through that owner.
-The worker executes committed batches, snapshot installation, local reads, and Watch scans.
+One apply worker owns StateMachine and all mutations.
+It executes committed batches, snapshot installation, diagnostic queries, and Watch scans.
+Independent KV read tasks use pinned data and matching applied metadata.
 It also pins checkpoints. A separate task builds each pinned snapshot.
 
 ```mermaid
@@ -139,19 +128,21 @@ flowchart LR
     IO -->|Durable completion| Raft
     Raft -->|Bounded work| Apply[One apply worker]
     Apply --> DB[SlateDB]
-    Apply -->|Completion and applied metadata| Raft
+    Apply -->|Completion and pinned read view| Raft
+    Raft -->|Confirmed reads| Reads[Bounded read tasks]
+    Reads -->|Pinned snapshot| DB
     Apply -->|Pinned view| Builder[Snapshot builder]
     Builder -->|Snapshot bytes| Raft
 ```
 
 The Raft owner must not wait for a full apply queue.
 It keeps the remaining committed work in the durable log and submits bounded batches.
-The implementation allows one active worker job.
-It bounds queued local reads and rejects excess requests with an explicit retryable error.
+The implementation allows one active apply job and four KV read jobs.
+It bounds queued reads and rejects excess requests with an explicit retryable error.
 It also rejects new proposals when the local apply backlog reaches its admission limit.
 Each entry batch contains at most 32 entries with a 512 KiB byte target.
 A single larger entry can exceed that byte target. Full snapshots retain the 64 MiB peer limit.
-At most 64 local queries and 64 checkpoint requests can wait at the Raft owner.
+At most 64 state queries, 64 KV reads, and 64 checkpoint requests can wait at the Raft owner.
 New proposals are rejected at 1,024 committed but unapplied entries.
 These limits bound queued work; they do not impose a total storage quota.
 
@@ -160,11 +151,11 @@ The Raft owner uses this cached metadata for status, admission, and lease schedu
 It never treats a submitted batch as completed work.
 Client replies must remain tied to proposal IDs. A role change can invalidate a pending reply.
 
-Local reads use the worker's applied state. They may lag the committed log prefix.
+Serializable KV reads use a pinned applied view. They may lag the committed log prefix.
 ReadIndex now serves linearizable Range requests and transactions that contain only reads.
 Both transaction branches must contain only reads, including nested transactions.
 Mutating transactions, Lease operations, and the diagnostic JSON API retain their log path.
-Queued reads must receive service between apply batches, so continuous writes cannot starve them.
+KV reads execute outside the apply queue. Diagnostic queries receive service between apply batches.
 
 A slow worker must delay client completion without delaying Raft heartbeats.
 Worker failure or panic must terminate the node. Shutdown must stop the worker and wait for exit.
@@ -409,7 +400,7 @@ The worker updates the counter only after SlateDB accepts the atomic batch.
 Quota reads cost O(1). Batch accounting uses K point reads for K changed logical keys.
 Startup performs one O(N) scan over N logical records.
 Snapshot replacement uses the same batch path.
-The counter adds no stored metadata. Snapshot import accepts only the current format, version 2.
+The counter adds no stored metadata. Snapshot import accepts only the current format, version 3.
 Each member uses a 64 MiB weighted Moka cache for immutable SST blocks and metadata.
 This state cache has a separate budget from Raft log memory. It has no time-based expiry.
 The weight limit covers cached entries; allocator and cache overhead can add resident memory.
@@ -481,7 +472,7 @@ The phase 1 tests cover:
 - Existing differential, upstream, fault, Jepsen, fuzz, and deterministic schedule tests.
 
 Later fault coverage must include slow and failed object writes, disk exhaustion, corruption,
-interrupted installation, clock changes, and rolling upgrades.
+interrupted installation and clock changes. Mixed binary versions are outside the current contract.
 DST should control apply completion and lease time before it claims full time determinism.
 Current DST controls log job execution and completion delivery through the real storage executor.
 It does not simulate partial sector writes, operating-system scheduling, or SlateDB background work.
@@ -505,7 +496,7 @@ Update this document when an ownership boundary, recovery rule, or roadmap phase
 
 ReadIndex batches reduce quorum messages without reusing a proof for later requests.
 Local read tracking uses integer identifiers. Each quorum proof adds the process nonce once.
-The apply worker groups up to 16 adjacent point queries without a batching timer.
+The read executor groups up to 16 adjacent point queries without a batching timer.
 Read completions omit unchanged member, Auth, and Lease metadata.
 Maintenance completions retain metadata because they can advance the durable apply index.
 The gRPC KV response path uses typed values through apply and the Raft owner.
@@ -516,7 +507,8 @@ Other mutations still read prior values. Final mutations determine the byte coun
 
 The snapshot builder captures membership with its pinned state view.
 It passes that membership with the result, so the owner does not decode the full snapshot.
-Snapshot serialization shares immutable row buffers and writes byte slices directly.
+Snapshot serialization writes rows directly into its output and releases spare buffer capacity.
+It does not retain an intermediate collection of every row.
 It still scans and encodes the full retained state. Cost grows with uncompressed history.
 
 See the [benchmark guide](benchmarks.md) for Linux CPU sampling and comparison controls.

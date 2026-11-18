@@ -34,7 +34,7 @@ impl Node {
             request: C::Publish { id, client_urls },
             credentials: crate::auth::Credentials::default(),
         };
-        let data = serde_json::to_vec(&command)?;
+        let data = command.encode()?;
         if self.raw.store().admits(
             self.raw.raft.raft_log.unstable_entries(),
             &[],

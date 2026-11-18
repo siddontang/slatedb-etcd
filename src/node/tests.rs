@@ -64,7 +64,8 @@ async fn flushed_state_recovers_a_lost_commit_marker_but_not_missing_entries() {
                     &[Entry {
                         index: 1,
                         term: 1,
-                        data: serde_json::to_vec(&RaftCommand::Legacy(command.clone()))
+                        data: RaftCommand::Diagnostic(command.clone())
+                            .encode()
                             .unwrap()
                             .into(),
                         ..Default::default()
@@ -373,7 +374,8 @@ async fn received_snapshot_fences_an_older_batch_and_later_entries() {
     append.entries.push(Entry {
         index: 201,
         term: 2,
-        data: serde_json::to_vec(&RaftCommand::Legacy(command("after")))
+        data: RaftCommand::Diagnostic(command("after"))
+            .encode()
             .unwrap()
             .into(),
         ..Default::default()

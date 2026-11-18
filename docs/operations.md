@@ -86,7 +86,9 @@ Use native backups and a new cluster if storage must move.
 
 ## Binary changes
 
-Mixed binary versions, rolling upgrades, and rolling downgrades are untested.
-Stop experiments and keep a native backup before changing a binary.
-Older binaries can lack newer Raft commands or MVCC compaction rules.
-Do not infer on-disk compatibility from the etcd API version reported by Status.
+Storage format 3 uses protobuf KV commands, MVCC history, and Watch journals.
+The Raft identity and native snapshot header require this format.
+Use fresh data directories and object prefixes for this version.
+Old directories and old native backups are not upgrade inputs. There is no format migration.
+Mixed binary versions and rolling upgrades are unsupported.
+The etcd client protocol remains separate from this internal storage format.

@@ -5,8 +5,8 @@ pub(crate) struct ReadView {
     pub snapshot: Arc<slatedb::DbSnapshot>,
     pub revision: i64,
     pub compact_revision: i64,
-    pub auth: crate::auth::Store,
-    pub leases: std::collections::BTreeMap<i64, crate::lease::LeaseRecord>,
+    pub auth: Arc<crate::auth::Store>,
+    pub leases: Arc<std::collections::BTreeMap<i64, crate::lease::LeaseRecord>>,
 }
 
 impl StateMachine {
@@ -62,6 +62,52 @@ mod tests {
     use crate::proto::etcdserverpb::request_op::Request as Op;
     use crate::proto::etcdserverpb::response_op::Response as Resp;
     use crate::proto::etcdserverpb::*;
+
+    #[tokio::test]
+    async fn pinned_read_survives_snapshot_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_dir = tempfile::tempdir().unwrap();
+        let mut state = StateMachine::open(dir.path()).await.unwrap();
+        let mut source = StateMachine::open(source_dir.path()).await.unwrap();
+        let put = |value: &[u8]| RequestOp {
+            request: Some(Op::RequestPut(PutRequest {
+                key: b"key".to_vec(),
+                value: value.to_vec(),
+                ..Default::default()
+            })),
+        };
+        state.apply_etcd(1, &put(b"old")).await.unwrap();
+        let old = state.read_view().unwrap();
+        source.apply_etcd(1, &put(b"source")).await.unwrap();
+        source.apply_etcd(2, &put(b"new")).await.unwrap();
+        let mut snapshot = Snapshot::default();
+        snapshot.mut_metadata().index = 2;
+        snapshot.data = source.snapshot_job().unwrap().await.unwrap().into();
+        state.install_snapshot(&snapshot).await.unwrap();
+        let current = state.read_view().unwrap();
+        let request = RequestOp {
+            request: Some(Op::RequestRange(RangeRequest {
+                key: b"key".to_vec(),
+                ..Default::default()
+            })),
+        };
+        for (view, revision, value) in [(old, 2, b"old"), (current, 3, b"new")] {
+            let Some(Resp::ResponseRange(reply)) = view
+                .read(&request, None)
+                .await
+                .unwrap()
+                .result
+                .unwrap()
+                .response
+            else {
+                panic!("expected range");
+            };
+            assert_eq!(reply.header.unwrap().revision, revision);
+            assert_eq!(reply.kvs[0].value, value);
+        }
+        state.close().await.unwrap();
+        source.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn pinned_reads_keep_data_revision_compaction_and_auth_together() {

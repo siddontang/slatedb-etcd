@@ -144,6 +144,8 @@ Empty profiles, unresolved user symbols, lost samples, and failed requests fail 
 
 Use `--backend etcd --binary tmp/benchmark-tools/etcd` to profile the reference process.
 Keep raw `perf.data` local. Share sanitized symbol summaries and measurement reports.
+Use `--skip-inline` if inline symbol expansion stalls.
+Flat symbols and call stacks remain available.
 Profiled latency and throughput include sampling overhead. Use separate runs for comparisons.
 Full snapshots and retained MVCC history increase cost during longer write runs.
 Check failures before comparing successful throughput or latency.

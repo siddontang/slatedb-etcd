@@ -55,7 +55,7 @@ impl RaftStorage {
             ..Config::default()
         };
         let engine = Engine::open_with_file_system(config, std::sync::Arc::new(FileSystem))?;
-        let identity = serde_json::to_vec(&(node_id, cluster_id, &voters))?;
+        let identity = serde_json::to_vec(&(crate::STORAGE_FORMAT, node_id, cluster_id, &voters))?;
         let stored = engine.get(GROUP, IDENTITY);
         let mut snapshot = engine
             .get_message::<Snapshot>(GROUP, SNAPSHOT)?
@@ -63,7 +63,7 @@ impl RaftStorage {
         if let Some(stored) = stored {
             ensure!(
                 stored == identity,
-                "data directory belongs to another node or cluster"
+                "data directory has another format, node, or cluster"
             );
         } else {
             ensure!(engine.last_index(GROUP).is_none(), "log has no identity");

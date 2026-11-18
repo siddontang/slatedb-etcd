@@ -450,7 +450,7 @@ async fn apply_entries(
             }
             EntryType::EntryConfChangeV2 => anyhow::bail!("unsupported joint configuration entry"),
         };
-        let command: RaftCommand = serde_json::from_slice(
+        let command = RaftCommand::decode(
             change
                 .as_ref()
                 .map_or(entry.data.as_ref(), |change| change.context.as_ref()),
@@ -461,7 +461,7 @@ async fn apply_entries(
                 if next.get_entry_type() != EntryType::EntryNormal || next.data.is_empty() {
                     break;
                 }
-                let command: RaftCommand = serde_json::from_slice(&next.data)?;
+                let command = RaftCommand::decode(&next.data)?;
                 if put_command(&command).is_none() {
                     break;
                 }
@@ -556,7 +556,7 @@ async fn apply_entries(
                 }
                 Reply::Encoded(serde_json::to_value(outcome)?)
             }
-            RaftCommand::Legacy(c) => Reply::Encoded(serde_json::to_value(
+            RaftCommand::Diagnostic(c) => Reply::Encoded(serde_json::to_value(
                 state.apply(entry.index, Some(c)).await?,
             )?),
             RaftCommand::Etcd { etcd, origin, .. } => {
@@ -673,7 +673,7 @@ mod tests {
             .map(|(offset, command)| Entry {
                 index: offset as u64 + 1,
                 term: 1,
-                data: serde_json::to_vec(command).unwrap().into(),
+                data: command.encode().unwrap().into(),
                 ..Default::default()
             })
             .collect();

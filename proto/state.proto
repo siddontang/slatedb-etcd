@@ -1,0 +1,15 @@
+syntax = "proto3";
+package slatedb_state;
+
+import "kv.proto";
+
+// A missing value records a deleted key at this revision.
+message Version {
+  bytes key = 1;
+  int64 revision = 2;
+  mvccpb.KeyValue value = 3;
+}
+
+message Journal {
+  repeated mvccpb.Event events = 1;
+}

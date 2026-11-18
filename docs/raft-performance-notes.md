@@ -92,7 +92,7 @@ The service keeps Safe ReadIndex and now runs bounded reads outside the apply qu
 Each read uses a pinned view that covers its confirmed index.
 The view must include matching revision, compaction, Auth, Lease, and snapshot-generation metadata.
 A snapshot cache needs invalidation and memory limits; a cached value alone is insufficient.
-This experiment addresses a remaining serialized stage without assuming a lease is valid.
+This split removes the shared apply queue without assuming a leader lease is valid.
 
 TiKV's [read amendment] can attach later requests to an earlier pending read under lease rules.
 It checks proposal time, lease state, and special request constraints.
@@ -134,6 +134,14 @@ TiKV also uses multi-group scheduling and inactive-region hibernation.
 The [region tuning guide] describes their purpose and tradeoffs.
 This project currently has one Raft group. Extra region scheduling would not address that group's
 serialized reads or full-state checkpoint cost.
+
+## Encoding and allocation work
+
+The ordinary KV log path now uses protobuf requests, as etcd does for its Raft requests.
+The service also uses protobuf for MVCC history and Watch journals.
+A point Put reads its prior value directly. History key encoding uses one allocation.
+Snapshot construction writes rows directly into the output buffer and releases spare capacity.
+These changes target allocation and parsing costs. Matched measurements determine their benefit.
 
 ## Experiment order and acceptance
 

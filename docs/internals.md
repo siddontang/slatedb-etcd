@@ -2,6 +2,15 @@
 
 This document describes the current local implementation.
 See [architecture](architecture.md) for the target design and roadmap.
+See [module boundaries](modules.md) for ownership and extension rules.
+
+## Command and state encoding
+
+The log stores a protobuf envelope. KV commands contain typed requests and optional credentials.
+Administrative commands use JSON inside the same envelope. The diagnostic HTTP API also uses JSON.
+This avoids JSON number arrays and untagged enum trials on the common replicated KV path.
+MVCC versions and Watch journals use protobuf messages. Native snapshots retain a binary envelope.
+Format 3 accepts no older data directory or snapshot. There is no migration or dual decoder.
 
 ## Commit and recovery rules
 
@@ -36,7 +45,7 @@ Regressions check cross-engine values and count the underlying sync calls.
 For a checkpoint, the node:
 
 1. Pins a SlateDB snapshot at the current applied index.
-2. Flushes SlateDB and serializes that pinned view in a background task.
+2. Flushes SlateDB and streams that pinned view into one output buffer in a background task.
 3. Saves the snapshot and log truncation command in one synchronous raft-engine batch.
 4. Calls raft-engine's purge routine to reclaim obsolete files.
 

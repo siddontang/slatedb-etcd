@@ -12,6 +12,7 @@ use crate::proto::etcdserverpb::request_op::Request as Op;
 use crate::proto::etcdserverpb::response_op::Response as Resp;
 use crate::proto::etcdserverpb::*;
 use crate::proto::mvccpb::KeyValue;
+use crate::proto::state::Version;
 
 const CURRENT: &[u8] = b"etcd/current/";
 const HISTORY: &[u8] = b"etcd/history/";
@@ -53,21 +54,17 @@ pub struct Outcome<T = ResponseOp> {
     pub result: KvResult<T>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct Version {
-    key: Vec<u8>,
-    revision: i64,
-    value: Option<KeyValue>,
-}
-
 fn current_key(key: &[u8]) -> Vec<u8> {
     [CURRENT, key].concat()
 }
 
 fn history_prefix(key: &[u8]) -> Vec<u8> {
-    let mut out = HISTORY.to_vec();
+    const HEX: &[u8] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(HISTORY.len() + key.len() * 2 + 1);
+    out.extend_from_slice(HISTORY);
     for byte in key {
-        out.extend_from_slice(format!("{byte:02x}").as_bytes());
+        out.push(HEX[(byte >> 4) as usize]);
+        out.push(HEX[(byte & 15) as usize]);
     }
     out.push(b'/');
     out
@@ -350,7 +347,7 @@ impl View<'_> {
             .await
             .map_err(KvError::storage)?;
         while let Some(row) = scan.next().await.map_err(KvError::storage)? {
-            let v: Version = bincode::deserialize(&row.value).map_err(KvError::storage)?;
+            let v = Version::decode(row.value).map_err(KvError::storage)?;
             if v.revision <= revision
                 && contains(&v.key, key, end)
                 && versions
@@ -454,7 +451,7 @@ impl View<'_> {
                         return Err(KvError::new(Code::NotFound, "requested lease not found"));
                     }
                     if (p.ignore_value || p.ignore_lease)
-                        && self.latest(&p.key, &[], false).await?.is_empty()
+                        && self.point(&p.key, false).await?.is_none()
                     {
                         return Err(KvError::invalid("key not found"));
                     }
@@ -550,7 +547,7 @@ impl View<'_> {
                     response(Resp::ResponseRange(self.range(&r).await?))
                 }
                 Plan::Op(Op::RequestPut(p)) => {
-                    let old = self.latest(&p.key, &[], true).await?.remove(&p.key);
+                    let old = self.point(&p.key, true).await?;
                     let revision = self.revision + 1;
                     let kv = KeyValue {
                         key: p.key.clone(),
@@ -733,7 +730,7 @@ async fn prepare_inner(
     let response = view.execute(plan, false).await?;
     let next = view.current_revision();
     let mut batch = WriteBatch::new();
-    crate::watch::record(next, &view.events, &mut batch)?;
+    crate::watch::record(next, view.events, &mut batch);
     for (key, value) in view.changes {
         if let Some(value) = &value {
             batch.put(current_key(&key), value.encode_to_vec());
@@ -747,10 +744,7 @@ async fn prepare_inner(
             revision: next,
             value,
         };
-        batch.put_new(
-            history_key,
-            bincode::serialize(&version).map_err(KvError::storage)?,
-        );
+        batch.put_new(history_key, version.encode_to_vec());
     }
     batch.put(REVISION, next.to_be_bytes());
     Ok((response, batch, next))
@@ -782,7 +776,7 @@ pub async fn prepare_compaction(
         .map_err(KvError::storage)?;
     let mut previous: Option<(Vec<u8>, Vec<u8>)> = None;
     while let Some(row) = scan.next().await.map_err(KvError::storage)? {
-        let version: Version = bincode::deserialize(&row.value).map_err(KvError::storage)?;
+        let version = Version::decode(row.value).map_err(KvError::storage)?;
         if version.revision <= request.revision {
             // History keys sort by user key, then by increasing revision.
             if let Some((key, history_key)) = previous.take() {
@@ -871,15 +865,15 @@ pub(crate) async fn revoke_keys(
         history_key.extend_from_slice(&next.to_be_bytes());
         batch.put_new(
             history_key,
-            bincode::serialize(&Version {
+            Version {
                 key,
                 revision: next,
                 value,
-            })
-            .map_err(KvError::storage)?,
+            }
+            .encode_to_vec(),
         );
     }
-    crate::watch::record(next, &view.events, &mut batch)?;
+    crate::watch::record(next, view.events, &mut batch);
     batch.put(REVISION, next.to_be_bytes());
     Ok((batch, next))
 }
