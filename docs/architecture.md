@@ -57,7 +57,8 @@ The diagnostic JSON API uses a separate keyspace from the etcd API.
 | Raft owner | Run elections, stage Ready, send permitted messages, and track completion |
 | Log worker | Persist Ready, fetch entries, publish snapshots, and reclaim files |
 | raft-engine | Store log entries, terms, votes, commit position, and recovery snapshots |
-| Apply owner | Execute committed entries in order and maintain state metadata |
+| Apply owner | Execute committed entries in order and publish matching read views |
+| Read executor | Evaluate bounded KV reads on pinned data and metadata |
 | SlateDB | Store current values, history, event journals, leases, and the apply marker |
 | Snapshot builder | Flush and serialize a pinned state view |
 | Object binding | Bind local identity to an exclusive S3 namespace |
@@ -105,7 +106,7 @@ The service must preserve these rules across every implementation phase:
 1. Persist terms, votes, and entries before sending dependent vote or append acknowledgements.
 2. Persist the commit position before submitting entries to the state machine.
 3. Apply a committed prefix in index order. Never apply an uncommitted entry.
-4. Store each state change and its apply marker in one SlateDB batch.
+4. Store each state change and the covered final apply marker in one SlateDB batch.
 5. Reply with write success only after quorum commit, local log persistence, and local apply.
 6. Advance RawNode's applied position only after the apply owner reports completion.
 7. Reclaim log entries only after a durable snapshot covers them.
@@ -180,7 +181,12 @@ It also requires a committed entry in the leader's current term.
 
 The owner waits for local application through that index before scheduling the state read.
 Local application already requires quorum commit and durable local entries.
-The apply worker evaluates the entire read-only transaction against one applied state view.
+The read executor evaluates the entire read-only transaction against one pinned applied view.
+That view includes matching revision, compaction, Auth, and Lease metadata.
+Later apply and snapshot installation cannot change the selected view.
+Four read jobs can run, with at most 16 point reads per job and one wide read in total.
+The queue holds at most 64 requests. Each running job has a five-second deadline.
+Shutdown stops these jobs before closing the state database.
 The owner checks the term, role, and leader identity again before returning the result.
 Leadership loss, a five-second timeout, or client cancellation removes the pending request.
 At most 64 ReadIndex requests can wait. These requests do not append log entries.
@@ -302,6 +308,19 @@ It also exposes `cached_last_log_index`, `log_busy`, queued log jobs and bytes, 
 Snapshot installation waits if the memory view contains a snapshot that is not durable yet.
 Entry selection pauses until that snapshot becomes durable.
 Apply cannot select entries from a cache prefix that the new snapshot removed.
+
+## State write groups
+
+The apply worker groups ordinary unleased puts within its 32-entry, 512 KiB job target.
+One large entry can exceed the byte target. The pending log limit still bounds that entry.
+Each request reads earlier puts from a temporary overlay and retains its own etcd revision.
+Quota accounting includes each successful request before it checks the next request.
+The storage write includes all mutations and the last covered apply marker at one SlateDB sequence.
+The owner publishes replies and the matching read view only after that write completes.
+
+Transactions, Lease changes, Auth changes, membership, compaction, and empty entries end a group.
+Puts with a lease or ignore flags also use the individual path.
+Broad transaction batching needs an overlay that also merges scans and historical reads.
 
 ## Snapshot order and recovery
 

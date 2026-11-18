@@ -57,6 +57,9 @@ peak combined server RSS, allocated local data bytes, and server binary hashes.
 Schema version 2 separates startup, preload, warmup, and measurement with client barriers.
 Both backends receive one idle second after warmup, before the measured phase.
 This reduces overlap with background work from preload. It does not stop background work.
+Service state counters are captured before and after measurement, outside resource sampling.
+`state_write_batches` resets at startup and counts all state writes, including non-Put operations.
+Use counter deltas to check whether a workload actually shared storage writes.
 CPU deltas and peak RSS cover the measured phase. RSS still includes retained preload memory.
 The report separates client resources from the sum of all server processes.
 CPU per successful operation measures work. Average CPU cores measure utilization.

@@ -45,6 +45,8 @@ WAL sync hooks run for entries, term changes, vote changes, and snapshots.
 Commit-only progress does not require a device sync. Rust tests model loss of that marker.
 Recovery requires a covering local log and rejects a state position beyond its entries.
 
+The state batch adds `apply-batch-before-write` and `apply-batch-after-write` crash boundaries.
+Repeated Put tests preserve each request's revision and Watch event across group recovery.
 The separate checkpoint cases cover before-save, after-save, and after-GC crashes.
 The snapshot cases also distinguish buffered state replacement from completed object flush.
 The S3 suite checks delayed PUT, ambiguous PUT success, HTTP failures, restart GET failure, and

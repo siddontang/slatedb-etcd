@@ -78,6 +78,10 @@ Rust tests preserve entry, term, vote, and snapshot sync barriers.
 A lost commit marker can recover from flushed state only when the local log covers that state.
 Read tests cover bounded point batches, cancelled callers, apply fences, and stale process nonces.
 DST includes point-read bursts and checks each acknowledged value after faults.
+Reads can execute while apply is paused. A retained read view also spans a 16-Put group.
+Restart checks require every Put revision and Watch event from that group.
+State tests compare grouped puts with individual writes, including repeated keys, errors, and quota.
+Native process hooks cover both sides of the combined state write.
 
 Peer stream tests use real local sockets. They check message and byte limits, malformed frames,
 cluster rejection, receipt timeout, reconnection, queued-message disposal, and snapshot results.

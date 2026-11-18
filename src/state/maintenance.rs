@@ -319,7 +319,7 @@ pub(crate) async fn compact_hash(
 }
 
 // Rebuild derived accounting when opening stored state.
-pub(super) async fn count_logical_size(db: &Db) -> Result<u64> {
+pub(crate) async fn count_logical_size(db: &Db) -> Result<u64> {
     let mut scan = db.scan_prefix(b"etcd/", ..).await?;
     let mut size = 0_u64;
     while let Some(row) = scan.next().await? {

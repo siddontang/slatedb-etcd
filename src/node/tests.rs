@@ -176,15 +176,15 @@ async fn point_read_batches_stop_at_the_limit_and_before_a_range() {
     }
     for count in [apply::READ_BATCH, 4, 1, 2] {
         node.drive_ready().await.unwrap();
-        let completion = node.worker.step().await.unwrap().unwrap();
-        match &completion.output {
+        let completion = node.read_executor.step().await.unwrap().unwrap();
+        match &completion {
             Output::Reads(reads) => assert_eq!(reads.len(), count),
             Output::Read { .. } => assert_eq!(count, 1),
             _ => panic!("expected point reads or the range boundary"),
         }
-        node.complete_apply(completion).unwrap();
+        node.complete_read(completion).unwrap();
     }
-    assert!(node.queries.is_empty());
+    assert!(node.read_queries.is_empty());
     for reply in replies {
         assert!(reply.await.unwrap().unwrap().result.is_ok());
     }
@@ -711,9 +711,9 @@ async fn read_index_waits_for_apply_and_rejects_late_results_after_term_change()
     let completed = node.worker.step().await.unwrap().unwrap();
     node.complete_apply(completed).unwrap();
     node.drive_ready().await.unwrap();
-    let read_result = node.worker.step().await.unwrap().unwrap();
+    let read_result = node.read_executor.step().await.unwrap().unwrap();
     node.raw.raft.become_follower(node.raw.raft.term + 1, 2);
-    node.complete_apply(read_result).unwrap();
+    node.complete_read(read_result).unwrap();
     assert!(reply.await.unwrap().is_err());
     assert!(node.reads.is_empty());
 }
@@ -1170,7 +1170,8 @@ async fn read_contexts_require_the_current_process_nonce_and_exact_length() {
             request_ctx: context,
         }]);
         node.schedule_reads();
-        assert!(node.queries.is_empty());
+        assert!(node.read_queries.is_empty());
+        assert_eq!(node.read_executor.len(), 0);
         assert!(result.try_recv().is_err());
     }
     node.confirm_reads(vec![raft::ReadState {
@@ -1178,5 +1179,67 @@ async fn read_contexts_require_the_current_process_nonce_and_exact_length() {
         request_ctx: valid,
     }]);
     node.schedule_reads();
-    assert_eq!(node.queries.len(), 1);
+    assert_eq!(node.read_executor.len(), 1);
+}
+
+#[tokio::test]
+async fn independent_reads_pin_their_view_and_do_not_wait_for_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_log(dir.path(), 64);
+    let (events, _) = mpsc::channel(256);
+    let mut node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    node.drive_ready().await.unwrap();
+    assert!(node.apply_busy);
+    let (tx, reply) = oneshot::channel();
+    node.enqueue_query(Query::Read(range_request(), None, ClientResponse::Kv(tx)));
+    node.drive_ready().await.unwrap();
+    let read = node.read_executor.step().await.unwrap().unwrap();
+    node.complete_read(read).unwrap();
+    assert!(reply.await.unwrap().unwrap().result.is_ok());
+    assert_eq!(node.state.applied, 0);
+    assert!(node.apply_busy);
+
+    let (tx, reply) = oneshot::channel();
+    node.enqueue_query(Query::Read(range_request(), None, ClientResponse::Kv(tx)));
+    node.drive_ready().await.unwrap();
+    let applied = node.worker.step().await.unwrap().unwrap();
+    node.complete_apply(applied).unwrap();
+    assert_eq!(node.state.applied, apply::BATCH_ENTRIES);
+    let read = node.read_executor.step().await.unwrap().unwrap();
+    node.complete_read(read).unwrap();
+    let mut result = reply.await.unwrap().unwrap().result.unwrap();
+    assert_eq!(
+        crate::mvcc::response_header(&mut result).unwrap().revision,
+        1
+    );
+}
+
+#[tokio::test]
+async fn independent_read_jobs_and_queue_have_separate_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (events, _) = mpsc::channel(256);
+    let mut node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    let mut replies = vec![];
+    for _ in 0..2 {
+        for _ in 0..apply::MAX_QUERIES {
+            let (tx, rx) = oneshot::channel();
+            node.enqueue_query(Query::Read(range_request(), None, ClientResponse::Kv(tx)));
+            replies.push(rx);
+        }
+        node.drive_ready().await.unwrap();
+    }
+    assert_eq!(node.read_executor.len(), 4);
+    assert_eq!(node.read_queries.len(), apply::MAX_QUERIES);
+    let (tx, rx) = oneshot::channel();
+    node.enqueue_query(Query::Read(range_request(), None, ClientResponse::Kv(tx)));
+    assert!(rx.await.unwrap().is_err());
+    assert!(!node.apply_busy);
+    node.drain_reads().await.unwrap();
+    for rx in replies {
+        assert!(rx.await.unwrap().unwrap().result.is_ok());
+    }
 }

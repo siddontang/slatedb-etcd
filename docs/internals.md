@@ -12,8 +12,10 @@ The node writes commit progress before applying entries. Commit-only updates nee
 This follows Raft's persistence rule, which requires stable entries, terms, and votes.
 
 The leader replies only after quorum commit and local apply. Followers apply the same committed
-commands in order. Each command updates its business keys and `meta/applied` in one SlateDB batch.
-The SlateDB sequence number is the Raft index. Even an empty Raft entry advances the apply marker.
+commands in order. Consecutive ordinary puts can share one SlateDB write.
+Each request retains its own etcd revision, Watch events, quota result, and response.
+The batch stores its final `meta/applied` marker with all mutations.
+The SlateDB sequence is that final Raft index. Even an empty Raft entry advances the apply marker.
 This index is not an etcd revision.
 
 Reads in `/kv` enter the Raft log as barriers. This provides a simple linearizable read path, but
@@ -71,12 +73,15 @@ Embedded servers use their caller's runtime.
 Only worker completion advances `applied_index` or permits a successful write response.
 Committed work stays in the durable log until the worker can accept it.
 A batch has at most 32 entries and a 512 KiB target. One larger entry can exceed the byte target.
-The worker also handles serializable reads, Watch scans, snapshot installation, and checkpoint pins.
-Local reads receive service between entry batches. They can lag the committed log prefix.
+The worker also handles Watch scans, snapshot installation, and checkpoint pins.
+KV reads use separate bounded tasks. Diagnostic queries still receive service between entry batches.
 
-The owner queues at most 64 local reads and 64 checkpoint requests.
+The owner queues at most 64 state queries, 64 KV reads, and 64 checkpoint requests.
+At most four KV read jobs run. Each point-read job contains at most 16 requests.
+Only one range scan or read-only transaction runs at a time. Each job has a five-second deadline.
+These bounds limit tasks and retained views, not total response bytes.
 It rejects new proposals at 1,024 committed but unapplied entries.
-Worker failure or panic stops the node. Shutdown cancels the worker and its snapshot builder.
+Worker failure or panic stops the node. Shutdown joins reads before closing state storage.
 The log thread performs steady-state disk I/O, file reclamation, and disk statistics.
 Apply waits for committed Ready delivery and local entry durability.
 The owner pins unapplied entries and keeps a bounded cache of applied log payloads.
@@ -101,10 +106,20 @@ A frozen batch shares one quorum context. Later requests use a new context.
 These reads do not append log entries. Unconfirmed batches retry every two Raft ticks.
 Serializable reads remain local and can return older state.
 The gRPC KV path passes typed responses internally. Diagnostic callers retain JSON responses.
-The worker groups up to 16 adjacent point reads. Other query types end a group.
-Read completions keep the apply index but do not copy member, auth, or lease metadata.
+The read executor groups up to 16 adjacent point reads. Other read types end a group.
+Each job shares a pinned SlateDB view with matching revision, compaction, Auth, and Lease metadata.
+The apply owner publishes this view after a complete state write or snapshot installation.
+A read can finish from an older view while later writes apply. Its proof must cover that view.
+Read completion does not move the apply index or copy state metadata.
 The owner still checks the read proof and apply position before it sends a response.
 Read evaluation does not construct a discarded write batch.
+
+Ordinary puts without leases or ignore flags share writes within an apply job.
+A bounded overlay lets repeated keys see earlier puts in that group.
+Transactions, leased puts, administration, compaction, and empty entries end a group.
+Quota checks use each request's updated logical size. Failed requests do not advance the revision.
+No response leaves the worker before the combined storage write completes.
+`state_write_batches` counts storage writes since startup. It includes non-Put state operations.
 
 Log work uses a FIFO queue with 64 jobs and a 16 MiB entry admission target.
 Snapshots use a separate 64 MiB target. One Ready can exceed a target.

@@ -141,6 +141,8 @@ pub struct Node {
     log_read_fail: bool,
     peer_waiters: Vec<Response>,
     built_checkpoint: Option<(u64, raft::eraftpb::ConfState, Vec<u8>)>,
+    read_executor: read::executor::Executor,
+    read_queries: VecDeque<Query>,
     reads: BTreeMap<u64, read::PendingRead>,
     revision_waiters: VecDeque<RevisionWaiter>,
     read_nonce: [u8; 16],
@@ -299,7 +301,7 @@ impl Node {
             }
             senders
         };
-        let applied = AppliedState::from(&state);
+        let applied = AppliedState::new(&state)?;
         let worker = Worker::start(state, events.clone(), manual_apply);
         let log_worker = log::Worker::start(storage, manual_apply)?;
         let mut node = Self {
@@ -323,6 +325,8 @@ impl Node {
             log_read_fail: false,
             peer_waiters: vec![],
             built_checkpoint: None,
+            read_executor: read::executor::Executor::new(manual_apply),
+            read_queries: VecDeque::new(),
             reads: BTreeMap::new(),
             revision_waiters: VecDeque::new(),
             read_nonce: *uuid::Uuid::new_v4().as_bytes(),
@@ -369,6 +373,7 @@ impl Node {
         };
         self.transports.shutdown().await;
         // Keep the Raft directory locked until the state worker has stopped.
+        self.read_executor.shutdown().await;
         let apply = self.worker.shutdown().await;
         let log = self.log_worker.shutdown().await;
         result.and(apply).and(log)
@@ -390,6 +395,9 @@ impl Node {
                 _ = ticks.tick() => { self.raw.tick(); self.retry_reads(); self.expire_leases()?; self.publish_member()?; }
                 persisted = self.log_worker.next() => { self.complete_log(persisted?)?; }
                 completed = self.worker.next() => { self.complete_apply(completed?)?; }
+                read = self.read_executor.next(), if self.read_executor.len() > 0 => {
+                    self.complete_read(read?)?;
+                }
                 event = events.recv() => {
                     let Some(event) = event else { return Ok(()); };
                     self.handle(event, &mut step_responses).await?;
@@ -934,6 +942,14 @@ impl Node {
     }
 
     fn enqueue_query(&mut self, query: Query) {
+        if matches!(query, Query::Read(..) | Query::Linear(..)) {
+            if self.read_queries.len() >= apply::MAX_QUERIES {
+                query.reject(self.error("too many queued reads"));
+            } else {
+                self.read_queries.push_back(query);
+            }
+            return;
+        }
         if self.queries.len() >= apply::MAX_QUERIES {
             query.reject(self.error("too many queued state reads"));
         } else {
@@ -942,17 +958,7 @@ impl Node {
     }
 
     fn next_query_job(&mut self) -> Option<Job> {
-        let query = self.queries.pop_front()?;
-        if !query.is_point_read() || !self.queries.front().is_some_and(Query::is_point_read) {
-            return Some(Job::Query(query));
-        }
-        let mut reads = vec![query];
-        while reads.len() < apply::READ_BATCH
-            && self.queries.front().is_some_and(Query::is_point_read)
-        {
-            reads.push(self.queries.pop_front().unwrap());
-        }
-        Some(Job::Reads(reads))
+        self.queries.pop_front().map(Job::Query)
     }
 
     fn submit_apply(&mut self, job: Job, target: u64) -> Result<()> {
@@ -1131,8 +1137,36 @@ impl Node {
 
     #[cfg(test)]
     async fn drain_apply(&mut self) -> Result<()> {
+        loop {
+            let mut progress = false;
+            if let Some(completed) = self.worker.step().await? {
+                self.complete_apply(completed)?;
+                progress = true;
+            }
+            if let Some(completed) = self.read_executor.step().await? {
+                self.complete_read(completed)?;
+                progress = true;
+            }
+            if !progress {
+                return Ok(());
+            }
+            self.drive_ready().await?;
+        }
+    }
+
+    #[cfg(test)]
+    async fn drain_state(&mut self) -> Result<()> {
         while let Some(completed) = self.worker.step().await? {
             self.complete_apply(completed)?;
+            self.drive_ready().await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn drain_reads(&mut self) -> Result<()> {
+        while let Some(completed) = self.read_executor.step().await? {
+            self.complete_read(completed)?;
             self.drive_ready().await?;
         }
         Ok(())
@@ -1373,7 +1407,10 @@ impl Node {
             "id": self.options.id, "cluster_id": self.options.cluster_id,
             "role": format!("{:?}", self.raw.raft.state), "leader_id": self.raw.raft.leader_id,
             "term": self.raw.raft.term, "commit_index": self.raw.store().commit_index(),
-            "applied_index": self.state.applied, "durable_applied_index": self.state.durable_applied,
+            "applied_index": self.state.applied,
+            "state_write_batches": self.state.write_batches,
+            "active_read_jobs": self.read_executor.len(), "queued_reads": self.read_queries.len(),
+            "durable_applied_index": self.state.durable_applied,
             "snapshot_index": self.raw.store().snapshot_index(),
             "first_log_index": self.raw.store().snapshot_index() + 1, "last_log_index": self.raw.store().durable.last_index,
             "sync_writes": self.raw.store().durable.sync_writes, "pending": self.pending.len(),

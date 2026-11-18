@@ -58,7 +58,7 @@ def main():
             if binary is None:
                 source = directory / "source.tar.gz"
                 with tarfile.open(source, "w:gz") as archive:
-                    for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "build.rs", "src", "proto"]:
+                    for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "build.rs", "src", "proto", "third_party"]:
                         archive.add(ROOT / name, arcname=name)
                 build = directory / "build.sh"
                 build.write_text('''#!/bin/sh

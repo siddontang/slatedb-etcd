@@ -16,6 +16,9 @@ use crate::proto::etcdserverpb::{CompactionRequest, CompactionResponse, RequestO
 use crate::{Command, Operation, Reply};
 
 mod backup;
+pub(crate) mod put_batch;
+mod read;
+pub(crate) use read::ReadView;
 pub(crate) mod maintenance;
 #[cfg(test)]
 mod quota_tests;
@@ -37,6 +40,7 @@ pub struct StateMachine {
     admin: slatedb::admin::Admin,
     pub quota: u64,
     logical_bytes: u64,
+    pub(crate) write_batches: u64,
     pub alarms: Vec<crate::proto::etcdserverpb::AlarmMember>,
     pub applied: u64,
     pub durable_applied: u64,
@@ -119,6 +123,7 @@ impl StateMachine {
                 admin,
                 quota: 0,
                 logical_bytes: maintenance::count_logical_size(&db).await?,
+                write_batches: 0,
                 alarms,
                 auth,
                 db: Arc::clone(&db),
@@ -143,6 +148,7 @@ impl StateMachine {
         self.db
             .write_with_options(batch.into_storage(), &WriteOptions { seqnum: index })
             .await?;
+        self.write_batches += 1;
         self.logical_bytes = size;
         Ok(())
     }

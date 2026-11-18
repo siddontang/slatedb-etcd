@@ -56,13 +56,37 @@ impl WriteBatch {
         self.changes.is_empty()
     }
 
-    pub(crate) async fn logical_size(&self, db: &Db, mut size: u64) -> Result<u64> {
+    pub(crate) fn get(&self, key: &[u8]) -> Option<Option<Bytes>> {
+        self.changes.get(key).map(|change| change.value.clone())
+    }
+
+    pub(crate) fn extend(&mut self, other: Self) {
+        for (key, change) in other.changes {
+            self.changes
+                .entry(key)
+                .and_modify(|old| old.value = change.value.clone())
+                .or_insert(change);
+        }
+    }
+
+    pub(crate) async fn logical_size(&self, db: &Db, size: u64) -> Result<u64> {
+        self.logical_size_after(db, None, size).await
+    }
+
+    pub(crate) async fn logical_size_after(
+        &self,
+        db: &Db,
+        previous: Option<&Self>,
+        mut size: u64,
+    ) -> Result<u64> {
         for (key, change) in &self.changes {
             if !key.starts_with(b"etcd/") {
                 continue;
             }
             if let Some(old) = if change.absent {
                 None
+            } else if let Some(value) = previous.and_then(|batch| batch.get(key)) {
+                value
             } else {
                 db.get(key).await?
             } {

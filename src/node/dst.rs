@@ -42,6 +42,7 @@ struct Simulation {
     terms: BTreeMap<u64, u64>,
     isolated: Option<u64>,
     paused_apply: Option<u64>,
+    paused_reads: Option<u64>,
     paused_log: Option<u64>,
     held_log: Option<(u64, log::Completion)>,
     expected_log_failure: Option<u64>,
@@ -83,6 +84,7 @@ impl Simulation {
             terms: BTreeMap::new(),
             isolated: None,
             paused_apply: None,
+            paused_reads: None,
             paused_log: None,
             held_log: None,
             expected_log_failure: None,
@@ -189,7 +191,13 @@ impl Simulation {
                 }
             }
             if self.paused_apply != Some(id) {
-                node.drain_apply().await.unwrap();
+                if self.paused_reads == Some(id) {
+                    node.drain_state().await.unwrap();
+                } else {
+                    node.drain_apply().await.unwrap();
+                }
+            } else if self.paused_reads != Some(id) {
+                node.drain_reads().await.unwrap();
             }
         }
         for id in failed {
@@ -895,6 +903,132 @@ impl Simulation {
             .push("auth and physical compact recovered".into());
     }
 
+    async fn batch_and_pinned_reads(&mut self) {
+        let leader = self.leader().unwrap();
+        self.paused_reads = Some(leader);
+        let old_revision = self.nodes[&leader].state.revision;
+        let (tx, read) = oneshot::channel();
+        self.nodes
+            .get_mut(&leader)
+            .unwrap()
+            .enqueue_query(Query::Read(
+                RequestOp {
+                    request: Some(Op::RequestRange(RangeRequest {
+                        key: b"batch-key".to_vec(),
+                        serializable: true,
+                        ..Default::default()
+                    })),
+                },
+                None,
+                ClientResponse::Kv(tx),
+            ));
+        self.drive().await;
+        assert!(self.nodes[&leader].read_executor.len() > 0);
+        self.paused_apply = Some(leader);
+        let before = self.nodes[&leader].state.write_batches;
+        let mut replies = vec![];
+        for index in 0..16 {
+            let (tx, rx) = oneshot::channel();
+            self.nodes
+                .get_mut(&leader)
+                .unwrap()
+                .propose(
+                    RaftCommand::Etcd {
+                        id: format!("batch-{index}"),
+                        origin: leader,
+                        etcd: RequestOp {
+                            request: Some(Op::RequestPut(PutRequest {
+                                key: b"batch-key".to_vec(),
+                                value: format!("v{index}").into_bytes(),
+                                prev_kv: true,
+                                ..Default::default()
+                            })),
+                        },
+                    },
+                    ClientResponse::Kv(tx),
+                )
+                .unwrap();
+            replies.push(rx);
+        }
+        self.drive().await;
+        for _ in 0..150 {
+            self.deliver(false).await;
+        }
+        self.paused_apply = None;
+        self.drive().await;
+        for _ in 0..150 {
+            self.deliver(false).await;
+        }
+        let writes = self.nodes[&leader].state.write_batches - before;
+        assert!(writes < 16, "put burst did not share storage writes");
+        for (offset, mut reply) in replies.into_iter().enumerate() {
+            let Some(Resp::ResponsePut(value)) =
+                reply.try_recv().unwrap().unwrap().result.unwrap().response
+            else {
+                panic!("expected put");
+            };
+            assert_eq!(
+                value.header.unwrap().revision,
+                old_revision + offset as i64 + 1
+            );
+            assert_eq!(
+                value.prev_kv.map(|kv| kv.value),
+                offset.checked_sub(1).map(|i| format!("v{i}").into_bytes())
+            );
+        }
+        self.paused_reads = None;
+        self.drive().await;
+        let Some(Resp::ResponseRange(value)) =
+            read.await.unwrap().unwrap().result.unwrap().response
+        else {
+            panic!("expected range");
+        };
+        assert!(value.kvs.is_empty());
+        assert_eq!(value.header.unwrap().revision, old_revision);
+        self.trace.push(format!(
+            "pinned read across batch {leader} {old_revision} {writes}"
+        ));
+        self.stop(leader);
+        self.start(leader).await;
+        for _ in 0..25 {
+            for id in 1..=3 {
+                self.tick(id).await;
+            }
+            for _ in 0..30 {
+                self.deliver(false).await;
+            }
+        }
+        for node in self.nodes.values() {
+            let state = node.worker.state();
+            let page = state
+                .watch(
+                    &WatchCreateRequest {
+                        key: b"batch-key".to_vec(),
+                        start_revision: old_revision + 1,
+                        prev_kv: true,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            let events: Vec<_> = page.responses.into_iter().flat_map(|r| r.events).collect();
+            assert_eq!(events.len(), 16);
+            for (offset, event) in events.iter().enumerate() {
+                let kv = event.kv.as_ref().unwrap();
+                assert_eq!(kv.mod_revision, old_revision + offset as i64 + 1);
+                assert_eq!(kv.value, format!("v{offset}").as_bytes());
+            }
+            assert_eq!(
+                state.logical_size(),
+                crate::state::maintenance::count_logical_size(&state.db)
+                    .await
+                    .unwrap()
+            );
+        }
+        self.trace.push("batched put history recovered".into());
+    }
+
     async fn run(seed: u64) -> Vec<String> {
         let mut sim = Self::new(seed).await;
         for _ in 0..100 {
@@ -1191,6 +1325,7 @@ impl Simulation {
                 );
             }
         }
+        sim.batch_and_pinned_reads().await;
         sim.admin_recovery().await;
         sim.trace.clone()
     }
