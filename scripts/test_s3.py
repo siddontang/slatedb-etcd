@@ -2,6 +2,7 @@
 """Check S3 startup retries before the recovery tests."""
 
 import importlib.util
+from io import BytesIO
 from pathlib import Path
 import unittest
 from unittest.mock import Mock, patch
@@ -17,7 +18,7 @@ class BucketReadiness(unittest.TestCase):
     def test_refusal_and_unavailable_then_ready(self):
         process = Mock()
         process.poll.return_value = None
-        responses = [URLError(ConnectionRefusedError()), HTTPError("", 503, "", {}, None), None]
+        responses = [URLError(ConnectionRefusedError()), HTTPError("", 503, "", {}, BytesIO()), None]
         with patch.object(s3, "create_bucket", side_effect=responses) as create:
             with patch.object(s3.time, "sleep"):
                 s3.wait_for_bucket(process, "endpoint", "bucket", "key", "secret")
@@ -26,7 +27,7 @@ class BucketReadiness(unittest.TestCase):
     def test_failed_signature_stops_startup(self):
         process = Mock()
         process.poll.return_value = None
-        with patch.object(s3, "create_bucket", side_effect=HTTPError("", 403, "", {}, None)):
+        with patch.object(s3, "create_bucket", side_effect=HTTPError("", 403, "", {}, BytesIO())):
             with self.assertRaises(HTTPError) as error:
                 s3.wait_for_bucket(process, "endpoint", "bucket", "key", "secret")
         self.assertEqual(error.exception.code, 403)

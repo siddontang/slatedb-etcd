@@ -56,9 +56,9 @@ def wait_for_bucket(process, endpoint, bucket, access, secret):
             create_bucket(endpoint, bucket, access, secret)
             return
         except urllib.error.HTTPError as error:
-            error.close()
             if error.code != 503:
                 raise
+            error.close()
         except urllib.error.URLError as error:
             if not isinstance(error.reason, ConnectionRefusedError):
                 raise
