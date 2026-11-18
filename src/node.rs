@@ -23,6 +23,7 @@ mod log;
 mod maintenance;
 mod read;
 mod response;
+use crate::peer::transport;
 use apply::{AppliedState, Completion, Header, Job, Output, Query, Reply, Work, Worker};
 use response::ClientResponse;
 
@@ -140,7 +141,7 @@ pub struct Node {
     log_read_fail: bool,
     peer_waiters: Vec<Response>,
     built_checkpoint: Option<(u64, raft::eraftpb::ConfState, Vec<u8>)>,
-    reads: BTreeMap<Vec<u8>, read::PendingRead>,
+    reads: BTreeMap<u64, read::PendingRead>,
     revision_waiters: VecDeque<RevisionWaiter>,
     read_nonce: [u8; 16],
     read_sequence: u64,
@@ -293,7 +294,7 @@ impl Node {
                     options.cluster_id.clone(),
                     rx,
                     events.clone(),
-                    options.transport.http.clone(),
+                    options.transport.clone(),
                 ));
             }
             senders
@@ -392,6 +393,10 @@ impl Node {
                 event = events.recv() => {
                     let Some(event) = event else { return Ok(()); };
                     self.handle(event, &mut step_responses).await?;
+                    // Let ready tasks add proposals before starting the next durable log write.
+                    if !self.pending.is_empty() {
+                        tokio::task::yield_now().await;
+                    }
                     // Accumulate proposals so concurrent clients can share one durable log write.
                     for _ in 0..63 {
                         let Ok(event) = events.try_recv() else { break; };
@@ -1391,97 +1396,4 @@ impl Node {
             "compact_revision": self.state.compact_revision,
         }))
     }
-}
-
-async fn transport(
-    peer: u64,
-    address: String,
-    cluster_id: String,
-    mut messages: mpsc::Receiver<Message>,
-    events: mpsc::Sender<Event>,
-    client: reqwest::Client,
-) {
-    const IN_FLIGHT: usize = 4;
-    let url = format!("{}/raft", crate::cluster::url(&address));
-    let mut requests = tokio::task::JoinSet::new();
-    loop {
-        let message = tokio::select! {
-            result = requests.join_next(), if !requests.is_empty() => {
-                let success = matches!(result, Some(Ok(true)));
-                if events.send(Event::NetworkResult { peer, snapshot: false, success }).await.is_err() {
-                    return;
-                }
-                continue;
-            }
-            message = messages.recv(), if requests.len() < IN_FLIGHT => message,
-        };
-        let Some(message) = message else {
-            break;
-        };
-        if message.get_msg_type() == MessageType::MsgSnapshot {
-            // Finish older requests before a snapshot. Its HTTP reply still fences durable storage.
-            while let Some(result) = requests.join_next().await {
-                if events
-                    .send(Event::NetworkResult {
-                        peer,
-                        snapshot: false,
-                        success: matches!(result, Ok(true)),
-                    })
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            let success = post_message(&client, &url, &cluster_id, message).await;
-            if events
-                .send(Event::NetworkResult {
-                    peer,
-                    snapshot: true,
-                    success,
-                })
-                .await
-                .is_err()
-            {
-                return;
-            }
-        } else {
-            let client = client.clone();
-            let url = url.clone();
-            let cluster_id = cluster_id.clone();
-            requests.spawn(async move { post_message(&client, &url, &cluster_id, message).await });
-        }
-    }
-    // Dropping the set cancels requests when membership removes this transport.
-}
-
-async fn post_message(
-    client: &reqwest::Client,
-    url: &str,
-    cluster_id: &str,
-    message: Message,
-) -> bool {
-    let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
-    let result: Result<()> = async {
-        let response = client
-            .post(url)
-            .header("x-cluster-id", cluster_id)
-            .timeout(if snapshot {
-                Duration::from_secs(30)
-            } else {
-                Duration::from_secs(2)
-            })
-            .body(message.write_to_bytes()?)
-            .send()
-            .await?;
-        ensure!(
-            response.status().is_success(),
-            "peer returned {}",
-            response.status()
-        );
-        response.bytes().await.context("read peer response")?;
-        Ok(())
-    }
-    .await;
-    result.is_ok()
 }

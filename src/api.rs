@@ -35,6 +35,10 @@ impl IntoResponse for ApiError {
 
 pub fn router(state: ApiState) -> Router {
     Router::new()
+        .route_service(
+            "/slatedb.peer.Transport/Exchange",
+            crate::peer::service(state.clone()),
+        )
         .route("/kv", post(propose))
         .route("/raft", post(raft_message))
         .route("/status", get(status))

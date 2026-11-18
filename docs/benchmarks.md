@@ -83,6 +83,8 @@ The previous implementation scanned all logical etcd state before each quota-lim
 Use `--baseline-binary` to compare a saved release binary with the current service and etcd.
 Use `--read-requests` for longer read-only samples, and `--warmup` to set unmeasured operations.
 The driver shuffles backend and workload order for each repeat.
+Use `--service-runtime-workers` for explicit service worker comparisons.
+An omitted value uses the binary's default. The override does not change the baseline or etcd.
 Each repeat shares one operation seed.
 Keys and read choices use a seeded uniform distribution. Reads verify the expected value.
 Summarize complete runs with medians and ranges across repeats:

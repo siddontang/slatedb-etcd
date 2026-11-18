@@ -109,10 +109,16 @@ Adjacent queued Ready jobs share a sync. Other log job types form batch boundari
 Disk statistics run only for `/debug/log-stats` requests.
 Raft advances durable progress and releases dependent messages only after log completion.
 Leader replication can run before local persistence, as permitted by raft-rs.
-Each peer transport permits up to four concurrent ordinary HTTP requests.
-Raft can accept reordered messages. Failed requests report the peer as unreachable.
-A snapshot waits for older requests and completes before later requests start.
-Ordinary HTTP receipt confirms delivery; snapshot receipt waits for durable snapshot storage.
+Each peer transport uses a persistent gRPC stream for ordinary Raft messages.
+A sequence check and a 64-message receipt window bound outstanding work.
+Encoded payloads also have a separate 16 MiB admission target per peer.
+One frame can exceed that target. Each frame has an 8 MiB plus 1 KiB limit.
+The stream requires progress within two seconds when messages are pending.
+Failure reports the peer as unreachable. Raft retries lost messages on a later connection.
+A snapshot waits for older receipts and uses the durable HTTP endpoint.
+Later messages wait for its result. Failed streams also reject any waiting snapshot.
+Ordinary stream receipts confirm delivery; snapshot receipts confirm durable snapshot storage.
+Neither receipt replaces Raft's durable vote or append acknowledgement.
 
 Status separates `raft_commit_index`, log-worker-confirmed `commit_index`, and `applied_index`.
 The worker confirms entry durability before advancing `commit_index`.

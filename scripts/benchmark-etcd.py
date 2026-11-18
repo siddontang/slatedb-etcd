@@ -113,6 +113,9 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
                                "--listen", clients[i], "--peer-listen", peers[i],
                                "--cluster-id", root.name, "--snapshot-every", str(args.snapshot_entries),
                                "--quota-backend-bytes", str(args.quota_bytes)]
+                    workers = getattr(args, "service_runtime_workers", None)
+                    if kind == "service" and workers is not None:
+                        command += ["--runtime-workers", str(workers)]
                     if args.s3_bucket:
                         command += ["--s3-bucket", args.s3_bucket]
                     if args.s3_endpoint:
@@ -186,6 +189,8 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--members", type=int, choices=[1, 3], default=3)
+    parser.add_argument("--service-runtime-workers", type=int,
+                        help="Override the current service's async worker count")
     parser.add_argument("--requests", type=int, default=10000)
     parser.add_argument("--read-requests", type=int, help="Separate request count for read-only samples")
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 8, 32])
@@ -209,6 +214,8 @@ def main():
     if min(args.requests, args.keys, args.value_size, args.timeout_seconds, args.repeat,
            args.snapshot_entries, args.quota_bytes, *args.concurrency) < 1 or args.warmup < 0:
         parser.error("Counts, sizes, quotas, and timeouts must be positive; warmup can be zero")
+    if args.service_runtime_workers is not None and args.service_runtime_workers < 1:
+        parser.error("Service runtime workers must be positive")
     if args.read_requests is not None and args.read_requests < 1:
         parser.error("Read request count must be positive")
     if args.seed < 0 or args.seed+args.repeat > 2**64-1:
@@ -225,6 +232,7 @@ def main():
               "created_at": datetime.now(timezone.utc).isoformat(), "expected_samples": expected,
               "platform": platform.system(), "architecture": platform.machine(), "logical_cpus": os.cpu_count(),
               "members": args.members,
+              "service_runtime_workers": args.service_runtime_workers,
               "deployment": f"{args.members} processes per backend; shared host and disk; loopback plaintext",
               "reference_etcd": "v3.6.5", "state_backend": "s3" if args.s3_bucket else "local",
               "raft_snapshot_entries": args.snapshot_entries, "quota_bytes": args.quota_bytes,

@@ -205,7 +205,7 @@ impl Node {
                 self.options.cluster_id.clone(),
                 rx,
                 self.events.clone(),
-                self.options.transport.http.clone(),
+                self.options.transport.clone(),
             ));
         }
         self.options.peers = peers;

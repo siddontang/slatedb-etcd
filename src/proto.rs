@@ -9,3 +9,7 @@ pub mod etcdserverpb {
 pub mod authpb {
     tonic::include_proto!("authpb");
 }
+
+pub(crate) mod peer {
+    tonic::include_proto!("slatedb.peer");
+}

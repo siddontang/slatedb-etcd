@@ -64,7 +64,7 @@ pub(super) enum Query {
         Response,
     ),
     Read(RequestOp, Option<crate::auth::Credentials>, ClientResponse),
-    Linear(RequestOp, Option<crate::auth::Credentials>, Vec<u8>),
+    Linear(RequestOp, Option<crate::auth::Credentials>, u64),
     Watch(
         crate::proto::etcdserverpb::WatchCreateRequest,
         bool,
@@ -136,7 +136,7 @@ pub(super) struct AppliedCommand {
 pub(super) enum Output {
     Reads(Vec<Output>),
     Linear {
-        id: Vec<u8>,
+        id: u64,
         outcome: Outcome,
     },
     Read {

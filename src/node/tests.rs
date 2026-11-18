@@ -476,13 +476,13 @@ fn range_request() -> RequestOp {
     }
 }
 
-async fn confirm_read(node: &mut Node, id: &[u8]) {
+async fn confirm_read(node: &mut Node, id: &u64) {
     let mut message = Message::default();
     message.set_msg_type(MessageType::MsgHeartbeatResponse);
     message.from = 2;
     message.to = 1;
     message.term = node.raw.raft.term;
-    message.context = id.to_vec().into();
+    message.context = node.read_context(*id).into();
     node.raw.step(message).unwrap();
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
@@ -499,7 +499,7 @@ async fn read_batches_freeze_before_quorum_and_survive_a_cancelled_first_request
     let (second, mut reply) = oneshot::channel();
     node.linear_read(range_request(), first);
     node.linear_read(range_request(), second);
-    let context = node.reads.keys().next().unwrap().clone();
+    let context = *node.reads.keys().next().unwrap();
     node.drive_ready().await.unwrap();
     assert!(node.log_worker.step().unwrap().is_none());
     let mut contexts = vec![];
@@ -508,11 +508,11 @@ async fn read_batches_freeze_before_quorum_and_survive_a_cancelled_first_request
             contexts.push(message.context.to_vec());
         }
     }
-    assert_eq!(contexts, vec![context.clone()]);
+    assert_eq!(contexts, vec![node.read_context(context)]);
     drop(cancelled);
     let (later, mut late_reply) = oneshot::channel();
     node.linear_read(range_request(), later);
-    let late_context = node.reads.keys().last().unwrap().clone();
+    let late_context = *node.reads.keys().last().unwrap();
     node.drive_ready().await.unwrap();
     assert!(reply.try_recv().is_err());
     confirm_read(&mut node, &context).await;
@@ -659,7 +659,7 @@ async fn read_index_requires_quorum_and_does_not_write_the_log() {
     let syncs = node.raw.store().durable.sync_writes;
     let (tx, mut reply) = oneshot::channel();
     node.linear_read(range_request(), tx);
-    let id = node.reads.keys().next().unwrap().clone();
+    let id = *node.reads.keys().next().unwrap();
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
     node.drain_apply().await.unwrap();
@@ -702,7 +702,7 @@ async fn read_index_waits_for_apply_and_rejects_late_results_after_term_change()
     assert!(node.state.applied < node.raw.store().commit_index());
     let (tx, mut reply) = oneshot::channel();
     node.linear_read(range_request(), tx);
-    let id = node.reads.keys().next().unwrap().clone();
+    let id = *node.reads.keys().next().unwrap();
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
     confirm_read(&mut node, &id).await;
@@ -892,7 +892,7 @@ async fn read_index_retries_after_the_first_commit_in_a_new_term() {
     assert!(!node.raw.raft.commit_to_current_term());
     let (tx, mut reply) = oneshot::channel();
     node.linear_read(range_request(), tx);
-    let id = node.reads.keys().next().unwrap().clone();
+    let id = *node.reads.keys().next().unwrap();
     // The initial request is discarded before the leader commits its no-op entry.
     confirm_read(&mut node, &id).await;
     node.drain_apply().await.unwrap();
@@ -1117,130 +1117,6 @@ async fn queued_ready_jobs_share_sync_and_keep_the_final_log_suffix() {
 }
 
 #[tokio::test]
-async fn peer_pipeline_is_bounded_and_keeps_snapshot_acknowledgements() {
-    async fn step(events: &mut mpsc::Receiver<Event>) -> Response {
-        match tokio::time::timeout(Duration::from_secs(2), events.recv())
-            .await
-            .unwrap()
-            .unwrap()
-        {
-            Event::Step(_, response) => response,
-            _ => panic!("expected a peer message"),
-        }
-    }
-    for snapshot_success in [true, false] {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap().to_string();
-        let (events, mut received) = mpsc::channel(16);
-        let router = crate::api::router(crate::api::ApiState {
-            events,
-            cluster_id: "pipeline-test".into(),
-        });
-        let server = tokio::spawn(crate::tls::serve(listener, router, None));
-        let (messages, queue) = mpsc::channel(16);
-        let (events, mut completed) = mpsc::channel(16);
-        let sender = tokio::spawn(transport(
-            2,
-            address,
-            "pipeline-test".into(),
-            queue,
-            events,
-            reqwest::Client::new(),
-        ));
-        for index in 0..7 {
-            messages
-                .send(Message {
-                    msg_type: if index == 5 {
-                        MessageType::MsgSnapshot
-                    } else {
-                        MessageType::MsgHeartbeat
-                    },
-                    to: 2,
-                    from: 1,
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-        }
-        let mut first = vec![];
-        for _ in 0..4 {
-            first.push(step(&mut received).await);
-        }
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), received.recv())
-                .await
-                .is_err()
-        );
-        for (index, response) in first.into_iter().enumerate() {
-            let result = if index == 0 {
-                Err(ApiError {
-                    error: "injected peer failure".into(),
-                    leader_id: 0,
-                })
-            } else {
-                Ok(json!({"accepted": true}))
-            };
-            response.send(result).unwrap();
-        }
-        let fifth = step(&mut received).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), received.recv())
-                .await
-                .is_err()
-        );
-        fifth.send(Ok(json!({"accepted": true}))).unwrap();
-        let snapshot = step(&mut received).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), received.recv())
-                .await
-                .is_err()
-        );
-        snapshot
-            .send(if snapshot_success {
-                Ok(json!({"accepted": true}))
-            } else {
-                Err(ApiError {
-                    error: "snapshot storage failed".into(),
-                    leader_id: 0,
-                })
-            })
-            .unwrap();
-        step(&mut received)
-            .await
-            .send(Ok(json!({"accepted": true})))
-            .unwrap();
-        let mut failures = 0;
-        let mut snapshots = 0;
-        for _ in 0..7 {
-            match tokio::time::timeout(Duration::from_secs(2), completed.recv())
-                .await
-                .unwrap()
-                .unwrap()
-            {
-                Event::NetworkResult {
-                    peer: 2,
-                    snapshot,
-                    success,
-                } => {
-                    failures += usize::from(!success);
-                    if snapshot {
-                        snapshots += 1;
-                        assert_eq!(success, snapshot_success);
-                    }
-                }
-                _ => panic!("expected a transport result"),
-            }
-        }
-        assert_eq!(failures, 1 + usize::from(!snapshot_success));
-        assert_eq!(snapshots, 1);
-        drop(messages);
-        sender.await.unwrap();
-        server.abort();
-        let _ = server.await;
-    }
-}
-
-#[tokio::test]
 async fn maintenance_flushes_update_durable_apply_metadata() {
     for command in [
         crate::maintenance::Command::Snapshot,
@@ -1271,4 +1147,36 @@ async fn maintenance_flushes_update_durable_apply_metadata() {
         result.await.unwrap().unwrap();
         assert_eq!(node.state.durable_applied, 1);
     }
+}
+
+#[tokio::test]
+async fn read_contexts_require_the_current_process_nonce_and_exact_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    let (response, mut result) = oneshot::channel();
+    node.linear_read(range_request(), response);
+    let id = *node.reads.keys().next().unwrap();
+    node.drive_ready().await.unwrap();
+    let valid = node.read_context(id);
+    let mut stale = valid.clone();
+    stale[0] ^= 1;
+    for context in [
+        stale,
+        valid[..23].to_vec(),
+        [valid.as_slice(), &[0]].concat(),
+    ] {
+        node.confirm_reads(vec![raft::ReadState {
+            index: node.state.applied,
+            request_ctx: context,
+        }]);
+        node.schedule_reads();
+        assert!(node.queries.is_empty());
+        assert!(result.try_recv().is_err());
+    }
+    node.confirm_reads(vec![raft::ReadState {
+        index: node.state.applied,
+        request_ctx: valid,
+    }]);
+    node.schedule_reads();
+    assert_eq!(node.queries.len(), 1);
 }

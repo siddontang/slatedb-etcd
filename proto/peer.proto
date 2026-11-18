@@ -1,0 +1,17 @@
+syntax = "proto3";
+package slatedb.peer;
+
+// Carry ordinary Raft messages over one bounded stream per peer.
+service Transport {
+  rpc Exchange(stream Frame) returns (stream Receipt);
+}
+
+message Frame {
+  uint64 sequence = 1;
+  bytes payload = 2;
+}
+
+// Confirm receipt by the Raft owner. This is not a durable Raft acknowledgement.
+message Receipt {
+  uint64 sequence = 1;
+}
