@@ -25,6 +25,7 @@ An exhausted identity counter stops construction instead of reusing an identity.
 
 The original `sync()` called `write()` with an empty batch, which returned without syncing.
 The local fix follows the direct sync behavior now present in upstream code.
+Nonempty synchronous writes already reached the file system before this fix.
 
 Related upstream reports: [multiple engines][engines] and [missing explicit sync][sync].
 Remove these local patches when an upstream release includes both fixes.

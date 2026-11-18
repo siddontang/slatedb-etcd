@@ -16,6 +16,7 @@ Keep changes focused and state which compatibility behavior they add or change.
 | `tests/compat/` | Official-client, differential, imported, and process fault tests |
 | `tests/compat/cmd/slatedb-snapshot/` | Native backup export with the official Go client |
 | `tests/jepsen/` | Knossos and Elle history checks |
+| `third_party/raft-engine/` | Pinned Raft Engine source with documented local correctness fixes |
 | `scripts/` | Build wrappers, test runners, and repository checks |
 | `results/` | Selected validation and historical benchmark records |
 | `docs/` | Setup, design, operations, and publication notes |

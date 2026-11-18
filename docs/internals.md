@@ -26,6 +26,11 @@ Flushed state can exceed the recovered commit marker because commit-only updates
 Startup restores commit progress from that state only when the durable log covers its applied index.
 Missing log entries still prevent startup. Checkpoints save their commit marker in the synced batch.
 
+The [local Raft Engine copy](../third_party/raft-engine/README.md) fixes two dependency defects.
+Its thread cache separates open log instances, including reopened instances.
+Explicit sync reaches the file system even when no new write batch exists.
+Regressions check cross-engine values and count the underlying sync calls.
+
 For a checkpoint, the node:
 
 1. Pins a SlateDB snapshot at the current applied index.
