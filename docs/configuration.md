@@ -48,6 +48,12 @@ The default simple-token lifetime is 300 seconds. Auth changes invalidate existi
 Certificates are read at startup. Automatic generation and certificate reload are unsupported.
 Keep client and peer trust roots separate. See [security](../SECURITY.md).
 
+## Runtime
+
+`--runtime-workers` sets the async worker count. The default is two; zero is invalid.
+Log I/O uses a separate thread. Embedded servers use the caller's runtime.
+More workers can increase task handoffs. Measure the target workload before changing this setting.
+
 ## Storage and log memory
 
 | Flag | Default | Meaning |

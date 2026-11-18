@@ -95,7 +95,7 @@ impl RaftStorage {
         Ok(this)
     }
 
-    /// Persist a Ready before sending any of its messages or applying its entries.
+    /// Write a Ready. Sync entries, snapshots, terms, and votes before Raft acknowledgements.
     pub fn persist(
         &mut self,
         entries: &[Entry],
@@ -105,6 +105,12 @@ impl RaftStorage {
         if entries.is_empty() && hard_state.is_none() && snapshot.is_none() {
             return Ok(());
         }
+        // Raft commit progress is volatile. Entries, terms, and votes require stable storage.
+        let must_sync = !entries.is_empty()
+            || snapshot.is_some()
+            || hard_state.is_some_and(|hs| {
+                hs.term != self.hard_state.term || hs.vote != self.hard_state.vote
+            });
         let mut batch = LogBatch::default();
         if let Some(snapshot) = snapshot {
             ensure!(
@@ -128,13 +134,17 @@ impl RaftStorage {
         if snapshot.is_some() {
             crate::failpoint::hit("snapshot-before-save");
         }
-        crate::failpoint::hit("wal-before-sync");
-        self.engine.write(&mut batch, true)?;
-        crate::failpoint::hit("wal-after-sync");
+        if must_sync {
+            crate::failpoint::hit("wal-before-sync");
+        }
+        self.engine.write(&mut batch, must_sync)?;
+        if must_sync {
+            crate::failpoint::hit("wal-after-sync");
+            self.sync_writes += 1;
+        }
         if snapshot.is_some() {
             crate::failpoint::hit("snapshot-after-save");
         }
-        self.sync_writes += 1;
         if let Some(hs) = hard_state {
             self.hard_state = hs.clone();
         }
@@ -146,10 +156,13 @@ impl RaftStorage {
 
     pub fn persist_commit(&mut self, commit: u64) -> Result<()> {
         ensure!(commit >= self.hard_state.commit, "commit regressed");
+        ensure!(commit <= self.last_index()?, "commit exceeds durable log");
         if commit != self.hard_state.commit {
             let mut hs = self.hard_state.clone();
             hs.commit = commit;
             self.persist(&[], Some(&hs), None)?;
+            self.engine.sync()?;
+            self.sync_writes += 1;
         }
         Ok(())
     }
@@ -181,6 +194,7 @@ impl RaftStorage {
         snapshot.data = data.into();
         let mut batch = LogBatch::default();
         batch.put_message(GROUP, SNAPSHOT.to_vec(), &snapshot)?;
+        batch.put_message(GROUP, HARD_STATE.to_vec(), &self.hard_state)?;
         batch.add_command(GROUP, EngineCommand::Compact { index: index + 1 });
         crate::failpoint::hit("checkpoint-before-save");
         self.engine.write(&mut batch, true)?;

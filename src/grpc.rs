@@ -177,13 +177,7 @@ impl Service {
         }
         mvcc::validate(&request).map_err(|e| e.status())?;
         let (tx, rx) = oneshot::channel();
-        let event = if mvcc::read_only(&request, true) {
-            Event::EtcdRead(request, tx)
-        } else if mvcc::read_only(&request, false) {
-            Event::LinearRead(request, tx)
-        } else {
-            Event::EtcdPropose(request, tx)
-        };
+        let event = Event::Kv(request, tx);
         self.events
             .try_send(Event::Authenticated(credentials.clone(), Box::new(event)))
             .map_err(|_| Status::unavailable("etcdserver: too many requests"))?;
@@ -194,11 +188,7 @@ impl Service {
             })?
             .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?;
         match reply {
-            Ok(value) => {
-                let outcome: Outcome =
-                    serde_json::from_value(value).map_err(|e| Status::internal(e.to_string()))?;
-                outcome.result.map_err(|e| e.status())
-            }
+            Ok(outcome) => outcome.result.map_err(|e| e.status()),
             Err(error) if error.error == "not leader" && !forwarded => {
                 let channel = self.peer_channel(error.leader_id).await?;
                 let mut client =

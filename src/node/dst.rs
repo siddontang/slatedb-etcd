@@ -10,13 +10,13 @@ use crate::proto::etcdserverpb::{PutRequest, RangeRequest, WatchCreateRequest};
 struct ClientRequest {
     key: String,
     value: String,
-    reply: oneshot::Receiver<Result<Value, ApiError>>,
+    reply: oneshot::Receiver<Result<Outcome, ApiError>>,
 }
 
 struct ReadRequest {
     node: u64,
     known: BTreeMap<String, String>,
-    reply: oneshot::Receiver<Result<Value, ApiError>>,
+    reply: oneshot::Receiver<Result<Outcome, ApiError>>,
 }
 
 struct RevisionRequest {
@@ -231,8 +231,7 @@ impl Simulation {
         let mut pending = vec![];
         for mut request in self.requests.drain(..) {
             match request.reply.try_recv() {
-                Ok(Ok(reply)) => {
-                    let result: Outcome = serde_json::from_value(reply).unwrap();
+                Ok(Ok(result)) => {
                     let mut result = result.result.unwrap();
                     let revision = crate::mvcc::response_header(&mut result).unwrap().revision;
                     for (&id, node) in &mut self.nodes {
@@ -255,8 +254,7 @@ impl Simulation {
         let mut pending_reads = vec![];
         for mut read in self.reads.drain(..) {
             match read.reply.try_recv() {
-                Ok(Ok(value)) => {
-                    let result: Outcome = serde_json::from_value(value).unwrap();
+                Ok(Ok(result)) => {
                     let Some(Resp::ResponseRange(response)) = result.result.unwrap().response
                     else {
                         panic!("expected range");
@@ -418,7 +416,7 @@ impl Simulation {
                         })),
                     },
                 },
-                tx,
+                ClientResponse::Kv(tx),
             )
             .unwrap();
         self.trace.push(format!("propose {leader} {key}"));
@@ -441,18 +439,32 @@ impl Simulation {
         }
         let id = candidates[self.choose(candidates.len())];
         let count = self.choose(6) + 3;
+        let point = if self.choose(2) == 0 {
+            self.acknowledged
+                .first_key_value()
+                .map(|(key, value)| (key.clone(), value.clone()))
+        } else {
+            None
+        };
         for offset in 0..count {
             let (tx, rx) = oneshot::channel();
             let node = self.nodes.get_mut(&id).unwrap();
-            node.linear_read(
+            node.linear_read_auth(
                 RequestOp {
                     request: Some(Op::RequestRange(RangeRequest {
-                        key: b"key-".to_vec(),
-                        range_end: b"key.".to_vec(),
+                        key: point
+                            .as_ref()
+                            .map_or_else(|| b"key-".to_vec(), |(key, _)| key.as_bytes().to_vec()),
+                        range_end: if point.is_some() {
+                            vec![]
+                        } else {
+                            b"key.".to_vec()
+                        },
                         ..Default::default()
                     })),
                 },
-                tx,
+                None,
+                ClientResponse::Kv(tx),
             );
             // Issue one batch, cancel its first client, then queue later reads.
             if offset == 1 {
@@ -463,7 +475,10 @@ impl Simulation {
             self.trace.push(format!("read {id}"));
             self.reads.push(ReadRequest {
                 node: id,
-                known: self.acknowledged.clone(),
+                known: point.as_ref().map_or_else(
+                    || self.acknowledged.clone(),
+                    |(key, value)| [(key.clone(), value.clone())].into_iter().collect(),
+                ),
                 reply: rx,
             });
         }

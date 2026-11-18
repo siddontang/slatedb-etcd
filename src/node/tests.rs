@@ -44,6 +44,78 @@ fn seed_log(dir: &std::path::Path, count: u64) {
 }
 
 #[tokio::test]
+async fn flushed_state_recovers_a_lost_commit_marker_but_not_missing_entries() {
+    for has_entry in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let command = Command {
+            id: "committed".into(),
+            request: Request {
+                operations: vec![crate::Operation::Put {
+                    key: "key".into(),
+                    value: "committed".into(),
+                }],
+            },
+        };
+        let mut storage =
+            RaftStorage::open(&dir.path().join("raft"), 1, "worker-test", vec![1, 2, 3]).unwrap();
+        if has_entry {
+            storage
+                .persist(
+                    &[Entry {
+                        index: 1,
+                        term: 1,
+                        data: serde_json::to_vec(&RaftCommand::Legacy(command.clone()))
+                            .unwrap()
+                            .into(),
+                        ..Default::default()
+                    }],
+                    Some(&HardState {
+                        term: 1,
+                        vote: 1,
+                        commit: 0,
+                        ..Default::default()
+                    }),
+                    None,
+                )
+                .unwrap();
+        }
+        // Model a lost commit-only WAL update after committed state reached object storage.
+        let mut state = StateMachine::open(&dir.path().join("objects"))
+            .await
+            .unwrap();
+        state.apply(1, Some(&command)).await.unwrap();
+        state.snapshot_data().await.unwrap();
+        state.close().await.unwrap();
+        drop(state);
+        drop(storage);
+        let (events, _) = mpsc::channel(256);
+        let result =
+            Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new())).await;
+        if has_entry {
+            let node = result.unwrap();
+            assert_eq!(node.state.applied, 1);
+            assert_eq!(node.raw.store().commit_index(), 1);
+            assert_eq!(node.log_worker.storage().commit_index(), 1);
+            assert_eq!(
+                node.worker
+                    .state()
+                    .local_value("key")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("committed")
+            );
+        } else {
+            assert!(result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("commit exceeds durable log"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn queued_state_reads_are_bounded_and_complete_without_raft_writes() {
     let dir = tempfile::tempdir().unwrap();
     let (events, _) = mpsc::channel(256);
@@ -67,6 +139,54 @@ async fn queued_state_reads_are_bounded_and_complete_without_raft_writes() {
         let value = reply.await.unwrap().unwrap();
         assert!(value["value"].is_null());
         assert_eq!(value["applied_index"], 0);
+    }
+    assert_eq!(node.raw.store().last_index().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn point_read_batches_stop_at_the_limit_and_before_a_range() {
+    use crate::proto::etcdserverpb::request_op::Request as Op;
+    use crate::proto::etcdserverpb::RangeRequest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (events, _) = mpsc::channel(256);
+    let mut node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    let mut replies = Vec::new();
+    for index in 0..apply::READ_BATCH + 7 {
+        let (tx, rx) = oneshot::channel();
+        node.enqueue_query(Query::Read(
+            RequestOp {
+                request: Some(Op::RequestRange(RangeRequest {
+                    key: b"a".to_vec(),
+                    range_end: if index == apply::READ_BATCH + 4 {
+                        b"z".to_vec()
+                    } else {
+                        vec![]
+                    },
+                    serializable: true,
+                    ..Default::default()
+                })),
+            },
+            None,
+            ClientResponse::Kv(tx),
+        ));
+        replies.push(rx);
+    }
+    for count in [apply::READ_BATCH, 4, 1, 2] {
+        node.drive_ready().await.unwrap();
+        let completion = node.worker.step().await.unwrap().unwrap();
+        match &completion.output {
+            Output::Reads(reads) => assert_eq!(reads.len(), count),
+            Output::Read { .. } => assert_eq!(count, 1),
+            _ => panic!("expected point reads or the range boundary"),
+        }
+        node.complete_apply(completion).unwrap();
+    }
+    assert!(node.queries.is_empty());
+    for reply in replies {
+        assert!(reply.await.unwrap().unwrap().result.is_ok());
     }
     assert_eq!(node.raw.store().last_index().unwrap(), 0);
 }
@@ -994,4 +1114,161 @@ async fn queued_ready_jobs_share_sync_and_keep_the_final_log_suffix() {
     assert_eq!(reopened.initial_state().unwrap().hard_state.term, 2);
     assert_eq!(reopened.initial_state().unwrap().hard_state.vote, 2);
     assert_eq!(reopened.term(first + 2).unwrap(), 2);
+}
+
+#[tokio::test]
+async fn peer_pipeline_is_bounded_and_keeps_snapshot_acknowledgements() {
+    async fn step(events: &mut mpsc::Receiver<Event>) -> Response {
+        match tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Event::Step(_, response) => response,
+            _ => panic!("expected a peer message"),
+        }
+    }
+    for snapshot_success in [true, false] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (events, mut received) = mpsc::channel(16);
+        let router = crate::api::router(crate::api::ApiState {
+            events,
+            cluster_id: "pipeline-test".into(),
+        });
+        let server = tokio::spawn(crate::tls::serve(listener, router, None));
+        let (messages, queue) = mpsc::channel(16);
+        let (events, mut completed) = mpsc::channel(16);
+        let sender = tokio::spawn(transport(
+            2,
+            address,
+            "pipeline-test".into(),
+            queue,
+            events,
+            reqwest::Client::new(),
+        ));
+        for index in 0..7 {
+            messages
+                .send(Message {
+                    msg_type: if index == 5 {
+                        MessageType::MsgSnapshot
+                    } else {
+                        MessageType::MsgHeartbeat
+                    },
+                    to: 2,
+                    from: 1,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let mut first = vec![];
+        for _ in 0..4 {
+            first.push(step(&mut received).await);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), received.recv())
+                .await
+                .is_err()
+        );
+        for (index, response) in first.into_iter().enumerate() {
+            let result = if index == 0 {
+                Err(ApiError {
+                    error: "injected peer failure".into(),
+                    leader_id: 0,
+                })
+            } else {
+                Ok(json!({"accepted": true}))
+            };
+            response.send(result).unwrap();
+        }
+        let fifth = step(&mut received).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), received.recv())
+                .await
+                .is_err()
+        );
+        fifth.send(Ok(json!({"accepted": true}))).unwrap();
+        let snapshot = step(&mut received).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), received.recv())
+                .await
+                .is_err()
+        );
+        snapshot
+            .send(if snapshot_success {
+                Ok(json!({"accepted": true}))
+            } else {
+                Err(ApiError {
+                    error: "snapshot storage failed".into(),
+                    leader_id: 0,
+                })
+            })
+            .unwrap();
+        step(&mut received)
+            .await
+            .send(Ok(json!({"accepted": true})))
+            .unwrap();
+        let mut failures = 0;
+        let mut snapshots = 0;
+        for _ in 0..7 {
+            match tokio::time::timeout(Duration::from_secs(2), completed.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                Event::NetworkResult {
+                    peer: 2,
+                    snapshot,
+                    success,
+                } => {
+                    failures += usize::from(!success);
+                    if snapshot {
+                        snapshots += 1;
+                        assert_eq!(success, snapshot_success);
+                    }
+                }
+                _ => panic!("expected a transport result"),
+            }
+        }
+        assert_eq!(failures, 1 + usize::from(!snapshot_success));
+        assert_eq!(snapshots, 1);
+        drop(messages);
+        sender.await.unwrap();
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test]
+async fn maintenance_flushes_update_durable_apply_metadata() {
+    for command in [
+        crate::maintenance::Command::Snapshot,
+        crate::maintenance::Command::Defragment,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        seed_log(dir.path(), 1);
+        let (events, _) = mpsc::channel(256);
+        let mut node =
+            Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+                .await
+                .unwrap();
+        node.drive_ready().await.unwrap();
+        node.drain_apply().await.unwrap();
+        assert_eq!(node.state.applied, 1);
+        assert_eq!(node.state.durable_applied, 0);
+        let (response, result) = oneshot::channel();
+        node.enqueue_query(Query::Maintenance(
+            command,
+            crate::auth::Credentials::default(),
+            Box::default(),
+            response,
+        ));
+        node.drive_ready().await.unwrap();
+        let completed = node.worker.step().await.unwrap().unwrap();
+        assert_eq!(completed.state.as_ref().unwrap().durable_applied, 1);
+        node.complete_apply(completed).unwrap();
+        result.await.unwrap().unwrap();
+        assert_eq!(node.state.durable_applied, 1);
+    }
 }

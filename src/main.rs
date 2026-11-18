@@ -10,6 +10,9 @@ use slatedb_etcd::server::{Server, ServerConfig};
 #[derive(Parser)]
 #[command(about = "Experimental etcd v3 service with Raft and SlateDB")]
 struct Args {
+    /// Async worker count. Log writes use a separate thread.
+    #[arg(long, default_value = "2")]
+    runtime_workers: std::num::NonZeroUsize,
     /// Persistent member ID. Keep it with its data directory.
     #[arg(long)]
     id: u64,
@@ -89,15 +92,22 @@ struct Args {
     log_term_bytes: usize,
 }
 
-#[tokio::main(worker_threads = 4)]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let args = Args::parse();
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(args.runtime_workers.get())
+        .enable_all()
+        .build()?
+        .block_on(run(args))
+}
+
+async fn run(args: Args) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_writer(std::io::stderr)
         .init();
-    let args = Args::parse();
     let config = ServerConfig {
         id: args.id,
         cluster_id: args.cluster_id,

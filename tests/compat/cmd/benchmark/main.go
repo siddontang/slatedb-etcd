@@ -1,4 +1,4 @@
-// Measure the same gRPC workload against either three-member service.
+// Measure the same gRPC workload against each service.
 package main
 
 import (

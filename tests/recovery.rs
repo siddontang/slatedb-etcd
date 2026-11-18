@@ -17,6 +17,39 @@ fn storage(dir: &std::path::Path) -> RaftStorage {
 }
 
 #[test]
+fn commit_progress_skips_sync_but_entries_terms_and_votes_do_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = storage(dir.path());
+    let mut hs = HardState {
+        term: 1,
+        vote: 1,
+        ..Default::default()
+    };
+    store.persist(&[entry(1, 1)], Some(&hs), None).unwrap();
+    assert_eq!(store.sync_writes, 1);
+    hs.commit = 1;
+    store.persist(&[], Some(&hs), None).unwrap();
+    assert_eq!(store.sync_writes, 1);
+    hs.term = 2;
+    hs.vote = 0;
+    store.persist(&[], Some(&hs), None).unwrap();
+    assert_eq!(store.sync_writes, 2);
+    hs.vote = 2;
+    store.persist(&[], Some(&hs), None).unwrap();
+    assert_eq!(store.sync_writes, 3);
+    store.persist(&[entry(2, 2)], None, None).unwrap();
+    assert_eq!(store.sync_writes, 4);
+    store.persist_commit(2).unwrap();
+    assert_eq!(store.sync_writes, 5);
+    assert!(store.persist_commit(3).is_err());
+    drop(store);
+    let store = storage(dir.path());
+    assert_eq!(store.initial_state().unwrap().hard_state.vote, 2);
+    assert_eq!(store.commit_index(), 2);
+    assert_eq!(store.last_index().unwrap(), 2);
+}
+
+#[test]
 fn durable_log_replaces_an_uncommitted_suffix() {
     let dir = tempfile::tempdir().unwrap();
     {

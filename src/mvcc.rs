@@ -223,6 +223,38 @@ struct View<'a> {
 }
 
 impl View<'_> {
+    async fn point(&self, key: &[u8], overlay: bool) -> KvResult<Option<KeyValue>> {
+        if overlay {
+            if let Some(value) = self.changes.get(key) {
+                return Ok(value.clone());
+            }
+        }
+        self.db
+            .get(current_key(key))
+            .await
+            .map_err(KvError::storage)?
+            .map(|value| KeyValue::decode(value).map_err(KvError::storage))
+            .transpose()
+    }
+
+    fn check_revision(&self, request: &RangeRequest, nested: bool) -> KvResult<()> {
+        if request.revision < self.compact_revision
+            && (request.revision > 0 || (nested && request.revision != 0))
+        {
+            return Err(KvError::new(
+                Code::OutOfRange,
+                "mvcc: required revision has been compacted",
+            ));
+        }
+        if request.revision > self.revision {
+            return Err(KvError::new(
+                Code::OutOfRange,
+                "mvcc: required revision is a future revision",
+            ));
+        }
+        Ok(())
+    }
+
     async fn latest(&self, key: &[u8], end: &[u8], overlay: bool) -> KvResult<Rows> {
         let mut rows = BTreeMap::new();
         if end.is_empty() {
@@ -380,19 +412,10 @@ impl View<'_> {
                         children,
                     })
                 }
-                Op::RequestRange(r)
-                    if r.revision < self.compact_revision
-                        && (r.revision > 0 || (nested && r.revision != 0)) =>
-                {
-                    Err(KvError::new(
-                        Code::OutOfRange,
-                        "mvcc: required revision has been compacted",
-                    ))
+                Op::RequestRange(r) => {
+                    self.check_revision(r, nested)?;
+                    Ok(Plan::Op(op.clone()))
                 }
-                Op::RequestRange(r) if r.revision > self.revision => Err(KvError::new(
-                    Code::OutOfRange,
-                    "mvcc: required revision is a future revision",
-                )),
                 Op::RequestPut(p) => {
                     if p.lease != 0 && !self.leases.contains_key(&p.lease) {
                         return Err(KvError::new(Code::NotFound, "requested lease not found"));
@@ -414,16 +437,24 @@ impl View<'_> {
     }
 
     async fn range(&self, r: &RangeRequest) -> KvResult<RangeResponse> {
-        let rows = if r.revision > 0 {
-            self.historical(&r.key, &r.range_end, r.revision).await?
+        let rows: Vec<_> = if r.revision > 0 {
+            self.historical(&r.key, &r.range_end, r.revision)
+                .await?
+                .into_values()
+                .collect()
+        } else if r.range_end.is_empty() {
+            self.point(&r.key, true).await?.into_iter().collect()
         } else {
-            self.latest(&r.key, &r.range_end, true).await?
+            self.latest(&r.key, &r.range_end, true)
+                .await?
+                .into_values()
+                .collect()
         };
         let count = rows.len() as i64;
         let mut kvs: Vec<_> = if r.count_only {
             vec![]
         } else {
-            rows.into_values()
+            rows.into_iter()
                 .filter(|kv| {
                     (r.min_mod_revision == 0 || kv.mod_revision >= r.min_mod_revision)
                         && (r.max_mod_revision == 0 || kv.mod_revision <= r.max_mod_revision)
@@ -544,6 +575,34 @@ impl View<'_> {
             })
         })
     }
+}
+
+/// Evaluate a read without constructing a state write batch.
+pub async fn read(
+    db: &Db,
+    revision: i64,
+    compact_revision: i64,
+    request: &RequestOp,
+    leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
+) -> KvResult<ResponseOp> {
+    validate(request)?;
+    if !read_only(request, false) {
+        return Err(KvError::invalid("read request contains a write"));
+    }
+    let mut view = View {
+        db,
+        revision,
+        compact_revision,
+        changes: BTreeMap::new(),
+        events: vec![],
+        leases,
+    };
+    if let Some(Op::RequestRange(range)) = &request.request {
+        view.check_revision(range, false)?;
+        return Ok(response(Resp::ResponseRange(view.range(range).await?)));
+    }
+    let plan = view.plan(request, false).await?;
+    view.execute(plan, false).await
 }
 
 /// Build one atomic state batch. Semantic errors discard all changes.

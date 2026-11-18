@@ -346,7 +346,7 @@ impl StateMachine {
     }
 
     pub async fn read_etcd(&self, request: &RequestOp) -> Result<Outcome> {
-        let result = mvcc::prepare(
+        let result = mvcc::read(
             &self.db,
             self.revision,
             self.compact_revision,
@@ -361,9 +361,7 @@ impl StateMachine {
                 error.message
             );
         }
-        Ok(Outcome {
-            result: result.map(|(response, _, _)| response),
-        })
+        Ok(Outcome { result })
     }
 
     pub async fn apply_etcd_quota(
@@ -750,6 +748,91 @@ mod tests {
             count += 1;
         }
         count
+    }
+
+    #[tokio::test]
+    async fn read_path_matches_transaction_evaluation_without_a_write_batch() {
+        use crate::proto::etcdserverpb::TxnRequest;
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = StateMachine::open(dir.path()).await.unwrap();
+        for (index, request) in [put(b"a", b"first"), put(b"b", b"second"), put(b"a", b"new")]
+            .iter()
+            .enumerate()
+        {
+            state
+                .apply_etcd(index as u64 + 1, request)
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+        }
+        state
+            .apply_compaction(
+                4,
+                &CompactionRequest {
+                    revision: 3,
+                    physical: false,
+                },
+            )
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let applied = state.applied;
+        for key in [b"a".to_vec(), b"missing".to_vec()] {
+            for end in [vec![], vec![0]] {
+                for revision in [-1, 0, 2, 3, 4, 5] {
+                    for mode in 0..4 {
+                        let request = RequestOp {
+                            request: Some(Op::RequestRange(RangeRequest {
+                                key: key.clone(),
+                                range_end: end.clone(),
+                                revision,
+                                keys_only: mode == 1,
+                                count_only: mode == 2,
+                                min_mod_revision: if mode == 3 { 4 } else { 0 },
+                                limit: 1,
+                                sort_order: 2,
+                                sort_target: 4,
+                                ..Default::default()
+                            })),
+                        };
+                        for request in [
+                            request.clone(),
+                            RequestOp {
+                                request: Some(Op::RequestTxn(TxnRequest {
+                                    success: vec![request],
+                                    ..Default::default()
+                                })),
+                            },
+                        ] {
+                            let expected = mvcc::prepare(
+                                &state.db,
+                                state.revision,
+                                state.compact_revision,
+                                &request,
+                                &state.leases,
+                            )
+                            .await
+                            .map(|(response, _, _)| response);
+                            let actual = state.read_etcd(&request).await.unwrap().result;
+                            assert_eq!(
+                                serde_json::to_value(actual).unwrap(),
+                                serde_json::to_value(expected).unwrap()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(state
+            .read_etcd(&put(b"a", b"forbidden"))
+            .await
+            .unwrap()
+            .result
+            .is_err());
+        assert_eq!(state.applied, applied);
+        state.close().await.unwrap();
     }
 
     #[tokio::test]

@@ -41,7 +41,9 @@ python3 scripts/benchmark-etcd.py --requests 10000 --keys 1000 \
 ```
 
 The driver builds etcd v3.6.5 from the pinned Go module and calls its original command entry point.
-Each backend uses three separate server processes. Each workload starts with a fresh cluster.
+Each backend uses three separate server processes by default. Use `--members 1` for one member.
+Run the one-member and three-member comparisons separately.
+Each workload starts with a fresh cluster.
 Both use the same official gRPC client, key count, value size, request count, and concurrency.
 All reads are linearizable. Both retain normal Raft sync behavior.
 Both use a 2 GiB quota setting and a 1,000-entry snapshot setting. Their accounting and retention
@@ -51,7 +53,7 @@ The report records successful throughput, error counts, p50/p95/p99/p999 latency
 peak combined server RSS, allocated local data bytes, and server binary hashes.
 Schema version 2 separates startup, preload, warmup, and measurement with client barriers.
 CPU deltas and peak RSS cover the measured phase. RSS still includes retained preload memory.
-The report separates client resources from the sum of the three server processes.
+The report separates client resources from the sum of all server processes.
 CPU per successful operation measures work. Average CPU cores measure utilization.
 The controller samples RSS every 100 ms and includes both measurement boundaries.
 RSS is not unique physical memory. Short samples can amplify CPU rounding and barrier overhead.
@@ -94,10 +96,10 @@ The summary keeps each repeat's percentiles separate. It does not pool or averag
 An incomplete run or failed resource sample cannot produce a passing report.
 Keep build, test, and profiler workloads separate from final measurements.
 
-On macOS, etcd uses `F_FULLFSYNC`; the pinned Raft engine uses `fsync`.
-These calls differ in device cache guarantees.
-Keep both defaults and state this limit in comparisons.
-Do not treat macOS write throughput as a comparison with equal power-loss durability.
+On macOS, both services now use `F_FULLFSYNC` for required durable log writes.
+The service wraps the pinned Raft engine's filesystem to flush the drive cache.
+Earlier macOS reports used the engine's plain `fsync`. Their write results had weaker guarantees.
+Do not compare those earlier write rates with the current durability profile.
 See the [etcd sync implementation][etcd-sync] and [Raft engine implementation][raft-sync].
 
 [etcd-sync]: https://github.com/etcd-io/etcd/blob/v3.6.5/client/pkg/fileutil/sync_darwin.go

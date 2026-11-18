@@ -91,6 +91,18 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             summary.summarize(report)
 
+    def test_summary_separates_one_and_three_members(self):
+        sample = dict(backend="service", concurrency=8, read_percent=100,
+                      keys=10, value_bytes=256, requests=100, successes=100,
+                      errors={}, passed=True, repeat=0, successful_ops_per_second=100,
+                      latency_ms={"p50": 1, "p99": 5}, server_cpu_microseconds_per_success=20,
+                      average_server_cpu_cores=1, peak_process_rss_bytes=1024**2,
+                      client_cpu_seconds=0.1)
+        report = dict(schema_version=2, complete=True, passed=True, expected_samples=2,
+                      samples=[dict(sample, members=1), dict(sample, members=3)])
+        groups = summary.summarize(report)["groups"]
+        self.assertEqual({group["members"] for group in groups}, {1, 3})
+
     def test_failed_build_replaces_old_passed_report(self):
         import json
         with tempfile.TemporaryDirectory() as directory:
