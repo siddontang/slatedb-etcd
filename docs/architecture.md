@@ -234,9 +234,13 @@ Each direction checks message order with a connection-local sequence number.
 The receiver checks the cluster identity before accepting messages.
 TLS and separate listener rules also apply to this private route.
 
-Each sender admits at most 64 unacknowledged messages and targets 16 MiB of encoded payload.
-One message can exceed the byte target. Each encoded frame must fit 8 MiB plus 1 KiB.
+Each sender and receiver admits at most 64 unacknowledged messages.
+Each direction targets 16 MiB of encoded payload. Admission can cross that target by one frame.
+Each encoded frame must fit 8 MiB plus 1 KiB.
 These limits cover stream payloads, not all transport buffers or the existing Raft message queue.
+The receiver can deliver later messages to Raft while earlier receipts wait for processing.
+This lets Ready jobs share a log write. Receipts remain ordered and wait for owner completion.
+The oldest pending receipt has a five-second server deadline.
 A two-second progress timeout closes stalled streams. Raft retries after connection failure.
 The sender discards the old queue and reports any pending snapshot failure before reconnecting.
 

@@ -141,6 +141,8 @@ Raft advances durable progress and releases dependent messages only after log co
 Leader replication can run before local persistence, as permitted by raft-rs.
 Each peer transport uses a persistent gRPC stream for ordinary Raft messages.
 A sequence check and a 64-message receipt window bound outstanding work.
+The receiver admits messages within the same count and byte limits while earlier receipts wait.
+This permits shared log writes across frames. It returns receipts in arrival order.
 Encoded payloads also have a separate 16 MiB admission target per peer.
 One frame can exceed that target. Each frame has an 8 MiB plus 1 KiB limit.
 The stream requires progress within two seconds when messages are pending.

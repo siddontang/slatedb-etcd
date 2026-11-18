@@ -85,6 +85,8 @@ Native process hooks cover both sides of the combined state write.
 
 Peer stream tests use real local sockets. They check message and byte limits, malformed frames,
 cluster rejection, receipt timeout, reconnection, queued-message disposal, and snapshot results.
+Receiver tests hold receipts, check both admission limits, and complete later messages first.
+No later receipt can pass an earlier incomplete message.
 Snapshot replies must still wait for the storage result.
 Ordinary receipts are not Raft acknowledgements.
 DST controls Raft message delivery directly.

@@ -27,6 +27,7 @@ The CLI and embedded API share the same lifecycle and runtime paths.
 | `state/diagnostic` | Execute the separate diagnostic keyspace API |
 | `mvcc` and `watch` | Define revision, transaction, history, and event semantics |
 | `storage`, `peer`, `tls`, and `object` | Bind durable logs, transport, security, and objects |
+| `peer/receive` | Bound incoming Raft work and return ordered processing receipts |
 
 Domain modules extend the same StateMachine. They do not add independent mutable state owners.
 The read view contains immutable metadata and a pinned SlateDB snapshot.

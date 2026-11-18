@@ -76,6 +76,8 @@ TiKV's wait settings are not defaults for this different storage engine and one 
 TiKV's [Raft client] collects messages into `BatchRaftMessage`.
 It limits batch count and estimated bytes and carries an overflow message into the next batch.
 The service now reuses a stream, but each stream frame still contains one Raft message.
+Its receiver pipelines bounded messages into Raft while earlier processing receipts wait.
+This exposes more work to the existing shared log writer without moving acknowledgement barriers.
 A bounded frame batch could reduce serialization, wakeups, and network calls.
 
 This is a candidate experiment, not a measured gain.
