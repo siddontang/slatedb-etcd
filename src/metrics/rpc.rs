@@ -47,13 +47,14 @@ struct Method {
     received: IntCounter,
     sent: IntCounter,
     handled: Vec<IntCounter>,
+    duration: Option<prometheus::Histogram>,
     shape: &'static str,
     current_client: IntCounter,
     unknown_client: IntCounter,
 }
 
 impl Observer {
-    pub fn new(registry: &Registry) -> Result<Self> {
+    pub fn new(registry: &Registry, level: crate::server::MetricsLevel) -> Result<Self> {
         let vector = |name, help, labels: &[&str]| -> Result<IntCounterVec> {
             let value = IntCounterVec::new(Opts::new(name, help), labels)?;
             registry.register(Box::new(value.clone()))?;
@@ -77,6 +78,19 @@ impl Observer {
             "Requests by client API version.",
             &["type", "client_api_version"],
         )?;
+        let duration = match level {
+            crate::server::MetricsLevel::Basic => None,
+            crate::server::MetricsLevel::Extensive => Some(super::state::register(
+                registry,
+                prometheus::HistogramVec::new(
+                    prometheus::HistogramOpts::new(
+                        "grpc_server_handling_seconds",
+                        "Duration of complete gRPC requests in seconds.",
+                    ),
+                    &labels,
+                )?,
+            )?),
+        };
         let mut methods = HashMap::new();
         let mut add = |service: &str, method: &str, shape| {
             let labels = [shape, service, method];
@@ -92,6 +106,7 @@ impl Observer {
                         "unknown",
                     ]),
                     started: started.with_label_values(&labels),
+                    duration: duration.as_ref().map(|vec| vec.with_label_values(&labels)),
                     received: received.with_label_values(&labels),
                     sent: sent.with_label_values(&labels),
                     handled: CODES
@@ -176,7 +191,10 @@ pub(super) async fn observe(
         return next.run(req).await;
     };
     method.started.inc();
-    let mut terminal = Completion(Some(method.clone()));
+    let mut terminal = Completion(Some((
+        method.clone(),
+        method.duration.as_ref().map(|_| std::time::Instant::now()),
+    )));
     let version = req
         .headers()
         .get("client-api-version")
@@ -279,12 +297,15 @@ impl ObservedBody {
     }
 }
 
-struct Completion(Option<Arc<Method>>);
+struct Completion(Option<(Arc<Method>, Option<std::time::Instant>)>);
 
 impl Completion {
     fn finish(&mut self, code: usize) {
-        if let Some(method) = self.0.take() {
+        if let Some((method, start)) = self.0.take() {
             method.handled[code].inc();
+            if let (Some(duration), Some(start)) = (&method.duration, start) {
+                duration.observe(start.elapsed().as_secs_f64());
+            }
         }
     }
 }

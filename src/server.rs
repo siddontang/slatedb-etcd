@@ -14,6 +14,14 @@ use crate::api::{router, ApiState};
 use crate::node::{Event, LogMemory, Node, NodeOptions};
 use crate::proto::etcdserverpb::{request_op, RangeRequest, RequestOp};
 
+/// Select the etcd Prometheus collection level.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum MetricsLevel {
+    #[default]
+    Basic,
+    Extensive,
+}
+
 /// Configuration for one member. Preserve its ID, cluster ID, and directory across restarts.
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -24,6 +32,7 @@ pub struct ServerConfig {
     pub peer_listen: Option<SocketAddr>,
     /// Extra HTTP or HTTPS listeners for Prometheus scrapes.
     pub listen_metrics_urls: Vec<String>,
+    pub metrics: MetricsLevel,
     pub peers: BTreeMap<u64, String>,
     pub client_peers: BTreeMap<u64, String>,
     pub allow_remote: bool,
@@ -50,6 +59,7 @@ impl ServerConfig {
             listen: address.parse().unwrap(),
             peer_listen: None,
             listen_metrics_urls: Vec::new(),
+            metrics: MetricsLevel::Basic,
             peers: BTreeMap::from([(1, address.into())]),
             client_peers: BTreeMap::from([(1, address.into())]),
             allow_remote: false,
@@ -247,7 +257,7 @@ impl Server {
             .clone()
             .fallback_service(grpc.clone().layer(axum::Extension(crate::tls::PeerServer)));
         let metrics_app = node.metrics.scrape_router(events.clone());
-        let grpc = node.metrics.routes(grpc, events.clone())?;
+        let grpc = node.metrics.routes(grpc, events.clone(), config.metrics)?;
         let client_app = if peer_listener.is_some() {
             grpc.layer(axum::Extension(crate::tls::ClientServer))
         } else {

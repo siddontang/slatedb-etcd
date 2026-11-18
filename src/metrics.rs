@@ -1,5 +1,7 @@
 //! Prometheus metrics for one embedded or standalone member.
 
+mod peer;
+pub(crate) use peer::PeerTraffic;
 mod rpc;
 mod state;
 pub(crate) use state::{Active, StateMeters, WatchMeters, Writes};
@@ -50,12 +52,6 @@ impl Wal {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct PeerTraffic {
-    pub sent: std::sync::atomic::AtomicU64,
-    pub received: std::sync::atomic::AtomicU64,
-}
-
 pub(crate) struct Member {
     registry: Registry,
     admin: Arc<slatedb::admin::Admin>,
@@ -82,7 +78,7 @@ pub struct Sample {
     pub(crate) compact: i64,
     pub(crate) auth_revision: u64,
     pub(crate) peers: Vec<(u64, bool)>,
-    pub(crate) traffic: Vec<(u64, u64, u64)>,
+    pub(crate) traffic: Vec<(u64, Arc<PeerTraffic>)>,
 }
 
 impl Member {
@@ -143,10 +139,11 @@ impl Member {
         self: &Arc<Self>,
         grpc: axum::Router,
         events: mpsc::Sender<Event>,
+        level: crate::server::MetricsLevel,
     ) -> Result<axum::Router> {
         let watch = Arc::new(WatchMeters::new(&self.registry)?);
         let grpc = grpc.layer(axum::Extension(watch));
-        let rpc = rpc::Observer::new(&self.registry)?;
+        let rpc = rpc::Observer::new(&self.registry, level)?;
         let grpc = grpc.layer(axum::middleware::from_fn_with_state(
             Arc::new(rpc),
             rpc::observe,
@@ -261,27 +258,7 @@ impl Sample {
             }
             registry.register(Box::new(gauge))?;
         }
-        let sent = prometheus::IntCounterVec::new(
-            Opts::new(
-                "etcd_network_peer_sent_bytes_total",
-                "Raft payload bytes accepted by the peer.",
-            ),
-            &["To"],
-        )?;
-        let received = prometheus::IntCounterVec::new(
-            Opts::new(
-                "etcd_network_peer_received_bytes_total",
-                "Received Raft payload bytes.",
-            ),
-            &["From"],
-        )?;
-        for (id, outgoing, incoming) in &self.traffic {
-            let label = format!("{id:x}");
-            sent.with_label_values(&[&label]).inc_by(*outgoing);
-            received.with_label_values(&[&label]).inc_by(*incoming);
-        }
-        registry.register(Box::new(sent))?;
-        registry.register(Box::new(received))?;
+        peer::collect(&id, &self.traffic, &registry)?;
         Ok(registry)
     }
 }

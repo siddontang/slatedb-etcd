@@ -51,6 +51,8 @@ Keep client and peer trust roots separate. See [security](../SECURITY.md).
 ## Monitoring
 
 Expose additional scrape listeners with `--listen-metrics-urls`.
+The default `--metrics basic` counts gRPC calls and messages.
+Select `--metrics extensive` to time calls by method.
 See the [metrics guide](metrics.md) for listener security and per-member metric coverage.
 
 ## Runtime

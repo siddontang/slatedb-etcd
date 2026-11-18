@@ -738,13 +738,7 @@ impl Node {
                     traffic: self
                         .traffic
                         .iter()
-                        .map(|(&id, m)| {
-                            (
-                                id,
-                                m.sent.load(std::sync::atomic::Ordering::Relaxed),
-                                m.received.load(std::sync::atomic::Ordering::Relaxed),
-                            )
-                        })
+                        .map(|(&id, meter)| (id, meter.clone()))
                         .collect(),
                     peers: self
                         .state
@@ -810,8 +804,12 @@ impl Node {
             } => {
                 if success {
                     self.peer_health.entry(peer).or_insert_with(Instant::now);
-                } else {
-                    self.peer_health.remove(&peer);
+                } else if self.peer_health.remove(&peer).is_some() {
+                    if let Some(meter) = self.traffic.get(&peer) {
+                        meter
+                            .disconnected
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 if snapshot {
                     self.raw.report_snapshot(
@@ -931,6 +929,9 @@ impl Node {
                     .get(&peer)
                     .is_some_and(|sender| sender.try_send(message).is_ok());
             if !sent {
+                if let Some(meter) = self.traffic.get(&peer) {
+                    meter.failed(1);
+                }
                 self.send_failures.push((peer, snapshot));
             }
         }

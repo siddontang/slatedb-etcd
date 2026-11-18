@@ -30,6 +30,9 @@ struct Args {
     /// Comma-separated HTTP or HTTPS listeners for Prometheus scrapes.
     #[arg(long, value_delimiter = ',')]
     listen_metrics_urls: Vec<String>,
+    /// Select extensive to measure gRPC handling duration by method.
+    #[arg(long, value_enum, default_value = "basic")]
+    metrics: slatedb_etcd::server::MetricsLevel,
     /// Advertised client URL. Repeat as --client-peer ID=URL.
     #[arg(long = "client-peer")]
     client_peers: Vec<String>,
@@ -118,6 +121,7 @@ async fn run(args: Args) -> Result<()> {
         listen: args.listen,
         peer_listen: args.peer_listen,
         listen_metrics_urls: args.listen_metrics_urls,
+        metrics: args.metrics,
         peers: parse_peers(args.peers)?,
         client_peers: parse_peers(args.client_peers)?,
         allow_remote: args.allow_remote,

@@ -7,8 +7,12 @@ The CLI and embedded API share the same lifecycle and runtime paths.
 
 | Module | Owner and responsibility |
 | --- | --- |
+| `metrics/rpc` | Count gRPC messages, status, and optional call duration |
+| `metrics/peer` | Measure send failures, disconnects, and peer round trips |
 | `server` | Start listeners, report readiness, and join workers at shutdown |
 | `grpc` | Validate public requests and encode etcd responses |
+| `grpc/forwarding` | Resolve peer channels and wait for local revision progress |
+| `node/forwarding` | Publish applied routes and the member revision |
 | `command` | Encode and decode internal Raft commands |
 | `node` | Own RawNode, admission, elections, and client completion |
 | `node/ready` | Order Ready delivery, durable completions, and peer acknowledgements |
