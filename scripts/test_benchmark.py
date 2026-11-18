@@ -18,6 +18,17 @@ spec.loader.exec_module(summary)
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_server_resources_exclude_the_client_for_each_cluster_size(self):
+        for members in (1, 3):
+            before = [(2, 200)] * (members + 1)
+            after = [(3, 300)] * members + [(12, 900)]
+            memory = [[row[1] for row in values] for values in (before, after)]
+            measured = benchmark.measured_resources(before, after, memory, members, 2, 100)
+            self.assertEqual(measured["process_cpu_seconds"], members)
+            self.assertEqual(measured["client_cpu_seconds"], 10)
+            self.assertEqual(measured["peak_process_rss_bytes"], members * 300)
+            self.assertEqual(measured["peak_client_rss_bytes"], 900)
+
     def test_cluster_addresses_are_distinct(self):
         ports = benchmark.addresses(6)
         self.assertEqual(len(ports), len(set(ports)))

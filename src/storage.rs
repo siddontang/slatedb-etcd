@@ -6,6 +6,13 @@ use raft::{GetEntriesContext, RaftState, Storage, StorageError};
 use raft_engine::{Command as EngineCommand, Config, Engine, LogBatch, MessageExt, ReadableSize};
 use serde::Serialize;
 
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos::FullSyncFileSystem as FileSystem;
+#[cfg(not(target_os = "macos"))]
+use raft_engine::env::DefaultFileSystem as FileSystem;
+
 const GROUP: u64 = 1;
 const HARD_STATE: &[u8] = b"hard-state";
 const SNAPSHOT: &[u8] = b"snapshot";
@@ -23,7 +30,7 @@ impl MessageExt for EntryCodec {
 
 /// Stores Raft metadata, log entries, and a full recovery snapshot on local disk.
 pub struct RaftStorage {
-    engine: Engine,
+    engine: Engine<FileSystem>,
     hard_state: HardState,
     snapshot: Snapshot,
     identity: Vec<u8>,
@@ -39,14 +46,15 @@ pub struct LogStats {
 
 impl RaftStorage {
     pub fn open(dir: &Path, node_id: u64, cluster_id: &str, voters: Vec<u64>) -> Result<Self> {
-        let engine = Engine::open(Config {
+        let config = Config {
             dir: dir.to_string_lossy().into_owned(),
             target_file_size: ReadableSize::kb(256),
             purge_threshold: ReadableSize::kb(512),
             batch_compression_threshold: ReadableSize(0),
             enable_log_recycle: false,
             ..Config::default()
-        })?;
+        };
+        let engine = Engine::open_with_file_system(config, std::sync::Arc::new(FileSystem))?;
         let identity = serde_json::to_vec(&(node_id, cluster_id, &voters))?;
         let stored = engine.get(GROUP, IDENTITY);
         let mut snapshot = engine

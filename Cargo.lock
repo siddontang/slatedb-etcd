@@ -3134,6 +3134,7 @@ dependencies = [
  "futures",
  "hyper-util",
  "jsonwebtoken",
+ "libc",
  "prost",
  "protobuf",
  "raft",
