@@ -87,11 +87,15 @@ impl StateMachine {
         }
         let last = puts.last().unwrap().index;
         batch.put(APPLIED, last.to_be_bytes());
-        crate::failpoint::hit("apply-batch-before-write");
+        if puts.len() > 1 {
+            crate::failpoint::hit("apply-batch-before-write");
+        }
         self.db
             .write_with_options(batch.into_storage(), &WriteOptions { seqnum: last })
             .await?;
-        crate::failpoint::hit("apply-batch-after-write");
+        if puts.len() > 1 {
+            crate::failpoint::hit("apply-batch-after-write");
+        }
         self.write_batches += 1;
         self.applied = last;
         self.revision = revision;

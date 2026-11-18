@@ -46,6 +46,7 @@ Commit-only progress does not require a device sync. Rust tests model loss of th
 Recovery requires a covering local log and rejects a state position beyond its entries.
 
 The state batch adds `apply-batch-before-write` and `apply-batch-after-write` crash boundaries.
+These hooks require at least two entries. Process tests stage a delayed multi-entry apply job.
 Repeated Put tests preserve each request's revision and Watch event across group recovery.
 The separate checkpoint cases cover before-save, after-save, and after-GC crashes.
 The snapshot cases also distinguish buffered state replacement from completed object flush.
