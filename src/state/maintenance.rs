@@ -286,7 +286,7 @@ pub(crate) fn record_hash(
                 ..Default::default()
             };
         }
-        batch.put(key, kv.encode_to_vec());
+        batch.put_new(key, kv.encode_to_vec());
     }
 }
 

@@ -10,7 +10,8 @@ With separate listeners, only the peer listener exposes these routes.
 | --- | --- |
 | `POST /kv` | Replicated diagnostic operations in a separate keyspace |
 | `POST /raft` | Internal Raft messages; use the service transport, not a manual request |
-| `GET /status` | Local identity, role, apply progress, disk use, and memory counters |
+| `GET /status` | Local identity, role, apply progress, queues, and memory counters |
+| `GET /debug/log-stats` | Read current Raft file names and sizes on the log worker |
 | `POST /checkpoint` | Build and persist a pinned state snapshot |
 | `GET /debug/value?key=KEY` | Read local diagnostic data without a quorum barrier |
 | `POST /debug/partition` | Drop traffic to the listed peer IDs in both directions |

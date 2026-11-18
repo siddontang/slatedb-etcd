@@ -24,10 +24,10 @@ const APPLIED: &[u8] = b"meta/applied";
 const DATA: &[u8] = b"data/";
 
 #[derive(Deserialize, Serialize)]
-struct SnapshotData {
+struct SnapshotData<K = Vec<u8>, V = Vec<u8>> {
     version: u32,
     applied: u64,
-    rows: Vec<(Vec<u8>, Vec<u8>)>,
+    rows: Vec<(K, V)>,
 }
 
 pub struct StateMachine {
@@ -153,17 +153,6 @@ impl StateMachine {
             .close_with_options(slatedb::config::CloseOptions { flush_type: None })
             .await?;
         Ok(())
-    }
-
-    pub fn snapshot_conf(bytes: &[u8]) -> Result<Option<raft::eraftpb::ConfState>> {
-        let data: SnapshotData = bincode::deserialize(bytes)?;
-        for (key, value) in data.rows {
-            if key == crate::cluster::KEY {
-                let members: crate::cluster::Store = serde_json::from_slice(&value)?;
-                return Ok(Some(members.conf()));
-            }
-        }
-        Ok(None)
     }
 
     pub async fn apply_cluster(
@@ -624,10 +613,13 @@ impl StateMachine {
             let mut rows = vec![];
             let mut iterator = snapshot.scan_prefix(b"", ..).await?;
             while let Some(row) = iterator.next().await? {
-                rows.push((row.key.to_vec(), row.value.to_vec()));
+                rows.push((row.key, row.value));
             }
-            rows.retain(|(key, _)| key != crate::cluster::KEY);
-            rows.push((crate::cluster::KEY.to_vec(), members));
+            rows.retain(|(key, _)| key.as_ref() != crate::cluster::KEY);
+            rows.push((
+                bytes::Bytes::from_static(crate::cluster::KEY),
+                members.into(),
+            ));
             Ok(bincode::serialize(&SnapshotData {
                 version: 2,
                 applied,

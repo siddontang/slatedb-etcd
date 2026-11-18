@@ -18,6 +18,10 @@ spec.loader.exec_module(summary)
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_cluster_addresses_are_distinct(self):
+        ports = benchmark.addresses(6)
+        self.assertEqual(len(ports), len(set(ports)))
+
     def test_cpu_formats_and_process_order(self):
         self.assertEqual(benchmark.parse_cpu("03:04.50"), 184.5)
         self.assertEqual(benchmark.parse_cpu("02:03:04"), 7384)

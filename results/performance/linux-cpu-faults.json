@@ -1,0 +1,62 @@
+{
+  "created_at": "2026-11-18T01:01:32.989471+00:00",
+  "binary_sha256": "c9a307011997aea784ad6b3b359fc2b9f30ef6b216cfa117473d6807955c3f8f",
+  "reference_etcd": "3.6.5",
+  "client": "go.etcd.io/etcd/client/v3 v3.6.5",
+  "go": "go version go1.25.6 linux/arm64",
+  "deployment": "three local service processes; one embedded reference etcd",
+  "suite": "compat",
+  "command": [
+    "go",
+    "test",
+    "-mod=readonly",
+    "-json",
+    "-count=1",
+    "-timeout=30m",
+    "-run",
+    "^Test(ReadIndex|ForwardedWrite|SlowLog|LogWrite|SlowCheckpoint)",
+    "./..."
+  ],
+  "profile": "supported-capabilities",
+  "log": "<repo>/tmp/test-results/linux-faults.jsonl",
+  "tests": [
+    {
+      "name": "TestForwardedWriteWaitsForLocalApply",
+      "result": "pass",
+      "seconds": 4.66
+    },
+    {
+      "name": "TestReadIndexAndNestedReadTxnDoNotWriteLogs",
+      "result": "pass",
+      "seconds": 1.1
+    },
+    {
+      "name": "TestReadIndexRejectsMinorityLeader",
+      "result": "pass",
+      "seconds": 5.48
+    },
+    {
+      "name": "TestSlowLogKeepsRaftLiveAndFencesReplies",
+      "result": "pass",
+      "seconds": 3.55
+    },
+    {
+      "name": "TestLogWriteFailureStopsNodeAndRecoversAcknowledgedState",
+      "result": "pass",
+      "seconds": 1.97
+    },
+    {
+      "name": "TestSlowCheckpointPublicationKeepsRaftLive",
+      "result": "pass",
+      "seconds": 4.41
+    }
+  ],
+  "counts": {
+    "pass": 6
+  },
+  "leaf_counts": {
+    "pass": 6
+  },
+  "passed": true,
+  "complete": true
+}

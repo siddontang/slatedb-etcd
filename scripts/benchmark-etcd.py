@@ -2,6 +2,7 @@
 """Compare three-member services with one gRPC workload and separate resource phases."""
 
 import argparse
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -20,10 +21,17 @@ from reporting import write_report
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def address():
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        return "127.0.0.1:" + str(listener.getsockname()[1])
+def addresses(count):
+    listeners = []
+    try:
+        for _ in range(count):
+            listener = socket.socket()
+            listeners.append(listener)
+            listener.bind(("127.0.0.1", 0))
+        return ["127.0.0.1:" + str(listener.getsockname()[1]) for listener in listeners]
+    finally:
+        for listener in listeners:
+            listener.close()
 
 
 def parse_cpu(value):
@@ -63,10 +71,11 @@ def wait_file(path, processes, deadline):
         time.sleep(0.005)
 
 
-def run_sample(args, tools, binary, kind, concurrency, reads, repeat):
+def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=None):
     with tempfile.TemporaryDirectory(prefix="slatedb-bench-") as directory:
         root = Path(directory)
-        clients, peers = [address() for _ in range(3)], [address() for _ in range(3)]
+        ports = addresses(6)
+        clients, peers = ports[:3], ports[3:]
         processes, logs = [], []
         driver = None
         stop = threading.Event()
@@ -113,29 +122,30 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat):
             all_processes = processes + [driver]
             deadline = time.monotonic() + args.timeout_seconds
             wait_file(root / "ready", all_processes, deadline)
-            before = resources(all_processes)
-            sample["startup_preload_warmup_server_cpu_seconds"] = sum(row[0] for row in before[:3])
-            sample["server_rss_after_warmup_bytes"] = sum(row[1] for row in before[:3])
-            memory.append([row[1] for row in before])
+            with observer(processes) if observer else nullcontext():
+                before = resources(all_processes)
+                sample["startup_preload_warmup_server_cpu_seconds"] = sum(row[0] for row in before[:3])
+                sample["server_rss_after_warmup_bytes"] = sum(row[1] for row in before[:3])
+                memory.append([row[1] for row in before])
 
-            def sample_memory():
-                while not stop.wait(0.1):
-                    try:
-                        memory.append([row[1] for row in resources(all_processes)])
-                    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-                        resource_errors.append(str(error))
-                        return
+                def sample_memory():
+                    while not stop.wait(0.1):
+                        try:
+                            memory.append([row[1] for row in resources(all_processes)])
+                        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                            resource_errors.append(str(error))
+                            return
 
-            sampler = threading.Thread(target=sample_memory)
-            sampler.start()
-            (root / "start").touch()
-            wait_file(root / "done", all_processes, deadline)
-            after = resources(all_processes)
-            memory.append([row[1] for row in after])
-            stop.set()
-            sampler.join()
-            (root / "finish").touch()
-            code = driver.wait(timeout=10)
+                sampler = threading.Thread(target=sample_memory)
+                sampler.start()
+                (root / "start").touch()
+                wait_file(root / "done", all_processes, deadline)
+                after = resources(all_processes)
+                memory.append([row[1] for row in after])
+                stop.set()
+                sampler.join()
+                (root / "finish").touch()
+                code = driver.wait(timeout=10)
             sample.update(json.loads(result_path.read_text()))
             sample["passed"] &= code == 0 and not resource_errors and all(p.poll() is None for p in processes)
             cpu = [max(0, end[0]-start[0]) for start, end in zip(before, after)]

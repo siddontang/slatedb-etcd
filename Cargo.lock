@@ -3128,6 +3128,7 @@ dependencies = [
  "axum 0.8.9",
  "bcrypt",
  "bincode",
+ "bytes",
  "clap",
  "crc32c",
  "futures",

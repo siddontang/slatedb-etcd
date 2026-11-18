@@ -133,8 +133,12 @@ func TestForwardedWriteWaitsForLocalApply(t *testing.T) {
 	}()
 	require.Eventually(t, func() bool {
 		state, err := c.http(follower, "/status", nil)
-		return err == nil && state["commit_index"].(float64) > state["applied_index"].(float64)
+		return err == nil && state["commit_index"].(float64) > state["applied_index"].(float64) &&
+			state["pending_revision_waiters"].(float64) > 0
 	}, time.Second, 10*time.Millisecond)
+	state, err := c.http(follower, "/status", nil)
+	require.NoError(t, err)
+	require.Zero(t, state["pending_read_indexes"].(float64))
 	select {
 	case reply := <-replies:
 		t.Fatalf("forwarded write returned before local apply: %v", reply)
@@ -149,4 +153,11 @@ func TestForwardedWriteWaitsForLocalApply(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, result.Kvs, 1)
 	require.Equal(t, "value", string(result.Kvs[0].Value))
+	c.stop(follower)
+	c.start(follower)
+	recovered, err := api.Get(ctx, "forwarded-barrier")
+	require.NoError(t, err)
+	require.Len(t, recovered.Kvs, 1)
+	require.Equal(t, "value", string(recovered.Kvs[0].Value))
+
 }

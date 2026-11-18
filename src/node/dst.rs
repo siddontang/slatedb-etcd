@@ -19,6 +19,12 @@ struct ReadRequest {
     reply: oneshot::Receiver<Result<Value, ApiError>>,
 }
 
+struct RevisionRequest {
+    node: u64,
+    revision: i64,
+    reply: oneshot::Receiver<Result<Value, ApiError>>,
+}
+
 struct Simulation {
     seed: u64,
     root: tempfile::TempDir,
@@ -29,6 +35,8 @@ struct Simulation {
     requests: Vec<ClientRequest>,
     reads: Vec<ReadRequest>,
     read_count: usize,
+    revisions: Vec<RevisionRequest>,
+    revision_count: usize,
     acknowledged: BTreeMap<String, String>,
     committed_entries: BTreeMap<u64, Vec<u8>>,
     terms: BTreeMap<u64, u64>,
@@ -68,6 +76,8 @@ impl Simulation {
             requests: vec![],
             reads: vec![],
             read_count: 0,
+            revisions: vec![],
+            revision_count: 0,
             acknowledged: BTreeMap::new(),
             committed_entries: BTreeMap::new(),
             terms: BTreeMap::new(),
@@ -223,7 +233,17 @@ impl Simulation {
             match request.reply.try_recv() {
                 Ok(Ok(reply)) => {
                     let result: Outcome = serde_json::from_value(reply).unwrap();
-                    result.result.unwrap();
+                    let mut result = result.result.unwrap();
+                    let revision = crate::mvcc::response_header(&mut result).unwrap().revision;
+                    for (&id, node) in &mut self.nodes {
+                        let (tx, rx) = oneshot::channel();
+                        node.wait_revision(revision, tx);
+                        self.revisions.push(RevisionRequest {
+                            node: id,
+                            revision,
+                            reply: rx,
+                        });
+                    }
                     self.trace.push(format!("ack {}", request.key));
                     self.acknowledged.insert(request.key, request.value);
                 }
@@ -259,6 +279,25 @@ impl Simulation {
             }
         }
         self.reads = pending_reads;
+        self.revisions
+            .retain_mut(|request| match request.reply.try_recv() {
+                Ok(Ok(_)) => {
+                    if let Some(node) = self.nodes.get(&request.node) {
+                        assert!(
+                            node.state.revision >= request.revision,
+                            "revision barrier preceded local apply"
+                        );
+                    }
+                    self.trace.push(format!(
+                        "revision ack {} {}",
+                        request.node, request.revision
+                    ));
+                    self.revision_count += 1;
+                    false
+                }
+                Ok(Err(_)) | Err(oneshot::error::TryRecvError::Closed) => false,
+                Err(oneshot::error::TryRecvError::Empty) => true,
+            });
         let mut leaders = BTreeMap::new();
         for (&id, node) in &self.nodes {
             let term = node.raw.raft.term;
@@ -401,23 +440,33 @@ impl Simulation {
             return;
         }
         let id = candidates[self.choose(candidates.len())];
-        let (tx, rx) = oneshot::channel();
-        self.nodes.get_mut(&id).unwrap().linear_read(
-            RequestOp {
-                request: Some(Op::RequestRange(RangeRequest {
-                    key: b"key-".to_vec(),
-                    range_end: b"key.".to_vec(),
-                    ..Default::default()
-                })),
-            },
-            tx,
-        );
-        self.trace.push(format!("read {id}"));
-        self.reads.push(ReadRequest {
-            node: id,
-            known: self.acknowledged.clone(),
-            reply: rx,
-        });
+        let count = self.choose(6) + 3;
+        for offset in 0..count {
+            let (tx, rx) = oneshot::channel();
+            let node = self.nodes.get_mut(&id).unwrap();
+            node.linear_read(
+                RequestOp {
+                    request: Some(Op::RequestRange(RangeRequest {
+                        key: b"key-".to_vec(),
+                        range_end: b"key.".to_vec(),
+                        ..Default::default()
+                    })),
+                },
+                tx,
+            );
+            // Issue one batch, cancel its first client, then queue later reads.
+            if offset == 1 {
+                node.drive_ready().await.unwrap();
+                self.reads.pop();
+                self.trace.push(format!("cancel read {id}"));
+            }
+            self.trace.push(format!("read {id}"));
+            self.reads.push(ReadRequest {
+                node: id,
+                known: self.acknowledged.clone(),
+                reply: rx,
+            });
+        }
         self.drive().await;
     }
 
@@ -431,6 +480,7 @@ impl Simulation {
             node.handle(
                 Event::SnapshotBuilt {
                     index,
+                    conf: node.worker.state().members.conf(),
                     result: Ok(data),
                 },
                 &mut vec![],
@@ -452,6 +502,7 @@ impl Simulation {
         let first = node.raw.store().first_index().unwrap();
         store.set(PAUSE_PUT);
         let index = node.state.applied;
+        let conf = node.worker.state().members.conf();
         let job = tokio::spawn(node.worker.state().snapshot_job().unwrap());
         tokio::time::timeout(Duration::from_secs(10), store.entered.acquire())
             .await
@@ -477,6 +528,7 @@ impl Simulation {
                 .handle(
                     Event::SnapshotBuilt {
                         index,
+                        conf,
                         result: Ok(data),
                     },
                     &mut vec![],
@@ -1021,6 +1073,10 @@ impl Simulation {
         assert!(
             sim.read_count >= 5,
             "seed {seed}: insufficient read index checks"
+        );
+        assert!(
+            sim.revision_count >= 10,
+            "seed {seed}: insufficient revision barriers"
         );
         let snapshots = sim.installed_snapshots
             + sim

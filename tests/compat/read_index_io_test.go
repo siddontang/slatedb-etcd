@@ -218,7 +218,7 @@ func TestSlowCheckpointPublicationKeepsRaftLive(t *testing.T) {
 	go func() { _, err := c.http(leader, "/checkpoint", map[string]any{}); checkpoint <- err }()
 	require.Eventually(t, func() bool {
 		state, err := c.http(leader, "/status", nil)
-		return err == nil && state["log_busy"] == true && state["queued_log_bytes"].(float64) > 0
+		return err == nil && state["log_busy"] == true && state["queued_snapshot_bytes"].(float64) > 0
 	}, time.Second, 10*time.Millisecond)
 	for n := 0; n < 10; n++ {
 		state, err := c.http(leader, "/status", nil)

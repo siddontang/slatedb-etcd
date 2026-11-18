@@ -277,7 +277,7 @@ async fn snapshot_import_requires_the_current_format() {
     use sha2::{Digest, Sha256};
     let dir = tempfile::tempdir().unwrap();
     let mut state = StateMachine::open(&dir.path().join("state")).await.unwrap();
-    let data = SnapshotData {
+    let data: SnapshotData = SnapshotData {
         version: 1,
         applied: 1,
         rows: vec![],
@@ -353,5 +353,27 @@ async fn warm_reads_use_the_state_cache_and_observe_new_versions() {
     };
     assert_eq!(response.kvs[0].value, b"second");
     check(&state).await;
+    state.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn append_accounting_keeps_original_absence_through_batch_rewrites() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut batch = WriteBatch::new();
+    batch.put_new(b"etcd/new", b"temporary");
+    batch.delete(b"etcd/new");
+    batch.put(b"etcd/new", b"final");
+    batch.put_new(b"etcd/deleted", b"gone");
+    batch.delete(b"etcd/deleted");
+    state.write_batch(batch, 1).await.unwrap();
+    check(&state).await;
+    assert_eq!(state.logical_bytes, 13);
+    let mut batch = WriteBatch::new();
+    batch.put(b"etcd/new", b"replace");
+    batch.delete(b"etcd/new");
+    state.write_batch(batch, 2).await.unwrap();
+    check(&state).await;
+    assert_eq!(state.logical_bytes, 0);
     state.close().await.unwrap();
 }

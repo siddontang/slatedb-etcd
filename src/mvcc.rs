@@ -581,7 +581,7 @@ pub async fn prepare(
             revision: next,
             value,
         };
-        batch.put(
+        batch.put_new(
             history_key,
             bincode::serialize(&version).map_err(KvError::storage)?,
         );
@@ -702,7 +702,7 @@ pub(crate) async fn revoke_keys(
         batch.delete(current_key(&key));
         let mut history_key = history_prefix(&key);
         history_key.extend_from_slice(&next.to_be_bytes());
-        batch.put(
+        batch.put_new(
             history_key,
             bincode::serialize(&Version {
                 key,

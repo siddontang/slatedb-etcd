@@ -1,0 +1,99 @@
+{
+  "passed": true,
+  "aggregation": "median, min, and max across repeats; no pooled percentiles",
+  "groups": [
+    {
+      "backend": "etcd",
+      "concurrency": 8,
+      "read_percent": 0,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 20000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 9103.14770612214,
+          "min": 8978.518252219657,
+          "max": 9390.638875057768
+        },
+        "p50_ms": {
+          "median": 0.87359,
+          "min": 0.822089,
+          "max": 0.879673
+        },
+        "p99_ms": {
+          "median": 1.888722,
+          "min": 1.790805,
+          "max": 1.993307
+        },
+        "server_cpu_us_per_op": {
+          "median": 177.0,
+          "min": 169.5,
+          "max": 180.0
+        },
+        "average_server_cpu_cores": {
+          "median": 1.6112571439836185,
+          "min": 1.5917132893222918,
+          "max": 1.6161332853995383
+        },
+        "peak_server_rss_mib": {
+          "median": 171.8125,
+          "min": 170.84765625,
+          "max": 172.41015625
+        },
+        "client_cpu_us_per_op": {
+          "median": 48.50000000000001,
+          "min": 44.99999999999999,
+          "max": 49.00000000000001
+        }
+      }
+    },
+    {
+      "backend": "service",
+      "concurrency": 8,
+      "read_percent": 0,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 20000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 2542.181500223459,
+          "min": 2532.3717682556344,
+          "max": 2543.6114338801403
+        },
+        "p50_ms": {
+          "median": 2.64477,
+          "min": 2.630186,
+          "max": 2.662562
+        },
+        "p99_ms": {
+          "median": 15.43099,
+          "min": 13.907184,
+          "max": 16.75392
+        },
+        "server_cpu_us_per_op": {
+          "median": 1048.0,
+          "min": 1041.0,
+          "max": 1051.0
+        },
+        "average_server_cpu_cores": {
+          "median": 2.653925613131905,
+          "min": 2.6464109417326207,
+          "max": 2.6733356170080276
+        },
+        "peak_server_rss_mib": {
+          "median": 644.39453125,
+          "min": 644.1328125,
+          "max": 658.82421875
+        },
+        "client_cpu_us_per_op": {
+          "median": 55.0,
+          "min": 54.0,
+          "max": 56.5
+        }
+      }
+    }
+  ],
+  "source_sha256": "8bc1d1647227d3394e3293f63206e27fcf48fa5f9cf6d658c4eac538206cefed"
+}

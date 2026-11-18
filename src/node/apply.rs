@@ -251,6 +251,7 @@ impl Executor {
             },
             Job::Checkpoint(delay) => {
                 let index = self.state.applied;
+                let conf = self.state.members.conf();
                 let job = self.state.snapshot_job()?;
                 let events = self.events.clone();
                 self.snapshot_task = Some(tokio::spawn(async move {
@@ -258,7 +259,13 @@ impl Executor {
                         tokio::time::sleep(delay).await;
                     }
                     let result = job.await;
-                    let _ = events.send(Event::SnapshotBuilt { index, result }).await;
+                    let _ = events
+                        .send(Event::SnapshotBuilt {
+                            index,
+                            conf,
+                            result,
+                        })
+                        .await;
                 }));
                 Output::Checkpoint
             }
