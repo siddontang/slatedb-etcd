@@ -63,6 +63,15 @@ def resources(processes):
     return [rows[p.pid] for p in processes]
 
 
+def linux_io(processes):
+    rows = []
+    for process in processes:
+        lines = Path(f"/proc/{process.pid}/io").read_text().splitlines()
+        counters = dict(line.split(": ") for line in lines)
+        rows.append((int(counters["read_bytes"]), int(counters["write_bytes"])))
+    return rows
+
+
 def wait_file(path, processes, deadline):
     while not path.exists():
         if any(p.poll() is not None for p in processes):
@@ -77,7 +86,10 @@ def measured_resources(before, after, memory, members, seconds, successes):
         raise ValueError("Resource samples must contain all servers and one client")
     cpu = [max(0, end[0] - start[0]) for start, end in zip(before, after)]
     server_cpu = sum(cpu[:members])
-    return dict(process_cpu_seconds=server_cpu, client_cpu_seconds=cpu[members],
+    return dict(member_resources=[
+                    dict(member=i + 1, cpu_seconds=cpu[i], peak_rss_bytes=max(row[i] for row in memory))
+                    for i in range(members)],
+                process_cpu_seconds=server_cpu, client_cpu_seconds=cpu[members],
                 average_server_cpu_cores=server_cpu / seconds,
                 server_cpu_microseconds_per_success=server_cpu * 1e6 / max(1, successes),
                 peak_process_rss_bytes=max(sum(row[:members]) for row in memory),
@@ -146,6 +158,7 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
             driver = subprocess.Popen([str(tools / "benchmark"), "--endpoints", ",".join(clients),
                 "--requests", str(args.read_requests if reads == 100 and args.read_requests else args.requests), "--keys", str(args.keys), "--value-size", str(args.value_size),
                 "--concurrency", str(concurrency), "--read-percent", str(reads), "--warmup", str(args.warmup),
+                "--rate", str(getattr(args, "rate", 0)),
                 "--seed", str(args.seed+repeat), "--control-dir", str(root), "--output", str(result_path)],
                 stdout=log, stderr=log)
             all_processes = processes + [driver]
@@ -156,6 +169,9 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
             # Give both backends one idle second after preload and warmup.
             time.sleep(1)
             with observer(processes) if observer else nullcontext():
+                linux = platform.system() == "Linux"
+                if linux:
+                    io_before = linux_io(processes)
                 before = resources(all_processes)
                 sample["startup_preload_warmup_server_cpu_seconds"] = sum(row[0] for row in before[:members])
                 sample["server_rss_after_warmup_bytes"] = sum(row[1] for row in before[:members])
@@ -174,6 +190,11 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
                 (root / "start").touch()
                 wait_file(root / "done", all_processes, deadline)
                 after = resources(all_processes)
+                if linux:
+                    io_after = linux_io(processes)
+                    sample["member_storage_io_bytes"] = [
+                        {"member": i + 1, "read": end[0] - start[0], "write": end[1] - start[1]}
+                        for i, (start, end) in enumerate(zip(io_before, io_after))]
                 memory.append([row[1] for row in after])
                 stop.set()
                 sampler.join()
@@ -217,6 +238,7 @@ def main():
                         help="Override the current service's async worker count")
     parser.add_argument("--requests", type=int, default=10000)
     parser.add_argument("--read-requests", type=int, help="Separate request count for read-only samples")
+    parser.add_argument("--rate", type=int, default=0, help="Target operations per second; zero runs at capacity")
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 8, 32])
     parser.add_argument("--read-percent", type=int, nargs="+", default=[0, 50, 100])
     parser.add_argument("--keys", type=int, default=1000)
@@ -240,6 +262,8 @@ def main():
     if min(args.requests, args.keys, args.value_size, args.timeout_seconds, args.repeat,
            args.snapshot_entries, args.quota_bytes, *args.concurrency) < 1 or args.warmup < 0:
         parser.error("Counts, sizes, quotas, and timeouts must be positive; warmup can be zero")
+    if args.rate < 0:
+        parser.error("Rate must be nonnegative")
     if args.service_runtime_workers is not None and args.service_runtime_workers < 1:
         parser.error("Service runtime workers must be positive")
     if args.read_requests is not None and args.read_requests < 1:
@@ -261,7 +285,7 @@ def main():
     report = {"schema_version": 2, "passed": False, "complete": False, "samples": [],
               "created_at": datetime.now(timezone.utc).isoformat(), "expected_samples": expected,
               "platform": platform.system(), "architecture": platform.machine(), "logical_cpus": os.cpu_count(),
-              "members": args.members,
+              "members": args.members, "target_ops_per_second": args.rate,
               "service_runtime_workers": args.service_runtime_workers,
               "baseline_concurrency": args.baseline_concurrency,
               "settle_seconds_after_warmup": 1,
@@ -270,7 +294,7 @@ def main():
               "raft_snapshot_entries": args.snapshot_entries, "quota_bytes": args.quota_bytes,
               "order_seed": args.seed, "binaries": {},
               "resource_phases": "CPU deltas and peak RSS cover only the measured phase; retained preload memory remains",
-              "limits": "closed loop; warm keys; host page cache is not cleared; RSS is not unique physical memory; "
+              "limits": "bounded concurrency; warm keys; host page cache is not cleared; RSS is not unique physical memory; "
                         "ps CPU precision and controller barriers affect short samples; no capacity or cross-AZ claim"}
     report["host_memory_bytes"] = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     if platform.system() == "Darwin":

@@ -25,6 +25,8 @@ class BenchmarkTests(unittest.TestCase):
             memory = [[row[1] for row in values] for values in (before, after)]
             measured = benchmark.measured_resources(before, after, memory, members, 2, 100)
             self.assertEqual(measured["process_cpu_seconds"], members)
+            self.assertEqual(measured["member_resources"], [
+                dict(member=i + 1, cpu_seconds=1, peak_rss_bytes=300) for i in range(members)])
             self.assertEqual(measured["client_cpu_seconds"], 10)
             self.assertEqual(measured["peak_process_rss_bytes"], members * 300)
             self.assertEqual(measured["peak_client_rss_bytes"], 900)
@@ -61,6 +63,11 @@ class BenchmarkTests(unittest.TestCase):
              patch.object(benchmark.os, "sysconf", side_effect=[100, 4096]), \
              patch.object(Path, "read_text", return_value=row):
             self.assertEqual(benchmark.resources([SimpleNamespace(pid=10)]), [(0.05, 28672)])
+
+    def test_linux_storage_io_uses_bytes_charged_by_the_kernel(self):
+        sample = "rchar: 9000\nwchar: 8000\nread_bytes: 4096\nwrite_bytes: 8192\n"
+        with patch.object(Path, "read_text", return_value=sample):
+            self.assertEqual(benchmark.linux_io([SimpleNamespace(pid=5)]), [(4096, 8192)])
 
     def test_missing_process_does_not_become_zero_usage(self):
         result = SimpleNamespace(stdout="10 00:01 100\n")

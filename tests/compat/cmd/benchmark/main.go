@@ -57,6 +57,7 @@ func main() {
 	endpoints := flag.String("endpoints", "", "Comma-separated client endpoints")
 	requests := flag.Int("requests", 10000, "Measured operations")
 	concurrency := flag.Int("concurrency", 8, "Concurrent requests")
+	rate := flag.Int("rate", 0, "Target operations per second during measurement; zero runs at capacity")
 	reads := flag.Int("read-percent", 50, "Linearizable read percentage")
 	keys := flag.Int("keys", 1000, "Preloaded keys")
 	size := flag.Int("value-size", 256, "Value size in bytes")
@@ -65,7 +66,7 @@ func main() {
 	control := flag.String("control-dir", "", "Optional controller barrier directory")
 	output := flag.String("output", "", "JSON result file")
 	flag.Parse()
-	if *endpoints == "" || *requests < 1 || *concurrency < 1 || *keys < 1 || *size < 1 || *warmup < 0 || *reads < 0 || *reads > 100 {
+	if *endpoints == "" || *requests < 1 || *rate < 0 || *concurrency < 1 || *keys < 1 || *size < 1 || *warmup < 0 || *reads < 0 || *reads > 100 {
 		fmt.Fprintln(os.Stderr, "invalid benchmark arguments")
 		os.Exit(2)
 	}
@@ -123,6 +124,7 @@ func main() {
 	failures := make([]string, *requests)
 	var next atomic.Int64
 	var wg sync.WaitGroup
+	var measurementStart time.Time
 	start := make(chan struct{})
 	for worker := 0; worker < *concurrency; worker++ {
 		wg.Add(1)
@@ -135,6 +137,11 @@ func main() {
 					return
 				}
 				began := time.Now()
+				if *rate > 0 {
+					// Include time spent waiting for a free worker after the scheduled arrival.
+					began = measurementStart.Add(time.Duration(float64(i) / float64(*rate) * float64(time.Second)))
+					time.Sleep(time.Until(began))
+				}
 				err := operation(i)
 				durations[i] = float64(time.Since(began).Nanoseconds()) / 1e6
 				if err != nil {
@@ -146,10 +153,10 @@ func main() {
 	if err := barrier(*control, "ready", "start"); err != nil {
 		panic(err)
 	}
-	began := time.Now()
+	measurementStart = time.Now()
 	close(start)
 	wg.Wait()
-	elapsed := time.Since(began).Seconds()
+	elapsed := time.Since(measurementStart).Seconds()
 	if err := barrier(*control, "done", "finish"); err != nil {
 		panic(err)
 	}
@@ -173,11 +180,11 @@ func main() {
 	report := map[string]any{"passed": len(samples) == *requests, "requests": *requests,
 		"successes": len(samples), "errors": errors, "concurrency": *concurrency,
 		"read_percent": *reads, "read_requests": readCount, "write_requests": *requests - readCount,
-		"keys": *keys, "value_bytes": *size, "warmup_operations": *warmup, "seed": *seed,
+		"keys": *keys, "value_bytes": *size, "warmup_operations": *warmup, "seed": *seed, "target_ops_per_second": *rate,
 		"seconds": elapsed, "successful_ops_per_second": float64(len(samples)) / elapsed,
 		"latency_ms": percentiles(samples), "read_latency_ms": percentiles(getSamples),
 		"write_latency_ms": percentiles(putSamples),
-		"model":            "closed loop; seeded uniform keys and read selection; latency includes successful operations only"}
+		"model":            "bounded concurrency; seeded uniform keys and reads; paced latency starts at the scheduled arrival"}
 	data, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
 		panic(err)
