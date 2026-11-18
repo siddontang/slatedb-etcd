@@ -656,6 +656,8 @@ async fn forwarded_revision_waits_for_apply_without_a_new_quorum_round() {
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
     let (tx, mut reply) = oneshot::channel();
+    let view = node.forwarding.subscribe();
+    assert!(!view.applied(revision));
     node.wait_revision(revision, tx);
     assert!(reply.try_recv().is_err());
     assert!(node.reads.is_empty());
@@ -664,6 +666,7 @@ async fn forwarded_revision_waits_for_apply_without_a_new_quorum_round() {
     node.drain_apply().await.unwrap();
     assert!(reply.await.unwrap().is_ok());
     assert_eq!(node.state.revision, revision);
+    assert!(view.applied(revision));
 
     let mut pending = vec![];
     for _ in 0..apply::MAX_QUERIES {
@@ -1283,4 +1286,68 @@ async fn independent_read_jobs_and_queue_have_separate_bounds() {
     for rx in replies {
         assert!(rx.await.unwrap().unwrap().result.is_ok());
     }
+}
+
+#[tokio::test]
+async fn forwarding_uses_live_membership_and_stops_with_its_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = options(dir.path());
+    let (events, mut receiver) = mpsc::channel(4);
+    let service = crate::grpc::Service::new(
+        1,
+        events.clone(),
+        &config.peers,
+        crate::auth::TokenIssuer::parse("simple").unwrap(),
+        config.transport.clone(),
+    )
+    .unwrap();
+    let mut node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    let (first, ()) = tokio::join!(service.peer_channel(2), async {
+        let event = receiver.recv().await.unwrap();
+        node.handle(event, &mut vec![]).await.unwrap();
+    });
+    first.unwrap();
+    assert!(service.wait_revision(node.state.revision).await.is_ok());
+    assert!(receiver.try_recv().is_err());
+    std::sync::Arc::make_mut(&mut node.state.members)
+        .members
+        .remove(&2);
+    node.sync_members();
+    assert_eq!(
+        service.peer_channel(2).await.unwrap_err().code(),
+        tonic::Code::Unavailable
+    );
+    let mut member = node.state.members.members[&3].clone();
+    member.id = 2;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    member.peer_ur_ls = vec![format!("http://{}", listener.local_addr().unwrap())];
+    std::sync::Arc::make_mut(&mut node.state.members)
+        .members
+        .insert(2, member);
+    node.sync_members();
+    let mut client =
+        tonic_health::pb::health_client::HealthClient::new(service.peer_channel(2).await.unwrap());
+    let request = tokio::spawn(async move {
+        client
+            .check(tonic_health::pb::HealthCheckRequest::default())
+            .await
+    });
+    let (connection, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(connection);
+    request.abort();
+    assert!(receiver.try_recv().is_err());
+    drop(receiver);
+    assert_eq!(
+        service
+            .wait_revision(node.state.revision)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unavailable
+    );
 }

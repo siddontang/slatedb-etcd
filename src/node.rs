@@ -19,10 +19,12 @@ mod apply;
 mod cache;
 pub use cache::LogMemory;
 mod cluster;
+mod forwarding;
 mod lease;
 mod log;
 mod maintenance;
 mod proposal;
+pub use forwarding::ForwardView;
 mod quorum_put;
 mod read;
 mod ready;
@@ -48,7 +50,7 @@ pub enum Event {
     AuthLookup(String, Response),
     Maintenance(crate::maintenance::Command, Response),
     Cluster(crate::cluster::Command, Response),
-    PeerAddress(u64, Response),
+    SubscribeForwarding(oneshot::Sender<ForwardView>),
     Propose(Request, Response),
     Kv(RequestOp, KvResponse),
     EtcdPropose(RequestOp, Response),
@@ -132,6 +134,7 @@ pub struct Node {
     last_observed_leader: u64,
     traffic: BTreeMap<u64, std::sync::Arc<crate::metrics::PeerTraffic>>,
     applied_notify: tokio::sync::watch::Sender<u64>,
+    forwarding: forwarding::Publisher,
     transfers: Vec<(u64, Instant, Response)>,
     published_at: Option<Instant>,
     events: mpsc::Sender<Event>,
@@ -330,6 +333,7 @@ impl Node {
             last_observed_leader: 0,
             traffic,
             applied_notify: tokio::sync::watch::channel(applied.applied).0,
+            forwarding: forwarding::Publisher::new(&options.peers, applied.revision),
             transfers: vec![],
             published_at: None,
             events,
@@ -528,9 +532,8 @@ impl Node {
             Event::Cluster(request, response) => {
                 self.cluster_request(request, credentials.unwrap_or_default(), response)?
             }
-            Event::PeerAddress(id, response) => {
-                let address = self.options.peers.get(&id).cloned();
-                let _ = response.send(Ok(json!(address)));
+            Event::SubscribeForwarding(response) => {
+                let _ = response.send(self.forwarding.subscribe());
             }
             Event::Maintenance(request, response) => {
                 use crate::maintenance::Command as M;

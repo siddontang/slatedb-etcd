@@ -3,11 +3,11 @@ use std::time::Duration;
 
 use prost::Message;
 use tokio::sync::{mpsc, oneshot};
-use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
 mod auth;
 mod cluster;
+mod forwarding;
 mod health;
 mod lease;
 mod maintenance;
@@ -24,10 +24,9 @@ use crate::proto::etcdserverpb::*;
 #[derive(Clone)]
 pub struct Service {
     events: mpsc::Sender<Event>,
-    peers: std::sync::Arc<std::sync::Mutex<BTreeMap<u64, (String, Channel)>>>,
+    forwarding: std::sync::Arc<forwarding::Forwarding>,
     member: u64,
     tokens: crate::auth::TokenIssuer,
-    transport: crate::tls::Transport,
 }
 
 pub fn service(
@@ -37,22 +36,7 @@ pub fn service(
     tokens: crate::auth::TokenIssuer,
     transport: crate::tls::Transport,
 ) -> anyhow::Result<axum::Router> {
-    let peers = peers
-        .iter()
-        .map(|(&id, address)| {
-            Ok((
-                id,
-                (crate::cluster::url(address), transport.channel(address)?),
-            ))
-        })
-        .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-    let service = Service {
-        events,
-        peers: std::sync::Arc::new(std::sync::Mutex::new(peers)),
-        member,
-        tokens,
-        transport,
-    };
+    let service = Service::new(member, events, peers, tokens, transport)?;
     Ok(axum::Router::new()
         .route_service(
             "/etcdserverpb.Cluster/{*method}",
@@ -88,49 +72,19 @@ pub fn service(
 }
 
 impl Service {
-    async fn wait_revision(&self, revision: i64) -> Result<(), Status> {
-        let (tx, rx) = oneshot::channel();
-        self.events
-            .try_send(Event::WaitRevision(revision, tx))
-            .map_err(|_| Status::unavailable("etcdserver: too many requests"))?;
-        tokio::time::timeout(Duration::from_secs(10), rx)
-            .await
-            .map_err(|_| Status::deadline_exceeded("etcdserver: local apply timed out"))?
-            .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?
-            .map_err(|e| Status::unavailable(e.error))?;
-        Ok(())
-    }
-
-    async fn peer_channel(&self, id: u64) -> Result<Channel, Status> {
-        let (tx, rx) = oneshot::channel();
-        self.events
-            .send(Event::PeerAddress(id, tx))
-            .await
-            .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?;
-        let value = rx
-            .await
-            .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?
-            .map_err(|e| Status::unavailable(e.error))?;
-        let address: Option<String> =
-            serde_json::from_value(value).map_err(|e| Status::internal(e.to_string()))?;
-        let address = crate::cluster::url(
-            &address.ok_or_else(|| Status::unavailable("etcdserver: no leader"))?,
-        );
-        let mut peers = self
-            .peers
-            .lock()
-            .map_err(|_| Status::internal("peer channel lock failed"))?;
-        if let Some((old, channel)) = peers.get(&id) {
-            if old == &address {
-                return Ok(channel.clone());
-            }
-        }
-        let channel = self
-            .transport
-            .channel(&address)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        peers.insert(id, (address, channel.clone()));
-        Ok(channel)
+    pub(crate) fn new(
+        member: u64,
+        events: mpsc::Sender<Event>,
+        peers: &BTreeMap<u64, String>,
+        tokens: crate::auth::TokenIssuer,
+        transport: crate::tls::Transport,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            events,
+            forwarding: std::sync::Arc::new(forwarding::Forwarding::new(peers, transport)?),
+            member,
+            tokens,
+        })
     }
 
     // A forwarded result can supply a revision for the next local STM read.
@@ -191,8 +145,7 @@ impl Service {
             Ok(outcome) => outcome.result.map_err(|e| e.status()),
             Err(error) if error.error == "not leader" && !forwarded => {
                 let channel = self.peer_channel(error.leader_id).await?;
-                let mut client =
-                    KvClient::new(channel.clone()).max_decoding_message_size(64 * 1024 * 1024);
+                let mut client = KvClient::new(channel).max_decoding_message_size(64 * 1024 * 1024);
                 let response = match op {
                     Op::RequestRange(r) => Resp::ResponseRange(
                         client
@@ -396,7 +349,7 @@ impl Kv for Service {
             }
             Err(error) if error.error == "not leader" && !forwarded => {
                 let channel = self.peer_channel(error.leader_id).await?;
-                let response = KvClient::new(channel.clone())
+                let response = KvClient::new(channel)
                     .compact(forward_auth(request, &credentials))
                     .await?
                     .into_inner();

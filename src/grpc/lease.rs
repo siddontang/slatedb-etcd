@@ -31,7 +31,7 @@ impl Service {
                 .map_err(|e| e.status())?,
             Err(error) if error.error == "not leader" && !forwarded => {
                 let channel = self.peer_channel(error.leader_id).await?;
-                let mut client = LeaseClient::new(channel.clone());
+                let mut client = LeaseClient::new(channel);
                 let response = match command {
                     LeaseCommand::Grant { id, ttl } => LeaseReply::Grant(
                         client
