@@ -31,6 +31,8 @@ impl Node {
                 }
                 self.last_observed_leader = state.leader_id;
             }
+            #[cfg(feature = "write-profile")]
+            crate::write_profile::Stage::Raft.batch(ready.entries().len());
             let snapshot = (!ready.snapshot().is_empty()).then(|| ready.snapshot().clone());
             self.raw
                 .mut_store()

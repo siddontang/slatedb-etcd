@@ -217,10 +217,24 @@ impl Worker {
         }
         assert!(!manual);
         let shutdown = Arc::clone(&stop);
+        #[cfg(feature = "write-profile")]
+        let runtime = tokio::runtime::Handle::current();
         let task = std::thread::Builder::new()
             .name("raft-log-io".into())
             .spawn(move || {
-                while let Some(work) = jobs.blocking_recv() {
+                #[cfg(feature = "write-profile")]
+                let _stage = crate::write_profile::Stage::Wal.enter();
+                #[cfg(feature = "write-profile")]
+                let probe = crate::write_profile::Probe::new(crate::write_profile::Stage::Wal);
+                #[cfg(feature = "write-profile")]
+                let mut receive = || runtime.block_on(probe.run(jobs.recv()));
+                #[cfg(not(feature = "write-profile"))]
+                let mut receive = || jobs.blocking_recv();
+                while let Some(work) = receive() {
+                    #[cfg(feature = "write-profile")]
+                    if let Job::Ready { entries, .. } = &work.job {
+                        crate::write_profile::Stage::Wal.batch(entries.len());
+                    }
                     let mut stopped = shutdown.0.lock().unwrap();
                     if (work.job.writes() || matches!(work.job, Job::Fetch(_)))
                         && !work.delay.is_zero()

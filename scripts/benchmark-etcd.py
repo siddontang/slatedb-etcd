@@ -89,7 +89,10 @@ def state_counters(peers):
     for address in peers:
         with urllib.request.urlopen("http://" + address + "/status", timeout=10) as response:
             status = json.load(response)
-        counters.append({key: status.get(key) for key in ("applied_index", "state_write_batches")})
+        member = {key: status.get(key) for key in ("applied_index", "state_write_batches")}
+        if "write_profile" in status:
+            member["write_profile"] = status["write_profile"]
+        counters.append(member)
     return counters
 
 

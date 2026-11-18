@@ -407,8 +407,13 @@ impl Node {
         events: mpsc::Receiver<Event>,
         stop: impl std::future::Future<Output = ()>,
     ) -> Result<()> {
+        let owner = self.run_loop(events);
+        #[cfg(feature = "write-profile")]
+        let probe = crate::write_profile::Probe::new(crate::write_profile::Stage::Raft);
+        #[cfg(feature = "write-profile")]
+        let owner = probe.run(owner);
         let result = tokio::select! {
-            result = self.run_loop(events) => result,
+            result = owner => result,
             _ = stop => Ok(()),
         };
         self.transports.shutdown().await;
@@ -1045,6 +1050,10 @@ impl Node {
             "revision": self.state.revision,
             "compact_revision": self.state.compact_revision,
         });
+        #[cfg(feature = "write-profile")]
+        {
+            status["write_profile"] = crate::write_profile::snapshot();
+        }
         status["quorum_reply_index"] = self.quorum_reply_index.into();
         Ok(status)
     }
