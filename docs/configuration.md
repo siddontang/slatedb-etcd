@@ -66,7 +66,7 @@ More workers can increase task handoffs. Measure the target workload before chan
 | Flag | Default | Meaning |
 | --- | ---: | --- |
 | `--snapshot-every` | 1000 | Applied entries between checkpoint opportunities; zero disables it. |
-| `--quota-backend-bytes` | 0 | Logical data quota; zero disables it. |
+| `--quota-backend-bytes` | 0 | Zero selects 2 GiB. A negative value disables the quota. |
 | `--log-cache-bytes` | 8388608 | Cache budget for log entries. |
 | `--log-pending-bytes` | 33554432 | Pending entry budget, including unapplied entries. |
 | `--log-read-bytes` | 16777216 | Budget for asynchronous log read results. |

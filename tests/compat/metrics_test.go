@@ -339,3 +339,33 @@ func TestMetricsReportPeerFailure(t *testing.T) {
 		alertMetricShape(t, after, name)
 	}
 }
+
+func TestMetricsBackendQuotaMatchesEtcd(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		flags     []string
+		effective float64
+	}{
+		{"default", nil, 2 * 1024 * 1024 * 1024},
+		{"zero", []string{"--quota-backend-bytes=0"}, 2 * 1024 * 1024 * 1024},
+		{"disabled", []string{"--quota-backend-bytes=-3"}, -3},
+		{"custom", []string{"--quota-backend-bytes=16777216"}, 16777216},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newClusterSize(t, 1, tc.flags...)
+			actual := client(t, c.addresses)
+			ref := metricsReference(t, tc.flags...)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var values []int64
+			for _, cli := range []*clientv3.Client{ref, actual} {
+				m := scrapeMetrics(t, cli.Endpoints()[0])
+				require.Equal(t, tc.effective, m["etcd_server_quota_backend_bytes"].Metric[0].GetGauge().GetValue())
+				status, err := cli.Status(ctx, cli.Endpoints()[0])
+				require.NoError(t, err)
+				values = append(values, status.DbSizeQuota)
+			}
+			require.Equal(t, values[0], values[1])
+		})
+	}
+}

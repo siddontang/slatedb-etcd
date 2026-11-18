@@ -68,6 +68,9 @@ It predefines all standard gRPC status codes. An abandoned response body counts 
 Client version labels accept one or two digits after `3.`. Other values use `other`.
 An absent version uses `unknown`.
 The version gauges match the version reported by Maintenance Status.
+The quota gauge reports 2 GiB for zero, the configured capacity for a positive number,
+and the configured negative number when quota enforcement is off.
+Maintenance Status returns the configured value, as etcd does.
 
 The Raft owner snapshots local state for a scrape. The HTTP task reads the manifest.
 A blocking worker formats the result outside the Raft owner.

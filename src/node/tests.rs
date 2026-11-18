@@ -1351,3 +1351,17 @@ async fn forwarding_uses_live_membership_and_stops_with_its_owner() {
         tonic::Code::Unavailable
     );
 }
+
+#[tokio::test]
+async fn applied_state_enforces_the_effective_etcd_quota() {
+    for (configured, effective) in [(0, 2_u64 << 30), (-3, 0), (65536, 65536)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _) = mpsc::channel(4);
+        let mut config = options(dir.path());
+        config.quota_bytes = configured;
+        let node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(node.worker.state().quota, effective);
+    }
+}

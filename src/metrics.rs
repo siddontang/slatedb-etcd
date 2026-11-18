@@ -72,7 +72,7 @@ pub struct Sample {
     pub(crate) committed: u64,
     pub(crate) applied: u64,
     pub(crate) pending: usize,
-    pub(crate) quota: u64,
+    pub(crate) quota: i64,
     pub(crate) used: u64,
     pub(crate) revision: i64,
     pub(crate) compact: i64,
@@ -195,7 +195,7 @@ impl Sample {
             (
                 "etcd_server_quota_backend_bytes",
                 "Backend quota in bytes.",
-                self.quota as i64,
+                self.quota,
             ),
             (
                 "etcd_mvcc_db_total_size_in_use_in_bytes",

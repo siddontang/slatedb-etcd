@@ -41,7 +41,8 @@ pub struct ServerConfig {
     pub object_store: crate::object::Config,
     pub snapshot_every: u64,
     pub log_memory: LogMemory,
-    pub quota_bytes: u64,
+    /// Zero selects the default 2 GiB quota. A negative value disables the quota.
+    pub quota_bytes: i64,
     pub auth_token: String,
     pub strict_reconfiguration: bool,
     pub join: bool,

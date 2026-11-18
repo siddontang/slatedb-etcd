@@ -72,9 +72,9 @@ struct Args {
     /// Log entry cache budget in bytes.
     #[arg(long, default_value_t = 8 * 1024 * 1024)]
     log_cache_bytes: usize,
-    /// Logical data quota in bytes. Zero disables the quota.
-    #[arg(long, default_value_t = 0)]
-    quota_backend_bytes: u64,
+    /// Logical quota in bytes. Zero selects 2 GiB. A negative value disables the quota.
+    #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
+    quota_backend_bytes: i64,
     /// Token mode: simple, or jwt with RS256 public-key and private-key paths.
     #[arg(long, default_value = "simple")]
     auth_token: String,
