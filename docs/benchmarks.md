@@ -2,6 +2,8 @@
 
 Run these commands from the repository root.
 
+See the [read and apply report](../results/performance/linux-batch-apply.md) for the latest Linux
+one-member and three-member comparison, grouped writes, and module changes.
 See the [native macOS report](../results/performance/macos.md) for one-member and three-member
 results.
 The [Linux CPU report](../results/performance/linux-cpu.md) covers earlier ReadIndex and apply work.
@@ -67,6 +69,7 @@ The controller samples RSS every 100 ms and includes both measurement boundaries
 RSS is not unique physical memory. Short samples can amplify CPU rounding and barrier overhead.
 Latency percentiles include successful operations only. Any failed request makes the report fail.
 CI compares the PR head and etcd on one Linux x86 runner.
+It includes matched PR base cases at concurrency 8 in the same shuffled matrix.
 It also samples CPU stacks for the PR base and head.
 It uses identical release settings with line symbols for both service builds.
 It runs three repeats at concurrency 1, 8, and 32, with 0%, 50%, and 100% reads.

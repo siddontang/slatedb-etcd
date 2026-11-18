@@ -1,0 +1,1782 @@
+{
+  "schema_version": 2,
+  "passed": true,
+  "complete": true,
+  "samples": [
+    {
+      "passed": true,
+      "backend": "service",
+      "members": 3,
+      "concurrency": 1,
+      "read_percent": 0,
+      "repeat": 0,
+      "state_counters_before": [
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        }
+      ],
+      "startup_preload_warmup_server_cpu_seconds": 0.96,
+      "server_rss_after_warmup_bytes": 89882624,
+      "state_counters_after": [
+        {
+          "applied_index": 11201,
+          "state_write_batches": 11198
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 11197
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 11201
+        }
+      ],
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 66.132174,
+        "p50": 0.428201,
+        "p95": 0.837029,
+        "p99": 1.521602,
+        "p999": 6.727603
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 5.09469175,
+      "seed": 42,
+      "successes": 10000,
+      "successful_ops_per_second": 1962.8272897962865,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 66.132174,
+        "p50": 0.428201,
+        "p95": 0.837029,
+        "p99": 1.521602,
+        "p999": 6.727603
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 8.969999999999999,
+      "client_cpu_seconds": 0.62,
+      "average_server_cpu_cores": 1.7606560789472687,
+      "server_cpu_microseconds_per_success": 896.9999999999998,
+      "peak_process_rss_bytes": 356679680,
+      "peak_client_rss_bytes": 21360640,
+      "resource_samples": 52,
+      "resource_errors": [],
+      "allocated_data_bytes": 128770048
+    },
+    {
+      "passed": true,
+      "backend": "etcd",
+      "members": 3,
+      "concurrency": 1,
+      "read_percent": 0,
+      "repeat": 0,
+      "startup_preload_warmup_server_cpu_seconds": 0.67,
+      "server_rss_after_warmup_bytes": 133038080,
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 113.950811,
+        "p50": 0.301537,
+        "p95": 0.536825,
+        "p99": 0.825695,
+        "p999": 1.370729
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 3.417934327,
+      "seed": 42,
+      "successes": 10000,
+      "successful_ops_per_second": 2925.7437514246303,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 113.950811,
+        "p50": 0.301537,
+        "p95": 0.536825,
+        "p99": 0.825695,
+        "p999": 1.370729
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 4.33,
+      "client_cpu_seconds": 0.69,
+      "average_server_cpu_cores": 1.266847044366865,
+      "server_cpu_microseconds_per_success": 433.0,
+      "peak_process_rss_bytes": 170393600,
+      "peak_client_rss_bytes": 21135360,
+      "resource_samples": 36,
+      "resource_errors": [],
+      "allocated_data_bytes": 396914688
+    },
+    {
+      "passed": true,
+      "backend": "etcd",
+      "members": 3,
+      "concurrency": 8,
+      "read_percent": 0,
+      "repeat": 0,
+      "startup_preload_warmup_server_cpu_seconds": 0.65,
+      "server_rss_after_warmup_bytes": 132956160,
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 4.803551,
+        "p50": 0.912861,
+        "p95": 1.442436,
+        "p99": 2.282715,
+        "p999": 3.983147
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 1.163895963,
+      "seed": 42,
+      "successes": 10000,
+      "successful_ops_per_second": 8591.833220406143,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 4.803551,
+        "p50": 0.912861,
+        "p95": 1.442436,
+        "p99": 2.282715,
+        "p999": 3.983147
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 1.83,
+      "client_cpu_seconds": 0.5,
+      "average_server_cpu_cores": 1.5723054793343243,
+      "server_cpu_microseconds_per_success": 183.0,
+      "peak_process_rss_bytes": 175685632,
+      "peak_client_rss_bytes": 21204992,
+      "resource_samples": 13,
+      "resource_errors": [],
+      "allocated_data_bytes": 396918784
+    },
+    {
+      "passed": true,
+      "backend": "service",
+      "members": 3,
+      "concurrency": 8,
+      "read_percent": 0,
+      "repeat": 0,
+      "state_counters_before": [
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        }
+      ],
+      "startup_preload_warmup_server_cpu_seconds": 0.99,
+      "server_rss_after_warmup_bytes": 89878528,
+      "state_counters_after": [
+        {
+          "applied_index": 11201,
+          "state_write_batches": 5249
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 5097
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 5137
+        }
+      ],
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 21.238174,
+        "p50": 1.198023,
+        "p95": 2.706416,
+        "p99": 7.209306,
+        "p999": 16.012796
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 1.8123308040000001,
+      "seed": 42,
+      "successes": 10000,
+      "successful_ops_per_second": 5517.756459212067,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 21.238174,
+        "p50": 1.198023,
+        "p95": 2.706416,
+        "p99": 7.209306,
+        "p999": 16.012796
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 4.52,
+      "client_cpu_seconds": 0.4,
+      "average_server_cpu_cores": 2.494025919563854,
+      "server_cpu_microseconds_per_success": 452.0,
+      "peak_process_rss_bytes": 314048512,
+      "peak_client_rss_bytes": 21233664,
+      "resource_samples": 20,
+      "resource_errors": [],
+      "allocated_data_bytes": 122908672
+    },
+    {
+      "passed": true,
+      "backend": "etcd",
+      "members": 3,
+      "concurrency": 32,
+      "read_percent": 0,
+      "repeat": 0,
+      "startup_preload_warmup_server_cpu_seconds": 0.79,
+      "server_rss_after_warmup_bytes": 131682304,
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 6.773522,
+        "p50": 1.665266,
+        "p95": 2.964455,
+        "p99": 4.523056,
+        "p999": 6.10824
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 0.542046592,
+      "seed": 42,
+      "successes": 10000,
+      "successful_ops_per_second": 18448.598603125243,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 6.773522,
+        "p50": 1.665266,
+        "p95": 2.964455,
+        "p99": 4.523056,
+        "p999": 6.10824
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 0.9200000000000002,
+      "client_cpu_seconds": 0.31,
+      "average_server_cpu_cores": 1.6972710714875228,
+      "server_cpu_microseconds_per_success": 92.00000000000001,
+      "peak_process_rss_bytes": 176693248,
+      "peak_client_rss_bytes": 21086208,
+      "resource_samples": 7,
+      "resource_errors": [],
+      "allocated_data_bytes": 396951552
+    },
+    {
+      "passed": true,
+      "backend": "baseline",
+      "members": 3,
+      "concurrency": 32,
+      "read_percent": 0,
+      "repeat": 0,
+      "state_counters_before": [
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        }
+      ],
+      "startup_preload_warmup_server_cpu_seconds": 0.96,
+      "server_rss_after_warmup_bytes": 89575424,
+      "state_counters_after": [
+        {
+          "applied_index": 11201,
+          "state_write_batches": 3260
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 3166
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 3285
+        }
+      ],
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 23.143857,
+        "p50": 2.932455,
+        "p95": 7.848089,
+        "p99": 13.775832,
+        "p999": 18.510593
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 1.109573817,
+      "seed": 42,
+      "successes": 10000,
+      "successful_ops_per_second": 9012.46933443095,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 23.143857,
+        "p50": 2.932455,
+        "p95": 7.848089,
+        "p99": 13.775832,
+        "p999": 18.510593
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 3.0199999999999996,
+      "client_cpu_seconds": 0.28,
+      "average_server_cpu_cores": 2.7217657389981467,
+      "server_cpu_microseconds_per_success": 301.99999999999994,
+      "peak_process_rss_bytes": 293744640,
+      "peak_client_rss_bytes": 21389312,
+      "resource_samples": 13,
+      "resource_errors": [],
+      "allocated_data_bytes": 128430080
+    },
+    {
+      "passed": true,
+      "backend": "service",
+      "members": 3,
+      "concurrency": 32,
+      "read_percent": 0,
+      "repeat": 0,
+      "state_counters_before": [
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        }
+      ],
+      "startup_preload_warmup_server_cpu_seconds": 0.94,
+      "server_rss_after_warmup_bytes": 89931776,
+      "state_counters_after": [
+        {
+          "applied_index": 11201,
+          "state_write_batches": 2331
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 2346
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 2376
+        }
+      ],
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 19.338498,
+        "p50": 2.544586,
+        "p95": 6.911437,
+        "p99": 14.02737,
+        "p999": 17.661149
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 0.987801311,
+      "seed": 42,
+      "successes": 10000,
+      "successful_ops_per_second": 10123.493346932803,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 19.338498,
+        "p50": 2.544586,
+        "p95": 6.911437,
+        "p99": 14.02737,
+        "p999": 17.661149
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 2.54,
+      "client_cpu_seconds": 0.27,
+      "average_server_cpu_cores": 2.571367310120932,
+      "server_cpu_microseconds_per_success": 254.0,
+      "peak_process_rss_bytes": 301973504,
+      "peak_client_rss_bytes": 21585920,
+      "resource_samples": 11,
+      "resource_errors": [],
+      "allocated_data_bytes": 133795840
+    },
+    {
+      "passed": true,
+      "backend": "baseline",
+      "members": 3,
+      "concurrency": 1,
+      "read_percent": 0,
+      "repeat": 0,
+      "state_counters_before": [
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        }
+      ],
+      "startup_preload_warmup_server_cpu_seconds": 0.9500000000000001,
+      "server_rss_after_warmup_bytes": 90431488,
+      "state_counters_after": [
+        {
+          "applied_index": 11201,
+          "state_write_batches": 11201
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 11192
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 11191
+        }
+      ],
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 19.268959,
+        "p50": 0.430536,
+        "p95": 0.669365,
+        "p99": 1.388146,
+        "p999": 10.491592
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 4.84400271,
+      "seed": 42,
+      "successes": 10000,
+      "successful_ops_per_second": 2064.4084239168396,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 19.268959,
+        "p50": 0.430536,
+        "p95": 0.669365,
+        "p99": 1.388146,
+        "p999": 10.491592
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 9.0,
+      "client_cpu_seconds": 0.6,
+      "average_server_cpu_cores": 1.8579675815251557,
+      "server_cpu_microseconds_per_success": 900.0,
+      "peak_process_rss_bytes": 347938816,
+      "peak_client_rss_bytes": 21336064,
+      "resource_samples": 50,
+      "resource_errors": [],
+      "allocated_data_bytes": 127995904
+    },
+    {
+      "passed": true,
+      "backend": "baseline",
+      "members": 3,
+      "concurrency": 8,
+      "read_percent": 0,
+      "repeat": 0,
+      "state_counters_before": [
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        }
+      ],
+      "startup_preload_warmup_server_cpu_seconds": 0.91,
+      "server_rss_after_warmup_bytes": 89878528,
+      "state_counters_after": [
+        {
+          "applied_index": 11201,
+          "state_write_batches": 6434
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 6321
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 6333
+        }
+      ],
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 20.978978,
+        "p50": 1.293356,
+        "p95": 2.964081,
+        "p99": 8.819409,
+        "p999": 15.619432
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 1.9527233609999999,
+      "seed": 42,
+      "successes": 10000,
+      "successful_ops_per_second": 5121.053089096526,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 20.978978,
+        "p50": 1.293356,
+        "p95": 2.964081,
+        "p99": 8.819409,
+        "p999": 15.619432
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 4.99,
+      "client_cpu_seconds": 0.41,
+      "average_server_cpu_cores": 2.5554054914591666,
+      "server_cpu_microseconds_per_success": 499.0,
+      "peak_process_rss_bytes": 310935552,
+      "peak_client_rss_bytes": 21479424,
+      "resource_samples": 21,
+      "resource_errors": [],
+      "allocated_data_bytes": 123424768
+    },
+    {
+      "passed": true,
+      "backend": "etcd",
+      "members": 3,
+      "concurrency": 1,
+      "read_percent": 0,
+      "repeat": 1,
+      "startup_preload_warmup_server_cpu_seconds": 0.62,
+      "server_rss_after_warmup_bytes": 130154496,
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 3.67782,
+        "p50": 0.304454,
+        "p95": 0.429202,
+        "p99": 0.640157,
+        "p999": 1.280189
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 3.178353154,
+      "seed": 43,
+      "successes": 10000,
+      "successful_ops_per_second": 3146.2834730668196,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 3.67782,
+        "p50": 0.304454,
+        "p95": 0.429202,
+        "p99": 0.640157,
+        "p999": 1.280189
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 4.35,
+      "client_cpu_seconds": 0.6799999999999999,
+      "average_server_cpu_cores": 1.3686333107840665,
+      "server_cpu_microseconds_per_success": 435.0,
+      "peak_process_rss_bytes": 172089344,
+      "peak_client_rss_bytes": 21262336,
+      "resource_samples": 33,
+      "resource_errors": [],
+      "allocated_data_bytes": 396914688
+    },
+    {
+      "passed": true,
+      "backend": "etcd",
+      "members": 3,
+      "concurrency": 32,
+      "read_percent": 0,
+      "repeat": 1,
+      "startup_preload_warmup_server_cpu_seconds": 0.63,
+      "server_rss_after_warmup_bytes": 132771840,
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 8.141337,
+        "p50": 1.683017,
+        "p95": 3.048413,
+        "p99": 4.465308,
+        "p999": 7.052187
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 0.548981518,
+      "seed": 43,
+      "successes": 10000,
+      "successful_ops_per_second": 18215.54947137583,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 8.141337,
+        "p50": 1.683017,
+        "p95": 3.048413,
+        "p99": 4.465308,
+        "p999": 7.052187
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 0.94,
+      "client_cpu_seconds": 0.31000000000000005,
+      "average_server_cpu_cores": 1.712261650309328,
+      "server_cpu_microseconds_per_success": 94.0,
+      "peak_process_rss_bytes": 176492544,
+      "peak_client_rss_bytes": 21270528,
+      "resource_samples": 7,
+      "resource_errors": [],
+      "allocated_data_bytes": 396955648
+    },
+    {
+      "passed": true,
+      "backend": "etcd",
+      "members": 3,
+      "concurrency": 8,
+      "read_percent": 0,
+      "repeat": 1,
+      "startup_preload_warmup_server_cpu_seconds": 0.64,
+      "server_rss_after_warmup_bytes": 130981888,
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 7.125894,
+        "p50": 0.90207,
+        "p95": 1.441645,
+        "p99": 2.187843,
+        "p999": 4.099523
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 1.153606157,
+      "seed": 43,
+      "successes": 10000,
+      "successful_ops_per_second": 8668.46968466726,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 7.125894,
+        "p50": 0.90207,
+        "p95": 1.441645,
+        "p99": 2.187843,
+        "p999": 4.099523
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 1.85,
+      "client_cpu_seconds": 0.51,
+      "average_server_cpu_cores": 1.6036668916634431,
+      "server_cpu_microseconds_per_success": 185.0,
+      "peak_process_rss_bytes": 172269568,
+      "peak_client_rss_bytes": 21200896,
+      "resource_samples": 13,
+      "resource_errors": [],
+      "allocated_data_bytes": 396918784
+    },
+    {
+      "passed": true,
+      "backend": "baseline",
+      "members": 3,
+      "concurrency": 32,
+      "read_percent": 0,
+      "repeat": 1,
+      "state_counters_before": [
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        }
+      ],
+      "startup_preload_warmup_server_cpu_seconds": 1.0,
+      "server_rss_after_warmup_bytes": 90533888,
+      "state_counters_after": [
+        {
+          "applied_index": 11201,
+          "state_write_batches": 3062
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 3135
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 3020
+        }
+      ],
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 25.28667,
+        "p50": 2.859458,
+        "p95": 7.758885,
+        "p99": 13.102141,
+        "p999": 23.942356
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 1.079920187,
+      "seed": 43,
+      "successes": 10000,
+      "successful_ops_per_second": 9259.943577663671,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 25.28667,
+        "p50": 2.859458,
+        "p95": 7.758885,
+        "p99": 13.102141,
+        "p999": 23.942356
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 2.94,
+      "client_cpu_seconds": 0.30999999999999994,
+      "average_server_cpu_cores": 2.722423411833119,
+      "server_cpu_microseconds_per_success": 294.0,
+      "peak_process_rss_bytes": 303644672,
+      "peak_client_rss_bytes": 21782528,
+      "resource_samples": 12,
+      "resource_errors": [],
+      "allocated_data_bytes": 126808064
+    },
+    {
+      "passed": true,
+      "backend": "service",
+      "members": 3,
+      "concurrency": 1,
+      "read_percent": 0,
+      "repeat": 1,
+      "state_counters_before": [
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        }
+      ],
+      "startup_preload_warmup_server_cpu_seconds": 0.95,
+      "server_rss_after_warmup_bytes": 90255360,
+      "state_counters_after": [
+        {
+          "applied_index": 11201,
+          "state_write_batches": 11201
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 11189
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 11197
+        }
+      ],
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 24.230896,
+        "p50": 0.437077,
+        "p95": 0.676698,
+        "p99": 1.415187,
+        "p999": 8.798788
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 4.928080592,
+      "seed": 43,
+      "successes": 10000,
+      "successful_ops_per_second": 2029.1875940976902,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 24.230896,
+        "p50": 0.437077,
+        "p95": 0.676698,
+        "p99": 1.415187,
+        "p999": 8.798788
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 9.309999999999999,
+      "client_cpu_seconds": 0.6199999999999999,
+      "average_server_cpu_cores": 1.8891736501049492,
+      "server_cpu_microseconds_per_success": 930.9999999999998,
+      "peak_process_rss_bytes": 347205632,
+      "peak_client_rss_bytes": 21188608,
+      "resource_samples": 51,
+      "resource_errors": [],
+      "allocated_data_bytes": 128782336
+    },
+    {
+      "passed": true,
+      "backend": "baseline",
+      "members": 3,
+      "concurrency": 8,
+      "read_percent": 0,
+      "repeat": 1,
+      "state_counters_before": [
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        }
+      ],
+      "startup_preload_warmup_server_cpu_seconds": 0.94,
+      "server_rss_after_warmup_bytes": 90165248,
+      "state_counters_after": [
+        {
+          "applied_index": 11201,
+          "state_write_batches": 6416
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 6437
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 6277
+        }
+      ],
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 24.961345,
+        "p50": 1.303064,
+        "p95": 2.855459,
+        "p99": 7.49685,
+        "p999": 21.062819
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 1.9598708440000001,
+      "seed": 43,
+      "successes": 10000,
+      "successful_ops_per_second": 5102.377042147579,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 24.961345,
+        "p50": 1.303064,
+        "p95": 2.855459,
+        "p99": 7.49685,
+        "p999": 21.062819
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 4.99,
+      "client_cpu_seconds": 0.42000000000000004,
+      "average_server_cpu_cores": 2.546086144031642,
+      "server_cpu_microseconds_per_success": 499.0,
+      "peak_process_rss_bytes": 344023040,
+      "peak_client_rss_bytes": 21454848,
+      "resource_samples": 21,
+      "resource_errors": [],
+      "allocated_data_bytes": 121114624
+    },
+    {
+      "passed": true,
+      "backend": "service",
+      "members": 3,
+      "concurrency": 32,
+      "read_percent": 0,
+      "repeat": 1,
+      "state_counters_before": [
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        }
+      ],
+      "startup_preload_warmup_server_cpu_seconds": 0.97,
+      "server_rss_after_warmup_bytes": 90488832,
+      "state_counters_after": [
+        {
+          "applied_index": 11201,
+          "state_write_batches": 2335
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 2432
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 2397
+        }
+      ],
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 21.821683,
+        "p50": 2.543963,
+        "p95": 7.319811,
+        "p99": 15.796354,
+        "p999": 20.432995
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 0.995125323,
+      "seed": 43,
+      "successes": 10000,
+      "successful_ops_per_second": 10048.985558776702,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 21.821683,
+        "p50": 2.543963,
+        "p95": 7.319811,
+        "p99": 15.796354,
+        "p999": 20.432995
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 2.55,
+      "client_cpu_seconds": 0.29000000000000004,
+      "average_server_cpu_cores": 2.5624913174880586,
+      "server_cpu_microseconds_per_success": 255.0,
+      "peak_process_rss_bytes": 352727040,
+      "peak_client_rss_bytes": 21749760,
+      "resource_samples": 11,
+      "resource_errors": [],
+      "allocated_data_bytes": 135929856
+    },
+    {
+      "passed": true,
+      "backend": "service",
+      "members": 3,
+      "concurrency": 8,
+      "read_percent": 0,
+      "repeat": 1,
+      "state_counters_before": [
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        }
+      ],
+      "startup_preload_warmup_server_cpu_seconds": 0.97,
+      "server_rss_after_warmup_bytes": 90312704,
+      "state_counters_after": [
+        {
+          "applied_index": 11201,
+          "state_write_batches": 5256
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 5026
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 5065
+        }
+      ],
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 25.958625,
+        "p50": 1.230357,
+        "p95": 2.828084,
+        "p99": 7.218146,
+        "p999": 18.074114
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 1.856892809,
+      "seed": 43,
+      "successes": 10000,
+      "successful_ops_per_second": 5385.3404738991585,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 25.958625,
+        "p50": 1.230357,
+        "p95": 2.828084,
+        "p99": 7.218146,
+        "p999": 18.074114
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 4.5600000000000005,
+      "client_cpu_seconds": 0.4,
+      "average_server_cpu_cores": 2.4557152560980167,
+      "server_cpu_microseconds_per_success": 456.0000000000001,
+      "peak_process_rss_bytes": 311115776,
+      "peak_client_rss_bytes": 21229568,
+      "resource_samples": 20,
+      "resource_errors": [],
+      "allocated_data_bytes": 121552896
+    },
+    {
+      "passed": true,
+      "backend": "baseline",
+      "members": 3,
+      "concurrency": 1,
+      "read_percent": 0,
+      "repeat": 1,
+      "state_counters_before": [
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        }
+      ],
+      "startup_preload_warmup_server_cpu_seconds": 0.9400000000000001,
+      "server_rss_after_warmup_bytes": 89505792,
+      "state_counters_after": [
+        {
+          "applied_index": 11201,
+          "state_write_batches": 11201
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 11191
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 11192
+        }
+      ],
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 19.102101,
+        "p50": 0.428535,
+        "p95": 0.656074,
+        "p99": 1.481687,
+        "p999": 11.054341
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 4.829167133,
+      "seed": 43,
+      "successes": 10000,
+      "successful_ops_per_second": 2070.7504471454786,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 19.102101,
+        "p50": 0.428535,
+        "p95": 0.656074,
+        "p99": 1.481687,
+        "p999": 11.054341
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 8.969999999999999,
+      "client_cpu_seconds": 0.61,
+      "average_server_cpu_cores": 1.8574631510894941,
+      "server_cpu_microseconds_per_success": 896.9999999999998,
+      "peak_process_rss_bytes": 342675456,
+      "peak_client_rss_bytes": 21086208,
+      "resource_samples": 50,
+      "resource_errors": [],
+      "allocated_data_bytes": 127954944
+    },
+    {
+      "passed": true,
+      "backend": "service",
+      "members": 3,
+      "concurrency": 8,
+      "read_percent": 0,
+      "repeat": 2,
+      "state_counters_before": [
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1200
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        }
+      ],
+      "startup_preload_warmup_server_cpu_seconds": 0.96,
+      "server_rss_after_warmup_bytes": 89714688,
+      "state_counters_after": [
+        {
+          "applied_index": 11201,
+          "state_write_batches": 5119
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 5056
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 5281
+        }
+      ],
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 20.783995,
+        "p50": 1.208774,
+        "p95": 2.819835,
+        "p99": 7.514392,
+        "p999": 15.985855
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 1.8189393489999999,
+      "seed": 44,
+      "successes": 10000,
+      "successful_ops_per_second": 5497.709423625208,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 20.783995,
+        "p50": 1.208774,
+        "p95": 2.819835,
+        "p99": 7.514392,
+        "p999": 15.985855
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 4.48,
+      "client_cpu_seconds": 0.41000000000000003,
+      "average_server_cpu_cores": 2.4629738217840935,
+      "server_cpu_microseconds_per_success": 448.0,
+      "peak_process_rss_bytes": 308363264,
+      "peak_client_rss_bytes": 21303296,
+      "resource_samples": 20,
+      "resource_errors": [],
+      "allocated_data_bytes": 124026880
+    },
+    {
+      "passed": true,
+      "backend": "service",
+      "members": 3,
+      "concurrency": 32,
+      "read_percent": 0,
+      "repeat": 2,
+      "state_counters_before": [
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        }
+      ],
+      "startup_preload_warmup_server_cpu_seconds": 0.96,
+      "server_rss_after_warmup_bytes": 89673728,
+      "state_counters_after": [
+        {
+          "applied_index": 11201,
+          "state_write_batches": 2364
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 2394
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 2441
+        }
+      ],
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 24.39757,
+        "p50": 2.498423,
+        "p95": 6.462283,
+        "p99": 15.128576,
+        "p999": 23.100088
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 0.95973313,
+      "seed": 44,
+      "successes": 10000,
+      "successful_ops_per_second": 10419.563196698231,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 24.39757,
+        "p50": 2.498423,
+        "p95": 6.462283,
+        "p99": 15.128576,
+        "p999": 23.100088
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 2.43,
+      "client_cpu_seconds": 0.28,
+      "average_server_cpu_cores": 2.5319538567976703,
+      "server_cpu_microseconds_per_success": 243.0,
+      "peak_process_rss_bytes": 301142016,
+      "peak_client_rss_bytes": 21671936,
+      "resource_samples": 11,
+      "resource_errors": [],
+      "allocated_data_bytes": 115453952
+    },
+    {
+      "passed": true,
+      "backend": "baseline",
+      "members": 3,
+      "concurrency": 1,
+      "read_percent": 0,
+      "repeat": 2,
+      "state_counters_before": [
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        }
+      ],
+      "startup_preload_warmup_server_cpu_seconds": 0.93,
+      "server_rss_after_warmup_bytes": 89837568,
+      "state_counters_after": [
+        {
+          "applied_index": 11201,
+          "state_write_batches": 11201
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 11192
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 11196
+        }
+      ],
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 20.112549,
+        "p50": 0.424119,
+        "p95": 0.657032,
+        "p99": 1.359189,
+        "p999": 10.90122
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 4.788185616,
+      "seed": 44,
+      "successes": 10000,
+      "successful_ops_per_second": 2088.4737564442826,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 20.112549,
+        "p50": 0.424119,
+        "p95": 0.657032,
+        "p99": 1.359189,
+        "p999": 10.90122
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 8.94,
+      "client_cpu_seconds": 0.6100000000000001,
+      "average_server_cpu_cores": 1.8670955382611885,
+      "server_cpu_microseconds_per_success": 894.0,
+      "peak_process_rss_bytes": 398368768,
+      "peak_client_rss_bytes": 21164032,
+      "resource_samples": 49,
+      "resource_errors": [],
+      "allocated_data_bytes": 128229376
+    },
+    {
+      "passed": true,
+      "backend": "baseline",
+      "members": 3,
+      "concurrency": 32,
+      "read_percent": 0,
+      "repeat": 2,
+      "state_counters_before": [
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1200
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        }
+      ],
+      "startup_preload_warmup_server_cpu_seconds": 0.94,
+      "server_rss_after_warmup_bytes": 88698880,
+      "state_counters_after": [
+        {
+          "applied_index": 11201,
+          "state_write_batches": 3153
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 3196
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 3067
+        }
+      ],
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 28.265851,
+        "p50": 2.883251,
+        "p95": 8.429215,
+        "p99": 16.994344,
+        "p999": 26.945286
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 1.130039772,
+      "seed": 44,
+      "successes": 10000,
+      "successful_ops_per_second": 8849.246059987348,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 28.265851,
+        "p50": 2.883251,
+        "p95": 8.429215,
+        "p99": 16.994344,
+        "p999": 26.945286
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 3.04,
+      "client_cpu_seconds": 0.29000000000000004,
+      "average_server_cpu_cores": 2.6901708022361537,
+      "server_cpu_microseconds_per_success": 304.0,
+      "peak_process_rss_bytes": 310595584,
+      "peak_client_rss_bytes": 21405696,
+      "resource_samples": 13,
+      "resource_errors": [],
+      "allocated_data_bytes": 142491648
+    },
+    {
+      "passed": true,
+      "backend": "etcd",
+      "members": 3,
+      "concurrency": 32,
+      "read_percent": 0,
+      "repeat": 2,
+      "startup_preload_warmup_server_cpu_seconds": 0.59,
+      "server_rss_after_warmup_bytes": 130244608,
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 8.255717,
+        "p50": 1.685977,
+        "p95": 3.127123,
+        "p99": 4.75585,
+        "p999": 7.676642
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 0.558501687,
+      "seed": 44,
+      "successes": 10000,
+      "successful_ops_per_second": 17905.04887051487,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 8.255717,
+        "p50": 1.685977,
+        "p95": 3.127123,
+        "p99": 4.75585,
+        "p999": 7.676642
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 0.94,
+      "client_cpu_seconds": 0.31,
+      "average_server_cpu_cores": 1.6830745938283977,
+      "server_cpu_microseconds_per_success": 94.0,
+      "peak_process_rss_bytes": 177287168,
+      "peak_client_rss_bytes": 21311488,
+      "resource_samples": 7,
+      "resource_errors": [],
+      "allocated_data_bytes": 396951552
+    },
+    {
+      "passed": true,
+      "backend": "service",
+      "members": 3,
+      "concurrency": 1,
+      "read_percent": 0,
+      "repeat": 2,
+      "state_counters_before": [
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        }
+      ],
+      "startup_preload_warmup_server_cpu_seconds": 0.86,
+      "server_rss_after_warmup_bytes": 89780224,
+      "state_counters_after": [
+        {
+          "applied_index": 11201,
+          "state_write_batches": 11201
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 11193
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 11193
+        }
+      ],
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 22.240314,
+        "p50": 0.428744,
+        "p95": 0.665157,
+        "p99": 1.497562,
+        "p999": 7.032527
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 4.817326995,
+      "seed": 44,
+      "successes": 10000,
+      "successful_ops_per_second": 2075.839985614263,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 22.240314,
+        "p50": 0.428744,
+        "p95": 0.665157,
+        "p99": 1.497562,
+        "p999": 7.032527
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 8.95,
+      "client_cpu_seconds": 0.62,
+      "average_server_cpu_cores": 1.857876787124765,
+      "server_cpu_microseconds_per_success": 895.0,
+      "peak_process_rss_bytes": 348008448,
+      "peak_client_rss_bytes": 20963328,
+      "resource_samples": 50,
+      "resource_errors": [],
+      "allocated_data_bytes": 128765952
+    },
+    {
+      "passed": true,
+      "backend": "etcd",
+      "members": 3,
+      "concurrency": 8,
+      "read_percent": 0,
+      "repeat": 2,
+      "startup_preload_warmup_server_cpu_seconds": 0.62,
+      "server_rss_after_warmup_bytes": 130887680,
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 6.004874,
+        "p50": 0.900571,
+        "p95": 1.431231,
+        "p99": 2.357008,
+        "p999": 4.172692
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 1.1537012500000001,
+      "seed": 44,
+      "successes": 10000,
+      "successful_ops_per_second": 8667.755192256227,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 6.004874,
+        "p50": 0.900571,
+        "p95": 1.431231,
+        "p99": 2.357008,
+        "p999": 4.172692
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 1.86,
+      "client_cpu_seconds": 0.5,
+      "average_server_cpu_cores": 1.6122024657596583,
+      "server_cpu_microseconds_per_success": 186.0,
+      "peak_process_rss_bytes": 174915584,
+      "peak_client_rss_bytes": 21082112,
+      "resource_samples": 13,
+      "resource_errors": [],
+      "allocated_data_bytes": 396996608
+    },
+    {
+      "passed": true,
+      "backend": "baseline",
+      "members": 3,
+      "concurrency": 8,
+      "read_percent": 0,
+      "repeat": 2,
+      "state_counters_before": [
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        },
+        {
+          "applied_index": 1201,
+          "state_write_batches": 1201
+        }
+      ],
+      "startup_preload_warmup_server_cpu_seconds": 1.12,
+      "server_rss_after_warmup_bytes": 89305088,
+      "state_counters_after": [
+        {
+          "applied_index": 11201,
+          "state_write_batches": 6346
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 6351
+        },
+        {
+          "applied_index": 11201,
+          "state_write_batches": 6401
+        }
+      ],
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 30.549201,
+        "p50": 1.303565,
+        "p95": 3.150664,
+        "p99": 8.066347,
+        "p999": 18.953195
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 1.987273308,
+      "seed": 44,
+      "successes": 10000,
+      "successful_ops_per_second": 5032.020487440674,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 30.549201,
+        "p50": 1.303565,
+        "p95": 3.150664,
+        "p99": 8.066347,
+        "p999": 18.953195
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 4.95,
+      "client_cpu_seconds": 0.43000000000000005,
+      "average_server_cpu_cores": 2.4908501412831336,
+      "server_cpu_microseconds_per_success": 495.0,
+      "peak_process_rss_bytes": 345460736,
+      "peak_client_rss_bytes": 21356544,
+      "resource_samples": 21,
+      "resource_errors": [],
+      "allocated_data_bytes": 123551744
+    },
+    {
+      "passed": true,
+      "backend": "etcd",
+      "members": 3,
+      "concurrency": 1,
+      "read_percent": 0,
+      "repeat": 2,
+      "startup_preload_warmup_server_cpu_seconds": 0.63,
+      "server_rss_after_warmup_bytes": 132157440,
+      "errors": {},
+      "keys": 1000,
+      "latency_ms": {
+        "max": 3.237288,
+        "p50": 0.303246,
+        "p95": 0.477243,
+        "p99": 0.654324,
+        "p999": 1.288357
+      },
+      "model": "closed loop; seeded uniform keys and read selection; latency includes successful operations only",
+      "read_latency_ms": {},
+      "read_requests": 0,
+      "requests": 10000,
+      "seconds": 3.203459089,
+      "seed": 44,
+      "successes": 10000,
+      "successful_ops_per_second": 3121.6256309743057,
+      "value_bytes": 256,
+      "warmup_operations": 200,
+      "write_latency_ms": {
+        "max": 3.237288,
+        "p50": 0.303246,
+        "p95": 0.477243,
+        "p99": 0.654324,
+        "p999": 1.288357
+      },
+      "write_requests": 10000,
+      "process_cpu_seconds": 4.32,
+      "client_cpu_seconds": 0.69,
+      "average_server_cpu_cores": 1.3485422725809002,
+      "server_cpu_microseconds_per_success": 432.0,
+      "peak_process_rss_bytes": 172232704,
+      "peak_client_rss_bytes": 21155840,
+      "resource_samples": 34,
+      "resource_errors": [],
+      "allocated_data_bytes": 397107200
+    }
+  ],
+  "created_at": "2026-11-18T08:22:23.717423+00:00",
+  "expected_samples": 27,
+  "platform": "Linux",
+  "architecture": "aarch64",
+  "logical_cpus": 4,
+  "members": 3,
+  "service_runtime_workers": null,
+  "baseline_concurrency": null,
+  "settle_seconds_after_warmup": 1,
+  "deployment": "3 processes per backend; shared host and disk; loopback plaintext",
+  "reference_etcd": "v3.6.5",
+  "state_backend": "local",
+  "raft_snapshot_entries": 1000,
+  "quota_bytes": 2147483648,
+  "order_seed": 42,
+  "binaries": {
+    "baseline": "8f1d86a2a7c2404d35df152e4459eb944754bd2b2e54382f3d171dc07858d151",
+    "service": "c0e8a6fcdb59ca81a72d526b49f9a69ca9812697e7fc98b38a9642010d036f3c",
+    "etcd": "c9ebab003d59b120ca53730d8e5d4a22f3f554cbfdf058efb51dbcece9a020a4"
+  },
+  "resource_phases": "CPU deltas and peak RSS cover only the measured phase; retained preload memory remains",
+  "limits": "closed loop; warm keys; host page cache is not cleared; RSS is not unique physical memory; ps CPU precision and controller barriers affect short samples; no capacity or cross-AZ claim",
+  "host_memory_bytes": 6198489088,
+  "cpu_model": "aarch64",
+  "kernel": "6.8.0-142-generic",
+  "source_commits": {
+    "baseline": "f7c317fafb9e60a9baef1439512cd65d171ac521",
+    "service": "ff116521c4398a746e1ab2fb4403b03a47086df5"
+  }
+}

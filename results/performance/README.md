@@ -1,5 +1,6 @@
 # State performance
 
+See the [read and apply report](linux-batch-apply.md) for the latest Linux runtime refactor.
 See the [Linux CPU report](linux-cpu.md) for the later ReadIndex and apply changes.
 
 This report measures two changes against fixed binaries and etcd v3.6.5.
