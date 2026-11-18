@@ -82,6 +82,23 @@ jobs:
               faults = ",".join(map(str, range(1, 17))) if extended else "1,2,3,4"
               env.write(f"SLATEDB_DST_SEEDS={dst}\nFAULT_SEEDS={faults}\n")
           PY
+      - name: Check the minimum protobuf compiler
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import os
+          import subprocess
+          metadata = json.loads(subprocess.check_output(
+              ["cargo", "metadata", "--locked", "--format-version", "1"], text=True))
+          package = next(p for p in metadata["packages"] if p["name"] == "protobuf-build")
+          compiler = Path(package["manifest_path"]).parent / "bin/protoc-linux-x86_64"
+          output = Path(os.environ["RUNNER_TEMP"]) / "schema.pb"
+          subprocess.run([str(compiler), "--version"], check=True)
+          subprocess.run([str(compiler), "--proto_path=proto", f"--descriptor_set_out={output}",
+                          "proto/rpc.proto", "proto/kv.proto", "proto/peer.proto",
+                          "proto/command.proto", "proto/state.proto"], check=True)
+          PY
       - name: Check Rust
         run: |
           cargo fmt --check

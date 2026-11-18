@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use prost::Message;
 
-use crate::proto::command::{envelope::Payload, Credentials, Envelope, Kv};
+use crate::proto::command::{credentials::Identity, envelope::Payload, Credentials, Envelope, Kv};
 use crate::RaftCommand;
 
 impl RaftCommand {
@@ -20,7 +20,7 @@ impl RaftCommand {
                 origin: *origin,
                 request: Some(etcd.clone()),
                 credentials: credentials.map(|auth| Credentials {
-                    user: auth.user.clone(),
+                    identity: auth.user.clone().map(Identity::User),
                     token: auth.token.clone(),
                     time: auth.time,
                 }),
@@ -44,7 +44,7 @@ impl RaftCommand {
                 etcd: kv.request.context("missing KV request")?,
             }
             .secure(kv.credentials.map(|auth| crate::auth::Credentials {
-                user: auth.user,
+                user: auth.identity.map(|Identity::User(user)| user),
                 token: auth.token,
                 time: auth.time,
             }))),

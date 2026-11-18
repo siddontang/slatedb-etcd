@@ -19,7 +19,9 @@ message Kv {
 }
 
 message Credentials {
-  optional string user = 1;
+  oneof identity {
+    string user = 1;
+  }
   string token = 2;
   uint64 time = 3;
 }
