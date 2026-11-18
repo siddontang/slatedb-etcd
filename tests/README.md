@@ -36,6 +36,12 @@ Set `SLATEDB_KEEP_DATA=1` to retain successful ordinary test data too.
 Reports count skipped tests separately. Checker timeouts and unknown results fail the run.
 See the [audit and capability gaps](upstream/README.md) before interpreting a passing report.
 
+Watch has local apply semantics under the [etcd API contract][watch-guarantees].
+The compaction comparison waits for a linearizable read on each endpoint before expecting rejection.
+A partition test replays retained history on a lagging member, then checks rejection after recovery.
+
+[watch-guarantees]: https://etcd.io/docs/v3.6/learning/api_guarantees/#watch-apis
+
 ## Repeat a saved history
 
 ```sh
@@ -78,9 +84,15 @@ Rust tests preserve entry, term, vote, and snapshot sync barriers.
 A lost commit marker can recover from flushed state only when the local log covers that state.
 Read tests cover bounded point batches, cancelled callers, apply fences, and stale process nonces.
 DST includes point-read bursts and checks each acknowledged value after faults.
+Reads can execute while apply is paused. A retained read view also spans a 16-Put group.
+Restart checks require every Put revision and Watch event from that group.
+State tests compare grouped puts with individual writes, including repeated keys, errors, and quota.
+Native process hooks cover both sides of the combined state write.
 
 Peer stream tests use real local sockets. They check message and byte limits, malformed frames,
 cluster rejection, receipt timeout, reconnection, queued-message disposal, and snapshot results.
+Receiver tests hold receipts, check both admission limits, and complete later messages first.
+No later receipt can pass an earlier incomplete message.
 Snapshot replies must still wait for the storage result.
 Ordinary receipts are not Raft acknowledgements.
 DST controls Raft message delivery directly.

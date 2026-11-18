@@ -2,6 +2,8 @@
 
 Run these commands from the repository root.
 
+See the [read and apply report](../results/performance/linux-batch-apply.md) for the latest Linux
+one-member and three-member comparison, grouped writes, and module changes.
 See the [native macOS report](../results/performance/macos.md) for one-member and three-member
 results.
 The [Linux CPU report](../results/performance/linux-cpu.md) covers earlier ReadIndex and apply work.
@@ -57,6 +59,9 @@ peak combined server RSS, allocated local data bytes, and server binary hashes.
 Schema version 2 separates startup, preload, warmup, and measurement with client barriers.
 Both backends receive one idle second after warmup, before the measured phase.
 This reduces overlap with background work from preload. It does not stop background work.
+Service state counters are captured before and after measurement, outside resource sampling.
+`state_write_batches` resets at startup and counts all state writes, including non-Put operations.
+Use counter deltas to check whether a workload actually shared storage writes.
 CPU deltas and peak RSS cover the measured phase. RSS still includes retained preload memory.
 The report separates client resources from the sum of all server processes.
 CPU per successful operation measures work. Average CPU cores measure utilization.
@@ -64,6 +69,7 @@ The controller samples RSS every 100 ms and includes both measurement boundaries
 RSS is not unique physical memory. Short samples can amplify CPU rounding and barrier overhead.
 Latency percentiles include successful operations only. Any failed request makes the report fail.
 CI compares the PR head and etcd on one Linux x86 runner.
+It includes matched PR base cases at concurrency 8 in the same shuffled matrix.
 It also samples CPU stacks for the PR base and head.
 It uses identical release settings with line symbols for both service builds.
 It runs three repeats at concurrency 1, 8, and 32, with 0%, 50%, and 100% reads.
@@ -141,6 +147,8 @@ Empty profiles, unresolved user symbols, lost samples, and failed requests fail 
 
 Use `--backend etcd --binary tmp/benchmark-tools/etcd` to profile the reference process.
 Keep raw `perf.data` local. Share sanitized symbol summaries and measurement reports.
+Use `--skip-inline` if inline symbol expansion stalls.
+Flat symbols and call stacks remain available.
 Profiled latency and throughput include sampling overhead. Use separate runs for comparisons.
 Full snapshots and retained MVCC history increase cost during longer write runs.
 Check failures before comparing successful throughput or latency.

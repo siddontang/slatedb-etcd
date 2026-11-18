@@ -181,6 +181,13 @@ func TestDifferentialWatch(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_, err := c.Compact(ctx, 4)
 		require.NoError(t, err)
+		if c == actual {
+			// The Watch stream can use a different member. Fence compaction on every endpoint.
+			for _, address := range cluster.addresses {
+				_, err := client(t, []string{address}).Get(ctx, "watch/", clientv3.WithPrefix())
+				require.NoError(t, err)
+			}
+		}
 		r := <-c.Watch(ctx, "watch/", clientv3.WithPrefix(), clientv3.WithRev(3))
 		require.True(t, errors.Is(r.Err(), rpctypes.ErrCompacted), "%v", r.Err())
 		require.Equal(t, int64(4), r.CompactRevision)
@@ -191,6 +198,42 @@ func TestDifferentialWatch(t *testing.T) {
 	for i := range a {
 		require.True(t, proto.Equal(a[i], b[i]), "compacted event %d: service %s; etcd %s", i, a[i], b[i])
 	}
+}
+
+func TestWatchCompactionUsesLocalApply(t *testing.T) {
+	c := newCluster(t)
+	leader := c.leader()
+	follower := leader%3 + 1
+	majority := client(t, []string{c.addresses[leader-1]})
+	local := client(t, []string{c.addresses[follower-1]})
+	first := mustCall(t, majority, clientv3.OpPut("local-watch", "first")).(*pb.PutResponse)
+	last := mustCall(t, majority, clientv3.OpPut("local-watch", "last")).(*pb.PutResponse)
+	mustCall(t, local, clientv3.OpGet("local-watch"))
+	for id := range c.processes {
+		blocked := []int{follower}
+		if id == follower {
+			blocked = []int{follower%3 + 1, (follower+1)%3 + 1}
+		}
+		_, err := c.http(id, "/debug/partition", map[string]any{"blocked": blocked})
+		require.NoError(t, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, err := majority.Compact(ctx, last.Header.Revision)
+	require.NoError(t, err)
+	// A local Watch can replay history that the majority has already compacted.
+	events := collectWatch(t, local, "local-watch", 2, clientv3.WithRev(first.Header.Revision))
+	require.Equal(t, "first", string(events[0].Kv.Value))
+	require.Equal(t, "last", string(events[1].Kv.Value))
+	for id := range c.processes {
+		_, err := c.http(id, "/debug/partition", map[string]any{"blocked": []int{}})
+		require.NoError(t, err)
+	}
+	// A later linearizable read waits for the same member to apply compaction.
+	mustCall(t, local, clientv3.OpGet("local-watch"))
+	response := <-local.Watch(ctx, "local-watch", clientv3.WithRev(first.Header.Revision))
+	require.ErrorIs(t, response.Err(), rpctypes.ErrCompacted)
+	require.Equal(t, last.Header.Revision, response.CompactRevision)
 }
 
 func TestWatchLeaseRestartAndSnapshot(t *testing.T) {

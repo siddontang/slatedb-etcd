@@ -11,24 +11,27 @@ pub(super) const MAX_APPLY_LAG: u64 = 1024;
 pub(super) struct AppliedState {
     pub applied: u64,
     pub durable_applied: u64,
-    pub revision: i64,
-    pub compact_revision: i64,
     pub members: crate::cluster::Store,
-    pub auth: crate::auth::Store,
-    pub leases: BTreeMap<i64, crate::lease::LeaseRecord>,
+    pub read: std::sync::Arc<crate::state::ReadView>,
+    pub write_batches: u64,
 }
 
-impl From<&StateMachine> for AppliedState {
-    fn from(state: &StateMachine) -> Self {
-        Self {
+impl std::ops::Deref for AppliedState {
+    type Target = crate::state::ReadView;
+    fn deref(&self) -> &Self::Target {
+        &self.read
+    }
+}
+
+impl AppliedState {
+    pub fn new(state: &StateMachine) -> Result<Self> {
+        Ok(Self {
             applied: state.applied,
             durable_applied: state.durable_applied,
-            revision: state.revision,
-            compact_revision: state.compact_revision,
-            leases: state.leases.clone(),
             members: state.members.clone(),
-            auth: state.auth.clone(),
-        }
+            read: state.read_view()?,
+            write_batches: state.write_batches,
+        })
     }
 }
 
@@ -48,7 +51,7 @@ impl Header {
         }
     }
 
-    fn outcome(self, outcome: &mut Outcome) {
+    pub(super) fn outcome(self, outcome: &mut Outcome) {
         if let Ok(response) = &mut outcome.result {
             self.fill(crate::mvcc::response_header(response));
         }
@@ -84,7 +87,7 @@ impl Query {
         matches!(
             &request.request,
             Some(crate::proto::etcdserverpb::request_op::Request::RequestRange(range))
-                if range.range_end.is_empty()
+                if range.range_end.is_empty() && range.revision <= 0
         )
     }
 
@@ -110,7 +113,6 @@ pub(super) enum Job {
     Entries(Vec<Entry>),
     Snapshot(Snapshot),
     Query(Query),
-    Reads(Vec<Query>),
     Checkpoint(Duration),
 }
 
@@ -174,25 +176,6 @@ impl Drop for Executor {
 }
 
 impl Executor {
-    async fn read_query(&self, query: Query, header: Header) -> Result<Output> {
-        let (request, credentials) = match &query {
-            Query::Read(request, credentials, _) | Query::Linear(request, credentials, _) => {
-                (request, credentials)
-            }
-            _ => anyhow::bail!("read batch contains a different query type"),
-        };
-        let mut outcome = self
-            .state
-            .read_etcd_authorized(request, credentials.as_ref())
-            .await?;
-        header.outcome(&mut outcome);
-        Ok(match query {
-            Query::Read(_, _, response) => Output::Read { response, outcome },
-            Query::Linear(_, _, id) => Output::Linear { id, outcome },
-            _ => unreachable!(),
-        })
-    }
-
     async fn execute(&mut self, work: Work) -> Result<Completion> {
         let changes_state = matches!(work.job, Job::Entries(_) | Job::Snapshot(_));
         let copy_state = changes_state || matches!(work.job, Job::Query(Query::Maintenance(..)));
@@ -208,13 +191,6 @@ impl Executor {
             Job::Snapshot(snapshot) => {
                 self.state.install_snapshot(&snapshot).await?;
                 Output::Snapshot
-            }
-            Job::Reads(queries) => {
-                let mut outputs = Vec::with_capacity(queries.len());
-                for query in queries {
-                    outputs.push(self.read_query(query, work.header).await?);
-                }
-                Output::Reads(outputs)
             }
             Job::Query(query) => match query {
                 Query::Maintenance(command, credentials, status, response) => {
@@ -234,8 +210,8 @@ impl Executor {
                     value: serde_json::to_value(self.state.auth.users.get(&name))?,
                     require_leader: false,
                 },
-                query @ (Query::Linear(..) | Query::Read(..)) => {
-                    self.read_query(query, work.header).await?
+                Query::Linear(..) | Query::Read(..) => {
+                    anyhow::bail!("read reached the apply worker")
                 }
                 Query::Watch(request, require_leader, through, credentials, response) => {
                     let permission = credentials.as_ref().map_or(Ok(()), |auth| {
@@ -305,7 +281,9 @@ impl Executor {
         };
         Ok(Completion {
             applied: self.state.applied,
-            state: copy_state.then(|| AppliedState::from(&self.state)),
+            state: copy_state
+                .then(|| AppliedState::new(&self.state))
+                .transpose()?,
             output,
         })
     }
@@ -430,13 +408,33 @@ impl Worker {
     }
 }
 
+fn put_command(
+    command: &RaftCommand,
+) -> Option<(&RequestOp, Option<&crate::auth::Credentials>, u64)> {
+    let (command, credentials) = match command {
+        RaftCommand::Secured {
+            command,
+            credentials,
+            ..
+        } => (command.as_ref(), Some(credentials)),
+        command => (command, None),
+    };
+    match command {
+        RaftCommand::Etcd { etcd, origin, .. } if crate::mvcc::batchable_put(etcd) => {
+            Some((etcd, credentials, *origin))
+        }
+        _ => None,
+    }
+}
+
 async fn apply_entries(
     state: &mut StateMachine,
     entries: Vec<Entry>,
     header: Header,
 ) -> Result<Vec<AppliedCommand>> {
     let mut replies = vec![];
-    for entry in entries {
+    let mut entries = entries.into_iter().peekable();
+    while let Some(entry) = entries.next() {
         ensure!(
             entry.index == state.applied + 1,
             "apply batch has an index gap"
@@ -452,11 +450,46 @@ async fn apply_entries(
             }
             EntryType::EntryConfChangeV2 => anyhow::bail!("unsupported joint configuration entry"),
         };
-        let command: RaftCommand = serde_json::from_slice(
+        let command = RaftCommand::decode(
             change
                 .as_ref()
                 .map_or(entry.data.as_ref(), |change| change.context.as_ref()),
         )?;
+        if change.is_none() && put_command(&command).is_some() {
+            let mut commands = vec![(entry.index, command)];
+            while let Some(next) = entries.peek() {
+                if next.get_entry_type() != EntryType::EntryNormal || next.data.is_empty() {
+                    break;
+                }
+                let command = RaftCommand::decode(&next.data)?;
+                if put_command(&command).is_none() {
+                    break;
+                }
+                commands.push((entries.next().unwrap().index, command));
+            }
+            let puts: Vec<_> = commands
+                .iter()
+                .map(|(index, command)| {
+                    let (request, credentials, origin) = put_command(command).unwrap();
+                    crate::state::put_batch::Put {
+                        index: *index,
+                        request,
+                        credentials,
+                        origin,
+                    }
+                })
+                .collect();
+            for ((_, command), mut outcome) in commands.iter().zip(state.apply_puts(&puts).await?) {
+                header.outcome(&mut outcome);
+                replies.push(AppliedCommand {
+                    id: command.id().to_owned(),
+                    change: None,
+                    lease: None,
+                    reply: Reply::Kv(outcome),
+                });
+            }
+            continue;
+        }
         let id = command.id().to_owned();
         let command = if let RaftCommand::Secured {
             credentials,
@@ -523,7 +556,7 @@ async fn apply_entries(
                 }
                 Reply::Encoded(serde_json::to_value(outcome)?)
             }
-            RaftCommand::Legacy(c) => Reply::Encoded(serde_json::to_value(
+            RaftCommand::Diagnostic(c) => Reply::Encoded(serde_json::to_value(
                 state.apply(entry.index, Some(c)).await?,
             )?),
             RaftCommand::Etcd { etcd, origin, .. } => {
@@ -581,4 +614,121 @@ fn fill_value_header(header: Header, outcome: &mut Outcome<Value>) -> Result<()>
         value["header"] = serde_json::to_value(h)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::etcdserverpb::request_op::Request as Op;
+    use crate::proto::etcdserverpb::response_op::Response as Resp;
+    use crate::proto::etcdserverpb::*;
+
+    #[tokio::test]
+    async fn put_groups_stop_at_transactions_leases_and_empty_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = StateMachine::open(directory.path()).await.unwrap();
+        let put = |key: &[u8], value: &[u8], lease| RequestOp {
+            request: Some(Op::RequestPut(PutRequest {
+                key: key.to_vec(),
+                value: value.to_vec(),
+                lease,
+                ..Default::default()
+            })),
+        };
+        let kv = |id: &str, etcd| RaftCommand::Etcd {
+            id: id.into(),
+            etcd,
+            origin: 1,
+        };
+        let commands = [
+            kv("one", put(b"a", b"one", 0)),
+            kv("two", put(b"a", b"two", 0)),
+            kv(
+                "txn",
+                RequestOp {
+                    request: Some(Op::RequestTxn(TxnRequest {
+                        compare: vec![Compare {
+                            key: b"a".to_vec(),
+                            target: 3,
+                            target_union: Some(compare::TargetUnion::Value(b"two".to_vec())),
+                            ..Default::default()
+                        }],
+                        success: vec![put(b"b", b"observed", 0)],
+                        ..Default::default()
+                    })),
+                },
+            ),
+            RaftCommand::Lease {
+                id: "lease".into(),
+                lease: LeaseCommand::Grant { id: 77, ttl: 60 },
+                origin: 1,
+            },
+            kv("leased", put(b"a", b"leased", 77)),
+            kv("detach", put(b"a", b"detached", 0)),
+            kv("last", put(b"c", b"last", 0)),
+        ];
+        let mut entries: Vec<_> = commands
+            .iter()
+            .enumerate()
+            .map(|(offset, command)| Entry {
+                index: offset as u64 + 1,
+                term: 1,
+                data: command.encode().unwrap().into(),
+                ..Default::default()
+            })
+            .collect();
+        entries.push(Entry {
+            index: 8,
+            term: 1,
+            ..Default::default()
+        });
+        let replies = apply_entries(
+            &mut state,
+            entries,
+            Header {
+                cluster: 1,
+                member: 1,
+                term: 1,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(replies.len(), 7);
+        assert_eq!(state.applied, 8);
+        assert_eq!(state.write_batches, 6);
+        let Reply::Kv(outcome) = &replies[2].reply else {
+            panic!("expected transaction reply");
+        };
+        let Some(Resp::ResponseTxn(txn)) = &outcome.result.as_ref().unwrap().response else {
+            panic!("expected transaction");
+        };
+        assert!(txn.succeeded);
+        let read = RequestOp {
+            request: Some(Op::RequestRange(RangeRequest {
+                key: b"a".to_vec(),
+                range_end: b"z".to_vec(),
+                ..Default::default()
+            })),
+        };
+        let Some(Resp::ResponseRange(result)) = state
+            .read_etcd(&read)
+            .await
+            .unwrap()
+            .result
+            .unwrap()
+            .response
+        else {
+            panic!("expected range");
+        };
+        assert_eq!(
+            result
+                .kvs
+                .iter()
+                .map(|kv| kv.value.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"detached".as_slice(), b"observed", b"last"]
+        );
+        assert_eq!(result.header.unwrap().revision, 7);
+        state.close().await.unwrap();
+    }
 }

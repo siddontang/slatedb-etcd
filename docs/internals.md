@@ -2,6 +2,15 @@
 
 This document describes the current local implementation.
 See [architecture](architecture.md) for the target design and roadmap.
+See [module boundaries](modules.md) for ownership and extension rules.
+
+## Command and state encoding
+
+The log stores a protobuf envelope. KV commands contain typed requests and optional credentials.
+Administrative commands use JSON inside the same envelope. The diagnostic HTTP API also uses JSON.
+This avoids JSON number arrays and untagged enum trials on the common replicated KV path.
+MVCC versions and Watch journals use protobuf messages. Native snapshots retain a binary envelope.
+Format 3 accepts no older data directory or snapshot. There is no migration or dual decoder.
 
 ## Commit and recovery rules
 
@@ -12,8 +21,10 @@ The node writes commit progress before applying entries. Commit-only updates nee
 This follows Raft's persistence rule, which requires stable entries, terms, and votes.
 
 The leader replies only after quorum commit and local apply. Followers apply the same committed
-commands in order. Each command updates its business keys and `meta/applied` in one SlateDB batch.
-The SlateDB sequence number is the Raft index. Even an empty Raft entry advances the apply marker.
+commands in order. Consecutive ordinary puts can share one SlateDB write.
+Each request retains its own etcd revision, Watch events, quota result, and response.
+The batch stores its final `meta/applied` marker with all mutations.
+The SlateDB sequence is that final Raft index. Even an empty Raft entry advances the apply marker.
 This index is not an etcd revision.
 
 Reads in `/kv` enter the Raft log as barriers. This provides a simple linearizable read path, but
@@ -34,7 +45,7 @@ Regressions check cross-engine values and count the underlying sync calls.
 For a checkpoint, the node:
 
 1. Pins a SlateDB snapshot at the current applied index.
-2. Flushes SlateDB and serializes that pinned view in a background task.
+2. Flushes SlateDB and streams that pinned view into one output buffer in a background task.
 3. Saves the snapshot and log truncation command in one synchronous raft-engine batch.
 4. Calls raft-engine's purge routine to reclaim obsolete files.
 
@@ -71,12 +82,16 @@ Embedded servers use their caller's runtime.
 Only worker completion advances `applied_index` or permits a successful write response.
 Committed work stays in the durable log until the worker can accept it.
 A batch has at most 32 entries and a 512 KiB target. One larger entry can exceed the byte target.
-The worker also handles serializable reads, Watch scans, snapshot installation, and checkpoint pins.
-Local reads receive service between entry batches. They can lag the committed log prefix.
+The worker also handles Watch scans, snapshot installation, and checkpoint pins.
+KV reads use separate bounded tasks. Diagnostic queries still receive service between entry batches.
 
-The owner queues at most 64 local reads and 64 checkpoint requests.
+The owner queues at most 64 state queries, 64 KV reads, and 64 checkpoint requests.
+At most four KV read jobs run. Each point-read job contains at most 16 requests.
+Only one range scan, historical read, or read-only transaction runs at a time.
+Current point reads can pass queued scans. Each job has a five-second deadline.
+These bounds limit tasks and retained views, not total response bytes.
 It rejects new proposals at 1,024 committed but unapplied entries.
-Worker failure or panic stops the node. Shutdown cancels the worker and its snapshot builder.
+Worker failure or panic stops the node. Shutdown joins reads before closing state storage.
 The log thread performs steady-state disk I/O, file reclamation, and disk statistics.
 Apply waits for committed Ready delivery and local entry durability.
 The owner pins unapplied entries and keeps a bounded cache of applied log payloads.
@@ -101,10 +116,20 @@ A frozen batch shares one quorum context. Later requests use a new context.
 These reads do not append log entries. Unconfirmed batches retry every two Raft ticks.
 Serializable reads remain local and can return older state.
 The gRPC KV path passes typed responses internally. Diagnostic callers retain JSON responses.
-The worker groups up to 16 adjacent point reads. Other query types end a group.
-Read completions keep the apply index but do not copy member, auth, or lease metadata.
+The read executor groups up to 16 adjacent point reads. Other read types end a group.
+Each job shares a pinned SlateDB view with matching revision, compaction, Auth, and Lease metadata.
+The apply owner publishes this view after a complete state write or snapshot installation.
+A read can finish from an older view while later writes apply. Its proof must cover that view.
+Read completion does not move the apply index or copy state metadata.
 The owner still checks the read proof and apply position before it sends a response.
 Read evaluation does not construct a discarded write batch.
+
+Ordinary puts without leases or ignore flags share writes within an apply job.
+A bounded overlay lets repeated keys see earlier puts in that group.
+Transactions, leased puts, administration, compaction, and empty entries end a group.
+Quota checks use each request's updated logical size. Failed requests do not advance the revision.
+No response leaves the worker before the combined storage write completes.
+`state_write_batches` counts storage writes since startup. It includes non-Put state operations.
 
 Log work uses a FIFO queue with 64 jobs and a 16 MiB entry admission target.
 Snapshots use a separate 64 MiB target. One Ready can exceed a target.
@@ -116,6 +141,8 @@ Raft advances durable progress and releases dependent messages only after log co
 Leader replication can run before local persistence, as permitted by raft-rs.
 Each peer transport uses a persistent gRPC stream for ordinary Raft messages.
 A sequence check and a 64-message receipt window bound outstanding work.
+The receiver admits messages within the same count and byte limits while earlier receipts wait.
+This permits shared log writes across frames. It returns receipts in arrival order.
 Encoded payloads also have a separate 16 MiB admission target per peer.
 One frame can exceed that target. Each frame has an 8 MiB plus 1 KiB limit.
 The stream requires progress within two seconds when messages are pending.

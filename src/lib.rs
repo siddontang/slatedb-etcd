@@ -1,4 +1,5 @@
 mod batch;
+mod command;
 pub use batch::WriteBatch;
 
 pub mod api;
@@ -20,6 +21,8 @@ pub mod tls;
 pub mod watch;
 
 use serde::{Deserialize, Serialize};
+
+pub(crate) const STORAGE_FORMAT: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -61,7 +64,7 @@ pub struct Command {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum RaftCommand {
-    Legacy(Command),
+    Diagnostic(Command),
     Cluster {
         id: String,
         request: cluster::Command,
@@ -114,7 +117,7 @@ impl RaftCommand {
 
     pub fn id(&self) -> &str {
         match self {
-            Self::Legacy(c) => &c.id,
+            Self::Diagnostic(c) => &c.id,
             Self::Cluster { id, .. }
             | Self::Maintenance { id, .. }
             | Self::Auth { id, .. }

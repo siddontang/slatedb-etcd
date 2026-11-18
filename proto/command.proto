@@ -1,0 +1,27 @@
+syntax = "proto3";
+package slatedb_command;
+
+import "rpc.proto";
+
+// Store KV payloads as protobuf. Administrative commands retain their JSON form.
+message Envelope {
+  oneof payload {
+    Kv kv = 1;
+    bytes json = 2;
+  }
+}
+
+message Kv {
+  string id = 1;
+  uint64 origin = 2;
+  etcdserverpb.RequestOp request = 3;
+  Credentials credentials = 4;
+}
+
+message Credentials {
+  oneof identity {
+    string user = 1;
+  }
+  string token = 2;
+  uint64 time = 3;
+}

@@ -86,6 +86,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=200)
     parser.add_argument("--snapshot-entries", type=int, default=1000)
     parser.add_argument("--frequency", type=int, default=99)
+    parser.add_argument("--skip-inline", action="store_true",
+                        help="Skip slow inline expansion; retain resolved flat stacks")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if platform.system() != "Linux":
@@ -97,6 +99,7 @@ def main():
     report = {"passed": False, "profiled": True, "platform": platform.system(),
               "architecture": platform.machine(), "frequency_hz": args.frequency,
               "event": "cpu-clock", "stack_bytes": 16384,
+              "inline_symbols": not args.skip_inline,
               "scope": "three servers; measured phase only; no client samples",
               "limits": "Sampling changes runtime cost. Use separate runs for performance results."}
     report_path = args.output / "report.json"
@@ -117,8 +120,9 @@ def main():
     report["sample"] = sample
     if sample["passed"]:
         views = [("self.txt", "--no-children", "--no-inline", "none"),
-                 ("stacks.txt", "--children", "--no-inline", "graph"),
-                 ("inline.txt", "--children", "--inline", "none")]
+                 ("stacks.txt", "--children", "--no-inline", "graph")]
+        if not args.skip_inline:
+            views.append(("inline.txt", "--children", "--inline", "none"))
         for name, children, inline, graph in views:
             with (args.output / name).open("w") as output:
                 subprocess.run(["perf", "report", "--stdio", inline, children,

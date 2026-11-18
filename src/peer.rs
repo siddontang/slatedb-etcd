@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{ensure, Context, Result};
 use protobuf::Message as ProtobufMessage;
 use raft::eraftpb::{Message, MessageType};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -16,6 +16,8 @@ use crate::proto::peer::{
     transport_server::{Transport, TransportServer},
     Frame, Receipt,
 };
+
+mod receive;
 
 const WINDOW: usize = 64;
 const BYTE_TARGET: usize = 16 * 1024 * 1024;
@@ -44,53 +46,12 @@ impl Transport for Service {
         {
             return Err(Status::permission_denied("peer cluster does not match"));
         }
-        let mut incoming = request.into_inner();
+        let incoming = request.into_inner();
         let events = self.0.events.clone();
         let (responses, stream) = mpsc::channel(WINDOW);
         tokio::spawn(async move {
-            let mut sequence = 0_u64;
-            loop {
-                let result: Result<Option<Receipt>, Status> = tokio::select! {
-                    _ = responses.closed() => return,
-                    result = async {
-                    let Some(frame) = incoming.message().await? else {
-                        return Ok(None);
-                    };
-                    if Some(frame.sequence) != sequence.checked_add(1) {
-                        return Err(Status::invalid_argument("peer sequence is out of order"));
-                    }
-                    sequence = frame.sequence;
-                    let message = Message::parse_from_bytes(&frame.payload)
-                        .map_err(|_| Status::invalid_argument("invalid Raft message"))?;
-                    if message.get_msg_type() == MessageType::MsgSnapshot {
-                        return Err(Status::invalid_argument(
-                            "snapshots require the durable endpoint",
-                        ));
-                    }
-                    let (response, completed) = oneshot::channel();
-                    events
-                        .try_send(Event::Step(message, response))
-                        .map_err(|_| Status::unavailable("peer queue is unavailable"))?;
-                    tokio::time::timeout(Duration::from_secs(5), completed)
-                        .await
-                        .map_err(|_| Status::deadline_exceeded("peer receipt timed out"))?
-                        .map_err(|_| Status::unavailable("peer stopped"))?
-                        .map_err(|error| Status::unavailable(error.error))?;
-                    Ok(Some(Receipt { sequence }))
-                    } => result,
-                };
-                match result {
-                    Ok(Some(receipt)) => {
-                        if responses.send(Ok(receipt)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Ok(None) => return,
-                    Err(error) => {
-                        let _ = responses.send(Err(error)).await;
-                        return;
-                    }
-                }
+            if let Err(error) = receive::run(incoming, events, &responses).await {
+                let _ = responses.send(Err(error)).await;
             }
         });
         Ok(Response::new(ReceiverStream::new(stream)))

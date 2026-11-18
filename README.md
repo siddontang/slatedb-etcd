@@ -88,6 +88,7 @@ Raw logs and generated data stay outside tracked reports.
 - [Diagnostic APIs](docs/diagnostics.md): trusted local controls and fault injection.
 - [Benchmarks](docs/benchmarks.md): gRPC comparisons, resource measurements, and limits.
 - [Native macOS results](results/performance/macos.md): one member and three local processes.
+- [Linux read and apply results](results/performance/linux-batch-apply.md): refactor and CPU costs.
 - [Contributing](CONTRIBUTING.md): repository layout, checks, and upstream test imports.
 - [Security](SECURITY.md): trust boundaries and private issue reporting.
 

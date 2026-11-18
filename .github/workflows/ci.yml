@@ -82,6 +82,23 @@ jobs:
               faults = ",".join(map(str, range(1, 17))) if extended else "1,2,3,4"
               env.write(f"SLATEDB_DST_SEEDS={dst}\nFAULT_SEEDS={faults}\n")
           PY
+      - name: Check the minimum protobuf compiler
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import os
+          import subprocess
+          metadata = json.loads(subprocess.check_output(
+              ["cargo", "metadata", "--locked", "--format-version", "1"], text=True))
+          package = next(p for p in metadata["packages"] if p["name"] == "protobuf-build")
+          compiler = Path(package["manifest_path"]).parent / "bin/protoc-linux-x86_64"
+          output = Path(os.environ["RUNNER_TEMP"]) / "schema.pb"
+          subprocess.run([str(compiler), "--version"], check=True)
+          subprocess.run([str(compiler), "--proto_path=proto", f"--descriptor_set_out={output}",
+                          "proto/rpc.proto", "proto/kv.proto", "proto/peer.proto",
+                          "proto/command.proto", "proto/state.proto"], check=True)
+          PY
       - name: Check Rust
         run: |
           cargo fmt --check
@@ -178,7 +195,7 @@ jobs:
           git worktree remove "$RUNNER_TEMP/performance-base"
       - name: Compare throughput, latency, CPU, and memory
         run: |
-          python3 scripts/benchmark-etcd.py --binary tmp/performance/head             --requests 5000 --read-requests 60000             --keys 1000 --value-size 256 --concurrency 1 8 32 --read-percent 0 50 100             --warmup 200 --repeat 3 --output results/ci/benchmark-linux.json
+          python3 scripts/benchmark-etcd.py --binary tmp/performance/head             --baseline-binary tmp/performance/base --baseline-concurrency 8             --requests 5000 --read-requests 60000             --keys 1000 --value-size 256 --concurrency 1 8 32 --read-percent 0 50 100             --warmup 200 --repeat 3 --output results/ci/benchmark-linux.json
           python3 scripts/summarize-benchmark.py results/ci/benchmark-linux.json             --output results/ci/benchmark-summary.json >> "$GITHUB_STEP_SUMMARY"
       - name: Sample Linux CPU stacks after warmup
         run: |

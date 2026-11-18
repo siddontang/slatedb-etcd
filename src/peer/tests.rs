@@ -388,6 +388,12 @@ async fn failed_stream_discards_its_backlog_and_rejects_a_queued_snapshot() {
         }
     }
     assert_eq!(messages.capacity(), 256);
+    while let Ok(Event::Step(_, response)) = received.try_recv() {
+        assert!(
+            response.is_closed(),
+            "failed stream kept an accepted message waiter"
+        );
+    }
     messages.send(message(false)).await.unwrap();
     step(&mut received, false)
         .await
@@ -407,4 +413,59 @@ async fn failed_stream_discards_its_backlog_and_rejects_a_queued_snapshot() {
     sender.await.unwrap();
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn receiver_pipelines_with_count_bytes_and_ordered_receipt_limits() {
+    for (payload_bytes, window) in [(0, WINDOW), (3 * 1024 * 1024, 6)] {
+        let (address, mut received, server) = server().await;
+        let channel = crate::tls::Transport::default().channel(&address).unwrap();
+        let mut client = TransportClient::new(channel).max_encoding_message_size(FRAME_LIMIT);
+        let mut message = message(false);
+        message.context = vec![0; payload_bytes].into();
+        let frames: Vec<_> = (1..=window + 1)
+            .map(|sequence| Frame {
+                sequence: sequence as u64,
+                payload: message.write_to_bytes().unwrap(),
+            })
+            .collect();
+        let mut request = Request::new(tokio_stream::iter(frames));
+        request
+            .metadata_mut()
+            .insert("x-cluster-id", "stream-test".parse().unwrap());
+        let mut receipts = client.exchange(request).await.unwrap().into_inner();
+        let mut held = VecDeque::new();
+        for _ in 0..window {
+            held.push_back(step(&mut received, false).await);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), received.recv())
+                .await
+                .is_err()
+        );
+        held.pop_back().unwrap().send(Ok(json!({}))).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), receipts.message())
+                .await
+                .is_err()
+        );
+        held.pop_front().unwrap().send(Ok(json!({}))).unwrap();
+        assert_eq!(receipts.message().await.unwrap().unwrap().sequence, 1);
+        step(&mut received, false)
+            .await
+            .send(Ok(json!({})))
+            .unwrap();
+        for response in held {
+            response.send(Ok(json!({}))).unwrap();
+        }
+        for sequence in 2..=window + 1 {
+            assert_eq!(
+                receipts.message().await.unwrap().unwrap().sequence,
+                sequence as u64
+            );
+        }
+        assert!(receipts.message().await.unwrap().is_none());
+        server.abort();
+        let _ = server.await;
+    }
 }

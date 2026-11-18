@@ -1,4 +1,5 @@
 use crate::WriteBatch;
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use slatedb::Db;
 
@@ -12,15 +13,14 @@ fn key(revision: i64) -> Vec<u8> {
     [EVENTS, &revision.to_be_bytes()].concat()
 }
 
-pub fn record(revision: i64, events: &[Event], batch: &mut WriteBatch) -> Result<(), KvError> {
-    crate::state::maintenance::record_hash(revision, events, batch);
+pub fn record(revision: i64, events: Vec<Event>, batch: &mut WriteBatch) {
+    crate::state::maintenance::record_hash(revision, &events, batch);
     if !events.is_empty() {
         batch.put_new(
             key(revision),
-            bincode::serialize(events).map_err(KvError::storage)?,
+            crate::proto::state::Journal { events }.encode_to_vec(),
         );
     }
-    Ok(())
 }
 
 pub async fn compact(db: &Db, revision: i64, batch: &mut WriteBatch) -> Result<(), KvError> {
@@ -77,7 +77,9 @@ pub async fn read(
                 .try_into()
                 .map_err(KvError::storage)?,
         );
-        let events: Vec<Event> = bincode::deserialize(&row.value).map_err(KvError::storage)?;
+        let events = crate::proto::state::Journal::decode(row.value)
+            .map_err(KvError::storage)?
+            .events;
         let events: Vec<_> = events
             .into_iter()
             .filter_map(|mut event| {

@@ -16,8 +16,8 @@ Historical articles explain the original designs. The pinned source defines the 
 | Avoid commit-only sync | Implemented with recovery checks | Preserve entry and vote barriers |
 | Reuse peer streams | Implemented with count and byte limits | Test bounded message batches |
 | Batch quorum reads | Implemented with frozen batches | Later requests need a new proof |
-| Serve reads outside apply | Pending | Test bounded readers with pinned views |
-| Batch state writes across entries | Pending | Preserve each etcd request's revision |
+| Serve reads outside apply | Implemented with pinned views | Measure queue time and scan cost |
+| Batch state writes across entries | Ordinary unleased puts | Extend overlays to transactions |
 | Lease-based local reads | Not enabled | Require a clock and lease safety design |
 
 ## Separate and measure the stages
@@ -56,8 +56,9 @@ Its [apply worker] shares a database write batch and reuses its allocation after
 Large batches cause the worker to replace that allocation with a smaller one.
 
 The service groups Ready log writes and applies up to 32 entries per worker job.
-That apply job still performs separate state writes for its entries.
-Thus, grouping worker jobs does not yet amortize every SlateDB write.
+Consecutive ordinary unleased puts now share one SlateDB write within that job.
+They retain separate revisions, results, Watch events, and sequential quota checks.
+Other entry types form group boundaries and retain individual writes.
 
 A combined state batch needs an overlay for reads of earlier writes in that batch.
 Each etcd request must retain its revision, Watch events, quota result, and response.
@@ -75,6 +76,8 @@ TiKV's wait settings are not defaults for this different storage engine and one 
 TiKV's [Raft client] collects messages into `BatchRaftMessage`.
 It limits batch count and estimated bytes and carries an overflow message into the next batch.
 The service now reuses a stream, but each stream frame still contains one Raft message.
+Its receiver pipelines bounded messages into Raft while earlier processing receipts wait.
+This exposes more work to the existing shared log writer without moving acknowledgement barriers.
 A bounded frame batch could reduce serialization, wakeups, and network calls.
 
 This is a candidate experiment, not a measured gain.
@@ -87,11 +90,11 @@ TiKV's [local reader] uses read delegates and cached snapshots outside the Raft 
 It checks the applied term and lease state and redirects requests when local conditions fail.
 Its [read queue] tracks proof contexts, ready requests, role changes, and retries.
 
-The service can first keep Safe ReadIndex and move bounded read execution off the apply queue.
-Each read needs a pinned view that covers its confirmed index.
+The service keeps Safe ReadIndex and now runs bounded reads outside the apply queue.
+Each read uses a pinned view that covers its confirmed index.
 The view must include matching revision, compaction, Auth, Lease, and snapshot-generation metadata.
 A snapshot cache needs invalidation and memory limits; a cached value alone is insufficient.
-This experiment addresses a remaining serialized stage without assuming a lease is valid.
+This split removes the shared apply queue without assuming a leader lease is valid.
 
 TiKV's [read amendment] can attach later requests to an earlier pending read under lease rules.
 It checks proposal time, lease state, and special request constraints.
@@ -119,9 +122,8 @@ These rules support the service's existing log batching and commit-marker change
 
 The [etcd read path] batches read notifications, confirms ReadIndex, and waits for apply progress.
 Its Range execution then runs in the request path.
-The service still sends read execution through the apply worker, even after its proof is ready.
-Both upstream designs therefore support testing a separate bounded read path here.
-This is a design inference; the benchmark must establish its actual benefit.
+The service now sends confirmed reads to bounded tasks with a matching pinned state view.
+Both upstream designs informed this split. Matched measurements must establish its actual benefit.
 
 ## Lease reads and multi-group techniques
 
@@ -135,11 +137,19 @@ The [region tuning guide] describes their purpose and tradeoffs.
 This project currently has one Raft group. Extra region scheduling would not address that group's
 serialized reads or full-state checkpoint cost.
 
+## Encoding and allocation work
+
+The ordinary KV log path now uses protobuf requests, as etcd does for its Raft requests.
+The service also uses protobuf for MVCC history and Watch journals.
+A point Put reads its prior value directly. History key encoding uses one allocation.
+Snapshot construction writes rows directly into the output buffer and releases spare capacity.
+These changes target allocation and parsing costs. Matched measurements determine their benefit.
+
 ## Experiment order and acceptance
 
 1. Add sampled stage timing and batch-size counters with a measured overhead budget.
-2. Test bounded reads with pinned views while retaining Safe ReadIndex.
-3. Test state-write batching with a bounded overlay and distinct request revisions.
+2. Measure the bounded read executor while retaining Safe ReadIndex.
+3. Measure ordinary Put groups, then extend the overlay to transaction scans.
 4. Test bounded peer message batches and compare low-load and saturated latency.
 5. Separate cheap local checkpoints from full snapshot transfer.
 6. Consider lease reads or early apply only with their full recovery and timing proofs.

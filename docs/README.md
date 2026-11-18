@@ -12,6 +12,7 @@ Commands use the repository root unless a guide states otherwise.
 | Check health, disk use, and recovery | [Operations](operations.md) |
 | Understand storage and the roadmap | [Architecture](architecture.md) |
 | Inspect current implementation details | [Implementation notes](internals.md) |
+| Find module owners and change rules | [Module boundaries](modules.md) |
 | Use local diagnostics and injected faults | [Diagnostic APIs](diagnostics.md) |
 | Compare gRPC and local write latency | [Benchmarks](benchmarks.md) |
 | Compare Raft optimization techniques | [etcd and TiKV notes](raft-performance-notes.md) |

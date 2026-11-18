@@ -19,10 +19,13 @@ mod apply;
 mod cache;
 pub use cache::LogMemory;
 mod cluster;
+mod lease;
 mod log;
 mod maintenance;
 mod read;
+mod ready;
 mod response;
+mod schedule;
 use crate::peer::transport;
 use apply::{AppliedState, Completion, Header, Job, Output, Query, Reply, Work, Worker};
 use response::ClientResponse;
@@ -141,6 +144,8 @@ pub struct Node {
     log_read_fail: bool,
     peer_waiters: Vec<Response>,
     built_checkpoint: Option<(u64, raft::eraftpb::ConfState, Vec<u8>)>,
+    read_executor: read::executor::Executor,
+    read_queries: VecDeque<Query>,
     reads: BTreeMap<u64, read::PendingRead>,
     revision_waiters: VecDeque<RevisionWaiter>,
     read_nonce: [u8; 16],
@@ -299,7 +304,7 @@ impl Node {
             }
             senders
         };
-        let applied = AppliedState::from(&state);
+        let applied = AppliedState::new(&state)?;
         let worker = Worker::start(state, events.clone(), manual_apply);
         let log_worker = log::Worker::start(storage, manual_apply)?;
         let mut node = Self {
@@ -323,6 +328,8 @@ impl Node {
             log_read_fail: false,
             peer_waiters: vec![],
             built_checkpoint: None,
+            read_executor: read::executor::Executor::new(manual_apply),
+            read_queries: VecDeque::new(),
             reads: BTreeMap::new(),
             revision_waiters: VecDeque::new(),
             read_nonce: *uuid::Uuid::new_v4().as_bytes(),
@@ -369,6 +376,7 @@ impl Node {
         };
         self.transports.shutdown().await;
         // Keep the Raft directory locked until the state worker has stopped.
+        self.read_executor.shutdown().await;
         let apply = self.worker.shutdown().await;
         let log = self.log_worker.shutdown().await;
         result.and(apply).and(log)
@@ -390,6 +398,9 @@ impl Node {
                 _ = ticks.tick() => { self.raw.tick(); self.retry_reads(); self.expire_leases()?; self.publish_member()?; }
                 persisted = self.log_worker.next() => { self.complete_log(persisted?)?; }
                 completed = self.worker.next() => { self.complete_apply(completed?)?; }
+                read = self.read_executor.next(), if self.read_executor.len() > 0 => {
+                    self.complete_read(read?)?;
+                }
                 event = events.recv() => {
                     let Some(event) = event else { return Ok(()); };
                     self.handle(event, &mut step_responses).await?;
@@ -521,7 +532,7 @@ impl Node {
             }
             Event::Propose(request, response) => {
                 self.propose(
-                    RaftCommand::Legacy(Command {
+                    RaftCommand::Diagnostic(Command {
                         id: uuid::Uuid::new_v4().to_string(),
                         request,
                     }),
@@ -731,477 +742,6 @@ impl Node {
         Ok(())
     }
 
-    async fn drive_ready(&mut self) -> Result<()> {
-        self.expire_reads();
-        self.issue_reads();
-        if self.log_queue.len() < log::MAX_JOBS
-            && self.log_bytes < log::MAX_BYTES
-            && self.log_snapshot_bytes < log::MAX_SNAPSHOT_BYTES
-        {
-            if let Some((index, conf, data)) = self.built_checkpoint.take() {
-                self.queue_log(
-                    log::Job::Checkpoint { index, conf, data },
-                    None,
-                    Some(index),
-                    vec![],
-                    vec![],
-                );
-            }
-        }
-        while self.raw.has_ready()
-            && self.log_queue.len() < log::MAX_JOBS
-            && self.log_bytes < log::MAX_BYTES
-            && self.log_snapshot_bytes < log::MAX_SNAPSHOT_BYTES
-        {
-            let mut ready = self.raw.ready();
-            let snapshot = (!ready.snapshot().is_empty()).then(|| ready.snapshot().clone());
-            self.raw
-                .mut_store()
-                .stage(ready.entries(), ready.hs(), snapshot.as_ref())?;
-            let job = log::Job::Ready {
-                entries: ready.take_entries(),
-                hs: ready.hs().cloned(),
-                snapshot,
-            };
-            let early = ready.take_messages();
-            let messages = ready.take_persisted_messages();
-            let reads = ready.take_read_states();
-            let number = ready.number();
-            // Apply only entries that Raft has delivered, even if disk commit is ahead.
-            self.committed_ready = self
-                .committed_ready
-                .max(ready.snapshot().get_metadata().index);
-            if let Some(entry) = ready.take_committed_entries().last() {
-                self.committed_ready = self.committed_ready.max(entry.index);
-            }
-            // Cached entries must be readable before Raft can advance without disk completion.
-            self.raw.advance_append_async(ready);
-            self.queue_log(job, Some(number), None, messages, reads);
-            // raft-rs permits leader replication before local persistence.
-            self.send(early);
-            for (peer, snapshot) in std::mem::take(&mut self.send_failures) {
-                self.raw.report_unreachable(peer);
-                if snapshot {
-                    self.raw.report_snapshot(peer, SnapshotStatus::Failure);
-                }
-            }
-        }
-        if self.log_queue.len() < log::MAX_JOBS {
-            if let Some(fetch) = self.raw.mut_store().take_fetch() {
-                self.queue_log(log::Job::Fetch(fetch), None, None, vec![], vec![]);
-            }
-        }
-        if !self.raw.has_ready() {
-            if let Some(task) = self.log_queue.back_mut() {
-                task.responses.append(&mut self.peer_waiters);
-            } else {
-                for response in self.peer_waiters.drain(..) {
-                    let _ = response.send(Ok(json!({"accepted": true})));
-                }
-            }
-        }
-        self.start_log()?;
-        self.schedule_reads();
-        self.schedule_apply()?;
-        Ok(())
-    }
-
-    fn queue_log(
-        &mut self,
-        job: log::Job,
-        ready: Option<u64>,
-        checkpoint: Option<u64>,
-        messages: Vec<Message>,
-        reads: Vec<raft::ReadState>,
-    ) {
-        self.log_sequence += 1;
-        let bytes = job.bytes();
-        let snapshot_bytes = job.snapshot_bytes();
-        self.log_bytes += bytes;
-        self.log_snapshot_bytes += snapshot_bytes;
-        self.log_queue.push_back(LogTask {
-            id: self.log_sequence,
-            work: Some(job),
-            bytes,
-            snapshot_bytes,
-            ready,
-            checkpoint,
-            messages,
-            reads,
-            responses: vec![],
-            stats_response: None,
-        });
-    }
-
-    fn start_log(&mut self) -> Result<()> {
-        if !self.log_busy {
-            // Empty Ready batches only fence earlier writes. They need no storage work.
-            while self
-                .log_queue
-                .front()
-                .is_some_and(|task| task.work.as_ref().is_some_and(log::Job::is_barrier))
-            {
-                let task = self.log_queue.pop_front().unwrap();
-                self.finish_log_task(task)?;
-            }
-            // Combine queued Ready work without adding a timer or crossing other job types.
-            while self.log_queue.len() >= 2
-                && self
-                    .log_queue
-                    .iter()
-                    .take(2)
-                    .all(|task| task.work.as_ref().is_some_and(log::Job::can_batch))
-            {
-                let mut task = self.log_queue.pop_front().unwrap();
-                let next = self.log_queue.pop_front().unwrap();
-                task.work.as_mut().unwrap().append(next.work.unwrap())?;
-                task.bytes += next.bytes;
-                task.ready = next.ready.or(task.ready);
-                task.messages.extend(next.messages);
-                task.reads.extend(next.reads);
-                task.responses.extend(next.responses);
-                self.log_queue.push_front(task);
-            }
-            if let Some(task) = self.log_queue.front_mut() {
-                let job = task.work.take().context("log job already submitted")?;
-                let reading = matches!(job, log::Job::Fetch(_));
-                self.log_worker.submit(log::Work {
-                    id: task.id,
-                    job,
-                    delay: Duration::from_millis(if reading {
-                        self.log_read_delay_ms
-                    } else {
-                        self.log_delay_ms
-                    }),
-                    fail: if reading {
-                        self.log_read_fail
-                    } else {
-                        self.log_fail
-                    },
-                })?;
-                self.log_busy = true;
-            }
-        }
-        Ok(())
-    }
-
-    fn complete_log(&mut self, completed: log::Completion) -> Result<()> {
-        ensure!(self.log_busy, "unexpected log completion");
-        let mut task = self.log_queue.pop_front().context("missing log job")?;
-        ensure!(task.id == completed.id, "log completion is out of order");
-        self.log_bytes -= task.bytes;
-        self.log_snapshot_bytes -= task.snapshot_bytes;
-        self.log_busy = false;
-        self.raw.mut_store().complete(completed.durable)?;
-        if let Some(stats) = completed.stats {
-            if let Some(response) = task.stats_response.take() {
-                let _ = response.send(Ok(serde_json::to_value(stats)?));
-            }
-        }
-        if let Some((fetch, entries)) = completed.fetched {
-            self.raw.mut_store().fetched(&fetch, entries)?;
-            self.raw.on_entries_fetched(fetch.context);
-        }
-        self.finish_log_task(task)?;
-        self.start_log()?;
-        Ok(())
-    }
-
-    fn finish_log_task(&mut self, task: LogTask) -> Result<()> {
-        if let Some(number) = task.ready {
-            crate::failpoint::hit("raft-before-advance");
-            self.raw.on_persist_ready(number);
-        }
-        if let Some(index) = task.checkpoint {
-            self.checkpoint_running = false;
-            self.state.durable_applied = self.state.durable_applied.max(index);
-        }
-        self.confirm_reads(task.reads);
-        self.send(task.messages);
-        for response in task.responses {
-            let _ = response.send(Ok(json!({"accepted": true})));
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    async fn drain_log(&mut self) -> Result<()> {
-        while let Some(completed) = self.log_worker.step()? {
-            self.complete_log(completed)?;
-            self.drive_ready().await?;
-        }
-        Ok(())
-    }
-
-    fn enqueue_query(&mut self, query: Query) {
-        if self.queries.len() >= apply::MAX_QUERIES {
-            query.reject(self.error("too many queued state reads"));
-        } else {
-            self.queries.push_back(query);
-        }
-    }
-
-    fn next_query_job(&mut self) -> Option<Job> {
-        let query = self.queries.pop_front()?;
-        if !query.is_point_read() || !self.queries.front().is_some_and(Query::is_point_read) {
-            return Some(Job::Query(query));
-        }
-        let mut reads = vec![query];
-        while reads.len() < apply::READ_BATCH
-            && self.queries.front().is_some_and(Query::is_point_read)
-        {
-            reads.push(self.queries.pop_front().unwrap());
-        }
-        Some(Job::Reads(reads))
-    }
-
-    fn submit_apply(&mut self, job: Job, target: u64) -> Result<()> {
-        ensure!(!self.apply_busy, "apply worker already has a job");
-        self.worker.submit(Work {
-            job,
-            header: self.header(),
-            delay: Duration::from_millis(self.apply_delay_ms),
-        })?;
-        self.apply_busy = true;
-        self.apply_target = target;
-        Ok(())
-    }
-
-    fn schedule_apply(&mut self) -> Result<()> {
-        if self.apply_busy || self.raw.store().snapshot_pending() {
-            return Ok(());
-        }
-        let snapshot_index = self.raw.store().snapshot_index();
-        if self.state.applied < snapshot_index {
-            return self.submit_apply(
-                Job::Snapshot(self.raw.store().recovery_snapshot().clone()),
-                snapshot_index,
-            );
-        }
-        let checkpoint_due = (self.membership_checkpoint > snapshot_index
-            && self.state.applied >= self.membership_checkpoint)
-            || self
-                .checkpoint_waiters
-                .iter()
-                .any(|(index, _)| *index <= self.state.applied)
-            || (self.options.snapshot_every > 0
-                && self.state.applied.saturating_sub(snapshot_index)
-                    >= self.options.snapshot_every);
-        if checkpoint_due && !self.checkpoint_running && self.state.applied > snapshot_index {
-            return self.start_checkpoint();
-        }
-        if self.prefer_query {
-            if let Some(job) = self.next_query_job() {
-                self.prefer_query = false;
-                return self.submit_apply(job, self.state.applied);
-            }
-        }
-        let committed = self.raw.store().commit_index().min(self.committed_ready);
-        if self.state.applied < committed {
-            let low = self.state.applied + 1;
-            let high = (low + apply::BATCH_ENTRIES).min(committed + 1);
-            let entries = self.raw.store().entries(
-                low,
-                high,
-                Some(apply::BATCH_BYTES),
-                raft::GetEntriesContext::empty(false),
-            )?;
-            let target = entries.last().context("empty apply batch")?.index;
-            ensure!(
-                target <= self.raw.store().commit_index(),
-                "apply exceeds durable commit"
-            );
-            self.prefer_query = true;
-            return self.submit_apply(Job::Entries(entries), target);
-        }
-        if let Some(job) = self.next_query_job() {
-            return self.submit_apply(job, self.state.applied);
-        }
-        Ok(())
-    }
-
-    fn complete_apply(&mut self, completed: Completion) -> Result<()> {
-        ensure!(self.apply_busy, "unexpected apply completion");
-        ensure!(
-            completed.applied == self.apply_target,
-            "apply completion has the wrong index"
-        );
-        ensure!(
-            completed.applied >= self.state.applied,
-            "apply position regressed"
-        );
-        ensure!(
-            completed.applied <= self.raw.store().commit_index(),
-            "apply completion exceeds durable commit"
-        );
-        self.apply_busy = false;
-        self.expire_reads();
-        let Some(state) = completed.state else {
-            ensure!(
-                completed.applied == self.state.applied,
-                "read changed the apply position"
-            );
-            return self.finish_output(completed.output);
-        };
-        let durable = self.state.durable_applied.max(state.durable_applied);
-        self.state = state;
-        if *self.applied_notify.borrow() != self.state.applied {
-            self.applied_notify.send_replace(self.state.applied);
-        }
-        self.state.durable_applied = durable;
-        self.finish_revision_waiters();
-
-        self.sync_lease_deadlines();
-        self.expire_pending();
-        self.finish_output(completed.output)?;
-        self.raw.advance_apply_to(self.state.applied);
-        self.raw.mut_store().applied_to(self.state.applied);
-        self.sync_members();
-        Ok(())
-    }
-
-    fn finish_output(&mut self, output: Output) -> Result<()> {
-        match output {
-            Output::Reads(reads) => {
-                for read in reads {
-                    self.finish_output(read)?;
-                }
-            }
-            Output::Entries(replies) => {
-                for command in replies {
-                    if let Some(change) = &command.change {
-                        self.raw.apply_conf_change(change)?;
-                        self.membership_checkpoint = self.state.applied;
-                    }
-                    if let Some(LeaseCommand::Expire { id, generation }) = command.lease {
-                        self.lease_expiring.remove(&(id, generation));
-                    }
-                    if let Some(pending) = self.pending.remove(&command.id) {
-                        let reply = match command.reply {
-                            Reply::Kv(outcome) => {
-                                pending.response.kv(outcome)?;
-                                continue;
-                            }
-                            Reply::Encoded(value) => value,
-                            Reply::Lease(mut outcome) => {
-                                if let Ok(response) = &mut outcome.result {
-                                    if let LeaseReply::TimeToLive(response) = response {
-                                        if response.ttl >= 0 {
-                                            if let Some((_, deadline)) =
-                                                self.lease_deadlines.get(&response.id)
-                                            {
-                                                response.ttl = deadline
-                                                    .saturating_duration_since(Instant::now())
-                                                    .as_secs()
-                                                    as i64;
-                                            }
-                                        }
-                                    }
-                                    self.fill_header(response.header_mut());
-                                }
-                                serde_json::to_value(outcome)?
-                            }
-                        };
-                        pending.response.json(reply)?;
-                    }
-                }
-            }
-            Output::Snapshot => {
-                self.installed_snapshots += 1;
-                self.options.join = false;
-            }
-            Output::Query {
-                response,
-                value,
-                require_leader,
-            } => {
-                let result = if require_leader && self.raw.raft.leader_id == 0 {
-                    Err(self.error("no leader"))
-                } else {
-                    Ok(value)
-                };
-                let _ = response.send(result);
-            }
-            Output::Read { response, outcome } => response.kv(outcome)?,
-            Output::Linear { id, outcome } => self.finish_read(id, outcome)?,
-            Output::Checkpoint => {}
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    async fn drain_apply(&mut self) -> Result<()> {
-        while let Some(completed) = self.worker.step().await? {
-            self.complete_apply(completed)?;
-            self.drive_ready().await?;
-        }
-        Ok(())
-    }
-
-    fn sync_lease_deadlines(&mut self) {
-        if self.raw.raft.state != StateRole::Leader || self.lease_term != self.raw.raft.term {
-            self.lease_deadlines.clear();
-            self.lease_expiring.clear();
-            self.lease_term = self.raw.raft.term;
-        }
-        if self.raw.raft.state != StateRole::Leader {
-            return;
-        }
-        self.lease_deadlines
-            .retain(|id, _| self.state.leases.contains_key(id));
-        for (&id, lease) in &self.state.leases {
-            let entry = self
-                .lease_deadlines
-                .entry(id)
-                .or_insert((0, Instant::now()));
-            if entry.0 != lease.generation {
-                *entry = (
-                    lease.generation,
-                    Instant::now() + Duration::from_secs(lease.ttl as u64),
-                );
-            }
-        }
-    }
-
-    fn expire_leases(&mut self) -> Result<()> {
-        self.sync_lease_deadlines();
-        if self
-            .raw
-            .store()
-            .commit_index()
-            .max(self.raw.raft.raft_log.committed)
-            .saturating_sub(self.state.applied)
-            >= apply::MAX_APPLY_LAG
-            || self.log_queue.len() >= log::MAX_JOBS
-            || self.log_bytes >= log::MAX_BYTES
-        {
-            return Ok(());
-        }
-        let now = Instant::now();
-        for (&id, &(generation, deadline)) in &self.lease_deadlines {
-            if deadline > now || self.lease_expiring.contains(&(id, generation)) {
-                continue;
-            }
-            let command = RaftCommand::Lease {
-                origin: self.options.id,
-                id: uuid::Uuid::new_v4().to_string(),
-                lease: LeaseCommand::Expire { id, generation },
-            };
-            let data = serde_json::to_vec(&command)?;
-            if !self.raw.store().admits(
-                self.raw.raft.raft_log.unstable_entries(),
-                &[],
-                data.len() + cache::ENTRY_OVERHEAD + 64,
-            ) {
-                break;
-            }
-            if self.raw.propose(vec![], data).is_ok() {
-                self.lease_expiring.insert((id, generation));
-            }
-        }
-        Ok(())
-    }
-
     fn propose(&mut self, command: RaftCommand, response: impl Into<ClientResponse>) -> Result<()> {
         let response = response.into();
         if self.raw.raft.state != StateRole::Leader {
@@ -1220,7 +760,7 @@ impl Node {
         } else if self.pending.len() >= 1024 {
             response.error(self.error("too many pending requests"));
         } else {
-            let data = serde_json::to_vec(&command)?;
+            let data = command.encode()?;
             if data.len() + 64 > cache::MAX_ENTRY_BYTES
                 || !self.raw.store().admits(
                     self.raw.raft.raft_log.unstable_entries(),
@@ -1373,7 +913,10 @@ impl Node {
             "id": self.options.id, "cluster_id": self.options.cluster_id,
             "role": format!("{:?}", self.raw.raft.state), "leader_id": self.raw.raft.leader_id,
             "term": self.raw.raft.term, "commit_index": self.raw.store().commit_index(),
-            "applied_index": self.state.applied, "durable_applied_index": self.state.durable_applied,
+            "applied_index": self.state.applied,
+            "state_write_batches": self.state.write_batches,
+            "active_read_jobs": self.read_executor.len(), "queued_reads": self.read_queries.len(),
+            "durable_applied_index": self.state.durable_applied,
             "snapshot_index": self.raw.store().snapshot_index(),
             "first_log_index": self.raw.store().snapshot_index() + 1, "last_log_index": self.raw.store().durable.last_index,
             "sync_writes": self.raw.store().durable.sync_writes, "pending": self.pending.len(),

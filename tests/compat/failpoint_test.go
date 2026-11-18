@@ -22,6 +22,7 @@ func TestFailpointRecovery(t *testing.T) {
 		"wal-before-sync", "wal-after-sync",
 		"raft-before-advance", "raft-before-leader-send", "raft-before-follower-send",
 		"snapshot-before-save", "snapshot-after-save", "apply-before-entry", "apply-after-entry",
+		"apply-batch-before-write", "apply-batch-after-write",
 		"checkpoint-before-save", "checkpoint-after-save", "checkpoint-after-gc",
 		"snapshot-before-install", "snapshot-after-install-write", "snapshot-after-install-flush",
 		"compact-before-apply", "compact-after-apply", "watch-before-send", "lease-before-expire",
@@ -43,6 +44,7 @@ func TestFailpointRecovery(t *testing.T) {
 			witness := trigger + ".reached"
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
+			batched := map[string]int64{}
 			if strings.HasPrefix(point, "snapshot-") {
 				c.stop(target)
 				for i := 0; i < 8; i++ {
@@ -54,6 +56,24 @@ func TestFailpointRecovery(t *testing.T) {
 				}
 				require.NoError(t, os.WriteFile(trigger, []byte(point), 0600))
 				c.start(target)
+			} else if strings.HasPrefix(point, "apply-batch-") {
+				applyDelay(t, c, target, 2500)
+				mustCall(t, api, clientv3.OpPut("batch-blocker", "ready"))
+				for i := 0; i < 8; i++ {
+					key := fmt.Sprintf("batch/%02d", i)
+					reply := mustCall(t, api, clientv3.OpPut(key, point)).(*pb.PutResponse)
+					batched[key] = reply.Header.Revision
+				}
+				last, err := c.http(leader, "/status", nil)
+				require.NoError(t, err)
+				// Arm only after a delayed job contains the complete multi-entry suffix.
+				require.Eventually(t, func() bool {
+					state, err := c.http(target, "/status", nil)
+					return err == nil && state["apply_busy"] == true &&
+						state["apply_target"].(float64) >= last["applied_index"].(float64) &&
+						state["apply_target"].(float64)-state["applied_index"].(float64) > 1
+				}, 10*time.Second, 10*time.Millisecond, "no multi-entry apply job")
+				require.NoError(t, os.WriteFile(trigger, []byte(point), 0600))
 			} else if point == "lease-before-expire" {
 				// Only the leader proposes expiration. Its follower must replay that entry.
 				grant, err := api.Grant(ctx, 2)
@@ -101,6 +121,12 @@ func TestFailpointRecovery(t *testing.T) {
 			require.Len(t, got.Kvs, 1)
 			require.Equal(t, "acknowledged", string(got.Kvs[0].Value))
 			require.GreaterOrEqual(t, got.Header.Revision, base.Header.Revision)
+			for key, revision := range batched {
+				got := mustCall(t, recovered, clientv3.OpGet(key)).(*pb.RangeResponse)
+				require.Len(t, got.Kvs, 1)
+				require.Equal(t, point, string(got.Kvs[0].Value))
+				require.Equal(t, revision, got.Kvs[0].ModRevision)
+			}
 			mustCall(t, recovered, clientv3.OpPut("after-fault", point))
 			if point == "watch-before-send" {
 				replay := recovered.Watch(ctx, "watched", clientv3.WithRev(base.Header.Revision+1))

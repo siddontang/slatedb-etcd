@@ -42,7 +42,10 @@ impl StateMachine {
             .with_limit(MAX_BACKUP_BYTES)
             .deserialize(payload)
             .context("invalid native snapshot")?;
-        ensure!(data.version == 2, "unsupported snapshot version");
+        ensure!(
+            data.version == STORAGE_FORMAT,
+            "unsupported snapshot version"
+        );
         let mut seen = std::collections::BTreeSet::new();
         for (key, value) in &mut data.rows {
             ensure!(
@@ -74,7 +77,7 @@ impl StateMachine {
         data.rows
             .push((crate::cluster::KEY.to_vec(), serde_json::to_vec(members)?));
         data.applied = 1;
-        data.version = 2;
+        data.version = STORAGE_FORMAT;
         let mut snapshot = Snapshot::default();
         snapshot.mut_metadata().index = 1;
         snapshot.mut_metadata().term = 1;

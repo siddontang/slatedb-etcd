@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.request
 
 from reporting import write_report
 
@@ -83,6 +84,15 @@ def measured_resources(before, after, memory, members, seconds, successes):
                 peak_client_rss_bytes=max(row[members] for row in memory))
 
 
+def state_counters(peers):
+    counters = []
+    for address in peers:
+        with urllib.request.urlopen("http://" + address + "/status", timeout=10) as response:
+            status = json.load(response)
+        counters.append({key: status.get(key) for key in ("applied_index", "state_write_batches")})
+    return counters
+
+
 def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=None):
     with tempfile.TemporaryDirectory(prefix="slatedb-bench-") as directory:
         root = Path(directory)
@@ -138,6 +148,8 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
             all_processes = processes + [driver]
             deadline = time.monotonic() + args.timeout_seconds
             wait_file(root / "ready", all_processes, deadline)
+            if kind != "etcd":
+                sample["state_counters_before"] = state_counters(peers)
             # Give both backends one idle second after preload and warmup.
             time.sleep(1)
             with observer(processes) if observer else nullcontext():
@@ -164,6 +176,8 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
                 sampler.join()
                 (root / "finish").touch()
                 code = driver.wait(timeout=10)
+            if kind != "etcd":
+                sample["state_counters_after"] = state_counters(peers)
             sample.update(json.loads(result_path.read_text()))
             sample["passed"] &= code == 0 and not resource_errors and all(p.poll() is None for p in processes)
             sample.update(measured_resources(before, after, memory, members,

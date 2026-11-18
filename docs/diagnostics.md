@@ -24,6 +24,10 @@ The delay controls accept `{"delay_ms":2500}`. Log fault controls also accept `"
 Apply and log delays have a five-second limit. Zero delay and `"fail":false` clear those controls.
 An injected log failure can stop the node. Use these endpoints only with disposable test data.
 
+`state_write_batches` counts state storage writes since startup.
+`active_read_jobs` and `queued_reads` describe the independent KV read executor.
+The benchmark records state counters outside the measured resource phase.
+
 ## Run a node manually
 
 Run this command in three terminals. Set `NODE_ID` to 1, 2, and 3, respectively.

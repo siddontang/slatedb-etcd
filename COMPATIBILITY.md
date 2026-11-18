@@ -5,6 +5,9 @@ The reference server, imported common suite, model, and Go client use etcd v3.6.
 Local tests use ARM64 macOS. The PR workflow repeats validation on Linux.
 Each JSON report records its command, date, and tested binary hash.
 
+See the [read and apply report](results/performance/linux-batch-apply.md) for later runtime checks
+and Linux measurements.
+
 ## Results
 
 | Check | Result |
@@ -89,6 +92,8 @@ Independent physical host failures, physical power loss, and rolling binary upgr
 untested.
 
 Native backup and backend Hash formats differ from etcd bbolt.
+Storage format 3 requires fresh directories and object prefixes.
+Old backups and logs are unsupported.
 Use `--restore-snapshot` for native backups; `etcdutl` cannot restore them.
 Use the [native export tool](docs/operations.md#backups-and-restoration) to save a backup.
 `etcdctl snapshot save` can reject the native image because it requires bbolt page alignment.
@@ -118,6 +123,6 @@ all of them run against the Rust implementation.
 
 The [fault map](tests/upstream/fault-mapping.md) accounts for all 41 named gofail hooks at etcd
 v3.6.5.
-Nineteen native crash boundaries and two TLS client failover cases have real process coverage.
+Twenty-one native crash boundaries and two TLS client failover cases have real process coverage.
 Selected original Kubernetes storage tests and the CoreDNS etcd plugin run against both backends.
 The [retained remote results](results/remote-storage/README.md) record the new evidence and limits.

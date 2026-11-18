@@ -1,4 +1,5 @@
 use super::*;
+pub(super) mod executor;
 
 pub(super) struct PendingRead {
     request: Option<RequestOp>,
@@ -156,16 +157,47 @@ impl Node {
 
     pub(super) fn schedule_reads(&mut self) {
         for (id, read) in &mut self.reads {
-            if self.queries.len() >= apply::MAX_QUERIES {
+            if self.read_queries.len() >= apply::MAX_QUERIES {
                 break;
             }
             if read.index.is_some_and(|index| index <= self.state.applied) {
                 if let Some(request) = read.request.take() {
-                    self.queries
-                        .push_back(Query::Linear(request, read.credentials.take(), *id));
+                    self.read_queries.push_back(Query::Linear(
+                        request,
+                        read.credentials.take(),
+                        *id,
+                    ));
                 }
             }
         }
+        while self.read_executor.has_capacity() {
+            let Some(position) = self
+                .read_queries
+                .iter()
+                .position(|query| self.read_executor.can_submit(query))
+            else {
+                break;
+            };
+            let first = self.read_queries.remove(position).unwrap();
+            let point = first.is_point_read();
+            let mut queries = vec![first];
+            while point
+                && queries.len() < apply::READ_BATCH
+                && self
+                    .read_queries
+                    .get(position)
+                    .is_some_and(Query::is_point_read)
+            {
+                queries.push(self.read_queries.remove(position).unwrap());
+            }
+            self.read_executor
+                .submit(self.state.read.clone(), queries, self.header());
+        }
+    }
+
+    pub(super) fn complete_read(&mut self, output: Output) -> Result<()> {
+        self.expire_reads();
+        self.finish_output(output)
     }
 
     pub(super) fn finish_read(&mut self, id: u64, outcome: crate::mvcc::Outcome) -> Result<()> {

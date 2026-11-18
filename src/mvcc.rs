@@ -12,6 +12,7 @@ use crate::proto::etcdserverpb::request_op::Request as Op;
 use crate::proto::etcdserverpb::response_op::Response as Resp;
 use crate::proto::etcdserverpb::*;
 use crate::proto::mvccpb::KeyValue;
+use crate::proto::state::Version;
 
 const CURRENT: &[u8] = b"etcd/current/";
 const HISTORY: &[u8] = b"etcd/history/";
@@ -53,21 +54,17 @@ pub struct Outcome<T = ResponseOp> {
     pub result: KvResult<T>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct Version {
-    key: Vec<u8>,
-    revision: i64,
-    value: Option<KeyValue>,
-}
-
 fn current_key(key: &[u8]) -> Vec<u8> {
     [CURRENT, key].concat()
 }
 
 fn history_prefix(key: &[u8]) -> Vec<u8> {
-    let mut out = HISTORY.to_vec();
+    const HEX: &[u8] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(HISTORY.len() + key.len() * 2 + 1);
+    out.extend_from_slice(HISTORY);
     for byte in key {
-        out.extend_from_slice(format!("{byte:02x}").as_bytes());
+        out.push(HEX[(byte >> 4) as usize]);
+        out.push(HEX[(byte & 15) as usize]);
     }
     out.push(b'/');
     out
@@ -213,8 +210,40 @@ enum Plan {
     },
 }
 
+enum ReadDb<'a> {
+    Live(&'a Db),
+    Pinned(&'a slatedb::DbSnapshot),
+}
+
+impl ReadDb<'_> {
+    async fn get(&self, key: Vec<u8>) -> Result<Option<bytes::Bytes>, slatedb::Error> {
+        match self {
+            Self::Live(db) => db.get(key).await,
+            Self::Pinned(db) => db.get(key).await,
+        }
+    }
+
+    async fn scan(
+        &self,
+        range: std::ops::Range<Vec<u8>>,
+    ) -> Result<slatedb::DbIterator, slatedb::Error> {
+        match self {
+            Self::Live(db) => db.scan(range).await,
+            Self::Pinned(db) => db.scan(range).await,
+        }
+    }
+
+    async fn scan_prefix(&self, prefix: Vec<u8>) -> Result<slatedb::DbIterator, slatedb::Error> {
+        match self {
+            Self::Live(db) => db.scan_prefix(prefix, ..).await,
+            Self::Pinned(db) => db.scan_prefix(prefix, ..).await,
+        }
+    }
+}
+
 struct View<'a> {
-    db: &'a Db,
+    db: ReadDb<'a>,
+    previous: Option<&'a WriteBatch>,
     revision: i64,
     compact_revision: i64,
     changes: BTreeMap<Vec<u8>, Option<KeyValue>>,
@@ -223,14 +252,20 @@ struct View<'a> {
 }
 
 impl View<'_> {
+    async fn get(&self, key: Vec<u8>) -> Result<Option<bytes::Bytes>, slatedb::Error> {
+        if let Some(value) = self.previous.and_then(|batch| batch.get(&key)) {
+            return Ok(value);
+        }
+        self.db.get(key).await
+    }
+
     async fn point(&self, key: &[u8], overlay: bool) -> KvResult<Option<KeyValue>> {
         if overlay {
             if let Some(value) = self.changes.get(key) {
                 return Ok(value.clone());
             }
         }
-        self.db
-            .get(current_key(key))
+        self.get(current_key(key))
             .await
             .map_err(KvError::storage)?
             .map(|value| KeyValue::decode(value).map_err(KvError::storage))
@@ -258,12 +293,7 @@ impl View<'_> {
     async fn latest(&self, key: &[u8], end: &[u8], overlay: bool) -> KvResult<Rows> {
         let mut rows = BTreeMap::new();
         if end.is_empty() {
-            if let Some(value) = self
-                .db
-                .get(current_key(key))
-                .await
-                .map_err(KvError::storage)?
-            {
+            if let Some(value) = self.get(current_key(key)).await.map_err(KvError::storage)? {
                 rows.insert(
                     key.to_vec(),
                     KeyValue::decode(value).map_err(KvError::storage)?,
@@ -313,11 +343,11 @@ impl View<'_> {
         let mut versions = BTreeMap::<Vec<u8>, Version>::new();
         let mut scan = self
             .db
-            .scan_prefix(prefix, ..)
+            .scan_prefix(prefix)
             .await
             .map_err(KvError::storage)?;
         while let Some(row) = scan.next().await.map_err(KvError::storage)? {
-            let v: Version = bincode::deserialize(&row.value).map_err(KvError::storage)?;
+            let v = Version::decode(row.value).map_err(KvError::storage)?;
             if v.revision <= revision
                 && contains(&v.key, key, end)
                 && versions
@@ -421,7 +451,7 @@ impl View<'_> {
                         return Err(KvError::new(Code::NotFound, "requested lease not found"));
                     }
                     if (p.ignore_value || p.ignore_lease)
-                        && self.latest(&p.key, &[], false).await?.is_empty()
+                        && self.point(&p.key, false).await?.is_none()
                     {
                         return Err(KvError::invalid("key not found"));
                     }
@@ -517,7 +547,7 @@ impl View<'_> {
                     response(Resp::ResponseRange(self.range(&r).await?))
                 }
                 Plan::Op(Op::RequestPut(p)) => {
-                    let old = self.latest(&p.key, &[], true).await?.remove(&p.key);
+                    let old = self.point(&p.key, true).await?;
                     let revision = self.revision + 1;
                     let kv = KeyValue {
                         key: p.key.clone(),
@@ -585,12 +615,47 @@ pub async fn read(
     request: &RequestOp,
     leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
 ) -> KvResult<ResponseOp> {
+    read_from(
+        ReadDb::Live(db),
+        revision,
+        compact_revision,
+        request,
+        leases,
+    )
+    .await
+}
+
+pub(crate) async fn read_snapshot(
+    db: &slatedb::DbSnapshot,
+    revision: i64,
+    compact_revision: i64,
+    request: &RequestOp,
+    leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
+) -> KvResult<ResponseOp> {
+    read_from(
+        ReadDb::Pinned(db),
+        revision,
+        compact_revision,
+        request,
+        leases,
+    )
+    .await
+}
+
+async fn read_from(
+    db: ReadDb<'_>,
+    revision: i64,
+    compact_revision: i64,
+    request: &RequestOp,
+    leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
+) -> KvResult<ResponseOp> {
     validate(request)?;
     if !read_only(request, false) {
         return Err(KvError::invalid("read request contains a write"));
     }
     let mut view = View {
         db,
+        previous: None,
         revision,
         compact_revision,
         changes: BTreeMap::new(),
@@ -613,9 +678,48 @@ pub async fn prepare(
     request: &RequestOp,
     leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
 ) -> KvResult<(ResponseOp, WriteBatch, i64)> {
+    prepare_inner(db, revision, compact_revision, request, leases, None).await
+}
+
+pub(crate) fn batchable_put(request: &RequestOp) -> bool {
+    matches!(&request.request, Some(Op::RequestPut(p))
+        if p.lease == 0 && !p.ignore_lease && !p.ignore_value)
+}
+
+pub(crate) async fn prepare_put(
+    db: &Db,
+    revision: i64,
+    compact_revision: i64,
+    request: &RequestOp,
+    leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
+    previous: &WriteBatch,
+) -> KvResult<(ResponseOp, WriteBatch, i64)> {
+    if !batchable_put(request) {
+        return Err(KvError::invalid("batch requires an ordinary put"));
+    }
+    prepare_inner(
+        db,
+        revision,
+        compact_revision,
+        request,
+        leases,
+        Some(previous),
+    )
+    .await
+}
+
+async fn prepare_inner(
+    db: &Db,
+    revision: i64,
+    compact_revision: i64,
+    request: &RequestOp,
+    leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
+    previous: Option<&WriteBatch>,
+) -> KvResult<(ResponseOp, WriteBatch, i64)> {
     validate(request)?;
     let mut view = View {
-        db,
+        db: ReadDb::Live(db),
+        previous,
         revision,
         compact_revision,
         changes: BTreeMap::new(),
@@ -626,7 +730,7 @@ pub async fn prepare(
     let response = view.execute(plan, false).await?;
     let next = view.current_revision();
     let mut batch = WriteBatch::new();
-    crate::watch::record(next, &view.events, &mut batch)?;
+    crate::watch::record(next, view.events, &mut batch);
     for (key, value) in view.changes {
         if let Some(value) = &value {
             batch.put(current_key(&key), value.encode_to_vec());
@@ -640,10 +744,7 @@ pub async fn prepare(
             revision: next,
             value,
         };
-        batch.put_new(
-            history_key,
-            bincode::serialize(&version).map_err(KvError::storage)?,
-        );
+        batch.put_new(history_key, version.encode_to_vec());
     }
     batch.put(REVISION, next.to_be_bytes());
     Ok((response, batch, next))
@@ -675,7 +776,7 @@ pub async fn prepare_compaction(
         .map_err(KvError::storage)?;
     let mut previous: Option<(Vec<u8>, Vec<u8>)> = None;
     while let Some(row) = scan.next().await.map_err(KvError::storage)? {
-        let version: Version = bincode::deserialize(&row.value).map_err(KvError::storage)?;
+        let version = Version::decode(row.value).map_err(KvError::storage)?;
         if version.revision <= request.revision {
             // History keys sort by user key, then by increasing revision.
             if let Some((key, history_key)) = previous.take() {
@@ -738,7 +839,8 @@ pub(crate) async fn revoke_keys(
     leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
 ) -> KvResult<(WriteBatch, i64)> {
     let mut view = View {
-        db,
+        db: ReadDb::Live(db),
+        previous: None,
         revision,
         compact_revision,
         changes: BTreeMap::new(),
@@ -763,15 +865,15 @@ pub(crate) async fn revoke_keys(
         history_key.extend_from_slice(&next.to_be_bytes());
         batch.put_new(
             history_key,
-            bincode::serialize(&Version {
+            Version {
                 key,
                 revision: next,
                 value,
-            })
-            .map_err(KvError::storage)?,
+            }
+            .encode_to_vec(),
         );
     }
-    crate::watch::record(next, &view.events, &mut batch)?;
+    crate::watch::record(next, view.events, &mut batch);
     batch.put(REVISION, next.to_be_bytes());
     Ok((batch, next))
 }
