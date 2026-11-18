@@ -918,6 +918,13 @@ impl Simulation {
         }
         for node in self.nodes.values() {
             assert_eq!(node.state.compact_revision, revision);
+            let state = node.worker.state();
+            assert_eq!(
+                state.logical_size(),
+                crate::state::maintenance::count_logical_size(&state.db)
+                    .await
+                    .unwrap()
+            );
             assert!(node.state.auth.range(&writer, b"admin", b"", true).is_err());
             assert!(node.state.auth.range(&token, b"admin", b"", true).is_err());
             let value = node

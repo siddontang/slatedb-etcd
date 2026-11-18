@@ -735,17 +735,18 @@ pub async fn prepare_compaction(
         .scan_prefix(HISTORY, ..)
         .await
         .map_err(KvError::storage)?;
-    let mut previous: Option<(Vec<u8>, Vec<u8>)> = None;
+    let mut previous: Option<(Vec<u8>, bytes::Bytes, usize)> = None;
     while let Some(row) = scan.next().await.map_err(KvError::storage)? {
+        let len = row.value.len();
         let version = Version::decode(row.value).map_err(KvError::storage)?;
         if version.revision <= request.revision {
             // History keys sort by user key, then by increasing revision.
-            if let Some((key, history_key)) = previous.take() {
+            if let Some((key, history_key, old_len)) = previous.take() {
                 if key == version.key {
-                    batch.delete(history_key);
+                    batch.delete_known(history_key, old_len);
                 }
             }
-            previous = Some((version.key, row.key.to_vec()));
+            previous = Some((version.key, row.key, len));
         }
     }
     crate::watch::compact(db, request.revision, &mut batch).await?;

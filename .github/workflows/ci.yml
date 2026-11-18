@@ -213,6 +213,13 @@ jobs:
               --value-pattern "$pattern" --requests 12000 --keys 1000 --value-size 256 \
               --warmup 200 --repeat 3 --output "results/ci/benchmark-$pattern.json"
           done
+      - name: Compare writes during physical compaction
+        run: |
+          python3 scripts/benchmark-etcd.py --binary tmp/performance/head \
+            --baseline-binary tmp/performance/base --concurrency 32 --read-percent 0 --rate 1000 \
+            --compact-every 2500 --retain-revisions 500 --value-pattern metadata \
+            --requests 10000 --keys 1000 --warmup 200 --repeat 2 \
+            --output results/ci/benchmark-compact.json
       - name: Sample Linux CPU stacks after warmup
         run: |
           for backend in base head; do

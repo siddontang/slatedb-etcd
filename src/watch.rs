@@ -34,7 +34,7 @@ pub async fn compact(db: &Db, revision: i64, batch: &mut WriteBatch) -> Result<(
         .await
         .map_err(KvError::storage)?;
     while let Some(row) = scan.next().await.map_err(KvError::storage)? {
-        batch.delete(row.key);
+        batch.delete_known(row.key, row.value.len());
     }
     Ok(())
 }

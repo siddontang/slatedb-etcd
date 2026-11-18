@@ -60,6 +60,8 @@ func main() {
 	rate := flag.Int("rate", 0, "Target operations per second during measurement; zero runs at capacity")
 	reads := flag.Int("read-percent", 50, "Linearizable read percentage")
 	keys := flag.Int("keys", 1000, "Preloaded keys")
+	every := flag.Int64("compact-every", 0, "Run a physical Compact after this many measured puts")
+	retain := flag.Int64("retain-revisions", 1000, "Keep this many revisions after each Compact")
 	pattern := flag.String("value-pattern", "repeat", "Value pattern: repeat, binary, or metadata")
 	size := flag.Int("value-size", 256, "Value size in bytes")
 	warmup := flag.Int("warmup", 100, "Unmeasured operations after preload")
@@ -67,7 +69,7 @@ func main() {
 	control := flag.String("control-dir", "", "Optional controller barrier directory")
 	output := flag.String("output", "", "JSON result file")
 	flag.Parse()
-	if *endpoints == "" || *requests < 1 || *rate < 0 || *concurrency < 1 || *keys < 1 || *size < 1 || *warmup < 0 || *reads < 0 || *reads > 100 {
+	if *endpoints == "" || *requests < 1 || *rate < 0 || *every < 0 || *retain < 0 || *concurrency < 1 || *keys < 1 || *size < 1 || *warmup < 0 || *reads < 0 || *reads > 100 {
 		fmt.Fprintln(os.Stderr, "invalid benchmark arguments")
 		os.Exit(2)
 	}
@@ -105,6 +107,7 @@ func main() {
 			panic(err)
 		}
 	}
+	schedule := compactionSchedule{every: *every, retain: *retain}
 	isRead := func(i int) bool { return mix(uint64(i)^*seed)%100 < uint64(*reads) }
 	operation := func(i int) error {
 		keyIndex := int(mix(uint64(i)^*seed^0x51ed270b) % uint64(*keys))
@@ -122,8 +125,11 @@ func main() {
 			}
 			return err
 		}
-		_, err := client.Put(ctx, key, value)
-		return err
+		response, err := client.Put(ctx, key, value)
+		if err != nil || i >= *requests {
+			return err
+		}
+		return schedule.afterPut(ctx, client, response.Header.Revision)
 	}
 	for i := 0; i < *warmup; i++ {
 		if err := operation(*requests + i); err != nil {
@@ -195,6 +201,10 @@ func main() {
 		"latency_ms": percentiles(samples), "read_latency_ms": percentiles(getSamples),
 		"write_latency_ms": percentiles(putSamples),
 		"model":            "bounded concurrency; seeded uniform keys and reads; paced latency starts at the scheduled arrival"}
+	report["compact_every"] = schedule.every
+	report["retain_revisions"] = schedule.retain
+	report["physical_compactions"] = len(schedule.latencies)
+	report["compact_latency_ms"] = percentiles(schedule.latencies)
 	data, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
 		panic(err)
