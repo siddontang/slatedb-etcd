@@ -15,6 +15,7 @@ The CLI and embedded API share the same lifecycle and runtime paths.
 | `node/log` and `node/cache` | Isolate disk work and bound retained log memory |
 | `node/schedule` | Dispatch state work and publish completed apply positions |
 | `node/apply` | Apply committed entries in order and group ordinary puts |
+| `node/proposal` | Group consecutive leader Put proposals within one event turn |
 | `node/quorum_put` | Prepare exact Put results after quorum commit |
 | `state/checkpoint` | Merge bounded row changes into a complete checkpoint |
 | `node/read` | Confirm Safe ReadIndex and reject obsolete proofs |

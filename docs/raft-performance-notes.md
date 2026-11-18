@@ -55,6 +55,10 @@ It checks request type, headers, request size, and total batch size.
 Its [apply worker] shares a database write batch and reuses its allocation after writing.
 Large batches cause the worker to replace that allocation with a smaller one.
 
+The leader can submit consecutive ordinary Put proposals to Raft as separate entries in one
+message. A different event ends the group. Each group fits 32 entries and a 512 KiB target.
+A larger request travels alone. Each proposal has its own request ID and log index.
+
 The service groups Ready log writes and applies up to 32 entries per worker job.
 Consecutive ordinary unleased puts now share one SlateDB write within that job.
 They retain separate revisions, results, Watch events, and sequential quota checks.

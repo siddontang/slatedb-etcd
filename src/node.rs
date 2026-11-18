@@ -22,6 +22,7 @@ mod cluster;
 mod lease;
 mod log;
 mod maintenance;
+mod proposal;
 mod quorum_put;
 mod read;
 mod ready;
@@ -165,6 +166,7 @@ pub struct Node {
     senders: BTreeMap<u64, mpsc::Sender<Message>>,
     transports: tokio::task::JoinSet<()>,
     pending: HashMap<String, Pending>,
+    put_proposals: proposal::Group,
     blocked: BTreeSet<u64>,
     installed_snapshots: u64,
     recovered_from_index: u64,
@@ -352,6 +354,7 @@ impl Node {
             senders,
             transports,
             pending: HashMap::new(),
+            put_proposals: proposal::Group::default(),
             blocked: BTreeSet::new(),
             installed_snapshots: 0,
             recovered_from_index,
@@ -411,7 +414,7 @@ impl Node {
                     let Some(event) = event else { return Ok(()); };
                     self.handle(event, &mut step_responses).await?;
                     // Let ready tasks add proposals before starting the next durable log write.
-                    if !self.pending.is_empty() {
+                    if !self.pending.is_empty() || !self.put_proposals.is_empty() {
                         tokio::task::yield_now().await;
                     }
                     // Accumulate proposals so concurrent clients can share one durable log write.
@@ -478,6 +481,13 @@ impl Node {
             Event::Authenticated(credentials, event) => (Some(credentials), *event),
             event => (None, event),
         };
+        let event = match event {
+            Event::Kv(request, tx) if crate::mvcc::batchable_put(&request) => {
+                return self.queue_put(request, credentials, tx);
+            }
+            event => event,
+        };
+        self.flush_puts();
         match event {
             Event::Authenticated(..) => anyhow::bail!("nested authentication context"),
             Event::Auth(auth, response) => self.propose(
@@ -517,7 +527,6 @@ impl Node {
                                 .members
                                 .get(&self.options.id)
                                 .is_some_and(|member| member.is_learner),
-                            leader: self.raw.raft.leader_id,
                             raft_index: self.raw.store().commit_index(),
                             raft_term: self.raw.raft.term,
                             version: "3.6.5".into(),
@@ -748,12 +757,8 @@ impl Node {
         Ok(())
     }
 
-    fn propose(&mut self, command: RaftCommand, response: impl Into<ClientResponse>) -> Result<()> {
-        let response = response.into();
-        if self.raw.raft.state != StateRole::Leader {
-            response.error(self.error("not leader"));
-        } else if self
-            .raw
+    fn backlogged(&self) -> bool {
+        self.raw
             .store()
             .commit_index()
             .max(self.raw.raft.raft_log.committed)
@@ -761,7 +766,13 @@ impl Node {
             >= apply::MAX_APPLY_LAG
             || self.log_queue.len() >= log::MAX_JOBS
             || self.log_bytes >= log::MAX_BYTES
-        {
+    }
+
+    fn propose(&mut self, command: RaftCommand, response: impl Into<ClientResponse>) -> Result<()> {
+        let response = response.into();
+        if self.raw.raft.state != StateRole::Leader {
+            response.error(self.error("not leader"));
+        } else if self.backlogged() {
             response.error(self.error("state apply backlog is full"));
         } else if self.pending.len() >= 1024 {
             response.error(self.error("too many pending requests"));
