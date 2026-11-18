@@ -9,9 +9,9 @@ impl Node {
             && self.log_bytes < log::MAX_BYTES
             && self.log_snapshot_bytes < log::MAX_SNAPSHOT_BYTES
         {
-            if let Some((index, conf, data)) = self.built_checkpoint.take() {
+            if let Some((index, conf, image)) = self.built_checkpoint.take() {
                 self.queue_log(
-                    log::Job::Checkpoint { index, conf, data },
+                    log::Job::Checkpoint { index, conf, image },
                     None,
                     Some(index),
                     vec![],
@@ -171,6 +171,10 @@ impl Node {
         self.log_bytes -= task.bytes;
         self.log_snapshot_bytes -= task.snapshot_bytes;
         self.log_busy = false;
+        let saved = completed.durable.snapshot.get_metadata().index;
+        if saved > self.raw.store().snapshot_index() {
+            self.next_checkpoint = self.options.next_checkpoint(saved);
+        }
         self.raw.mut_store().complete(completed.durable)?;
         if let Some(stats) = completed.stats {
             if let Some(response) = task.stats_response.take() {

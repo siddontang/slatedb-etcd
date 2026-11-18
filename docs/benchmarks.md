@@ -71,7 +71,7 @@ The controller samples RSS every 100 ms and includes both measurement boundaries
 RSS is not unique physical memory. Short samples can amplify CPU rounding and barrier overhead.
 Latency percentiles include successful operations only. Any failed request makes the report fail.
 CI compares the PR head and etcd on one Linux x86 runner.
-It includes matched PR base cases at concurrency 8 in the same shuffled matrix.
+It includes matched PR base cases at concurrency 8 and 32 in the same shuffled matrix.
 It also samples CPU stacks for the PR base and head.
 It uses identical release settings with line symbols for both service builds.
 It runs three repeats at concurrency 1, 8, and 32, with 0%, 50%, and 100% reads.
@@ -79,6 +79,15 @@ The `linux-performance` artifact includes samples, summaries, and CPU stack repo
 CI checks request success and report completeness. It does not enforce a performance threshold.
 Shared CI hosts can vary in CPU scheduling, storage latency, and available memory.
 Linux resource sampling reads process CPU ticks and resident pages from `/proc`.
+Each report includes CPU time and peak RSS for each member.
+Linux also records the change in each server's storage read and write bytes from `/proc/PID/io`.
+Page cache hits do not add storage read bytes. Write bytes include dirty pages charged to a process.
+These counters do not measure physical device traffic or remote object bytes.
+
+CI also compares all three builds at 1,000 scheduled puts per second with 32 client workers.
+Use `--rate` to set a target for the measured phase. Zero selects the unpaced workload.
+Paced latency starts at the scheduled arrival and includes time waiting for a client worker.
+Compare achieved throughput before comparing resource use at a fixed rate.
 macOS sampling reads `ps` counters. Both exclude child processes and the controller.
 
 Use `--s3-bucket`, `--s3-endpoint`, and optional `--s3-allow-http` to measure remote state storage.

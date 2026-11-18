@@ -35,13 +35,7 @@ impl Node {
             return Ok(());
         }
         let id = uuid::Uuid::new_v4().to_string();
-        let data = RaftCommand::Etcd {
-            origin: self.options.id,
-            id: id.clone(),
-            etcd: request,
-        }
-        .secure(credentials)
-        .encode()?;
+        let data = RaftCommand::encode_kv(id.clone(), self.options.id, request, credentials);
         let charge = data.len() + cache::ENTRY_OVERHEAD + 64;
         if self.put_proposals.bytes + charge > apply::BATCH_BYTES as usize {
             self.flush_puts();
