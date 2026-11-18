@@ -14,6 +14,7 @@ pub(super) struct AppliedState {
     pub members: std::sync::Arc<crate::cluster::Store>,
     pub read: std::sync::Arc<crate::state::ReadView>,
     pub write_batches: u64,
+    pub logical_size: u64,
 }
 
 impl std::ops::Deref for AppliedState {
@@ -31,6 +32,7 @@ impl AppliedState {
             members: state.members.clone(),
             read: state.read_view()?,
             write_batches: state.write_batches,
+            logical_size: state.logical_size(),
         })
     }
 }

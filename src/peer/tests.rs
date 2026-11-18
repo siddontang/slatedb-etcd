@@ -37,7 +37,7 @@ async fn step(events: &mut mpsc::Receiver<Event>, snapshot: bool) -> crate::node
         .unwrap()
         .unwrap()
     {
-        Event::Step(message, response) => {
+        Event::PeerFrame(message, _, response) => {
             assert_eq!(message.get_msg_type() == MessageType::MsgSnapshot, snapshot);
             response
         }
@@ -68,6 +68,7 @@ async fn stream_window_and_snapshot_storage_ack_bound_the_sender() {
             queue,
             events,
             crate::tls::Transport::default(),
+            Default::default(),
         ));
         for _ in 0..WINDOW {
             messages.send(message(false)).await.unwrap();
@@ -153,6 +154,7 @@ async fn rejected_stream_reports_a_waiting_snapshot_and_reconnects() {
         queue,
         events,
         crate::tls::Transport::default(),
+        Default::default(),
     ));
     messages.send(message(false)).await.unwrap();
     messages.send(message(true)).await.unwrap();
@@ -256,6 +258,7 @@ async fn a_stalled_receipt_times_out_and_releases_server_work() {
         queue,
         events,
         crate::tls::Transport::default(),
+        Default::default(),
     ));
     messages.send(message(false)).await.unwrap();
     let held = step(&mut received, false).await;
@@ -309,6 +312,7 @@ async fn large_frames_stop_at_the_independent_byte_target() {
         queue,
         events,
         crate::tls::Transport::default(),
+        Default::default(),
     ));
     let mut large = message(false);
     large.entries.push(raft::eraftpb::Entry {
@@ -358,6 +362,7 @@ async fn failed_stream_discards_its_backlog_and_rejects_a_queued_snapshot() {
         queue,
         events,
         crate::tls::Transport::default(),
+        Default::default(),
     ));
     for _ in 0..WINDOW + 2 {
         messages.send(message(false)).await.unwrap();
@@ -388,7 +393,7 @@ async fn failed_stream_discards_its_backlog_and_rejects_a_queued_snapshot() {
         }
     }
     assert_eq!(messages.capacity(), 256);
-    while let Ok(Event::Step(_, response)) = received.try_recv() {
+    while let Ok(Event::PeerFrame(_, _, response)) = received.try_recv() {
         assert!(
             response.is_closed(),
             "failed stream kept an accepted message waiter"

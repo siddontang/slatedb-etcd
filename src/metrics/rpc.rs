@@ -1,0 +1,348 @@
+//! Count gRPC messages and terminal status at the client listener.
+
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use anyhow::Result;
+use axum::body::{Body, Bytes};
+use axum::extract::{Request, State};
+use axum::http::HeaderMap;
+use axum::middleware::Next;
+use axum::response::Response;
+use http_body::{Body as HttpBody, Frame, SizeHint};
+use prometheus::{IntCounter, IntCounterVec, Opts, Registry};
+use prost::Message;
+
+const CODES: [&str; 17] = [
+    "OK",
+    "Canceled",
+    "Unknown",
+    "InvalidArgument",
+    "DeadlineExceeded",
+    "NotFound",
+    "AlreadyExists",
+    "PermissionDenied",
+    "ResourceExhausted",
+    "FailedPrecondition",
+    "Aborted",
+    "OutOfRange",
+    "Unimplemented",
+    "Internal",
+    "Unavailable",
+    "DataLoss",
+    "Unauthenticated",
+];
+
+pub(super) struct Observer {
+    methods: HashMap<String, Arc<Method>>,
+    sent: IntCounter,
+    received: IntCounter,
+    requests: IntCounterVec,
+}
+
+struct Method {
+    started: IntCounter,
+    received: IntCounter,
+    sent: IntCounter,
+    handled: Vec<IntCounter>,
+    shape: &'static str,
+    current_client: IntCounter,
+    unknown_client: IntCounter,
+}
+
+impl Observer {
+    pub fn new(registry: &Registry) -> Result<Self> {
+        let vector = |name, help, labels: &[&str]| -> Result<IntCounterVec> {
+            let value = IntCounterVec::new(Opts::new(name, help), labels)?;
+            registry.register(Box::new(value.clone()))?;
+            Ok(value)
+        };
+        let labels = ["grpc_type", "grpc_service", "grpc_method"];
+        let started = vector("grpc_server_started_total", "Started RPCs.", &labels)?;
+        let received = vector(
+            "grpc_server_msg_received_total",
+            "Received RPC messages.",
+            &labels,
+        )?;
+        let sent = vector("grpc_server_msg_sent_total", "Sent RPC messages.", &labels)?;
+        let handled = vector(
+            "grpc_server_handled_total",
+            "Finished RPCs by status.",
+            &["grpc_type", "grpc_service", "grpc_method", "grpc_code"],
+        )?;
+        let requests = vector(
+            "etcd_server_client_requests_total",
+            "Requests by client API version.",
+            &["type", "client_api_version"],
+        )?;
+        let mut methods = HashMap::new();
+        let mut add = |service: &str, method: &str, shape| {
+            let labels = [shape, service, method];
+            methods.insert(
+                format!("/{service}/{method}"),
+                Arc::new(Method {
+                    current_client: requests.with_label_values(&[
+                        if shape == "unary" { "unary" } else { "stream" },
+                        "3.6",
+                    ]),
+                    unknown_client: requests.with_label_values(&[
+                        if shape == "unary" { "unary" } else { "stream" },
+                        "unknown",
+                    ]),
+                    started: started.with_label_values(&labels),
+                    received: received.with_label_values(&labels),
+                    sent: sent.with_label_values(&labels),
+                    handled: CODES
+                        .iter()
+                        .map(|code| handled.with_label_values(&[shape, service, method, code]))
+                        .collect(),
+                    shape,
+                }),
+            );
+        };
+        let descriptors = prost_types::FileDescriptorSet::decode(
+            include_bytes!(concat!(env!("OUT_DIR"), "/services.pb")).as_slice(),
+        )?;
+        for file in descriptors.file {
+            if file.package() == "etcdserverpb" {
+                for service in file.service {
+                    let name = format!("etcdserverpb.{}", service.name());
+                    for method in service.method {
+                        let shape = match (method.client_streaming(), method.server_streaming()) {
+                            (false, false) => "unary",
+                            (false, true) => "server_stream",
+                            (true, false) => "client_stream",
+                            (true, true) => "bidi_stream",
+                        };
+                        add(&name, method.name(), shape);
+                    }
+                }
+            }
+        }
+        add("grpc.health.v1.Health", "Check", "unary");
+        add("grpc.health.v1.Health", "Watch", "server_stream");
+        let bytes = |name, help| -> Result<IntCounter> {
+            let value = IntCounter::new(name, help)?;
+            registry.register(Box::new(value.clone()))?;
+            Ok(value)
+        };
+        Ok(Self {
+            methods,
+            requests,
+            received: bytes(
+                "etcd_network_client_grpc_received_bytes_total",
+                "Received protobuf payload bytes.",
+            )?,
+            sent: bytes(
+                "etcd_network_client_grpc_sent_bytes_total",
+                "Sent protobuf payload bytes.",
+            )?,
+        })
+    }
+}
+
+fn status(headers: &HeaderMap) -> Option<usize> {
+    headers.get("grpc-status").map(|value| {
+        value
+            .to_str()
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&code| code < CODES.len())
+            .unwrap_or(2)
+    })
+}
+
+pub(super) async fn observe(
+    State(observer): State<Arc<Observer>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if req.method() != axum::http::Method::POST
+        || !req
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.split(';')
+                    .next()
+                    .is_some_and(|t| t == "application/grpc" || t.starts_with("application/grpc+"))
+            })
+    {
+        return next.run(req).await;
+    }
+    let Some(method) = observer.methods.get(req.uri().path()).cloned() else {
+        return next.run(req).await;
+    };
+    method.started.inc();
+    let mut terminal = Completion(Some(method.clone()));
+    let version = req
+        .headers()
+        .get("client-api-version")
+        .and_then(|v| v.to_str().ok());
+    // Limit client-controlled label values to canonical etcd v3 minor versions.
+    let version = match version {
+        None => "unknown",
+        Some(v)
+            if v.strip_prefix("3.").is_some_and(|n| {
+                !n.is_empty() && n.len() <= 2 && n.bytes().all(|c| c.is_ascii_digit())
+            }) =>
+        {
+            v
+        }
+        Some(_) => "other",
+    };
+    let kind = if method.shape == "unary" {
+        "unary"
+    } else {
+        "stream"
+    };
+    match version {
+        "3.6" => method.current_client.inc(),
+        "unknown" => method.unknown_client.inc(),
+        _ => observer.requests.with_label_values(&[kind, version]).inc(),
+    }
+    let req = req.map(|body| {
+        Body::new(ObservedBody::new(
+            body,
+            method.received.clone(),
+            observer.received.clone(),
+            Completion(None),
+        ))
+    });
+    let response = next.run(req).await;
+    if let Some(code) = status(response.headers()) {
+        terminal.finish(code);
+    }
+    response.map(|body| {
+        Body::new(ObservedBody::new(
+            body,
+            method.sent.clone(),
+            observer.sent.clone(),
+            terminal,
+        ))
+    })
+}
+
+#[derive(Default)]
+struct MessageFrames {
+    header: [u8; 5],
+    filled: usize,
+    remaining: usize,
+}
+
+impl MessageFrames {
+    fn consume(&mut self, mut data: &[u8]) -> (u64, u64) {
+        let (mut messages, mut bytes) = (0, 0);
+        while !data.is_empty() {
+            if self.filled < 5 {
+                let n = (5 - self.filled).min(data.len());
+                self.header[self.filled..self.filled + n].copy_from_slice(&data[..n]);
+                data = &data[n..];
+                self.filled += n;
+                if self.filled < 5 {
+                    break;
+                }
+                self.remaining = u32::from_be_bytes(self.header[1..].try_into().unwrap()) as usize;
+            }
+            let n = self.remaining.min(data.len());
+            data = &data[n..];
+            self.remaining -= n;
+            if self.remaining == 0 {
+                messages += 1;
+                bytes += u64::from(u32::from_be_bytes(self.header[1..].try_into().unwrap()));
+                self.filled = 0;
+            }
+        }
+        (messages, bytes)
+    }
+}
+
+struct ObservedBody {
+    inner: Body,
+    frames: MessageFrames,
+    messages: IntCounter,
+    bytes: IntCounter,
+    terminal: Completion,
+}
+
+impl ObservedBody {
+    fn new(inner: Body, messages: IntCounter, bytes: IntCounter, terminal: Completion) -> Self {
+        Self {
+            inner,
+            frames: MessageFrames::default(),
+            messages,
+            bytes,
+            terminal,
+        }
+    }
+}
+
+struct Completion(Option<Arc<Method>>);
+
+impl Completion {
+    fn finish(&mut self, code: usize) {
+        if let Some(method) = self.0.take() {
+            method.handled[code].inc();
+        }
+    }
+}
+
+impl Drop for Completion {
+    fn drop(&mut self) {
+        self.finish(1);
+    }
+}
+
+impl HttpBody for ObservedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        let result = std::task::ready!(Pin::new(&mut self.inner).poll_frame(cx));
+        match &result {
+            Some(Ok(frame)) => {
+                if let Some(data) = frame.data_ref() {
+                    let (n, bytes) = self.frames.consume(data);
+                    if n != 0 {
+                        self.messages.inc_by(n);
+                        self.bytes.inc_by(bytes);
+                    }
+                } else if let Some(code) = frame.trailers_ref().and_then(status) {
+                    self.terminal.finish(code);
+                }
+            }
+            Some(Err(_)) | None => self.terminal.finish(2),
+        }
+        Poll::Ready(result)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_complete_messages_across_data_frames() {
+        let stream = [
+            0, 0, 0, 0, 2, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 3, 4, 5, 0, 0,
+        ];
+        for split in 0..=stream.len() {
+            let mut frames = MessageFrames::default();
+            let a = frames.consume(&stream[..split]);
+            let b = frames.consume(&stream[split..]);
+            assert_eq!((a.0 + b.0, a.1 + b.1), (3, 5));
+        }
+    }
+}

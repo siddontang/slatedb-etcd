@@ -183,6 +183,7 @@ impl Node {
             return;
         }
         while self.transports.try_join_next().is_some() {}
+        self.traffic.retain(|id, _| peers.contains_key(id));
         self.senders.retain(|id, _| peers.contains_key(id));
         for (&id, address) in &peers {
             if id == self.options.id {
@@ -206,6 +207,7 @@ impl Node {
                 rx,
                 self.events.clone(),
                 self.options.transport.clone(),
+                self.traffic.entry(id).or_default().clone(),
             ));
         }
         self.options.peers = peers;

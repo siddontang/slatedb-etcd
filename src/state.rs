@@ -41,10 +41,11 @@ struct SnapshotData {
 }
 
 pub struct StateMachine {
+    pub(crate) metrics: Arc<crate::metrics::StateMeters>,
     pub(crate) db: Arc<Db>,
     pub auth: Arc<crate::auth::Store>,
     pub members: Arc<crate::cluster::Store>,
-    admin: slatedb::admin::Admin,
+    pub(crate) admin: Arc<slatedb::admin::Admin>,
     pub quota: u64,
     logical_bytes: u64,
     checkpoint_delta: Option<checkpoint::Delta>,
@@ -128,7 +129,8 @@ impl StateMachine {
             };
             Ok(Self {
                 members: Arc::new(members),
-                admin,
+                admin: Arc::new(admin),
+                metrics: Arc::new(crate::metrics::StateMeters::new()?),
                 quota: 0,
                 checkpoint_delta: None,
                 logical_bytes: maintenance::count_logical_size(&db).await?,

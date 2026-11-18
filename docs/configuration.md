@@ -48,6 +48,11 @@ The default simple-token lifetime is 300 seconds. Auth changes invalidate existi
 Certificates are read at startup. Automatic generation and certificate reload are unsupported.
 Keep client and peer trust roots separate. See [security](../SECURITY.md).
 
+## Monitoring
+
+Expose additional scrape listeners with `--listen-metrics-urls`.
+See the [metrics guide](metrics.md) for listener security and per-member metric coverage.
+
 ## Runtime
 
 `--runtime-workers` sets the async worker count. The default is two; zero is invalid.

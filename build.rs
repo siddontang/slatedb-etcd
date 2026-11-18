@@ -1,5 +1,8 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
+        .file_descriptor_set_path(
+            std::path::PathBuf::from(std::env::var("OUT_DIR")?).join("services.pb"),
+        )
         .message_attribute(".", "#[serde(default)]")
         .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
         .compile_protos(

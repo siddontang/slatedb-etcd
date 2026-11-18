@@ -63,7 +63,9 @@ pub enum Event {
         Response,
     ),
     Step(Message, Response),
+    PeerFrame(Message, usize, Response),
     Status(Response),
+    Metrics(oneshot::Sender<crate::metrics::Sample>),
     LogStats(Response),
     Checkpoint(Response),
     LocalValue(String, Response),
@@ -126,6 +128,9 @@ struct LogTask {
 }
 
 pub struct Node {
+    pub(crate) metrics: std::sync::Arc<crate::metrics::Member>,
+    last_observed_leader: u64,
+    traffic: BTreeMap<u64, std::sync::Arc<crate::metrics::PeerTraffic>>,
     applied_notify: tokio::sync::watch::Sender<u64>,
     transfers: Vec<(u64, Instant, Response)>,
     published_at: Option<Instant>,
@@ -288,6 +293,7 @@ impl Node {
             }
         };
         let manual_apply = transport_override.is_some();
+        let mut traffic = BTreeMap::<u64, std::sync::Arc<crate::metrics::PeerTraffic>>::new();
         let mut transports = tokio::task::JoinSet::new();
         let senders = if let Some(senders) = transport_override {
             senders
@@ -306,14 +312,23 @@ impl Node {
                     rx,
                     events.clone(),
                     options.transport.clone(),
+                    traffic.entry(peer).or_default().clone(),
                 ));
             }
             senders
         };
         let applied = AppliedState::new(&state)?;
+        let metrics = std::sync::Arc::new(crate::metrics::Member::new(
+            storage.wal_metrics.clone(),
+            state.admin.clone(),
+            state.metrics.registry.clone(),
+        )?);
         let worker = Worker::start(state, events.clone(), manual_apply);
         let log_worker = log::Worker::start(storage, manual_apply)?;
         let mut node = Self {
+            metrics,
+            last_observed_leader: 0,
+            traffic,
             applied_notify: tokio::sync::watch::channel(applied.applied).0,
             transfers: vec![],
             published_at: None,
@@ -477,6 +492,16 @@ impl Node {
     }
 
     async fn handle(&mut self, event: Event, step_responses: &mut Vec<Response>) -> Result<()> {
+        let event = if let Event::PeerFrame(message, bytes, tx) = event {
+            if let Some(meter) = self.traffic.get(&message.from) {
+                meter
+                    .received
+                    .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            Event::Step(message, tx)
+        } else {
+            event
+        };
         let (credentials, event) = match event {
             Event::Authenticated(credentials, event) => (Some(credentials), *event),
             event => (None, event),
@@ -489,7 +514,9 @@ impl Node {
         };
         self.flush_puts();
         match event {
-            Event::Authenticated(..) => anyhow::bail!("nested authentication context"),
+            Event::PeerFrame(..) | Event::Authenticated(..) => {
+                anyhow::bail!("nested authentication context")
+            }
             Event::Auth(auth, response) => self.propose(
                 RaftCommand::Auth {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -682,6 +709,49 @@ impl Node {
             Event::SubscribeApply(response) => {
                 let _ = response.send(self.applied_notify.subscribe());
             }
+            Event::Metrics(response) => {
+                let id = self.options.id;
+                let _ = response.send(crate::metrics::Sample {
+                    id,
+                    leader: self.raw.raft.leader_id,
+                    learner: self
+                        .state
+                        .members
+                        .members
+                        .get(&id)
+                        .is_some_and(|m| m.is_learner),
+                    committed: self.raw.raft.raft_log.committed,
+                    applied: self.state.applied,
+                    pending: self.pending.len(),
+                    quota: self.options.quota_bytes,
+                    used: self.state.logical_size,
+                    revision: self.state.revision,
+                    compact: if self.state.compact_revision == 0 {
+                        -1
+                    } else {
+                        self.state.compact_revision
+                    },
+                    auth_revision: self.state.auth.revision,
+                    traffic: self
+                        .traffic
+                        .iter()
+                        .map(|(&id, m)| {
+                            (
+                                id,
+                                m.sent.load(std::sync::atomic::Ordering::Relaxed),
+                                m.received.load(std::sync::atomic::Ordering::Relaxed),
+                            )
+                        })
+                        .collect(),
+                    peers: self
+                        .state
+                        .members
+                        .members
+                        .keys()
+                        .map(|&id| (id, self.peer_health.contains_key(&id)))
+                        .collect(),
+                });
+            }
             Event::Status(response) => {
                 let _ = response.send(Ok(self.status()?));
             }
@@ -817,6 +887,7 @@ impl Node {
                     );
                 }
                 Err(error) => {
+                    self.metrics.failed_proposals.inc();
                     response.error(self.error(&error.to_string()));
                 }
             }
@@ -915,6 +986,7 @@ impl Node {
             .collect();
         for id in expired {
             if let Some(pending) = self.pending.remove(&id) {
+                self.metrics.failed_proposals.inc();
                 pending.response.error(
                     self.error("request outcome unknown: leadership changed or request timed out"),
                 );

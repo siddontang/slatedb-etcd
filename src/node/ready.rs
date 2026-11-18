@@ -25,6 +25,12 @@ impl Node {
             && self.log_snapshot_bytes < log::MAX_SNAPSHOT_BYTES
         {
             let mut ready = self.raw.ready();
+            if let Some(state) = ready.ss() {
+                if state.leader_id != 0 && self.last_observed_leader != state.leader_id {
+                    self.metrics.leader_changes.inc();
+                }
+                self.last_observed_leader = state.leader_id;
+            }
             let snapshot = (!ready.snapshot().is_empty()).then(|| ready.snapshot().clone());
             self.raw
                 .mut_store()

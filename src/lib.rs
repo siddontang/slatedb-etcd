@@ -9,6 +9,7 @@ mod failpoint;
 pub mod grpc;
 pub mod lease;
 pub mod maintenance;
+mod metrics;
 pub mod mvcc;
 pub mod node;
 pub mod object;

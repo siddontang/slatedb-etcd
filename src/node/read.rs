@@ -228,11 +228,18 @@ impl Node {
             })
             .map(|(id, _)| *id)
             .collect();
+        let mut failed = BTreeSet::new();
         for id in expired {
             if let Some(read) = self.reads.remove(&id) {
+                if read.index.is_none() && !read.response.is_closed() {
+                    failed.extend(read.context);
+                }
                 read.response
                     .error(self.error("read cancelled: leadership changed or request timed out"));
             }
+        }
+        if !failed.is_empty() {
+            self.metrics.failed_read_indexes.inc_by(failed.len() as u64);
         }
     }
 }

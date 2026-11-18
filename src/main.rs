@@ -27,6 +27,9 @@ struct Args {
     /// Separate peer listener address. Required when TLS is enabled.
     #[arg(long)]
     peer_listen: Option<SocketAddr>,
+    /// Comma-separated HTTP or HTTPS listeners for Prometheus scrapes.
+    #[arg(long, value_delimiter = ',')]
+    listen_metrics_urls: Vec<String>,
     /// Advertised client URL. Repeat as --client-peer ID=URL.
     #[arg(long = "client-peer")]
     client_peers: Vec<String>,
@@ -114,6 +117,7 @@ async fn run(args: Args) -> Result<()> {
         dir: args.dir,
         listen: args.listen,
         peer_listen: args.peer_listen,
+        listen_metrics_urls: args.listen_metrics_urls,
         peers: parse_peers(args.peers)?,
         client_peers: parse_peers(args.client_peers)?,
         allow_remote: args.allow_remote,

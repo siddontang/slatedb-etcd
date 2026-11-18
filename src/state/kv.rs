@@ -64,7 +64,7 @@ impl StateMachine {
             index == self.applied + 1,
             "non-contiguous state machine apply"
         );
-        let (result, mut batch, revision) = match mvcc::prepare(
+        let (result, mut batch, revision, counts) = match mvcc::prepare_with_counts(
             &self.db,
             self.revision,
             self.compact_revision,
@@ -73,20 +73,26 @@ impl StateMachine {
         )
         .await
         {
-            Ok((response, batch, revision)) => (Ok(response), batch, revision),
+            Ok((response, batch, revision, counts)) => (Ok(response), batch, revision, counts),
             Err(error) => {
                 ensure!(
                     error.code != tonic::Code::Internal as i32,
                     "{}",
                     error.message
                 );
-                (Err(error), WriteBatch::new(), self.revision)
+                (
+                    Err(error),
+                    WriteBatch::new(),
+                    self.revision,
+                    Default::default(),
+                )
             }
         };
         batch.put(APPLIED, index.to_be_bytes());
         self.write_batch(batch, index).await?;
         self.applied = index;
         self.revision = revision;
+        counts.publish(&self.metrics);
         Ok(Outcome { result })
     }
 
@@ -136,7 +142,7 @@ impl StateMachine {
         if result.is_ok() {
             self.compact_revision = request.revision;
             if request.physical {
-                self.db.flush().await?;
+                self.metrics.flush_db(&self.db).await?;
                 self.durable_applied = self.applied;
             }
         }

@@ -5,6 +5,8 @@ use watch_request::RequestUnion;
 use watch_server::Watch;
 
 struct Watcher {
+    _active: Option<crate::metrics::Active>,
+    meters: Option<std::sync::Arc<crate::metrics::WatchMeters>>,
     request: WatchCreateRequest,
     progress: tokio::time::Instant,
     credentials: crate::auth::Credentials,
@@ -77,7 +79,11 @@ impl Service {
             let caught_up = page.next_revision > page.header.as_ref().unwrap().revision;
             let had_events = !page.responses.is_empty();
             for response in page.responses {
+                let sent = response.events.len();
                 send_events(tx, response, watcher.request.fragment).await?;
+                if let Some(metrics) = &watcher.meters {
+                    metrics.events.inc_by(sent as u64);
+                }
             }
             watcher.request.start_revision = page.next_revision;
             if had_events {
@@ -112,7 +118,11 @@ impl Service {
         tx: &Output,
         require_leader: bool,
         credentials: crate::auth::Credentials,
+        meters: Option<std::sync::Arc<crate::metrics::WatchMeters>>,
     ) -> Result<(), Status> {
+        let _stream = meters
+            .as_ref()
+            .map(|m| crate::metrics::Active::new(&m.streams));
         let (subscribe, receiver) = oneshot::channel();
         self.events
             .send(Event::SubscribeApply(subscribe))
@@ -169,7 +179,7 @@ impl Service {
                             if !reason.is_empty() { continue; }
                             if request.start_revision <= 0 { request.start_revision = page.next_revision; }
                             let id = request.watch_id;
-                            let mut watcher = Watcher { request, progress: tokio::time::Instant::now(), credentials: credentials.clone() };
+                            let mut watcher = Watcher { _active: meters.as_ref().map(|m| crate::metrics::Active::new(&m.watchers)), meters: meters.clone(), request, progress: tokio::time::Instant::now(), credentials: credentials.clone() };
                             if self.poll_watch(&mut watcher, tx, require_leader, None).await? {
                                 watchers.insert(id, watcher);
                             }
@@ -243,13 +253,23 @@ impl Watch for Service {
         &self,
         request: Request<tonic::Streaming<WatchRequest>>,
     ) -> Result<Response<Self::WatchStream>, Status> {
+        let meters = request
+            .extensions()
+            .get::<std::sync::Arc<crate::metrics::WatchMeters>>()
+            .cloned();
         let credentials = credentials(&request);
         let require_leader = request.metadata().contains_key("hasleader");
         let service = self.clone();
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             if let Err(error) = service
-                .watch_stream(request.into_inner(), &tx, require_leader, credentials)
+                .watch_stream(
+                    request.into_inner(),
+                    &tx,
+                    require_leader,
+                    credentials,
+                    meters,
+                )
                 .await
             {
                 let _ = tx.send(Err(error)).await;

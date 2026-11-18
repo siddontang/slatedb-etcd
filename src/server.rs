@@ -22,6 +22,8 @@ pub struct ServerConfig {
     pub dir: PathBuf,
     pub listen: SocketAddr,
     pub peer_listen: Option<SocketAddr>,
+    /// Extra HTTP or HTTPS listeners for Prometheus scrapes.
+    pub listen_metrics_urls: Vec<String>,
     pub peers: BTreeMap<u64, String>,
     pub client_peers: BTreeMap<u64, String>,
     pub allow_remote: bool,
@@ -47,6 +49,7 @@ impl ServerConfig {
             dir: dir.into(),
             listen: address.parse().unwrap(),
             peer_listen: None,
+            listen_metrics_urls: Vec::new(),
             peers: BTreeMap::from([(1, address.into())]),
             client_peers: BTreeMap::from([(1, address.into())]),
             allow_remote: false,
@@ -148,6 +151,35 @@ impl Server {
             "peer listener differs from advertised peer port"
         );
         // Bind both sockets before opening storage or starting any member tasks.
+        let mut metrics_listeners = Vec::with_capacity(config.listen_metrics_urls.len());
+        for address in &mut config.listen_metrics_urls {
+            let url = reqwest::Url::parse(address)?;
+            crate::tls::validate_url(address, config.allow_remote, false)?;
+            let tls = if url.scheme() == "https" {
+                Some(
+                    client_tls
+                        .clone()
+                        .context("HTTPS metrics require client TLS settings")?,
+                )
+            } else {
+                None
+            };
+            let host = url
+                .host_str()
+                .context("metrics URL has no host")?
+                .trim_matches(['[', ']']);
+            let port = url
+                .port_or_known_default()
+                .context("metrics URL has no port")?;
+            let listener = TcpListener::bind((host, port)).await?;
+            let bound = listener.local_addr()?;
+            ensure!(
+                bound.ip().is_loopback() || (config.allow_remote && tls.is_some()),
+                "remote metrics require remote mode and client TLS"
+            );
+            *address = format!("{}://{bound}", url.scheme());
+            metrics_listeners.push((listener, tls));
+        }
         let listener = TcpListener::bind(config.listen).await?;
         config.listen = listener.local_addr()?;
         let peer_listener = match config.peer_listen {
@@ -214,6 +246,8 @@ impl Server {
         let peer_app = diagnostics
             .clone()
             .fallback_service(grpc.clone().layer(axum::Extension(crate::tls::PeerServer)));
+        let metrics_app = node.metrics.scrape_router(events.clone());
+        let grpc = node.metrics.routes(grpc, events.clone())?;
         let client_app = if peer_listener.is_some() {
             grpc.layer(axum::Extension(crate::tls::ClientServer))
         } else {
@@ -221,6 +255,14 @@ impl Server {
         };
         let (stop, _) = watch::channel(false);
         let mut tasks = tokio::task::JoinSet::new();
+        for (metrics_listener, tls) in metrics_listeners {
+            tasks.spawn(crate::tls::serve_until(
+                metrics_listener,
+                metrics_app.clone(),
+                tls,
+                stopped(stop.subscribe()),
+            ));
+        }
         tasks.spawn(node.run_until(receiver, stopped(stop.subscribe())));
         tasks.spawn(crate::tls::serve_until(
             listener,
