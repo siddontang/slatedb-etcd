@@ -11,6 +11,7 @@ pub mod maintenance;
 pub mod mvcc;
 pub mod node;
 pub mod object;
+mod peer;
 pub mod proto;
 pub mod server;
 pub mod state;

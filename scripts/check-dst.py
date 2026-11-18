@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--seeds", default="1,2,42")
+    parser.add_argument("--seeds", default="1,2,42,58,70")
     parser.add_argument("--output", type=Path, default=ROOT / "results/dst.json")
     args = parser.parse_args()
     seeds = list(dict.fromkeys(int(seed) for seed in args.seeds.split(",")))

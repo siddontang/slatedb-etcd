@@ -18,8 +18,9 @@ def summarize(report):
             or not samples or not all(row.get("passed") for row in samples)):
         raise ValueError("A summary requires a complete, passing version 2 report")
     groups, seen = defaultdict(list), set()
-    fields = ("backend", "concurrency", "read_percent", "keys", "value_bytes", "requests")
+    fields = ("backend", "members", "concurrency", "read_percent", "keys", "value_bytes", "requests")
     for row in samples:
+        row = dict(row, members=row.get("members", report.get("members", 3)))
         key = tuple(row[field] for field in fields)
         repeat = key + (row["repeat"],)
         if repeat in seen or row["successes"] != row["requests"] or row["errors"]:
@@ -45,11 +46,11 @@ def summarize(report):
 
 
 def table(summary):
-    lines = ["| Backend | C | Read % | ops/s | p50 ms | p99 ms | CPU us/op | RSS MiB |",
-             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    lines = ["| Backend | Members | C | Read % | ops/s | p50 ms | p99 ms | CPU us/op | RSS MiB |",
+             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
     for row in summary["groups"]:
         metrics = row["metrics"]
-        values = [row["backend"], str(row["concurrency"]), str(row["read_percent"])]
+        values = [row["backend"], str(row["members"]), str(row["concurrency"]), str(row["read_percent"])]
         for name, precision in [("ops_per_second", 0), ("p50_ms", 2), ("p99_ms", 2),
                                 ("server_cpu_us_per_op", 0), ("peak_server_rss_mib", 1)]:
             values.append(f"{metrics[name]['median']:.{precision}f}")

@@ -1,0 +1,994 @@
+{
+  "passed": true,
+  "aggregation": "median, min, and max across repeats; no pooled percentiles",
+  "groups": [
+    {
+      "backend": "baseline",
+      "members": 1,
+      "concurrency": 8,
+      "read_percent": 0,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 5000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 521.0909521780818,
+          "min": 520.9511510487314,
+          "max": 524.8506963784646
+        },
+        "p50_ms": {
+          "median": 15.0925,
+          "min": 15.0415,
+          "max": 15.167084
+        },
+        "p99_ms": {
+          "median": 26.433625,
+          "min": 26.206875,
+          "max": 27.07375
+        },
+        "server_cpu_us_per_op": {
+          "median": 556.0000000000001,
+          "min": 548.0,
+          "max": 568.0
+        },
+        "average_server_cpu_cores": {
+          "median": 0.28972656941101355,
+          "min": 0.28761818161539865,
+          "max": 0.2959002537956794
+        },
+        "peak_server_rss_mib": {
+          "median": 130.78125,
+          "min": 130.78125,
+          "max": 131.0
+        },
+        "client_cpu_us_per_op": {
+          "median": 160.0,
+          "min": 158.0,
+          "max": 164.00000000000003
+        }
+      }
+    },
+    {
+      "backend": "baseline",
+      "members": 1,
+      "concurrency": 8,
+      "read_percent": 50,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 5000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 642.6100696405683,
+          "min": 642.0228685610452,
+          "max": 643.3632353553318
+        },
+        "p50_ms": {
+          "median": 13.674333,
+          "min": 13.631083,
+          "max": 13.783166
+        },
+        "p99_ms": {
+          "median": 19.646209,
+          "min": 19.418375,
+          "max": 20.1595
+        },
+        "server_cpu_us_per_op": {
+          "median": 432.0,
+          "min": 430.0,
+          "max": 442.0
+        },
+        "average_server_cpu_cores": {
+          "median": 0.27760755008472554,
+          "min": 0.27606983348124947,
+          "max": 0.28436655002705663
+        },
+        "peak_server_rss_mib": {
+          "median": 57.671875,
+          "min": 57.4375,
+          "max": 57.765625
+        },
+        "client_cpu_us_per_op": {
+          "median": 192.0,
+          "min": 192.0,
+          "max": 195.99999999999997
+        }
+      }
+    },
+    {
+      "backend": "baseline",
+      "members": 1,
+      "concurrency": 8,
+      "read_percent": 100,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 300000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 53994.11733443712,
+          "min": 52567.96057435479,
+          "max": 54198.258452130605
+        },
+        "p50_ms": {
+          "median": 0.143625,
+          "min": 0.142958,
+          "max": 0.1455
+        },
+        "p99_ms": {
+          "median": 0.286875,
+          "min": 0.285833,
+          "max": 0.320292
+        },
+        "server_cpu_us_per_op": {
+          "median": 43.03333333333333,
+          "min": 42.699999999999996,
+          "max": 43.93333333333333
+        },
+        "average_server_cpu_cores": {
+          "median": 2.3142656359059766,
+          "min": 2.3094857345666537,
+          "max": 2.323546849291944
+        },
+        "peak_server_rss_mib": {
+          "median": 35.046875,
+          "min": 35.03125,
+          "max": 35.140625
+        },
+        "client_cpu_us_per_op": {
+          "median": 33.46666666666667,
+          "min": 33.2,
+          "max": 34.03333333333333
+        }
+      }
+    },
+    {
+      "backend": "etcd",
+      "members": 1,
+      "concurrency": 1,
+      "read_percent": 0,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 5000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 223.78128238747897,
+          "min": 220.85742151610668,
+          "max": 227.99499555198113
+        },
+        "p50_ms": {
+          "median": 4.013833,
+          "min": 4.01075,
+          "max": 4.023459
+        },
+        "p99_ms": {
+          "median": 14.27325,
+          "min": 14.197542,
+          "max": 14.277333
+        },
+        "server_cpu_us_per_op": {
+          "median": 738.0000000000001,
+          "min": 734.0,
+          "max": 776.0
+        },
+        "average_server_cpu_cores": {
+          "median": 0.16826030671736208,
+          "min": 0.16425546127240956,
+          "max": 0.17138535909649877
+        },
+        "peak_server_rss_mib": {
+          "median": 45.125,
+          "min": 44.90625,
+          "max": 45.203125
+        },
+        "client_cpu_us_per_op": {
+          "median": 424.0,
+          "min": 417.99999999999994,
+          "max": 426.0
+        }
+      }
+    },
+    {
+      "backend": "etcd",
+      "members": 1,
+      "concurrency": 1,
+      "read_percent": 50,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 5000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 420.581932501273,
+          "min": 414.77655723603016,
+          "max": 423.1505257947497
+        },
+        "p50_ms": {
+          "median": 2.834291,
+          "min": 2.811334,
+          "max": 2.862542
+        },
+        "p99_ms": {
+          "median": 13.022209,
+          "min": 12.488792,
+          "max": 13.661125
+        },
+        "server_cpu_us_per_op": {
+          "median": 552.0,
+          "min": 535.9999999999999,
+          "max": 572.0
+        },
+        "average_server_cpu_cores": {
+          "median": 0.2321612267407027,
+          "min": 0.22680868182598582,
+          "max": 0.23725219073900922
+        },
+        "peak_server_rss_mib": {
+          "median": 42.40625,
+          "min": 41.953125,
+          "max": 43.8125
+        },
+        "client_cpu_us_per_op": {
+          "median": 359.99999999999994,
+          "min": 350.0,
+          "max": 369.9999999999999
+        }
+      }
+    },
+    {
+      "backend": "etcd",
+      "members": 1,
+      "concurrency": 1,
+      "read_percent": 100,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 300000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 18988.824472446977,
+          "min": 18920.855273452027,
+          "max": 19217.03059372089
+        },
+        "p50_ms": {
+          "median": 0.049542,
+          "min": 0.049416,
+          "max": 0.049917
+        },
+        "p99_ms": {
+          "median": 0.119791,
+          "min": 0.1105,
+          "max": 0.135
+        },
+        "server_cpu_us_per_op": {
+          "median": 70.33333333333331,
+          "min": 69.76666666666667,
+          "max": 70.9
+        },
+        "average_server_cpu_cores": {
+          "median": 1.3407081677552606,
+          "min": 1.3355473212287707,
+          "max": 1.3414886388877487
+        },
+        "peak_server_rss_mib": {
+          "median": 43.453125,
+          "min": 42.96875,
+          "max": 43.59375
+        },
+        "client_cpu_us_per_op": {
+          "median": 51.63333333333333,
+          "min": 51.0,
+          "max": 51.9
+        }
+      }
+    },
+    {
+      "backend": "etcd",
+      "members": 1,
+      "concurrency": 8,
+      "read_percent": 0,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 5000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 899.8424983718942,
+          "min": 896.3783224344091,
+          "max": 902.9859442562397
+        },
+        "p50_ms": {
+          "median": 7.994375,
+          "min": 7.990125,
+          "max": 7.995667
+        },
+        "p99_ms": {
+          "median": 22.407459,
+          "min": 22.373792,
+          "max": 23.084417
+        },
+        "server_cpu_us_per_op": {
+          "median": 308.0,
+          "min": 304.0,
+          "max": 313.99999999999994
+        },
+        "average_server_cpu_cores": {
+          "median": 0.27608452330979805,
+          "min": 0.27450772705389687,
+          "max": 0.28255054448877476
+        },
+        "peak_server_rss_mib": {
+          "median": 46.90625,
+          "min": 46.234375,
+          "max": 47.0625
+        },
+        "client_cpu_us_per_op": {
+          "median": 170.00000000000003,
+          "min": 168.0,
+          "max": 172.00000000000003
+        }
+      }
+    },
+    {
+      "backend": "etcd",
+      "members": 1,
+      "concurrency": 8,
+      "read_percent": 50,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 5000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 1019.5934076298312,
+          "min": 1018.6648084623293,
+          "max": 1028.2555191677202
+        },
+        "p50_ms": {
+          "median": 7.946125,
+          "min": 7.936084,
+          "max": 7.954375
+        },
+        "p99_ms": {
+          "median": 21.993416,
+          "min": 21.779417,
+          "max": 22.042541
+        },
+        "server_cpu_us_per_op": {
+          "median": 286.00000000000006,
+          "min": 280.0,
+          "max": 305.99999999999994
+        },
+        "average_server_cpu_cores": {
+          "median": 0.294081078481968,
+          "min": 0.2852261463694522,
+          "max": 0.31199558273472827
+        },
+        "peak_server_rss_mib": {
+          "median": 42.46875,
+          "min": 42.375,
+          "max": 42.953125
+        },
+        "client_cpu_us_per_op": {
+          "median": 162.0,
+          "min": 157.99999999999997,
+          "max": 170.00000000000003
+        }
+      }
+    },
+    {
+      "backend": "etcd",
+      "members": 1,
+      "concurrency": 8,
+      "read_percent": 100,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 300000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 61821.20372404551,
+          "min": 61697.865612149886,
+          "max": 61968.271883314155
+        },
+        "p50_ms": {
+          "median": 0.120083,
+          "min": 0.119833,
+          "max": 0.120334
+        },
+        "p99_ms": {
+          "median": 0.329041,
+          "min": 0.326209,
+          "max": 0.329625
+        },
+        "server_cpu_us_per_op": {
+          "median": 51.4,
+          "min": 51.3,
+          "max": 51.7
+        },
+        "average_server_cpu_cores": {
+          "median": 3.1789723476140157,
+          "min": 3.1776098714159393,
+          "max": 3.189779652148149
+        },
+        "peak_server_rss_mib": {
+          "median": 44.25,
+          "min": 43.6875,
+          "max": 44.6875
+        },
+        "client_cpu_us_per_op": {
+          "median": 30.666666666666668,
+          "min": 30.533333333333335,
+          "max": 30.733333333333327
+        }
+      }
+    },
+    {
+      "backend": "etcd",
+      "members": 1,
+      "concurrency": 32,
+      "read_percent": 0,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 5000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 3423.870259837541,
+          "min": 3405.2517787046627,
+          "max": 6399.711245028624
+        },
+        "p50_ms": {
+          "median": 8.035833,
+          "min": 4.800708,
+          "max": 8.068291
+        },
+        "p99_ms": {
+          "median": 25.185792,
+          "min": 19.28775,
+          "max": 26.563
+        },
+        "server_cpu_us_per_op": {
+          "median": 156.0,
+          "min": 96.0,
+          "max": 158.0
+        },
+        "average_server_cpu_cores": {
+          "median": 0.5380297810353367,
+          "min": 0.5341237605346565,
+          "max": 0.6143722795227479
+        },
+        "peak_server_rss_mib": {
+          "median": 46.828125,
+          "min": 46.515625,
+          "max": 46.859375
+        },
+        "client_cpu_us_per_op": {
+          "median": 84.00000000000001,
+          "min": 61.999999999999986,
+          "max": 91.99999999999999
+        }
+      }
+    },
+    {
+      "backend": "etcd",
+      "members": 1,
+      "concurrency": 32,
+      "read_percent": 50,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 5000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 3623.391783101982,
+          "min": 3606.216323574251,
+          "max": 4613.867896461534
+        },
+        "p50_ms": {
+          "median": 8.027292,
+          "min": 7.371458,
+          "max": 8.038167
+        },
+        "p99_ms": {
+          "median": 25.952583,
+          "min": 19.9825,
+          "max": 26.385333
+        },
+        "server_cpu_us_per_op": {
+          "median": 162.0,
+          "min": 146.0,
+          "max": 166.00000000000003
+        },
+        "average_server_cpu_cores": {
+          "median": 0.5986319097133257,
+          "min": 0.5869894688625211,
+          "max": 0.6736247128833839
+        },
+        "peak_server_rss_mib": {
+          "median": 43.53125,
+          "min": 43.53125,
+          "max": 44.125
+        },
+        "client_cpu_us_per_op": {
+          "median": 91.99999999999999,
+          "min": 85.99999999999999,
+          "max": 94.0
+        }
+      }
+    },
+    {
+      "backend": "etcd",
+      "members": 1,
+      "concurrency": 32,
+      "read_percent": 100,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 300000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 108167.38418545487,
+          "min": 107835.32038177241,
+          "max": 109340.30936656016
+        },
+        "p50_ms": {
+          "median": 0.266042,
+          "min": 0.261458,
+          "max": 0.266375
+        },
+        "p99_ms": {
+          "median": 0.723625,
+          "min": 0.720917,
+          "max": 0.728375
+        },
+        "server_cpu_us_per_op": {
+          "median": 45.166666666666664,
+          "min": 44.9,
+          "max": 45.5
+        },
+        "average_server_cpu_cores": {
+          "median": 4.906507077370645,
+          "min": 4.856715549926924,
+          "max": 4.938537306389634
+        },
+        "peak_server_rss_mib": {
+          "median": 45.609375,
+          "min": 45.34375,
+          "max": 45.671875
+        },
+        "client_cpu_us_per_op": {
+          "median": 23.83333333333333,
+          "min": 23.666666666666668,
+          "max": 23.9
+        }
+      }
+    },
+    {
+      "backend": "service",
+      "members": 1,
+      "concurrency": 1,
+      "read_percent": 0,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 5000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 236.0242744676715,
+          "min": 231.51046137154174,
+          "max": 237.1011688637133
+        },
+        "p50_ms": {
+          "median": 4.066,
+          "min": 4.054542,
+          "max": 4.090125
+        },
+        "p99_ms": {
+          "median": 5.945,
+          "min": 5.845458,
+          "max": 6.854666
+        },
+        "server_cpu_us_per_op": {
+          "median": 856.0,
+          "min": 854.0,
+          "max": 898.0
+        },
+        "average_server_cpu_cores": {
+          "median": 0.20248439820961112,
+          "min": 0.2020367789443268,
+          "max": 0.2078963943116445
+        },
+        "peak_server_rss_mib": {
+          "median": 130.203125,
+          "min": 129.890625,
+          "max": 130.65625
+        },
+        "client_cpu_us_per_op": {
+          "median": 312.0,
+          "min": 306.00000000000006,
+          "max": 321.99999999999994
+        }
+      }
+    },
+    {
+      "backend": "service",
+      "members": 1,
+      "concurrency": 1,
+      "read_percent": 50,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 5000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 446.6633455394762,
+          "min": 445.62529534813535,
+          "max": 611.2030368967536
+        },
+        "p50_ms": {
+          "median": 1.461208,
+          "min": 0.994458,
+          "max": 1.527041
+        },
+        "p99_ms": {
+          "median": 5.459208,
+          "min": 5.195166,
+          "max": 5.472459
+        },
+        "server_cpu_us_per_op": {
+          "median": 504.0,
+          "min": 417.99999999999994,
+          "max": 506.0000000000001
+        },
+        "average_server_cpu_cores": {
+          "median": 0.2254863994461565,
+          "min": 0.225118326151896,
+          "max": 0.255482869422843
+        },
+        "peak_server_rss_mib": {
+          "median": 57.421875,
+          "min": 57.1875,
+          "max": 57.9375
+        },
+        "client_cpu_us_per_op": {
+          "median": 270.0,
+          "min": 226.0,
+          "max": 271.99999999999994
+        }
+      }
+    },
+    {
+      "backend": "service",
+      "members": 1,
+      "concurrency": 1,
+      "read_percent": 100,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 300000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 20770.716535013158,
+          "min": 20744.952273384864,
+          "max": 21079.127117210584
+        },
+        "p50_ms": {
+          "median": 0.046791,
+          "min": 0.046458,
+          "max": 0.047333
+        },
+        "p99_ms": {
+          "median": 0.067,
+          "min": 0.066084,
+          "max": 0.084
+        },
+        "server_cpu_us_per_op": {
+          "median": 34.133333333333326,
+          "min": 33.7,
+          "max": 34.3
+        },
+        "average_server_cpu_cores": {
+          "median": 0.7103665838499967,
+          "min": 0.7089737910617824,
+          "max": 0.7115518629771009
+        },
+        "peak_server_rss_mib": {
+          "median": 35.03125,
+          "min": 35.0,
+          "max": 35.046875
+        },
+        "client_cpu_us_per_op": {
+          "median": 44.833333333333336,
+          "min": 44.266666666666666,
+          "max": 44.93333333333333
+        }
+      }
+    },
+    {
+      "backend": "service",
+      "members": 1,
+      "concurrency": 8,
+      "read_percent": 0,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 5000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 964.6708902079229,
+          "min": 964.4485537359799,
+          "max": 975.0174924232001
+        },
+        "p50_ms": {
+          "median": 8.020709,
+          "min": 7.997458,
+          "max": 8.029541
+        },
+        "p99_ms": {
+          "median": 18.894166,
+          "min": 18.426917,
+          "max": 19.424542
+        },
+        "server_cpu_us_per_op": {
+          "median": 394.0,
+          "min": 384.00000000000006,
+          "max": 396.00000000000006
+        },
+        "average_server_cpu_cores": {
+          "median": 0.37999273017197605,
+          "min": 0.3744067170905089,
+          "max": 0.38200967252233753
+        },
+        "peak_server_rss_mib": {
+          "median": 129.96875,
+          "min": 129.796875,
+          "max": 130.5625
+        },
+        "client_cpu_us_per_op": {
+          "median": 130.0,
+          "min": 122.0,
+          "max": 130.0
+        }
+      }
+    },
+    {
+      "backend": "service",
+      "members": 1,
+      "concurrency": 8,
+      "read_percent": 50,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 5000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 1008.5651556719229,
+          "min": 999.0591194898392,
+          "max": 1015.5450496291788
+        },
+        "p50_ms": {
+          "median": 8.088167,
+          "min": 8.080375,
+          "max": 8.220542
+        },
+        "p99_ms": {
+          "median": 16.483625,
+          "min": 14.485417,
+          "max": 16.883541
+        },
+        "server_cpu_us_per_op": {
+          "median": 321.99999999999994,
+          "min": 313.99999999999994,
+          "max": 330.0
+        },
+        "average_server_cpu_cores": {
+          "median": 0.32169703647572817,
+          "min": 0.31668945888098377,
+          "max": 0.335129866377629
+        },
+        "peak_server_rss_mib": {
+          "median": 57.53125,
+          "min": 57.453125,
+          "max": 57.625
+        },
+        "client_cpu_us_per_op": {
+          "median": 174.0,
+          "min": 166.0,
+          "max": 174.0
+        }
+      }
+    },
+    {
+      "backend": "service",
+      "members": 1,
+      "concurrency": 8,
+      "read_percent": 100,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 300000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 68049.7108808794,
+          "min": 68016.45190009844,
+          "max": 68156.88476689934
+        },
+        "p50_ms": {
+          "median": 0.112458,
+          "min": 0.112458,
+          "max": 0.112625
+        },
+        "p99_ms": {
+          "median": 0.247167,
+          "min": 0.246334,
+          "max": 0.248833
+        },
+        "server_cpu_us_per_op": {
+          "median": 22.96666666666667,
+          "min": 22.933333333333334,
+          "max": 23.0
+        },
+        "average_server_cpu_cores": {
+          "median": 1.5630645573208914,
+          "min": 1.562111178638928,
+          "max": 1.5651433502602263
+        },
+        "peak_server_rss_mib": {
+          "median": 35.046875,
+          "min": 35.046875,
+          "max": 35.109375
+        },
+        "client_cpu_us_per_op": {
+          "median": 28.266666666666666,
+          "min": 28.233333333333334,
+          "max": 28.333333333333332
+        }
+      }
+    },
+    {
+      "backend": "service",
+      "members": 1,
+      "concurrency": 32,
+      "read_percent": 0,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 5000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 3572.6480565643074,
+          "min": 3539.946229052208,
+          "max": 3606.7126314828624
+        },
+        "p50_ms": {
+          "median": 7.868292,
+          "min": 7.850875,
+          "max": 7.904125
+        },
+        "p99_ms": {
+          "median": 28.09825,
+          "min": 27.206375,
+          "max": 28.995375
+        },
+        "server_cpu_us_per_op": {
+          "median": 146.0,
+          "min": 138.0,
+          "max": 146.00000000000006
+        },
+        "average_server_cpu_cores": {
+          "median": 0.5168321494416224,
+          "min": 0.4930254318058744,
+          "max": 0.5265800441964981
+        },
+        "peak_server_rss_mib": {
+          "median": 108.421875,
+          "min": 107.703125,
+          "max": 108.578125
+        },
+        "client_cpu_us_per_op": {
+          "median": 52.0,
+          "min": 52.0,
+          "max": 57.999999999999986
+        }
+      }
+    },
+    {
+      "backend": "service",
+      "members": 1,
+      "concurrency": 32,
+      "read_percent": 50,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 5000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 3107.694028876693,
+          "min": 3106.1899985936475,
+          "max": 3121.8634208954045
+        },
+        "p50_ms": {
+          "median": 10.295041,
+          "min": 9.869708,
+          "max": 10.297167
+        },
+        "p99_ms": {
+          "median": 22.169,
+          "min": 21.197167,
+          "max": 25.103667
+        },
+        "server_cpu_us_per_op": {
+          "median": 146.0,
+          "min": 146.0,
+          "max": 148.0
+        },
+        "average_server_cpu_cores": {
+          "median": 0.45579205945072904,
+          "min": 0.45350373979467257,
+          "max": 0.4599387162737506
+        },
+        "peak_server_rss_mib": {
+          "median": 58.859375,
+          "min": 58.734375,
+          "max": 60.0
+        },
+        "client_cpu_us_per_op": {
+          "median": 90.00000000000001,
+          "min": 88.00000000000001,
+          "max": 90.00000000000001
+        }
+      }
+    },
+    {
+      "backend": "service",
+      "members": 1,
+      "concurrency": 32,
+      "read_percent": 100,
+      "keys": 1000,
+      "value_bytes": 256,
+      "requests": 300000,
+      "repeats": 3,
+      "metrics": {
+        "ops_per_second": {
+          "median": 90636.23694470205,
+          "min": 90325.36550632608,
+          "max": 91210.2228417761
+        },
+        "p50_ms": {
+          "median": 0.346584,
+          "min": 0.344541,
+          "max": 0.347375
+        },
+        "p99_ms": {
+          "median": 0.645041,
+          "min": 0.639667,
+          "max": 0.650834
+        },
+        "server_cpu_us_per_op": {
+          "median": 18.366666666666667,
+          "min": 18.133333333333333,
+          "max": 18.36666666666667
+        },
+        "average_server_cpu_cores": {
+          "median": 1.6589758797995222,
+          "min": 1.65394537419754,
+          "max": 1.6646855518843613
+        },
+        "peak_server_rss_mib": {
+          "median": 35.625,
+          "min": 35.546875,
+          "max": 35.65625
+        },
+        "client_cpu_us_per_op": {
+          "median": 24.2,
+          "min": 24.133333333333333,
+          "max": 24.333333333333332
+        }
+      }
+    }
+  ],
+  "source_sha256": "6565daf72c95bc96f2cc4aef239ecfc1d612670e9c467afc6335e553e53538f1"
+}

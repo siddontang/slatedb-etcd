@@ -41,6 +41,10 @@ The native names below identify cases under `TestFailpointRecovery`.
 | `defragBeforeCopy`, `defragBeforeRename` | SST rewrite tests; no file rename |
 | `defragOpenFileError`, `defragdbFail` | Object error tests; bbolt is absent |
 
+WAL sync hooks run for entries, term changes, vote changes, and snapshots.
+Commit-only progress does not require a device sync. Rust tests model loss of that marker.
+Recovery requires a covering local log and rejects a state position beyond its entries.
+
 The separate checkpoint cases cover before-save, after-save, and after-GC crashes.
 The snapshot cases also distinguish buffered state replacement from completed object flush.
 The S3 suite checks delayed PUT, ambiguous PUT success, HTTP failures, restart GET failure, and

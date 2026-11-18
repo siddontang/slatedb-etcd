@@ -3,13 +3,13 @@ use super::*;
 pub(super) struct PendingRead {
     request: Option<RequestOp>,
     credentials: Option<crate::auth::Credentials>,
-    response: Response,
+    response: ClientResponse,
     term: u64,
     leader: u64,
     role: StateRole,
     started: Instant,
     index: Option<u64>,
-    context: Option<Vec<u8>>,
+    context: Option<u64>,
     retry_ticks: u8,
 }
 
@@ -56,23 +56,23 @@ impl Node {
         &mut self,
         request: RequestOp,
         credentials: Option<crate::auth::Credentials>,
-        response: Response,
+        response: impl Into<ClientResponse>,
     ) {
+        let response = response.into();
         if !crate::mvcc::read_only(&request, false) {
-            let _ = response.send(Err(self.error("read index request contains a write")));
+            response.error(self.error("read index request contains a write"));
         } else if self.raw.raft.leader_id == 0 {
-            let _ = response.send(Err(self.error("not leader")));
+            response.error(self.error("not leader"));
         } else if self.reads.len() >= apply::MAX_QUERIES {
-            let _ = response.send(Err(self.error("too many pending read indexes")));
+            response.error(self.error("too many pending read indexes"));
         } else {
-            self.read_sequence += 1;
-            let id = [
-                self.read_nonce.as_slice(),
-                &self.read_sequence.to_be_bytes(),
-            ]
-            .concat();
+            let Some(id) = self.read_sequence.checked_add(1) else {
+                response.error(self.error("read sequence exhausted"));
+                return;
+            };
+            self.read_sequence = id;
             self.reads.insert(
-                id.clone(),
+                id,
                 PendingRead {
                     request: Some(request),
                     credentials,
@@ -89,6 +89,10 @@ impl Node {
         }
     }
 
+    pub(super) fn read_context(&self, id: u64) -> Vec<u8> {
+        [self.read_nonce.as_slice(), &id.to_be_bytes()].concat()
+    }
+
     pub(super) fn issue_reads(&mut self) {
         if self
             .reads
@@ -100,14 +104,14 @@ impl Node {
         let mut context = None;
         for (id, read) in &mut self.reads {
             if read.context.is_none() {
-                let context = context.get_or_insert_with(|| id.clone());
-                read.context = Some(context.clone());
+                let context = *context.get_or_insert(*id);
+                read.context = Some(context);
                 read.retry_ticks = 2;
             }
         }
         // Freeze the batch before asking the quorum. Later requests need a new proof.
         if let Some(context) = context {
-            self.raw.read_index(context);
+            self.raw.read_index(self.read_context(context));
         }
     }
 
@@ -121,19 +125,24 @@ impl Node {
             read.retry_ticks -= 1;
             if read.retry_ticks == 0 {
                 // Raft can drop reads before the new leader commits its first entry.
-                retry.insert(read.context.as_ref().unwrap().clone());
+                retry.insert(read.context.unwrap());
                 read.retry_ticks = 2;
             }
         }
         for context in retry {
-            self.raw.read_index(context);
+            self.raw.read_index(self.read_context(context));
         }
     }
 
     pub(super) fn confirm_reads(&mut self, reads: Vec<raft::ReadState>) {
         for state in reads {
+            let context: &[u8] = state.request_ctx.as_ref();
+            if context.len() != 24 || context[..16] != self.read_nonce {
+                continue;
+            }
+            let id = u64::from_be_bytes(context[16..].try_into().unwrap());
             for read in self.reads.values_mut() {
-                if read.context.as_deref() == Some(state.request_ctx.as_ref())
+                if read.context == Some(id)
                     && read.index.is_none()
                     && read.term == self.raw.raft.term
                     && read.leader == self.raw.raft.leader_id
@@ -152,25 +161,22 @@ impl Node {
             }
             if read.index.is_some_and(|index| index <= self.state.applied) {
                 if let Some(request) = read.request.take() {
-                    self.queries.push_back(Query::Linear(
-                        request,
-                        read.credentials.take(),
-                        id.clone(),
-                    ));
+                    self.queries
+                        .push_back(Query::Linear(request, read.credentials.take(), *id));
                 }
             }
         }
     }
 
-    pub(super) fn finish_read(&mut self, id: Vec<u8>, value: Value) {
-        self.expire_reads();
+    pub(super) fn finish_read(&mut self, id: u64, outcome: crate::mvcc::Outcome) -> Result<()> {
         if let Some(read) = self.reads.remove(&id) {
-            let _ = read.response.send(Ok(value));
+            read.response.kv(outcome)?;
         }
+        Ok(())
     }
 
     pub(super) fn expire_reads(&mut self) {
-        let error = self.error("read cancelled: leadership changed or request timed out");
+        let now = Instant::now();
         let term = self.raw.raft.term;
         let leader = self.raw.raft.leader_id;
         let role = self.raw.raft.state;
@@ -183,13 +189,14 @@ impl Node {
                     || read.role != role
                     || read.term != term
                     || read.response.is_closed()
-                    || read.started.elapsed() > Duration::from_secs(5)
+                    || now.duration_since(read.started) > Duration::from_secs(5)
             })
-            .map(|(id, _)| id.clone())
+            .map(|(id, _)| *id)
             .collect();
         for id in expired {
             if let Some(read) = self.reads.remove(&id) {
-                let _ = read.response.send(Err(error.clone()));
+                read.response
+                    .error(self.error("read cancelled: leadership changed or request timed out"));
             }
         }
     }

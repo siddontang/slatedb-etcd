@@ -53,8 +53,13 @@ The CI workflow pins Leiningen 2.11.2 and verifies its SHA-256.
 ## Deterministic event schedules
 
 ```sh
-python3 scripts/check-dst.py --seeds 1,2,42
+python3 scripts/check-dst.py --seeds 1,2,42,58,70
 ```
+
+Seed 58 covers reordered appends before object-store fault injection.
+The setup waits for a new applied write and checks that each PUT fault runs.
+Seed 70 covers log-cache isolation across three engine instances on one thread.
+See the [local Raft Engine fixes](../third_party/raft-engine/README.md) for dependency regressions.
 
 The runner writes traces under `target/dst/`.
 Direct Cargo tests accept `SLATEDB_DST_TRACE_DIR` to select another trace directory.
@@ -66,6 +71,21 @@ The scheduler controls disk execution, completion delivery, and apply jobs.
 A 1 KiB cache forces asynchronous reads. Each schedule checks all four log pool limits.
 It injects read and write failure, restart, and late read completion after a term change.
 It does not control operating system threads or SlateDB background scheduling.
+
+## Raft durability and peer streams
+
+Rust tests preserve entry, term, vote, and snapshot sync barriers.
+A lost commit marker can recover from flushed state only when the local log covers that state.
+Read tests cover bounded point batches, cancelled callers, apply fences, and stale process nonces.
+DST includes point-read bursts and checks each acknowledged value after faults.
+
+Peer stream tests use real local sockets. They check message and byte limits, malformed frames,
+cluster rejection, receipt timeout, reconnection, queued-message disposal, and snapshot results.
+Snapshot replies must still wait for the storage result.
+Ordinary receipts are not Raft acknowledgements.
+DST controls Raft message delivery directly.
+It does not simulate HTTP/2 framing or socket scheduling.
+Process failover and TLS tests exercise the actual stream transport.
 
 ## API sequence fuzzing
 

@@ -8,7 +8,8 @@ See [architecture](architecture.md) for the target design and roadmap.
 Each node persists Raft entries, terms, and votes with a non-empty synchronous raft-engine batch.
 A dedicated log thread persists these batches. Leader replication can overlap local disk I/O.
 Vote and append acknowledgements wait for their dependent writes.
-The node also persists the commit index before applying entries.
+The node writes commit progress before applying entries. Commit-only updates need no device sync.
+This follows Raft's persistence rule, which requires stable entries, terms, and votes.
 
 The leader replies only after quorum commit and local apply. Followers apply the same committed
 commands in order. Each command updates its business keys and `meta/applied` in one SlateDB batch.
@@ -21,6 +22,14 @@ adds log writes. The etcd gRPC read path uses ReadIndex and an apply barrier.
 On restart, the node reads the apply marker from SlateDB. It installs a newer durable Raft snapshot
 if necessary, then replays committed log entries after that marker. It never treats an in-memory
 apply position as a durable recovery boundary.
+Flushed state can exceed the recovered commit marker because commit-only updates can be lost.
+Startup restores commit progress from that state only when the durable log covers its applied index.
+Missing log entries still prevent startup. Checkpoints save their commit marker in the synced batch.
+
+The [local Raft Engine copy](../third_party/raft-engine/README.md) fixes two dependency defects.
+Its thread cache separates open log instances, including reopened instances.
+Explicit sync reaches the file system even when no new write batch exists.
+Regressions check cross-engine values and count the underlying sync calls.
 
 For a checkpoint, the node:
 
@@ -57,17 +66,19 @@ writers share a manifest. A shared SST design needs a separate ownership and ref
 
 The Raft owner stages and replicates entries. A dedicated thread persists them in raft-engine.
 One apply task owns SlateDB.
+The standalone server defaults to two async workers. `--runtime-workers` can change this count.
+Embedded servers use their caller's runtime.
 Only worker completion advances `applied_index` or permits a successful write response.
 Committed work stays in the durable log until the worker can accept it.
 A batch has at most 32 entries and a 512 KiB target. One larger entry can exceed the byte target.
 The worker also handles serializable reads, Watch scans, snapshot installation, and checkpoint pins.
-Local reads receive service between entry batches. They can lag durable commit.
+Local reads receive service between entry batches. They can lag the committed log prefix.
 
 The owner queues at most 64 local reads and 64 checkpoint requests.
 It rejects new proposals at 1,024 committed but unapplied entries.
 Worker failure or panic stops the node. Shutdown cancels the worker and its snapshot builder.
 The log thread performs steady-state disk I/O, file reclamation, and disk statistics.
-Apply waits for Raft to deliver committed entries through Ready, then waits for local durability.
+Apply waits for committed Ready delivery and local entry durability.
 The owner pins unapplied entries and keeps a bounded cache of applied log payloads.
 Cache misses fetch entries asynchronously through the disk worker.
 Term runs support synchronous Raft term lookup without retaining every payload.
@@ -89,6 +100,11 @@ Leadership loss, timeout, or cancellation removes the pending read. At most 64 r
 A frozen batch shares one quorum context. Later requests use a new context.
 These reads do not append log entries. Unconfirmed batches retry every two Raft ticks.
 Serializable reads remain local and can return older state.
+The gRPC KV path passes typed responses internally. Diagnostic callers retain JSON responses.
+The worker groups up to 16 adjacent point reads. Other query types end a group.
+Read completions keep the apply index but do not copy member, auth, or lease metadata.
+The owner still checks the read proof and apply position before it sends a response.
+Read evaluation does not construct a discarded write batch.
 
 Log work uses a FIFO queue with 64 jobs and a 16 MiB entry admission target.
 Snapshots use a separate 64 MiB target. One Ready can exceed a target.
@@ -98,9 +114,20 @@ Adjacent queued Ready jobs share a sync. Other log job types form batch boundari
 Disk statistics run only for `/debug/log-stats` requests.
 Raft advances durable progress and releases dependent messages only after log completion.
 Leader replication can run before local persistence, as permitted by raft-rs.
-Ordinary HTTP receipt confirms delivery; snapshot receipt waits for durable snapshot storage.
+Each peer transport uses a persistent gRPC stream for ordinary Raft messages.
+A sequence check and a 64-message receipt window bound outstanding work.
+Encoded payloads also have a separate 16 MiB admission target per peer.
+One frame can exceed that target. Each frame has an 8 MiB plus 1 KiB limit.
+The stream requires progress within two seconds when messages are pending.
+Failure reports the peer as unreachable. Raft retries lost messages on a later connection.
+A snapshot waits for older receipts and uses the durable HTTP endpoint.
+Later messages wait for its result. Failed streams also reject any waiting snapshot.
+Ordinary stream receipts confirm delivery; snapshot receipts confirm durable snapshot storage.
+Neither receipt replaces Raft's durable vote or append acknowledgement.
 
-Status separates `raft_commit_index`, durable `commit_index`, and `applied_index`.
+Status separates `raft_commit_index`, log-worker-confirmed `commit_index`, and `applied_index`.
+The worker confirms entry durability before advancing `commit_index`.
+Its marker can remain unsynced.
 It also reports `cached_last_log_index`, `log_busy`, `queued_log_jobs`, `queued_log_bytes`,
 `queued_snapshot_bytes`, `pending_read_indexes`, and `pending_revision_waiters`.
 `log_memory` reports bytes and limits for the cache, pending entries, read results,

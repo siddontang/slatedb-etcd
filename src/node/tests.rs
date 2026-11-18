@@ -44,6 +44,78 @@ fn seed_log(dir: &std::path::Path, count: u64) {
 }
 
 #[tokio::test]
+async fn flushed_state_recovers_a_lost_commit_marker_but_not_missing_entries() {
+    for has_entry in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let command = Command {
+            id: "committed".into(),
+            request: Request {
+                operations: vec![crate::Operation::Put {
+                    key: "key".into(),
+                    value: "committed".into(),
+                }],
+            },
+        };
+        let mut storage =
+            RaftStorage::open(&dir.path().join("raft"), 1, "worker-test", vec![1, 2, 3]).unwrap();
+        if has_entry {
+            storage
+                .persist(
+                    &[Entry {
+                        index: 1,
+                        term: 1,
+                        data: serde_json::to_vec(&RaftCommand::Legacy(command.clone()))
+                            .unwrap()
+                            .into(),
+                        ..Default::default()
+                    }],
+                    Some(&HardState {
+                        term: 1,
+                        vote: 1,
+                        commit: 0,
+                        ..Default::default()
+                    }),
+                    None,
+                )
+                .unwrap();
+        }
+        // Model a lost commit-only WAL update after committed state reached object storage.
+        let mut state = StateMachine::open(&dir.path().join("objects"))
+            .await
+            .unwrap();
+        state.apply(1, Some(&command)).await.unwrap();
+        state.snapshot_data().await.unwrap();
+        state.close().await.unwrap();
+        drop(state);
+        drop(storage);
+        let (events, _) = mpsc::channel(256);
+        let result =
+            Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new())).await;
+        if has_entry {
+            let node = result.unwrap();
+            assert_eq!(node.state.applied, 1);
+            assert_eq!(node.raw.store().commit_index(), 1);
+            assert_eq!(node.log_worker.storage().commit_index(), 1);
+            assert_eq!(
+                node.worker
+                    .state()
+                    .local_value("key")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("committed")
+            );
+        } else {
+            assert!(result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("commit exceeds durable log"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn queued_state_reads_are_bounded_and_complete_without_raft_writes() {
     let dir = tempfile::tempdir().unwrap();
     let (events, _) = mpsc::channel(256);
@@ -67,6 +139,54 @@ async fn queued_state_reads_are_bounded_and_complete_without_raft_writes() {
         let value = reply.await.unwrap().unwrap();
         assert!(value["value"].is_null());
         assert_eq!(value["applied_index"], 0);
+    }
+    assert_eq!(node.raw.store().last_index().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn point_read_batches_stop_at_the_limit_and_before_a_range() {
+    use crate::proto::etcdserverpb::request_op::Request as Op;
+    use crate::proto::etcdserverpb::RangeRequest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (events, _) = mpsc::channel(256);
+    let mut node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    let mut replies = Vec::new();
+    for index in 0..apply::READ_BATCH + 7 {
+        let (tx, rx) = oneshot::channel();
+        node.enqueue_query(Query::Read(
+            RequestOp {
+                request: Some(Op::RequestRange(RangeRequest {
+                    key: b"a".to_vec(),
+                    range_end: if index == apply::READ_BATCH + 4 {
+                        b"z".to_vec()
+                    } else {
+                        vec![]
+                    },
+                    serializable: true,
+                    ..Default::default()
+                })),
+            },
+            None,
+            ClientResponse::Kv(tx),
+        ));
+        replies.push(rx);
+    }
+    for count in [apply::READ_BATCH, 4, 1, 2] {
+        node.drive_ready().await.unwrap();
+        let completion = node.worker.step().await.unwrap().unwrap();
+        match &completion.output {
+            Output::Reads(reads) => assert_eq!(reads.len(), count),
+            Output::Read { .. } => assert_eq!(count, 1),
+            _ => panic!("expected point reads or the range boundary"),
+        }
+        node.complete_apply(completion).unwrap();
+    }
+    assert!(node.queries.is_empty());
+    for reply in replies {
+        assert!(reply.await.unwrap().unwrap().result.is_ok());
     }
     assert_eq!(node.raw.store().last_index().unwrap(), 0);
 }
@@ -356,13 +476,13 @@ fn range_request() -> RequestOp {
     }
 }
 
-async fn confirm_read(node: &mut Node, id: &[u8]) {
+async fn confirm_read(node: &mut Node, id: &u64) {
     let mut message = Message::default();
     message.set_msg_type(MessageType::MsgHeartbeatResponse);
     message.from = 2;
     message.to = 1;
     message.term = node.raw.raft.term;
-    message.context = id.to_vec().into();
+    message.context = node.read_context(*id).into();
     node.raw.step(message).unwrap();
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
@@ -379,7 +499,7 @@ async fn read_batches_freeze_before_quorum_and_survive_a_cancelled_first_request
     let (second, mut reply) = oneshot::channel();
     node.linear_read(range_request(), first);
     node.linear_read(range_request(), second);
-    let context = node.reads.keys().next().unwrap().clone();
+    let context = *node.reads.keys().next().unwrap();
     node.drive_ready().await.unwrap();
     assert!(node.log_worker.step().unwrap().is_none());
     let mut contexts = vec![];
@@ -388,11 +508,11 @@ async fn read_batches_freeze_before_quorum_and_survive_a_cancelled_first_request
             contexts.push(message.context.to_vec());
         }
     }
-    assert_eq!(contexts, vec![context.clone()]);
+    assert_eq!(contexts, vec![node.read_context(context)]);
     drop(cancelled);
     let (later, mut late_reply) = oneshot::channel();
     node.linear_read(range_request(), later);
-    let late_context = node.reads.keys().last().unwrap().clone();
+    let late_context = *node.reads.keys().last().unwrap();
     node.drive_ready().await.unwrap();
     assert!(reply.try_recv().is_err());
     confirm_read(&mut node, &context).await;
@@ -539,7 +659,7 @@ async fn read_index_requires_quorum_and_does_not_write_the_log() {
     let syncs = node.raw.store().durable.sync_writes;
     let (tx, mut reply) = oneshot::channel();
     node.linear_read(range_request(), tx);
-    let id = node.reads.keys().next().unwrap().clone();
+    let id = *node.reads.keys().next().unwrap();
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
     node.drain_apply().await.unwrap();
@@ -582,7 +702,7 @@ async fn read_index_waits_for_apply_and_rejects_late_results_after_term_change()
     assert!(node.state.applied < node.raw.store().commit_index());
     let (tx, mut reply) = oneshot::channel();
     node.linear_read(range_request(), tx);
-    let id = node.reads.keys().next().unwrap().clone();
+    let id = *node.reads.keys().next().unwrap();
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
     confirm_read(&mut node, &id).await;
@@ -772,7 +892,7 @@ async fn read_index_retries_after_the_first_commit_in_a_new_term() {
     assert!(!node.raw.raft.commit_to_current_term());
     let (tx, mut reply) = oneshot::channel();
     node.linear_read(range_request(), tx);
-    let id = node.reads.keys().next().unwrap().clone();
+    let id = *node.reads.keys().next().unwrap();
     // The initial request is discarded before the leader commits its no-op entry.
     confirm_read(&mut node, &id).await;
     node.drain_apply().await.unwrap();
@@ -994,4 +1114,69 @@ async fn queued_ready_jobs_share_sync_and_keep_the_final_log_suffix() {
     assert_eq!(reopened.initial_state().unwrap().hard_state.term, 2);
     assert_eq!(reopened.initial_state().unwrap().hard_state.vote, 2);
     assert_eq!(reopened.term(first + 2).unwrap(), 2);
+}
+
+#[tokio::test]
+async fn maintenance_flushes_update_durable_apply_metadata() {
+    for command in [
+        crate::maintenance::Command::Snapshot,
+        crate::maintenance::Command::Defragment,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        seed_log(dir.path(), 1);
+        let (events, _) = mpsc::channel(256);
+        let mut node =
+            Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+                .await
+                .unwrap();
+        node.drive_ready().await.unwrap();
+        node.drain_apply().await.unwrap();
+        assert_eq!(node.state.applied, 1);
+        assert_eq!(node.state.durable_applied, 0);
+        let (response, result) = oneshot::channel();
+        node.enqueue_query(Query::Maintenance(
+            command,
+            crate::auth::Credentials::default(),
+            Box::default(),
+            response,
+        ));
+        node.drive_ready().await.unwrap();
+        let completed = node.worker.step().await.unwrap().unwrap();
+        assert_eq!(completed.state.as_ref().unwrap().durable_applied, 1);
+        node.complete_apply(completed).unwrap();
+        result.await.unwrap().unwrap();
+        assert_eq!(node.state.durable_applied, 1);
+    }
+}
+
+#[tokio::test]
+async fn read_contexts_require_the_current_process_nonce_and_exact_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    let (response, mut result) = oneshot::channel();
+    node.linear_read(range_request(), response);
+    let id = *node.reads.keys().next().unwrap();
+    node.drive_ready().await.unwrap();
+    let valid = node.read_context(id);
+    let mut stale = valid.clone();
+    stale[0] ^= 1;
+    for context in [
+        stale,
+        valid[..23].to_vec(),
+        [valid.as_slice(), &[0]].concat(),
+    ] {
+        node.confirm_reads(vec![raft::ReadState {
+            index: node.state.applied,
+            request_ctx: context,
+        }]);
+        node.schedule_reads();
+        assert!(node.queries.is_empty());
+        assert!(result.try_recv().is_err());
+    }
+    node.confirm_reads(vec![raft::ReadState {
+        index: node.state.applied,
+        request_ctx: valid,
+    }]);
+    node.schedule_reads();
+    assert_eq!(node.queries.len(), 1);
 }

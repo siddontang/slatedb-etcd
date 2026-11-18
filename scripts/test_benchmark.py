@@ -18,6 +18,27 @@ spec.loader.exec_module(summary)
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_server_resources_exclude_the_client_for_each_cluster_size(self):
+        for members in (1, 3):
+            before = [(2, 200)] * (members + 1)
+            after = [(3, 300)] * members + [(12, 900)]
+            memory = [[row[1] for row in values] for values in (before, after)]
+            measured = benchmark.measured_resources(before, after, memory, members, 2, 100)
+            self.assertEqual(measured["process_cpu_seconds"], members)
+            self.assertEqual(measured["client_cpu_seconds"], 10)
+            self.assertEqual(measured["peak_process_rss_bytes"], members * 300)
+            self.assertEqual(measured["peak_client_rss_bytes"], 900)
+
+    def test_baseline_subset_keeps_all_reference_and_service_cases(self):
+        cases = benchmark.workload_cases(["baseline", "service", "etcd"], [1, 8, 32],
+                                         [0, 50, 100], [8])
+        self.assertEqual(len(cases), 21)
+        self.assertEqual(len(set(cases)), 21)
+        for kind in ["service", "etcd"]:
+            self.assertEqual(sum(case[0] == kind for case in cases), 9)
+        self.assertEqual([case for case in cases if case[0] == "baseline"],
+                         [("baseline", 8, percent) for percent in [0, 50, 100]])
+
     def test_cluster_addresses_are_distinct(self):
         ports = benchmark.addresses(6)
         self.assertEqual(len(ports), len(set(ports)))
@@ -79,6 +100,18 @@ class BenchmarkTests(unittest.TestCase):
         rows[-1] = rows[0]
         with self.assertRaises(ValueError):
             summary.summarize(report)
+
+    def test_summary_separates_one_and_three_members(self):
+        sample = dict(backend="service", concurrency=8, read_percent=100,
+                      keys=10, value_bytes=256, requests=100, successes=100,
+                      errors={}, passed=True, repeat=0, successful_ops_per_second=100,
+                      latency_ms={"p50": 1, "p99": 5}, server_cpu_microseconds_per_success=20,
+                      average_server_cpu_cores=1, peak_process_rss_bytes=1024**2,
+                      client_cpu_seconds=0.1)
+        report = dict(schema_version=2, complete=True, passed=True, expected_samples=2,
+                      samples=[dict(sample, members=1), dict(sample, members=3)])
+        groups = summary.summarize(report)["groups"]
+        self.assertEqual({group["members"] for group in groups}, {1, 3})
 
     def test_failed_build_replaces_old_passed_report(self):
         import json

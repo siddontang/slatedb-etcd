@@ -12,3 +12,8 @@ Copyright The etcd Authors. Source: https://github.com/etcd-io/etcd
 Imported common tests retain notices from The etcd Authors under Apache License 2.0.
 Their adapted source and license appear under tests/compat/ and tests/upstream/.
 The SlateDB license text retains the upstream copyright notice for Chris Riccomini.
+
+third_party/raft-engine contains Raft Engine 0.4.2 with local cache and sync fixes.
+Copyright 2017-present PingCAP, Inc. Licensed under Apache License 2.0.
+Source: https://github.com/tikv/raft-engine
+The directory retains its license and documents each local runtime change.

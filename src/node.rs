@@ -22,7 +22,10 @@ mod cluster;
 mod log;
 mod maintenance;
 mod read;
+mod response;
+use crate::peer::transport;
 use apply::{AppliedState, Completion, Header, Job, Output, Query, Reply, Work, Worker};
+use response::ClientResponse;
 
 #[cfg(test)]
 mod dst;
@@ -30,6 +33,7 @@ mod dst;
 mod tests;
 
 pub type Response = oneshot::Sender<Result<Value, ApiError>>;
+pub type KvResponse = oneshot::Sender<Result<crate::mvcc::Outcome, ApiError>>;
 
 pub enum Event {
     SubscribeApply(oneshot::Sender<tokio::sync::watch::Receiver<u64>>),
@@ -41,6 +45,7 @@ pub enum Event {
     Cluster(crate::cluster::Command, Response),
     PeerAddress(u64, Response),
     Propose(Request, Response),
+    Kv(RequestOp, KvResponse),
     EtcdPropose(RequestOp, Response),
     EtcdRead(RequestOp, Response),
     LinearRead(RequestOp, Response),
@@ -91,7 +96,7 @@ pub struct NodeOptions {
 }
 
 struct Pending {
-    response: Response,
+    response: ClientResponse,
     started: Instant,
     term: u64,
 }
@@ -136,7 +141,7 @@ pub struct Node {
     log_read_fail: bool,
     peer_waiters: Vec<Response>,
     built_checkpoint: Option<(u64, raft::eraftpb::ConfState, Vec<u8>)>,
-    reads: BTreeMap<Vec<u8>, read::PendingRead>,
+    reads: BTreeMap<u64, read::PendingRead>,
     revision_waiters: VecDeque<RevisionWaiter>,
     read_nonce: [u8; 16],
     read_sequence: u64,
@@ -185,7 +190,7 @@ impl Node {
         );
         std::fs::create_dir_all(&options.dir)?;
         // Open Raft first. Its exclusive file lock also protects this node's SlateDB directory.
-        let storage = RaftStorage::open(
+        let mut storage = RaftStorage::open(
             &options.dir.join("raft"),
             options.id,
             &options.cluster_id,
@@ -201,10 +206,10 @@ impl Node {
             .await?;
         let recovered = async {
             state.quota = options.quota_bytes;
-            ensure!(
-                state.applied <= storage.commit_index(),
-                "state is ahead of durable commit"
-            );
+            // Flushed state proves this prefix was committed, even if its commit marker was lost.
+            if state.applied > storage.commit_index() {
+                storage.persist_commit(state.applied)?;
+            }
             let recovered_from_index = state.applied;
             state.install_snapshot(storage.recovery_snapshot()).await?;
             if state.members.members.is_empty() && !options.join {
@@ -289,7 +294,7 @@ impl Node {
                     options.cluster_id.clone(),
                     rx,
                     events.clone(),
-                    options.transport.http.clone(),
+                    options.transport.clone(),
                 ));
             }
             senders
@@ -388,6 +393,10 @@ impl Node {
                 event = events.recv() => {
                     let Some(event) = event else { return Ok(()); };
                     self.handle(event, &mut step_responses).await?;
+                    // Let ready tasks add proposals before starting the next durable log write.
+                    if !self.pending.is_empty() {
+                        tokio::task::yield_now().await;
+                    }
                     // Accumulate proposals so concurrent clients can share one durable log write.
                     for _ in 0..63 {
                         let Ok(event) = events.try_recv() else { break; };
@@ -530,6 +539,24 @@ impl Node {
                     response,
                 )?;
             }
+            Event::Kv(request, response) => {
+                let response = ClientResponse::Kv(response);
+                if crate::mvcc::read_only(&request, true) {
+                    self.enqueue_query(Query::Read(request, credentials, response));
+                } else if crate::mvcc::read_only(&request, false) {
+                    self.linear_read_auth(request, credentials, response);
+                } else {
+                    self.propose(
+                        RaftCommand::Etcd {
+                            origin: self.options.id,
+                            id: uuid::Uuid::new_v4().to_string(),
+                            etcd: request,
+                        }
+                        .secure(credentials),
+                        response,
+                    )?;
+                }
+            }
             Event::LinearRead(request, response) => {
                 self.linear_read_auth(request, credentials, response)
             }
@@ -543,7 +570,7 @@ impl Node {
                 }
             }
             Event::EtcdRead(request, response) => {
-                self.enqueue_query(Query::Read(request, credentials, response));
+                self.enqueue_query(Query::Read(request, credentials, response.into()));
             }
             Event::EtcdCompact(compact, response) => {
                 self.propose(
@@ -914,6 +941,20 @@ impl Node {
         }
     }
 
+    fn next_query_job(&mut self) -> Option<Job> {
+        let query = self.queries.pop_front()?;
+        if !query.is_point_read() || !self.queries.front().is_some_and(Query::is_point_read) {
+            return Some(Job::Query(query));
+        }
+        let mut reads = vec![query];
+        while reads.len() < apply::READ_BATCH
+            && self.queries.front().is_some_and(Query::is_point_read)
+        {
+            reads.push(self.queries.pop_front().unwrap());
+        }
+        Some(Job::Reads(reads))
+    }
+
     fn submit_apply(&mut self, job: Job, target: u64) -> Result<()> {
         ensure!(!self.apply_busy, "apply worker already has a job");
         self.worker.submit(Work {
@@ -950,9 +991,9 @@ impl Node {
             return self.start_checkpoint();
         }
         if self.prefer_query {
-            if let Some(query) = self.queries.pop_front() {
+            if let Some(job) = self.next_query_job() {
                 self.prefer_query = false;
-                return self.submit_apply(Job::Query(query), self.state.applied);
+                return self.submit_apply(job, self.state.applied);
             }
         }
         let committed = self.raw.store().commit_index().min(self.committed_ready);
@@ -973,8 +1014,8 @@ impl Node {
             self.prefer_query = true;
             return self.submit_apply(Job::Entries(entries), target);
         }
-        if let Some(query) = self.queries.pop_front() {
-            return self.submit_apply(Job::Query(query), self.state.applied);
+        if let Some(job) = self.next_query_job() {
+            return self.submit_apply(job, self.state.applied);
         }
         Ok(())
     }
@@ -982,33 +1023,50 @@ impl Node {
     fn complete_apply(&mut self, completed: Completion) -> Result<()> {
         ensure!(self.apply_busy, "unexpected apply completion");
         ensure!(
-            completed.state.applied == self.apply_target,
+            completed.applied == self.apply_target,
             "apply completion has the wrong index"
         );
         ensure!(
-            completed.state.applied >= self.state.applied,
+            completed.applied >= self.state.applied,
             "apply position regressed"
         );
         ensure!(
-            completed.state.applied <= self.raw.store().commit_index(),
+            completed.applied <= self.raw.store().commit_index(),
             "apply completion exceeds durable commit"
         );
-        let durable = self
-            .state
-            .durable_applied
-            .max(completed.state.durable_applied);
-        self.state = completed.state;
+        self.apply_busy = false;
+        self.expire_reads();
+        let Some(state) = completed.state else {
+            ensure!(
+                completed.applied == self.state.applied,
+                "read changed the apply position"
+            );
+            return self.finish_output(completed.output);
+        };
+        let durable = self.state.durable_applied.max(state.durable_applied);
+        self.state = state;
         if *self.applied_notify.borrow() != self.state.applied {
             self.applied_notify.send_replace(self.state.applied);
         }
         self.state.durable_applied = durable;
-        self.apply_busy = false;
         self.finish_revision_waiters();
 
         self.sync_lease_deadlines();
         self.expire_pending();
-        self.expire_reads();
-        match completed.output {
+        self.finish_output(completed.output)?;
+        self.raw.advance_apply_to(self.state.applied);
+        self.raw.mut_store().applied_to(self.state.applied);
+        self.sync_members();
+        Ok(())
+    }
+
+    fn finish_output(&mut self, output: Output) -> Result<()> {
+        match output {
+            Output::Reads(reads) => {
+                for read in reads {
+                    self.finish_output(read)?;
+                }
+            }
             Output::Entries(replies) => {
                 for command in replies {
                     if let Some(change) = &command.change {
@@ -1020,6 +1078,10 @@ impl Node {
                     }
                     if let Some(pending) = self.pending.remove(&command.id) {
                         let reply = match command.reply {
+                            Reply::Kv(outcome) => {
+                                pending.response.kv(outcome)?;
+                                continue;
+                            }
                             Reply::Encoded(value) => value,
                             Reply::Lease(mut outcome) => {
                                 if let Ok(response) = &mut outcome.result {
@@ -1040,7 +1102,7 @@ impl Node {
                                 serde_json::to_value(outcome)?
                             }
                         };
-                        let _ = pending.response.send(Ok(reply));
+                        pending.response.json(reply)?;
                     }
                 }
             }
@@ -1060,12 +1122,10 @@ impl Node {
                 };
                 let _ = response.send(result);
             }
-            Output::Linear { id, value } => self.finish_read(id, value),
+            Output::Read { response, outcome } => response.kv(outcome)?,
+            Output::Linear { id, outcome } => self.finish_read(id, outcome)?,
             Output::Checkpoint => {}
         }
-        self.raw.advance_apply_to(self.state.applied);
-        self.raw.mut_store().applied_to(self.state.applied);
-        self.sync_members();
         Ok(())
     }
 
@@ -1142,9 +1202,10 @@ impl Node {
         Ok(())
     }
 
-    fn propose(&mut self, command: RaftCommand, response: Response) -> Result<()> {
+    fn propose(&mut self, command: RaftCommand, response: impl Into<ClientResponse>) -> Result<()> {
+        let response = response.into();
         if self.raw.raft.state != StateRole::Leader {
-            let _ = response.send(Err(self.error("not leader")));
+            response.error(self.error("not leader"));
         } else if self
             .raw
             .store()
@@ -1155,9 +1216,9 @@ impl Node {
             || self.log_queue.len() >= log::MAX_JOBS
             || self.log_bytes >= log::MAX_BYTES
         {
-            let _ = response.send(Err(self.error("state apply backlog is full")));
+            response.error(self.error("state apply backlog is full"));
         } else if self.pending.len() >= 1024 {
-            let _ = response.send(Err(self.error("too many pending requests")));
+            response.error(self.error("too many pending requests"));
         } else {
             let data = serde_json::to_vec(&command)?;
             if data.len() + 64 > cache::MAX_ENTRY_BYTES
@@ -1167,7 +1228,7 @@ impl Node {
                     data.len() + cache::ENTRY_OVERHEAD + 64,
                 )
             {
-                let _ = response.send(Err(self.error("pending log memory quota is full")));
+                response.error(self.error("pending log memory quota is full"));
                 return Ok(());
             }
             let proposed = if let RaftCommand::Cluster { request, .. } = &command {
@@ -1198,7 +1259,7 @@ impl Node {
                     );
                 }
                 Err(error) => {
-                    let _ = response.send(Err(self.error(&error.to_string())));
+                    response.error(self.error(&error.to_string()));
                 }
             }
         }
@@ -1279,7 +1340,7 @@ impl Node {
 
     fn expire_pending(&mut self) {
         let is_leader = self.raw.raft.state == StateRole::Leader;
-        let error = self.error("request outcome unknown: leadership changed or request timed out");
+        let now = Instant::now();
         let expired: Vec<_> = self
             .pending
             .iter()
@@ -1287,13 +1348,15 @@ impl Node {
                 !is_leader
                     || p.term != self.raw.raft.term
                     || p.response.is_closed()
-                    || p.started.elapsed() > Duration::from_secs(5)
+                    || now.duration_since(p.started) > Duration::from_secs(5)
             })
             .map(|(id, _)| id.clone())
             .collect();
         for id in expired {
             if let Some(pending) = self.pending.remove(&id) {
-                let _ = pending.response.send(Err(error.clone()));
+                pending.response.error(
+                    self.error("request outcome unknown: leadership changed or request timed out"),
+                );
             }
         }
     }
@@ -1332,48 +1395,5 @@ impl Node {
             "revision": self.state.revision,
             "compact_revision": self.state.compact_revision,
         }))
-    }
-}
-
-async fn transport(
-    peer: u64,
-    address: String,
-    cluster_id: String,
-    mut messages: mpsc::Receiver<Message>,
-    events: mpsc::Sender<Event>,
-    client: reqwest::Client,
-) {
-    while let Some(message) = messages.recv().await {
-        let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
-        let result: Result<()> = async {
-            let response = client
-                .post(format!("{}/raft", crate::cluster::url(&address)))
-                .header("x-cluster-id", &cluster_id)
-                .timeout(if snapshot {
-                    Duration::from_secs(30)
-                } else {
-                    Duration::from_secs(2)
-                })
-                .body(message.write_to_bytes()?)
-                .send()
-                .await?;
-            ensure!(
-                response.status().is_success(),
-                "peer returned {}",
-                response.status()
-            );
-            response.bytes().await.context("read peer response")?;
-            Ok(())
-        }
-        .await;
-        {
-            let _ = events
-                .send(Event::NetworkResult {
-                    peer,
-                    snapshot,
-                    success: result.is_ok(),
-                })
-                .await;
-        }
     }
 }

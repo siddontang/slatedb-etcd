@@ -78,7 +78,7 @@ jobs:
           import os
           extended = os.environ["EXTENDED"] == "true"
           with open(os.environ["GITHUB_ENV"], "a") as env:
-              dst = ",".join(map(str, range(1, 101))) if extended else "1,2,42"
+              dst = ",".join(map(str, range(1, 101))) if extended else "1,2,42,58,70"
               faults = ",".join(map(str, range(1, 17))) if extended else "1,2,3,4"
               env.write(f"SLATEDB_DST_SEEDS={dst}\nFAULT_SEEDS={faults}\n")
           PY

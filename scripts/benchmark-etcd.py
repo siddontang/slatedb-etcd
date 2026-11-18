@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare three-member services with one gRPC workload and separate resource phases."""
+"""Compare services with one gRPC workload and separate resource phases."""
 
 import argparse
 from contextlib import nullcontext
@@ -71,21 +71,34 @@ def wait_file(path, processes, deadline):
         time.sleep(0.005)
 
 
+def measured_resources(before, after, memory, members, seconds, successes):
+    if len(before) != members + 1 or len(after) != members + 1:
+        raise ValueError("Resource samples must contain all servers and one client")
+    cpu = [max(0, end[0] - start[0]) for start, end in zip(before, after)]
+    server_cpu = sum(cpu[:members])
+    return dict(process_cpu_seconds=server_cpu, client_cpu_seconds=cpu[members],
+                average_server_cpu_cores=server_cpu / seconds,
+                server_cpu_microseconds_per_success=server_cpu * 1e6 / max(1, successes),
+                peak_process_rss_bytes=max(sum(row[:members]) for row in memory),
+                peak_client_rss_bytes=max(row[members] for row in memory))
+
+
 def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=None):
     with tempfile.TemporaryDirectory(prefix="slatedb-bench-") as directory:
         root = Path(directory)
-        ports = addresses(6)
-        clients, peers = ports[:3], ports[3:]
+        members = getattr(args, "members", 3)
+        ports = addresses(members * 2)
+        clients, peers = ports[:members], ports[members:]
         processes, logs = [], []
         driver = None
         stop = threading.Event()
         sampler = None
         memory, resource_errors = [], []
         initial = ",".join(f"node{i+1}=http://{peer}" for i, peer in enumerate(peers))
-        sample = {"passed": False, "backend": kind, "concurrency": concurrency,
+        sample = {"passed": False, "backend": kind, "members": members, "concurrency": concurrency,
                   "read_percent": reads, "repeat": repeat}
         try:
-            for i in range(3):
+            for i in range(members):
                 data = root / f"node{i+1}"
                 if kind == "etcd":
                     command = [str(binary), "--name", f"node{i+1}", "--data-dir", str(data),
@@ -100,13 +113,16 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
                                "--listen", clients[i], "--peer-listen", peers[i],
                                "--cluster-id", root.name, "--snapshot-every", str(args.snapshot_entries),
                                "--quota-backend-bytes", str(args.quota_bytes)]
+                    workers = getattr(args, "service_runtime_workers", None)
+                    if kind == "service" and workers is not None:
+                        command += ["--runtime-workers", str(workers)]
                     if args.s3_bucket:
                         command += ["--s3-bucket", args.s3_bucket]
                     if args.s3_endpoint:
                         command += ["--s3-endpoint", args.s3_endpoint]
                     if args.s3_allow_http:
                         command += ["--s3-allow-http"]
-                    for j in range(3):
+                    for j in range(members):
                         command += ["--peer", f"{j+1}={peers[j]}", "--client-peer", f"{j+1}={clients[j]}"]
                 log = open(root / f"node{i+1}.log", "w")
                 logs.append(log)
@@ -122,10 +138,12 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
             all_processes = processes + [driver]
             deadline = time.monotonic() + args.timeout_seconds
             wait_file(root / "ready", all_processes, deadline)
+            # Give both backends one idle second after preload and warmup.
+            time.sleep(1)
             with observer(processes) if observer else nullcontext():
                 before = resources(all_processes)
-                sample["startup_preload_warmup_server_cpu_seconds"] = sum(row[0] for row in before[:3])
-                sample["server_rss_after_warmup_bytes"] = sum(row[1] for row in before[:3])
+                sample["startup_preload_warmup_server_cpu_seconds"] = sum(row[0] for row in before[:members])
+                sample["server_rss_after_warmup_bytes"] = sum(row[1] for row in before[:members])
                 memory.append([row[1] for row in before])
 
                 def sample_memory():
@@ -148,13 +166,9 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
                 code = driver.wait(timeout=10)
             sample.update(json.loads(result_path.read_text()))
             sample["passed"] &= code == 0 and not resource_errors and all(p.poll() is None for p in processes)
-            cpu = [max(0, end[0]-start[0]) for start, end in zip(before, after)]
-            sample.update(process_cpu_seconds=sum(cpu[:3]), client_cpu_seconds=cpu[3],
-                          average_server_cpu_cores=sum(cpu[:3])/sample["seconds"],
-                          server_cpu_microseconds_per_success=sum(cpu[:3])*1e6/max(1, sample["successes"]),
-                          peak_process_rss_bytes=max(sum(row[:3]) for row in memory),
-                          peak_client_rss_bytes=max(row[3] for row in memory),
-                          resource_samples=len(memory), resource_errors=resource_errors,
+            sample.update(measured_resources(before, after, memory, members,
+                                             sample["seconds"], sample["successes"]))
+            sample.update(resource_samples=len(memory), resource_errors=resource_errors,
                           allocated_data_bytes=sum(p.stat().st_blocks*512
                               for p in root.glob("node*/**/*") if p.is_file()))
         except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as error:
@@ -174,8 +188,16 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
         return sample
 
 
+def workload_cases(kinds, concurrency, reads, baseline_concurrency=None):
+    return [(kind, count, percent) for kind in kinds for count in concurrency for percent in reads
+            if kind != "baseline" or baseline_concurrency is None or count in baseline_concurrency]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--members", type=int, choices=[1, 3], default=3)
+    parser.add_argument("--service-runtime-workers", type=int,
+                        help="Override the current service's async worker count")
     parser.add_argument("--requests", type=int, default=10000)
     parser.add_argument("--read-requests", type=int, help="Separate request count for read-only samples")
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 8, 32])
@@ -190,6 +212,8 @@ def main():
     parser.add_argument("--output", type=Path, default=ROOT / "results/benchmark-etcd.json")
     parser.add_argument("--binary", type=Path, default=ROOT / "target/release/slatedb-etcd")
     parser.add_argument("--baseline-binary", type=Path)
+    parser.add_argument("--baseline-concurrency", type=int, nargs="+",
+                        help="Restrict baseline cases to these selected concurrency levels")
     parser.add_argument("--backends", nargs="+", choices=["baseline", "service", "etcd"])
     parser.add_argument("--s3-bucket")
     parser.add_argument("--s3-endpoint")
@@ -199,6 +223,8 @@ def main():
     if min(args.requests, args.keys, args.value_size, args.timeout_seconds, args.repeat,
            args.snapshot_entries, args.quota_bytes, *args.concurrency) < 1 or args.warmup < 0:
         parser.error("Counts, sizes, quotas, and timeouts must be positive; warmup can be zero")
+    if args.service_runtime_workers is not None and args.service_runtime_workers < 1:
+        parser.error("Service runtime workers must be positive")
     if args.read_requests is not None and args.read_requests < 1:
         parser.error("Read request count must be positive")
     if args.seed < 0 or args.seed+args.repeat > 2**64-1:
@@ -210,11 +236,19 @@ def main():
         parser.error("The baseline backend requires --baseline-binary")
     if len(set(kinds)) != len(kinds):
         parser.error("Backend names must be distinct")
-    expected = len(kinds)*len(args.concurrency)*len(args.read_percent)*args.repeat
+    if args.baseline_concurrency is not None and (
+            "baseline" not in kinds or not set(args.baseline_concurrency) <= set(args.concurrency)):
+        parser.error("Baseline concurrency must select measured levels and requires a baseline")
+    cases = workload_cases(kinds, args.concurrency, args.read_percent, args.baseline_concurrency)
+    expected = len(cases)*args.repeat
     report = {"schema_version": 2, "passed": False, "complete": False, "samples": [],
               "created_at": datetime.now(timezone.utc).isoformat(), "expected_samples": expected,
               "platform": platform.system(), "architecture": platform.machine(), "logical_cpus": os.cpu_count(),
-              "deployment": "three processes per backend; shared host and disk; loopback plaintext",
+              "members": args.members,
+              "service_runtime_workers": args.service_runtime_workers,
+              "baseline_concurrency": args.baseline_concurrency,
+              "settle_seconds_after_warmup": 1,
+              "deployment": f"{args.members} processes per backend; shared host and disk; loopback plaintext",
               "reference_etcd": "v3.6.5", "state_backend": "s3" if args.s3_bucket else "local",
               "raft_snapshot_entries": args.snapshot_entries, "quota_bytes": args.quota_bytes,
               "order_seed": args.seed, "binaries": {},
@@ -240,10 +274,9 @@ def main():
     for kind in kinds:
         report["binaries"][kind] = hashlib.sha256(binaries[kind].read_bytes()).hexdigest()
     for repeat in range(args.repeat):
-        cases = [(kind, concurrency, reads) for kind in kinds
-                 for concurrency in args.concurrency for reads in args.read_percent]
-        random.Random(args.seed+repeat).shuffle(cases)
-        for kind, concurrency, reads in cases:
+        shuffled = cases.copy()
+        random.Random(args.seed+repeat).shuffle(shuffled)
+        for kind, concurrency, reads in shuffled:
             sample = run_sample(args, tools, binaries[kind], kind, concurrency, reads, repeat)
             report["samples"].append(sample)
             report["complete"] = len(report["samples"]) == expected

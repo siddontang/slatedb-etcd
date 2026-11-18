@@ -5,6 +5,7 @@ use raft::eraftpb::Snapshot;
 pub(super) const BATCH_ENTRIES: u64 = 32;
 pub(super) const BATCH_BYTES: u64 = 512 * 1024;
 pub(super) const MAX_QUERIES: usize = 64;
+pub(super) const READ_BATCH: usize = 16;
 pub(super) const MAX_APPLY_LAG: u64 = 1024;
 
 pub(super) struct AppliedState {
@@ -62,8 +63,8 @@ pub(super) enum Query {
         Box<crate::proto::etcdserverpb::StatusResponse>,
         Response,
     ),
-    Read(RequestOp, Option<crate::auth::Credentials>, Response),
-    Linear(RequestOp, Option<crate::auth::Credentials>, Vec<u8>),
+    Read(RequestOp, Option<crate::auth::Credentials>, ClientResponse),
+    Linear(RequestOp, Option<crate::auth::Credentials>, u64),
     Watch(
         crate::proto::etcdserverpb::WatchCreateRequest,
         bool,
@@ -75,12 +76,27 @@ pub(super) enum Query {
 }
 
 impl Query {
+    pub fn is_point_read(&self) -> bool {
+        let request = match self {
+            Self::Read(request, ..) | Self::Linear(request, ..) => request,
+            _ => return false,
+        };
+        matches!(
+            &request.request,
+            Some(crate::proto::etcdserverpb::request_op::Request::RequestRange(range))
+                if range.range_end.is_empty()
+        )
+    }
+
     pub fn reject(self, error: ApiError) {
         let response = match self {
             Self::Linear(..) => unreachable!("linear reads wait for queue capacity"),
+            Self::Read(_, _, response) => {
+                response.error(error);
+                return;
+            }
             Self::Maintenance(_, _, _, response)
             | Self::AuthLookup(_, response)
-            | Self::Read(_, _, response)
             | Self::Watch(_, _, _, _, response)
             | Self::Local(_, response) => response,
         };
@@ -94,6 +110,7 @@ pub(super) enum Job {
     Entries(Vec<Entry>),
     Snapshot(Snapshot),
     Query(Query),
+    Reads(Vec<Query>),
     Checkpoint(Duration),
 }
 
@@ -105,6 +122,7 @@ pub(super) struct Work {
 
 pub(super) enum Reply {
     Encoded(Value),
+    Kv(Outcome),
     Lease(Outcome<LeaseReply>),
 }
 
@@ -116,9 +134,14 @@ pub(super) struct AppliedCommand {
 }
 
 pub(super) enum Output {
+    Reads(Vec<Output>),
     Linear {
-        id: Vec<u8>,
-        value: Value,
+        id: u64,
+        outcome: Outcome,
+    },
+    Read {
+        response: ClientResponse,
+        outcome: Outcome,
     },
     Entries(Vec<AppliedCommand>),
     Snapshot,
@@ -131,7 +154,8 @@ pub(super) enum Output {
 }
 
 pub(super) struct Completion {
-    pub state: AppliedState,
+    pub applied: u64,
+    pub state: Option<AppliedState>,
     pub output: Output,
 }
 
@@ -150,8 +174,29 @@ impl Drop for Executor {
 }
 
 impl Executor {
+    async fn read_query(&self, query: Query, header: Header) -> Result<Output> {
+        let (request, credentials) = match &query {
+            Query::Read(request, credentials, _) | Query::Linear(request, credentials, _) => {
+                (request, credentials)
+            }
+            _ => anyhow::bail!("read batch contains a different query type"),
+        };
+        let mut outcome = self
+            .state
+            .read_etcd_authorized(request, credentials.as_ref())
+            .await?;
+        header.outcome(&mut outcome);
+        Ok(match query {
+            Query::Read(_, _, response) => Output::Read { response, outcome },
+            Query::Linear(_, _, id) => Output::Linear { id, outcome },
+            _ => unreachable!(),
+        })
+    }
+
     async fn execute(&mut self, work: Work) -> Result<Completion> {
-        if matches!(work.job, Job::Entries(_) | Job::Snapshot(_)) && !work.delay.is_zero() {
+        let changes_state = matches!(work.job, Job::Entries(_) | Job::Snapshot(_));
+        let copy_state = changes_state || matches!(work.job, Job::Query(Query::Maintenance(..)));
+        if changes_state && !work.delay.is_zero() {
             tokio::time::sleep(work.delay).await;
         }
         let output = match work.job {
@@ -163,6 +208,13 @@ impl Executor {
             Job::Snapshot(snapshot) => {
                 self.state.install_snapshot(&snapshot).await?;
                 Output::Snapshot
+            }
+            Job::Reads(queries) => {
+                let mut outputs = Vec::with_capacity(queries.len());
+                for query in queries {
+                    outputs.push(self.read_query(query, work.header).await?);
+                }
+                Output::Reads(outputs)
             }
             Job::Query(query) => match query {
                 Query::Maintenance(command, credentials, status, response) => {
@@ -182,28 +234,8 @@ impl Executor {
                     value: serde_json::to_value(self.state.auth.users.get(&name))?,
                     require_leader: false,
                 },
-                Query::Linear(request, credentials, id) => {
-                    let mut outcome = self
-                        .state
-                        .read_etcd_authorized(&request, credentials.as_ref())
-                        .await?;
-                    work.header.outcome(&mut outcome);
-                    Output::Linear {
-                        id,
-                        value: serde_json::to_value(outcome)?,
-                    }
-                }
-                Query::Read(request, credentials, response) => {
-                    let mut outcome = self
-                        .state
-                        .read_etcd_authorized(&request, credentials.as_ref())
-                        .await?;
-                    work.header.outcome(&mut outcome);
-                    Output::Query {
-                        response,
-                        value: serde_json::to_value(outcome)?,
-                        require_leader: false,
-                    }
+                query @ (Query::Linear(..) | Query::Read(..)) => {
+                    self.read_query(query, work.header).await?
                 }
                 Query::Watch(request, require_leader, through, credentials, response) => {
                     let permission = credentials.as_ref().map_or(Ok(()), |auth| {
@@ -217,7 +249,8 @@ impl Executor {
                     });
                     let mut page = if let Err(error) = permission {
                         return Ok(Completion {
-                            state: AppliedState::from(&self.state),
+                            applied: self.state.applied,
+                            state: None,
                             output: Output::Query {
                                 response,
                                 require_leader,
@@ -271,7 +304,8 @@ impl Executor {
             }
         };
         Ok(Completion {
-            state: AppliedState::from(&self.state),
+            applied: self.state.applied,
+            state: copy_state.then(|| AppliedState::from(&self.state)),
             output,
         })
     }
@@ -495,7 +529,7 @@ async fn apply_entries(
             RaftCommand::Etcd { etcd, origin, .. } => {
                 let mut outcome = state.apply_etcd_quota(entry.index, etcd, *origin).await?;
                 header.outcome(&mut outcome);
-                Reply::Encoded(serde_json::to_value(outcome)?)
+                Reply::Kv(outcome)
             }
             RaftCommand::Lease { lease, origin, .. } => {
                 lease_command = Some(lease.clone());

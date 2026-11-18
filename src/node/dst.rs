@@ -10,13 +10,13 @@ use crate::proto::etcdserverpb::{PutRequest, RangeRequest, WatchCreateRequest};
 struct ClientRequest {
     key: String,
     value: String,
-    reply: oneshot::Receiver<Result<Value, ApiError>>,
+    reply: oneshot::Receiver<Result<Outcome, ApiError>>,
 }
 
 struct ReadRequest {
     node: u64,
     known: BTreeMap<String, String>,
-    reply: oneshot::Receiver<Result<Value, ApiError>>,
+    reply: oneshot::Receiver<Result<Outcome, ApiError>>,
 }
 
 struct RevisionRequest {
@@ -231,8 +231,7 @@ impl Simulation {
         let mut pending = vec![];
         for mut request in self.requests.drain(..) {
             match request.reply.try_recv() {
-                Ok(Ok(reply)) => {
-                    let result: Outcome = serde_json::from_value(reply).unwrap();
+                Ok(Ok(result)) => {
                     let mut result = result.result.unwrap();
                     let revision = crate::mvcc::response_header(&mut result).unwrap().revision;
                     for (&id, node) in &mut self.nodes {
@@ -255,8 +254,7 @@ impl Simulation {
         let mut pending_reads = vec![];
         for mut read in self.reads.drain(..) {
             match read.reply.try_recv() {
-                Ok(Ok(value)) => {
-                    let result: Outcome = serde_json::from_value(value).unwrap();
+                Ok(Ok(result)) => {
                     let Some(Resp::ResponseRange(response)) = result.result.unwrap().response
                     else {
                         panic!("expected range");
@@ -418,7 +416,7 @@ impl Simulation {
                         })),
                     },
                 },
-                tx,
+                ClientResponse::Kv(tx),
             )
             .unwrap();
         self.trace.push(format!("propose {leader} {key}"));
@@ -441,18 +439,32 @@ impl Simulation {
         }
         let id = candidates[self.choose(candidates.len())];
         let count = self.choose(6) + 3;
+        let point = if self.choose(2) == 0 {
+            self.acknowledged
+                .first_key_value()
+                .map(|(key, value)| (key.clone(), value.clone()))
+        } else {
+            None
+        };
         for offset in 0..count {
             let (tx, rx) = oneshot::channel();
             let node = self.nodes.get_mut(&id).unwrap();
-            node.linear_read(
+            node.linear_read_auth(
                 RequestOp {
                     request: Some(Op::RequestRange(RangeRequest {
-                        key: b"key-".to_vec(),
-                        range_end: b"key.".to_vec(),
+                        key: point
+                            .as_ref()
+                            .map_or_else(|| b"key-".to_vec(), |(key, _)| key.as_bytes().to_vec()),
+                        range_end: if point.is_some() {
+                            vec![]
+                        } else {
+                            b"key.".to_vec()
+                        },
                         ..Default::default()
                     })),
                 },
-                tx,
+                None,
+                ClientResponse::Kv(tx),
             );
             // Issue one batch, cancel its first client, then queue later reads.
             if offset == 1 {
@@ -463,7 +475,10 @@ impl Simulation {
             self.trace.push(format!("read {id}"));
             self.reads.push(ReadRequest {
                 node: id,
-                known: self.acknowledged.clone(),
+                known: point.as_ref().map_or_else(
+                    || self.acknowledged.clone(),
+                    |(key, value)| [(key.clone(), value.clone())].into_iter().collect(),
+                ),
                 reply: rx,
             });
         }
@@ -558,10 +573,7 @@ impl Simulation {
             }
         }
         // A successful PUT with a lost reply must keep the same immutable object.
-        self.propose().await;
-        for _ in 0..100 {
-            self.deliver(false).await;
-        }
+        self.propose_before_object_fault(id).await;
         let before = self.nodes[&id].raw.store().snapshot_index();
         while let Ok(permit) = store.entered.try_acquire() {
             permit.forget();
@@ -575,13 +587,10 @@ impl Simulation {
             .await
             .unwrap();
         assert_eq!(self.nodes[&id].raw.store().snapshot_index(), before);
-        assert!(store.entered.try_acquire().is_ok());
+        store.entered.try_acquire().unwrap().forget();
         self.trace
             .push(format!("recover lost object put reply {id}"));
-        self.propose().await;
-        for _ in 0..100 {
-            self.deliver(false).await;
-        }
+        self.propose_before_object_fault(id).await;
         let before = self.nodes[&id].raw.store().snapshot_index();
         let first = self.nodes[&id].raw.store().first_index().unwrap();
         store.set(FAIL_PUT);
@@ -592,6 +601,7 @@ impl Simulation {
         .await
         .unwrap();
         assert!(result.is_err());
+        store.entered.try_acquire().unwrap().forget();
         assert_eq!(self.nodes[&id].raw.store().snapshot_index(), before);
         assert_eq!(self.nodes[&id].raw.store().first_index().unwrap(), first);
         self.trace
@@ -625,6 +635,32 @@ impl Simulation {
             assert_eq!(response.kvs.len(), 1);
             assert_eq!(response.kvs[0].value, value.as_bytes());
         }
+    }
+
+    async fn propose_before_object_fault(&mut self, id: u64) {
+        let leader = self.leader().unwrap();
+        self.propose().await;
+        let index = self.nodes[&leader].raw.raft.raft_log.last_index();
+        let key = format!("key-{}", self.next_request);
+        for _ in 0..100 {
+            self.deliver(false).await;
+        }
+        // Reordered appends can leave the follower waiting for a heartbeat with the commit index.
+        // A clean state flush does not PUT an object and cannot exercise a PUT fault.
+        for _ in 0..100 {
+            if self.nodes[&id].state.applied >= index && self.acknowledged.contains_key(&key) {
+                self.trace
+                    .push(format!("object fault apply barrier {id} {index}"));
+                return;
+            }
+            for member in 1..=3 {
+                self.tick(member).await;
+            }
+            for _ in 0..30 {
+                self.deliver(false).await;
+            }
+        }
+        panic!("object fault setup did not apply {key} at index {index} on node {id}");
     }
 
     async fn lease(&mut self, lease: LeaseCommand) {
@@ -1162,7 +1198,7 @@ impl Simulation {
 
 #[tokio::test]
 async fn seeded_fault_schedules_replay_identically() {
-    let seeds = std::env::var("SLATEDB_DST_SEEDS").unwrap_or_else(|_| "1,2,42".into());
+    let seeds = std::env::var("SLATEDB_DST_SEEDS").unwrap_or_else(|_| "1,2,42,58,70".into());
     for seed in seeds.split(',').map(|s| s.parse::<u64>().unwrap()) {
         eprintln!("DST seed {seed}: starting");
         let first = Simulation::run(seed).await;
