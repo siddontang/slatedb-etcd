@@ -88,6 +88,19 @@ pub fn service(
 }
 
 impl Service {
+    async fn wait_revision(&self, revision: i64) -> Result<(), Status> {
+        let (tx, rx) = oneshot::channel();
+        self.events
+            .try_send(Event::WaitRevision(revision, tx))
+            .map_err(|_| Status::unavailable("etcdserver: too many requests"))?;
+        tokio::time::timeout(Duration::from_secs(10), rx)
+            .await
+            .map_err(|_| Status::deadline_exceeded("etcdserver: local apply timed out"))?
+            .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?
+            .map_err(|e| Status::unavailable(e.error))?;
+        Ok(())
+    }
+
     async fn peer_channel(&self, id: u64) -> Result<Channel, Status> {
         let (tx, rx) = oneshot::channel();
         self.events
@@ -219,7 +232,11 @@ impl Service {
                 let mut response = ResponseOp {
                     response: Some(response),
                 };
-                self.local_barrier().await?;
+                let revision = mvcc::response_header(&mut response)
+                    .ok_or_else(|| Status::internal("forwarded KV response has no header"))?
+                    .revision;
+                // The leader already confirmed this result. Only local MVCC progress is missing.
+                self.wait_revision(revision).await?;
                 if let Some(header) = mvcc::response_header(&mut response) {
                     header.member_id = self.member;
                 }

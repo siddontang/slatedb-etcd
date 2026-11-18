@@ -9,10 +9,44 @@ pub(super) struct PendingRead {
     role: StateRole,
     started: Instant,
     index: Option<u64>,
+    context: Option<Vec<u8>>,
     retry_ticks: u8,
 }
 
 impl Node {
+    pub(super) fn wait_revision(&mut self, revision: i64, response: Response) {
+        self.finish_revision_waiters();
+        if self.state.revision >= revision {
+            let _ = response.send(Ok(Value::Null));
+        } else if self.revision_waiters.len() >= apply::MAX_QUERIES {
+            let _ = response.send(Err(self.error("too many pending apply barriers")));
+        } else {
+            self.revision_waiters.push_back(RevisionWaiter {
+                revision,
+                response,
+                started: Instant::now(),
+            });
+        }
+    }
+
+    pub(super) fn finish_revision_waiters(&mut self) {
+        for _ in 0..self.revision_waiters.len() {
+            let waiter = self.revision_waiters.pop_front().unwrap();
+            if waiter.response.is_closed() {
+                continue;
+            }
+            if waiter.started.elapsed() > Duration::from_secs(5) {
+                let _ = waiter
+                    .response
+                    .send(Err(self.error("local apply timed out")));
+            } else if self.state.revision >= waiter.revision {
+                let _ = waiter.response.send(Ok(Value::Null));
+            } else {
+                self.revision_waiters.push_back(waiter);
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn linear_read(&mut self, request: RequestOp, response: Response) {
         self.linear_read_auth(request, None, response);
@@ -48,32 +82,59 @@ impl Node {
                     role: self.raw.raft.state,
                     started: Instant::now(),
                     index: None,
+                    context: None,
                     retry_ticks: 2,
                 },
             );
-            self.raw.read_index(id);
+        }
+    }
+
+    pub(super) fn issue_reads(&mut self) {
+        if self
+            .reads
+            .values()
+            .any(|read| read.context.is_some() && read.index.is_none())
+        {
+            return;
+        }
+        let mut context = None;
+        for (id, read) in &mut self.reads {
+            if read.context.is_none() {
+                let context = context.get_or_insert_with(|| id.clone());
+                read.context = Some(context.clone());
+                read.retry_ticks = 2;
+            }
+        }
+        // Freeze the batch before asking the quorum. Later requests need a new proof.
+        if let Some(context) = context {
+            self.raw.read_index(context);
         }
     }
 
     pub(super) fn retry_reads(&mut self) {
         self.expire_reads();
-        for (id, read) in &mut self.reads {
-            if read.index.is_some() {
+        let mut retry = BTreeSet::new();
+        for read in self.reads.values_mut() {
+            if read.index.is_some() || read.context.is_none() {
                 continue;
             }
             read.retry_ticks -= 1;
             if read.retry_ticks == 0 {
                 // Raft can drop reads before the new leader commits its first entry.
-                self.raw.read_index(id.clone());
+                retry.insert(read.context.as_ref().unwrap().clone());
                 read.retry_ticks = 2;
             }
+        }
+        for context in retry {
+            self.raw.read_index(context);
         }
     }
 
     pub(super) fn confirm_reads(&mut self, reads: Vec<raft::ReadState>) {
         for state in reads {
-            if let Some(read) = self.reads.get_mut::<[u8]>(state.request_ctx.as_ref()) {
-                if read.index.is_none()
+            for read in self.reads.values_mut() {
+                if read.context.as_deref() == Some(state.request_ctx.as_ref())
+                    && read.index.is_none()
                     && read.term == self.raw.raft.term
                     && read.leader == self.raw.raft.leader_id
                     && read.role == self.raw.raft.state

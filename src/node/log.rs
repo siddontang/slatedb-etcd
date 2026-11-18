@@ -7,13 +7,13 @@ use raft::GetEntriesContext;
 
 pub(super) const MAX_JOBS: usize = 64;
 pub(super) const MAX_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 
 pub(super) struct Durable {
     pub hard_state: HardState,
     pub last_index: u64,
     pub snapshot: Snapshot,
     pub sync_writes: u64,
-    pub stats: crate::storage::LogStats,
 }
 
 impl Durable {
@@ -23,12 +23,12 @@ impl Durable {
             last_index: storage.last_index()?,
             snapshot: storage.recovery_snapshot().clone(),
             sync_writes: storage.sync_writes,
-            stats: storage.log_stats()?,
         })
     }
 }
 
 pub(super) enum Job {
+    Stats,
     Fetch(super::cache::Fetch),
     Ready {
         entries: Vec<Entry>,
@@ -45,23 +45,30 @@ pub(super) enum Job {
 }
 
 impl Job {
+    pub fn is_barrier(&self) -> bool {
+        matches!(self, Self::Ready { entries, hs: None, snapshot: None } if entries.is_empty())
+    }
+
     pub fn bytes(&self) -> usize {
         match self {
-            Self::Fetch(_) => 0,
-            Self::Ready {
-                entries, snapshot, ..
-            } => {
-                entries
-                    .iter()
-                    .map(|e| e.compute_size() as usize)
-                    .sum::<usize>()
-                    + snapshot.as_ref().map_or(0, |s| s.data.len())
-            }
-            Self::Checkpoint { data, .. } => data.len(),
+            Self::Fetch(_) | Self::Stats => 0,
+            Self::Ready { entries, .. } => entries.iter().map(|e| e.compute_size() as usize).sum(),
+            Self::Checkpoint { .. } => 0,
             #[cfg(test)]
             Self::Panic => 0,
         }
     }
+    pub fn snapshot_bytes(&self) -> usize {
+        match self {
+            Self::Ready {
+                snapshot: Some(snapshot),
+                ..
+            } => snapshot.data.len(),
+            Self::Checkpoint { data, .. } => data.len(),
+            _ => 0,
+        }
+    }
+
     fn writes(&self) -> bool {
         match self {
             Self::Ready {
@@ -69,7 +76,7 @@ impl Job {
                 hs,
                 snapshot,
             } => !entries.is_empty() || hs.is_some() || snapshot.is_some(),
-            Self::Fetch(_) => false,
+            Self::Fetch(_) | Self::Stats => false,
             Self::Checkpoint { .. } => true,
             #[cfg(test)]
             Self::Panic => true,
@@ -88,6 +95,7 @@ pub(super) struct Completion {
     pub id: u64,
     pub durable: Durable,
     pub fetched: Option<(super::cache::Fetch, raft::Result<Vec<Entry>>)>,
+    pub stats: Option<crate::storage::LogStats>,
 }
 
 struct Executor {
@@ -101,7 +109,9 @@ impl Executor {
             "injected Raft log write failure"
         );
         let mut fetched = None;
+        let mut stats = None;
         match work.job {
+            Job::Stats => stats = Some(self.storage.log_stats()?),
             Job::Fetch(fetch) => {
                 ensure!(!work.fail, "injected Raft log read failure");
                 let entries = self.storage.entries(
@@ -131,6 +141,7 @@ impl Executor {
             id: work.id,
             durable: Durable::read(&self.storage)?,
             fetched,
+            stats,
         })
     }
 }

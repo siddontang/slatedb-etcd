@@ -174,6 +174,7 @@ The deterministic driver executes the same worker jobs under an explicit schedul
 The receiving replica submits a unique context through raft-rs Safe ReadIndex.
 A follower sends the request through Raft to its known leader.
 The context includes a process nonce and a counter, so restart cannot reuse an old context.
+Pending reads share one frozen context per quorum round. Later reads wait for the next round.
 Raft confirms leadership through a quorum and returns the associated committed index.
 It also requires a committed entry in the leader's current term.
 
@@ -186,9 +187,11 @@ At most 64 ReadIndex requests can wait. These requests do not append log entries
 Unconfirmed requests retry every two Raft ticks until confirmation, cancellation, or timeout.
 Retries cover lost messages and reads dropped before a new leader commits its first entry.
 
-Forwarded KV, Lease, and Compact results also wait for a local ReadIndex barrier before returning.
-This makes their revisions available to later local STM reads on the same member.
-The barrier adds a quorum exchange to forwarded writes.
+Forwarded KV results wait for local apply through the revision in the leader response.
+At most 64 revision waiters can wait, with a five-second timeout and client cancellation.
+Lease and Compact results still use a local ReadIndex barrier.
+Compaction can change state without increasing the MVCC revision.
+These barriers make returned revisions available to later local STM reads.
 
 Serializable reads still use the local applied prefix without quorum confirmation.
 A local commit counter cannot replace the ReadIndex quorum exchange.
@@ -197,7 +200,9 @@ A local commit counter cannot replace the ReadIndex quorum exchange.
 
 The owner stages each Ready in its memory view before calling `advance_append_async`.
 This makes entries and terms readable through the synchronous Raft Storage interface.
-A FIFO worker persists Ready updates, checkpoint publication, log reclamation, and disk statistics.
+A FIFO worker persists Ready updates, checkpoint publication, and log reclamation.
+The worker reads disk statistics only for an explicit `/debug/log-stats` request.
+Empty Ready jobs complete on the owner after all earlier jobs finish. They do no disk work.
 The owner calls `on_persist_ready` only after it receives the matching completion.
 It then releases the associated persisted messages and ReadIndex states.
 Errors or worker panic stop the node.
@@ -208,14 +213,19 @@ Ordinary HTTP receipt only confirms message delivery. It does not confirm Raft p
 Holding that receipt behind disk I/O would block the peer's subsequent heartbeat responses.
 Snapshot HTTP receipt remains behind durable snapshot storage, before state installation.
 
-The queue contains at most 64 jobs and uses a 16 MiB admission target.
-One Ready or full snapshot can exceed that byte target.
+The queue contains at most 64 jobs. Entries use a 16 MiB admission target.
+Snapshots use a separate 64 MiB admission target and do not consume the entry allowance.
+One Ready can exceed an admission target. These counters do not limit total process memory.
 The owner rejects new proposals when this queue or the apply backlog reaches its admission limit.
 A worker failure stops progress instead of reporting an uncertain write as durable.
 Shutdown cancels queued work and injected delays. A running kernel I/O call must finish before
 its thread releases the storage lock.
 
 ### Bounded log pools
+
+Apply cannot exceed the committed entries that Raft has delivered through Ready.
+A durable commit counter alone is insufficient when persistence callbacks are delayed.
+This rule keeps Raft from requesting payloads that apply has already released.
 
 The cache evicts applied entry payloads independently of checkpoints.
 It pins unapplied entries because raft-rs requires synchronous reads during elections and Ready.
@@ -444,3 +454,17 @@ It does not simulate partial sector writes, operating-system scheduling, or Slat
 - [Test commands](../tests/README.md) and [upstream coverage audit](../tests/upstream/README.md)
 
 Update this document when an ownership boundary, recovery rule, or roadmap phase changes.
+
+## Linux CPU work
+
+ReadIndex batches reduce quorum messages without reusing a proof for later requests.
+Forwarded KV writes wait for local revision progress without another quorum round.
+Append-only MVCC, Watch, and hash records skip quota lookups for keys absent before the batch.
+Other mutations still read prior values. Final mutations determine the byte counter.
+
+The snapshot builder captures membership with its pinned state view.
+It passes that membership with the result, so the owner does not decode the full snapshot.
+Snapshot serialization shares immutable row buffers and writes byte slices directly.
+It still scans and encodes the full retained state. Cost grows with uncompressed history.
+
+See the [benchmark guide](benchmarks.md) for Linux CPU sampling and comparison controls.

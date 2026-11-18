@@ -67,6 +67,7 @@ The owner queues at most 64 local reads and 64 checkpoint requests.
 It rejects new proposals at 1,024 committed but unapplied entries.
 Worker failure or panic stops the node. Shutdown cancels the worker and its snapshot builder.
 The log thread performs steady-state disk I/O, file reclamation, and disk statistics.
+Apply waits for Raft to deliver committed entries through Ready, then waits for local durability.
 The owner pins unapplied entries and keeps a bounded cache of applied log payloads.
 Cache misses fetch entries asynchronously through the disk worker.
 Term runs support synchronous Raft term lookup without retaining every payload.
@@ -80,22 +81,27 @@ This loopback test hook has a five-second limit. Set the delay to zero to restor
 Linearizable Range requests and read-only transactions use Safe ReadIndex.
 The leader confirms a quorum. The receiving member waits for local apply through the read index.
 Followers use Raft to request that index, then evaluate the read locally.
-Forwarded KV, Lease, and Compact results also wait for a local barrier.
+Forwarded KV results wait for local apply through the leader response revision.
+Lease and Compact results still require a local ReadIndex barrier.
 Later STM reads on that member can then use their revisions.
 Both branches of nested transactions must contain only reads.
 Leadership loss, timeout, or cancellation removes the pending read. At most 64 reads can wait.
-These reads do not append log entries. Unconfirmed requests retry every two Raft ticks.
+A frozen batch shares one quorum context. Later requests use a new context.
+These reads do not append log entries. Unconfirmed batches retry every two Raft ticks.
 Serializable reads remain local and can return older state.
 
-Log work uses a FIFO queue with 64 jobs and a 16 MiB admission target.
-One Ready or full snapshot can exceed the target. New proposals stop at the queue limit.
+Log work uses a FIFO queue with 64 jobs and a 16 MiB entry admission target.
+Snapshots use a separate 64 MiB target. One Ready can exceed a target.
+New proposals stop at the entry or job limit.
+Empty Ready barriers finish on the owner after earlier writes finish.
+Disk statistics run only for `/debug/log-stats` requests.
 Raft advances durable progress and releases dependent messages only after log completion.
 Leader replication can run before local persistence, as permitted by raft-rs.
 Ordinary HTTP receipt confirms delivery; snapshot receipt waits for durable snapshot storage.
 
 Status separates `raft_commit_index`, durable `commit_index`, and `applied_index`.
 It also reports `cached_last_log_index`, `log_busy`, `queued_log_jobs`, `queued_log_bytes`,
-and `pending_read_indexes`.
+`queued_snapshot_bytes`, `pending_read_indexes`, and `pending_revision_waiters`.
 `log_memory` reports bytes and limits for the cache, pending entries, read results,
 and term metadata.
 It also reports hits, misses, evictions, disk reads, and discarded stale results.

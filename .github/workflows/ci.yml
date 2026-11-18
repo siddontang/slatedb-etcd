@@ -40,6 +40,7 @@ jobs:
           python3 scripts/check-public.py
           python3 scripts/test_reporting.py
           python3 scripts/test_benchmark.py
+          python3 scripts/test_profile.py
           python3 scripts/test_history.py
           python3 scripts/check-history.py
           python3 scripts/test_secret_scan.py
@@ -88,11 +89,6 @@ jobs:
           scripts/cargo.sh test --locked -- --skip seeded_fault_schedules_replay_identically
           python3 scripts/check-dst.py --seeds "$SLATEDB_DST_SEEDS" --output results/ci/dst.json
           scripts/cargo.sh build --locked --release
-      - name: Compare gRPC performance on Linux
-        run: |
-          python3 scripts/benchmark-etcd.py --requests 2000 --read-requests 30000 \
-            --keys 1000 --value-size 256 --concurrency 8 --read-percent 0 50 100 \
-            --warmup 200 --repeat 3 --output results/ci/benchmark-linux.json
       - name: Check etcd compatibility and recovery
         run: |
           python3 scripts/check-compat.py --output results/ci/etcd-compatibility.json
@@ -140,4 +136,64 @@ jobs:
         with:
           name: validation-reports
           path: results/ci/*.json
+          retention-days: 14
+
+  performance:
+    needs: public-files
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_RELEASE_DEBUG: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: tests/compat/go.sum
+      - name: Install Linux profiling tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler linux-tools-common linux-tools-generic
+          perf_path="$(find /usr/lib/linux-tools -type f -name perf | sort | tail -1)"
+          test -n "$perf_path"
+          sudo ln -sf "$perf_path" /usr/local/bin/perf
+          sudo sysctl kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+      - name: Build head and base with the same settings
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          mkdir -p tmp/performance
+          cargo build --locked --release
+          cp target/release/slatedb-etcd tmp/performance/head
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            BASE_SHA="$(git rev-parse HEAD^)"
+          fi
+          git worktree add --detach "$RUNNER_TEMP/performance-base" "$BASE_SHA"
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --locked --release             --manifest-path "$RUNNER_TEMP/performance-base/Cargo.toml"
+          cp target/release/slatedb-etcd tmp/performance/base
+          git worktree remove "$RUNNER_TEMP/performance-base"
+      - name: Compare throughput, latency, CPU, and memory
+        run: |
+          python3 scripts/benchmark-etcd.py --binary tmp/performance/head             --baseline-binary tmp/performance/base --requests 5000 --read-requests 60000             --keys 1000 --value-size 256 --concurrency 1 8 32 --read-percent 0 50 100             --warmup 200 --repeat 3 --output results/ci/benchmark-linux.json
+          python3 scripts/summarize-benchmark.py results/ci/benchmark-linux.json             --output results/ci/benchmark-summary.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Sample Linux CPU stacks after warmup
+        run: |
+          for backend in base head; do
+            python3 scripts/profile-linux.py --binary "tmp/performance/$backend"               --read-percent 0 --requests 5000 --output "results/ci/profile-$backend-write"
+            python3 scripts/profile-linux.py --binary "tmp/performance/$backend"               --read-percent 100 --requests 60000 --output "results/ci/profile-$backend-read"
+          done
+      - name: Save performance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-performance
+          path: |
+            results/ci/*.json
+            results/ci/profile-*/*.json
+            results/ci/profile-*/*.txt
+            results/ci/profile-*/*.log
           retention-days: 14

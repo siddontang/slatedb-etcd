@@ -191,7 +191,9 @@ def run_tests(cluster, checks):
         cluster.put(leader, f"gc/{index % 16}", f"{index}:" + "x" * 4096)
     cluster.put(leader, "snapshot-marker", "caught-up")
     before = cluster.status(leader)
+    before["log"] = request(cluster.ports[leader], "/debug/log-stats")
     after = cluster.checkpoint(leader)
+    after["log"] = request(cluster.ports[leader], "/debug/log-stats")
     assert after["snapshot_index"] > 0
     assert after["first_log_index"] == after["snapshot_index"] + 1
     removed = set(before["log"]["files"]) - set(after["log"]["files"])

@@ -38,6 +38,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/kv", post(propose))
         .route("/raft", post(raft_message))
         .route("/status", get(status))
+        .route("/debug/log-stats", get(log_stats))
         .route("/checkpoint", post(checkpoint))
         .route("/debug/value", get(local_value))
         .route("/debug/partition", post(partition))
@@ -100,6 +101,10 @@ async fn raft_message(State(state): State<ApiState>, headers: HeaderMap, body: B
 
 async fn status(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
     dispatch(state, Event::Status).await
+}
+
+async fn log_stats(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    dispatch(state, Event::LogStats).await
 }
 
 async fn checkpoint(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {

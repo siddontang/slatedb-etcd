@@ -218,7 +218,7 @@ func TestSlowCheckpointPublicationKeepsRaftLive(t *testing.T) {
 	go func() { _, err := c.http(leader, "/checkpoint", map[string]any{}); checkpoint <- err }()
 	require.Eventually(t, func() bool {
 		state, err := c.http(leader, "/status", nil)
-		return err == nil && state["log_busy"] == true && state["queued_log_bytes"].(float64) > 0
+		return err == nil && state["log_busy"] == true && state["queued_snapshot_bytes"].(float64) > 0
 	}, time.Second, 10*time.Millisecond)
 	for n := 0; n < 10; n++ {
 		state, err := c.http(leader, "/status", nil)
@@ -241,4 +241,43 @@ func TestSlowCheckpointPublicationKeepsRaftLive(t *testing.T) {
 	result, err := client(t, []string{c.addresses[recoveredLeader-1]}).Get(ctx, "checkpoint-io")
 	require.NoError(t, err)
 	require.Equal(t, "value", string(result.Kvs[0].Value))
+}
+
+func TestForwardedWriteWaitsForLocalApply(t *testing.T) {
+	c := newCluster(t)
+	leader := c.leader()
+	follower := leader%3 + 1
+	api := client(t, []string{c.addresses[follower-1]})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, err := api.Put(ctx, "forward-apply", "before")
+	require.NoError(t, err)
+	_, err = c.http(follower, "/debug/apply-delay", map[string]any{"delay_ms": 1500})
+	require.NoError(t, err)
+	written := make(chan error, 1)
+	go func() { _, err := api.Put(ctx, "forward-apply", "after"); written <- err }()
+	require.Eventually(t, func() bool {
+		state, err := c.http(follower, "/status", nil)
+		return err == nil && state["pending_revision_waiters"].(float64) > 0
+	}, time.Second, 10*time.Millisecond)
+	state, err := c.http(follower, "/status", nil)
+	require.NoError(t, err)
+	require.Zero(t, state["pending_read_indexes"].(float64))
+	select {
+	case err := <-written:
+		t.Fatalf("forwarded write preceded local apply: %v", err)
+	default:
+	}
+	_, err = c.http(follower, "/debug/apply-delay", map[string]any{"delay_ms": 0})
+	require.NoError(t, err)
+	require.NoError(t, <-written)
+	result, err := api.Get(ctx, "forward-apply", clientv3.WithSerializable())
+	require.NoError(t, err)
+	require.Len(t, result.Kvs, 1)
+	require.Equal(t, "after", string(result.Kvs[0].Value))
+	c.stop(follower)
+	c.start(follower)
+	result, err = api.Get(ctx, "forward-apply")
+	require.NoError(t, err)
+	require.Equal(t, "after", string(result.Kvs[0].Value))
 }

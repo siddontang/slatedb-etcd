@@ -15,7 +15,7 @@ fn key(revision: i64) -> Vec<u8> {
 pub fn record(revision: i64, events: &[Event], batch: &mut WriteBatch) -> Result<(), KvError> {
     crate::state::maintenance::record_hash(revision, events, batch);
     if !events.is_empty() {
-        batch.put(
+        batch.put_new(
             key(revision),
             bincode::serialize(events).map_err(KvError::storage)?,
         );

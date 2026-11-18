@@ -55,8 +55,10 @@ CPU per successful operation measures work. Average CPU cores measure utilizatio
 The controller samples RSS every 100 ms and includes both measurement boundaries.
 RSS is not unique physical memory. Short samples can amplify CPU rounding and barrier overhead.
 Latency percentiles include successful operations only. Any failed request makes the report fail.
-CI runs three repeats of each workload on Linux with the normal release binary.
-The `validation-reports` artifact includes `benchmark-linux.json`.
+CI compares the PR base, head, and etcd on one Linux x86 runner.
+It uses identical release settings with line symbols for both service builds.
+It runs three repeats at concurrency 1, 8, and 32, with 0%, 50%, and 100% reads.
+The `linux-performance` artifact includes samples, summaries, and CPU stack reports.
 CI checks request success and report completeness. It does not enforce a performance threshold.
 Shared CI hosts can vary in CPU scheduling, storage latency, and available memory.
 Linux resource sampling reads process CPU ticks and resident pages from `/proc`.
@@ -102,3 +104,29 @@ See the [etcd sync implementation][etcd-sync] and [Raft engine implementation][r
 Further benchmarks must add larger state, warm and cold reads, Watch fan-out, lease churn,
 compaction, snapshot catch-up, S3 request costs, and independent-host network latency.
 Record recovery latency and correctness alongside throughput during each fault campaign.
+
+## Sample Linux CPU stacks
+
+Install a Linux `perf` binary and allow CPU sampling in an isolated test environment.
+Build with line symbols. The code still uses release optimization.
+
+```sh
+CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --locked --release
+python3 scripts/profile-linux.py --binary target/release/slatedb-etcd \
+  --read-percent 100 --requests 100000 --output results/ci/profile-read
+python3 scripts/profile-linux.py --binary target/release/slatedb-etcd \
+  --read-percent 0 --requests 10000 --output results/ci/profile-write
+```
+
+The controller attaches to all three server processes after preload and warmup.
+A perf control acknowledgment starts sampling before the client enters its measured phase.
+The controller stops sampling after the client finishes. It excludes client CPU stacks.
+The default uses `cpu-clock` at 99 Hz with 16 KiB DWARF call stacks.
+Reports retain self and inclusive symbol costs. Inclusive percentages overlap; do not add them.
+Empty profiles, unresolved user symbols, lost samples, and failed requests fail validation.
+
+Use `--backend etcd --binary tmp/benchmark-tools/etcd` to profile the reference process.
+Keep raw `perf.data` local. Share sanitized symbol summaries and measurement reports.
+Profiled latency and throughput include sampling overhead. Use separate runs for comparisons.
+Full snapshots and retained MVCC history increase cost during longer write runs.
+Check failures before comparing successful throughput or latency.
