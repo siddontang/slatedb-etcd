@@ -178,7 +178,7 @@ jobs:
           git worktree remove "$RUNNER_TEMP/performance-base"
       - name: Compare throughput, latency, CPU, and memory
         run: |
-          python3 scripts/benchmark-etcd.py --binary tmp/performance/head             --baseline-binary tmp/performance/base --requests 5000 --read-requests 60000             --keys 1000 --value-size 256 --concurrency 1 8 32 --read-percent 0 50 100             --warmup 200 --repeat 3 --output results/ci/benchmark-linux.json
+          python3 scripts/benchmark-etcd.py --binary tmp/performance/head             --requests 5000 --read-requests 60000             --keys 1000 --value-size 256 --concurrency 1 8 32 --read-percent 0 50 100             --warmup 200 --repeat 3 --output results/ci/benchmark-linux.json
           python3 scripts/summarize-benchmark.py results/ci/benchmark-linux.json             --output results/ci/benchmark-summary.json >> "$GITHUB_STEP_SUMMARY"
       - name: Sample Linux CPU stacks after warmup
         run: |

@@ -203,6 +203,10 @@ This makes entries and terms readable through the synchronous Raft Storage inter
 A FIFO worker persists Ready updates, checkpoint publication, and log reclamation.
 The worker reads disk statistics only for an explicit `/debug/log-stats` request.
 Empty Ready jobs complete on the owner after all earlier jobs finish. They do no disk work.
+Adjacent queued Ready jobs share one durable write without a batching timer.
+The batch keeps the final HardState and log suffix, including overwritten entries.
+Checkpoints, snapshots, disk reads, and diagnostic jobs form batch boundaries.
+All dependent replies remain blocked until the combined write completes.
 The owner calls `on_persist_ready` only after it receives the matching completion.
 It then releases the associated persisted messages and ReadIndex states.
 Errors or worker panic stop the node.

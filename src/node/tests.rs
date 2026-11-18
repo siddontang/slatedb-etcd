@@ -904,7 +904,7 @@ async fn a_full_log_queue_cannot_let_apply_pass_the_ready_cursor() {
     let mut node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
         .await
         .unwrap();
-    node.raw.raft.max_committed_size_per_ready = 1;
+    node.raw.raft.set_max_committed_size_per_ready(1);
     for _ in 0..log::MAX_JOBS - 1 {
         node.queue_log(log::Job::Stats, None, None, vec![], vec![]);
     }
@@ -919,4 +919,79 @@ async fn a_full_log_queue_cannot_let_apply_pass_the_ready_cursor() {
     node.drain_log().await.unwrap();
     node.drain_apply().await.unwrap();
     assert_eq!(node.state.applied, 128);
+}
+
+#[tokio::test]
+async fn queued_ready_jobs_share_sync_and_keep_the_final_log_suffix() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    let first = node.raw.store().last_index().unwrap() + 1;
+    let entry = |index, term| Entry {
+        index,
+        term,
+        ..Default::default()
+    };
+    let mut replies = vec![];
+    for entries in [
+        vec![entry(first, 1), entry(first + 1, 1)],
+        vec![entry(first + 1, 2), entry(first + 2, 2)],
+    ] {
+        let term = entries.last().unwrap().term;
+        node.queue_log(
+            log::Job::Ready {
+                entries,
+                hs: Some(HardState {
+                    term,
+                    vote: term,
+                    commit: first - 1,
+                    ..Default::default()
+                }),
+                snapshot: None,
+            },
+            None,
+            None,
+            vec![],
+            vec![],
+        );
+        let (tx, rx) = oneshot::channel();
+        node.log_queue.back_mut().unwrap().responses.push(tx);
+        replies.push(rx);
+    }
+    // A diagnostic job is a batch boundary.
+    node.queue_log(log::Job::Stats, None, None, vec![], vec![]);
+    let before = node.log_worker.storage().sync_writes;
+    let charged = node.log_bytes;
+    node.start_log().unwrap();
+    assert_eq!(node.log_queue.len(), 2);
+    assert_eq!(node.log_bytes, charged);
+    assert!(replies.iter_mut().all(|reply| reply.try_recv().is_err()));
+    let completed = node.log_worker.step().unwrap().unwrap();
+    let storage = node.log_worker.storage();
+    assert_eq!(storage.sync_writes, before + 1);
+    assert_eq!(storage.initial_state().unwrap().hard_state.term, 2);
+    assert_eq!(storage.initial_state().unwrap().hard_state.vote, 2);
+    assert_eq!(
+        storage
+            .entries(
+                first,
+                first + 3,
+                None,
+                raft::GetEntriesContext::empty(false)
+            )
+            .unwrap(),
+        vec![entry(first, 1), entry(first + 1, 2), entry(first + 2, 2)]
+    );
+    node.complete_log(completed).unwrap();
+    for reply in replies {
+        assert!(reply.await.unwrap().is_ok());
+    }
+    assert_eq!(node.log_bytes, 0);
+    node.drain_log().await.unwrap();
+    assert_eq!(node.log_worker.storage().sync_writes, before + 1);
+    drop(node);
+    let reopened =
+        RaftStorage::open(&dir.path().join("raft"), 1, "worker-test", vec![1, 2, 3]).unwrap();
+    assert_eq!(reopened.initial_state().unwrap().hard_state.term, 2);
+    assert_eq!(reopened.initial_state().unwrap().hard_state.vote, 2);
+    assert_eq!(reopened.term(first + 2).unwrap(), 2);
 }

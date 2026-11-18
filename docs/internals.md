@@ -94,6 +94,7 @@ Log work uses a FIFO queue with 64 jobs and a 16 MiB entry admission target.
 Snapshots use a separate 64 MiB target. One Ready can exceed a target.
 New proposals stop at the entry or job limit.
 Empty Ready barriers finish on the owner after earlier writes finish.
+Adjacent queued Ready jobs share a sync. Other log job types form batch boundaries.
 Disk statistics run only for `/debug/log-stats` requests.
 Raft advances durable progress and releases dependent messages only after log completion.
 Leader replication can run before local persistence, as permitted by raft-rs.

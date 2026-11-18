@@ -817,6 +817,24 @@ impl Node {
                 let task = self.log_queue.pop_front().unwrap();
                 self.finish_log_task(task)?;
             }
+            // Combine queued Ready work without adding a timer or crossing other job types.
+            while self.log_queue.len() >= 2
+                && self
+                    .log_queue
+                    .iter()
+                    .take(2)
+                    .all(|task| task.work.as_ref().is_some_and(log::Job::can_batch))
+            {
+                let mut task = self.log_queue.pop_front().unwrap();
+                let next = self.log_queue.pop_front().unwrap();
+                task.work.as_mut().unwrap().append(next.work.unwrap())?;
+                task.bytes += next.bytes;
+                task.ready = next.ready.or(task.ready);
+                task.messages.extend(next.messages);
+                task.reads.extend(next.reads);
+                task.responses.extend(next.responses);
+                self.log_queue.push_front(task);
+            }
             if let Some(task) = self.log_queue.front_mut() {
                 let job = task.work.take().context("log job already submitted")?;
                 let reading = matches!(job, log::Job::Fetch(_));

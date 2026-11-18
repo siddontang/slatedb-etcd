@@ -55,7 +55,8 @@ CPU per successful operation measures work. Average CPU cores measure utilizatio
 The controller samples RSS every 100 ms and includes both measurement boundaries.
 RSS is not unique physical memory. Short samples can amplify CPU rounding and barrier overhead.
 Latency percentiles include successful operations only. Any failed request makes the report fail.
-CI compares the PR base, head, and etcd on one Linux x86 runner.
+CI compares the PR head and etcd on one Linux x86 runner.
+It also samples CPU stacks for the PR base and head.
 It uses identical release settings with line symbols for both service builds.
 It runs three repeats at concurrency 1, 8, and 32, with 0%, 50%, and 100% reads.
 The `linux-performance` artifact includes samples, summaries, and CPU stack reports.

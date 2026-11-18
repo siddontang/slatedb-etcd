@@ -49,6 +49,43 @@ impl Job {
         matches!(self, Self::Ready { entries, hs: None, snapshot: None } if entries.is_empty())
     }
 
+    pub fn can_batch(&self) -> bool {
+        matches!(self, Self::Ready { snapshot: None, .. })
+    }
+
+    pub fn append(&mut self, next: Self) -> Result<()> {
+        let Self::Ready {
+            entries,
+            hs,
+            snapshot: None,
+        } = self
+        else {
+            anyhow::bail!("cannot batch this log job");
+        };
+        let Self::Ready {
+            entries: newer,
+            hs: newer_hs,
+            snapshot: None,
+        } = next
+        else {
+            anyhow::bail!("cannot batch this log job");
+        };
+        if let Some(first) = newer.first() {
+            entries.truncate(entries.partition_point(|entry| entry.index < first.index));
+            ensure!(
+                entries
+                    .last()
+                    .is_none_or(|last| last.index + 1 == first.index),
+                "batched log jobs have an index gap"
+            );
+            entries.extend(newer);
+        }
+        if newer_hs.is_some() {
+            *hs = newer_hs;
+        }
+        Ok(())
+    }
+
     pub fn bytes(&self) -> usize {
         match self {
             Self::Fetch(_) | Self::Stats => 0,

@@ -21,10 +21,17 @@ from reporting import write_report
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def address():
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        return "127.0.0.1:" + str(listener.getsockname()[1])
+def addresses(count):
+    listeners = []
+    try:
+        for _ in range(count):
+            listener = socket.socket()
+            listeners.append(listener)
+            listener.bind(("127.0.0.1", 0))
+        return ["127.0.0.1:" + str(listener.getsockname()[1]) for listener in listeners]
+    finally:
+        for listener in listeners:
+            listener.close()
 
 
 def parse_cpu(value):
@@ -67,7 +74,8 @@ def wait_file(path, processes, deadline):
 def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=None):
     with tempfile.TemporaryDirectory(prefix="slatedb-bench-") as directory:
         root = Path(directory)
-        clients, peers = [address() for _ in range(3)], [address() for _ in range(3)]
+        ports = addresses(6)
+        clients, peers = ports[:3], ports[3:]
         processes, logs = [], []
         driver = None
         stop = threading.Event()

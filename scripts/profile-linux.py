@@ -119,8 +119,10 @@ def main():
         for name, children in [("self.txt", "--no-children"), ("stacks.txt", "--children")]:
             with (args.output / name).open("w") as output:
                 subprocess.run(["perf", "report", "--stdio", "--no-inline", children,
-                                "--sort", "symbol", "--call-graph", "none" if name == "self.txt" else "graph",
-                                "--percent-limit", "0.5", "--input", str(args.output / "perf.data")],
+                                "--sort", "symbol", "--call-graph",
+                                "none" if name == "self.txt" else "graph",
+                                "--percent-limit", "0.5", "--input",
+                                str(args.output / "perf.data")],
                                stdout=output, check=True)
         report["sampling"] = validate_profile((args.output / "self.txt").read_text())
         report["passed"] = True
