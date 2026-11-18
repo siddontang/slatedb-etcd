@@ -36,21 +36,42 @@ def sample_rows(sample):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report", type=Path)
+    parser.add_argument("--locks", action="store_true", help="Show the totals for the two service locks")
     args = parser.parse_args()
     report = json.loads(args.report.read_text())
     if not report["passed"] or not report["complete"]:
         parser.error("Use a complete successful benchmark report")
     groups = defaultdict(list)
+    locks = defaultdict(Counter)
     for sample in report["samples"]:
         if not sample["passed"] or sample["read_percent"] != 0:
             parser.error("Use successful pure write samples")
-        for stage, row in sample_rows(sample):
+        rows = list(sample_rows(sample))
+        if args.locks:
+            for start, end in zip(sample["state_counters_before"], sample["state_counters_after"]):
+                for name in ("forwarding", "wal_stop"):
+                    first = start["write_profile"]["locks"][name]
+                    last = end["write_profile"]["locks"][name]
+                    totals = locks[sample["backend"], sample["concurrency"], name]
+                    for field in ("calls", "busy", "wait_ns"):
+                        delta = last[field] - first[field]
+                        if delta < 0:
+                            raise ValueError("A lock counter regressed")
+                        totals[field] += delta
+        for stage, row in rows:
             groups[sample["backend"], sample["concurrency"], stage].append(row)
     print("| Build | C | Stage | Entries | Allocations | Bytes | From Raft | From WAL | From apply |")
     print("| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
     for (build, concurrency, stage), rows in sorted(groups.items()):
         values = [f"{median(column):.2f}" for column in zip(*rows)]
         print("|", " | ".join([build, str(concurrency), stage, *values]), "|")
+
+    if args.locks:
+        print("\n| Build | C | Lock | Calls | Busy | Total slow path µs |")
+        print("| --- | ---: | --- | ---: | ---: | ---: |")
+        for (build, concurrency, name), counts in sorted(locks.items()):
+            print(f"| {build} | {concurrency} | {name} | {counts['calls']} | {counts['busy']} | "
+                  f"{counts['wait_ns'] / 1000:.2f} |")
 
 
 if __name__ == "__main__":

@@ -55,6 +55,27 @@ python3 scripts/benchmark-etcd.py --binary /path/to/candidate --baseline-binary 
 python3 scripts/summarize-write-profile.py results/stages.json
 ```
 
+## Lock contention
+
+Build with `write-profile`. Add `--locks` to the summary command to include the two service locks.
+The probe tries each lock once. After a busy result, it times the blocking acquisition.
+These timings include any scheduling delay. Uncontended calls do not read the clock.
+Each line sums the three members over three runs of 12,000 writes each.
+
+| C | Lock | Acquisitions | Busy | Total slow path µs |
+| ---: | --- | ---: | ---: | ---: |
+| 8 | Forwarding channel map | 24,000 | 5 | 1.58 |
+| 32 | Forwarding channel map | 24,000 | 10 | 440.79 |
+| 8 | WAL worker stop flag at job receipt | 63,495 | 0 | 0 |
+| 32 | WAL worker stop flag at job receipt | 17,171 | 0 | 0 |
+
+A separate bpftrace run traced 14,000 writes at each concurrency on the ordinary release build.
+The Tokio blocking pool wait site accounted for 94% to 95% of completed futex wait time.
+This sums elapsed waits across threads. It does not measure CPU time or client latency.
+The trace also found waits in the allocator and HTTP/2 stack. Two stack lookups failed at 32.
+Use the [trace program](../../tests/performance/write-waits.bt) with the three Linux server PIDs.
+This trace covers futex waits and kernel lock events. User-space spinning needs separate CPU data.
+
 ## io_uring experiment
 
 The same guest used Linux 6.8 and buffered files. Each batch used one write and one data sync.

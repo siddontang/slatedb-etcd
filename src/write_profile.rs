@@ -154,7 +154,62 @@ pub(crate) fn snapshot() -> Value {
             "wakes_from_apply": counts.wakes_from[Apply as usize].load(Relaxed),
         });
     }
+    for (name, lock) in [
+        ("forwarding", Lock::Forwarding),
+        ("wal_stop", Lock::WalStop),
+    ] {
+        let counts = &LOCKS[lock as usize];
+        result["locks"][name] = json!({
+            "calls": counts.calls.load(Relaxed), "busy": counts.busy.load(Relaxed),
+            "wait_ns": counts.wait_ns.load(Relaxed), "lifetime_max_ns": counts.max_ns.load(Relaxed),
+        });
+    }
     result
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Lock {
+    Forwarding,
+    WalStop,
+}
+
+struct LockCounts {
+    calls: AtomicU64,
+    busy: AtomicU64,
+    wait_ns: AtomicU64,
+    max_ns: AtomicU64,
+}
+
+static LOCKS: [LockCounts; 2] = [const {
+    LockCounts {
+        calls: AtomicU64::new(0),
+        busy: AtomicU64::new(0),
+        wait_ns: AtomicU64::new(0),
+        max_ns: AtomicU64::new(0),
+    }
+}; 2];
+
+impl Lock {
+    pub(crate) fn acquire<T>(
+        self,
+        mutex: &Mutex<T>,
+    ) -> std::sync::LockResult<std::sync::MutexGuard<'_, T>> {
+        let counts = &LOCKS[self as usize];
+        counts.calls.fetch_add(1, Relaxed);
+        match mutex.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(error)) => Err(error),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let start = std::time::Instant::now();
+                let guard = mutex.lock();
+                let ns = start.elapsed().as_nanos() as u64;
+                counts.busy.fetch_add(1, Relaxed);
+                counts.wait_ns.fetch_add(ns, Relaxed);
+                counts.max_ns.fetch_max(ns, Relaxed);
+                guard
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -235,7 +235,11 @@ impl Worker {
                     if let Job::Ready { entries, .. } = &work.job {
                         crate::write_profile::Stage::Wal.batch(entries.len());
                     }
-                    let mut stopped = shutdown.0.lock().unwrap();
+                    #[cfg(feature = "write-profile")]
+                    let guard = crate::write_profile::Lock::WalStop.acquire(&shutdown.0);
+                    #[cfg(not(feature = "write-profile"))]
+                    let guard = shutdown.0.lock();
+                    let mut stopped = guard.unwrap();
                     if (work.job.writes() || matches!(work.job, Job::Fetch(_)))
                         && !work.delay.is_zero()
                     {
