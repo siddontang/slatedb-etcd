@@ -13,6 +13,8 @@ Historical articles explain the original designs. The pinned source defines the 
 | --- | --- | --- |
 | Separate Raft, log I/O, and apply | Implemented | Measure each queue and execution stage |
 | Share log writes | Implemented for adjacent Ready jobs | Measure batch size before adding waits |
+| Replicate during leader log I/O | Leader sends Append early | Keep follower replies durable |
+| Reply on a durable quorum | Ordinary eligible puts | Measure isolated leader I/O delays |
 | Avoid commit-only sync | Implemented with recovery checks | Preserve entry and vote barriers |
 | Reuse peer streams | Implemented with count and byte limits | Test bounded message batches |
 | Batch quorum reads | Implemented with frozen batches | Later requests need a new proof |
@@ -54,6 +56,10 @@ TiKV's [proposal builder] combines compatible Put and Delete requests.
 It checks request type, headers, request size, and total batch size.
 Its [apply worker] shares a database write batch and reuses its allocation after writing.
 Large batches cause the worker to replace that allocation with a smaller one.
+
+The leader can submit consecutive ordinary Put proposals to Raft as separate entries in one
+message. A different event ends the group. Each group fits 32 entries and a 512 KiB target.
+A larger request travels alone. Each proposal has its own request ID and log index.
 
 The service groups Ready log writes and applies up to 32 entries per worker job.
 Consecutive ordinary unleased puts now share one SlateDB write within that job.
@@ -114,6 +120,7 @@ The [peer implementation] disables and later restores this mode around unsafe tr
 This service uses the durable quorum to prepare ordinary Put results in memory.
 Local state publication still waits for the log. This preserves the existing restart proof.
 The [ordering contract](architecture.md#state-write-groups) lists the eligibility rules.
+The [slow-leader experiment](../results/performance/quorum-put/README.md) measures this path.
 
 ## Cross-check with etcd
 

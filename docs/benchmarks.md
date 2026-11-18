@@ -2,7 +2,9 @@
 
 Run these commands from the repository root.
 
-See the [read and apply report](../results/performance/linux-batch-apply.md) for the latest Linux
+See the [quorum Put report](../results/performance/quorum-put/README.md) for slow-leader latency,
+Linux CPU cost, and native macOS comparisons.
+See the [read and apply report](../results/performance/linux-batch-apply.md) for the earlier Linux
 one-member and three-member comparison, grouped writes, and module changes.
 See the [native macOS report](../results/performance/macos.md) for one-member and three-member
 results.

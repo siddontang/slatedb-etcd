@@ -282,6 +282,22 @@ impl Cache {
     }
 
     pub fn admits(&self, unstable: &[Entry], incoming: &[Entry], proposal_bytes: usize) -> bool {
+        if incoming
+            .iter()
+            .any(|entry| entry.compute_size() as usize > MAX_ENTRY_BYTES)
+        {
+            return false;
+        }
+        let incoming_bytes: usize = incoming.iter().map(charge).sum();
+        // Count the full suffix first. Overwrites can only reduce this upper bound.
+        let upper = self
+            .pending_bytes
+            .saturating_add(unstable.iter().map(charge).sum())
+            .saturating_add(incoming_bytes)
+            .saturating_add(proposal_bytes);
+        if upper <= self.limits.pending_bytes - CONTROL_RESERVE {
+            return true;
+        }
         let overwrite = incoming.first().map_or(u64::MAX, |e| e.index);
         let unstable_start = unstable.first().map_or(u64::MAX, |e| e.index);
         let retained: usize = self
@@ -294,7 +310,6 @@ impl Cache {
             .filter(|e| e.index < overwrite)
             .map(charge)
             .sum();
-        let incoming_bytes: usize = incoming.iter().map(charge).sum();
         let data_charge = |entry: &Entry| {
             if entry.data.is_empty()
                 && entry.context.is_empty()
@@ -327,10 +342,7 @@ impl Cache {
             .saturating_add(unstable_bytes)
             .saturating_add(incoming_bytes)
             .saturating_add(proposal_bytes);
-        incoming
-            .iter()
-            .all(|e| e.compute_size() as usize <= MAX_ENTRY_BYTES)
-            && projected <= self.limits.pending_bytes
+        projected <= self.limits.pending_bytes
             && projected_data <= current_data.max(self.limits.pending_bytes - CONTROL_RESERVE)
     }
 
