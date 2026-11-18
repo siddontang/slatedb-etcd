@@ -1,0 +1,163 @@
+{
+  "passed": true,
+  "scope": "Three Linux ARM64 servers; CPU sampling after warmup.",
+  "limits": "Inclusive symbol costs overlap. Null means absent from the 0.5% report, not zero cost.",
+  "profiles": [
+    {
+      "name": "baseline-read",
+      "binary_sha256": "bdcacbea093c404a8ea5f96ea90b824a57b5580ce0dc522aedb9683a97c6f3a6",
+      "requests": 100000,
+      "frequency_hz": 99,
+      "samples": 3065,
+      "lost_samples": 0,
+      "stacks_sha256": "ec7971f4538bcb67ee00452ab339b9fa4594dd044123f225be73d0b3a4ba5ce5",
+      "symbols": {
+        "peer_transport": {
+          "inclusive_percent": 17.03,
+          "self_percent": 0.46
+        },
+        "log_executor": {
+          "inclusive_percent": 8.84,
+          "self_percent": 0.0
+        },
+        "disk_statistics": {
+          "inclusive_percent": 7.9,
+          "self_percent": 0.03
+        },
+        "apply_entries": null,
+        "state_write_batch": null,
+        "snapshot_build": null,
+        "snapshot_membership_decode": null
+      }
+    },
+    {
+      "name": "baseline-write",
+      "binary_sha256": "bdcacbea093c404a8ea5f96ea90b824a57b5580ce0dc522aedb9683a97c6f3a6",
+      "requests": 10000,
+      "frequency_hz": 99,
+      "samples": 1404,
+      "lost_samples": 0,
+      "stacks_sha256": "385a07bac98fa655236da3d0501e35098f081722efa118cda2025b7453e078cc",
+      "symbols": {
+        "peer_transport": {
+          "inclusive_percent": 11.61,
+          "self_percent": 0.0
+        },
+        "log_executor": {
+          "inclusive_percent": 14.67,
+          "self_percent": 0.07
+        },
+        "disk_statistics": {
+          "inclusive_percent": 7.76,
+          "self_percent": 0.14
+        },
+        "apply_entries": {
+          "inclusive_percent": 9.26,
+          "self_percent": 0.0
+        },
+        "state_write_batch": {
+          "inclusive_percent": 6.77,
+          "self_percent": 0.07
+        },
+        "snapshot_build": {
+          "inclusive_percent": 7.69,
+          "self_percent": 0.14
+        },
+        "snapshot_membership_decode": {
+          "inclusive_percent": 0.85,
+          "self_percent": 0.0
+        }
+      }
+    },
+    {
+      "name": "final-read",
+      "binary_sha256": "c9a307011997aea784ad6b3b359fc2b9f30ef6b216cfa117473d6807955c3f8f",
+      "requests": 100000,
+      "frequency_hz": 99,
+      "samples": 1855,
+      "lost_samples": 0,
+      "stacks_sha256": "1a5cb177c28cee3fd9c25444105fe00d226093d3fa7cb58debcae3153d421268",
+      "symbols": {
+        "peer_transport": {
+          "inclusive_percent": 18.71,
+          "self_percent": 0.49
+        },
+        "log_executor": null,
+        "disk_statistics": null,
+        "apply_entries": null,
+        "state_write_batch": null,
+        "snapshot_build": null,
+        "snapshot_membership_decode": null
+      }
+    },
+    {
+      "name": "final-write",
+      "binary_sha256": "c9a307011997aea784ad6b3b359fc2b9f30ef6b216cfa117473d6807955c3f8f",
+      "requests": 10000,
+      "frequency_hz": 99,
+      "samples": 791,
+      "lost_samples": 0,
+      "stacks_sha256": "9c169bb936996f7debff939f0a0e276fb683b60fb43d96ed768189fe988ca710",
+      "symbols": {
+        "peer_transport": {
+          "inclusive_percent": 11.0,
+          "self_percent": 0.25
+        },
+        "log_executor": {
+          "inclusive_percent": 6.57,
+          "self_percent": 0.0
+        },
+        "disk_statistics": null,
+        "apply_entries": {
+          "inclusive_percent": 11.0,
+          "self_percent": 0.63
+        },
+        "state_write_batch": {
+          "inclusive_percent": 4.3,
+          "self_percent": 0.13
+        },
+        "snapshot_build": {
+          "inclusive_percent": 7.96,
+          "self_percent": 0.0
+        },
+        "snapshot_membership_decode": null
+      }
+    },
+    {
+      "name": "etcd-read",
+      "binary_sha256": "c9ebab003d59b120ca53730d8e5d4a22f3f554cbfdf058efb51dbcece9a020a4",
+      "requests": 100000,
+      "frequency_hz": 99,
+      "samples": 828,
+      "lost_samples": 0,
+      "stacks_sha256": "60a541591e9d5a19b2ff48ea470bb215cc1598b6af3bd41b51c7e7aab86a88a3",
+      "symbols": {
+        "peer_transport": null,
+        "log_executor": null,
+        "disk_statistics": null,
+        "apply_entries": null,
+        "state_write_batch": null,
+        "snapshot_build": null,
+        "snapshot_membership_decode": null
+      }
+    },
+    {
+      "name": "etcd-write",
+      "binary_sha256": "c9ebab003d59b120ca53730d8e5d4a22f3f554cbfdf058efb51dbcece9a020a4",
+      "requests": 10000,
+      "frequency_hz": 99,
+      "samples": 129,
+      "lost_samples": 0,
+      "stacks_sha256": "71e88f73cf84f38d344a05b30ee0996b30e225c1c38eec41714bcb43b5f305d0",
+      "symbols": {
+        "peer_transport": null,
+        "log_executor": null,
+        "disk_statistics": null,
+        "apply_entries": null,
+        "state_write_batch": null,
+        "snapshot_build": null,
+        "snapshot_membership_decode": null
+      }
+    }
+  ]
+}

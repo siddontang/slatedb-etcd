@@ -1,5 +1,7 @@
 # State performance
 
+See the [Linux CPU report](linux-cpu.md) for the later ReadIndex and apply changes.
+
 This report measures two changes against fixed binaries and etcd v3.6.5.
 Stage 1 replaces a full logical-state scan with incremental quota accounting.
 Stage 2 adds a 64 MiB weighted cache for immutable SST blocks and metadata.

@@ -62,7 +62,7 @@ def record(processes, output, frequency):
 
 
 def validate_profile(text):
-    samples = re.search(r"# Samples: ([0-9.]+[KMG]?) of event 'cpu-clock'", text)
+    samples = re.search(r"# Samples: ([0-9.]+[KMG]?)\s+of event 'cpu-clock'", text)
     lost = re.search(r"# Total Lost Samples: ([0-9]+)", text)
     symbols = re.findall(r"^\s+[0-9.]+%\s+\[\.\] ([^\n]+)", text, re.MULTILINE)
     if not samples or float(samples[1].rstrip("KMG")) <= 0:

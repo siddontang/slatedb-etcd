@@ -2,7 +2,8 @@
 
 Run these commands from the repository root.
 
-See the [measured results](../results/performance/README.md) for quota and state-cache comparisons.
+See the [Linux CPU report](../results/performance/linux-cpu.md) for ReadIndex and apply results.
+The [earlier report](../results/performance/README.md) covers quota and state-cache changes.
 
 ## Measure write latency
 

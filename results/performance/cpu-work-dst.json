@@ -1,0 +1,109 @@
+{
+  "created_at": "2026-11-18T01:01:23.404385+00:00",
+  "passed": true,
+  "replays_per_seed": 2,
+  "seeds": [
+    {
+      "seed": 1,
+      "trace": "<repo>/target/dst/seed-1.json",
+      "events": 4046,
+      "sha256": "d0e1c3f8d2eca30f561581e2491a59f82da87c310d76f745b0b4cc3a3fcc7e4c"
+    },
+    {
+      "seed": 2,
+      "trace": "<repo>/target/dst/seed-2.json",
+      "events": 4132,
+      "sha256": "0becb1ab4fd0f55b4dfd48bb6ec48bea54fd37d94e16d84f53d6414e338ba3bd"
+    },
+    {
+      "seed": 3,
+      "trace": "<repo>/target/dst/seed-3.json",
+      "events": 3999,
+      "sha256": "40b84651b8a03533d1e53417f162ea06f2f2db01a7c055df1dbb5ad3d3262b7e"
+    },
+    {
+      "seed": 4,
+      "trace": "<repo>/target/dst/seed-4.json",
+      "events": 4158,
+      "sha256": "cf7544f014e95c440f941dee3cf34166d8a3312e072e613e4d717e921d865132"
+    },
+    {
+      "seed": 5,
+      "trace": "<repo>/target/dst/seed-5.json",
+      "events": 4015,
+      "sha256": "9b47ef42c51d485244c3f518e5d9d52d5a3282545da694baf58d4e5225428991"
+    },
+    {
+      "seed": 6,
+      "trace": "<repo>/target/dst/seed-6.json",
+      "events": 4043,
+      "sha256": "155f244a55ecd4fbcb1a2d3c3179998e0266cadeda632a475ad6731e910a3069"
+    },
+    {
+      "seed": 7,
+      "trace": "<repo>/target/dst/seed-7.json",
+      "events": 3961,
+      "sha256": "fb74e3671605c8ab537f37677a37bf073c90c5615410b4ae2b58badd4b47572e"
+    },
+    {
+      "seed": 8,
+      "trace": "<repo>/target/dst/seed-8.json",
+      "events": 4062,
+      "sha256": "5433208ad9761605ef4c673b322e6e7cf2e66a2470c00abbb7e9fd1bdbd38f4f"
+    },
+    {
+      "seed": 9,
+      "trace": "<repo>/target/dst/seed-9.json",
+      "events": 4077,
+      "sha256": "f9a1b76c5fbc3b8d670d5b2bcb538dc5c23334cdf3076e2d3449863e605834a6"
+    },
+    {
+      "seed": 10,
+      "trace": "<repo>/target/dst/seed-10.json",
+      "events": 4081,
+      "sha256": "b177d3dc4c13955b0c8f4cd3d79b57349af5915720657e6f2378a97396caffdd"
+    },
+    {
+      "seed": 11,
+      "trace": "<repo>/target/dst/seed-11.json",
+      "events": 4078,
+      "sha256": "8e74d17957edd1bb53a8a783c968828b9a1b52571141d2dc5e0555d3a8fefe46"
+    },
+    {
+      "seed": 12,
+      "trace": "<repo>/target/dst/seed-12.json",
+      "events": 4002,
+      "sha256": "33febb412ce868a7476f954a3e6dd9881759591de5727c8f5821e3f02a0fa26c"
+    },
+    {
+      "seed": 13,
+      "trace": "<repo>/target/dst/seed-13.json",
+      "events": 4120,
+      "sha256": "2834761e83c031c79ea3b916446e59a61dae410faf51a3f8480e88d211c5016f"
+    },
+    {
+      "seed": 14,
+      "trace": "<repo>/target/dst/seed-14.json",
+      "events": 4074,
+      "sha256": "28495ff81a0aaff2f92c8cd15a4b8048f50667933d2613e0a6dd0b2689549970"
+    },
+    {
+      "seed": 15,
+      "trace": "<repo>/target/dst/seed-15.json",
+      "events": 4092,
+      "sha256": "1d8c8f82a9a2a20e2e3b4439f04154ef4465359f08c27d7d28b36a27e0d6a9ff"
+    },
+    {
+      "seed": 16,
+      "trace": "<repo>/target/dst/seed-16.json",
+      "events": 4017,
+      "sha256": "a891ccd7e3ebde324d99058528878b609d9235014b6f334d5d46f3c8b80b8385"
+    },
+    {
+      "seed": 42,
+      "trace": "<repo>/target/dst/seed-42.json",
+      "events": 3992,
+      "sha256": "761a33fa9bf7591a42d71931ecd5780049a5c658e89fd5372a838ad0b83141b7"
+    }
+  ]
+}

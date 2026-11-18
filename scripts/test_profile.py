@@ -34,6 +34,8 @@ class ProfileTests(unittest.TestCase):
     def test_missing_lost_or_unresolved_samples_fail(self):
         valid = "# Total Lost Samples: 0\n# Samples: 3K of event 'cpu-clock'\n 1.20% [.] server\n"
         self.assertEqual(profile.validate_profile(valid)["samples_display"], "3K")
+        self.assertEqual(profile.validate_profile(valid.replace("3K", "806 "))["samples_display"],
+                         "806")
         for text in ["", valid.replace("3K", "0"), valid.replace("server", "0x1234"),
                      valid.replace("Lost Samples: 0", "Lost Samples: 1")]:
             with self.assertRaises(RuntimeError):
