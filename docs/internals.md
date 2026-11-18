@@ -21,7 +21,8 @@ The node writes commit progress before applying entries. Commit-only updates nee
 This follows Raft's persistence rule, which requires stable entries, terms, and votes.
 
 The leader returns a computed result after quorum commit. Followers apply the same prefix.
-An ordinary Put can use the bounded preparation path in the [Raft design](architecture.md). Consecutive ordinary puts can share one SlateDB write.
+An ordinary Put can use the bounded preparation path in the [Raft design](architecture.md).
+Consecutive ordinary puts can share one SlateDB write.
 Each request retains its own etcd revision, Watch events, quota result, and response.
 The batch stores its final `meta/applied` marker with all mutations.
 The SlateDB sequence is that final Raft index. Even an empty Raft entry advances the apply marker.
