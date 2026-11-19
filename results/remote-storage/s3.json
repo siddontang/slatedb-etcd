@@ -1,6 +1,6 @@
 {
-  "created_at": "2026-11-17T20:09:10.248039+00:00",
-  "binary_sha256": "a8617f24ef908db0f2ab2f15fc39cd68c22f73b573b4a159097efbd7cad11804",
+  "created_at": "2026-11-19T04:04:14.575855+00:00",
+  "binary_sha256": "5539f529bb5b163f1e364b774305afca839d50c5c64289009b51fd3c6c9b0c8f",
   "reference_etcd": "3.6.5",
   "client": "go.etcd.io/etcd/client/v3 v3.6.5",
   "go": "go version go1.25.6 darwin/arm64",
@@ -20,37 +20,37 @@
     "./..."
   ],
   "profile": "supported-capabilities",
-  "log": "<repo>/tmp/test-results/s3-cleanup.jsonl",
+  "log": "<repo>/tmp/test-results/rustfs-recovery.jsonl",
   "tests": [
     {
       "name": "TestS3Recovery/delayed-put-keeps-raft-active",
       "result": "pass",
-      "seconds": 0.01
+      "seconds": 0.05
     },
     {
       "name": "TestS3Recovery/lost-put-response",
       "result": "pass",
-      "seconds": 0.19
+      "seconds": 0.33
     },
     {
       "name": "TestS3Recovery/outage-crash-and-recovery",
       "result": "pass",
-      "seconds": 1.95
+      "seconds": 1.91
     },
     {
       "name": "TestS3Recovery/read-outage-at-restart",
       "result": "pass",
-      "seconds": 0.05
+      "seconds": 0.11
     },
     {
       "name": "TestS3Recovery/snapshot-transfer-and-full-restart",
       "result": "pass",
-      "seconds": 1.29
+      "seconds": 1.51
     },
     {
       "name": "TestS3Recovery",
       "result": "pass",
-      "seconds": 5.55
+      "seconds": 5.44
     }
   ],
   "counts": {
@@ -62,8 +62,8 @@
   "passed": true,
   "complete": true,
   "object_store": {
-    "name": "MinIO",
-    "source_revision": "9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a",
-    "binary_sha256": "0facf6e53595d4842885ce0017afdf509eeb370496953418b9f5368a072e1c80"
+    "name": "RustFS",
+    "version": "1.0.6",
+    "binary_sha256": "80cb1c34190b1fcc60b4ca5fc8413f0dc11bd10b3fc40c8f2dd6c6eab585c198"
   }
 }
