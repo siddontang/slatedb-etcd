@@ -30,6 +30,7 @@ python3 scripts/check-upstream-go.py e2e --target service --require-complete
 | `e2e` | Both | All process tests, including failover, recovery, CLI, and mixed versions |
 | `proxy-e2e` | Both | Process tests with the upstream proxy build tag |
 | `robustness` | Both | The original exploratory and regression campaigns |
+| `examples` | Both | Each runnable upstream client example on a fresh three-member cluster |
 | `go-bench` | etcd | All 73 Go benchmark functions, including storage and client recipes |
 | `fuzz` | etcd | All three upstream fuzz targets, with a separate run for each target |
 
@@ -49,6 +50,8 @@ process fixture. Upstream tests, failpoints, workloads, assertions, and checkers
 Unsupported flags return an error. A skip stays visible in the report.
 The full workflow supplies etcd v3.5.20 for mixed-version tests and builds Go failpoints for etcd.
 Supply `--last-release PATH` or `--lazyfs PATH` to select existing binaries on a local host.
+The examples fixture changes the server endpoints. Each example retains its upstream assertion
+and runs in its own process. The fixture disables strict reconfiguration for membership examples.
 Use a disposable Linux host for full process campaigns. They stop members and mount filesystems.
 
 The service still has gaps in AutoTLS, Unix sockets, gRPC proxy mode, rolling etcd upgrades,
@@ -83,9 +86,10 @@ Use the [resource benchmark](../../docs/benchmarks.md) for process CPU and memor
 
 ## CI and results
 
-Pull requests run the full CLI smoke profile, the source coverage check, and four HashKV process
-cases with current members. The weekly and manual **Full etcd suites** workflow runs all Go suites
-and the one-member and three-member stress profiles. The heatmap runs on demand from the CLI.
+Pull requests run the full CLI smoke profile, the source coverage check, the client KV examples,
+and four HashKV process cases with current members.
+The weekly and manual **Full etcd suites** workflow runs all Go suites and load profiles
+on one and three members. The heatmap runs on demand from the CLI.
 CI stores the results as artifacts, including failures. Each process job requires zero skips.
 
 Go runs write compressed JSON events, stderr, and summary records under `tmp/upstream-results`.

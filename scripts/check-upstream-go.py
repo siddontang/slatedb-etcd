@@ -2,15 +2,17 @@
 """Run the original etcd Go suites from the pinned source tree."""
 
 import argparse
+from contextlib import ExitStack
 import gzip
 import json
+import os
 import re
 import shutil
 from pathlib import Path
 import subprocess
 import tempfile
 
-from upstream_source import ROOT, INVENTORY, build_tool, checked_source
+from upstream_source import ROOT, INVENTORY, build_tool, checked_source, start_cluster
 
 
 def service_overlay(source, directory):
@@ -65,7 +67,7 @@ def go_cases(source, suite, args):
         yield "tests", ["./" + suite]
 
 
-def run_go(command, cwd, log_path, selector, suite):
+def run_go(command, cwd, log_path, selector, suite, env=None):
     print(cwd.name, *command, flush=True)
     counts = {"pass": 0, "fail": 0, "skip": 0}
     samples = set()
@@ -73,7 +75,7 @@ def run_go(command, cwd, log_path, selector, suite):
     with gzip.open(log_path, "wt", compresslevel=1) as log, \
             log_path.with_suffix(".stderr").open("w") as errors, \
             subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE, stderr=errors,
-                             text=True, errors="replace") as process:
+                             text=True, errors="replace", env=env) as process:
         for line in process.stdout:
             log.write(line)
             event = json.loads(line)
@@ -117,10 +119,58 @@ def process_runs(source, module, flags, go_flags, binary_flags, directory, args)
         yield name, command, work
 
 
+def run_examples(source, args):
+    package = source / "tests/integration/clientv3/examples"
+    summary = args.output / f"{args.target}-examples-summary.jsonl"
+    summary.write_text("")
+    passed = True
+    with tempfile.TemporaryDirectory() as temp:
+        directory = Path(temp).resolve()
+        ctl = build_tool(source, directory, "etcdctl")
+        binary = (args.binary.resolve(strict=True) if args.target == "service"
+                  else build_tool(source, directory, "etcd"))
+        fixture = package / "main_test.go"
+        original = "return lazyCluster.EndpointsGRPC()"
+        text = fixture.read_text()
+        if text.count(original) != 1:
+            raise ValueError("Unexpected upstream client example fixture")
+        copy = directory / fixture.name
+        text = text.replace('import (', 'import (\n	"strings"', 1)
+        copy.write_text(text.replace(original, 'return strings.Split(os.Getenv("TEST_URLS"), ",")'))
+        overlay = directory / "overlay.json"
+        overlay.write_text(json.dumps({"Replace": {str(fixture): str(copy)}}))
+        executable = directory / "examples.test"
+        subprocess.run(["go", "test", "-c", "-overlay=" + str(overlay), "-o", executable, "."],
+                       cwd=package, check=True)
+        selector = args.run or "^Example"
+        listing = subprocess.check_output([executable, "-test.list=" + selector], cwd=package,
+                                          text=True)
+        names = [name for name in listing.splitlines() if re.fullmatch(r"Example\w*", name)]
+        if not names:
+            raise ValueError("No runnable client examples matched the selector")
+        for name in names:
+            # An example can change membership or call log.Fatal. Isolate both kinds of change.
+            with tempfile.TemporaryDirectory() as data, ExitStack() as stack:
+                endpoints = start_cluster(stack, Path(data), binary, args.target, 3, ctl, 1000,
+                                          2 * 1024**3, strict=False)
+                env = dict(os.environ, TEST_URLS=endpoints)
+                command = ["go", "tool", "test2json", "-t", executable, "-test.v=test2json",
+                           "-test.run=^" + name + "$", "-test.timeout=" + args.timeout]
+                log = args.output / f"{args.target}-{name}.jsonl.gz"
+                result = run_go(command, package, log, name, "examples", env)
+            result.update(target=args.target, suite="examples", case=name)
+            with summary.open("a") as output:
+                output.write(json.dumps(result) + "\n")
+            print(name, result, flush=True)
+            passed &= result["complete" if args.require_complete else "passed"]
+    return passed
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("suite", choices=["unit", "integration", "common", "e2e", "robustness",
-                                          "proxy-integration", "proxy-e2e", "go-bench", "fuzz"])
+                                          "proxy-integration", "proxy-e2e", "go-bench", "fuzz",
+                                          "examples"])
     parser.add_argument("--target", choices=["etcd", "service"], default="etcd")
     parser.add_argument("--source", type=Path, default=ROOT / "reference/etcd")
     parser.add_argument("--binary", type=Path, default=ROOT / "target/release/slatedb-etcd")
@@ -140,12 +190,14 @@ def main():
         parser.error("Shard index must be at least zero and less than the shard count")
     if args.shards != 1 and (not process_suite or args.run):
         parser.error("Shards apply to a complete process suite")
-    if args.target == "service" and not process_suite:
+    if args.target == "service" and not process_suite and args.suite != "examples":
         parser.error("This suite links the Go implementation. Use --target etcd.")
     if args.run and args.suite in ("go-bench", "fuzz"):
         parser.error("--run selects tests, not fuzz targets or benchmarks")
     source = checked_source(args.source)
     args.output.mkdir(parents=True, exist_ok=True)
+    if args.suite == "examples":
+        raise SystemExit(not run_examples(source, args))
     summary = args.output / f"{args.target}-{args.suite}-{args.shard_index}-summary.jsonl"
     summary.write_text("")
     passed = True

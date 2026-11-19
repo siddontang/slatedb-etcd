@@ -81,7 +81,13 @@ jobs:
           sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3
           echo user_allow_other | sudo tee -a /etc/fuse.conf
           make install-lazyfs
+      - name: Run client examples on fresh clusters
+        if: matrix.suite == 'common' && matrix.shard == 0
+        run: |
+          python3 scripts/check-upstream-go.py examples --target "${{ matrix.target }}" \
+            --require-complete --timeout 2m
       - name: Run the process tests
+        if: ${{ !cancelled() }}
         run: |
           python3 scripts/check-upstream-go.py "${{ matrix.suite }}" --target "${{ matrix.target }}" \
             --shards 2 --shard-index "${{ matrix.shard }}" --timeout 20m --require-complete

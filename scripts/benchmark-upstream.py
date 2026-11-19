@@ -8,12 +8,10 @@ from fractions import Fraction
 import json
 from pathlib import Path
 import re
-import socket
 import subprocess
 import tempfile
-import time
 
-from upstream_source import ROOT, INVENTORY, build_tool, checked_source
+from upstream_source import ROOT, INVENTORY, build_tool, checked_source, start_cluster
 
 
 @dataclass(frozen=True)
@@ -95,6 +93,8 @@ def parse_report(text, expected):
         expected = totals
     else:
         blocks = re.split(r"(?m)^Summary:\s*$", text)[1:]
+        if not blocks and "Error distribution:" in text:
+            blocks = [text]
         reports = [section(block) for block in blocks]
         complete = True
     complete &= len(expected) == len(reports) and all(
@@ -102,54 +102,6 @@ def parse_report(text, expected):
         for r, n in zip(reports, expected))
     return {"sections": reports, "mixed_attempts": totals,
             "passed": complete and "Error distribution:" not in text}
-
-
-def stop(process):
-    if process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-
-
-def start_cluster(stack, directory, executable, target, members, ctl, snapshot, quota):
-    with ExitStack() as reservations:
-        ports = []
-        for _ in range(2 * members):
-            sock = reservations.enter_context(socket.socket())
-            sock.bind(("127.0.0.1", 0))
-            ports.append(f"127.0.0.1:{sock.getsockname()[1]}")
-    clients, peers = ports[:members], ports[members:]
-    cluster = ",".join(f"m{i}=http://{addr}" for i, addr in enumerate(peers))
-    processes = []
-    for i, (client, peer) in enumerate(zip(clients, peers)):
-        data = directory / f"data-{i}"
-        if target == "etcd":
-            argv = ["--name", f"m{i}", "--data-dir", data, "--listen-client-urls", "http://"+client,
-                    "--advertise-client-urls", "http://"+client, "--listen-peer-urls", "http://"+peer,
-                    "--initial-advertise-peer-urls", "http://"+peer, "--initial-cluster", cluster,
-                    "--snapshot-count", str(snapshot), "--log-level", "error"]
-        else:
-            argv = ["--id", str(i+1), "--dir", data, "--listen", client, "--peer-listen", peer,
-                    "--snapshot-every", str(snapshot)]
-            for j in range(members):
-                argv.extend(["--peer", f"{j+1}={peers[j]}", "--client-peer", f"{j+1}={clients[j]}"])
-        argv.extend(["--quota-backend-bytes", str(quota)])
-        log = stack.enter_context((directory / f"member-{i}.log").open("w"))
-        process = subprocess.Popen([executable, *argv], stdout=log, stderr=log)
-        stack.callback(stop, process)
-        processes.append(process)
-    endpoints = ",".join(clients)
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline and all(p.poll() is None for p in processes):
-        check = subprocess.run([ctl, "--endpoints", endpoints, "--command-timeout=1s", "endpoint",
-                                "health"], capture_output=True, timeout=10)
-        if check.returncode == 0:
-            return endpoints
-        time.sleep(0.1)
-    raise RuntimeError("Cluster did not become healthy")
 
 
 def run_case(case, target, args, tools, source_revision, repeat):

@@ -47,6 +47,16 @@ class BenchResults(unittest.TestCase):
         for output in ("", "Error distribution:\n  [8]\tfailure\n", SECTION):
             self.assertFalse(bench.parse_report(output, (16,))["passed"])
 
+    def test_all_failed_reads_keep_the_error(self):
+        report = ("Total Read Ops: 8\nError distribution:\n  [8]\trpc error\n"
+                  "Total Write Ops: 8\n" + SECTION)
+        result = bench.parse_report(report, ("mixed", 16))
+        self.assertFalse(result["passed"])
+        reads, writes = result["sections"]
+        self.assertEqual((reads["operation"], reads["successes"], reads["errors"][0]["count"]),
+                         ("Read", 0, 8))
+        self.assertEqual(writes["successes"], 8)
+
     def test_heatmap_unique_cells(self):
         cells = list(bench.heatmap_cases())
         self.assertEqual(len({c.name for c in cells}), 392)
