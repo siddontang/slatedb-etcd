@@ -130,7 +130,11 @@ impl Sample {
         for (name, label, value) in [
             ("etcd_server_id", "server_id", local.as_str()),
             ("etcd_cluster_version", "cluster_version", "3.6"),
-            ("etcd_server_version", "server_version", "3.6.5"),
+            (
+                "etcd_server_version",
+                "server_version",
+                crate::ETCD_API_VERSION,
+            ),
         ] {
             append(
                 families,

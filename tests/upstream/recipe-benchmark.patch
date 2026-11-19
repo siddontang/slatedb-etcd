@@ -1,0 +1,48 @@
+--- a/client/pkg/testutil/leak.go
++++ b/client/pkg/testutil/leak.go
+@@ -136,0 +137,8 @@
++		// The main test goroutine waits for the active benchmark.
++		if (strings.HasPrefix(stack, "testing.(*B).run1(") ||
++			strings.HasPrefix(stack, "testing.(*B).doBench(")) &&
++			strings.Contains(stack, "\ntesting.runBenchmarks(") &&
++			strings.Contains(stack, "\ntesting.(*M).Run(") {
++			continue
++		}
++
+--- a/tests/integration/clientv3/experimental/recipes/v3_queue_test.go
++++ b/tests/integration/clientv3/experimental/recipes/v3_queue_test.go
+@@ -85,3 +85,2 @@
+-	// XXX switch tests to use TB interface
+-	clus := integration2.NewCluster(nil, &integration2.ClusterConfig{Size: 3})
+-	defer clus.Terminate(nil)
++	clus := integration2.NewCluster(b, &integration2.ClusterConfig{Size: 3})
++	defer clus.Terminate(b)
+@@ -89 +88 @@
+-		testQueueNReaderMWriter(nil, manyQueueClients, manyQueueClients)
++		testReadersWriters(b, newQueues(clus, manyQueueClients), newQueues(clus, manyQueueClients))
+@@ -142,3 +141,2 @@
+-	// XXX switch tests to use TB interface
+-	clus := integration2.NewCluster(nil, &integration2.ClusterConfig{Size: 3})
+-	defer clus.Terminate(nil)
++	clus := integration2.NewCluster(b, &integration2.ClusterConfig{Size: 3})
++	defer clus.Terminate(b)
+@@ -148 +146 @@
+-		testReadersWriters(nil, rqs, wqs)
++		testReadersWriters(b, rqs, wqs)
+@@ -176 +174 @@
+-func testReadersWriters(t *testing.T, rqs []testQueue, wqs []testQueue) {
++func testReadersWriters(t testing.TB, rqs []testQueue, wqs []testQueue) {
+--- a/tests/integration/clientv3/experimental/recipes/v3_lock_test.go
++++ b/tests/integration/clientv3/experimental/recipes/v3_lock_test.go
+@@ -57 +57 @@
+-func testMutexLock(t *testing.T, waiters int, chooseClient func() *clientv3.Client) {
++func testMutexLock(t testing.TB, waiters int, chooseClient func() *clientv3.Client) {
+@@ -302,3 +302,2 @@
+-	// XXX switch tests to use TB interface
+-	clus := integration2.NewCluster(nil, &integration2.ClusterConfig{Size: 3})
+-	defer clus.Terminate(nil)
++	clus := integration2.NewCluster(b, &integration2.ClusterConfig{Size: 3})
++	defer clus.Terminate(b)
+@@ -306 +305 @@
+-		testMutexLock(nil, 4, func() *clientv3.Client { return clus.RandClient() })
++		testMutexLock(b, 4, func() *clientv3.Client { return clus.RandClient() })

@@ -1,0 +1,52 @@
+--- a/tests/framework/e2e/cluster.go
++++ b/tests/framework/e2e/cluster.go
+@@ -528,0 +529,6 @@
++		if etcdCfgs[i].ExecPath == BinPath.Etcd {
++			for _, member := range etcdCfgs {
++				etcdCfgs[i].Args = append(etcdCfgs[i].Args,
++					"--fixture-client="+member.Name+"="+member.ClientURL)
++			}
++		}
+--- a/tests/framework/e2e/etcd_process.go
++++ b/tests/framework/e2e/etcd_process.go
+@@ -31,0 +32,2 @@
++	grpchealth "google.golang.org/grpc/health/grpc_health_v1"
++	clientv3 "go.etcd.io/etcd/client/v3"
+@@ -41 +41 @@
+-var EtcdServerReadyLines = []string{"ready to serve client requests"}
++var EtcdServerReadyLines = []string{"Node started", "ready to serve client requests"}
+@@ -262,0 +265,34 @@
++	if ep.cfg.ExecPath == BinPath.Etcd {
++		ready, cancel := context.WithTimeout(ctx, 20*time.Second)
++		defer cancel()
++		flags := ep.Etcdctl().flags()
++		cfg, err := clientv3.NewClientConfig(&clientv3.ConfigSpec{
++			Endpoints: ep.EndpointsGRPC(),
++			Secure: &clientv3.SecureConfig{
++				Cert: flags["cert"], Key: flags["key"], Cacert: flags["cacert"],
++				InsecureTransport: ep.cfg.Client.ConnectionType != ClientTLS,
++				InsecureSkipVerify: flags["insecure-skip-tls-verify"] == "true",
++			},
++		}, ep.cfg.lg)
++		if err != nil {
++			return err
++		}
++		cfg.Context = ready
++		client, err := clientv3.New(*cfg)
++		if err != nil {
++			return err
++		}
++		defer client.Close()
++		probe := grpchealth.NewHealthClient(client.ActiveConnection())
++		for {
++			state, err := probe.Check(ready, &grpchealth.HealthCheckRequest{})
++			if err == nil && state.Status == grpchealth.HealthCheckResponse_SERVING {
++				break
++			}
++			select {
++			case <-ready.Done():
++				return fmt.Errorf("gRPC health check: %w", ready.Err())
++			case <-time.After(100 * time.Millisecond):
++			}
++		}
++	}

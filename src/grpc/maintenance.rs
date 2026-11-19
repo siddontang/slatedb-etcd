@@ -140,7 +140,7 @@ impl maintenance_server::Maintenance for Service {
                         header: response.header,
                         remaining_bytes: remaining as u64,
                         blob: chunk.to_vec(),
-                        version: "3.6.5".into(),
+                        version: crate::ETCD_API_VERSION.into(),
                     }))
                     .await
                     .is_err()

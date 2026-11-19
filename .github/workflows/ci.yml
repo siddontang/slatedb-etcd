@@ -102,6 +102,31 @@ jobs:
           scripts/cargo.sh test --locked -- --skip seeded_fault_schedules_replay_identically
           python3 scripts/check-dst.py --seeds "$SLATEDB_DST_SEEDS" --output results/ci/dst.json
           scripts/cargo.sh build --locked --release
+      - name: Check out the upstream etcd test source
+        uses: actions/checkout@v4
+        with:
+          repository: etcd-io/etcd
+          ref: a0614505aff9b8ff469e9c59c2d979a5936d13f4
+          path: reference/etcd
+          persist-credentials: false
+      - name: Run the official etcd benchmarks and process tests
+        run: |
+          python3 scripts/test_upstream.py
+          python3 scripts/check-upstream-go.py go-bench --require-complete \
+            --package tests/integration/clientv3/experimental/recipes --output results/ci/upstream-go
+          python3 scripts/benchmark-upstream.py --output results/ci/upstream-bench
+          python3 scripts/check-upstream-go.py e2e --target service --require-complete \
+            --run '^TestVerifyHashKVAfterCompact$/current-version' --output results/ci/upstream-go
+          python3 scripts/check-upstream-go.py common --target service --require-complete \
+            --run '^TestAuth(RevisionConsistency|TestCacheReload)$' --output results/ci/upstream-go
+          python3 scripts/check-upstream-go.py examples --target service --require-complete \
+            --timeout 2m --output results/ci/upstream-go
+      - name: Save the upstream results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-smoke
+          path: results/ci/upstream-*
       - name: Check etcd compatibility and recovery
         run: |
           python3 scripts/check-compat.py --output results/ci/etcd-compatibility.json

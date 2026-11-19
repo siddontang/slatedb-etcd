@@ -1,5 +1,7 @@
 # Local benchmark guide
 
+[Run all official etcd benchmarks](../tests/upstream/run-suites.md#official-benchmark-cli).
+
 Run these commands from the repository root.
 
 See the [quorum Put report](../results/performance/quorum-put/README.md) for slow-leader latency,

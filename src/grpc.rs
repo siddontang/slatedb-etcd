@@ -21,9 +21,12 @@ use crate::proto::etcdserverpb::request_op::Request as Op;
 use crate::proto::etcdserverpb::response_op::Response as Resp;
 use crate::proto::etcdserverpb::*;
 
+pub const DEFAULT_WATCH_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
+
 #[derive(Clone)]
 pub struct Service {
     events: mpsc::Sender<Event>,
+    watch_progress_interval: Duration,
     forwarding: std::sync::Arc<forwarding::Forwarding>,
     member: u64,
     tokens: crate::auth::TokenIssuer,
@@ -36,7 +39,25 @@ pub fn service(
     tokens: crate::auth::TokenIssuer,
     transport: crate::tls::Transport,
 ) -> anyhow::Result<axum::Router> {
-    let service = Service::new(member, events, peers, tokens, transport)?;
+    service_with_watch_interval(
+        member,
+        events,
+        peers,
+        tokens,
+        transport,
+        DEFAULT_WATCH_PROGRESS_INTERVAL,
+    )
+}
+
+pub(crate) fn service_with_watch_interval(
+    member: u64,
+    events: mpsc::Sender<Event>,
+    peers: &BTreeMap<u64, String>,
+    tokens: crate::auth::TokenIssuer,
+    transport: crate::tls::Transport,
+    interval: Duration,
+) -> anyhow::Result<axum::Router> {
+    let service = Service::new(member, events, peers, tokens, transport, interval)?;
     Ok(axum::Router::new()
         .route_service(
             "/etcdserverpb.Cluster/{*method}",
@@ -78,9 +99,15 @@ impl Service {
         peers: &BTreeMap<u64, String>,
         tokens: crate::auth::TokenIssuer,
         transport: crate::tls::Transport,
+        interval: Duration,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             events,
+            watch_progress_interval: if interval.is_zero() {
+                DEFAULT_WATCH_PROGRESS_INTERVAL
+            } else {
+                interval.max(Duration::from_millis(100))
+            },
             forwarding: std::sync::Arc::new(forwarding::Forwarding::new(peers, transport)?),
             member,
             tokens,

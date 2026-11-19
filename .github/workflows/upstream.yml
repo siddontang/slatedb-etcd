@@ -1,0 +1,182 @@
+name: Full etcd suites
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 0'
+
+permissions:
+  contents: read
+
+jobs:
+  reference:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [unit, integration, proxy-integration, go-bench, fuzz]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: etcd-io/etcd
+          ref: a0614505aff9b8ff469e9c59c2d979a5936d13f4
+          path: reference/etcd
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: reference/etcd/tests/go.sum
+      - run: make -C reference/etcd build
+      - run: python3 scripts/check-upstream-go.py "${{ matrix.suite }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reference-${{ matrix.suite }}
+          path: tmp/upstream-results
+
+  distribution:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [alerts, images, assets]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: etcd-io/etcd
+          ref: a0614505aff9b8ff469e9c59c2d979a5936d13f4
+          persist-credentials: false
+      - name: Test the upstream Prometheus alert rules
+        if: matrix.suite == 'alerts'
+        working-directory: contrib/mixin
+        run: |
+          sudo apt-get update && sudo apt-get install -y jsonnet prometheus
+          mkdir -p manifests
+          jsonnet -e "(import 'mixin.libsonnet').prometheusAlerts" > manifests/etcd-prometheusRules.yaml
+          promtool test rules test.yaml
+      - name: Test the upstream release images
+        if: matrix.suite == 'images'
+        env:
+          VERSION: 3.6.5
+          REPOSITORY: gcr.io/etcd-development/etcd
+        run: |
+          for arch in amd64 arm64 ppc64le s390x; do
+            docker pull --platform "linux/$arch" "$REPOSITORY:v$VERSION-$arch"
+          done
+          ./scripts/test_images.sh
+      - name: Verify the release archives on both mirrors
+        if: matrix.suite == 'assets'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir github-assets google-assets
+          cd github-assets
+          gh release download v3.6.5 --repo etcd-io/etcd
+          test "$(wc -l <SHA256SUMS)" -eq "$(find . -name 'etcd-*' | wc -l)"
+          sha256sum -c SHA256SUMS
+          for file in *; do
+            curl -fsSL --retry 3 -o "../google-assets/$file" \
+              "https://storage.googleapis.com/etcd/v3.6.5/$file"
+          done
+          cd ../google-assets
+          test "$(wc -l <SHA256SUMS)" -eq "$(find . -name 'etcd-*' | wc -l)"
+          sha256sum -c SHA256SUMS
+
+  process:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 320
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [service, etcd]
+        suite: [common, e2e, proxy-e2e, robustness]
+        shard: [0, 1]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: etcd-io/etcd
+          ref: a0614505aff9b8ff469e9c59c2d979a5936d13f4
+          path: reference/etcd
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: reference/etcd/tests/go.sum
+      - name: Build the Rust service
+        if: matrix.target == 'service'
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          cargo build --release --locked --features fault-injection
+      - name: Build the reference process with Go failpoints
+        if: matrix.target == 'etcd'
+        working-directory: reference/etcd
+        run: |
+          make gofail-enable
+          make build
+          make gofail-disable
+      - name: Install the previous etcd minor for mixed-version cases
+        working-directory: reference/etcd
+        run: |
+          mkdir -p bin
+          file=etcd-v3.5.20-linux-amd64.tar.gz
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$file" \
+            "https://github.com/etcd-io/etcd/releases/download/v3.5.20/$file"
+          sum=9ac85616fb8c0e45f485074dde0258ca2b7b42f1dd5320821af5a8b66daf7072
+          echo "$sum  $RUNNER_TEMP/$file" | sha256sum -c -
+          tar -xOf "$RUNNER_TEMP/$file" etcd-v3.5.20-linux-amd64/etcd > bin/etcd-last-release
+          chmod +x bin/etcd-last-release
+      - name: Install the upstream disk fault fixture
+        if: matrix.suite == 'robustness' || matrix.suite == 'e2e'
+        working-directory: reference/etcd
+        run: |
+          sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3
+          echo user_allow_other | sudo tee -a /etc/fuse.conf
+          make install-lazyfs
+      - name: Run client examples on fresh clusters
+        if: matrix.suite == 'common' && matrix.shard == 0
+        run: |
+          python3 scripts/check-upstream-go.py examples --target "${{ matrix.target }}" \
+            --require-complete --timeout 2m
+      - name: Run the process tests
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/check-upstream-go.py "${{ matrix.suite }}" --target "${{ matrix.target }}" \
+            --shards 2 --shard-index "${{ matrix.shard }}" --timeout 20m --require-complete
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: process-${{ matrix.target }}-${{ matrix.suite }}-${{ matrix.shard }}
+          path: tmp/upstream-results
+
+  load:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        members: [1, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: etcd-io/etcd
+          ref: a0614505aff9b8ff469e9c59c2d979a5936d13f4
+          path: reference/etcd
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: reference/etcd/tests/go.sum
+      - run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          cargo build --release --locked
+      - run: python3 scripts/benchmark-upstream.py --profile stress --members ${{ matrix.members }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: load-${{ matrix.members }}
+          path: tmp/upstream-benchmarks

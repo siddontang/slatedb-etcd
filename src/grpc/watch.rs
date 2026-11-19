@@ -95,7 +95,7 @@ impl Service {
             if !had_events
                 && watcher.request.start_revision == page.header.as_ref().unwrap().revision + 1
                 && watcher.request.progress_notify
-                && watcher.progress.elapsed() >= Duration::from_secs(10)
+                && watcher.progress.elapsed() >= self.watch_progress_interval
             {
                 send(
                     tx,

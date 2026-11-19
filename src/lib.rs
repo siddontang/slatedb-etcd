@@ -26,6 +26,9 @@ pub mod write_profile;
 
 use serde::{Deserialize, Serialize};
 
+/// The etcd API version this service advertises to clients.
+pub const ETCD_API_VERSION: &str = "3.6.5";
+
 pub(crate) const STORAGE_FORMAT: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

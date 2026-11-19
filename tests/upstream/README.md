@@ -9,6 +9,8 @@ It includes fuzz tests, benchmarks, examples, and `TestMain` entry points. It ex
 Each entry has its source file, line, family, and integration status.
 The index is an audit record. It does not mean that 1,771 tests passed against this service.
 
+[Run the complete Go suites and official benchmarks](run-suites.md).
+
 ## Integration map
 
 | Source family | Integration in this project |
@@ -19,7 +21,7 @@ The index is an audit record. It does not mean that 1,771 tests passed against t
 | `tests/robustness` | Use the original recorder, model, and Porcupine checker. |
 | Server and client unit tests | Keep source references; use Rust tests for storage invariants. |
 | Validation fuzz tests | Add an API sequence fuzzer with real etcd as the reference. |
-| Benchmarks and examples | Index them; keep performance and correctness results separate. |
+| Benchmarks and examples | Run the official CLI, Go benchmarks, and Go examples. |
 | Jepsen register and append | Check real fault histories with Knossos and Elle. |
 | Antithesis | Use its invariant approach in local DST; no hosted Antithesis run is claimed. |
 
