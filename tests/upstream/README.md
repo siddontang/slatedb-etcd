@@ -107,7 +107,7 @@ The normalization control test protects this adapter rule.
 
 ## Jepsen scope
 
-The project uses Jepsen 0.3.11, Knossos 0.3.15, and Elle 0.2.6.
+The project uses Jepsen 0.3.15, Knossos 0.3.16, and Elle 0.2.8.
 The Go driver records histories from real processes during real faults.
 Jepsen checks register histories. Elle checks append transactions for strict serializability.
 Append transactions use revision guards for both keys. Failed guards count as failed transactions.
