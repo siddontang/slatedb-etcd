@@ -88,7 +88,7 @@ sync
             code = result.returncode
             if args.output.exists():
                 report = json.loads(args.output.read_text())
-            report.update(guest_kernels=kernels, physical_hosts=1, s3_fixture="MinIO", guest_count=3)
+            report.update(guest_kernels=kernels, physical_hosts=1, guest_count=3)
     finally:
         cleanup = []
         for name in owned:

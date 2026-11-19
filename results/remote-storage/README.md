@@ -2,6 +2,7 @@
 
 These reports retain successful local runs from the remote storage milestone.
 Each report records binary hashes, trace hashes, or a precise source pin where applicable.
+These historical S3 reports used MinIO. Current local S3 tests use RustFS.
 The current CI workflow reruns portable checks on every pull request.
 
 | Report | Scope |

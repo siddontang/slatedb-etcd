@@ -18,6 +18,7 @@ import time
 import urllib.request
 
 from reporting import write_report
+from rustfs_fixture import local_rustfs
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -151,7 +152,8 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
                         command += ["--peer", f"{j+1}={peers[j]}", "--client-peer", f"{j+1}={clients[j]}"]
                 log = open(root / f"node{i+1}.log", "w")
                 logs.append(log)
-                processes.append(subprocess.Popen(command, stdout=log, stderr=log))
+                env = getattr(args, "service_env", None) if kind != "etcd" else None
+                processes.append(subprocess.Popen(command, stdout=log, stderr=log, env=env))
             log = open(root / "client.log", "w")
             logs.append(log)
             result_path = root / "sample.json"
@@ -260,6 +262,7 @@ def main():
     parser.add_argument("--baseline-concurrency", type=int, nargs="+",
                         help="Restrict baseline cases to these selected concurrency levels")
     parser.add_argument("--backends", nargs="+", choices=["baseline", "service", "etcd"])
+    parser.add_argument("--rustfs", action="store_true", help="Start a local RustFS test server")
     parser.add_argument("--s3-bucket")
     parser.add_argument("--s3-endpoint")
     parser.add_argument("--s3-allow-http", action="store_true")
@@ -290,6 +293,21 @@ def main():
     if args.baseline_concurrency is not None and (
             "baseline" not in kinds or not set(args.baseline_concurrency) <= set(args.concurrency)):
         parser.error("Baseline concurrency must select measured levels and requires a baseline")
+    if args.rustfs and (args.s3_bucket or args.s3_endpoint or args.s3_allow_http):
+        parser.error("--rustfs supplies its own bucket, endpoint, and HTTP settings")
+    if args.rustfs and kinds == ["etcd"]:
+        parser.error("--rustfs requires a service or baseline backend")
+    with local_rustfs() if args.rustfs else nullcontext() as fixture:
+        store = None
+        if fixture:
+            args.service_env, store = fixture
+            args.s3_bucket = args.service_env["SLATEDB_S3_TEST_BUCKET"]
+            args.s3_endpoint = args.service_env["SLATEDB_S3_TEST_ENDPOINT"]
+            args.s3_allow_http = True
+        benchmark(args, kinds, store)
+
+
+def benchmark(args, kinds, store):
     cases = workload_cases(kinds, args.concurrency, args.read_percent, args.baseline_concurrency)
     expected = len(cases)*args.repeat
     report = {"schema_version": 2, "passed": False, "complete": False, "samples": [],
@@ -306,6 +324,8 @@ def main():
               "resource_phases": "CPU deltas and peak RSS cover only the measured phase; retained preload memory remains",
               "limits": "bounded concurrency; warm keys; host page cache is not cleared; RSS is not unique physical memory; "
                         "ps CPU precision and controller barriers affect short samples; no capacity or cross-AZ claim"}
+    if store:
+        report["object_store"] = store
     report["host_memory_bytes"] = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     if platform.system() == "Darwin":
         report["cpu_model"] = subprocess.check_output(
