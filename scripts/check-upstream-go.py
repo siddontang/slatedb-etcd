@@ -50,7 +50,7 @@ def go_cases(source, suite, args):
                 children = {Path(row["file"]).parent for row in tests
                             if row["file"].startswith("tests/robustness/")}
                 children.discard(Path("tests/robustness"))
-                yield "tests", ["./common", "./framework/...",
+                yield "tests", ["./framework/...",
                                 *["./" + str(p.relative_to("tests")) for p in sorted(children)]]
             else:
                 yield str(module.relative_to(source)), ["./..."]
