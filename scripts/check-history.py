@@ -10,6 +10,7 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 SIGN_OFF = b"Signed-off-by: siddontang <siddontang@gmail.com>"
 PUBLIC_EMAIL = re.compile(rb"(?:[\w.+-]+@users\.noreply\.github\.com|noreply@github\.com)\Z")
+SIGN_OFF_LINE = re.compile(rb"Signed-off-by: [^<>\n]+ <([^<>\s]+)>")
 EMAIL = re.compile(rb"[\w.+%-]+@[\w.-]+\.[A-Za-z]{2,}")
 HOME = re.compile(rb"(?<![\w./<>-])/(?:Users|home)/([^/\s\"'<>]+)")
 TEMP = re.compile(rb"/(?:private/)?var/folders/[^/\s]+/[^/\s]+")
@@ -34,16 +35,36 @@ def path_errors(data, name=""):
     return sorted(set(errors))
 
 
+def sign_off_error(trailers, lines, author):
+    """Accept the owner sign-off, or one sign-off by the author with a GitHub public email.
+
+    The owner records approval of contributed commits with a signed-off merge commit.
+    """
+    if SIGN_OFF in trailers or SIGN_OFF in lines:
+        if trailers.count(SIGN_OFF) != 1 or lines.count(SIGN_OFF) != 1:
+            return "missing or repeated owner sign-off"
+        return None
+    sign_offs = [line for line in trailers if line.startswith(b"Signed-off-by:")]
+    match = SIGN_OFF_LINE.fullmatch(sign_offs[0]) if len(sign_offs) == 1 else None
+    if (match is None or lines.count(sign_offs[0]) != 1 or author is None
+            or PUBLIC_EMAIL.fullmatch(match[1]) is None or match[1] != author):
+        return "missing owner sign-off or author sign-off with a GitHub public email"
+    return None
+
+
 def commit_errors(root, raw):
     headers, message = raw.split(b"\n\n", 1)
     errors = path_errors(message)
+    emails = {}
     for field in (b"author", b"committer"):
         match = re.search(rb"(?m)^" + field + rb" .* <([^<>]+)> ", headers)
+        emails[field] = match[1] if match else None
         if match is None or PUBLIC_EMAIL.fullmatch(match[1]) is None:
             errors.append(field.decode() + " must use a GitHub public email")
     trailers = git(root, "interpret-trailers", "--parse", data=message).splitlines()
-    if trailers.count(SIGN_OFF) != 1 or message.splitlines().count(SIGN_OFF) != 1:
-        errors.append("missing or repeated owner sign-off")
+    error = sign_off_error(trailers, message.splitlines(), emails[b"author"])
+    if error:
+        errors.append(error)
     remaining = b"\n".join(line for line in message.splitlines() if line != SIGN_OFF)
     if any(PUBLIC_EMAIL.fullmatch(address) is None for address in EMAIL.findall(remaining)):
         errors.append("personal email outside the owner sign-off")

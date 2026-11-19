@@ -26,6 +26,7 @@ New repository checks and report normalization are separate changes at the branc
 
 Gitleaks 8.30.1 checks current publication files, all fetched history, and commit and tag messages.
 The metadata check also inspects author fields, sign-offs, deleted blobs, and annotated tags.
+It accepts the owner sign-off, or one author sign-off with the author's GitHub public email.
 Negative controls reject new private keys, missing sign-offs, private authors, and deleted paths.
 No deployment credential was identified in the audited source, reports, or downloaded Actions logs.
 
