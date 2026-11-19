@@ -71,7 +71,7 @@ For example, use `--watch-progress-notify-interval=200ms` for the upstream clien
 
 | Flag | Default | Meaning |
 | --- | ---: | --- |
-| `--snapshot-every` | 1000 | Applied entries between checkpoint opportunities; zero disables it. |
+| `--snapshot-every` | 10000 | Applied entries between checkpoint opportunities; zero disables it. |
 | `--quota-backend-bytes` | 0 | Zero selects 2 GiB. A negative value disables the quota. |
 | `--log-cache-bytes` | 8388608 | Cache budget for log entries. |
 | `--log-pending-bytes` | 33554432 | Pending entry budget, including unapplied entries. |

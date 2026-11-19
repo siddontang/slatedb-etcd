@@ -82,7 +82,7 @@ struct Args {
     #[arg(long, default_value = "slatedb-raft-poc")]
     cluster_id: String,
     /// Zero disables automatic snapshots. The checkpoint endpoint remains available.
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, default_value_t = 10_000)]
     snapshot_every: u64,
     /// Interval between idle Watch progress responses. Positive values have a 100 ms minimum.
     #[arg(long, alias = "experimental-watch-progress-notify-interval", default_value = "10s",
