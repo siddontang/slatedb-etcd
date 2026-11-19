@@ -227,49 +227,53 @@ impl StateMachine {
                 "mvcc: required revision is a future revision",
             ));
         }
-        // etcd excludes obsolete records below the compaction boundary at the requested revision.
-        let mut latest = std::collections::BTreeMap::new();
-        let mut scan = self
-            .db
-            .scan_prefix(HASH, ..)
-            .await
-            .map_err(KvError::storage)?;
-        while let Some(row) = scan.next().await.map_err(KvError::storage)? {
-            let key = &row.key[HASH.len()..];
-            let main = i64::from_be_bytes(key[..8].try_into().map_err(KvError::storage)?);
-            if main > revision {
-                break;
-            }
-            let kv = crate::proto::mvccpb::KeyValue::decode(row.value.clone())
-                .map_err(KvError::storage)?;
-            if key.len() == 18 {
-                latest.remove(&kv.key);
-            } else {
-                latest.insert(kv.key, key.to_vec());
+        let mut latest = std::collections::HashMap::new();
+        if self.compact_revision >= 0 {
+            let mut scan = hash_rows(&self.db, revision).await?;
+            while let Some(row) = scan.next().await.map_err(KvError::storage)? {
+                let kv = HashUserKey::decode(row.value).map_err(KvError::storage)?;
+                if row.key.len() == HASH.len() + 18 {
+                    latest.remove(&kv.key);
+                } else {
+                    latest.insert(kv.key, row.key[HASH.len()..].to_vec());
+                }
             }
         }
-        let keep: std::collections::BTreeSet<_> = latest.into_values().collect();
-        let mut hash = crc32c::crc32c(b"key");
-        let mut rows = self
-            .db
-            .scan_prefix(HASH, ..)
+        let keep = latest
+            .into_values()
+            .collect::<std::collections::HashSet<_>>();
+        self.hash_retained(revision, |row| keep.contains(&row[HASH.len()..]))
             .await
-            .map_err(KvError::storage)?;
+    }
+
+    pub(super) async fn hash_retained(
+        &self,
+        revision: i64,
+        retained: impl Fn(&[u8]) -> bool,
+    ) -> std::result::Result<Value, KvError> {
+        let mut hash = crc32c::crc32c(b"key");
+        // etcd includes obsolete records when the retention set is empty.
+        let mut empty_hash = Some(hash).filter(|_| self.compact_revision >= 0);
+        let mut rows = hash_rows(&self.db, revision).await?;
         while let Some(row) = rows.next().await.map_err(KvError::storage)? {
             let key = &row.key[HASH.len()..];
             let main = i64::from_be_bytes(key[..8].try_into().map_err(KvError::storage)?);
-            if main > revision {
-                break;
-            }
-            if main <= self.compact_revision && !keep.is_empty() && !keep.contains(key) {
+            let tombstone = key.len() == 18;
+            if main == self.compact_revision && tombstone {
                 continue;
             }
-            if main == self.compact_revision && key.len() == 18 {
-                continue;
+            let recent = main > self.compact_revision;
+            let kept = (!recent || empty_hash.is_some()) && retained(&row.key);
+            if kept {
+                empty_hash = None;
             }
-            hash = crc32c::crc32c_append(hash, key);
-            hash = crc32c::crc32c_append(hash, &row.value);
+            let append = |crc| crc32c::crc32c_append(crc32c::crc32c_append(crc, key), &row.value);
+            if recent || kept {
+                hash = append(hash);
+            }
+            empty_hash = empty_hash.map(append);
         }
+        let hash = empty_hash.unwrap_or(hash);
         Ok(json!({"header": mvcc::header(self.revision), "hash": hash,
             "compact_revision": self.compact_revision, "hash_revision": revision}))
     }
@@ -308,12 +312,28 @@ pub(crate) fn hash_key(revision: i64, sub: i64, deleted: bool) -> Vec<u8> {
     key
 }
 
+// Hash records use the etcd KeyValue wire format. Retention only needs field one.
+#[derive(prost::Message)]
+struct HashUserKey {
+    #[prost(bytes = "vec", tag = "1")]
+    key: Vec<u8>,
+}
+
+async fn hash_rows(db: &Db, revision: i64) -> std::result::Result<slatedb::DbIterator, KvError> {
+    db.scan_with_options(
+        HASH.to_vec()..=hash_key(revision, i64::MAX, true),
+        &mvcc::maintenance_scan(),
+    )
+    .await
+    .map_err(KvError::storage)
+}
+
 pub(crate) async fn compact_hash(
     db: &Db,
     revision: i64,
     batch: &mut WriteBatch,
 ) -> std::result::Result<(), KvError> {
-    let mut scan = db.scan_prefix(HASH, ..).await.map_err(KvError::storage)?;
+    let mut scan = hash_rows(db, revision).await?;
     let mut latest = std::collections::BTreeMap::new();
     while let Some(row) = scan.next().await.map_err(KvError::storage)? {
         let main = i64::from_be_bytes(
@@ -321,12 +341,8 @@ pub(crate) async fn compact_hash(
                 .try_into()
                 .map_err(KvError::storage)?,
         );
-        if main > revision {
-            break;
-        }
-        let kv =
-            crate::proto::mvccpb::KeyValue::decode(row.value.clone()).map_err(KvError::storage)?;
         let len = row.value.len();
+        let kv = HashUserKey::decode(row.value).map_err(KvError::storage)?;
         if let Some((old, old_len)) = latest.insert(kv.key, (row.key.clone(), len)) {
             batch.delete_known(old, old_len);
         }

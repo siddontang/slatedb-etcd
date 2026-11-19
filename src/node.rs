@@ -19,6 +19,7 @@ mod apply;
 mod cache;
 pub use cache::LogMemory;
 mod cluster;
+mod compaction;
 mod forwarding;
 mod lease;
 mod log;
@@ -161,6 +162,7 @@ pub struct Node {
     traffic: BTreeMap<u64, std::sync::Arc<crate::metrics::PeerTraffic>>,
     applied_notify: tokio::sync::watch::Sender<u64>,
     forwarding: forwarding::Publisher,
+    compaction: compaction::Flush,
     transfers: Vec<(u64, Instant, Response)>,
     published_at: Option<Instant>,
     events: mpsc::Sender<Event>,
@@ -353,6 +355,7 @@ impl Node {
             state.admin.clone(),
             state.metrics.registry.clone(),
         )?);
+        let compaction = compaction::Flush::new(&state);
         let worker = Worker::start(state, events.clone(), manual_apply);
         let log_worker = log::Worker::start(storage, manual_apply)?;
         let next_checkpoint = options.next_checkpoint(raw.store().snapshot_index());
@@ -361,7 +364,12 @@ impl Node {
             last_observed_leader: 0,
             traffic,
             applied_notify: tokio::sync::watch::channel(applied.applied).0,
-            forwarding: forwarding::Publisher::new(&options.peers, applied.revision),
+            forwarding: forwarding::Publisher::new(
+                &options.peers,
+                applied.revision,
+                compaction.durable.subscribe(),
+            ),
+            compaction,
             transfers: vec![],
             published_at: None,
             events,
@@ -438,6 +446,7 @@ impl Node {
         };
         self.transports.shutdown().await;
         // Keep the Raft directory locked until the state worker has stopped.
+        self.compaction.cancel();
         self.read_executor.shutdown().await;
         let apply = self.worker.shutdown().await;
         let log = self.log_worker.shutdown().await;
@@ -459,6 +468,9 @@ impl Node {
             tokio::select! {
                 _ = ticks.tick() => { self.raw.tick(); self.retry_reads(); self.expire_leases()?; self.publish_member()?; }
                 persisted = self.log_worker.next() => { self.complete_log(persisted?)?; }
+                target = self.compaction.next(), if self.compaction.active() => {
+                    self.finish_compaction_flush(target?)?;
+                }
                 completed = self.worker.next() => { self.complete_apply(completed?)?; }
                 read = self.read_executor.next(), if self.read_executor.len() > 0 => {
                     self.complete_read(read?)?;
@@ -1017,6 +1029,7 @@ impl Node {
             .collect();
         for id in expired {
             if let Some(pending) = self.pending.remove(&id) {
+                self.compaction.replies.remove(&id);
                 self.metrics.failed_proposals.inc();
                 pending.response.error(
                     self.error("request outcome unknown: leadership changed or request timed out"),

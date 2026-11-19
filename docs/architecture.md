@@ -469,7 +469,10 @@ This state cache has a separate budget from Raft log memory. It has no time-base
 The weight limit covers cached entries; allocator and cache overhead can add resident memory.
 Tests compare the counter with a full scan after state changes, restart, and DST recovery.
 
-Physical Compact flushes MVCC deletions. Defragment rewrites SSTs through the SlateDB compactor.
+One background flush per member makes MVCC deletions durable for physical Compact.
+The apply worker accepts later entries while the flush runs.
+The leader and any forwarding member wait for their local flush before they return success.
+Defragment rewrites SSTs through the SlateDB compactor.
 Both operations run on the apply worker. Slow state work cannot stop Raft heartbeats.
 Compactor failures return RPC errors; they do not stop the Raft owner.
 Native snapshot export includes SHA-256 and uses bounded response chunks, but builds a full buffer.

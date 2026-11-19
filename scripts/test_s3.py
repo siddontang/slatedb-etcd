@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 """Check S3 startup retries before the recovery tests."""
 
-import importlib.util
 from io import BytesIO
-from pathlib import Path
 import unittest
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError, URLError
 
-
-spec = importlib.util.spec_from_file_location("s3", Path(__file__).with_name("check-s3.py"))
-s3 = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(s3)
+import rustfs_fixture as s3
 
 
 class BucketReadiness(unittest.TestCase):

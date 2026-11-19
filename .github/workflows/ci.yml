@@ -220,6 +220,18 @@ jobs:
             --compact-every 2500 --retain-revisions 500 --value-pattern metadata \
             --requests 10000 --keys 1000 --warmup 200 --repeat 2 \
             --output results/ci/benchmark-compact.json
+      - name: Compare writes during physical compaction on RustFS
+        run: |
+          python3 scripts/benchmark-etcd.py --rustfs --binary tmp/performance/head \
+            --baseline-binary tmp/performance/base --backends baseline service \
+            --concurrency 32 --read-percent 0 --rate 300 --value-pattern metadata \
+            --compact-every 750 --retain-revisions 250 --requests 3000 --keys 1000 \
+            --warmup 200 --repeat 2 --output results/ci/benchmark-rustfs.json
+          python3 scripts/benchmark-etcd.py --rustfs --binary tmp/performance/head \
+            --backends service --concurrency 32 --read-percent 0 --rate 1000 \
+            --value-pattern metadata --compact-every 2500 --retain-revisions 500 \
+            --requests 10000 --keys 1000 --warmup 200 --repeat 2 \
+            --output results/ci/benchmark-rustfs-stress.json
       - name: Sample Linux CPU stacks after warmup
         run: |
           for backend in base head; do

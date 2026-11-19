@@ -349,12 +349,20 @@ impl Kv for Service {
             }
             Err(error) if error.error == "not leader" && !forwarded => {
                 let channel = self.peer_channel(error.leader_id).await?;
-                let response = KvClient::new(channel)
+                let result = KvClient::new(channel)
                     .compact(forward_auth(request, &credentials))
-                    .await?
-                    .into_inner();
-                self.local_barrier().await?;
-                response
+                    .await;
+                let compacted = result.as_ref().is_err_and(|s| {
+                    s.code() == tonic::Code::OutOfRange
+                        && s.message().strip_prefix("etcdserver: ") == Some(crate::mvcc::COMPACTED)
+                });
+                if result.is_ok() || (request.physical && compacted) {
+                    self.local_barrier().await?;
+                    if request.physical {
+                        self.wait_compaction(request.revision).await?;
+                    }
+                }
+                result?.into_inner()
             }
             Err(error) => return Err(Status::unavailable(format!("etcdserver: {}", error.error))),
         };

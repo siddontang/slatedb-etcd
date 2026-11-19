@@ -1,6 +1,6 @@
 {
-  "created_at": "2026-11-17T20:10:20.840241+00:00",
-  "binary_sha256": "782f8e9bc31cbca55447d49b4308d177201f02f5e362393b5d3879d71040d472",
+  "created_at": "2026-11-19T04:13:42.524744+00:00",
+  "binary_sha256": "74f0dab15d1420f7c38a37b12f8e989d305bede1fe030493e003cdead3136143",
   "reference_etcd": "3.6.5",
   "client": "go.etcd.io/etcd/client/v3 v3.6.5",
   "go": "go version go1.25.6 darwin/arm64",
@@ -20,7 +20,7 @@
     "./..."
   ],
   "profile": "supported-capabilities",
-  "log": "<repo>/tmp/test-results/multihost-embedded-2.jsonl",
+  "log": "<repo>/tmp/test-results/rustfs-guests.jsonl",
   "tests": [
     {
       "name": "TestThreeVirtualMachines/mutual-tls",
@@ -30,22 +30,22 @@
     {
       "name": "TestThreeVirtualMachines/leader-machine-crash",
       "result": "pass",
-      "seconds": 12.77
+      "seconds": 14.42
     },
     {
       "name": "TestThreeVirtualMachines/kernel-peer-partition",
       "result": "pass",
-      "seconds": 2.32
+      "seconds": 2.21
     },
     {
       "name": "TestThreeVirtualMachines/object-outage-crash-and-snapshot",
       "result": "pass",
-      "seconds": 21.76
+      "seconds": 19.15
     },
     {
       "name": "TestThreeVirtualMachines",
       "result": "pass",
-      "seconds": 46.88
+      "seconds": 42.28
     }
   ],
   "counts": {
@@ -57,9 +57,9 @@
   "passed": true,
   "complete": true,
   "object_store": {
-    "name": "MinIO",
-    "source_revision": "9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a",
-    "binary_sha256": "0facf6e53595d4842885ce0017afdf509eeb370496953418b9f5368a072e1c80"
+    "name": "RustFS",
+    "version": "1.0.6",
+    "binary_sha256": "80cb1c34190b1fcc60b4ca5fc8413f0dc11bd10b3fc40c8f2dd6c6eab585c198"
   },
   "guest_kernels": [
     "Linux 6.8.0-142-generic",
@@ -67,7 +67,6 @@
     "Linux 6.8.0-142-generic"
   ],
   "physical_hosts": 1,
-  "s3_fixture": "MinIO",
   "guest_count": 3,
   "temporary_guests_removed": true
 }

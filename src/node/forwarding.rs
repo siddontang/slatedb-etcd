@@ -7,19 +7,26 @@ use tokio::sync::watch;
 
 pub(super) struct Publisher {
     revision: Arc<AtomicI64>,
+    compact: watch::Receiver<i64>,
     peers: watch::Sender<Arc<BTreeMap<u64, String>>>,
 }
 
 /// Read the member routes and the latest locally applied revision.
 pub struct ForwardView {
     revision: Arc<AtomicI64>,
+    pub(crate) compact: watch::Receiver<i64>,
     pub(crate) peers: watch::Receiver<Arc<BTreeMap<u64, String>>>,
 }
 
 impl Publisher {
-    pub(super) fn new(peers: &BTreeMap<u64, String>, revision: i64) -> Self {
+    pub(super) fn new(
+        peers: &BTreeMap<u64, String>,
+        revision: i64,
+        compact: watch::Receiver<i64>,
+    ) -> Self {
         Self {
             revision: Arc::new(AtomicI64::new(revision)),
+            compact,
             peers: watch::channel(Arc::new(routes(peers))).0,
         }
     }
@@ -27,6 +34,7 @@ impl Publisher {
     pub(super) fn subscribe(&self) -> ForwardView {
         ForwardView {
             revision: self.revision.clone(),
+            compact: self.compact.clone(),
             peers: self.peers.subscribe(),
         }
     }

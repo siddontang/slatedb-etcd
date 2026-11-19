@@ -200,7 +200,14 @@ Compaction scans all history and builds one deletion batch on the apply worker.
 Quota accounting uses the stored lengths from the history, Watch, and HashKV scans.
 Each deleted row contributes its original size once.
 Large histories can delay state reads and write completion. Raft keeps processing ticks and peers.
-Physical Compact waits for the deletion batch to flush before it returns.
+The history scan reads revisions from row keys. Maintenance scans request 64 KiB of read-ahead.
+The cached HashKV checksum uses the deletion batch to identify retained rows.
+Each member flushes a physical Compact outside ordered apply. Writes can apply during this flush.
+One flush can run at a time. The highest queued index covers intervening physical compactions.
+A successful physical reply requires a flush through its own index.
+A forwarding member also waits for its local durable compact revision.
+A repeated physical request waits for the earlier boundary before it returns the compacted error.
+A storage error stops the node. On restart, Raft replays any missing deletion batch.
 Defragment rewrites the current SST set and waits for manifest publication.
 SlateDB garbage collection reclaims obsolete objects later. Pinned checkpoints can retain them.
 Do not downgrade to an older binary after compaction; older binaries do not enforce its boundary.

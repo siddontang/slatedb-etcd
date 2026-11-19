@@ -67,7 +67,10 @@ Restrict that trust boundary to operators and member processes.
 
 ## Validation
 
-Run the S3 suite with a pinned MinIO source build and generated temporary credentials:
+The S3 suite starts RustFS 1.0.6 on loopback with a temporary bucket and credentials.
+It verifies the release archive checksum before extracting the server.
+The fixture supports Apple Silicon macOS and GNU/Linux on x86-64 and ARM64.
+Run the recovery suite with these commands.
 
 ```sh
 scripts/cargo.sh build --locked --release
@@ -102,5 +105,5 @@ It builds the Linux binary in the first guest.
 `--linux-binary` can reuse an existing Linux ARM64 build.
 `--reuse` accepts three disposable guest names. It deletes those guests after the run.
 
-Sources: [Lima guest networking](https://lima-vm.io/docs/config/network/user-v2/) and
-[MinIO source](https://github.com/minio/minio/tree/9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a).
+[Lima guest networking](https://lima-vm.io/docs/config/network/user-v2/) and
+[RustFS release](https://github.com/rustfs/rustfs/releases/tag/1.0.6).

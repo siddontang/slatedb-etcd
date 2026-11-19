@@ -98,6 +98,17 @@ The caller waits for Compact. Other workers continue to issue requests.
 The report includes completed compactions and their durations. Put latency includes these waits.
 macOS sampling reads `ps` counters. Both exclude child processes and the controller.
 
+Use `--rustfs` for a temporary local RustFS server. The report records its version and binary hash.
+The client uses HTTP over loopback. CPU and RSS cover the etcd-compatible servers.
+They exclude the RustFS process. The fixture removes its data after the run.
+Linux CI compares the base and head at 300 puts/s. It also checks the head at 1,000 puts/s.
+
+```sh
+python3 scripts/benchmark-etcd.py --rustfs --requests 6000 --keys 1000 --repeat 3 \
+  --value-pattern metadata --concurrency 32 --read-percent 0 --warmup 200 --rate 300 \
+  --compact-every 1500 --retain-revisions 500 --output results/ci/benchmark-rustfs.json
+```
+
 Use `--s3-bucket`, `--s3-endpoint`, and optional `--s3-allow-http` to measure remote state storage.
 Create the bucket first and supply credentials through the supported AWS environment settings.
 The etcd reference still uses local disks. The service keeps its local Raft logs in this profile.

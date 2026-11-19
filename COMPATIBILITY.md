@@ -125,6 +125,6 @@ all of them run against the Rust implementation.
 
 The [fault map](tests/upstream/fault-mapping.md) accounts for all 41 named gofail hooks at etcd
 v3.6.5.
-Twenty-one native crash boundaries and two TLS client failover cases have real process coverage.
+Twenty-five native crash boundaries and two TLS client failover cases have real process coverage.
 Selected original Kubernetes storage tests and the CoreDNS etcd plugin run against both backends.
 The [retained remote results](results/remote-storage/README.md) record the new evidence and limits.

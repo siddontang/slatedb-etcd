@@ -128,6 +128,11 @@ pub(super) struct Work {
 
 pub(super) enum Reply {
     Encoded(Value),
+    PhysicalCompact {
+        index: u64,
+        revision: i64,
+        value: Value,
+    },
     Kv(Outcome),
     Lease(Outcome<LeaseReply>),
 }
@@ -571,11 +576,21 @@ async fn apply_entries(
                 Reply::Lease(state.apply_lease_from(entry.index, lease, *origin).await?)
             }
             RaftCommand::Compact { compact, .. } => {
-                let mut outcome = state.apply_compaction(entry.index, compact).await?;
+                let mut outcome = state.apply_compaction_batch(entry.index, compact).await?;
                 if let Ok(response) = &mut outcome.result {
                     header.fill(response.header.as_mut());
                 }
-                Reply::Encoded(serde_json::to_value(outcome)?)
+                let flush = state.physical_compact_revision(compact, &outcome);
+                let value = serde_json::to_value(outcome)?;
+                if let Some(revision) = flush {
+                    Reply::PhysicalCompact {
+                        index: entry.index,
+                        revision,
+                        value,
+                    }
+                } else {
+                    Reply::Encoded(value)
+                }
             }
         };
         crate::failpoint::hit("apply-after-entry");
@@ -595,6 +610,7 @@ pub(super) async fn recover(
     storage: &RaftStorage,
     header: Header,
 ) -> Result<()> {
+    let mut physical = false;
     while state.applied < storage.commit_index() {
         let low = state.applied + 1;
         let entries = storage.entries(
@@ -604,7 +620,14 @@ pub(super) async fn recover(
             raft::GetEntriesContext::empty(false),
         )?;
         ensure!(!entries.is_empty(), "empty recovery batch");
-        apply_entries(state, entries, header).await?;
+        let replies = apply_entries(state, entries, header).await?;
+        physical |= replies
+            .iter()
+            .any(|r| matches!(r.reply, Reply::PhysicalCompact { .. }));
+    }
+    if physical {
+        state.metrics.flush_db(&state.db).await?;
+        state.durable_applied = state.applied;
     }
     Ok(())
 }
