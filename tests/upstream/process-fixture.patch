@@ -1,0 +1,29 @@
+--- a/tests/framework/e2e/cluster.go
++++ b/tests/framework/e2e/cluster.go
+@@ -528,0 +529,6 @@
++		if etcdCfgs[i].ExecPath == BinPath.Etcd {
++			for _, member := range etcdCfgs {
++				etcdCfgs[i].Args = append(etcdCfgs[i].Args,
++					"--fixture-client="+member.Name+"="+member.ClientURL)
++			}
++		}
+--- a/tests/framework/e2e/etcd_process.go
++++ b/tests/framework/e2e/etcd_process.go
+@@ -41 +41 @@
+-var EtcdServerReadyLines = []string{"ready to serve client requests"}
++var EtcdServerReadyLines = []string{"Node started", "ready to serve client requests"}
+@@ -262,0 +263,14 @@
++	if ep.cfg.ExecPath == BinPath.Etcd {
++		ready, cancel := context.WithTimeout(ctx, 20*time.Second)
++		defer cancel()
++		for {
++			if err := ep.Etcdctl().Health(ready); err == nil {
++				break
++			}
++			select {
++			case <-ready.Done():
++				return fmt.Errorf("endpoint health: %w", ready.Err())
++			case <-time.After(100 * time.Millisecond):
++			}
++		}
++	}

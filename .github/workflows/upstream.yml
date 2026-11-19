@@ -1,0 +1,121 @@
+name: Full etcd suites
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 0'
+
+permissions:
+  contents: read
+
+jobs:
+  reference:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [unit, integration, proxy-integration, go-bench, fuzz]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: etcd-io/etcd
+          ref: a0614505aff9b8ff469e9c59c2d979a5936d13f4
+          path: reference/etcd
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: reference/etcd/tests/go.sum
+      - run: make -C reference/etcd build
+      - run: python3 scripts/check-upstream-go.py "${{ matrix.suite }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reference-${{ matrix.suite }}
+          path: tmp/upstream-results
+
+  process:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 320
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [service, etcd]
+        suite: [common, e2e, proxy-e2e, robustness]
+        shard: [0, 1]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: etcd-io/etcd
+          ref: a0614505aff9b8ff469e9c59c2d979a5936d13f4
+          path: reference/etcd
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: reference/etcd/tests/go.sum
+      - name: Build the Rust service
+        if: matrix.target == 'service'
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          cargo build --release --locked --features fault-injection
+      - name: Build the reference process with Go failpoints
+        if: matrix.target == 'etcd'
+        working-directory: reference/etcd
+        run: |
+          make gofail-enable
+          make build
+          make gofail-disable
+      - name: Install the previous etcd minor for mixed-version cases
+        working-directory: reference/etcd
+        run: |
+          mkdir -p bin
+          MANUAL_VER=v3.5.20 PASSES=release ./scripts/test.sh
+      - name: Install the upstream disk fault fixture
+        if: matrix.suite == 'robustness' || matrix.suite == 'e2e'
+        working-directory: reference/etcd
+        run: |
+          sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3
+          echo user_allow_other | sudo tee -a /etc/fuse.conf
+          make install-lazyfs
+      - name: Run the process tests
+        run: |
+          python3 scripts/check-upstream-go.py "${{ matrix.suite }}" --target "${{ matrix.target }}" \
+            --shards 2 --shard-index "${{ matrix.shard }}" --timeout 20m --require-complete
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: process-${{ matrix.target }}-${{ matrix.suite }}-${{ matrix.shard }}
+          path: tmp/upstream-results
+
+  load:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        members: [1, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: etcd-io/etcd
+          ref: a0614505aff9b8ff469e9c59c2d979a5936d13f4
+          path: reference/etcd
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: reference/etcd/tests/go.sum
+      - run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          cargo build --release --locked
+      - run: python3 scripts/benchmark-upstream.py --profile stress --members ${{ matrix.members }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: load-${{ matrix.members }}
+          path: tmp/upstream-benchmarks
