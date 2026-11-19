@@ -23,9 +23,9 @@ fn message(snapshot: bool) -> Message {
         from: 1,
         to: 2,
         msg_type: if snapshot {
-            MessageType::MsgSnapshot
+            MessageType::MsgSnapshot as i32
         } else {
-            MessageType::MsgHeartbeat
+            MessageType::MsgHeartbeat as i32
         },
         ..Default::default()
     }
@@ -216,7 +216,7 @@ async fn stream_rejects_wrong_clusters_sequences_payloads_and_snapshots() {
     for frame in [
         Frame {
             sequence: 2,
-            payload: message(false).write_to_bytes().unwrap(),
+            payload: message(false).encode_to_vec(),
         },
         Frame {
             sequence: 1,
@@ -224,7 +224,7 @@ async fn stream_rejects_wrong_clusters_sequences_payloads_and_snapshots() {
         },
         Frame {
             sequence: 1,
-            payload: message(true).write_to_bytes().unwrap(),
+            payload: message(true).encode_to_vec(),
         },
     ] {
         let mut request = Request::new(tokio_stream::iter([frame]));
@@ -431,7 +431,7 @@ async fn receiver_pipelines_with_count_bytes_and_ordered_receipt_limits() {
         let frames: Vec<_> = (1..=window + 1)
             .map(|sequence| Frame {
                 sequence: sequence as u64,
-                payload: message.write_to_bytes().unwrap(),
+                payload: message.encode_to_vec(),
             })
             .collect();
         let mut request = Request::new(tokio_stream::iter(frames));

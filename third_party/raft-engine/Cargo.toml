@@ -102,13 +102,14 @@ version = "0.2"
 version = "0.12"
 
 [dependencies.prometheus]
-version = "0.13"
+version = "0.14"
+default-features = false
 
 [dependencies.prometheus-static-metric]
 version = "0.5"
 
-[dependencies.protobuf]
-version = "2"
+[dependencies.prost]
+version = "0.14"
 
 [dependencies.rayon]
 version = "1.5"

@@ -7,8 +7,6 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use protobuf::Message as ProtobufMessage;
-use raft::eraftpb::Message;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -95,8 +93,9 @@ async fn raft_message(State(state): State<ApiState>, headers: HeaderMap, body: B
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    match Message::parse_from_bytes(&body) {
-        Ok(message) => dispatch(state, |tx| Event::PeerFrame(message, body.len(), tx))
+    let size = body.len();
+    match crate::peer::decode_message(body) {
+        Ok(message) => dispatch(state, |tx| Event::PeerFrame(message, size, tx))
             .await
             .into_response(),
         Err(_) => StatusCode::BAD_REQUEST.into_response(),

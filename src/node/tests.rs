@@ -35,7 +35,6 @@ fn seed_log(dir: &std::path::Path, count: u64) {
                 term: 1,
                 vote: 1,
                 commit: count,
-                ..Default::default()
             }),
             None,
         )
@@ -74,7 +73,6 @@ async fn flushed_state_recovers_a_lost_commit_marker_but_not_missing_entries() {
                         term: 1,
                         vote: 1,
                         commit: 0,
-                        ..Default::default()
                     }),
                     None,
                 )
@@ -605,7 +603,7 @@ async fn empty_log_barriers_wait_for_prior_persistence_and_fail_closed() {
         node.queue_log(
             log::Job::Ready {
                 entries: vec![],
-                hs: Some(node.raw.store().durable.hard_state.clone()),
+                hs: Some(node.raw.store().durable.hard_state),
                 snapshot: None,
             },
             None,
@@ -966,7 +964,7 @@ async fn read_index_retries_after_the_first_commit_in_a_new_term() {
     node.drain_apply().await.unwrap();
     assert!(reply.try_recv().is_err());
     let ack = Message {
-        msg_type: MessageType::MsgAppendResponse,
+        msg_type: MessageType::MsgAppendResponse as i32,
         from: 2,
         to: 1,
         term: node.raw.raft.term,
@@ -1133,7 +1131,6 @@ async fn queued_ready_jobs_share_sync_and_keep_the_final_log_suffix() {
                     term,
                     vote: term,
                     commit: first - 1,
-                    ..Default::default()
                 }),
                 snapshot: None,
             },

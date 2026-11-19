@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use anyhow::{ensure, Context, Result};
-use protobuf::Message as ProtobufMessage;
+use prost::Message as ProtobufMessage;
 use raft::eraftpb::{Message, MessageType};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -18,6 +18,15 @@ use crate::proto::peer::{
 };
 
 mod receive;
+
+pub(crate) fn decode_message(payload: bytes::Bytes) -> Result<Message> {
+    let message = Message::decode(payload)?;
+    MessageType::try_from(message.msg_type)?;
+    for entry in &message.entries {
+        raft::eraftpb::EntryType::try_from(entry.entry_type)?;
+    }
+    Ok(message)
+}
 
 const WINDOW: usize = 64;
 const BYTE_TARGET: usize = 16 * 1024 * 1024;
@@ -140,7 +149,7 @@ pub(crate) async fn transport(
         let mut outstanding_bytes = 0;
         let result: Result<()> = async {
             let send = |message: Message, sequence: u64| -> Result<usize> {
-                let frame = Frame { sequence, payload: message.write_to_bytes()? };
+                let frame = Frame { sequence, payload: message.encode_to_vec() };
                 ensure!(prost::Message::encoded_len(&frame) <= FRAME_LIMIT, "peer frame is too large");
                 let bytes = frame.payload.len();
                 frames.try_send(frame)
@@ -229,7 +238,7 @@ async fn post_snapshot(
     traffic: &crate::metrics::PeerTraffic,
 ) -> bool {
     let result: Result<()> = async {
-        let payload = message.write_to_bytes()?;
+        let payload = message.encode_to_vec();
         let size = payload.len();
         let response = client
             .post(url)

@@ -13,6 +13,7 @@ use slatedb_etcd::node::LogMemory;
 use slatedb_etcd::server::{Server, ServerConfig};
 
 #[derive(Parser)]
+#[group(id = "ServerArgs")]
 #[command(about = "Experimental etcd v3 service with Raft and SlateDB")]
 struct Args {
     /// Async worker count. Log writes use a separate thread.

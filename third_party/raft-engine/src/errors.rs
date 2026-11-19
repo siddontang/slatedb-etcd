@@ -18,7 +18,9 @@ pub enum Error {
     #[error("Codec Error: {0}")]
     Codec(#[from] CodecError),
     #[error("Protobuf Error: {0}")]
-    Protobuf(#[from] protobuf::ProtobufError),
+    Decode(#[from] prost::DecodeError),
+    #[error("Encode error: {0}")]
+    Encode(#[from] prost::EncodeError),
     #[error("TryAgain Error: {0}")]
     TryAgain(String),
     #[error("Entry Compacted")]

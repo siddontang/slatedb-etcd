@@ -99,6 +99,23 @@ The failure series appears after a failure. Removing the member removes its peer
 [alerts]: https://github.com/etcd-io/etcd/blob/v3.6.5/contrib/mixin/alerts/alerts.libsonnet
 [dashboard]: https://github.com/etcd-io/etcd/blob/v3.6.5/contrib/mixin/dashboards/targets.libsonnet
 
+## Collection cost
+
+The service resolves the method and status counters when it creates a member.
+Each RPC body holds one method handle. Request and response frames share its counters.
+Completed messages and terminal statuses are visible to the next scrape.
+Apply adds the counts for a batch after it commits.
+
+Each scrape takes a member snapshot. It builds the state and peer samples from that snapshot.
+Concurrent scrapes can report different Raft indices. They do not overwrite each other's samples.
+Removing a peer also removes its series from subsequent snapshots.
+
+TiKV uses fixed label handles and periodically flushes Raft worker counters and histograms.
+See the [TiKV Raft metrics][tikv-metrics].
+
+[tikv-metrics]:
+  https://github.com/tikv/tikv/blob/master/components/raftstore/src/store/local_metrics.rs
+
 ## Remaining coverage
 
 The pending families include MVCC range and transaction counters, slow apply, and several

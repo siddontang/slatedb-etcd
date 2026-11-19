@@ -3,6 +3,7 @@
 mod peer;
 pub(crate) use peer::PeerTraffic;
 mod rpc;
+mod sample;
 mod state;
 pub(crate) use state::{Active, StateMeters, WatchMeters, Writes};
 
@@ -14,8 +15,8 @@ use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use prometheus::{
-    exponential_buckets, Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, IntGaugeVec,
-    Opts, Registry, TextEncoder,
+    exponential_buckets, Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, Opts, Registry,
+    TextEncoder,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -158,111 +159,6 @@ impl Member {
     }
 }
 
-impl Sample {
-    fn gauges(&self, physical: Option<u64>) -> Result<Registry> {
-        let registry = Registry::new();
-        for (name, help, value) in [
-            (
-                "etcd_server_has_leader",
-                "Member knows its leader.",
-                i64::from(self.leader != 0),
-            ),
-            (
-                "etcd_server_is_leader",
-                "Member is the leader.",
-                i64::from(self.leader == self.id),
-            ),
-            (
-                "etcd_server_is_learner",
-                "Member is a learner.",
-                i64::from(self.learner),
-            ),
-            (
-                "etcd_server_proposals_committed_total",
-                "Committed Raft index.",
-                self.committed as i64,
-            ),
-            (
-                "etcd_server_proposals_applied_total",
-                "Applied Raft index.",
-                self.applied as i64,
-            ),
-            (
-                "etcd_server_proposals_pending",
-                "Outstanding local proposals.",
-                self.pending as i64,
-            ),
-            (
-                "etcd_server_quota_backend_bytes",
-                "Backend quota in bytes.",
-                self.quota,
-            ),
-            (
-                "etcd_mvcc_db_total_size_in_use_in_bytes",
-                "Logical backend bytes in use.",
-                self.used as i64,
-            ),
-            (
-                "etcd_debugging_mvcc_current_revision",
-                "Current MVCC revision.",
-                self.revision,
-            ),
-            (
-                "etcd_debugging_mvcc_compact_revision",
-                "Last compacted MVCC revision.",
-                self.compact,
-            ),
-            (
-                "etcd_debugging_auth_revision",
-                "Current authorization revision.",
-                self.auth_revision as i64,
-            ),
-        ] {
-            let gauge = IntGauge::new(name, help)?;
-            gauge.set(value);
-            registry.register(Box::new(gauge))?;
-        }
-        if let Some(physical) = physical {
-            let gauge =
-                IntGauge::new("etcd_mvcc_db_total_size_in_bytes", "Backend size in bytes.")?;
-            gauge.set(physical.max(self.used) as i64);
-            registry.register(Box::new(gauge))?;
-        }
-        let id = format!("{:x}", self.id);
-        for (name, label, value) in [
-            ("etcd_server_id", "server_id", id.as_str()),
-            ("etcd_cluster_version", "cluster_version", "3.6"),
-            ("etcd_server_version", "server_version", "3.6.5"),
-        ] {
-            let gauge = IntGaugeVec::new(
-                Opts::new(name, "Member identity or supported API version."),
-                &[label],
-            )?;
-            gauge.with_label_values(&[value]).set(1);
-            registry.register(Box::new(gauge))?;
-        }
-        for (name, active) in [
-            ("etcd_network_known_peers", false),
-            ("etcd_network_active_peers", true),
-        ] {
-            let gauge = IntGaugeVec::new(
-                Opts::new(name, "Peer membership or transport activity."),
-                &["Local", "Remote"],
-            )?;
-            for (peer, connected) in &self.peers {
-                if !active || *peer != self.id {
-                    gauge
-                        .with_label_values(&[&id, &format!("{peer:x}")])
-                        .set(i64::from(!active || *connected));
-                }
-            }
-            registry.register(Box::new(gauge))?;
-        }
-        peer::collect(&id, &self.traffic, &registry)?;
-        Ok(registry)
-    }
-}
-
 async fn scrape(State((member, events)): State<(Arc<Member>, mpsc::Sender<Event>)>) -> Response {
     let _active = Active::new(&member.scraping);
     let collect_member = member.clone();
@@ -285,7 +181,7 @@ async fn scrape(State((member, events)): State<(Arc<Member>, mpsc::Sender<Event>
         tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
             let _permit = permit;
             let mut families = member.registry.gather();
-            families.extend(sample.gauges(physical)?.gather());
+            sample.collect(physical, &mut families);
             let mut body = Vec::new();
             TextEncoder::new().encode(&families, &mut body)?;
             Ok(body)

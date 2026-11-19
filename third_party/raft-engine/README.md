@@ -2,7 +2,7 @@
 
 This directory contains the runtime, examples, and tests from the published `raft-engine` 0.4.2
 crate.
-Cargo selects this copy through a direct path dependency. It keeps the 0.4.2 storage format and API.
+Cargo selects this copy through a direct path dependency. It keeps the 0.4.2 storage format.
 This selection also applies when another program embeds the service as a dependency.
 The original [README](README.upstream) and [Apache-2.0 license](LICENSE) remain here.
 
@@ -16,6 +16,8 @@ The crate archive has SHA-256:
 
 Read [local.patch](local.patch) for the complete runtime delta against the published crate.
 
+- The engine uses Prost to read and write entries and metadata. It encodes into the batch buffer.
+- The metrics dependency exports Prometheus text with its native Rust data types.
 - `src/pipe_log.rs` adds an optional cache identity. Unknown implementations bypass the block cache.
 - `src/file_pipe_log/pipe.rs` assigns a unique identity to each open log, including reopened logs.
 - `src/engine.rs` includes that identity in both decoded-entry and raw-entry cache keys.
@@ -31,7 +33,7 @@ The local fix follows the direct sync behavior now present in upstream code.
 Nonempty synchronous writes already reached the file system before this fix.
 
 Related upstream reports: [multiple engines][engines] and [missing explicit sync][sync].
-Remove these local patches when an upstream release includes both fixes.
+Use the upstream crate when it includes both fixes and supports the service codec.
 Do not edit unrelated upstream files. Test dependency changes against the regressions below.
 
 ## Regression checks

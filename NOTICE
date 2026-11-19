@@ -1,7 +1,7 @@
 This project started as a three-replica service experiment in the SlateDB checkout.
 It uses SlateDB under the Apache License 2.0.
 Upstream: https://github.com/slatedb/slatedb
-Pinned revision: 8b68800252064164397ca6ce53e5883dcfbc37b9
+The service uses the published SlateDB crate.
 
 The files under results/ include historical experiments and later compatibility checks.
 Publication cleanup removed workstation paths. Measurements and binary hashes remain unchanged.
@@ -13,7 +13,12 @@ Imported common tests retain notices from The etcd Authors under Apache License 
 Their adapted source and license appear under tests/compat/ and tests/upstream/.
 The SlateDB license text retains the upstream copyright notice for Chris Riccomini.
 
-third_party/raft-engine contains Raft Engine 0.4.2 with local cache and sync fixes.
+third_party/raft-engine contains Raft Engine 0.4.2 with local storage and codec changes.
 Copyright 2017-present PingCAP, Inc. Licensed under Apache License 2.0.
 Source: https://github.com/tikv/raft-engine
 The directory retains its license and documents each local runtime change.
+
+third_party/raft contains TiKV raft-rs source with a local Prost adapter.
+Copyright TiKV Project Authors. Licensed under Apache License 2.0.
+Source: https://github.com/tikv/raft-rs
+The Cargo manifest records the source revision.

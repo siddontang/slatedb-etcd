@@ -186,7 +186,7 @@ impl Command {
         };
         ConfChange {
             node_id,
-            change_type,
+            change_type: change_type as i32,
             ..Default::default()
         }
     }

@@ -89,7 +89,7 @@ impl Job {
     pub fn bytes(&self) -> usize {
         match self {
             Self::Fetch(_) | Self::Stats => 0,
-            Self::Ready { entries, .. } => entries.iter().map(|e| e.compute_size() as usize).sum(),
+            Self::Ready { entries, .. } => entries.iter().map(|e| e.encoded_len()).sum(),
             Self::Checkpoint { .. } => 0,
             #[cfg(test)]
             Self::Panic => 0,
