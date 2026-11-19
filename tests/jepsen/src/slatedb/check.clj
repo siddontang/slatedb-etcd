@@ -1,11 +1,11 @@
 (ns slatedb.check
   (:require [clojure.edn :as edn]
-            [clj-time.core :as time]
             [clojure.java.io :as io]
             [clojure.pprint :as pprint]
             [elle.list-append :as append]
             [jepsen.checker :as checker]
             [jepsen.history :as history]
+            [jepsen.util :as util]
             [knossos.model :as model]))
 
 (defn encode-absence [op]
@@ -22,7 +22,7 @@
     (let [h (history/history events)]
       (case workload
         "register" (checker/check (checker/linearizable {:model (model/cas-register ::absent)})
-                                   {:name "slatedb-etcd" :start-time (time/now)}
+                                   {:name "slatedb-etcd" :start-time (util/local-time)}
                                    (history/history (mapv encode-absence events)) {})
         "append" (append/check {:consistency-models [:strict-serializable]} h)
         (throw (ex-info "Workload must be register or append" {:workload workload}))))))

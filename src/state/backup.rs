@@ -1,9 +1,8 @@
 use super::*;
-use bincode::Options;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 
-const MAX_BACKUP_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_BACKUP_BYTES: usize = 64 * 1024 * 1024;
 
 impl StateMachine {
     /// Restore a checked native snapshot with a new Raft identity and membership.
@@ -24,24 +23,21 @@ impl StateMachine {
         );
         let mut bytes = vec![];
         std::fs::File::open(backup)?
-            .take(MAX_BACKUP_BYTES + 1)
+            .take(MAX_BACKUP_BYTES as u64 + 1)
             .read_to_end(&mut bytes)?;
-        ensure!(
-            bytes.len() as u64 <= MAX_BACKUP_BYTES,
-            "snapshot exceeds 64 MiB"
-        );
+        ensure!(bytes.len() <= MAX_BACKUP_BYTES, "snapshot exceeds 64 MiB");
         ensure!(bytes.len() > 32, "snapshot is missing its checksum");
         let (payload, checksum) = bytes.split_at(bytes.len() - 32);
         ensure!(
             Sha256::digest(payload).as_slice() == checksum,
             "snapshot checksum mismatch"
         );
-        let mut data: SnapshotData = bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .reject_trailing_bytes()
-            .with_limit(MAX_BACKUP_BYTES)
-            .deserialize(payload)
-            .context("invalid native snapshot")?;
+        let (mut data, consumed): (SnapshotData, _) = bincode::serde::decode_from_slice(
+            payload,
+            bincode::config::legacy().with_limit::<MAX_BACKUP_BYTES>(),
+        )
+        .context("invalid native snapshot")?;
+        ensure!(consumed == payload.len(), "trailing native snapshot data");
         ensure!(
             data.version == STORAGE_FORMAT,
             "unsupported snapshot version"
@@ -82,7 +78,7 @@ impl StateMachine {
         snapshot.mut_metadata().index = 1;
         snapshot.mut_metadata().term = 1;
         snapshot.mut_metadata().set_conf_state(members.conf());
-        snapshot.data = bincode::serialize(&data)?.into();
+        snapshot.data = crate::codec::encode(&data)?.into();
         std::fs::create_dir_all(dir)?;
         let mut storage = crate::storage::RaftStorage::open(
             &dir.join("raft"),

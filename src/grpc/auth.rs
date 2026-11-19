@@ -24,7 +24,7 @@ impl Service {
             .unary(
                 forward_auth(body, credentials),
                 tonic::codegen::http::uri::PathAndQuery::from_static(path),
-                tonic::codec::ProstCodec::default(),
+                tonic_prost::ProstCodec::default(),
             )
             .await?;
         if !path.starts_with("/etcdserverpb.Cluster/")

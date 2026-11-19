@@ -22,21 +22,21 @@ impl StateMachine {
         );
         Ok(async move {
             metrics.flush_db(&db).await?;
-            let mut data = bincode::serialize(&(STORAGE_FORMAT, applied))?;
+            let mut data = crate::codec::encode(&(STORAGE_FORMAT, applied))?;
             let count_offset = data.len();
-            bincode::serialize_into(&mut data, &0_u64)?;
+            crate::codec::write(&mut data, &0_u64)?;
             let mut count = 0_u64;
             let mut iterator = snapshot.scan_prefix(b"", ..).await?;
             while let Some(row) = iterator.next().await? {
                 if row.key.as_ref() != crate::cluster::KEY {
-                    bincode::serialize_into(&mut data, &(row.key, row.value))?;
+                    crate::codec::write(&mut data, &(row.key, row.value))?;
                     count += 1;
                 }
             }
-            bincode::serialize_into(&mut data, &(crate::cluster::KEY, members))?;
+            crate::codec::write(&mut data, &(crate::cluster::KEY, members))?;
             count += 1;
             // Replace the vector length after streaming its rows in the same binary format.
-            bincode::serialize_into(&mut &mut data[count_offset..], &count)?;
+            crate::codec::write(&mut &mut data[count_offset..], &count)?;
             data.shrink_to_fit();
             Ok(data)
         })
@@ -48,7 +48,7 @@ impl StateMachine {
             return Ok(());
         }
         self.checkpoint_delta = None;
-        let data: SnapshotData = bincode::deserialize(snapshot.get_data())?;
+        let data: SnapshotData = crate::codec::decode(snapshot.get_data())?;
         ensure!(
             data.version == STORAGE_FORMAT && data.applied == index,
             "invalid snapshot metadata"

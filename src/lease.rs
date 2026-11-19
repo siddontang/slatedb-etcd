@@ -57,7 +57,7 @@ pub async fn load(db: &Db) -> anyhow::Result<BTreeMap<i64, LeaseRecord>> {
     let mut scan = db.scan_prefix(PREFIX, ..).await?;
     while let Some(row) = scan.next().await? {
         let id = i64::from_be_bytes(row.key[PREFIX.len()..].try_into()?);
-        leases.insert(id, bincode::deserialize(&row.value)?);
+        leases.insert(id, crate::codec::decode(&row.value)?);
     }
     Ok(leases)
 }
@@ -173,7 +173,7 @@ pub(crate) async fn prepare_with_counts(
         if let Some(record) = record {
             batch.put(
                 key(*id),
-                bincode::serialize(record).map_err(KvError::storage)?,
+                crate::codec::encode(record).map_err(KvError::storage)?,
             );
         } else {
             batch.delete(key(*id));

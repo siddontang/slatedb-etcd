@@ -284,7 +284,7 @@ async fn snapshot_import_requires_the_current_format() {
     };
     let mut snapshot = Snapshot::default();
     snapshot.mut_metadata().index = 1;
-    let mut bytes = bincode::serialize(&data).unwrap();
+    let mut bytes = crate::codec::encode(&data).unwrap();
     snapshot.set_data(bytes.clone().into());
     assert!(state.install_snapshot(&snapshot).await.is_err());
     assert_eq!(state.applied, 0);

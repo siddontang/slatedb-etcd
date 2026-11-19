@@ -120,9 +120,9 @@ impl S3 {
 
     pub fn member_prefix(&self, cluster: &str, member: u64) -> String {
         format!(
-            "{}/{:x}/member-{member}",
+            "{}/{}/member-{member}",
             self.prefix,
-            Sha256::digest(cluster.as_bytes())
+            hex::encode(Sha256::digest(cluster.as_bytes()))
         )
     }
 

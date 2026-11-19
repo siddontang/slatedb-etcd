@@ -19,6 +19,28 @@ That x86_64 executable requires Rosetta. You can instead set `PROTOC` to a worki
 binary.
 The wrapper does not modify the system compiler.
 
+## Dependency versions
+
+Use the latest compatible published release for a service dependency.
+Commit the resolved versions in `Cargo.lock`. Run the compatibility and recovery suites after edits.
+SlateDB 0.18.1 comes from crates.io. Its release supports S3, Moka, and disabling the native WAL.
+The server uses Tonic 0.14 with Prost. The gRPC project maintains Tonic.
+The separate `grpc` 0.9 client crate is a preview. Its server examples use Tonic.
+
+Three packages need specific version lines.
+
+- Raft 0.7 uses the Protobuf 2.28 message trait for its generated types.
+- Raft Engine 0.4.2 needs [two local fixes](../third_party/raft-engine/README.md).
+- Bincode 2.0.1 uses fixed-width little-endian fields for snapshots and lease records.
+  The published 3.0.0 crate contains only a compile error.
+
+The Go test modules build the etcd 3.6.5 reference server and client.
+Keep the reference server's linked dependencies when updating independent test tools.
+The downstream suite tests specific Kubernetes and CoreDNS releases.
+Update these test targets with their source inventories and compatibility reports.
+See the [compatibility matrix](../COMPATIBILITY.md) and
+[upstream cases](../tests/upstream/README.md).
+
 ## Build
 
 ```sh
@@ -27,7 +49,7 @@ cd slatedb-etcd
 scripts/cargo.sh build --locked --release
 ```
 
-Cargo downloads the pinned SlateDB revision and locked Rust dependencies.
+Cargo downloads the SlateDB release and other dependencies recorded in the lock file.
 The test reference clones are optional. Imported common tests are already in the repository.
 
 Build the matching etcdctl client without changing your global installation:

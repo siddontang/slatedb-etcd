@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::{self, RootCertStore};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
@@ -80,13 +81,9 @@ impl Options {
             );
             return Ok(None);
         };
-        let cert_bytes = std::fs::read(cert)?;
-        let certificates = rustls_pemfile::certs(&mut cert_bytes.as_slice())
-            .collect::<std::io::Result<Vec<_>>>()?;
-        let key = rustls_pemfile::private_key(
-            &mut std::fs::read(self.key.as_ref().unwrap())?.as_slice(),
-        )?
-        .context("TLS private key is missing")?;
+        let certificates = CertificateDer::pem_file_iter(cert)?.collect::<Result<Vec<_>, _>>()?;
+        let key = PrivateKeyDer::from_pem_file(self.key.as_ref().unwrap())
+            .context("cannot read TLS private key")?;
         let config = rustls::ServerConfig::builder();
         let config = if self.client_auth {
             let ca = self
@@ -94,7 +91,7 @@ impl Options {
                 .as_ref()
                 .context("client certificate authentication requires a CA")?;
             let mut roots = RootCertStore::empty();
-            for cert in rustls_pemfile::certs(&mut std::fs::read(ca)?.as_slice()) {
+            for cert in CertificateDer::pem_file_iter(ca)? {
                 roots.add(cert?)?;
             }
             config.with_client_cert_verifier(
@@ -121,7 +118,7 @@ impl Options {
         let identity = reqwest::Identity::from_pem(&[cert, key].concat())?;
         let http = reqwest::Client::builder()
             .https_only(true)
-            .add_root_certificate(reqwest::Certificate::from_pem(&ca)?)
+            .tls_certs_merge([reqwest::Certificate::from_pem(&ca)?])
             .identity(identity)
             .build()?;
         Ok(Transport {
