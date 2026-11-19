@@ -99,7 +99,10 @@ At most four KV read jobs run. Each point-read job contains at most 16 requests.
 Only one range scan, historical read, or read-only transaction runs at a time.
 Current point reads can pass queued scans. Each job has a five-second deadline.
 These bounds limit tasks and retained views, not total response bytes.
-It rejects new proposals at 1,024 committed but unapplied entries.
+At 1,024 committed but unapplied entries, the owner stops admitting new Raft proposals.
+A leader can hold up to 256 ordinary puts before proposal when apply or log I/O falls behind.
+The queue holds up to 4 MiB of encoded data. Each put expires after five seconds.
+A leadership change discards queued puts before Raft can propose them.
 Worker failure or panic stops the node. Shutdown joins reads before closing state storage.
 The log thread performs steady-state disk I/O, file reclamation, and disk statistics.
 Apply waits for committed Ready delivery and local entry durability.
