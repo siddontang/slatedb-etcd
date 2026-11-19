@@ -286,54 +286,106 @@ jobs:
           path: results/ci/*.json
           retention-days: 14
 
-  performance:
+  performance-build:
     needs: public-files
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_PROFILE_RELEASE_DEBUG: 1
+      BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25.x'
-          cache-dependency-path: tests/compat/go.sum
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install Linux profiling tools
+      - name: Select the base commit
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler linux-tools-common linux-tools-generic
-          perf_path="$(find -L /usr/lib/linux-tools -type f -name perf | sort | tail -1)"
-          test -n "$perf_path"
-          sudo ln -sf "$perf_path" /usr/local/bin/perf
-          sudo sysctl kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            echo "BASE_SHA=$(git rev-parse HEAD^)" >> "$GITHUB_ENV"
+          fi
+      # Main runs save their head binaries. A later pull request on that main tip reuses them as base.
+      - name: Restore base binaries
+        id: base-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: tmp/performance-base
+          key: performance-binaries-${{ env.BASE_SHA }}-${{ hashFiles('rust-toolchain.toml') }}
       - name: Build head and base with the same settings
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          BASE_CACHED: ${{ steps.base-cache.outputs.cache-hit }}
         run: |
           mkdir -p tmp/performance
           cargo build --locked --release
           cp target/release/slatedb-etcd tmp/performance/head
-          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
-            BASE_SHA="$(git rev-parse HEAD^)"
-          fi
-          git worktree add --detach "$RUNNER_TEMP/performance-base" "$BASE_SHA"
-          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --locked --release             --manifest-path "$RUNNER_TEMP/performance-base/Cargo.toml"
-          cp target/release/slatedb-etcd tmp/performance/base
-          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --locked --release \
-            --features write-profile --manifest-path "$RUNNER_TEMP/performance-base/Cargo.toml"
-          cp target/release/slatedb-etcd tmp/performance/base-counted
-          git worktree remove "$RUNNER_TEMP/performance-base"
-      - name: Measure three-member write costs
-        run: |
           cargo build --locked --release --features write-profile
-          python3 scripts/benchmark-etcd.py --binary target/release/slatedb-etcd \
+          cp target/release/slatedb-etcd tmp/performance/head-counted
+          if [ "$BASE_CACHED" = true ]; then
+            cp tmp/performance-base/head tmp/performance/base
+            cp tmp/performance-base/head-counted tmp/performance/base-counted
+          else
+            git worktree add --detach "$RUNNER_TEMP/performance-base" "$BASE_SHA"
+            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --locked --release \
+              --manifest-path "$RUNNER_TEMP/performance-base/Cargo.toml"
+            cp target/release/slatedb-etcd tmp/performance/base
+            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --locked --release \
+              --features write-profile --manifest-path "$RUNNER_TEMP/performance-base/Cargo.toml"
+            cp target/release/slatedb-etcd tmp/performance/base-counted
+            git worktree remove "$RUNNER_TEMP/performance-base"
+          fi
+          mkdir -p tmp/performance-head
+          cp tmp/performance/head tmp/performance/head-counted tmp/performance-head/
+      - name: Save head binaries for later base comparisons
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: tmp/performance-head
+          key: performance-binaries-${{ github.sha }}-${{ hashFiles('rust-toolchain.toml') }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: performance-binaries
+          path: tmp/performance/
+          retention-days: 3
+
+  # Each group compares head and base on one runner. Groups run on separate runners in parallel.
+  performance:
+    needs: performance-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [writes, throughput]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: tests/compat/go.sum
+      - uses: actions/download-artifact@v4
+        with:
+          name: performance-binaries
+          path: tmp/performance
+      - name: Restore binary permissions
+        run: chmod +x tmp/performance/*
+      - name: Install Linux profiling tools
+        if: matrix.group != 'throughput'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-common linux-tools-generic
+          perf_path="$(find -L /usr/lib/linux-tools -type f -name perf | sort | tail -1)"
+          test -n "$perf_path"
+          sudo ln -sf "$perf_path" /usr/local/bin/perf
+          sudo sysctl kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+      - name: Measure three-member write costs
+        if: matrix.group == 'writes'
+        run: |
+          python3 scripts/benchmark-etcd.py --binary tmp/performance/head-counted \
             --baseline-binary tmp/performance/base-counted --backends baseline service \
             --concurrency 32 --read-percent 0 --value-pattern metadata --requests 12000 \
             --keys 1000 --value-size 256 --warmup 200 --repeat 3 --output results/ci/write-cost.json
@@ -345,6 +397,7 @@ jobs:
               --output "results/ci/capacity-$kind" --skip-inline
           done
       - name: Compare writes through all members and each role
+        if: matrix.group == 'writes'
         run: |
           python3 scripts/benchmark-etcd.py --binary tmp/performance/head \
             --baseline-binary tmp/performance/base --concurrency 32 --read-percent 0 \
@@ -357,6 +410,7 @@ jobs:
               --output "results/ci/route-$role.json"
           done
       - name: Save write cost measurements
+        if: matrix.group == 'writes'
         uses: actions/upload-artifact@v4
         with:
           name: linux-write-cost
@@ -367,23 +421,27 @@ jobs:
             results/ci/route-*.json
             results/ci/capacity-*/*.txt
             results/ci/capacity-*/*.json
-      - name: Compare throughput, latency, CPU, and memory
-        run: |
-          python3 scripts/benchmark-etcd.py --binary tmp/performance/head             --baseline-binary tmp/performance/base --baseline-concurrency 8 32             --requests 5000 --read-requests 60000             --keys 1000 --value-size 256 --concurrency 1 8 32 --read-percent 0 50 100             --warmup 200 --repeat 3 --output results/ci/benchmark-linux.json
-          python3 scripts/summarize-benchmark.py results/ci/benchmark-linux.json             --output results/ci/benchmark-summary.json >> "$GITHUB_STEP_SUMMARY"
       - name: Compare server resources at the same write rate
+        if: matrix.group == 'writes'
         run: |
           python3 scripts/benchmark-etcd.py --binary tmp/performance/head \
             --baseline-binary tmp/performance/base --rate 1000 --concurrency 32 --read-percent 0 \
             --requests 6000 --keys 1000 --value-size 256 --warmup 200 --repeat 3 \
             --output results/ci/benchmark-paced.json
       - name: Compare binary writes
+        if: matrix.group == 'writes'
         run: |
           python3 scripts/benchmark-etcd.py --binary tmp/performance/head \
             --baseline-binary tmp/performance/base --concurrency 32 --read-percent 0 \
             --value-pattern binary --requests 12000 --keys 1000 --value-size 256 \
             --warmup 200 --repeat 3 --output results/ci/benchmark-binary.json
+      - name: Compare throughput, latency, CPU, and memory
+        if: matrix.group == 'throughput'
+        run: |
+          python3 scripts/benchmark-etcd.py --binary tmp/performance/head             --baseline-binary tmp/performance/base --baseline-concurrency 8 32             --requests 5000 --read-requests 60000             --keys 1000 --value-size 256 --concurrency 1 8 32 --read-percent 0 50 100             --warmup 200 --repeat 3 --output results/ci/benchmark-linux.json
+          python3 scripts/summarize-benchmark.py results/ci/benchmark-linux.json             --output results/ci/benchmark-summary.json >> "$GITHUB_STEP_SUMMARY"
       - name: Compare writes during physical compaction
+        if: matrix.group == 'writes'
         run: |
           python3 scripts/benchmark-etcd.py --binary tmp/performance/head \
             --baseline-binary tmp/performance/base --concurrency 32 --read-percent 0 --rate 1000 \
@@ -391,6 +449,7 @@ jobs:
             --requests 10000 --keys 1000 --warmup 200 --repeat 2 \
             --output results/ci/benchmark-compact.json
       - name: Compare writes during physical compaction on RustFS
+        if: matrix.group == 'writes'
         run: |
           python3 scripts/benchmark-etcd.py --rustfs --binary tmp/performance/head \
             --baseline-binary tmp/performance/base --backends baseline service \
@@ -403,6 +462,7 @@ jobs:
             --requests 10000 --keys 1000 --warmup 200 --repeat 2 \
             --output results/ci/benchmark-rustfs-stress.json
       - name: Sample Linux CPU stacks after warmup
+        if: matrix.group == 'writes'
         run: |
           for backend in base head; do
             python3 scripts/profile-linux.py --binary "tmp/performance/$backend"               --read-percent 0 --requests 5000 --output "results/ci/profile-$backend-write"
@@ -412,7 +472,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: linux-performance
+          name: linux-performance-${{ matrix.group }}
           path: |
             results/ci/*.json
             results/ci/profile-*/*.json
