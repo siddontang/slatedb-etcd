@@ -188,7 +188,32 @@ jobs:
           git worktree add --detach "$RUNNER_TEMP/performance-base" "$BASE_SHA"
           CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --locked --release             --manifest-path "$RUNNER_TEMP/performance-base/Cargo.toml"
           cp target/release/slatedb-etcd tmp/performance/base
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --locked --release \
+            --features write-profile --manifest-path "$RUNNER_TEMP/performance-base/Cargo.toml"
+          cp target/release/slatedb-etcd tmp/performance/base-counted
           git worktree remove "$RUNNER_TEMP/performance-base"
+      - name: Measure three-member write costs
+        run: |
+          cargo build --locked --release --features write-profile
+          python3 scripts/benchmark-etcd.py --binary target/release/slatedb-etcd \
+            --baseline-binary tmp/performance/base-counted --backends baseline service \
+            --concurrency 32 --read-percent 0 --value-pattern metadata --requests 12000 \
+            --keys 1000 --value-size 256 --warmup 200 --repeat 3 --output results/ci/write-cost.json
+          for kind in service etcd; do
+            binary=tmp/performance/head
+            if [ "$kind" = etcd ]; then binary=tmp/benchmark-tools/etcd; fi
+            python3 scripts/profile-linux.py --binary "$binary" --backend "$kind" \
+              --concurrency 32 --read-percent 0 --requests 12000 --value-pattern metadata \
+              --output "results/ci/capacity-$kind" --skip-inline
+          done
+      - name: Save write cost measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-write-cost
+          path: |
+            results/ci/write-cost.json
+            results/ci/capacity-*/*.txt
+            results/ci/capacity-*/*.json
       - name: Compare throughput, latency, CPU, and memory
         run: |
           python3 scripts/benchmark-etcd.py --binary tmp/performance/head             --baseline-binary tmp/performance/base --baseline-concurrency 8 32             --requests 5000 --read-requests 60000             --keys 1000 --value-size 256 --concurrency 1 8 32 --read-percent 0 50 100             --warmup 200 --repeat 3 --output results/ci/benchmark-linux.json
