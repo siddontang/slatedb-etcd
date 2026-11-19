@@ -101,7 +101,7 @@ macOS sampling reads `ps` counters. Both exclude child processes and the control
 Use `--rustfs` for a temporary local RustFS server. The report records its version and binary hash.
 The client uses HTTP over loopback. CPU and RSS cover the etcd-compatible servers.
 They exclude the RustFS process. The fixture removes its data after the run.
-Linux CI compares the base and head with this fixture at 1,000 puts per second.
+Linux CI compares the base and head at 300 puts/s. It also checks the head at 1,000 puts/s.
 
 ```sh
 python3 scripts/benchmark-etcd.py --rustfs --requests 6000 --keys 1000 --repeat 3 \
