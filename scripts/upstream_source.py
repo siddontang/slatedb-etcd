@@ -41,7 +41,7 @@ def stop(process):
             process.wait()
 
 
-def start_cluster(stack, directory, executable, target, members, ctl, snapshot, quota, strict=True):
+def start_cluster(stack, directory, executable, target, members, ctl, snapshot, quota, extra=()):
     with ExitStack() as reservations:
         ports = []
         for _ in range(2 * members):
@@ -63,8 +63,7 @@ def start_cluster(stack, directory, executable, target, members, ctl, snapshot, 
                     "--snapshot-every", str(snapshot)]
             for j in range(members):
                 argv.extend(["--peer", f"{j+1}={peers[j]}", "--client-peer", f"{j+1}={clients[j]}"])
-        argv.extend(["--quota-backend-bytes", str(quota),
-                     "--strict-reconfig-check=" + str(strict).lower()])
+        argv.extend(["--quota-backend-bytes", str(quota), *extra])
         log = stack.enter_context((directory / f"member-{i}.log").open("w"))
         process = subprocess.Popen([executable, *argv], stdout=log, stderr=log)
         stack.callback(stop, process)

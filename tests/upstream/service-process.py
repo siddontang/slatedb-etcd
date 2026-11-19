@@ -29,7 +29,8 @@ def service_args(argv=None):
     parser.add_argument("--listen-metrics-urls")
     passthrough = ("quota-backend-bytes", "strict-reconfig-check", "auth-token", "cert-file",
                    "key-file", "trusted-ca-file", "peer-cert-file", "peer-key-file",
-                   "peer-trusted-ca-file", "metrics")
+                   "peer-trusted-ca-file", "metrics", "watch-progress-notify-interval",
+                   "experimental-watch-progress-notify-interval")
     for flag in passthrough:
         parser.add_argument("--" + flag)
     parser.add_argument("--client-cert-auth", action="store_true")

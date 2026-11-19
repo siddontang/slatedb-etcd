@@ -51,7 +51,7 @@ Unsupported flags return an error. A skip stays visible in the report.
 The full workflow supplies etcd v3.5.20 for mixed-version tests and builds Go failpoints for etcd.
 Supply `--last-release PATH` or `--lazyfs PATH` to select existing binaries on a local host.
 The examples fixture changes the server endpoints. Each example retains its upstream assertion
-and runs in its own process. The fixture disables strict reconfiguration for membership examples.
+and runs in its own process. The cluster uses a 200 ms Watch interval and permits member changes.
 Use a disposable Linux host for full process campaigns. They stop members and mount filesystems.
 
 The service still has gaps in AutoTLS, Unix sockets, gRPC proxy mode, rolling etcd upgrades,
@@ -86,8 +86,8 @@ Use the [resource benchmark](../../docs/benchmarks.md) for process CPU and memor
 
 ## CI and results
 
-Pull requests run the full CLI smoke profile, the source coverage check, the client KV examples,
-and four HashKV process cases with current members.
+Pull requests run the full CLI smoke profile and the source coverage check.
+They also run all client examples with expected output and four current-member HashKV cases.
 The weekly and manual **Full etcd suites** workflow runs all Go suites and load profiles
 on one and three members. The heatmap runs on demand from the CLI.
 CI stores the results as artifacts, including failures. Each process job requires zero skips.

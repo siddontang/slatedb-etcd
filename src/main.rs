@@ -75,6 +75,10 @@ struct Args {
     /// Zero disables automatic snapshots. The checkpoint endpoint remains available.
     #[arg(long, default_value_t = 1000)]
     snapshot_every: u64,
+    /// Interval between idle Watch progress responses. Positive values have a 100 ms minimum.
+    #[arg(long, alias = "experimental-watch-progress-notify-interval", default_value = "10s",
+          value_parser = humantime::parse_duration)]
+    watch_progress_notify_interval: std::time::Duration,
     /// Log entry cache budget in bytes.
     #[arg(long, default_value_t = 8 * 1024 * 1024)]
     log_cache_bytes: usize,
@@ -145,6 +149,7 @@ async fn run(args: Args) -> Result<()> {
         },
         object_store: args.object_store.config()?,
         snapshot_every: args.snapshot_every,
+        watch_progress_notify_interval: args.watch_progress_notify_interval,
         log_memory: LogMemory {
             cache_bytes: args.log_cache_bytes,
             pending_bytes: args.log_pending_bytes,

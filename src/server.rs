@@ -40,6 +40,8 @@ pub struct ServerConfig {
     pub peer_tls: crate::tls::Options,
     pub object_store: crate::object::Config,
     pub snapshot_every: u64,
+    /// Interval between idle Watch progress responses.
+    pub watch_progress_notify_interval: Duration,
     pub log_memory: LogMemory,
     /// Zero selects the default 2 GiB quota. A negative value disables the quota.
     pub quota_bytes: i64,
@@ -67,6 +69,7 @@ impl ServerConfig {
             client_tls: crate::tls::Options::default(),
             peer_tls: crate::tls::Options::default(),
             object_store: crate::object::Config::Local,
+            watch_progress_notify_interval: crate::grpc::DEFAULT_WATCH_PROGRESS_INTERVAL,
             snapshot_every: 1000,
             log_memory: LogMemory::default(),
             quota_bytes: 0,
@@ -224,12 +227,13 @@ impl Server {
             )?;
         }
         let (events, receiver) = mpsc::channel(2048);
-        let grpc = crate::grpc::service(
+        let grpc = crate::grpc::service_with_watch_interval(
             config.id,
             events.clone(),
             &config.peers,
             tokens,
             transport.clone(),
+            config.watch_progress_notify_interval,
         )?;
         let node = Node::open(
             NodeOptions {

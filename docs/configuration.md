@@ -61,6 +61,12 @@ See the [metrics guide](metrics.md) for listener security and per-member metric 
 Log I/O uses a separate thread. Embedded servers use the caller's runtime.
 More workers can increase task handoffs. Measure the target workload before changing this setting.
 
+## Watch progress
+
+Use `--watch-progress-notify-interval` to set the interval for idle watches with progress enabled.
+The default is 10 seconds. Zero selects the default. Positive values below 100 ms select 100 ms.
+For example, use `--watch-progress-notify-interval=200ms` for the upstream client examples.
+
 ## Storage and log memory
 
 | Flag | Default | Meaning |

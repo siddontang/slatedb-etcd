@@ -86,6 +86,10 @@ def run_go(command, cwd, log_path, selector, suite, env=None):
             match = re.match(r"^(Benchmark\S+?)(?:-\d+)?\s+\d+\s+", output)
             if match:
                 samples.add(match[1])
+            elif event.get("Test", "").startswith("Benchmark") and re.match(
+                    r"^\s*\d+\s+[\d.]+ ns/op", output):
+                # Go can split the benchmark name and its measurements across two JSON events.
+                samples.add(event["Test"])
         status = process.wait()
     passed = status == 0
     if selector or suite == "fuzz":
@@ -152,7 +156,8 @@ def run_examples(source, args):
             # An example can change membership or call log.Fatal. Isolate both kinds of change.
             with tempfile.TemporaryDirectory() as data, ExitStack() as stack:
                 endpoints = start_cluster(stack, Path(data), binary, args.target, 3, ctl, 1000,
-                                          2 * 1024**3, strict=False)
+                                          2 * 1024**3, ["--strict-reconfig-check=false",
+                                                         "--watch-progress-notify-interval=200ms"])
                 env = dict(os.environ, TEST_URLS=endpoints)
                 command = ["go", "tool", "test2json", "-t", executable, "-test.v=test2json",
                            "-test.run=^" + name + "$", "-test.timeout=" + args.timeout]
@@ -234,6 +239,14 @@ def main():
                 name = f"{args.target}-{args.suite}-{label}"
                 log_path = args.output / (name + ".jsonl.gz")
                 result = run_go(command, cwd, log_path, args.run, args.suite)
+                if args.suite == "go-bench":
+                    tests = json.loads(INVENTORY.read_text())["tests"]
+                    expected = {t["name"] for t in tests if t["name"].startswith("Benchmark")
+                                and str(Path(t["file"]).parent) == module}
+                    measured = {name.split("/")[0] for name in result["samples"]}
+                    result["missing_benchmarks"] = sorted(expected - measured)
+                    if result["missing_benchmarks"]:
+                        result["passed"] = result["complete"] = False
                 result.update(target=args.target, suite=args.suite, case=label, module=module)
                 with summary.open("a") as log:
                     log.write(json.dumps(result) + "\n")
