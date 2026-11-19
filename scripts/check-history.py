@@ -9,6 +9,10 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 SIGN_OFF = b"Signed-off-by: siddontang <siddontang@gmail.com>"
+# Maintainer sign-offs. These emails remain public by request.
+MAINTAINER_SIGN_OFFS = (SIGN_OFF, b"Signed-off-by: nolouch <nolouch@gmail.com>")
+# Maintainers who merge pull requests on GitHub with these emails as the author.
+MAINTAINER_EMAILS = (b"nolouch@gmail.com",)
 PUBLIC_EMAIL = re.compile(rb"(?:[\w.+-]+@users\.noreply\.github\.com|noreply@github\.com)\Z")
 SIGN_OFF_LINE = re.compile(rb"Signed-off-by: [^<>\n]+ <([^<>\s]+)>")
 EMAIL = re.compile(rb"[\w.+%-]+@[\w.-]+\.[A-Za-z]{2,}")
@@ -36,12 +40,14 @@ def path_errors(data, name=""):
 
 
 def sign_off_error(trailers, lines, author):
-    """Accept the owner sign-off, or one sign-off by the author with a GitHub public email.
+    """Accept one maintainer sign-off, or one sign-off by the author with a GitHub public email.
 
-    The owner records approval of contributed commits with a signed-off merge commit.
+    A maintainer records approval of contributed commits with a signed-off merge commit.
     """
-    if SIGN_OFF in trailers or SIGN_OFF in lines:
-        if trailers.count(SIGN_OFF) != 1 or lines.count(SIGN_OFF) != 1:
+    if any(line in MAINTAINER_SIGN_OFFS for line in (*trailers, *lines)):
+        in_trailers = [line for line in trailers if line in MAINTAINER_SIGN_OFFS]
+        in_lines = [line for line in lines if line in MAINTAINER_SIGN_OFFS]
+        if len(in_trailers) != 1 or in_lines != in_trailers:
             return "missing or repeated owner sign-off"
         return None
     sign_offs = [line for line in trailers if line.startswith(b"Signed-off-by:")]
@@ -52,6 +58,16 @@ def sign_off_error(trailers, lines, author):
     return None
 
 
+def web_merge(headers, emails):
+    """Return whether a maintainer merged a pull request on GitHub.
+
+    GitHub commits the merge, so the merge itself records the maintainer approval.
+    """
+    return (len(re.findall(rb"(?m)^parent ", headers)) >= 2
+            and emails[b"author"] in MAINTAINER_EMAILS
+            and emails[b"committer"] == b"noreply@github.com")
+
+
 def commit_errors(root, raw):
     headers, message = raw.split(b"\n\n", 1)
     errors = path_errors(message)
@@ -59,13 +75,15 @@ def commit_errors(root, raw):
     for field in (b"author", b"committer"):
         match = re.search(rb"(?m)^" + field + rb" .* <([^<>]+)> ", headers)
         emails[field] = match[1] if match else None
-        if match is None or PUBLIC_EMAIL.fullmatch(match[1]) is None:
+        if match is None or (PUBLIC_EMAIL.fullmatch(match[1]) is None
+                             and not (field == b"author" and match[1] in MAINTAINER_EMAILS)):
             errors.append(field.decode() + " must use a GitHub public email")
     trailers = git(root, "interpret-trailers", "--parse", data=message).splitlines()
     error = sign_off_error(trailers, message.splitlines(), emails[b"author"])
-    if error:
+    if error and not web_merge(headers, emails):
         errors.append(error)
-    remaining = b"\n".join(line for line in message.splitlines() if line != SIGN_OFF)
+    lines = message.splitlines()
+    remaining = b"\n".join(line for line in lines if line not in MAINTAINER_SIGN_OFFS)
     if any(PUBLIC_EMAIL.fullmatch(address) is None for address in EMAIL.findall(remaining)):
         errors.append("personal email outside the owner sign-off")
     return errors

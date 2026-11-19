@@ -72,7 +72,10 @@ git commit --signoff
 ```
 
 The owner records approval of contributed commits with a signed-off merge commit.
-The owner email remains public in this trailer by request.
+The maintainer `Signed-off-by: nolouch <nolouch@gmail.com>` is accepted the same way.
+A maintainer may merge on GitHub with `nolouch@gmail.com` as the merge author.
+That merge commit records the approval, so it needs no sign-off.
+The owner and maintainer emails remain public by request.
 A sign-off records approval under the project policy. It is not a cryptographic signature.
 Do not add another person's sign-off without their authorization.
 Do not claim full etcd or Jepsen coverage from the imported common suite.
