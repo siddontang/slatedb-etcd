@@ -206,6 +206,18 @@ jobs:
               --concurrency 32 --read-percent 0 --requests 12000 --value-pattern metadata \
               --output "results/ci/capacity-$kind" --skip-inline
           done
+      - name: Compare writes through all members and each role
+        run: |
+          python3 scripts/benchmark-etcd.py --binary tmp/performance/head \
+            --baseline-binary tmp/performance/base --concurrency 32 --read-percent 0 \
+            --value-pattern metadata --requests 12000 --keys 1000 --value-size 256 \
+            --warmup 200 --repeat 3 --output results/ci/benchmark-metadata.json
+          for role in leader follower; do
+            python3 scripts/benchmark-etcd.py --binary tmp/performance/head \
+              --client-target "$role" --concurrency 32 --read-percent 0 --value-pattern metadata \
+              --requests 12000 --keys 1000 --value-size 256 --warmup 200 --repeat 3 \
+              --output "results/ci/route-$role.json"
+          done
       - name: Save write cost measurements
         uses: actions/upload-artifact@v4
         with:
@@ -213,6 +225,8 @@ jobs:
           retention-days: 14
           path: |
             results/ci/write-cost.json
+            results/ci/benchmark-metadata.json
+            results/ci/route-*.json
             results/ci/capacity-*/*.txt
             results/ci/capacity-*/*.json
       - name: Compare throughput, latency, CPU, and memory
@@ -225,14 +239,12 @@ jobs:
             --baseline-binary tmp/performance/base --rate 1000 --concurrency 32 --read-percent 0 \
             --requests 6000 --keys 1000 --value-size 256 --warmup 200 --repeat 3 \
             --output results/ci/benchmark-paced.json
-      - name: Compare binary and metadata writes
+      - name: Compare binary writes
         run: |
-          for pattern in binary metadata; do
-            python3 scripts/benchmark-etcd.py --binary tmp/performance/head \
-              --baseline-binary tmp/performance/base --concurrency 32 --read-percent 0 \
-              --value-pattern "$pattern" --requests 12000 --keys 1000 --value-size 256 \
-              --warmup 200 --repeat 3 --output "results/ci/benchmark-$pattern.json"
-          done
+          python3 scripts/benchmark-etcd.py --binary tmp/performance/head \
+            --baseline-binary tmp/performance/base --concurrency 32 --read-percent 0 \
+            --value-pattern binary --requests 12000 --keys 1000 --value-size 256 \
+            --warmup 200 --repeat 3 --output results/ci/benchmark-binary.json
       - name: Compare writes during physical compaction
         run: |
           python3 scripts/benchmark-etcd.py --binary tmp/performance/head \

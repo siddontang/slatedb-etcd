@@ -573,7 +573,12 @@ Read completions omit unchanged member, Auth, and Lease metadata.
 Maintenance completions retain metadata because they can advance the durable apply index.
 The gRPC KV response path uses typed values through apply and the Raft owner.
 Point reads avoid building an unused mutation plan. They retain MVCC and permission checks.
+The Raft owner publishes the current leader ID to the gRPC service.
+A follower can route an ordinary Put directly to that leader.
+The receiving member checks leadership. A forwarded request makes at most one peer RPC.
 Forwarded KV writes wait for local revision progress without another quorum round.
+Apply encodes each ordinary Put value once for the current, hash, history, and Watch rows.
+It adds each row to the storage batch and updates quota before it evaluates the next Put.
 Append-only MVCC, Watch, and hash records skip quota lookups for keys absent before the batch.
 Other mutations still read prior values. Final mutations determine the byte counter.
 

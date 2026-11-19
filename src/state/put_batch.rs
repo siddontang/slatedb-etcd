@@ -192,13 +192,21 @@ mod tests {
             let mut separate = StateMachine::open(right.path()).await.unwrap();
             grouped.quota = quota;
             separate.quota = quota;
-            let requests = [
+            let mut requests = [
                 request(b"a", b"old"),
                 request(b"", b"invalid"),
                 request(b"a", b"new"),
                 request(b"b", b"value"),
                 request(b"a", b"last"),
+                request(&[0, 255], &[0; 4096]),
+                request(&[0, 255], b""),
             ];
+            for (i, op) in requests.iter_mut().enumerate() {
+                let Some(Op::RequestPut(put)) = op.request.as_mut() else {
+                    unreachable!()
+                };
+                put.prev_kv = i % 2 == 1;
+            }
             let puts: Vec<_> = requests
                 .iter()
                 .enumerate()

@@ -198,3 +198,14 @@ The diagnostic build reads the worker thread CPU clock around each active poll o
 Waiting for a device or a task does not consume thread CPU.
 The three stages exclude RPC handling, checkpoint tasks, and background storage work.
 Use the separate native runs for throughput, p99 latency, process CPU, and peak RSS.
+Use `--client-target leader` or `--client-target follower` to measure one endpoint.
+The client checks the role and Raft term again after the run. All three servers still replicate.
+The default client uses all endpoints.
+
+In the first instrumented run, apply used 50 µs and 189 allocations per completed Put.
+Raft used 30 µs and 16 allocations. The WAL used 23 µs and 2.7 allocations.
+The three server processes used 395 µs per Put. Most CPU time fell outside the three workers.
+Native stacks included memory allocation, socket writes, and thread scheduling.
+The [write cost comparison][write-cost-pr] records the paired capacity measurements.
+
+[write-cost-pr]: https://github.com/siddontang/slatedb-etcd/pull/18

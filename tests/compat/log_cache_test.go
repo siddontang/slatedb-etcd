@@ -118,16 +118,27 @@ func TestFollowerReadIndexWaitsForLocalApply(t *testing.T) {
 
 func TestForwardedWriteWaitsForLocalApply(t *testing.T) {
 	c := newCluster(t)
-	follower := c.leader()%3 + 1
+	leader := c.leader()
+	follower := leader%3 + 1
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	_, err := c.http(follower, "/debug/apply-delay", map[string]any{"delay_ms": 2500})
-	require.NoError(t, err)
 	api := client(t, []string{c.addresses[follower-1]})
+	initial, err := api.Put(ctx, "forwarded-barrier", "before")
+	require.NoError(t, err)
+	next := follower%3 + 1
+	sender := client(t, []string{c.addresses[leader-1]})
+	_, err = sender.MoveLeader(ctx, uint64(next))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		status, err := api.Status(ctx, c.addresses[follower-1])
+		return err == nil && status.Leader == uint64(next)
+	}, 5*time.Second, 10*time.Millisecond)
+	_, err = c.http(follower, "/debug/apply-delay", map[string]any{"delay_ms": 2500})
+	require.NoError(t, err)
 	replies := make(chan *clientv3.PutResponse, 1)
 	errors := make(chan error, 1)
 	go func() {
-		response, err := api.Put(ctx, "forwarded-barrier", "value")
+		response, err := api.Put(ctx, "forwarded-barrier", "value", clientv3.WithPrevKV())
 		replies <- response
 		errors <- err
 	}()
@@ -148,6 +159,9 @@ func TestForwardedWriteWaitsForLocalApply(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, <-errors)
 	written := <-replies
+	require.NotNil(t, written.PrevKv)
+	require.Equal(t, initial.Header.Revision, written.PrevKv.ModRevision)
+	require.Equal(t, uint64(follower), written.Header.MemberId)
 	result, err := api.Get(ctx, "forwarded-barrier",
 		clientv3.WithSerializable(), clientv3.WithRev(written.Header.Revision))
 	require.NoError(t, err)

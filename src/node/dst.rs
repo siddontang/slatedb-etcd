@@ -1304,6 +1304,10 @@ impl Simulation {
                 sim.deliver(false).await;
             }
         }
+        let leader = sim.leader().unwrap();
+        for node in sim.nodes.values() {
+            assert_eq!(node.forwarding.subscribe().leader(), leader);
+        }
         // Fail a cache-miss read through the real disk executor, then restart the node.
         for _ in 0..8 {
             sim.propose().await;
