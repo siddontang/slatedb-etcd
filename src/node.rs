@@ -598,7 +598,7 @@ impl Node {
                             leader: self.raw.raft.leader_id,
                             raft_index: self.raw.store().commit_index(),
                             raft_term: self.raw.raft.term,
-                            version: "3.6.5".into(),
+                            version: crate::ETCD_API_VERSION.into(),
                             storage_version: "3.6.0".into(),
                             ..Default::default()
                         };

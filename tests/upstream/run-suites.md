@@ -47,6 +47,7 @@ microbenchmark duration. Each Go benchmark defaults to one iteration for a cover
 The fixture translates static loopback member addresses and bootstrap IDs for the Rust CLI.
 It calls etcdctl endpoint health before returning a ready member. The Go overlay changes the
 process fixture. Upstream tests, failpoints, workloads, assertions, and checkers keep their code.
+The fixture reads the advertised etcd API version from the binary to select scenarios.
 Unsupported flags return an error. A skip stays visible in the report.
 The full workflow supplies etcd v3.5.20 for mixed-version tests and builds Go failpoints for etcd.
 Supply `--last-release PATH` or `--lazyfs PATH` to select existing binaries on a local host.

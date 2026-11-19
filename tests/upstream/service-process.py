@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import os
 from pathlib import Path
+import subprocess
 import sys
 from urllib.parse import urlsplit
 
@@ -66,4 +67,12 @@ def service_args(argv=None):
 
 if __name__ == "__main__":
     binary = str(Path(sys.argv[0]).absolute().with_name("slatedb-etcd"))
-    os.execv(binary, [binary, *service_args()])
+    if sys.argv[1:] == ["--version"]:
+        output = subprocess.check_output([binary, "--version"], text=True)
+        # The upstream fixture selects test scenarios by the advertised etcd version.
+        version = next(line.removeprefix("etcd API version: ") for line in output.splitlines()
+                       if line.startswith("etcd API version: "))
+        print(output.rstrip())
+        print(f"etcd Version: {version}")
+    else:
+        os.execv(binary, [binary, *service_args()])

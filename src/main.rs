@@ -12,9 +12,18 @@ use clap::Parser;
 use slatedb_etcd::node::LogMemory;
 use slatedb_etcd::server::{Server, ServerConfig};
 
+static LONG_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "{}\netcd API version: {}",
+        env!("CARGO_PKG_VERSION"),
+        slatedb_etcd::ETCD_API_VERSION
+    )
+});
+
 #[derive(Parser)]
 #[group(id = "ServerArgs")]
-#[command(about = "Experimental etcd v3 service with Raft and SlateDB")]
+#[command(version, long_version = LONG_VERSION.as_str(),
+          about = "Experimental etcd v3 service with Raft and SlateDB")]
 struct Args {
     /// Async worker count. Log writes use a separate thread.
     #[arg(long, default_value = "2")]
