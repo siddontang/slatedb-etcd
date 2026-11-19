@@ -1082,12 +1082,11 @@ impl Simulation {
         let before = self.nodes[&leader].state.write_batches;
         let mut replies = vec![];
         // Keep one large value through Watch replay, compaction, and checkpoint recovery.
-        let batch_value = |index: usize| {
-            if index == 15 {
-                vec![b'v'; 64 * 1024]
-            } else {
-                format!("v{index}").into_bytes()
-            }
+        let batch_value = |index: usize| match index {
+            3 => vec![],
+            7 => vec![0, 255, 0, 127],
+            15 => vec![b'v'; 64 * 1024],
+            _ => format!("v{index}").into_bytes(),
         };
         for index in 0..16 {
             let (tx, rx) = oneshot::channel();
@@ -1102,7 +1101,7 @@ impl Simulation {
                             request: Some(Op::RequestPut(PutRequest {
                                 key: b"batch-key".to_vec(),
                                 value: batch_value(index),
-                                prev_kv: true,
+                                prev_kv: index % 2 == 0,
                                 ..Default::default()
                             })),
                         },
@@ -1135,7 +1134,10 @@ impl Simulation {
             );
             assert_eq!(
                 value.prev_kv.map(|kv| kv.value),
-                offset.checked_sub(1).map(batch_value)
+                offset
+                    .checked_sub(1)
+                    .filter(|_| offset % 2 == 0)
+                    .map(batch_value)
             );
         }
         self.paused_reads = None;
@@ -1180,6 +1182,12 @@ impl Simulation {
                 let kv = event.kv.as_ref().unwrap();
                 assert_eq!(kv.mod_revision, old_revision + offset as i64 + 1);
                 assert_eq!(kv.value, batch_value(offset));
+                assert_eq!(kv.create_revision, old_revision + 1);
+                assert_eq!(kv.version, offset as i64 + 1);
+                let previous = offset
+                    .checked_sub(1)
+                    .map(|i| events[i].kv.as_ref().unwrap());
+                assert_eq!(event.prev_kv.as_ref(), previous);
             }
             assert_eq!(
                 state.logical_size(),
@@ -1295,6 +1303,10 @@ impl Simulation {
             for _ in 0..30 {
                 sim.deliver(false).await;
             }
+        }
+        let leader = sim.leader().unwrap();
+        for node in sim.nodes.values() {
+            assert_eq!(node.forwarding.subscribe().leader(), leader);
         }
         // Fail a cache-miss read through the real disk executor, then restart the node.
         for _ in 0..8 {

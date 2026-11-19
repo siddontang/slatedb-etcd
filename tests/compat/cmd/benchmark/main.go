@@ -66,6 +66,7 @@ func main() {
 	size := flag.Int("value-size", 256, "Value size in bytes")
 	warmup := flag.Int("warmup", 100, "Unmeasured operations after preload")
 	seed := flag.Uint64("seed", 42, "Deterministic workload seed")
+	role := flag.String("client-target", "all", "Client endpoint role: all, leader, or follower")
 	control := flag.String("control-dir", "", "Optional controller barrier directory")
 	output := flag.String("output", "", "JSON result file")
 	flag.Parse()
@@ -79,13 +80,19 @@ func main() {
 		panic(err)
 	}
 	defer client.Close()
+	var endpoint string
+	var term uint64
 	deadline := time.Now().Add(30 * time.Second)
-	for _, endpoint := range client.Endpoints() {
+	for _, member := range client.Endpoints() {
 		for {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			status, err := client.Status(ctx, endpoint)
+			status, err := client.Status(ctx, member)
 			cancel()
 			if err == nil && status.Leader != 0 {
+				leader := status.Leader == status.Header.MemberId
+				if endpoint == "" && ((*role == "leader" && leader) || (*role == "follower" && !leader)) {
+					endpoint, term = member, status.RaftTerm
+				}
 				break
 			}
 			if time.Now().After(deadline) {
@@ -93,6 +100,12 @@ func main() {
 			}
 			time.Sleep(25 * time.Millisecond)
 		}
+	}
+	if *role != "all" {
+		if endpoint == "" {
+			panic("no ready member for the requested role")
+		}
+		client.SetEndpoints(endpoint)
 	}
 	values, err := makeValues(*pattern, *size, *keys+*requests+*warmup)
 	if err != nil {
@@ -201,6 +214,16 @@ func main() {
 		"latency_ms": percentiles(samples), "read_latency_ms": percentiles(getSamples),
 		"write_latency_ms": percentiles(putSamples),
 		"model":            "bounded concurrency; seeded uniform keys and reads; paced latency starts at the scheduled arrival"}
+	report["client_target"] = *role
+	if endpoint != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		status, err := client.Status(ctx, endpoint)
+		cancel()
+		if err != nil || status.RaftTerm != term || status.Leader == 0 ||
+			(status.Leader == status.Header.MemberId) != (*role == "leader") {
+			panic("the selected member changed role during the run")
+		}
+	}
 	report["compact_every"] = schedule.every
 	report["retain_revisions"] = schedule.retain
 	report["physical_compactions"] = len(schedule.latencies)

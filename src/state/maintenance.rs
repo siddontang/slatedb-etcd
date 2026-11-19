@@ -301,7 +301,7 @@ pub(crate) fn record_hash(
 }
 
 pub(crate) fn hash_key(revision: i64, sub: i64, deleted: bool) -> Vec<u8> {
-    let mut key = Vec::with_capacity(HASH.len() + 18);
+    let mut key = Vec::with_capacity(HASH.len() + 17 + usize::from(deleted));
     key.extend_from_slice(HASH);
     key.extend_from_slice(&revision.to_be_bytes());
     key.push(b'_');

@@ -30,6 +30,53 @@ impl Forwarding {
 }
 
 impl Service {
+    pub(super) fn cached_remote_leader(&self) -> Option<u64> {
+        let leader = self.forwarding.view.get()?.leader();
+        (leader != 0 && leader != self.member).then_some(leader)
+    }
+
+    pub(super) async fn forward_kv(
+        &self,
+        leader: u64,
+        op: Op,
+        credentials: &crate::auth::Credentials,
+    ) -> Result<ResponseOp, Status> {
+        let channel = self.peer_channel(leader).await?;
+        let mut client = KvClient::new(channel).max_decoding_message_size(64 * 1024 * 1024);
+        let response = match op {
+            Op::RequestRange(r) => Resp::ResponseRange(
+                client
+                    .range(forward_auth(r, credentials))
+                    .await?
+                    .into_inner(),
+            ),
+            Op::RequestPut(r) => {
+                Resp::ResponsePut(client.put(forward_auth(r, credentials)).await?.into_inner())
+            }
+            Op::RequestDeleteRange(r) => Resp::ResponseDeleteRange(
+                client
+                    .delete_range(forward_auth(r, credentials))
+                    .await?
+                    .into_inner(),
+            ),
+            Op::RequestTxn(r) => {
+                Resp::ResponseTxn(client.txn(forward_auth(r, credentials)).await?.into_inner())
+            }
+        };
+        let mut response = ResponseOp {
+            response: Some(response),
+        };
+        let revision = mvcc::response_header(&mut response)
+            .ok_or_else(|| Status::internal("forwarded KV response has no header"))?
+            .revision;
+        // The leader already confirmed this result. Only local MVCC progress is missing.
+        self.wait_revision(revision).await?;
+        if let Some(header) = mvcc::response_header(&mut response) {
+            header.member_id = self.member;
+        }
+        Ok(response)
+    }
+
     async fn forward_view(&self) -> Result<&ForwardView, Status> {
         let unavailable = || Status::unavailable("etcdserver: node unavailable");
         if self.events.is_closed() {

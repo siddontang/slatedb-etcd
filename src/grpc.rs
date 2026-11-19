@@ -121,19 +121,29 @@ impl Service {
         forwarded: bool,
         credentials: crate::auth::Credentials,
     ) -> Result<ResponseOp, Status> {
-        let request = RequestOp {
-            request: Some(op.clone()),
-        };
+        let request = RequestOp { request: Some(op) };
         if request.encoded_len() > 1536 * 1024 {
             return Err(Status::resource_exhausted(
                 "etcdserver: request is too large",
             ));
         }
         mvcc::validate(&request).map_err(|e| e.status())?;
+        if !forwarded && mvcc::batchable_put(&request) {
+            if let Some(leader) = self.cached_remote_leader() {
+                return self
+                    .forward_kv(leader, request.request.unwrap(), &credentials)
+                    .await;
+            }
+        }
+        let redirect = if forwarded {
+            None
+        } else {
+            request.request.clone().map(|op| (op, credentials.clone()))
+        };
         let (tx, rx) = oneshot::channel();
         let event = Event::Kv(request, tx);
         self.events
-            .try_send(Event::Authenticated(credentials.clone(), Box::new(event)))
+            .try_send(Event::Authenticated(credentials, Box::new(event)))
             .map_err(|_| Status::unavailable("etcdserver: too many requests"))?;
         let reply = tokio::time::timeout(Duration::from_secs(10), rx)
             .await
@@ -141,51 +151,12 @@ impl Service {
                 Status::deadline_exceeded("etcdserver: request timed out; outcome unknown")
             })?
             .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?;
-        match reply {
-            Ok(outcome) => outcome.result.map_err(|e| e.status()),
-            Err(error) if error.error == "not leader" && !forwarded => {
-                let channel = self.peer_channel(error.leader_id).await?;
-                let mut client = KvClient::new(channel).max_decoding_message_size(64 * 1024 * 1024);
-                let response = match op {
-                    Op::RequestRange(r) => Resp::ResponseRange(
-                        client
-                            .range(forward_auth(r, &credentials))
-                            .await?
-                            .into_inner(),
-                    ),
-                    Op::RequestPut(r) => Resp::ResponsePut(
-                        client
-                            .put(forward_auth(r, &credentials))
-                            .await?
-                            .into_inner(),
-                    ),
-                    Op::RequestDeleteRange(r) => Resp::ResponseDeleteRange(
-                        client
-                            .delete_range(forward_auth(r, &credentials))
-                            .await?
-                            .into_inner(),
-                    ),
-                    Op::RequestTxn(r) => Resp::ResponseTxn(
-                        client
-                            .txn(forward_auth(r, &credentials))
-                            .await?
-                            .into_inner(),
-                    ),
-                };
-                let mut response = ResponseOp {
-                    response: Some(response),
-                };
-                let revision = mvcc::response_header(&mut response)
-                    .ok_or_else(|| Status::internal("forwarded KV response has no header"))?
-                    .revision;
-                // The leader already confirmed this result. Only local MVCC progress is missing.
-                self.wait_revision(revision).await?;
-                if let Some(header) = mvcc::response_header(&mut response) {
-                    header.member_id = self.member;
-                }
-                Ok(response)
+        match (reply, redirect) {
+            (Ok(outcome), _) => outcome.result.map_err(|e| e.status()),
+            (Err(error), Some((op, credentials))) if error.error == "not leader" => {
+                self.forward_kv(error.leader_id, op, &credentials).await
             }
-            Err(error) => Err(Status::unavailable(format!("etcdserver: {}", error.error))),
+            (Err(error), _) => Err(Status::unavailable(format!("etcdserver: {}", error.error))),
         }
     }
 }

@@ -82,6 +82,7 @@ def main():
     parser.add_argument("--requests", type=int, default=20000)
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--keys", type=int, default=1000)
+    parser.add_argument("--value-pattern", choices=["repeat", "binary", "metadata"], default="repeat")
     parser.add_argument("--value-size", type=int, default=256)
     parser.add_argument("--warmup", type=int, default=200)
     parser.add_argument("--snapshot-entries", type=int, default=1000)

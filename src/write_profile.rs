@@ -20,6 +20,7 @@ use Stage::*;
 
 #[derive(Default)]
 struct Counts {
+    cpu_ns: AtomicU64,
     batches: AtomicU64,
     entries: AtomicU64,
     allocations: AtomicU64,
@@ -29,6 +30,7 @@ struct Counts {
 
 static COUNTS: [Counts; 3] = [const {
     Counts {
+        cpu_ns: AtomicU64::new(0),
         batches: AtomicU64::new(0),
         entries: AtomicU64::new(0),
         allocations: AtomicU64::new(0),
@@ -39,17 +41,40 @@ static COUNTS: [Counts; 3] = [const {
 
 thread_local! { static ACTIVE: Cell<Option<Stage>> = const { Cell::new(None) }; }
 
-pub(crate) struct Scope(Option<Stage>);
+pub(crate) struct Scope {
+    previous: Option<Stage>,
+    stage: Stage,
+    start: u64,
+}
+
+fn thread_cpu_ns() -> u64 {
+    let mut ts = std::mem::MaybeUninit::uninit();
+    // The kernel initializes the timespec on success.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, ts.as_mut_ptr()) };
+    assert_eq!(rc, 0, "thread CPU clock failed");
+    let ts = unsafe { ts.assume_init() };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
 
 impl Drop for Scope {
     fn drop(&mut self) {
-        ACTIVE.set(self.0);
+        let elapsed = thread_cpu_ns() - self.start;
+        COUNTS[self.stage as usize]
+            .cpu_ns
+            .fetch_add(elapsed, Relaxed);
+        ACTIVE.set(self.previous);
     }
 }
 
 impl Stage {
     pub(crate) fn enter(self) -> Scope {
-        Scope(ACTIVE.replace(Some(self)))
+        let previous = ACTIVE.replace(Some(self));
+        debug_assert!(previous.is_none());
+        Scope {
+            previous,
+            stage: self,
+            start: thread_cpu_ns(),
+        }
     }
 
     pub(crate) fn batch(self, entries: usize) {
@@ -147,6 +172,7 @@ pub(crate) fn snapshot() -> Value {
     for (name, stage) in [("raft", Raft), ("wal", Wal), ("apply", Apply)] {
         let counts = &COUNTS[stage as usize];
         result[name] = json!({
+            "cpu_ns": counts.cpu_ns.load(Relaxed),
             "batches": counts.batches.load(Relaxed), "entries": counts.entries.load(Relaxed),
             "allocation_calls": counts.allocations.load(Relaxed), "requested_bytes": counts.bytes.load(Relaxed),
             "wakes_from_raft": counts.wakes_from[Raft as usize].load(Relaxed),

@@ -30,6 +30,7 @@ impl Node {
                     self.metrics.leader_changes.inc();
                 }
                 self.last_observed_leader = state.leader_id;
+                self.forwarding.set_leader(state.leader_id);
             }
             #[cfg(feature = "write-profile")]
             crate::write_profile::Stage::Raft.batch(ready.entries().len());

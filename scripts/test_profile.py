@@ -12,7 +12,28 @@ profile = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(profile)
 
 
+spec = importlib.util.spec_from_file_location(
+    "write_summary", Path(__file__).with_name("summarize-write-profile.py"))
+summary = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(summary)
+
+
 class ProfileTests(unittest.TestCase):
+    def test_stage_cost_adds_member_deltas_per_completed_put(self):
+        def counters(base):
+            counts = {"allocation_calls": base, "requested_bytes": 1024 * base,
+                      "batches": base, "cpu_ns": 1000 * base}
+            return {"write_profile": {stage: counts.copy() for stage in summary.STAGES}}
+        sample = {"members": 3, "successes": 6,
+                  "state_counters_before": [counters(i) for i in (5, 6, 7)],
+                  "state_counters_after": [counters(i) for i in (6, 8, 10)]}
+        rows = dict(summary.sample_rows(sample, per_put=True))
+        self.assertEqual(rows["apply"], [1, 1, 1, 1])
+        for snapshot in sample["state_counters_before"] + sample["state_counters_after"]:
+            del snapshot["write_profile"]["raft"]["cpu_ns"]
+        rows = dict(summary.sample_rows(sample, per_put=True))
+        self.assertIsNone(rows["raft"][0])
+
     def test_control_acknowledgments(self):
         for ack in [b"ack\n", b"ack\n\0"]:
             with patch.object(profile.os, "write") as write, \

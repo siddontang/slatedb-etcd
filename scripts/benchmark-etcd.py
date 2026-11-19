@@ -163,6 +163,7 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
                 "--compact-every", str(getattr(args, "compact_every", 0)),
                 "--retain-revisions", str(getattr(args, "retain_revisions", 1000)),
                 "--value-pattern", getattr(args, "value_pattern", "repeat"),
+                "--client-target", getattr(args, "client_target", "all"),
                 "--rate", str(getattr(args, "rate", 0)),
                 "--seed", str(args.seed+repeat), "--control-dir", str(root), "--output", str(result_path)],
                 stdout=log, stderr=log)
@@ -238,6 +239,7 @@ def workload_cases(kinds, concurrency, reads, baseline_concurrency=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--client-target", choices=["all", "leader", "follower"], default="all")
     parser.add_argument("--members", type=int, choices=[1, 3], default=3)
     parser.add_argument("--service-runtime-workers", type=int,
                         help="Override the current service's async worker count")
@@ -317,6 +319,7 @@ def benchmark(args, kinds, store):
               "service_runtime_workers": args.service_runtime_workers,
               "baseline_concurrency": args.baseline_concurrency,
               "settle_seconds_after_warmup": 1,
+              "client_target": args.client_target,
               "deployment": f"{args.members} processes per backend; shared host and disk; loopback plaintext",
               "reference_etcd": "v3.6.5", "state_backend": "s3" if args.s3_bucket else "local",
               "raft_snapshot_entries": args.snapshot_entries, "quota_bytes": args.quota_bytes,
