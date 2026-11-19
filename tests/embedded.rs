@@ -296,3 +296,70 @@ async fn worker_failure_reaches_host_and_releases_storage() {
     assert_eq!(get(&server, b"anchor").await, b"durable");
     server.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn restore_precedes_autotls_and_preserves_the_nonempty_directory_guard() {
+    use slatedb_etcd::proto::etcdserverpb::SnapshotRequest;
+    use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = Server::start(ServerConfig::single_node(dir.path().join("source")))
+        .await
+        .unwrap();
+    ready(&source).await;
+    let channel = Endpoint::from_shared(source.client_url())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    KvClient::new(channel.clone())
+        .put(PutRequest {
+            key: b"restored".to_vec(),
+            value: b"value".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut snapshot = MaintenanceClient::new(channel)
+        .snapshot(SnapshotRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let mut bytes = Vec::new();
+    while let Some(part) = snapshot.message().await.unwrap() {
+        bytes.extend(part.blob);
+    }
+    source.shutdown().await.unwrap();
+    let backup = dir.path().join("snapshot");
+    std::fs::write(&backup, bytes).unwrap();
+
+    let target = dir.path().join("target");
+    let mut config = ServerConfig::single_node(&target);
+    config.restore_snapshot = Some(backup);
+    config.peer_listen = Some(config.listen);
+    config.peers.insert(1, "https://127.0.0.1:0".into());
+    config.client_peers = config.peers.clone();
+    config.client_tls.auto_tls = std::num::NonZeroU32::new(1);
+    config.peer_tls.auto_tls = std::num::NonZeroU32::new(1);
+    let restored = Server::start(config.clone()).await.unwrap();
+    ready(&restored).await;
+    let path = target.join("fixtures/client/cert.pem");
+    let cert = std::fs::read(&path).unwrap();
+    let endpoint = Endpoint::from_shared(restored.client_url())
+        .unwrap()
+        .tls_config(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(cert.clone())))
+        .unwrap();
+    let row = KvClient::new(endpoint.connect().await.unwrap())
+        .range(RangeRequest {
+            key: b"restored".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(row.kvs[0].value, b"value");
+    restored.shutdown().await.unwrap();
+    let error = Server::start(config).await.err().unwrap();
+    assert!(error.to_string().contains("new, empty data directory"));
+    assert_eq!(std::fs::read(path).unwrap(), cert);
+}
