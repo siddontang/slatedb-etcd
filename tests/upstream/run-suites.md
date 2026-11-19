@@ -52,7 +52,8 @@ handle and reuses the queue cluster. The leak check excludes only the Go benchma
 The mutex and queue operations and their assertions use the upstream code.
 
 The fixture translates static loopback member addresses and bootstrap IDs for the Rust CLI.
-It calls etcdctl endpoint health before returning a ready member. The Go overlay changes the
+It checks gRPC health with the configured client TLS settings after the member starts.
+This also works after a member restarts with authentication enabled. The Go overlay changes the
 process fixture. Upstream tests, failpoints, workloads, assertions, and checkers keep their code.
 The fixture reads the advertised etcd API version from the binary to select scenarios.
 Unsupported flags return an error. A skip stays visible in the report.
@@ -95,7 +96,8 @@ Use the [resource benchmark](../../docs/benchmarks.md) for process CPU and memor
 ## CI and results
 
 Pull requests run the full CLI smoke profile and the source coverage check.
-They also run the three recipe benchmarks, all runnable client examples, and four HashKV cases.
+They also run the three recipe benchmarks, all runnable client examples, four HashKV cases,
+and two authentication restart cases.
 The weekly and manual **Full etcd suites** workflow runs all Go suites and load profiles
 on one and three members. It also checks the upstream Prometheus alert rules, release images,
 and archive checksums from both release mirrors. The heatmap runs on demand from the CLI.
