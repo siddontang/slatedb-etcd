@@ -43,6 +43,13 @@ The process runner discovers names from the compiled test binary for the selecte
 Each top-level test has its own timeout. Use `--shards N --shard-index I` to split a suite.
 Use `--run` to select a test or subtest, `--fuzztime` to set fuzz time, and `--benchtime` to set
 microbenchmark duration. Each Go benchmark defaults to one iteration for a coverage check.
+Use `go-bench --package PATH` to run one benchmark package. The path starts at the etcd root.
+
+Three Go benchmarks in the client recipes package need a fixture correction in etcd v3.6.5.
+The upstream leak check counts the Go benchmark coordinator as a leaked goroutine.
+The benchmarks also pass a nil test handle to the cluster. The overlay supplies the benchmark
+handle and reuses the queue cluster. The leak check excludes only the Go benchmark coordinator.
+The mutex and queue operations and their assertions use the upstream code.
 
 The fixture translates static loopback member addresses and bootstrap IDs for the Rust CLI.
 It calls etcdctl endpoint health before returning a ready member. The Go overlay changes the
@@ -88,9 +95,10 @@ Use the [resource benchmark](../../docs/benchmarks.md) for process CPU and memor
 ## CI and results
 
 Pull requests run the full CLI smoke profile and the source coverage check.
-They also run all client examples with expected output and four current-member HashKV cases.
+They also run the three recipe benchmarks, all runnable client examples, and four HashKV cases.
 The weekly and manual **Full etcd suites** workflow runs all Go suites and load profiles
-on one and three members. The heatmap runs on demand from the CLI.
+on one and three members. It also checks the upstream Prometheus alert rules, release images,
+and archive checksums from both release mirrors. The heatmap runs on demand from the CLI.
 CI stores the results as artifacts, including failures. Each process job requires zero skips.
 
 Go runs write compressed JSON events, stderr, and summary records under `tmp/upstream-results`.

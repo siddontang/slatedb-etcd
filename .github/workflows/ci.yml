@@ -112,6 +112,8 @@ jobs:
       - name: Run the official etcd benchmarks and process tests
         run: |
           python3 scripts/test_upstream.py
+          python3 scripts/check-upstream-go.py go-bench --require-complete \
+            --package tests/integration/clientv3/experimental/recipes --output results/ci/upstream-go
           python3 scripts/benchmark-upstream.py --output results/ci/upstream-bench
           python3 scripts/check-upstream-go.py e2e --target service --require-complete \
             --run '^TestVerifyHashKVAfterCompact$/current-version' --output results/ci/upstream-go

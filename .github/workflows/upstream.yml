@@ -36,6 +36,55 @@ jobs:
           name: reference-${{ matrix.suite }}
           path: tmp/upstream-results
 
+  distribution:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [alerts, images, assets]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: etcd-io/etcd
+          ref: a0614505aff9b8ff469e9c59c2d979a5936d13f4
+          persist-credentials: false
+      - name: Test the upstream Prometheus alert rules
+        if: matrix.suite == 'alerts'
+        working-directory: contrib/mixin
+        run: |
+          sudo apt-get update && sudo apt-get install -y jsonnet prometheus
+          mkdir -p manifests
+          jsonnet -e "(import 'mixin.libsonnet').prometheusAlerts" > manifests/etcd-prometheusRules.yaml
+          promtool test rules test.yaml
+      - name: Test the upstream release images
+        if: matrix.suite == 'images'
+        env:
+          VERSION: 3.6.5
+          REPOSITORY: gcr.io/etcd-development/etcd
+        run: |
+          for arch in amd64 arm64 ppc64le s390x; do
+            docker pull --platform "linux/$arch" "$REPOSITORY:v$VERSION-$arch"
+          done
+          ./scripts/test_images.sh
+      - name: Verify the release archives on both mirrors
+        if: matrix.suite == 'assets'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir github-assets google-assets
+          cd github-assets
+          gh release download v3.6.5 --repo etcd-io/etcd
+          test "$(wc -l <SHA256SUMS)" -eq "$(find . -name 'etcd-*' | wc -l)"
+          sha256sum -c SHA256SUMS
+          for file in *; do
+            curl -fsSL --retry 3 -o "../google-assets/$file" \
+              "https://storage.googleapis.com/etcd/v3.6.5/$file"
+          done
+          cd ../google-assets
+          test "$(wc -l <SHA256SUMS)" -eq "$(find . -name 'etcd-*' | wc -l)"
+          sha256sum -c SHA256SUMS
+
   process:
     runs-on: ubuntu-24.04
     timeout-minutes: 320
@@ -73,7 +122,13 @@ jobs:
         working-directory: reference/etcd
         run: |
           mkdir -p bin
-          MANUAL_VER=v3.5.20 PASSES=release ./scripts/test.sh
+          file=etcd-v3.5.20-linux-amd64.tar.gz
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$file" \
+            "https://github.com/etcd-io/etcd/releases/download/v3.5.20/$file"
+          sum=9ac85616fb8c0e45f485074dde0258ca2b7b42f1dd5320821af5a8b66daf7072
+          echo "$sum  $RUNNER_TEMP/$file" | sha256sum -c -
+          tar -xOf "$RUNNER_TEMP/$file" etcd-v3.5.20-linux-amd64/etcd > bin/etcd-last-release
+          chmod +x bin/etcd-last-release
       - name: Install the upstream disk fault fixture
         if: matrix.suite == 'robustness' || matrix.suite == 'e2e'
         working-directory: reference/etcd

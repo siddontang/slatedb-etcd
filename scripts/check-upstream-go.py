@@ -15,16 +15,18 @@ import tempfile
 from upstream_source import ROOT, INVENTORY, build_tool, checked_source, start_cluster
 
 
-def service_overlay(source, directory):
+RECIPES = "tests/integration/clientv3/experimental/recipes"
+
+
+def fixture_overlay(source, directory, patch, files):
     replacements = {}
-    for name in ("cluster.go", "etcd_process.go"):
-        relative = Path("tests/framework/e2e") / name
+    for relative in files:
         copy = directory / relative
         copy.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source / relative, copy)
         replacements[str(source / relative)] = str(copy)
     subprocess.run(["git", "apply", "--no-index", "--unidiff-zero",
-                    ROOT / "tests/upstream/process-fixture.patch"],
+                    ROOT / "tests/upstream" / patch],
                    cwd=directory, check=True)
     overlay = directory / "overlay.json"
     overlay.write_text(json.dumps({"Replace": replacements}))
@@ -187,6 +189,7 @@ def main():
     parser.add_argument("--run", help="Go test name or subtest expression")
     parser.add_argument("--timeout", default="45m", help="Time limit per Go package")
     parser.add_argument("--benchtime", default="1x")
+    parser.add_argument("--package", help="Run Go benchmarks in this source-relative package")
     parser.add_argument("--fuzztime", default="10s")
     parser.add_argument("--output", type=Path, default=ROOT / "tmp/upstream-results")
     parser.add_argument("--last-release", type=Path)
@@ -204,7 +207,14 @@ def main():
         parser.error("This suite links the Go implementation. Use --target etcd.")
     if args.run and args.suite in ("go-bench", "fuzz"):
         parser.error("--run selects tests, not fuzz targets or benchmarks")
+    if args.package and args.suite != "go-bench":
+        parser.error("--package selects a Go benchmark package")
     source = checked_source(args.source)
+    cases = list(go_cases(source, args.suite, args))
+    if args.package:
+        cases = [case for case in cases if case[0] == args.package]
+        if not cases:
+            parser.error("No Go benchmark package matched " + args.package)
     args.output.mkdir(parents=True, exist_ok=True)
     if args.suite == "examples":
         raise SystemExit(not run_examples(source, args))
@@ -223,7 +233,9 @@ def main():
             if args.target == "service":
                 (binaries / "slatedb-etcd").symlink_to(args.binary.resolve(strict=True))
                 (binaries / "etcd").symlink_to(ROOT / "tests/upstream/service-process.py")
-                go_flags.append("-overlay=" + str(service_overlay(source, directory)))
+                files = ["tests/framework/e2e/" + name for name in ("cluster.go", "etcd_process.go")]
+                overlay = fixture_overlay(source, directory, "process-fixture.patch", files)
+                go_flags.append("-overlay=" + str(overlay))
             elif (source / "bin/etcd").is_file():
                 (binaries / "etcd").symlink_to(source / "bin/etcd")
             else:
@@ -235,7 +247,12 @@ def main():
             binary_flags = ["-args", "-bin-dir", str(binaries)]
         if args.run:
             go_flags += ["-run", args.run]
-        for index, (module, flags) in enumerate(go_cases(source, args.suite, args)):
+        for index, (module, flags) in enumerate(cases):
+            if module == RECIPES and args.suite == "go-bench":
+                files = ["client/pkg/testutil/leak.go", RECIPES + "/v3_lock_test.go",
+                         RECIPES + "/v3_queue_test.go"]
+                overlay = fixture_overlay(source, directory, "recipe-benchmark.patch", files)
+                flags = ["-overlay=" + str(overlay), *flags]
             if process_suite and not args.run:
                 runs = process_runs(source, module, flags, go_flags, binary_flags, directory, args)
             else:
