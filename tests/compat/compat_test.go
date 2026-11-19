@@ -27,6 +27,7 @@ import (
 )
 
 type cluster struct {
+	reserved      map[string]net.Listener
 	peerAddresses []string
 	tlsClient     *tls.Config
 	httpClient    *http.Client
@@ -39,15 +40,38 @@ type cluster struct {
 	args          []string
 }
 
-func address(t *testing.T) string {
+func listenLocal(t *testing.T) net.Listener {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr := l.Addr().String()
-	l.Close()
+	return listener
+}
+
+func address(t *testing.T) string {
+	t.Helper()
+	listener := listenLocal(t)
+	defer listener.Close()
+	return listener.Addr().String()
+}
+
+func (c *cluster) reserveAddress() string {
+	c.t.Helper()
+	listener := listenLocal(c.t)
+	addr := listener.Addr().String()
+	c.reserved[addr] = listener
 	return addr
+}
+
+func (c *cluster) releaseAddress(endpoint string) {
+	addr := endpointHost(endpoint)
+	if listener := c.reserved[addr]; listener != nil {
+		if err := listener.Close(); err != nil {
+			c.t.Fatal(err)
+		}
+		delete(c.reserved, addr)
+	}
 }
 
 func newCluster(t *testing.T, extraArgs ...string) *cluster {
@@ -76,8 +100,14 @@ func newClusterConfigured(t *testing.T, size int, configure func(*cluster), extr
 		t.Fatal(err)
 	}
 	c := &cluster{t: t, root: root, binary: binary, args: extraArgs, processes: map[int]*exec.Cmd{}, logs: map[int]*os.File{}}
+	c.reserved = make(map[string]net.Listener)
+	t.Cleanup(func() {
+		for _, listener := range c.reserved {
+			listener.Close()
+		}
+	})
 	for i := 0; i < size; i++ {
-		c.addresses = append(c.addresses, address(t))
+		c.addresses = append(c.addresses, c.reserveAddress())
 	}
 	if configure != nil {
 		configure(c)
@@ -130,6 +160,9 @@ func (c *cluster) start(id int) {
 		"SLATEDB_FAILPOINT_FILE="+filepath.Join(c.root, fmt.Sprintf("fault-%d", id)))
 	cmd.Stdout = file
 	cmd.Stderr = file
+	// Keep both ports reserved until this member can bind them.
+	c.releaseAddress(c.addresses[id-1])
+	c.releaseAddress(peers[id-1])
 	if err := cmd.Start(); err != nil {
 		file.Close()
 		c.t.Fatal(err)
@@ -208,7 +241,7 @@ func (c *cluster) waitReady() {
 		ready, sawLeader := true, false
 		for id := range c.processes {
 			s, err := c.http(id, "/status", nil)
-			if err != nil || s["leader_id"] == float64(0) {
+			if err != nil || s["id"] != float64(id) || s["cluster_id"] != filepath.Base(c.root) || s["leader_id"] == float64(0) {
 				ready = false
 				break
 			}

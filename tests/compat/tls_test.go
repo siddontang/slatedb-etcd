@@ -87,7 +87,7 @@ func makeTLS(t *testing.T, root, name, user string, hosts ...string) testTLS {
 func configureTLS(c *cluster, peerTLS, clientTLS, mutual bool) {
 	c.t.Helper()
 	for range c.addresses {
-		c.peerAddresses = append(c.peerAddresses, address(c.t))
+		c.peerAddresses = append(c.peerAddresses, c.reserveAddress())
 	}
 	if peerTLS {
 		config := makeTLS(c.t, c.root, "peer", "peer")
