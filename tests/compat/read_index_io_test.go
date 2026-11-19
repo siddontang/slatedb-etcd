@@ -26,12 +26,14 @@ func TestReadIndexAndNestedReadTxnDoNotWriteLogs(t *testing.T) {
 	require.NoError(t, err)
 	state, err := c.http(leader, "/status", nil)
 	require.NoError(t, err)
-	target := state["commit_index"].(float64)
+	// A quorum can confirm the Put before the leader finishes its local write.
+	target := state["raft_commit_index"].(float64)
 	before := make(map[int]map[string]any)
 	for id := 1; id <= 3; id++ {
 		require.Eventually(t, func() bool {
 			state, err := c.http(id, "/status", nil)
-			if err == nil && state["applied_index"].(float64) >= target {
+			if err == nil && state["applied_index"].(float64) >= target &&
+				state["commit_index"].(float64) >= target {
 				before[id] = state
 				return true
 			}
