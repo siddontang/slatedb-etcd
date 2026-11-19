@@ -71,11 +71,12 @@ def commit_errors(root, raw):
     return errors
 
 
-def audit(root):
+def audit(root, revisions=("--all",)):
+    """Check the objects reachable from revisions, or from every fetched ref by default."""
     if git(root, "rev-parse", "--is-shallow-repository").strip() == b"true":
         raise RuntimeError("Fetch complete history before checking commit metadata")
     failures, counts = [], {"commits": 0, "blobs": 0, "tags": 0}
-    rows = git(root, "rev-list", "--objects", "--all").splitlines()
+    rows = git(root, "rev-list", "--objects", *revisions, "--").splitlines()
     for row in rows:
         oid, _, name = row.partition(b" ")
         kind = git(root, "cat-file", "-t", oid.decode()).strip()
@@ -106,8 +107,11 @@ def audit(root):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=ROOT)
+    parser.add_argument("--range", dest="revisions",
+                        help="check only new commits, for example origin/main..HEAD")
     args = parser.parse_args()
-    counts, failures = audit(args.repo)
+    revisions = (args.revisions,) if args.revisions else ("--all",)
+    counts, failures = audit(args.repo, revisions)
     for failure in failures:
         print(json.dumps(failure))
     print(json.dumps({**counts, "passed": not failures, "findings": len(failures)}))

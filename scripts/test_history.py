@@ -53,6 +53,21 @@ class HistoryTests(unittest.TestCase):
         self.commit(HISTORY.SIGN_OFF + b"\n\nLater prose\n")
         self.assertIn("missing or repeated owner sign-off", self.errors())
 
+    def test_range_checks_only_new_commits(self):
+        self.commit(b"Old commit without sign-off\n")
+        base = self.git("rev-parse", "HEAD").strip().decode()
+        self.commit()
+        counts, failures = HISTORY.audit(self.root, (base + "..HEAD",))
+        self.assertEqual((counts["commits"], failures), (1, []))
+        self.assertIn(MISSING, self.errors())
+
+    def test_range_rejects_new_commit_without_sign_off(self):
+        self.commit()
+        base = self.git("rev-parse", "HEAD").strip().decode()
+        self.commit(b"New commit without sign-off\n")
+        failures = HISTORY.audit(self.root, (base + "..HEAD",))[1]
+        self.assertIn(MISSING, [item["error"] for item in failures])
+
     def test_contributor_sign_off_with_public_email_passes(self):
         self.contributor()
         self.commit(b"Contributed change\n\n" + CONTRIBUTOR_SIGN_OFF + b"\n")
