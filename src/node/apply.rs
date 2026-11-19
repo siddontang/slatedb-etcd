@@ -464,14 +464,17 @@ async fn apply_entries(
             entry.index == state.applied + 1,
             "apply batch has an index gap"
         );
+        let kind = EntryType::try_from(entry.entry_type)?;
         if entry.data.is_empty() {
             state.apply(entry.index, None).await?;
             continue;
         }
-        let change = match entry.get_entry_type() {
+        let change = match kind {
             EntryType::EntryNormal => None,
             EntryType::EntryConfChange => {
-                Some(raft::eraftpb::ConfChange::parse_from_bytes(&entry.data)?)
+                let change = raft::eraftpb::ConfChange::decode(entry.data.clone())?;
+                raft::eraftpb::ConfChangeType::try_from(change.change_type)?;
+                Some(change)
             }
             EntryType::EntryConfChangeV2 => anyhow::bail!("unsupported joint configuration entry"),
         };
@@ -483,7 +486,7 @@ async fn apply_entries(
         if change.is_none() && super::quorum_put::put_command(&command).is_some() {
             let mut commands = vec![(entry.index, command)];
             while let Some(next) = entries.peek() {
-                if next.get_entry_type() != EntryType::EntryNormal || next.data.is_empty() {
+                if next.entry_type != EntryType::EntryNormal as i32 || next.data.is_empty() {
                     break;
                 }
                 let command = RaftCommand::decode(&next.data)?;

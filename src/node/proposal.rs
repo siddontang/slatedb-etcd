@@ -69,11 +69,11 @@ impl Node {
         let group = std::mem::take(&mut self.put_proposals);
         // This is the local MsgPropose that RawNode::propose builds for one entry.
         let mut proposal = Message {
-            msg_type: MessageType::MsgPropose,
+            msg_type: MessageType::MsgPropose as i32,
             from: self.options.id,
             ..Default::default()
         };
-        proposal.set_entries(group.entries.into());
+        proposal.set_entries(group.entries);
         let result = self.raw.raft.step(proposal);
         let started = Instant::now();
         for (id, response) in group.clients {
@@ -146,7 +146,7 @@ mod tests {
         node.drain_log().await.unwrap();
         node.raw
             .step(Message {
-                msg_type: MessageType::MsgAppendResponse,
+                msg_type: MessageType::MsgAppendResponse as i32,
                 from: 2,
                 to: 1,
                 term: node.raw.raft.term,

@@ -83,26 +83,20 @@ jobs:
               faults = ",".join(map(str, range(1, 17))) if extended else "1,2,3,4"
               env.write(f"SLATEDB_DST_SEEDS={dst}\nFAULT_SEEDS={faults}\n")
           PY
-      - name: Check the minimum protobuf compiler
+      - name: Check the Rust Protobuf dependency graph
         run: |
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          import os
-          import subprocess
-          metadata = json.loads(subprocess.check_output(
-              ["cargo", "metadata", "--locked", "--format-version", "1"], text=True))
-          package = next(p for p in metadata["packages"] if p["name"] == "protobuf-build")
-          compiler = Path(package["manifest_path"]).parent / "bin/protoc-linux-x86_64"
-          output = Path(os.environ["RUNNER_TEMP"]) / "schema.pb"
-          subprocess.run([str(compiler), "--version"], check=True)
-          subprocess.run([str(compiler), "--proto_path=proto", f"--descriptor_set_out={output}",
-                          "proto/rpc.proto", "proto/kv.proto", "proto/peer.proto",
-                          "proto/command.proto", "proto/state.proto"], check=True)
-          PY
+          cargo metadata --locked --all-features --format-version 1 | python3 -c '
+          import json, sys
+          packages = json.load(sys.stdin)["packages"]
+          assert not any(p["name"] == "protobuf" for p in packages)
+          versions = {p["version"] for p in packages if p["name"] in
+                      {"prost", "prost-build", "prost-derive", "prost-types"}}
+          assert len(versions) == 1 and versions.pop().startswith("0.14.")'
       - name: Check Rust
         run: |
           cargo fmt --check
+          cargo test --locked --manifest-path third_party/raft/Cargo.toml --lib --features default-logger
+          cargo run --locked -- --help >/dev/null
           scripts/cargo.sh clippy --locked --all-targets --all-features -- -D warnings
           scripts/cargo.sh test --locked --features write-profile --lib write_profile::tests
           scripts/cargo.sh test --locked -- --skip seeded_fault_schedules_replay_identically

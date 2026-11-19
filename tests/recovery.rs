@@ -93,7 +93,6 @@ fn durable_log_replaces_an_uncommitted_suffix() {
             term: 1,
             vote: 1,
             commit: 1,
-            ..HardState::default()
         };
         store
             .persist(&[entry(1, 1), entry(2, 1), entry(3, 1)], Some(&hs), None)
@@ -102,7 +101,6 @@ fn durable_log_replaces_an_uncommitted_suffix() {
             term: 2,
             vote: 2,
             commit: 2,
-            ..HardState::default()
         };
         store.persist(&[entry(2, 2)], Some(&hs), None).unwrap();
     }
@@ -127,7 +125,6 @@ fn checkpoint_keeps_its_boundary_term_across_restart() {
             term: 2,
             vote: 1,
             commit: 3,
-            ..HardState::default()
         };
         store
             .persist(&[entry(1, 1), entry(2, 2), entry(3, 2)], Some(&hs), None)
@@ -187,7 +184,6 @@ async fn restart_finishes_a_snapshot_persisted_before_state_installation() {
         term: 1,
         vote: 1,
         commit: 1,
-        ..HardState::default()
     };
     source_store
         .persist(&[entry(1, 1)], Some(&hs), None)
@@ -245,7 +241,6 @@ async fn background_snapshot_excludes_later_writes() {
         term: 1,
         vote: 1,
         commit: 2,
-        ..HardState::default()
     };
     store
         .persist(&[entry(1, 1), entry(2, 1)], Some(&hs), None)
@@ -285,7 +280,6 @@ fn checkpoint_recovery_requires_the_referenced_bytes_and_discards_only_orphans()
             term: 1,
             vote: 1,
             commit: 2,
-            ..Default::default()
         };
         store
             .persist(&[entry(1, 1), entry(2, 1)], Some(&hs), None)
@@ -332,7 +326,6 @@ fn checkpoint_reopens_plain_and_compressed_images_and_rejects_damage() {
         term: 1,
         vote: 1,
         commit: 2,
-        ..Default::default()
     };
     store
         .persist(&[entry(1, 1), entry(2, 1)], Some(&hs), None)
@@ -356,4 +349,41 @@ fn checkpoint_reopens_plain_and_compressed_images_and_rejects_damage() {
     assert!(RaftStorage::open(root, 1, "test", vec![1, 2, 3]).is_err());
     std::fs::write(path(2), original).unwrap();
     assert_eq!(storage(root).recovery_snapshot().data.as_ref(), repeated);
+}
+
+#[test]
+fn prost_reads_and_writes_the_previous_raft_wire_format() {
+    use prost::Message as _;
+    use raft::eraftpb::{Entry, EntryType, Message, MessageType, Snapshot};
+
+    // Raft 0.7.0 produced these bytes with rust-protobuf 2.28.
+    let snapshot = [
+        10, 4, 115, 110, 97, 112, 18, 15, 10, 8, 8, 1, 8, 2, 8, 3, 16, 4, 16, 129, 1, 24, 3,
+    ];
+    let state = Snapshot::decode(snapshot.as_slice()).unwrap();
+    assert_eq!(state.data.as_ref(), b"snap");
+    let metadata = state.get_metadata();
+    assert_eq!((metadata.term, metadata.index), (3, 129));
+    assert_eq!(metadata.get_conf_state().voters, [1, 2, 3]);
+    assert_eq!(metadata.get_conf_state().learners, [4]);
+    assert_eq!(state.encode_to_vec(), snapshot);
+
+    let entry = [
+        8, 1, 16, 3, 24, 130, 1, 34, 3, 108, 111, 103, 50, 2, 105, 100,
+    ];
+    let record = Entry::decode(entry.as_slice()).unwrap();
+    assert_eq!(record.entry_type(), EntryType::EntryConfChange);
+    assert_eq!((record.term, record.index), (3, 130));
+    assert_eq!(record.data.as_ref(), b"log");
+    assert_eq!(record.context.as_ref(), b"id");
+    assert_eq!(record.encode_to_vec(), entry);
+
+    let append = [
+        8, 3, 16, 2, 24, 1, 58, 16, 8, 1, 16, 3, 24, 130, 1, 34, 3, 108, 111, 103, 50, 2, 105, 100,
+    ];
+    let msg = Message::decode(append.as_slice()).unwrap();
+    assert_eq!(msg.msg_type(), MessageType::MsgAppend);
+    assert_eq!((msg.from, msg.to), (1, 2));
+    assert_eq!(msg.entries, [record]);
+    assert_eq!(msg.encode_to_vec(), append);
 }

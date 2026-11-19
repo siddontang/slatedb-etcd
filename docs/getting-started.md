@@ -13,11 +13,8 @@ Use empty data directories for a new cluster. Keep data directories when restart
 - Java 17 or later and Leiningen for Jepsen. These are not needed to run the service.
 
 On Ubuntu, install `build-essential`, `pkg-config`, and `protobuf-compiler`.
-On macOS, install the Xcode command line tools. An incompatible system protoc can fail the build.
-`scripts/cargo.sh` selects the dependency's bundled protoc 3.9 on Apple Silicon when needed.
-That x86_64 executable requires Rosetta. You can instead set `PROTOC` to a working protoc 3.x
-binary.
-The wrapper does not modify the system compiler.
+On macOS, install the Xcode command line tools and Protobuf with `brew install protobuf`.
+Set `PROTOC` to use a compiler at a different path.
 
 ## Dependency versions
 
@@ -29,8 +26,8 @@ The separate `grpc` 0.9 client crate is a preview. Its server examples use Tonic
 
 Three packages need specific version lines.
 
-- Raft 0.7 uses the Protobuf 2.28 message trait for its generated types.
-- Raft Engine 0.4.2 needs [two local fixes](../third_party/raft-engine/README.md).
+- The [pinned Raft source](../third_party/raft/README.md) uses the same Prost codec as gRPC.
+- Raft Engine 0.4.2 needs [local storage changes](../third_party/raft-engine/README.md).
 - Bincode 2.0.1 uses fixed-width little-endian fields for snapshots and lease records.
   The published 3.0.0 crate contains only a compile error.
 

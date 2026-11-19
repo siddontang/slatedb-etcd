@@ -34,9 +34,9 @@ impl Node {
         let mut commands = Vec::new();
         for entry in entries {
             if entry.term != raft.term
-                || entry.get_entry_type() != EntryType::EntryNormal
+                || entry.entry_type != EntryType::EntryNormal as i32
                 || entry.data.is_empty()
-                || u64::from(entry.compute_size()) > apply::BATCH_BYTES
+                || (entry.encoded_len() as u64) > apply::BATCH_BYTES
             {
                 break;
             }

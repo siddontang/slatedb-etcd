@@ -51,7 +51,7 @@ impl LogMemory {
 }
 
 pub(super) fn charge(entry: &Entry) -> usize {
-    entry.compute_size() as usize + ENTRY_OVERHEAD
+    entry.encoded_len() + ENTRY_OVERHEAD
 }
 
 #[derive(Debug)]
@@ -143,7 +143,7 @@ impl Cache {
             limits,
             snapshot: durable.snapshot.clone(),
             initial_conf: None,
-            hard_state: durable.hard_state.clone(),
+            hard_state: durable.hard_state,
             durable,
         };
         let mut low = storage.first_index()?;
@@ -195,7 +195,7 @@ impl Cache {
             for entry in entries {
                 ensure!(entry.index == self.last + 1, "cached log gap");
                 ensure!(
-                    entry.compute_size() as usize <= MAX_ENTRY_BYTES,
+                    entry.encoded_len() <= MAX_ENTRY_BYTES,
                     "Raft entry exceeds size limit"
                 );
                 if self.terms.last_key_value().map(|(_, term)| *term) != Some(entry.term) {
@@ -220,7 +220,7 @@ impl Cache {
             }
         }
         if let Some(hs) = hs {
-            self.hard_state = hs.clone();
+            self.hard_state = *hs;
         }
         Ok(())
     }
@@ -274,7 +274,7 @@ impl Cache {
             message
                 .entries
                 .iter()
-                .all(|e| e.compute_size() as usize <= MAX_ENTRY_BYTES)
+                .all(|e| e.encoded_len() <= MAX_ENTRY_BYTES)
                 && self.admits(unstable, &[], message.entries.iter().map(charge).sum())
         } else {
             self.admits(unstable, &message.entries, 0)
@@ -284,7 +284,7 @@ impl Cache {
     pub fn admits(&self, unstable: &[Entry], incoming: &[Entry], proposal_bytes: usize) -> bool {
         if incoming
             .iter()
-            .any(|entry| entry.compute_size() as usize > MAX_ENTRY_BYTES)
+            .any(|entry| entry.encoded_len() > MAX_ENTRY_BYTES)
         {
             return false;
         }
@@ -313,7 +313,7 @@ impl Cache {
         let data_charge = |entry: &Entry| {
             if entry.data.is_empty()
                 && entry.context.is_empty()
-                && entry.get_entry_type() == EntryType::EntryNormal
+                && entry.entry_type == EntryType::EntryNormal as i32
             {
                 0
             } else {
@@ -404,7 +404,7 @@ impl Cache {
 impl Storage for Cache {
     fn initial_state(&self) -> raft::Result<RaftState> {
         Ok(RaftState {
-            hard_state: self.hard_state.clone(),
+            hard_state: self.hard_state,
             conf_state: self
                 .initial_conf
                 .clone()
@@ -456,7 +456,7 @@ impl Storage for Cache {
                 }
                 return Err(StorageError::Unavailable.into());
             };
-            let size = u64::from(entry.compute_size());
+            let size = entry.encoded_len() as u64;
             if !result.is_empty() && bytes + size > limit {
                 break;
             }
@@ -663,8 +663,8 @@ mod tests {
         assert!(!cache.admits(&[], &[], 1));
         assert!(cache.admits(&[], &[entry(5, 2)], 0));
         let proposal = Message {
-            msg_type: MessageType::MsgPropose,
-            entries: vec![entry(5, 2)].into(),
+            msg_type: MessageType::MsgPropose as i32,
+            entries: vec![entry(5, 2)],
             ..Default::default()
         };
         assert!(!cache.admits_message(&[], &proposal));
@@ -733,13 +733,13 @@ mod tests {
             (8, 1, 0, entry(9, 2), false, false),
         ] {
             let message = Message {
-                msg_type: MessageType::MsgAppend,
+                msg_type: MessageType::MsgAppend as i32,
                 from: 2,
                 to: 1,
                 term: wire_term,
                 index,
                 log_term: term,
-                entries: vec![next].into(),
+                entries: vec![next],
                 ..Default::default()
             };
             let (tx, rx) = oneshot::channel();
@@ -766,13 +766,13 @@ mod tests {
         };
         let extra = charge(&control);
         let message = Message {
-            msg_type: MessageType::MsgAppend,
+            msg_type: MessageType::MsgAppend as i32,
             from: 2,
             to: 1,
             term: 2,
             index: 8,
             log_term: 1,
-            entries: vec![control].into(),
+            entries: vec![control],
             ..Default::default()
         };
         let (tx, rx) = oneshot::channel();

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context, Result};
-use protobuf::Message as ProtobufMessage;
+use prost::Message as ProtobufMessage;
 use raft::eraftpb::{Entry, EntryType, Message, MessageType};
 use raft::{Config, RawNode, SnapshotStatus, StateRole, Storage};
 use serde_json::{json, Value};
@@ -715,7 +715,7 @@ impl Node {
                     && message.get_msg_type() == MessageType::MsgAppend
                 {
                     self.send(vec![Message {
-                        msg_type: MessageType::MsgAppendResponse,
+                        msg_type: MessageType::MsgAppendResponse as i32,
                         to: message.from,
                         from: self.options.id,
                         term: message.term,

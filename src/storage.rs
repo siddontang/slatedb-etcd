@@ -174,7 +174,7 @@ impl RaftStorage {
             crate::failpoint::hit("snapshot-after-save");
         }
         if let Some(hs) = hard_state {
-            self.hard_state = hs.clone();
+            self.hard_state = *hs;
         }
         if let Some(snapshot) = snapshot {
             checkpoint::retire(&self.dir, self.snapshot_index())?;
@@ -187,7 +187,7 @@ impl RaftStorage {
         ensure!(commit >= self.hard_state.commit, "commit regressed");
         ensure!(commit <= self.last_index()?, "commit exceeds durable log");
         if commit != self.hard_state.commit {
-            let mut hs = self.hard_state.clone();
+            let mut hs = self.hard_state;
             hs.commit = commit;
             self.persist(&[], Some(&hs), None)?;
             self.engine.sync()?;
@@ -292,7 +292,7 @@ fn storage_error(error: raft_engine::Error) -> raft::Error {
 impl Storage for RaftStorage {
     fn initial_state(&self) -> raft::Result<RaftState> {
         Ok(RaftState {
-            hard_state: self.hard_state.clone(),
+            hard_state: self.hard_state,
             conf_state: self.snapshot.get_metadata().get_conf_state().clone(),
         })
     }

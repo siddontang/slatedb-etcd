@@ -35,18 +35,19 @@ pub(super) async fn run(
                     return Err(Status::invalid_argument("peer sequence is out of order"));
                 }
                 sequence = frame.sequence;
-                let message = Message::parse_from_bytes(&frame.payload)
+                let size = frame.payload.len();
+                let message = decode_message(frame.payload.into())
                     .map_err(|_| Status::invalid_argument("invalid Raft message"))?;
                 if message.get_msg_type() == MessageType::MsgSnapshot {
                     return Err(Status::invalid_argument("snapshots require the durable endpoint"));
                 }
                 let (response, completed) = oneshot::channel();
-                events.try_send(Event::PeerFrame(message, frame.payload.len(), response))
+                events.try_send(Event::PeerFrame(message, size, response))
                     .map_err(|_| Status::unavailable("peer queue is unavailable"))?;
-                bytes += frame.payload.len();
+                bytes += size;
                 pending.push_back(Pending {
                     sequence,
-                    bytes: frame.payload.len(),
+                    bytes: size,
                     deadline: Instant::now() + Duration::from_secs(5),
                     completed,
                 });

@@ -348,7 +348,7 @@ impl Simulation {
                 )
                 .unwrap();
             for entry in entries {
-                let bytes = entry.write_to_bytes().unwrap();
+                let bytes = entry.encode_to_vec();
                 if let Some(previous) = self.committed_entries.insert(entry.index, bytes.clone()) {
                     assert_eq!(previous, bytes, "committed index {} changed", entry.index);
                 }
