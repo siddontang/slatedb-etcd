@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -66,6 +67,23 @@ class BenchResults(unittest.TestCase):
             adapter.local_url("unix://localhost:21379")
         with self.assertRaises(ValueError):
             adapter.local_url("http://local.invalid:21379")
+
+
+class GoResults(unittest.TestCase):
+    def test_selection_across_packages(self):
+        events = [
+            {"Action": "output", "Package": "empty", "Output": "testing: warning: no tests to run"},
+            {"Action": "run", "Package": "kv", "Test": "TestKV"},
+            {"Action": "pass", "Package": "kv", "Test": "TestKV"},
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "events"
+            for package, matched in (("other", True), ("kv", False)):
+                events[0]["Package"] = package
+                path.write_text("".join(json.dumps(event) + "\n" for event in events))
+                result = runner.run_go(["cat", path], root, root / "log.gz", "TestKV", "unit")
+                self.assertEqual(result["passed"], matched)
 
 
 class SourceCoverage(unittest.TestCase):

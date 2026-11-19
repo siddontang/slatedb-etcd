@@ -71,7 +71,7 @@ def run_go(command, cwd, log_path, selector, suite, env=None):
     print(cwd.name, *command, flush=True)
     counts = {"pass": 0, "fail": 0, "skip": 0}
     samples = set()
-    empty = False
+    empty_packages, active_packages = set(), set()
     with gzip.open(log_path, "wt", compresslevel=1) as log, \
             log_path.with_suffix(".stderr").open("w") as errors, \
             subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE, stderr=errors,
@@ -80,7 +80,11 @@ def run_go(command, cwd, log_path, selector, suite, env=None):
             log.write(line)
             event = json.loads(line)
             output = event.get("Output", "")
-            empty |= "testing: warning: no tests to run" in output
+            package = event.get("Package", "")
+            if "testing: warning: no tests to run" in output:
+                empty_packages.add(package)
+            if event.get("Test") and event["Action"] == "run":
+                active_packages.add(package)
             if event.get("Test") and event["Action"] in counts:
                 counts[event["Action"]] += 1
             match = re.match(r"^(Benchmark\S+?)(?:-\d+)?\s+\d+\s+", output)
@@ -92,12 +96,13 @@ def run_go(command, cwd, log_path, selector, suite, env=None):
                 samples.add(event["Test"])
         status = process.wait()
     passed = status == 0
+    matched = bool(active_packages - empty_packages)
     if selector or suite == "fuzz":
-        passed &= counts["pass"] > 0 and not empty
+        passed &= matched
     if suite == "go-bench":
         passed &= bool(samples)
     return dict(counts, passed=passed, complete=passed and counts["skip"] == 0,
-                exit_code=status, samples=sorted(samples),
+                exit_code=status, matched=matched, samples=sorted(samples),
                 log=log_path.name)
 
 
@@ -206,6 +211,7 @@ def main():
     summary = args.output / f"{args.target}-{args.suite}-{args.shard_index}-summary.jsonl"
     summary.write_text("")
     passed = True
+    any_match = False
     with tempfile.TemporaryDirectory() as temp:
         directory = Path(temp).resolve()
         go_flags = ["-count=1", "-json", "-p=1", "-timeout=" + args.timeout]
@@ -250,9 +256,11 @@ def main():
                 result.update(target=args.target, suite=args.suite, case=label, module=module)
                 with summary.open("a") as log:
                     log.write(json.dumps(result) + "\n")
-                passed &= result["complete" if args.require_complete else "passed"]
+                any_match |= result["matched"]
+                if not args.run or result["matched"] or result["exit_code"]:
+                    passed &= result["complete" if args.require_complete else "passed"]
                 print(name, result, flush=True)
-    raise SystemExit(not passed)
+    raise SystemExit(not passed or (bool(args.run) and not any_match))
 
 
 if __name__ == "__main__":
