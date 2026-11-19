@@ -52,7 +52,8 @@ Keep sentences below 30 words. Follow `AGENTS.md` and the pull request template.
 State the concrete behavior, validation results, and remaining limits.
 
 Use a GitHub public email in author and committer fields.
-The owner requires this exact trailer on every project commit:
+Each commit needs exactly one of these two sign-offs.
+An owner-approved commit carries this exact trailer:
 
 ```text
 Signed-off-by: siddontang <siddontang@gmail.com>
@@ -64,6 +65,13 @@ For an owner-approved commit, add the trailer explicitly:
 git commit --trailer "Signed-off-by: siddontang <siddontang@gmail.com>"
 ```
 
+A contributor commit carries one sign-off by its author with the same GitHub public email:
+
+```sh
+git commit --signoff
+```
+
+The owner records approval of contributed commits with a signed-off merge commit.
 The owner email remains public in this trailer by request.
 A sign-off records approval under the project policy. It is not a cryptographic signature.
 Do not add another person's sign-off without their authorization.
