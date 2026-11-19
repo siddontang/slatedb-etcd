@@ -4,8 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use anyhow::Result;
-use prometheus::{exponential_buckets, Histogram, HistogramOpts, IntCounterVec, Opts, Registry};
+use prometheus::{exponential_buckets, Histogram, HistogramOpts};
+
+const RTT_NAME: &str = "etcd_network_peer_round_trip_time_seconds";
+const RTT_HELP: &str = "Time from a sampled Raft frame to its transport receipt.";
 
 #[derive(Default)]
 pub(crate) struct PeerTraffic {
@@ -23,12 +25,9 @@ impl PeerTraffic {
 
     pub fn observe_rtt(&self, peer: u64, elapsed: Duration) {
         let meter = self.rtt.get_or_init(|| {
-            let options = HistogramOpts::new(
-                "etcd_network_peer_round_trip_time_seconds",
-                "Time from a sampled Raft frame to its transport receipt.",
-            )
-            .const_label("To", format!("{peer:x}"))
-            .buckets(exponential_buckets(0.0001, 2.0, 16).expect("valid RTT buckets"));
+            let options = HistogramOpts::new(RTT_NAME, RTT_HELP)
+                .const_label("To", format!("{peer:x}"))
+                .buckets(exponential_buckets(0.0001, 2.0, 16).expect("valid RTT buckets"));
             Histogram::with_opts(options).expect("valid RTT histogram")
         });
         meter.observe(elapsed.as_secs_f64());
@@ -38,59 +37,61 @@ impl PeerTraffic {
 pub(super) fn collect(
     local: &str,
     peers: &[(u64, Arc<PeerTraffic>)],
-    registry: &Registry,
-) -> Result<()> {
-    let counter = |name, help, label| {
-        super::state::register(
-            registry,
-            IntCounterVec::new(Opts::new(name, help), &[label])?,
-        )
-    };
-    let sent = counter(
-        "etcd_network_peer_sent_bytes_total",
-        "Raft payload bytes accepted by the peer.",
-        "To",
-    )?;
-    let received = counter(
-        "etcd_network_peer_received_bytes_total",
-        "Received Raft payload bytes.",
-        "From",
-    )?;
-    let failures = counter(
-        "etcd_network_peer_sent_failures_total",
-        "Failed outbound Raft messages.",
-        "To",
-    )?;
-    let disconnected = super::state::register(
-        registry,
-        IntCounterVec::new(
-            Opts::new(
-                "etcd_network_disconnected_peers_total",
-                "Losses of an active peer connection.",
-            ),
-            &["Local", "Remote"],
-        )?,
-    )?;
+    families: &mut Vec<prometheus::proto::MetricFamily>,
+) {
+    use super::sample::{append, counter};
+    use prometheus::{core::Metric, proto::MetricType};
+
+    let mut sent = Vec::with_capacity(peers.len());
+    let mut received = Vec::with_capacity(peers.len());
+    let mut failures = Vec::new();
+    let mut disconnected = Vec::new();
+    let mut times = Vec::new();
     for (id, meter) in peers {
         let label = format!("{id:x}");
-        sent.with_label_values(&[&label])
-            .inc_by(meter.sent.load(Ordering::Relaxed));
-        received
-            .with_label_values(&[&label])
-            .inc_by(meter.received.load(Ordering::Relaxed));
+        sent.push(counter(
+            meter.sent.load(Ordering::Relaxed),
+            [("To", &label)],
+        ));
+        received.push(counter(
+            meter.received.load(Ordering::Relaxed),
+            [("From", &label)],
+        ));
         let lost = meter.failures.load(Ordering::Relaxed);
         if lost > 0 {
-            failures.with_label_values(&[&label]).inc_by(lost);
+            failures.push(counter(lost, [("To", &label)]));
         }
         let changes = meter.disconnected.load(Ordering::Relaxed);
         if changes > 0 {
-            disconnected
-                .with_label_values(&[local, &label])
-                .inc_by(changes);
+            disconnected.push(counter(changes, [("Local", local), ("Remote", &label)]));
         }
         if let Some(rtt) = meter.rtt.get() {
-            registry.register(Box::new(rtt.clone()))?;
+            times.push(rtt.metric());
         }
     }
-    Ok(())
+    for (name, help, metrics) in [
+        (
+            "etcd_network_peer_sent_bytes_total",
+            "Raft payload bytes accepted by the peer.",
+            sent,
+        ),
+        (
+            "etcd_network_peer_received_bytes_total",
+            "Received Raft payload bytes.",
+            received,
+        ),
+        (
+            "etcd_network_peer_sent_failures_total",
+            "Failed outbound Raft messages.",
+            failures,
+        ),
+        (
+            "etcd_network_disconnected_peers_total",
+            "Losses of an active peer connection.",
+            disconnected,
+        ),
+    ] {
+        append(families, name, help, MetricType::COUNTER, metrics);
+    }
+    append(families, RTT_NAME, RTT_HELP, MetricType::HISTOGRAM, times);
 }

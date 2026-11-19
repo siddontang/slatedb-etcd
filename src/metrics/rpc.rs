@@ -37,15 +37,18 @@ const CODES: [&str; 17] = [
 
 pub(super) struct Observer {
     methods: HashMap<String, Arc<Method>>,
-    sent: IntCounter,
-    received: IntCounter,
     requests: IntCounterVec,
+}
+
+struct Traffic {
+    messages: IntCounter,
+    bytes: IntCounter,
 }
 
 struct Method {
     started: IntCounter,
-    received: IntCounter,
-    sent: IntCounter,
+    received: Traffic,
+    sent: Traffic,
     handled: Vec<IntCounter>,
     duration: Option<prometheus::Histogram>,
     shape: &'static str,
@@ -91,6 +94,20 @@ impl Observer {
                 )?,
             )?),
         };
+        let received_bytes = super::state::register(
+            registry,
+            IntCounter::new(
+                "etcd_network_client_grpc_received_bytes_total",
+                "Received protobuf payload bytes.",
+            )?,
+        )?;
+        let sent_bytes = super::state::register(
+            registry,
+            IntCounter::new(
+                "etcd_network_client_grpc_sent_bytes_total",
+                "Sent protobuf payload bytes.",
+            )?,
+        )?;
         let mut methods = HashMap::new();
         let mut add = |service: &str, method: &str, shape| {
             let labels = [shape, service, method];
@@ -107,8 +124,14 @@ impl Observer {
                     ]),
                     started: started.with_label_values(&labels),
                     duration: duration.as_ref().map(|vec| vec.with_label_values(&labels)),
-                    received: received.with_label_values(&labels),
-                    sent: sent.with_label_values(&labels),
+                    received: Traffic {
+                        messages: received.with_label_values(&labels),
+                        bytes: received_bytes.clone(),
+                    },
+                    sent: Traffic {
+                        messages: sent.with_label_values(&labels),
+                        bytes: sent_bytes.clone(),
+                    },
                     handled: CODES
                         .iter()
                         .map(|code| handled.with_label_values(&[shape, service, method, code]))
@@ -138,23 +161,7 @@ impl Observer {
         }
         add("grpc.health.v1.Health", "Check", "unary");
         add("grpc.health.v1.Health", "Watch", "server_stream");
-        let bytes = |name, help| -> Result<IntCounter> {
-            let value = IntCounter::new(name, help)?;
-            registry.register(Box::new(value.clone()))?;
-            Ok(value)
-        };
-        Ok(Self {
-            methods,
-            requests,
-            received: bytes(
-                "etcd_network_client_grpc_received_bytes_total",
-                "Received protobuf payload bytes.",
-            )?,
-            sent: bytes(
-                "etcd_network_client_grpc_sent_bytes_total",
-                "Sent protobuf payload bytes.",
-            )?,
-        })
+        Ok(Self { methods, requests })
     }
 }
 
@@ -191,10 +198,7 @@ pub(super) async fn observe(
         return next.run(req).await;
     };
     method.started.inc();
-    let mut terminal = Completion(Some((
-        method.clone(),
-        method.duration.as_ref().map(|_| std::time::Instant::now()),
-    )));
+    let start = method.duration.as_ref().map(|_| std::time::Instant::now());
     let version = req
         .headers()
         .get("client-api-version")
@@ -221,26 +225,18 @@ pub(super) async fn observe(
         "unknown" => method.unknown_client.inc(),
         _ => observer.requests.with_label_values(&[kind, version]).inc(),
     }
-    let req = req.map(|body| {
-        Body::new(ObservedBody::new(
-            body,
-            method.received.clone(),
-            observer.received.clone(),
-            Completion(None),
-        ))
-    });
+    let incoming = Observation::Request(method.clone());
+    let mut outgoing = Observation::Response {
+        method,
+        start,
+        finished: false,
+    };
+    let req = req.map(|body| Body::new(ObservedBody::new(body, incoming)));
     let response = next.run(req).await;
     if let Some(code) = status(response.headers()) {
-        terminal.finish(code);
+        outgoing.finish(code);
     }
-    response.map(|body| {
-        Body::new(ObservedBody::new(
-            body,
-            method.sent.clone(),
-            observer.sent.clone(),
-            terminal,
-        ))
-    })
+    response.map(|body| Body::new(ObservedBody::new(body, outgoing)))
 }
 
 #[derive(Default)]
@@ -280,37 +276,54 @@ impl MessageFrames {
 struct ObservedBody {
     inner: Body,
     frames: MessageFrames,
-    messages: IntCounter,
-    bytes: IntCounter,
-    terminal: Completion,
+    observation: Observation,
 }
 
 impl ObservedBody {
-    fn new(inner: Body, messages: IntCounter, bytes: IntCounter, terminal: Completion) -> Self {
+    fn new(inner: Body, observation: Observation) -> Self {
         Self {
             inner,
             frames: MessageFrames::default(),
-            messages,
-            bytes,
-            terminal,
+            observation,
         }
     }
 }
 
-struct Completion(Option<(Arc<Method>, Option<std::time::Instant>)>);
+enum Observation {
+    Request(Arc<Method>),
+    Response {
+        method: Arc<Method>,
+        start: Option<std::time::Instant>,
+        finished: bool,
+    },
+}
 
-impl Completion {
+impl Observation {
+    fn traffic(&self) -> &Traffic {
+        match self {
+            Self::Request(method) => &method.received,
+            Self::Response { method, .. } => &method.sent,
+        }
+    }
+
     fn finish(&mut self, code: usize) {
-        if let Some((method, start)) = self.0.take() {
-            method.handled[code].inc();
-            if let (Some(duration), Some(start)) = (&method.duration, start) {
-                duration.observe(start.elapsed().as_secs_f64());
+        if let Self::Response {
+            method,
+            start,
+            finished,
+        } = self
+        {
+            if !std::mem::replace(finished, true) {
+                method.handled[code].inc();
+                if let (Some(duration), Some(start)) = (&method.duration, start) {
+                    duration.observe(start.elapsed().as_secs_f64());
+                }
             }
         }
     }
 }
 
-impl Drop for Completion {
+impl Drop for Observation {
     fn drop(&mut self) {
         self.finish(1);
     }
@@ -330,14 +343,15 @@ impl HttpBody for ObservedBody {
                 if let Some(data) = frame.data_ref() {
                     let (n, bytes) = self.frames.consume(data);
                     if n != 0 {
-                        self.messages.inc_by(n);
-                        self.bytes.inc_by(bytes);
+                        let traffic = self.observation.traffic();
+                        traffic.messages.inc_by(n);
+                        traffic.bytes.inc_by(bytes);
                     }
                 } else if let Some(code) = frame.trailers_ref().and_then(status) {
-                    self.terminal.finish(code);
+                    self.observation.finish(code);
                 }
             }
-            Some(Err(_)) | None => self.terminal.finish(2),
+            Some(Err(_)) | None => self.observation.finish(2),
         }
         Poll::Ready(result)
     }
