@@ -31,6 +31,7 @@ mod read;
 mod ready;
 mod response;
 mod schedule;
+mod watch;
 use crate::peer::transport;
 use apply::{AppliedState, Completion, Header, Job, Output, Query, Reply, Work, Worker};
 use response::ClientResponse;
@@ -44,7 +45,7 @@ pub type Response = oneshot::Sender<Result<Value, ApiError>>;
 pub type KvResponse = oneshot::Sender<Result<crate::mvcc::Outcome, ApiError>>;
 
 pub enum Event {
-    SubscribeApply(oneshot::Sender<tokio::sync::watch::Receiver<u64>>),
+    SubscribeWatch(oneshot::Sender<crate::watch::Subscription>),
     WaitRevision(i64, Response),
     Authenticated(crate::auth::Credentials, Box<Event>),
     Auth(crate::auth::Command, Response),
@@ -59,12 +60,6 @@ pub enum Event {
     LinearRead(RequestOp, Response),
     EtcdCompact(CompactionRequest, Response),
     Lease(LeaseCommand, Response),
-    Watch(
-        crate::proto::etcdserverpb::WatchCreateRequest,
-        bool,
-        Option<i64>,
-        Response,
-    ),
     Step(Message, Response),
     PeerFrame(Message, usize, Response),
     Status(Response),
@@ -160,7 +155,7 @@ pub struct Node {
     pub(crate) metrics: std::sync::Arc<crate::metrics::Member>,
     last_observed_leader: u64,
     traffic: BTreeMap<u64, std::sync::Arc<crate::metrics::PeerTraffic>>,
-    applied_notify: tokio::sync::watch::Sender<u64>,
+    watch_feed: watch::Publisher,
     forwarding: forwarding::Publisher,
     compaction: compaction::Flush,
     transfers: Vec<(u64, Instant, Response)>,
@@ -363,7 +358,11 @@ impl Node {
             metrics,
             last_observed_leader: 0,
             traffic,
-            applied_notify: tokio::sync::watch::channel(applied.applied).0,
+            watch_feed: watch::Publisher::new(crate::watch::FeedState {
+                view: applied.read.clone(),
+                header: ResponseHeader::default(),
+                leader: 0,
+            }),
             forwarding: forwarding::Publisher::new(
                 &options.peers,
                 applied.revision,
@@ -454,6 +453,7 @@ impl Node {
     }
 
     async fn run_loop(&mut self, mut events: mpsc::Receiver<Event>) -> Result<()> {
+        self.publish_watch(None);
         // Schedule committed log recovery before accepting client work.
         self.drive_ready().await?;
         let mut ticks = tokio::time::interval(Duration::from_millis(100));
@@ -501,6 +501,7 @@ impl Node {
                 self.raw.raft.leader_id,
             );
             if role != old_role {
+                self.publish_watch(None);
                 tracing::info!(node = self.options.id, role = ?role.0, term = role.1,
                     leader = role.2, "Raft state changed");
                 old_role = role;
@@ -695,19 +696,6 @@ impl Node {
                     response,
                 )?;
             }
-            Event::Watch(request, require_leader, through, response) => {
-                if require_leader && self.raw.raft.leader_id == 0 {
-                    let _ = response.send(Err(self.error("no leader")));
-                } else {
-                    self.enqueue_query(Query::Watch(
-                        request,
-                        require_leader,
-                        through,
-                        credentials,
-                        response,
-                    ));
-                }
-            }
             Event::Step(message, response) => {
                 if self.options.join
                     && self.state.applied == 0
@@ -747,8 +735,8 @@ impl Node {
                     }
                 }
             }
-            Event::SubscribeApply(response) => {
-                let _ = response.send(self.applied_notify.subscribe());
+            Event::SubscribeWatch(response) => {
+                let _ = response.send(self.watch_feed.subscribe());
             }
             Event::Metrics(response) => {
                 let id = self.options.id;
@@ -946,6 +934,20 @@ impl Node {
             member: self.options.id,
             term: self.raw.raft.term,
         }
+    }
+
+    /// Publish the current view, header, and leader, then the optional event batch.
+    fn publish_watch(&self, batch: Option<std::sync::Arc<crate::watch::Batch>>) {
+        let mut header = ResponseHeader::default();
+        self.fill_header(Some(&mut header));
+        self.watch_feed.publish(
+            crate::watch::FeedState {
+                view: self.state.read.clone(),
+                header,
+                leader: self.raw.raft.leader_id,
+            },
+            batch,
+        );
     }
 
     fn fill_header(&self, header: Option<&mut ResponseHeader>) {

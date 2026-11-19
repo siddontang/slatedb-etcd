@@ -48,6 +48,10 @@ impl StateMachine {
             return Ok(());
         }
         self.checkpoint_delta = None;
+        // Installed journal rows reach watchers through storage catch-up.
+        if let Some(capture) = &mut self.watch_capture {
+            capture.invalidate();
+        }
         let data: SnapshotData = crate::codec::decode(snapshot.get_data())?;
         ensure!(
             data.version == STORAGE_FORMAT && data.applied == index,

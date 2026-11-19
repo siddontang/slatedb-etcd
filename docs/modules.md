@@ -18,6 +18,7 @@ The CLI and embedded API share the same lifecycle and runtime paths.
 | `node/ready` | Order Ready delivery, durable completions, and peer acknowledgements |
 | `node/log` and `node/cache` | Isolate disk work and bound retained log memory |
 | `node/schedule` | Dispatch state work and publish completed apply positions |
+| `node/watch` | Publish applied views and Watch event batches to local streams |
 | `node/apply` | Apply committed entries in order and group ordinary puts |
 | `node/proposal` | Group consecutive leader Put proposals within one event turn |
 | `node/quorum_put` | Prepare exact Put results after quorum commit |
@@ -55,7 +56,8 @@ A linearizable read first obtains a Safe ReadIndex proof.
 The owner waits for local apply to cover that index, then captures the current immutable view.
 A read task evaluates the request. The owner checks the proof again before returning its result.
 Serializable reads use a local view without a quorum proof.
-Watch and administrative scans still use the apply owner.
+Watch streams take events from an in-memory feed and scan history on pinned views.
+Administrative scans still use the apply owner.
 
 A checkpoint freezes one applied prefix. The builder flushes and encodes that prefix outside Raft.
 The log worker saves the snapshot and truncates its covered entries in one synced batch.

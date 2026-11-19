@@ -223,9 +223,19 @@ Compaction removes events below the boundary. Events at the boundary remain avai
 Previous values are omitted when the revision before the event is below the boundary.
 
 Watch runs on the receiving replica and can lag the leader. It does not provide linearizable reads.
-Streams poll the node every 50 ms. Each page contains at most 32 revisions.
+After each apply job, the node publishes the new read view, then that job's journal rows.
+The feed is an in-memory broadcast channel with 1,024 batches.
+A batch with more than 128 KiB of journal rows, or a snapshot installation, is incomplete.
+Each stream filters feed events in memory for its synced watchers.
+A watcher that starts in history, follows a feed gap, or follows an incomplete batch reads the
+journal from the newest pinned view. That scan runs in the stream task, not on the apply worker.
+One scan page serves all such watchers of the stream and contains at most 32 revisions.
+Each delivered revision advances the watcher start revision, so the feed handoff has no duplicates.
 The output channel buffers 32 responses.
-Each stream supports at most 1,024 watches. Automatic progress uses a 10-second interval.
+Each stream supports at most 1,024 watches.
+Automatic progress uses the configured progress interval, 10 seconds by default.
+A stream check runs at that interval, or every second if shorter. It sends automatic progress and
+rechecks token expiry.
 Progress replies follow all events through their reported revision. Future watches delay progress.
 The fragment option splits large responses near 1 MiB. Each encoded response must fit within 64 MiB.
 

@@ -58,6 +58,8 @@ pub struct StateMachine {
     pub revision: i64,
     pub compact_revision: i64,
     pub leases: Arc<std::collections::BTreeMap<i64, crate::lease::LeaseRecord>>,
+    /// Journal rows of the current apply job for the in-memory Watch feed.
+    pub(crate) watch_capture: Option<crate::watch::Capture>,
 }
 
 impl StateMachine {
@@ -146,6 +148,7 @@ impl StateMachine {
                 revision,
                 compact_revision,
                 leases: Arc::new(leases),
+                watch_capture: None,
             })
         }
         .await;
@@ -170,6 +173,9 @@ impl StateMachine {
             .await?;
         self.write_batches += 1;
         for (key, value) in batch.into_rows() {
+            if let Some(capture) = &mut self.watch_capture {
+                capture.record(&key, value.as_ref());
+            }
             self.current.publish(&key, value.as_ref());
             if let Some(delta) = &mut self.checkpoint_delta {
                 if !delta.record(key, value) {
@@ -178,6 +184,12 @@ impl StateMachine {
             }
         }
         Ok(())
+    }
+
+    /// Return the Watch events of the work since `previous`, if capture is enabled.
+    pub(crate) fn take_watch_batch(&mut self, previous: i64) -> Option<crate::watch::Batch> {
+        let revision = self.revision;
+        self.watch_capture.as_mut()?.take(previous, revision)
     }
 
     pub(crate) async fn close(&self) -> Result<()> {
