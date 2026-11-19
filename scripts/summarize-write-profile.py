@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize measured-phase allocation requests and cross-stage task wakes."""
+"""Summarize worker CPU, allocation requests, and cross-stage wakes."""
 
 import argparse
 import json
@@ -11,7 +11,7 @@ from statistics import median
 STAGES = ("raft", "wal", "apply")
 
 
-def sample_rows(sample):
+def sample_rows(sample, per_put=False):
     before = sample["state_counters_before"]
     after = sample["state_counters_after"]
     if len(before) != sample["members"] or len(after) != len(before):
@@ -28,6 +28,12 @@ def sample_rows(sample):
         batches = totals["batches"]
         if not batches:
             raise ValueError("No measured batches for " + stage)
+        if per_put:
+            puts = sample["successes"]
+            cpu = totals["cpu_ns"] / (1000 * puts) if "cpu_ns" in totals else None
+            yield stage, [cpu, totals["allocation_calls"] / puts,
+                          totals["requested_bytes"] / (1024 * puts), batches / puts]
+            continue
         yield stage, [totals["entries"] / batches, totals["allocation_calls"] / batches,
                       totals["requested_bytes"] / batches,
                       *(totals["wakes_from_" + source] / batches for source in STAGES)]
@@ -37,6 +43,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report", type=Path)
     parser.add_argument("--locks", action="store_true", help="Show the totals for the two service locks")
+    parser.add_argument("--per-put", action="store_true",
+                        help="Sum the member costs per successful client Put")
     args = parser.parse_args()
     report = json.loads(args.report.read_text())
     if not report["passed"] or not report["complete"]:
@@ -46,7 +54,7 @@ def main():
     for sample in report["samples"]:
         if not sample["passed"] or sample["read_percent"] != 0:
             parser.error("Use successful pure write samples")
-        rows = list(sample_rows(sample))
+        rows = list(sample_rows(sample, args.per_put))
         if args.locks:
             for start, end in zip(sample["state_counters_before"], sample["state_counters_after"]):
                 for name in ("forwarding", "wal_stop"):
@@ -60,10 +68,14 @@ def main():
                         totals[field] += delta
         for stage, row in rows:
             groups[sample["backend"], sample["concurrency"], stage].append(row)
-    print("| Build | C | Stage | Entries | Allocations | Bytes | From Raft | From WAL | From apply |")
-    print("| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    if args.per_put:
+        print("| Build | C | Stage | CPU µs/Put | Allocations/Put | KiB/Put | Batches/Put |")
+        print("| --- | ---: | --- | ---: | ---: | ---: | ---: |")
+    else:
+        print("| Build | C | Stage | Entries | Allocations | Bytes | From Raft | From WAL | From apply |")
+        print("| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
     for (build, concurrency, stage), rows in sorted(groups.items()):
-        values = [f"{median(column):.2f}" for column in zip(*rows)]
+        values = [f"{median(col):.2f}" if None not in col else "n/a" for col in zip(*rows)]
         print("|", " | ".join([build, str(concurrency), stage, *values]), "|")
 
     if args.locks:

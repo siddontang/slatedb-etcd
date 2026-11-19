@@ -64,7 +64,8 @@ fn current_key(key: &[u8]) -> Vec<u8> {
 
 fn history_prefix(key: &[u8]) -> Vec<u8> {
     const HEX: &[u8] = b"0123456789abcdef";
-    let mut out = Vec::with_capacity(HISTORY.len() + key.len() * 2 + 1);
+    // Reserve the revision suffix for history writes.
+    let mut out = Vec::with_capacity(HISTORY.len() + key.len() * 2 + 1 + 8);
     out.extend_from_slice(HISTORY);
     for byte in key {
         out.push(HEX[(byte >> 4) as usize]);

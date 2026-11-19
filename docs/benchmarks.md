@@ -182,3 +182,19 @@ Flat symbols and call stacks remain available.
 Profiled latency and throughput include sampling overhead. Use separate runs for comparisons.
 Full snapshots and retained MVCC history increase cost during longer write runs.
 Check failures before comparing successful throughput or latency.
+
+## Measure write costs per client Put
+
+The Linux performance job saves worker counters and native CPU samples in `linux-write-cost`.
+It uses three members, 32 clients, 1,000 keys, and 12,000 writes of 256-byte metadata values.
+
+```sh
+python3 scripts/summarize-write-profile.py --per-put results/ci/write-cost.json
+```
+
+The report subtracts warmup counters and sums all three members for each completed client Put.
+It shows the median of three runs. Requested bytes include reallocations.
+The diagnostic build reads the worker thread CPU clock around each active poll or WAL job.
+Waiting for a device or a task does not consume thread CPU.
+The three stages exclude RPC handling, checkpoint tasks, and background storage work.
+Use the separate native runs for throughput, p99 latency, process CPU, and peak RSS.

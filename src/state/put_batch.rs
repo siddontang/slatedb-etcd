@@ -75,20 +75,23 @@ impl StateMachine {
                         )
                     })
                 } else {
-                    match mvcc::prepare_put(&self.db, revision, put.request, &batch, &self.current)
-                        .await
+                    match mvcc::prepare_put(
+                        &self.db,
+                        revision,
+                        put.request,
+                        &mut batch,
+                        &mut size,
+                        &self.current,
+                    )
+                    .await
                     {
-                        Ok((reply, writes, next)) => {
-                            size = writes
-                                .logical_size_after(&self.db, Some(&batch), size)
-                                .await?;
+                        Ok((reply, next)) => {
                             if let Some(
                                 crate::proto::etcdserverpb::request_op::Request::RequestPut(p),
                             ) = &put.request.request
                             {
                                 counts.put(&p.key, &p.value);
                             }
-                            batch.extend(writes);
                             revision = next;
                             Ok(reply)
                         }
@@ -104,6 +107,9 @@ impl StateMachine {
                 }
             };
             replies.push(Outcome { result });
+        }
+        if revision != self.revision {
+            batch.put(mvcc::REVISION, revision.to_be_bytes());
         }
         let last = puts.last().unwrap().index;
         batch.put(APPLIED, last.to_be_bytes());

@@ -9,7 +9,7 @@ use crate::proto::mvccpb::Event;
 
 const EVENTS: &[u8] = b"etcd/events/";
 
-fn key(revision: i64) -> Vec<u8> {
+pub(crate) fn key(revision: i64) -> Vec<u8> {
     [EVENTS, &revision.to_be_bytes()].concat()
 }
 

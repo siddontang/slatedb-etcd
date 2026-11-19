@@ -51,14 +51,17 @@ impl WriteBatch {
         self.insert(key, None, Original::Known(Some(old_len)));
     }
 
-    /// Keep the size from the MVCC lookup for quota accounting.
-    pub(crate) fn put_known(
+    /// Update the quota total before the next put in this batch.
+    pub(crate) fn put_counted(
         &mut self,
-        key: impl Into<Bytes>,
-        value: impl Into<Bytes>,
+        key: Bytes,
+        value: Bytes,
         old_len: Option<usize>,
-    ) {
-        self.insert(key.into(), Some(value.into()), Original::Known(old_len));
+        size: &mut u64,
+    ) -> Result<()> {
+        *size = row_size_after(*size, key.len(), old_len, Some(value.len()))?;
+        self.insert(key, Some(value), Original::Known(old_len));
+        Ok(())
     }
 
     fn change(&mut self, key: &[u8], value: Option<Bytes>, original: Original) {
@@ -110,16 +113,12 @@ impl WriteBatch {
                     None => db.get(key).await?.map(|v| v.len()),
                 },
             };
-            if let Some(length) = old_len {
-                size = size
-                    .checked_sub((key.len() + length) as u64)
-                    .context("logical size counter underflow")?;
-            }
-            if let Some(value) = &change.value {
-                size = size
-                    .checked_add((key.len() + value.len()) as u64)
-                    .context("logical size counter overflow")?;
-            }
+            size = row_size_after(
+                size,
+                key.len(),
+                old_len,
+                change.value.as_ref().map(Bytes::len),
+            )?;
         }
         Ok(size)
     }
@@ -141,4 +140,17 @@ impl WriteBatch {
         }
         batch
     }
+}
+
+fn row_size_after(
+    size: u64,
+    key_len: usize,
+    old: Option<usize>,
+    new: Option<usize>,
+) -> Result<u64> {
+    let bytes = |len| (key_len + len) as u64;
+    size.checked_sub(old.map_or(0, bytes))
+        .context("logical size counter underflow")?
+        .checked_add(new.map_or(0, bytes))
+        .context("logical size counter overflow")
 }

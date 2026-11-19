@@ -55,6 +55,8 @@ func TestFailpointRecovery(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			batched := map[string]int64{}
+			var priorRevision int64
+			const priorValue = "\x00\xffbefore"
 			if strings.HasPrefix(point, "snapshot-") {
 				c.stop(target)
 				for i := 0; i < 8; i++ {
@@ -67,6 +69,8 @@ func TestFailpointRecovery(t *testing.T) {
 				require.NoError(t, os.WriteFile(trigger, []byte(point), 0600))
 				c.start(target)
 			} else if strings.HasPrefix(point, "apply-batch-") {
+				prior := mustCall(t, api, clientv3.OpPut("batch/00", priorValue)).(*pb.PutResponse)
+				priorRevision = prior.Header.Revision
 				applyDelay(t, c, target, 2500)
 				mustCall(t, api, clientv3.OpPut("batch-blocker", "ready"))
 				for i := 0; i < 8; i++ {
@@ -136,6 +140,23 @@ func TestFailpointRecovery(t *testing.T) {
 				require.Len(t, got.Kvs, 1)
 				require.Equal(t, point, string(got.Kvs[0].Value))
 				require.Equal(t, revision, got.Kvs[0].ModRevision)
+			}
+			if priorRevision != 0 {
+				old := mustCall(t, recovered, clientv3.OpGet("batch/00",
+					clientv3.WithRev(priorRevision))).(*pb.RangeResponse)
+				require.Len(t, old.Kvs, 1)
+				require.Equal(t, priorValue, string(old.Kvs[0].Value))
+				stream := recovered.Watch(ctx, "batch/00",
+					clientv3.WithRev(batched["batch/00"]), clientv3.WithPrevKV())
+				select {
+				case replay := <-stream:
+					require.NoError(t, replay.Err())
+					require.Len(t, replay.Events, 1)
+					require.Equal(t, old.Kvs[0], replay.Events[0].PrevKv)
+					require.Equal(t, point, string(replay.Events[0].Kv.Value))
+				case <-ctx.Done():
+					t.Fatal("batch watch replay timed out")
+				}
 			}
 			mustCall(t, recovered, clientv3.OpPut("after-fault", point))
 			if point == "watch-before-send" {
