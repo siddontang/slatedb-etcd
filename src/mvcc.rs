@@ -20,6 +20,7 @@ pub(crate) use put::prepare_put;
 pub(crate) const CURRENT: &[u8] = b"etcd/current/";
 const HISTORY: &[u8] = b"etcd/history/";
 pub const REVISION: &[u8] = b"etcd/revision";
+pub(crate) const COMPACTED: &str = "mvcc: required revision has been compacted";
 pub const COMPACT_REVISION: &[u8] = b"etcd/compact-revision";
 type KvResult<T> = Result<T, KvError>;
 type KvFuture<'a, T> = Pin<Box<dyn Future<Output = KvResult<T>> + Send + 'a>>;
@@ -273,10 +274,7 @@ impl View<'_> {
         if request.revision < self.compact_revision
             && (request.revision > 0 || (nested && request.revision != 0))
         {
-            return Err(KvError::new(
-                Code::OutOfRange,
-                "mvcc: required revision has been compacted",
-            ));
+            return Err(KvError::new(Code::OutOfRange, COMPACTED));
         }
         if request.revision > self.revision {
             return Err(KvError::new(
@@ -727,10 +725,7 @@ pub async fn prepare_compaction(
     request: &CompactionRequest,
 ) -> KvResult<(CompactionResponse, WriteBatch)> {
     if request.revision <= compact_revision {
-        return Err(KvError::new(
-            Code::OutOfRange,
-            "mvcc: required revision has been compacted",
-        ));
+        return Err(KvError::new(Code::OutOfRange, COMPACTED));
     }
     if request.revision > revision {
         return Err(KvError::new(

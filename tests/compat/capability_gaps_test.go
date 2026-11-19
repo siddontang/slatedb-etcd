@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
@@ -111,4 +112,8 @@ func TestDifferentialHashKV(t *testing.T) {
 	}
 	check(deleted)
 	check(0)
+	_, ae := compact(actual, deleted, true)
+	_, be := compact(expected, deleted, true)
+	require.Equal(t, codes.OutOfRange, status.Code(be))
+	require.Equal(t, status.Convert(be).Message(), status.Convert(ae).Message())
 }

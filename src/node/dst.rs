@@ -936,6 +936,12 @@ impl Simulation {
         })
         .await
         .expect("the compaction flush must reach the object store");
+        let (retry, mut retry_reply) = oneshot::channel();
+        self.nodes
+            .get_mut(&leader)
+            .unwrap()
+            .propose(physical("physical-retry", first), retry)
+            .unwrap();
         self.admin_command(
             RaftCommand::Etcd {
                 id: "put-during-flush".into(),
@@ -986,9 +992,19 @@ impl Simulation {
             second_reply.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
         ));
+        assert!(matches!(
+            retry_reply.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
         assert_eq!(*node.forwarding.subscribe().compact.borrow(), first);
         self.paused_flush = None;
         self.drive().await;
+        let retried: Outcome<Value> =
+            serde_json::from_value(retry_reply.await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            retried.result.unwrap_err().code,
+            tonic::Code::OutOfRange as i32
+        );
         let reply: Outcome<Value> =
             serde_json::from_value(second_reply.await.unwrap().unwrap()).unwrap();
         reply.result.unwrap();

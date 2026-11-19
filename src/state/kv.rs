@@ -102,11 +102,25 @@ impl StateMachine {
         request: &CompactionRequest,
     ) -> Result<Outcome<CompactionResponse>> {
         let outcome = self.apply_compaction_batch(index, request).await?;
-        if request.physical && outcome.result.is_ok() {
+        if self.physical_compact_revision(request, &outcome).is_some() {
             self.metrics.flush_db(&self.db).await?;
             self.durable_applied = index;
         }
         Ok(outcome)
+    }
+
+    pub(crate) fn physical_compact_revision(
+        &self,
+        request: &CompactionRequest,
+        outcome: &Outcome<CompactionResponse>,
+    ) -> Option<i64> {
+        // A physical retry also waits for an earlier logical compaction to reach storage.
+        let compacted = request.revision <= self.compact_revision
+            && outcome
+                .result
+                .as_ref()
+                .is_err_and(|e| e.code == tonic::Code::OutOfRange as i32);
+        (request.physical && (outcome.result.is_ok() || compacted)).then_some(self.compact_revision)
     }
 
     pub(crate) async fn apply_compaction_batch(

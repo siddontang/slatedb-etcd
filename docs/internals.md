@@ -206,6 +206,7 @@ Each member flushes a physical Compact outside ordered apply. Writes can apply d
 One flush can run at a time. The highest queued index covers intervening physical compactions.
 A successful physical reply requires a flush through its own index.
 A forwarding member also waits for its local durable compact revision.
+A repeated physical request waits for the earlier boundary before it returns the compacted error.
 A storage error stops the node. On restart, Raft replays any missing deletion batch.
 Defragment rewrites the current SST set and waits for manifest publication.
 SlateDB garbage collection reclaims obsolete objects later. Pinned checkpoints can retain them.

@@ -580,12 +580,12 @@ async fn apply_entries(
                 if let Ok(response) = &mut outcome.result {
                     header.fill(response.header.as_mut());
                 }
-                let physical = compact.physical && outcome.result.is_ok();
+                let flush = state.physical_compact_revision(compact, &outcome);
                 let value = serde_json::to_value(outcome)?;
-                if physical {
+                if let Some(revision) = flush {
                     Reply::PhysicalCompact {
                         index: entry.index,
-                        revision: compact.revision,
+                        revision,
                         value,
                     }
                 } else {
