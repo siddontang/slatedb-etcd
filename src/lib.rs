@@ -1,4 +1,5 @@
 mod batch;
+mod codec;
 mod command;
 pub use batch::WriteBatch;
 

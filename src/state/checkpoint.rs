@@ -39,13 +39,13 @@ impl Delta {
 
     fn merge(self, base: &[u8], applied: u64, members: &[u8]) -> Result<Vec<u8>> {
         let mut input = base;
-        let (format, index, rows): (u32, u64, u64) = bincode::deserialize_from(&mut input)?;
+        let (format, index, rows): (u32, u64, u64) = crate::codec::read(&mut input)?;
         ensure!(
             format == STORAGE_FORMAT && index == self.base,
             "wrong checkpoint base"
         );
         let mut out = Vec::with_capacity(base.len().saturating_add(self.charged));
-        bincode::serialize_into(&mut out, &(format, applied, 0_u64))?;
+        crate::codec::write(&mut out, &(format, applied, 0_u64))?;
         let count_offset = out.len() - 8;
         let mut count = 0_u64;
         let mut changes = self.rows.into_iter().peekable();
@@ -80,7 +80,7 @@ impl Delta {
 }
 
 fn field<'a>(input: &mut &'a [u8]) -> Result<&'a [u8]> {
-    let len = usize::try_from(bincode::deserialize_from::<_, u64>(&mut *input)?)?;
+    let len = usize::try_from(crate::codec::read::<u64>(input)?)?;
     let (value, rest) = input
         .split_at_checked(len)
         .context("short checkpoint field")?;
@@ -92,7 +92,7 @@ fn write_row(out: &mut Vec<u8>, key: &[u8], value: Option<&[u8]>) -> Result<u64>
     if let Some(value) = value {
         // Bincode prefixes each byte sequence with its length.
         for field in [key, value] {
-            bincode::serialize_into(&mut *out, &(field.len() as u64))?;
+            crate::codec::write(&mut *out, &(field.len() as u64))?;
             out.extend_from_slice(field);
         }
         return Ok(1);
