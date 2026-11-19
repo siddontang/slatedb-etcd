@@ -921,14 +921,21 @@ impl Simulation {
             self.deliver(false).await;
         }
         let store = self.stores[&leader].clone();
+        while let Ok(permit) = store.entered.try_acquire() {
+            permit.forget();
+        }
         store.set(crate::object::faults::PAUSE_PUT);
         let node = self.nodes.get_mut(&leader).unwrap();
         assert_eq!(node.state.compact_revision, first);
         let first_index = node.state.applied;
-        tokio::select! {
-            result = node.compaction.next() => panic!("flush escaped the storage fault: {result:?}"),
-            entered = store.entered.acquire() => entered.unwrap().forget(),
-        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                result = node.compaction.next() => panic!("unexpected flush completion: {result:?}"),
+                entered = store.entered.acquire() => entered.unwrap().forget(),
+            }
+        })
+        .await
+        .expect("the compaction flush must reach the object store");
         self.admin_command(
             RaftCommand::Etcd {
                 id: "put-during-flush".into(),
