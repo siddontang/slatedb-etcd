@@ -70,7 +70,7 @@ impl ServerConfig {
             peer_tls: crate::tls::Options::default(),
             object_store: crate::object::Config::Local,
             watch_progress_notify_interval: crate::grpc::DEFAULT_WATCH_PROGRESS_INTERVAL,
-            snapshot_every: 1000,
+            snapshot_every: 10_000,
             log_memory: LogMemory::default(),
             quota_bytes: 0,
             auth_token: "simple".into(),
