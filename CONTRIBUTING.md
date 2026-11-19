@@ -36,7 +36,7 @@ scripts/cargo.sh clippy --locked --all-targets -- -D warnings
 scripts/cargo.sh test --locked
 python3 scripts/check-public.py
 python3 scripts/test_history.py
-python3 scripts/check-history.py
+python3 scripts/check-history.py --range origin/main..HEAD
 python3 scripts/test_reporting.py
 python3 scripts/check-secrets.py
 ```
