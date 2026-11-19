@@ -114,16 +114,21 @@ impl Server {
             config.id != 0 && !config.peers.contains_key(&0),
             "invalid member ID"
         );
-        let client_tls = config.client_tls.server()?;
-        let peer_tls = config.peer_tls.server()?;
-        let transport = config.peer_tls.transport()?;
+        let peer_address = config.peer_listen.unwrap_or(config.listen);
+        let mut client_options = config.client_tls.clone();
+        let mut peer_options = config.peer_tls.clone();
+        client_options.prepare(&config.dir, "client", config.listen.ip())?;
+        peer_options.prepare(&config.dir, "peer", peer_address.ip())?;
+        let client_tls = client_options.server()?;
+        let peer_tls = peer_options.server()?;
+        let transport = peer_options.transport()?;
         let tokens = crate::auth::TokenIssuer::parse(&config.auth_token)?;
         ensure!(
             config.peer_listen.is_some() || (client_tls.is_none() && peer_tls.is_none()),
             "TLS requires a separate peer listener"
         );
         ensure!(
-            peer_tls.is_none() || config.peer_tls.client_auth,
+            peer_tls.is_none() || peer_options.client_auth || peer_options.auto_tls.is_some(),
             "peer TLS requires mutual authentication"
         );
         if config.allow_remote {
@@ -131,7 +136,8 @@ impl Server {
                 config.peer_listen.is_some()
                     && client_tls.is_some()
                     && config.client_tls.client_auth
-                    && peer_tls.is_some(),
+                    && peer_tls.is_some()
+                    && peer_options.client_auth,
                 "remote mode requires separate listeners and mutual client and peer TLS"
             );
         }
@@ -139,7 +145,6 @@ impl Server {
             config.allow_remote || config.listen.ip().is_loopback(),
             "remote listeners require allow_remote"
         );
-        let peer_address = config.peer_listen.unwrap_or(config.listen);
         ensure!(
             config.allow_remote || peer_address.ip().is_loopback(),
             "remote peer listeners require allow_remote"
@@ -328,11 +333,12 @@ impl Server {
 
     /// Get the local client endpoint. Remote hosts must use the advertised client URL.
     pub fn client_url(&self) -> String {
-        let scheme = if self.config.client_tls.cert.is_some() {
-            "https"
-        } else {
-            "http"
-        };
+        let scheme =
+            if self.config.client_tls.cert.is_some() || self.config.client_tls.auto_tls.is_some() {
+                "https"
+            } else {
+                "http"
+            };
         format!("{scheme}://{}", self.client_addr())
     }
 
