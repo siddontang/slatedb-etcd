@@ -11,7 +11,7 @@ use crate::proto::etcdserverpb::*;
 pub const KEY: &[u8] = b"etcd/auth";
 type Result<T> = std::result::Result<T, KvError>;
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Credentials {
     pub user: Option<String>,

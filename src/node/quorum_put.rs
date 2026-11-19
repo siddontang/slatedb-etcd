@@ -156,7 +156,13 @@ mod tests {
                 assert!(node.raw.raft.raft_log.committed < index);
             }
         }
-        assert!(reply.try_recv().unwrap().unwrap().result.is_ok());
+        assert!(reply
+            .try_recv()
+            .unwrap()
+            .unwrap()
+            .into_outcome()
+            .result
+            .is_ok());
         assert_eq!(node.quorum_reply_index, index);
         let (tx, mut read) = oneshot::channel();
         node.enqueue_query(Query::Read(
@@ -170,7 +176,13 @@ mod tests {
         node.drain_log().await.unwrap();
         node.drain_apply().await.unwrap();
         assert_eq!(node.state.applied, index);
-        assert!(read.try_recv().unwrap().unwrap().result.is_ok());
+        assert!(read
+            .try_recv()
+            .unwrap()
+            .unwrap()
+            .into_outcome()
+            .result
+            .is_ok());
         assert!(node.prepared_puts.is_none());
     }
 }

@@ -16,6 +16,7 @@ use crate::storage::{PreparedCheckpoint, RaftStorage};
 use crate::{ApiError, Command, RaftCommand, Request};
 
 mod apply;
+pub(crate) const MAX_PENDING_READS: usize = apply::MAX_QUERIES;
 mod cache;
 pub use cache::LogMemory;
 mod cluster;
@@ -34,6 +35,7 @@ mod schedule;
 use crate::peer::transport;
 use apply::{AppliedState, Completion, Header, Job, Output, Query, Reply, Work, Worker};
 use response::ClientResponse;
+pub use response::KvReply;
 
 #[cfg(test)]
 mod dst;
@@ -41,7 +43,7 @@ mod dst;
 mod tests;
 
 pub type Response = oneshot::Sender<Result<Value, ApiError>>;
-pub type KvResponse = oneshot::Sender<Result<crate::mvcc::Outcome, ApiError>>;
+pub type KvResponse = oneshot::Sender<Result<KvReply, ApiError>>;
 
 pub enum Event {
     SubscribeApply(oneshot::Sender<tokio::sync::watch::Receiver<u64>>),

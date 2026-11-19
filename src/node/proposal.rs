@@ -158,7 +158,7 @@ mod tests {
         node.drain_log().await.unwrap();
         node.drain_apply().await.unwrap();
         for (n, reply) in replies.into_iter().enumerate() {
-            let result = reply.await.unwrap().unwrap().result.unwrap();
+            let result = reply.await.unwrap().unwrap().into_outcome().result.unwrap();
             let Some(Response::ResponsePut(put)) = result.response else {
                 panic!("expected Put");
             };
