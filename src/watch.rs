@@ -30,7 +30,7 @@ pub(crate) fn record_journal(revision: i64, events: Vec<Event>, batch: &mut Writ
 pub async fn compact(db: &Db, revision: i64, batch: &mut WriteBatch) -> Result<(), KvError> {
     crate::state::maintenance::compact_hash(db, revision, batch).await?;
     let mut scan = db
-        .scan(EVENTS.to_vec()..key(revision))
+        .scan_with_options(EVENTS.to_vec()..key(revision), &mvcc::maintenance_scan())
         .await
         .map_err(KvError::storage)?;
     while let Some(row) = scan.next().await.map_err(KvError::storage)? {

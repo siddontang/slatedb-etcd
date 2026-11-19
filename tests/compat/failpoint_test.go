@@ -26,7 +26,8 @@ func TestFailpointRecovery(t *testing.T) {
 		"checkpoint-after-file-sync", "checkpoint-file-before-reference", "checkpoint-before-save",
 		"checkpoint-after-save", "checkpoint-after-gc",
 		"snapshot-before-install", "snapshot-after-install-write", "snapshot-after-install-flush",
-		"compact-before-apply", "compact-after-apply", "watch-before-send", "lease-before-expire",
+		"compact-before-apply", "compact-after-apply", "compact-before-flush", "compact-after-flush",
+		"watch-before-send", "lease-before-expire",
 	}
 	for _, point := range points {
 		t.Run(point, func(t *testing.T) {

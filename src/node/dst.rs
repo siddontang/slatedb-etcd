@@ -42,6 +42,7 @@ struct Simulation {
     terms: BTreeMap<u64, u64>,
     isolated: Option<u64>,
     paused_apply: Option<u64>,
+    paused_flush: Option<u64>,
     paused_reads: Option<u64>,
     paused_log: Option<u64>,
     held_log: Option<(u64, log::Completion)>,
@@ -84,6 +85,7 @@ impl Simulation {
             terms: BTreeMap::new(),
             isolated: None,
             paused_apply: None,
+            paused_flush: None,
             paused_reads: None,
             paused_log: None,
             held_log: None,
@@ -198,6 +200,10 @@ impl Simulation {
                 }
             } else if self.paused_reads != Some(id) {
                 node.drain_reads().await.unwrap();
+            }
+            if self.paused_flush != Some(id) && node.compaction.active() {
+                let completed = node.compaction.next().await.unwrap();
+                node.finish_compaction_flush(completed).unwrap();
             }
         }
         for id in failed {
@@ -889,21 +895,102 @@ impl Simulation {
             tonic::Code::PermissionDenied as i32
         );
         self.trace.push("revocation fences queued write".into());
-        let revision = self.nodes[&leader].state.revision;
-        self.admin_command(
+        let first = self.nodes[&leader].state.revision;
+        let physical = |id: &str, revision| {
             RaftCommand::Compact {
-                id: "physical".into(),
+                id: id.into(),
                 compact: CompactionRequest {
                     revision,
                     physical: true,
                 },
             }
-            .secure(Some(root)),
+            .secure(Some(root.clone()))
+        };
+        self.paused_flush = Some(leader);
+        let (tx, mut first_reply) = oneshot::channel();
+        self.nodes
+            .get_mut(&leader)
+            .unwrap()
+            .propose(physical("physical", first), tx)
+            .unwrap();
+        self.drive().await;
+        for _ in 0..500 {
+            if self.nodes[&leader].compaction.active() {
+                break;
+            }
+            self.deliver(false).await;
+        }
+        let store = self.stores[&leader].clone();
+        store.set(crate::object::faults::PAUSE_PUT);
+        let node = self.nodes.get_mut(&leader).unwrap();
+        assert_eq!(node.state.compact_revision, first);
+        let first_index = node.state.applied;
+        tokio::select! {
+            result = node.compaction.next() => panic!("flush escaped the storage fault: {result:?}"),
+            entered = store.entered.acquire() => entered.unwrap().forget(),
+        }
+        self.admin_command(
+            RaftCommand::Etcd {
+                id: "put-during-flush".into(),
+                origin: leader,
+                etcd: RequestOp {
+                    request: Some(Op::RequestPut(PutRequest {
+                        key: b"flush-progress".to_vec(),
+                        value: b"applied".to_vec(),
+                        ..Default::default()
+                    })),
+                },
+            }
+            .secure(Some(root.clone())),
         )
         .await
         .result
         .unwrap();
-        assert!(self.nodes[&leader].state.durable_applied >= self.nodes[&leader].state.applied);
+        let revision = self.nodes[&leader].state.revision;
+        assert!(revision > first);
+        let (tx, mut second_reply) = oneshot::channel();
+        self.nodes
+            .get_mut(&leader)
+            .unwrap()
+            .propose(physical("second-physical", revision), tx)
+            .unwrap();
+        self.drive().await;
+        for _ in 0..500 {
+            if self.nodes[&leader].state.compact_revision == revision {
+                break;
+            }
+            self.deliver(false).await;
+        }
+        let node = self.nodes.get_mut(&leader).unwrap();
+        assert_eq!(node.state.compact_revision, revision);
+        assert!(matches!(
+            first_reply.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(*node.forwarding.subscribe().compact.borrow() < first);
+        store.release.add_permits(1);
+        let flushed = node.compaction.next().await.unwrap();
+        assert_eq!(flushed, (first_index, first));
+        node.finish_compaction_flush(flushed).unwrap();
+        let reply: Outcome<Value> =
+            serde_json::from_value(first_reply.await.unwrap().unwrap()).unwrap();
+        reply.result.unwrap();
+        assert!(matches!(
+            second_reply.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(*node.forwarding.subscribe().compact.borrow(), first);
+        self.paused_flush = None;
+        self.drive().await;
+        let reply: Outcome<Value> =
+            serde_json::from_value(second_reply.await.unwrap().unwrap()).unwrap();
+        reply.result.unwrap();
+        assert_eq!(
+            *self.nodes[&leader].forwarding.subscribe().compact.borrow(),
+            revision
+        );
+        self.trace
+            .push("a later write applied during the held compaction flush".into());
         self.checkpoint().await;
         self.stop(lagging);
         self.start(lagging).await;

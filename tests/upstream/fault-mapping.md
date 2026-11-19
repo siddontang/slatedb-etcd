@@ -50,6 +50,8 @@ These hooks require at least two entries. Process tests stage a delayed multi-en
 Repeated Put tests preserve each request's revision and Watch event across group recovery.
 The separate checkpoint cases cover before-save, after-save, and after-GC crashes.
 The snapshot cases also distinguish buffered state replacement from completed object flush.
+Physical compaction tests crash a follower at `compact-before-flush` and `compact-after-flush`.
+DST holds a real SST upload, applies a later write, and checks two physical compact replies.
 The S3 suite checks delayed PUT, ambiguous PUT success, HTTP failures, restart GET failure, and
 snapshot transfer. DST checks the same object API boundaries with explicit scheduling.
 

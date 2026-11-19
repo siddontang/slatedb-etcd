@@ -354,6 +354,9 @@ impl Kv for Service {
                     .await?
                     .into_inner();
                 self.local_barrier().await?;
+                if request.physical {
+                    self.wait_compaction(request.revision).await?;
+                }
                 response
             }
             Err(error) => return Err(Status::unavailable(format!("etcdserver: {}", error.error))),

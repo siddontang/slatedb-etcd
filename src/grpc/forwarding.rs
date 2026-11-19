@@ -75,6 +75,18 @@ impl Service {
         Ok(channel)
     }
 
+    pub(super) async fn wait_compaction(&self, revision: i64) -> Result<(), Status> {
+        let mut durable = self.forward_view().await?.compact.clone();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            durable.wait_for(|r| *r >= revision),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("local compaction flush timed out"))?
+        .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?;
+        Ok(())
+    }
+
     pub(crate) async fn wait_revision(&self, revision: i64) -> Result<(), Status> {
         if self.forward_view().await?.applied(revision) {
             return Ok(());

@@ -54,7 +54,8 @@ func TestAdminCompatibility(t *testing.T) {
 
 func TestDifferentialHashKV(t *testing.T) {
 	c := newCluster(t)
-	actual, expected := client(t, c.addresses), reference(t)
+	follower := c.leader()%3 + 1
+	actual, expected := client(t, []string{c.addresses[follower-1]}), reference(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	check := func(revision int64) {
@@ -94,4 +95,20 @@ func TestDifferentialHashKV(t *testing.T) {
 		check(revision)
 		check(revision - 1)
 	}
+	// Hash an empty keyspace, then query that boundary after a key returns.
+	var deleted int64
+	for _, api := range []*clientv3.Client{actual, expected} {
+		result, err := api.Delete(ctx, "a", clientv3.WithFromKey())
+		require.NoError(t, err)
+		deleted = result.Header.Revision
+	}
+	check(deleted)
+	for _, api := range []*clientv3.Client{actual, expected} {
+		_, err := api.Put(ctx, "a", "new generation")
+		require.NoError(t, err)
+		_, err = api.Compact(ctx, deleted, clientv3.WithCompactPhysical())
+		require.NoError(t, err)
+	}
+	check(deleted)
+	check(0)
 }
