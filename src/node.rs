@@ -45,6 +45,8 @@ mod tests;
 
 pub type Response = oneshot::Sender<Result<Value, ApiError>>;
 pub type KvResponse = oneshot::Sender<Result<KvReply, ApiError>>;
+/// Typed lease reply. It skips the JSON round trip on the KeepAlive path.
+pub type LeaseResponse = oneshot::Sender<Result<crate::mvcc::Outcome<LeaseReply>, ApiError>>;
 
 pub enum Event {
     SubscribeWatch(oneshot::Sender<crate::watch::Subscription>),
@@ -62,6 +64,12 @@ pub enum Event {
     LinearRead(RequestOp, Response),
     EtcdCompact(CompactionRequest, Response),
     Lease(LeaseCommand, Response),
+    /// One KeepAlive from a gRPC stream, with the caller's credentials.
+    KeepAlive {
+        id: i64,
+        credentials: crate::auth::Credentials,
+        response: LeaseResponse,
+    },
     Step(Message, Response),
     PeerFrame(Message, usize, Response),
     Status(Response),
@@ -713,6 +721,13 @@ impl Node {
             }
             Event::Lease(LeaseCommand::KeepAlive { id }, response) => {
                 self.keep_alive(id, credentials, response)?;
+            }
+            Event::KeepAlive {
+                id,
+                credentials,
+                response,
+            } => {
+                self.keep_alive(id, Some(credentials), ClientResponse::Lease(response))?;
             }
             Event::Lease(mut lease, response) => {
                 self.expire_leases()?;

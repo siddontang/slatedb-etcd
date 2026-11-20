@@ -8,7 +8,7 @@ const RENEWAL_CANCELLED: &str = "lease renewal cancelled: leadership changed or 
 pub(super) struct Renewal {
     pub(super) id: i64,
     pub(super) credentials: Option<crate::auth::Credentials>,
-    pub(super) response: Response,
+    pub(super) response: ClientResponse,
     pub(super) started: Instant,
 }
 
@@ -131,14 +131,15 @@ impl Node {
         &mut self,
         id: i64,
         credentials: Option<crate::auth::Credentials>,
-        response: Response,
+        response: impl Into<ClientResponse>,
     ) -> Result<()> {
+        let response = response.into();
         if self.raw.raft.state != StateRole::Leader {
-            let _ = response.send(Err(self.error("not leader")));
+            response.error(self.error("not leader"));
         } else if self.state.auth.enabled {
             self.propose_keep_alive(id, credentials, response)?;
         } else if self.renewals.len() >= MAX_RENEWALS {
-            let _ = response.send(Err(self.error("too many pending lease renewals")));
+            response.error(self.error("too many pending lease renewals"));
         } else {
             self.renewals.waiting.push(Renewal {
                 id,
@@ -155,7 +156,7 @@ impl Node {
         &mut self,
         id: i64,
         credentials: Option<crate::auth::Credentials>,
-        response: Response,
+        response: ClientResponse,
     ) -> Result<()> {
         self.propose(
             RaftCommand::Lease {
@@ -177,15 +178,15 @@ impl Node {
         }
         if self.raw.raft.state != StateRole::Leader {
             for renewal in std::mem::take(&mut self.renewals.waiting) {
-                let _ = renewal.response.send(Err(self.error("not leader")));
+                renewal.response.error(self.error("not leader"));
             }
             return;
         }
         let Some(context) = self.read_sequence.checked_add(1) else {
             for renewal in std::mem::take(&mut self.renewals.waiting) {
-                let _ = renewal
+                renewal
                     .response
-                    .send(Err(self.error("read sequence exhausted")));
+                    .error(self.error("read sequence exhausted"));
             }
             return;
         };
@@ -260,7 +261,7 @@ impl Node {
             }
         }
         for response in cancelled {
-            let _ = response.send(Err(self.error(RENEWAL_CANCELLED)));
+            response.error(self.error(RENEWAL_CANCELLED));
         }
     }
 
@@ -279,10 +280,13 @@ impl Node {
             if stale || batch.term != self.raw.raft.term || self.raw.raft.state != StateRole::Leader
             {
                 for renewal in batch.renewals {
-                    let _ = renewal.response.send(Err(self.error(RENEWAL_CANCELLED)));
+                    renewal.response.error(self.error(RENEWAL_CANCELLED));
                 }
                 continue;
             }
+            // Every reply in the batch reports the same applied revision and member.
+            let mut header = crate::mvcc::header(self.state.revision);
+            self.fill_header(header.as_mut());
             for renewal in batch.renewals {
                 if renewal.response.is_closed() {
                     continue;
@@ -292,8 +296,6 @@ impl Node {
                     continue;
                 }
                 let ttl = self.renew_lease(renewal.id);
-                let mut header = crate::mvcc::header(self.state.revision);
-                self.fill_header(header.as_mut());
                 let reply = crate::mvcc::Outcome {
                     result: Ok(LeaseReply::KeepAlive(
                         crate::proto::etcdserverpb::LeaseKeepAliveResponse {
@@ -303,7 +305,7 @@ impl Node {
                         },
                     )),
                 };
-                let _ = renewal.response.send(Ok(serde_json::to_value(reply)?));
+                renewal.response.lease(reply)?;
             }
         }
         Ok(())

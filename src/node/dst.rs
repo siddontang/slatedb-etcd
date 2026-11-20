@@ -1067,6 +1067,116 @@ impl Simulation {
             .push("auth and physical compact recovered".into());
     }
 
+    /// Let every member tick past an election timeout and deliver the resulting messages.
+    async fn settle(&mut self) {
+        for _ in 0..25 {
+            for id in 1..=3 {
+                self.tick(id).await;
+            }
+            for _ in 0..30 {
+                self.deliver(false).await;
+            }
+        }
+    }
+
+    /// Renew a lease in leader memory, as the gRPC KeepAlive path does.
+    async fn renew(&mut self, member: u64, lease: i64) -> std::result::Result<i64, ApiError> {
+        let (tx, mut rx) = oneshot::channel();
+        self.trace.push(format!("renew {member} {lease}"));
+        self.nodes
+            .get_mut(&member)
+            .unwrap()
+            .keep_alive(lease, None, tx)
+            .unwrap();
+        self.drive().await;
+        for _ in 0..300 {
+            if let Ok(result) = rx.try_recv() {
+                let outcome: Outcome<LeaseReply> = serde_json::from_value(result?).unwrap();
+                let Ok(LeaseReply::KeepAlive(response)) = outcome.result else {
+                    panic!("expected a KeepAlive reply");
+                };
+                return Ok(response.ttl);
+            }
+            self.deliver(false).await;
+        }
+        panic!("renewal on {member} did not finish");
+    }
+
+    /// Retry a renewal that a slow host cancelled for a stale proof.
+    async fn renew_on_leader(&mut self, lease: i64) -> i64 {
+        for _ in 0..3 {
+            let leader = self.leader().unwrap();
+            match self.renew(leader, lease).await {
+                Ok(ttl) => return ttl,
+                Err(error) => assert!(error.error.contains("renewal cancelled"), "{error:?}"),
+            }
+            self.settle().await;
+        }
+        panic!("leader did not renew lease {lease}");
+    }
+
+    /// An isolated leader cannot renew in memory. The next leader extends inherited leases.
+    async fn renew_under_partition(&mut self) {
+        self.settle().await;
+        let ttl = self.nodes[&self.leader().unwrap()].state.leases[&77].ttl;
+        assert_eq!(self.renew_on_leader(77).await, ttl);
+        let old = self.leader().unwrap();
+        let last = self.nodes[&old].raw.raft.raft_log.last_index();
+        assert_eq!(self.renew(old, 78).await.unwrap(), 0, "unknown lease");
+        assert_eq!(
+            self.nodes[&old].raw.raft.raft_log.last_index(),
+            last,
+            "an in-memory renewal must not append a log entry"
+        );
+
+        // Cut the leader off. Its proof cannot reach a quorum, and check_quorum demotes it.
+        self.isolated = Some(old);
+        self.trace.push(format!("isolate renewing leader {old}"));
+        let (tx, mut rx) = oneshot::channel();
+        self.nodes
+            .get_mut(&old)
+            .unwrap()
+            .keep_alive(77, None, tx)
+            .unwrap();
+        self.settle().await;
+        let error = rx
+            .try_recv()
+            .expect("the isolated renewal must finish")
+            .expect_err("an isolated leader must not renew");
+        assert!(
+            error.error.contains("renewal cancelled") || error.error == "not leader",
+            "{error:?}"
+        );
+        let node = self.nodes.get_mut(&old).unwrap();
+        assert_ne!(node.raw.raft.state, StateRole::Leader);
+        // The run loop syncs deadlines after each event. A follower keeps none.
+        node.sync_lease_deadlines();
+        assert!(node.lease_deadlines.is_empty() && node.renewals.is_empty());
+        // A member that is no longer leader rejects new renewals, so the gRPC layer forwards them.
+        assert_eq!(self.renew(old, 77).await.unwrap_err().error, "not leader");
+
+        // The majority side elects a leader that gives the inherited lease its TTL plus the
+        // longest election timeout, so no renewal the old leader replied to can outlive it.
+        let new = self.leader().expect("the majority must elect a leader");
+        assert_ne!(new, old);
+        let node = self.nodes.get_mut(&new).unwrap();
+        node.sync_lease_deadlines();
+        let remaining = node.lease_deadlines[&77]
+            .1
+            .saturating_duration_since(Instant::now());
+        assert!(
+            remaining > Duration::from_secs(ttl as u64),
+            "seed {}: {remaining:?}",
+            self.seed
+        );
+        assert_eq!(self.renew_on_leader(77).await, ttl);
+
+        self.isolated = None;
+        self.trace.push("heal renewing leader".into());
+        self.settle().await;
+        assert_eq!(self.renew_on_leader(77).await, ttl);
+    }
+
     async fn batch_and_pinned_reads(&mut self) {
         let leader = self.leader().unwrap();
         self.paused_reads = Some(leader);
@@ -1614,6 +1724,7 @@ impl Simulation {
                 );
             }
         }
+        sim.renew_under_partition().await;
         sim.batch_and_pinned_reads().await;
         sim.crash_after_quorum_reply().await;
         sim.admin_recovery().await;
