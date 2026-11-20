@@ -1067,7 +1067,7 @@ mod tests {
 
     fn random_op(rng: &mut Rng, depth: u32) -> RequestOp {
         let key = rng.pick(&KEYS).to_vec();
-        let kinds = if depth < 2 { 10 } else { 7 };
+        let kinds = if depth < 2 { 12 } else { 7 };
         let request = match rng.below(kinds) {
             0..=2 => Op::RequestPut(PutRequest {
                 key,
@@ -1102,6 +1102,7 @@ mod tests {
                 keys_only: rng.below(8) == 0,
                 ..Default::default()
             }),
+            10 | 11 => random_put_txn(rng),
             _ => {
                 use compare::TargetUnion as T;
                 let compares = (0..rng.below(3))
@@ -1145,6 +1146,58 @@ mod tests {
         RequestOp {
             request: Some(request),
         }
+    }
+
+    /// A transaction of ordinary puts with point compares. It takes the direct write path.
+    fn random_put_txn(rng: &mut Rng) -> Op {
+        use compare::TargetUnion as T;
+        const PUT_KEYS: [&[u8]; 8] = [b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h"];
+        let branch = |rng: &mut Rng| {
+            let mut keys = PUT_KEYS.to_vec();
+            let mut ops = vec![];
+            for _ in 0..rng.below(9) {
+                let key = keys.remove(rng.below(keys.len() as u64) as usize);
+                ops.push(RequestOp {
+                    request: Some(Op::RequestPut(PutRequest {
+                        key: key.to_vec(),
+                        value: random_value(rng),
+                        prev_kv: rng.below(2) == 0,
+                        ..Default::default()
+                    })),
+                });
+            }
+            // A repeated key fails validation.
+            if !ops.is_empty() && rng.below(10) == 0 {
+                ops.push(ops[0].clone());
+            }
+            ops
+        };
+        let compare = (0..rng.below(3))
+            .map(|_| {
+                let target = rng.below(5) as i32;
+                let number = rng.below(12) as i64;
+                Compare {
+                    result: rng.below(4) as i32,
+                    target,
+                    key: rng.pick(&PUT_KEYS).to_vec(),
+                    target_union: Some(match target {
+                        0 => T::Version(number % 4),
+                        1 => T::CreateRevision(number),
+                        2 => T::ModRevision(number),
+                        3 => T::Value(random_value(rng)),
+                        _ => T::Lease(*rng.pick(&[0, 5, 6])),
+                    }),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let success = branch(rng);
+        let failure = branch(rng);
+        Op::RequestTxn(TxnRequest {
+            compare,
+            success,
+            failure,
+        })
     }
 
     fn reply_value(reply: &Reply) -> serde_json::Value {
@@ -1274,6 +1327,7 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(24);
+        let direct = crate::mvcc::DIRECT_TXNS.with(|count| count.get());
         for seed in 1..=seeds {
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
             let secured = seed % 3 == 0;
@@ -1410,5 +1464,7 @@ mod tests {
             );
             reopened.close().await.unwrap();
         }
+        // Put-only transactions took the direct path, and the one-by-one path checked them.
+        assert!(crate::mvcc::DIRECT_TXNS.with(|count| count.get()) > direct);
     }
 }

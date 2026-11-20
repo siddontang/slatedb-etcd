@@ -354,6 +354,11 @@ Apply cannot select entries from a cache prefix that the new snapshot removed.
 Ordinary puts share one immutable encoded value between the current row and the HashKV index.
 History and Watch keep their own records. Both indexes count their full logical size for quota.
 
+A transaction whose branches hold only ordinary puts, and whose compares each read one key, uses
+the same direct path. It writes into the group batch without the general evaluator. All its puts
+share one revision, and each put is the next HashKV sub-revision. Other writes use the general
+evaluator. It also encodes each new value once for the current, history, HashKV, and Watch rows.
+
 ## Key index
 
 The apply owner keeps an in-memory index of every current etcd key, like etcd's `treeIndex`.

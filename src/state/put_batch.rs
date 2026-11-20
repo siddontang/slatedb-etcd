@@ -101,30 +101,49 @@ impl StateMachine {
                                 (reply, next)
                             })
                     } else {
-                        match mvcc::prepare_grouped(
-                            &view,
-                            &batch,
-                            revision,
-                            self.compact_revision,
-                            put.request,
-                            &self.leases,
-                        )
-                        .await
-                        {
-                            Ok((reply, writes, next, count)) => {
-                                size = writes
-                                    .logical_size_after(
-                                        &self.db,
-                                        &self.key_index,
-                                        Some(&batch),
-                                        size,
-                                    )
-                                    .await?;
-                                counts.merge(count);
-                                batch.extend(writes);
-                                Ok((reply, next))
-                            }
+                        let direct = if mvcc::batchable_txn(put.request) {
+                            mvcc::prepare_txn_puts(
+                                &view,
+                                revision,
+                                self.compact_revision,
+                                put.request,
+                                &self.leases,
+                                &mut batch,
+                                &mut size,
+                                &mut counts,
+                            )
+                            .await
+                        } else {
+                            Ok(None)
+                        };
+                        match direct {
+                            Ok(Some(prepared)) => Ok(prepared),
                             Err(error) => Err(error),
+                            Ok(None) => match mvcc::prepare_grouped(
+                                &view,
+                                &batch,
+                                revision,
+                                self.compact_revision,
+                                put.request,
+                                &self.leases,
+                            )
+                            .await
+                            {
+                                Ok((reply, writes, next, count)) => {
+                                    size = writes
+                                        .logical_size_after(
+                                            &self.db,
+                                            &self.key_index,
+                                            Some(&batch),
+                                            size,
+                                        )
+                                        .await?;
+                                    counts.merge(count);
+                                    batch.extend(writes);
+                                    Ok((reply, next))
+                                }
+                                Err(error) => Err(error),
+                            },
                         }
                     };
                     match prepared {
