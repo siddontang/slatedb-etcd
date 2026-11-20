@@ -231,6 +231,16 @@ enum Plan {
     },
 }
 
+// Range reads cache the blocks they fetch. SlateDB scans skip the block cache by default,
+// so each Range otherwise reads and decodes every touched block from the object store again.
+// Moka uses TinyLFU admission, so one large scan does not flush hot point-read blocks.
+fn scan_options() -> slatedb::config::ScanOptions {
+    slatedb::config::ScanOptions {
+        cache_blocks: true,
+        ..Default::default()
+    }
+}
+
 enum ReadDb<'a> {
     Live(&'a Db),
     Pinned(&'a slatedb::DbSnapshot),
@@ -248,16 +258,23 @@ impl ReadDb<'_> {
         &self,
         range: std::ops::Range<Vec<u8>>,
     ) -> Result<slatedb::DbIterator, slatedb::Error> {
+        let options = scan_options();
         match self {
-            Self::Live(db) => db.scan(range).await,
-            Self::Pinned(db) => db.scan(range).await,
+            Self::Live(db) => db.scan_with_options(range, &options).await,
+            Self::Pinned(db) => db.scan_with_options(range, &options).await,
         }
     }
 
     async fn scan_prefix(&self, prefix: Vec<u8>) -> Result<slatedb::DbIterator, slatedb::Error> {
         match self {
-            Self::Live(db) => db.scan_prefix(prefix, ..).await,
-            Self::Pinned(db) => db.scan_prefix(prefix, ..).await,
+            Self::Live(db) => {
+                db.scan_prefix_with_options(prefix, .., &scan_options())
+                    .await
+            }
+            Self::Pinned(db) => {
+                db.scan_prefix_with_options(prefix, .., &scan_options())
+                    .await
+            }
         }
     }
 }
