@@ -66,9 +66,12 @@ See the [metrics guide](metrics.md) for listener security and per-member metric 
 
 ## Runtime
 
-`--runtime-workers` sets the async worker count. The default is two; zero is invalid.
-Log I/O uses a separate thread. Embedded servers use the caller's runtime.
-More workers can increase task handoffs. Measure the target workload before changing this setting.
+`--runtime-workers` sets the async worker count. Zero is invalid. The default is the number of CPUs
+that the process may use: the affinity mask and the cgroup CPU quota limit it, and two is the
+fallback when that count is unavailable. Pin the process with `taskset` or set a cgroup quota to
+reserve CPUs for other processes. Log I/O uses a separate thread. Embedded servers use the caller's
+runtime. More workers can increase task handoffs. Measure the target workload before changing this
+setting.
 
 ## Watch progress
 

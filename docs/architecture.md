@@ -113,8 +113,11 @@ A timeout or leader change can leave a request's result unknown. There is no ret
 ## Thread model
 
 Each standalone member uses one process and one Raft group.
-The main thread starts and supervises a Tokio runtime. Its default is two async worker threads.
+The main thread starts and supervises a Tokio runtime. By default it has one async worker per CPU
+that the process may use. Linux limits this count by the affinity mask and the cgroup CPU quota.
 `--runtime-workers` sets this count. An embedded member uses the caller's Tokio runtime.
+The worker count changes only scheduling. The Raft owner and the apply task each remain one task,
+so log order, apply order, and response order do not depend on it.
 Each task can resume on another runtime worker after it yields.
 
 | Work | Execution and ownership |
@@ -135,6 +138,8 @@ Leader replication can proceed while the WAL thread waits for the disk.
 A linear read obtains a quorum proof and waits for local apply before it uses a pinned view.
 
 `--runtime-workers` counts only async scheduler threads. Tokio can add blocking threads on demand.
+The WAL thread and blocking workers mostly wait for disk I/O, so one async worker per CPU does not
+oversubscribe busy cores. SlateDB flush and compaction run as tasks on the same runtime.
 Raft Engine also starts a metrics thread. Actual OS thread counts depend on load and storage.
 One Linux three-member write run observed 12 to 33 OS threads per member with the default settings.
 The count includes waiting threads. It does not measure the number of busy CPU cores.

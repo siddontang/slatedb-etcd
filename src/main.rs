@@ -26,8 +26,9 @@ static LONG_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
           about = "Experimental etcd v3 service with Raft and SlateDB")]
 struct Args {
     /// Async worker count. Log writes use a separate thread.
-    #[arg(long, default_value = "2")]
-    runtime_workers: std::num::NonZeroUsize,
+    /// The default is the CPU count that the process may use (affinity mask and cgroup quota).
+    #[arg(long)]
+    runtime_workers: Option<std::num::NonZeroUsize>,
     /// Persistent member ID. Keep it with its data directory.
     #[arg(long)]
     id: u64,
@@ -135,10 +136,15 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(args.runtime_workers.get())
+        .worker_threads(args.runtime_workers.unwrap_or_else(default_workers).get())
         .enable_all()
         .build()?
         .block_on(run(args))
+}
+
+/// Linux derives this from `sched_getaffinity` and the cgroup CPU quota. Two remains the fallback.
+fn default_workers() -> std::num::NonZeroUsize {
+    std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::new(2).unwrap())
 }
 
 async fn run(args: Args) -> Result<()> {
