@@ -213,8 +213,7 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
             sample.update(measured_resources(before, after, memory, members,
                                              sample["seconds"], sample["successes"]))
             sample.update(resource_samples=len(memory), resource_errors=resource_errors,
-                          allocated_data_bytes=sum(p.stat().st_blocks*512
-                              for p in root.glob("node*/**/*") if p.is_file()))
+                          allocated_data_bytes=allocated_bytes(root))
         except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as error:
             sample.update(passed=False, error=str(error))
         finally:
@@ -230,6 +229,18 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
             if not sample["passed"]:
                 sample["logs"] = {p.name: p.read_text(errors="replace")[-4000:] for p in root.glob("*.log")}
         return sample
+
+
+def allocated_bytes(root):
+    """Sum allocated data bytes. Running members can remove a checkpoint during the scan."""
+    total = 0
+    for path in root.glob("node*/**/*"):
+        try:
+            if path.is_file():
+                total += path.stat().st_blocks * 512
+        except FileNotFoundError:
+            continue
+    return total
 
 
 def workload_cases(kinds, concurrency, reads, baseline_concurrency=None):
