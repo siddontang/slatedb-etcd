@@ -227,11 +227,18 @@ impl StateMachine {
                 "mvcc: required revision is a future revision",
             ));
         }
+        let compact = self.compact_revision;
+        // A pending physical pass leaves rows that it removes later. Hash the rows that remain.
+        let pending = self.compaction.is_some();
         let mut latest = std::collections::HashMap::new();
-        if self.compact_revision >= 0 {
+        let mut survivors = std::collections::HashMap::new();
+        if compact >= 0 {
             let mut scan = hash_rows(&self.db, revision).await?;
             while let Some(row) = scan.next().await.map_err(KvError::storage)? {
                 let kv = HashUserKey::decode(row.value).map_err(KvError::storage)?;
+                if pending && hash_main(&row.key)? <= compact {
+                    survivors.insert(kv.key.clone(), row.key.clone());
+                }
                 if row.key.len() == HASH.len() + 18 {
                     latest.remove(&kv.key);
                 } else {
@@ -242,14 +249,24 @@ impl StateMachine {
         let keep = latest
             .into_values()
             .collect::<std::collections::HashSet<_>>();
-        self.hash_retained(revision, |row| keep.contains(&row[HASH.len()..]))
-            .await
+        // The pass keeps the latest record at or below the boundary, except older tombstones.
+        let survivors = survivors
+            .into_values()
+            .filter(|key| key.len() != HASH.len() + 18 || hash_main(key).ok() == Some(compact))
+            .collect::<std::collections::HashSet<_>>();
+        self.hash_retained(
+            revision,
+            |row| keep.contains(&row[HASH.len()..]),
+            |row, main| !pending || main > compact || survivors.contains(row),
+        )
+        .await
     }
 
     pub(super) async fn hash_retained(
         &self,
         revision: i64,
         retained: impl Fn(&[u8]) -> bool,
+        exists: impl Fn(&[u8], i64) -> bool,
     ) -> std::result::Result<Value, KvError> {
         let mut hash = crc32c::crc32c(b"key");
         // etcd includes obsolete records when the retention set is empty.
@@ -259,7 +276,7 @@ impl StateMachine {
             let key = &row.key[HASH.len()..];
             let main = i64::from_be_bytes(key[..8].try_into().map_err(KvError::storage)?);
             let tombstone = key.len() == 18;
-            if main == self.compact_revision && tombstone {
+            if !exists(&row.key, main) || (main == self.compact_revision && tombstone) {
                 continue;
             }
             let recent = main > self.compact_revision;
@@ -319,6 +336,13 @@ struct HashUserKey {
     key: Vec<u8>,
 }
 
+fn hash_main(key: &[u8]) -> std::result::Result<i64, KvError> {
+    key.get(HASH.len()..HASH.len() + 8)
+        .and_then(|main| main.try_into().ok())
+        .map(i64::from_be_bytes)
+        .ok_or_else(|| KvError::storage("invalid hash key"))
+}
+
 async fn hash_rows(db: &Db, revision: i64) -> std::result::Result<slatedb::DbIterator, KvError> {
     db.scan_with_options(
         HASH.to_vec()..=hash_key(revision, i64::MAX, true),
@@ -326,31 +350,6 @@ async fn hash_rows(db: &Db, revision: i64) -> std::result::Result<slatedb::DbIte
     )
     .await
     .map_err(KvError::storage)
-}
-
-pub(crate) async fn compact_hash(
-    db: &Db,
-    revision: i64,
-    batch: &mut WriteBatch,
-) -> std::result::Result<(), KvError> {
-    let mut scan = hash_rows(db, revision).await?;
-    let mut latest = std::collections::BTreeMap::new();
-    while let Some(row) = scan.next().await.map_err(KvError::storage)? {
-        let main = i64::from_be_bytes(
-            row.key[HASH.len()..HASH.len() + 8]
-                .try_into()
-                .map_err(KvError::storage)?,
-        );
-        let len = row.value.len();
-        let kv = HashUserKey::decode(row.value).map_err(KvError::storage)?;
-        if let Some((old, old_len)) = latest.insert(kv.key, (row.key.clone(), len)) {
-            batch.delete_known(old, old_len);
-        }
-        if row.key.len() == HASH.len() + 18 && main < revision {
-            batch.delete_known(row.key, len);
-        }
-    }
-    Ok(())
 }
 
 // Rebuild derived accounting when opening stored state.

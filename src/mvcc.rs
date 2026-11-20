@@ -18,7 +18,7 @@ mod put;
 pub(crate) use put::{prepare_put, CurrentView};
 
 pub(crate) const CURRENT: &[u8] = b"etcd/current/";
-const HISTORY: &[u8] = b"etcd/history/";
+pub(crate) const HISTORY: &[u8] = b"etcd/history/";
 pub const REVISION: &[u8] = b"etcd/revision";
 pub(crate) const COMPACTED: &str = "mvcc: required revision has been compacted";
 pub const COMPACT_REVISION: &[u8] = b"etcd/compact-revision";
@@ -801,8 +801,7 @@ pub(crate) fn batchable_put(request: &RequestOp) -> bool {
         if p.lease == 0 && !p.ignore_lease && !p.ignore_value)
 }
 
-/// Remove older versions while retaining each key's value at the compaction boundary.
-// Read adjacent SST blocks together during sequential maintenance scans.
+/// Read adjacent SST blocks together during sequential maintenance scans.
 pub(crate) fn maintenance_scan() -> slatedb::config::ScanOptions {
     slatedb::config::ScanOptions {
         read_ahead_bytes: 64 * 1024,
@@ -810,12 +809,12 @@ pub(crate) fn maintenance_scan() -> slatedb::config::ScanOptions {
     }
 }
 
-pub async fn prepare_compaction(
-    db: &Db,
+/// Validate a compaction boundary. The background pass removes the older versions later.
+pub fn check_compaction(
     revision: i64,
     compact_revision: i64,
     request: &CompactionRequest,
-) -> KvResult<(CompactionResponse, WriteBatch)> {
+) -> KvResult<CompactionResponse> {
     if request.revision <= compact_revision {
         return Err(KvError::new(Code::OutOfRange, COMPACTED));
     }
@@ -825,37 +824,9 @@ pub async fn prepare_compaction(
             "mvcc: required revision is a future revision",
         ));
     }
-    let mut batch = WriteBatch::new();
-    let mut scan = db
-        .scan_prefix_with_options(HISTORY, .., &maintenance_scan())
-        .await
-        .map_err(KvError::storage)?;
-    let mut previous: Option<(bytes::Bytes, usize)> = None;
-    while let Some(row) = scan.next().await.map_err(KvError::storage)? {
-        // The row key contains the complete user key prefix and an eight-byte revision.
-        let (prefix, encoded) = row
-            .key
-            .split_last_chunk::<8>()
-            .filter(|(p, _)| p.len() > HISTORY.len() && p.ends_with(b"/"))
-            .ok_or_else(|| KvError::storage("invalid history key"))?;
-        if i64::from_be_bytes(*encoded) > request.revision {
-            continue;
-        }
-        if let Some((older, size)) = previous.take() {
-            if older[..older.len() - 8] == *prefix {
-                batch.delete_known(older, size);
-            }
-        }
-        previous = Some((row.key, row.value.len()));
-    }
-    crate::watch::compact(db, request.revision, &mut batch).await?;
-    batch.put(COMPACT_REVISION, request.revision.to_be_bytes());
-    Ok((
-        CompactionResponse {
-            header: header(revision),
-        },
-        batch,
-    ))
+    Ok(CompactionResponse {
+        header: header(revision),
+    })
 }
 
 pub fn response_header(op: &mut ResponseOp) -> Option<&mut ResponseHeader> {

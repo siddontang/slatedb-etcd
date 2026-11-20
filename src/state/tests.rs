@@ -211,7 +211,7 @@ async fn compaction_removes_history_and_preserves_boundary_versions() {
     assert_eq!(history_len(&state).await, 6);
     state
         .apply_compaction(
-            7,
+            state.applied + 1,
             &CompactionRequest {
                 revision: 5,
                 physical: false,
@@ -221,6 +221,9 @@ async fn compaction_removes_history_and_preserves_boundary_versions() {
         .unwrap()
         .result
         .unwrap();
+    // Compact applies the boundary first. Later steps remove history.
+    assert_eq!(history_len(&state).await, 6);
+    super::compaction_tests::finish(&mut state).await;
     assert_eq!(history_len(&state).await, 4);
     let deleted = read(&state, b"a", 5).await.result.unwrap();
     assert!(matches!(deleted.response, Some(Resp::ResponseRange(r)) if r.kvs.is_empty()));
@@ -231,7 +234,7 @@ async fn compaction_removes_history_and_preserves_boundary_versions() {
     assert_eq!(compacted.code, tonic::Code::OutOfRange as i32);
     let future = state
         .apply_compaction(
-            8,
+            state.applied + 1,
             &CompactionRequest {
                 revision: 8,
                 physical: false,
@@ -244,7 +247,7 @@ async fn compaction_removes_history_and_preserves_boundary_versions() {
     assert_eq!(history_len(&state).await, 4);
     state
         .apply_compaction(
-            9,
+            state.applied + 1,
             &CompactionRequest {
                 revision: 7,
                 physical: false,
@@ -255,6 +258,7 @@ async fn compaction_removes_history_and_preserves_boundary_versions() {
         .result
         .unwrap();
     assert_eq!(state.revision, 7);
+    super::compaction_tests::finish(&mut state).await;
     assert_eq!(history_len(&state).await, 2);
     let current = read(&state, b"a", 7).await.result.unwrap();
     assert!(matches!(current.response, Some(Resp::ResponseRange(r))
@@ -264,8 +268,12 @@ async fn compaction_removes_history_and_preserves_boundary_versions() {
     drop(state);
     let state = StateMachine::open(dir.path()).await.unwrap();
     assert_eq!(
-        (state.applied, state.revision, state.compact_revision),
-        (9, 7, 7)
+        (
+            state.revision,
+            state.compact_revision,
+            state.physical_revision()
+        ),
+        (7, 7, 7)
     );
     assert_eq!(history_len(&state).await, 2);
     assert!(read(&state, b"a", 6).await.result.is_err());
@@ -348,6 +356,7 @@ async fn snapshot_keeps_the_boundary_at_its_pinned_apply_position() {
         .unwrap()
         .result
         .unwrap();
+    super::compaction_tests::finish(&mut state).await;
     let mut snapshot = Snapshot::default();
     snapshot.mut_metadata().index = 3;
     snapshot.data = snapshot_job.await.unwrap().into();
@@ -370,6 +379,7 @@ async fn snapshot_keeps_the_boundary_at_its_pinned_apply_position() {
         .unwrap()
         .result
         .unwrap();
+    super::compaction_tests::finish(&mut restored).await;
     assert_eq!(history_len(&restored).await, 1);
     assert!(read(&restored, b"key", 2).await.result.is_err());
 }
@@ -415,6 +425,7 @@ async fn renewed_lease_and_watch_history_survive_snapshot_and_stale_expiry() {
         .unwrap()
         .result
         .unwrap();
+    super::compaction_tests::finish(&mut state).await;
     let mut snapshot = Snapshot::default();
     snapshot.mut_metadata().index = 3;
     snapshot.data = state.snapshot_data().await.unwrap().into();

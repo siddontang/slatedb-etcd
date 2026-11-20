@@ -19,6 +19,9 @@ mod auth;
 mod backup;
 mod checkpoint;
 mod cluster;
+pub(crate) mod compaction;
+#[cfg(test)]
+pub(crate) mod compaction_tests;
 pub(crate) mod current;
 mod diagnostic;
 pub(crate) mod key_index;
@@ -61,6 +64,8 @@ pub struct StateMachine {
     pub durable_applied: u64,
     pub revision: i64,
     pub compact_revision: i64,
+    /// Physical removal that follows the logical boundary.
+    pub(crate) compaction: Option<compaction::Progress>,
     pub leases: Arc<std::collections::BTreeMap<i64, crate::lease::LeaseRecord>>,
     /// Journal rows of the current apply job for the in-memory Watch feed.
     pub(crate) watch_capture: Option<crate::watch::Capture>,
@@ -122,6 +127,7 @@ impl StateMachine {
                 compact_revision <= revision,
                 "compaction exceeds current revision"
             );
+            let compaction = compaction::load(&db).await?;
             let leases = crate::lease::load(&db).await?;
             let auth = match db.get(crate::auth::KEY).await? {
                 Some(data) => serde_json::from_slice(&data)?,
@@ -152,6 +158,7 @@ impl StateMachine {
                 durable_applied: applied,
                 revision,
                 compact_revision,
+                compaction,
                 leases: Arc::new(leases),
                 watch_capture: None,
             })

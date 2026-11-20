@@ -4,6 +4,7 @@ impl Node {
     pub(super) async fn drive_ready(&mut self) -> Result<()> {
         self.resume_puts();
         self.flush_puts();
+        self.drive_compaction()?;
         self.expire_reads();
         self.issue_reads();
         if self.log_queue.len() < log::MAX_JOBS

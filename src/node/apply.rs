@@ -17,6 +17,8 @@ pub(super) struct AppliedState {
     pub logical_size: u64,
     /// Watch events that this state publishes after the node installs it.
     pub watch: Option<std::sync::Arc<crate::watch::Batch>>,
+    pub compaction_pending: bool,
+    pub physical_revision: i64,
 }
 
 impl std::ops::Deref for AppliedState {
@@ -36,6 +38,8 @@ impl AppliedState {
             write_batches: state.write_batches,
             logical_size: state.logical_size(),
             watch: None,
+            compaction_pending: state.compaction_pending(),
+            physical_revision: state.physical_revision(),
         })
     }
 }
@@ -127,10 +131,18 @@ pub(super) struct Work {
 
 pub(super) enum Reply {
     Encoded(Value),
+    /// Physical Compact replies after a flush through `index` makes `revision` physical.
     PhysicalCompact {
         index: u64,
         revision: i64,
         value: Value,
+        /// The physical boundary when the pass already covers `revision`.
+        flush: Option<i64>,
+    },
+    /// A step finished a physical target. Flush through `index` and publish `revision`.
+    CompactFlush {
+        index: u64,
+        revision: i64,
     },
     Kv(Outcome),
     Lease(Outcome<LeaseReply>),
@@ -555,20 +567,31 @@ async fn apply_entries(
                 Reply::Lease(state.apply_lease_from(entry.index, lease, *origin).await?)
             }
             RaftCommand::Compact { compact, .. } => {
-                let mut outcome = state.apply_compaction_batch(entry.index, compact).await?;
+                let mut outcome = state.apply_compaction(entry.index, compact).await?;
                 if let Ok(response) = &mut outcome.result {
                     header.fill(response.header.as_mut());
                 }
-                let flush = state.physical_compact_revision(compact, &outcome);
+                let wait = state.physical_compact_revision(compact, &outcome);
                 let value = serde_json::to_value(outcome)?;
-                if let Some(revision) = flush {
+                if let Some(revision) = wait {
+                    let physical = state.physical_revision();
                     Reply::PhysicalCompact {
                         index: entry.index,
                         revision,
                         value,
+                        flush: (physical >= revision).then_some(physical),
                     }
                 } else {
                     Reply::Encoded(value)
+                }
+            }
+            RaftCommand::CompactStep { .. } => {
+                match state.apply_compaction_step(entry.index).await? {
+                    Some(revision) => Reply::CompactFlush {
+                        index: entry.index,
+                        revision,
+                    },
+                    None => Reply::Encoded(Value::Null),
                 }
             }
         };
@@ -600,9 +623,12 @@ pub(super) async fn recover(
         )?;
         ensure!(!entries.is_empty(), "empty recovery batch");
         let replies = apply_entries(state, entries, header).await?;
-        physical |= replies
-            .iter()
-            .any(|r| matches!(r.reply, Reply::PhysicalCompact { .. }));
+        physical |= replies.iter().any(|r| {
+            matches!(
+                r.reply,
+                Reply::PhysicalCompact { flush: Some(_), .. } | Reply::CompactFlush { .. }
+            )
+        });
     }
     if physical {
         state.metrics.flush_db(&state.db).await?;

@@ -248,6 +248,8 @@ async fn quota_matches_scan_across_state_changes_and_recovery() {
             .result
             .unwrap();
         check(&state).await;
+        super::compaction_tests::finish(&mut state).await;
+        check(&state).await;
     }
     let mut target = StateMachine::open(other.path()).await.unwrap();
     target

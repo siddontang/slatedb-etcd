@@ -973,14 +973,17 @@ impl Simulation {
             .propose(physical("second-physical", revision), tx)
             .unwrap();
         self.drive().await;
+        // Replicated steps remove the rows. Their final flush queues behind the held flush.
         for _ in 0..500 {
-            if self.nodes[&leader].state.compact_revision == revision {
+            let state = &self.nodes[&leader].state;
+            if state.compact_revision == revision && !state.compaction_pending {
                 break;
             }
             self.deliver(false).await;
         }
         let node = self.nodes.get_mut(&leader).unwrap();
         assert_eq!(node.state.compact_revision, revision);
+        assert_eq!(node.state.physical_revision, revision);
         assert!(matches!(
             first_reply.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
