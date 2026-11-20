@@ -3,6 +3,10 @@ use crate::mvcc::Outcome;
 use raft::eraftpb::Snapshot;
 
 pub(super) const BATCH_ENTRIES: u64 = 32;
+/// Committed-entry jobs that may wait in the apply queue behind the running job.
+pub(super) const PIPELINE_DEPTH: usize = 4;
+/// Committed entries in one apply job. A larger job shares the fixed cost of a state write.
+pub(super) const APPLY_ENTRIES: u64 = 64;
 pub(super) const BATCH_BYTES: u64 = 512 * 1024;
 pub(super) const MAX_QUERIES: usize = 64;
 pub(super) const READ_BATCH: usize = 16;
@@ -346,8 +350,8 @@ impl Drop for Worker {
 impl Worker {
     pub fn start(mut state: StateMachine, events: mpsc::Sender<Event>, manual: bool) -> Self {
         state.watch_capture = Some(Default::default());
-        let (work, mut jobs) = mpsc::channel::<Work>(1);
-        let (done, completed) = mpsc::channel(1);
+        let (work, mut jobs) = mpsc::channel::<Work>(PIPELINE_DEPTH);
+        let (done, completed) = mpsc::channel(PIPELINE_DEPTH);
         let database = state.db.clone();
         let mut executor = Executor {
             state,

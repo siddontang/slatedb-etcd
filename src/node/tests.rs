@@ -271,17 +271,24 @@ async fn committed_backlog_rejects_new_proposals_before_log_growth() {
     assert_eq!(node.raw.store().last_index().unwrap(), last);
     assert_eq!(node.state.applied, 0);
     assert!(node.apply_busy);
-    let (tx, read) = oneshot::channel();
+    let (tx, mut read) = oneshot::channel();
     node.enqueue_query(Query::Local("absent".into(), tx));
-    let first_batch = node.worker.step().await.unwrap().unwrap();
-    node.complete_apply(first_batch).unwrap();
-    node.drive_ready().await.unwrap();
-    let query = node.worker.step().await.unwrap().unwrap();
-    node.complete_apply(query).unwrap();
-    assert_eq!(
-        read.await.unwrap().unwrap()["applied_index"],
-        apply::BATCH_ENTRIES
-    );
+    // The query does not jump the batches already queued, and no new batch passes it.
+    let queued = node.apply_jobs.back().unwrap().0;
+    let value = loop {
+        let completed = node
+            .worker
+            .step()
+            .await
+            .unwrap()
+            .expect("query not scheduled");
+        node.complete_apply(completed).unwrap();
+        if let Ok(value) = read.try_recv() {
+            break value.unwrap();
+        }
+        node.drive_ready().await.unwrap();
+    };
+    assert_eq!(value["applied_index"], queued);
     node.drive_ready().await.unwrap();
     node.drain_apply().await.unwrap();
     assert_eq!(node.state.applied, apply::MAX_APPLY_LAG);
@@ -384,13 +391,18 @@ async fn future_checkpoint_and_automatic_checkpoints_do_not_stop_apply() {
 async fn received_snapshot_fences_an_older_batch_and_later_entries() {
     let dir = tempfile::tempdir().unwrap();
     let source = tempfile::tempdir().unwrap();
-    seed_log(dir.path(), 100);
+    // Two older batches wait in the apply queue when the snapshot arrives.
+    let seeded = apply::APPLY_ENTRIES + 32;
+    seed_log(dir.path(), seeded);
     let (events, _) = mpsc::channel(256);
     let mut node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
         .await
         .unwrap();
     node.drive_ready().await.unwrap();
-    assert_eq!(node.apply_target, 32);
+    assert_eq!(
+        node.apply_jobs.iter().map(|job| job.0).collect::<Vec<_>>(),
+        [apply::APPLY_ENTRIES, seeded]
+    );
     let mut state = StateMachine::open(source.path()).await.unwrap();
     for index in 1..200 {
         state.apply(index, None).await.unwrap();
@@ -421,9 +433,13 @@ async fn received_snapshot_fences_an_older_batch_and_later_entries() {
     node.drain_log().await.unwrap();
     assert_eq!(node.raw.store().snapshot_index(), 200);
     assert_eq!(node.state.applied, 0);
-    let old_batch = node.worker.step().await.unwrap().unwrap();
-    node.complete_apply(old_batch).unwrap();
-    node.drive_ready().await.unwrap();
+    // The queued batches finish in order before the snapshot replaces the state.
+    for target in [apply::APPLY_ENTRIES, seeded] {
+        let old_batch = node.worker.step().await.unwrap().unwrap();
+        node.complete_apply(old_batch).unwrap();
+        assert_eq!(node.state.applied, target);
+        node.drive_ready().await.unwrap();
+    }
     assert_eq!(node.apply_target, 200);
     let mut append = Message::default();
     append.set_msg_type(MessageType::MsgAppend);
@@ -446,7 +462,7 @@ async fn received_snapshot_fences_an_older_batch_and_later_entries() {
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
     assert_eq!(node.raw.store().commit_index(), 201);
-    assert_eq!(node.state.applied, 32);
+    assert_eq!(node.state.applied, seeded);
     let install = node.worker.step().await.unwrap().unwrap();
     node.complete_apply(install).unwrap();
     assert_eq!(node.state.applied, 200);
@@ -1414,7 +1430,7 @@ async fn read_contexts_require_the_current_process_nonce_and_exact_length() {
 #[tokio::test]
 async fn independent_reads_pin_their_view_and_do_not_wait_for_apply() {
     let dir = tempfile::tempdir().unwrap();
-    seed_log(dir.path(), 64);
+    seed_log(dir.path(), 2 * apply::APPLY_ENTRIES);
     let (events, _) = mpsc::channel(256);
     let mut node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
         .await
@@ -1435,7 +1451,7 @@ async fn independent_reads_pin_their_view_and_do_not_wait_for_apply() {
     node.drive_ready().await.unwrap();
     let applied = node.worker.step().await.unwrap().unwrap();
     node.complete_apply(applied).unwrap();
-    assert_eq!(node.state.applied, apply::BATCH_ENTRIES);
+    assert_eq!(node.state.applied, apply::APPLY_ENTRIES);
     let read = node.read_executor.step().await.unwrap().unwrap();
     node.complete_read(read).unwrap();
     let mut result = reply.await.unwrap().unwrap().into_outcome().result.unwrap();
@@ -1737,4 +1753,71 @@ async fn a_renewal_with_a_stale_proof_is_cancelled() {
 
     // A fresh proof renews again.
     assert_eq!(keep_alive(&mut node, 7).await.unwrap(), 60);
+}
+
+#[tokio::test]
+async fn committed_batches_queue_behind_running_apply_in_log_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let total = 3 * apply::APPLY_ENTRIES + 10;
+    let conf_index = 2 * apply::APPLY_ENTRIES + 5;
+    let mut store =
+        RaftStorage::open(&dir.path().join("raft"), 1, "worker-test", vec![1, 2, 3]).unwrap();
+    let entries: Vec<_> = (1..=total)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            // An empty change applies as a no-op but still ends the chain of queued jobs.
+            entry_type: if index == conf_index {
+                EntryType::EntryConfChange as i32
+            } else {
+                EntryType::EntryNormal as i32
+            },
+            ..Default::default()
+        })
+        .collect();
+    let hs = HardState {
+        term: 1,
+        vote: 1,
+        commit: total,
+    };
+    store.persist(&entries, Some(&hs), None).unwrap();
+    drop(store);
+    let (events, _) = mpsc::channel(256);
+    let mut node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    node.drive_ready().await.unwrap();
+    // Raft delivers all committed entries. The worker gets consecutive batches up to the
+    // job that holds the configuration change, without a completion between them.
+    let targets: Vec<_> = node.apply_jobs.iter().map(|(target, _)| *target).collect();
+    assert_eq!(
+        targets,
+        [
+            apply::APPLY_ENTRIES,
+            2 * apply::APPLY_ENTRIES,
+            3 * apply::APPLY_ENTRIES
+        ]
+    );
+    assert_eq!(node.state.applied, 0);
+    // A state query waits for the queue to drain and then sees every queued batch.
+    let (tx, query) = oneshot::channel();
+    node.enqueue_query(Query::Local("absent".into(), tx));
+    node.drive_ready().await.unwrap();
+    assert_eq!(node.apply_jobs.len(), 3);
+    for target in targets {
+        let completed = node.worker.step().await.unwrap().unwrap();
+        node.complete_apply(completed).unwrap();
+        assert_eq!(node.state.applied, target);
+        node.drive_ready().await.unwrap();
+    }
+    let completed = node.worker.step().await.unwrap().unwrap();
+    node.complete_apply(completed).unwrap();
+    assert_eq!(
+        query.await.unwrap().unwrap()["applied_index"],
+        3 * apply::APPLY_ENTRIES
+    );
+    node.drive_ready().await.unwrap();
+    node.drain_apply().await.unwrap();
+    assert_eq!(node.state.applied, total);
+    assert!(node.apply_jobs.is_empty() && !node.apply_busy);
 }

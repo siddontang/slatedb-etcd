@@ -201,6 +201,8 @@ pub struct Node {
     worker: Worker,
     apply_busy: bool,
     apply_target: u64,
+    /// Submitted apply jobs in order: target index, and whether a later Entries job may follow.
+    apply_jobs: VecDeque<(u64, bool)>,
     committed_ready: u64,
     prepared_puts: Option<crate::state::put_batch::PreparedPuts>,
     quorum_reply_index: u64,
@@ -426,6 +428,7 @@ impl Node {
             read_nonce: *uuid::Uuid::new_v4().as_bytes(),
             read_sequence: 0,
             apply_target: applied.applied,
+            apply_jobs: VecDeque::new(),
             committed_ready: applied.applied,
             prepared_puts: None,
             quorum_reply_index: 0,
