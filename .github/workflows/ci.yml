@@ -224,6 +224,10 @@ jobs:
           persist-credentials: false
       - name: Run the official etcd benchmarks and process tests
         run: |
+          # Build upstream tests with the Go release upstream pins. Its goroutine leak filter
+          # does not know the TLS cache cleanup that Go 1.25 adds.
+          export GOTOOLCHAIN="go$(cat reference/etcd/.go-version)"
+          go version
           python3 scripts/test_upstream.py
           python3 scripts/check-upstream-go.py go-bench --require-complete \
             --package tests/integration/clientv3/experimental/recipes --output results/ci/upstream-go
