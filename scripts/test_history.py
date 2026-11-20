@@ -75,6 +75,25 @@ class HistoryTests(unittest.TestCase):
         self.web_merge("nolouch@gmail.com")
         self.assertEqual(self.errors(), [])
 
+    def squash_merge(self, email):
+        message = b"Squashed (#1)\n\n" + b"\n\n".join([HISTORY.MAINTAINER_SIGN_OFFS[1]] * 3) + b"\n"
+        env = dict(os.environ, GIT_AUTHOR_NAME="ShuNing", GIT_AUTHOR_EMAIL=email,
+                   GIT_COMMITTER_NAME="GitHub", GIT_COMMITTER_EMAIL="noreply@github.com")
+        subprocess.check_output(["git", "commit", "-q", "--allow-empty", "--file=-"],
+                                cwd=self.root, env=env, input=message, stderr=subprocess.DEVNULL)
+
+    def test_maintainer_squash_merge_with_repeated_sign_offs_passes(self):
+        self.squash_merge("nolouch@gmail.com")
+        self.assertEqual(self.errors(), [])
+
+    def test_other_squash_merge_with_private_email_fails(self):
+        self.squash_merge("someone@example.com")
+        self.assertIn("author must use a GitHub public email", self.errors())
+
+    def test_maintainer_local_commit_with_repeated_sign_offs_fails(self):
+        self.commit(b"Twice\n\n" + b"\n".join([HISTORY.MAINTAINER_SIGN_OFFS[1]] * 2) + b"\n")
+        self.assertIn("missing or repeated owner sign-off", self.errors())
+
     def test_other_web_merge_with_private_email_fails(self):
         self.web_merge("someone@example.com")
         errors = self.errors()

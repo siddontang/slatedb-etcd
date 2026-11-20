@@ -61,10 +61,10 @@ def sign_off_error(trailers, lines, author):
 def web_merge(headers, emails):
     """Return whether a maintainer merged a pull request on GitHub.
 
-    GitHub commits the merge, so the merge itself records the maintainer approval.
+    GitHub commits merge and squash merges, so the merge itself records the maintainer approval.
+    A squash merge repeats the sign-offs of the squashed commits.
     """
-    return (len(re.findall(rb"(?m)^parent ", headers)) >= 2
-            and emails[b"author"] in MAINTAINER_EMAILS
+    return (emails[b"author"] in MAINTAINER_EMAILS
             and emails[b"committer"] == b"noreply@github.com")
 
 
