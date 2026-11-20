@@ -3,6 +3,16 @@
 static ALLOCATOR: slatedb_etcd::write_profile::StageAllocator =
     slatedb_etcd::write_profile::StageAllocator;
 
+// The write profiler counts allocations through its own wrapper, so it keeps the system allocator.
+#[cfg(all(
+    feature = "jemalloc",
+    not(feature = "write-profile"),
+    target_os = "linux",
+    target_env = "gnu"
+))]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
