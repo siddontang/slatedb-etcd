@@ -97,19 +97,6 @@ impl StateMachine {
         Ok(Outcome { result })
     }
 
-    pub async fn apply_compaction(
-        &mut self,
-        index: u64,
-        request: &CompactionRequest,
-    ) -> Result<Outcome<CompactionResponse>> {
-        let outcome = self.apply_compaction_batch(index, request).await?;
-        if self.physical_compact_revision(request, &outcome).is_some() {
-            self.metrics.flush_db(&self.db).await?;
-            self.durable_applied = index;
-        }
-        Ok(outcome)
-    }
-
     pub(crate) fn physical_compact_revision(
         &self,
         request: &CompactionRequest,
@@ -122,60 +109,6 @@ impl StateMachine {
                 .as_ref()
                 .is_err_and(|e| e.code == tonic::Code::OutOfRange as i32);
         (request.physical && (outcome.result.is_ok() || compacted)).then_some(self.compact_revision)
-    }
-
-    pub(crate) async fn apply_compaction_batch(
-        &mut self,
-        index: u64,
-        request: &CompactionRequest,
-    ) -> Result<Outcome<CompactionResponse>> {
-        ensure!(
-            index == self.applied + 1,
-            "non-contiguous state machine apply"
-        );
-        if self.alarms.iter().any(|alarm| alarm.alarm == 2) {
-            self.apply(index, None).await?;
-            return Ok(Outcome {
-                result: Err(mvcc::KvError::new(tonic::Code::DataLoss, "corrupt cluster")),
-            });
-        }
-        let (result, mut batch) =
-            match mvcc::prepare_compaction(&self.db, self.revision, self.compact_revision, request)
-                .await
-            {
-                Ok((response, batch)) => (Ok(response), batch),
-                Err(error) => {
-                    ensure!(
-                        error.code != tonic::Code::Internal as i32,
-                        "{}",
-                        error.message
-                    );
-                    (Err(error), WriteBatch::new())
-                }
-            };
-        if result.is_ok() {
-            let _timer = self.metrics.hash_rev.start_timer();
-            // The deletion batch also retains tombstones at the new boundary.
-            let hash = self
-                .hash_retained(request.revision, |row| batch.get(row).is_none())
-                .await
-                .map_err(|e| anyhow::anyhow!(e.message))?;
-            let mut hashes = self.hash_cache().await?;
-            hashes.push(hash);
-            if hashes.len() > 10 {
-                hashes.remove(0);
-            }
-            batch.put(b"etcd/hash-cache", serde_json::to_vec(&hashes)?);
-        }
-        crate::failpoint::hit("compact-before-apply");
-        batch.put(APPLIED, index.to_be_bytes());
-        self.write_batch(batch, index).await?;
-        self.applied = index;
-        if result.is_ok() {
-            self.compact_revision = request.revision;
-        }
-        crate::failpoint::hit("compact-after-apply");
-        Ok(Outcome { result })
     }
 
     #[cfg(test)]

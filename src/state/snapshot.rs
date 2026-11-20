@@ -80,6 +80,7 @@ impl StateMachine {
         self.durable_applied = index;
         self.revision = read_revision(&self.db).await?;
         self.compact_revision = read_compact_revision(&self.db).await?;
+        self.compaction = compaction::load(&self.db).await?;
         self.leases = Arc::new(crate::lease::load(&self.db).await?);
         self.alarms = match self.db.get(crate::maintenance::ALARMS).await? {
             Some(data) => serde_json::from_slice(&data)?,

@@ -108,6 +108,10 @@ pub enum RaftCommand {
         id: String,
         compact: proto::etcdserverpb::CompactionRequest,
     },
+    /// The leader proposes bounded physical compaction work after a Compact entry.
+    CompactStep {
+        id: String,
+    },
 }
 
 impl RaftCommand {
@@ -131,6 +135,7 @@ impl RaftCommand {
             | Self::Secured { id, .. }
             | Self::Etcd { id, .. }
             | Self::Compact { id, .. }
+            | Self::CompactStep { id }
             | Self::Lease { id, .. } => id,
         }
     }

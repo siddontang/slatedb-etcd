@@ -212,6 +212,8 @@ pub struct Node {
     lease_term: u64,
     lease_deadlines: BTreeMap<i64, (u64, Instant)>,
     lease_expiring: BTreeSet<(i64, u64)>,
+    compact_step: Option<(u64, u64)>,
+    compact_ready_at: Option<Instant>,
 }
 
 impl Node {
@@ -424,6 +426,8 @@ impl Node {
             lease_term: 0,
             lease_deadlines: BTreeMap::new(),
             lease_expiring: BTreeSet::new(),
+            compact_step: None,
+            compact_ready_at: None,
         };
         node.sync_members();
         Ok(node)
@@ -470,6 +474,9 @@ impl Node {
         loop {
             let mut step_responses = vec![];
             tokio::select! {
+                _ = tokio::time::sleep_until(
+                    self.compact_ready_at.unwrap_or_else(Instant::now).into()
+                ), if self.compact_ready_at.is_some() => { self.compact_ready_at = None; }
                 _ = ticks.tick() => { self.raw.tick(); self.retry_reads(); self.expire_leases()?; self.publish_member()?; }
                 persisted = self.log_worker.next() => { self.complete_log(persisted?)?; }
                 target = self.compaction.next(), if self.compaction.active() => {
@@ -1020,6 +1027,7 @@ impl Node {
     }
 
     fn expire_pending(&mut self) {
+        self.compaction.replies.retain(|waiter| !waiter.closed());
         let is_leader = self.raw.raft.state == StateRole::Leader;
         let now = Instant::now();
         let expired: Vec<_> = self
@@ -1035,7 +1043,6 @@ impl Node {
             .collect();
         for id in expired {
             if let Some(pending) = self.pending.remove(&id) {
-                self.compaction.replies.remove(&id);
                 self.metrics.failed_proposals.inc();
                 pending.response.error(
                     self.error("request outcome unknown: leadership changed or request timed out"),

@@ -167,17 +167,24 @@ impl Node {
                     if let Some(LeaseCommand::Expire { id, generation }) = command.lease {
                         self.lease_expiring.remove(&(id, generation));
                     }
-                    if let Reply::PhysicalCompact {
-                        index,
-                        revision,
-                        value,
-                    } = command.reply
-                    {
-                        if self.pending.contains_key(&command.id) {
-                            self.compaction.replies.insert(command.id, (index, value));
+                    match command.reply {
+                        Reply::PhysicalCompact {
+                            index,
+                            revision,
+                            value,
+                            flush,
+                        } => {
+                            self.wait_physical_compact(&command.id, (index, revision, value));
+                            if let Some(physical) = flush {
+                                self.compaction.request(index, physical);
+                            }
+                            continue;
                         }
-                        self.compaction.request(index, revision);
-                        continue;
+                        Reply::CompactFlush { index, revision } => {
+                            self.compaction.request(index, revision);
+                            continue;
+                        }
+                        Reply::Encoded(_) | Reply::Kv(_) | Reply::Lease(_) => {}
                     }
                     if let Some(pending) = self.pending.remove(&command.id) {
                         let reply = match command.reply {
@@ -186,7 +193,9 @@ impl Node {
                                 continue;
                             }
                             Reply::Encoded(value) => value,
-                            Reply::PhysicalCompact { .. } => unreachable!(),
+                            Reply::PhysicalCompact { .. } | Reply::CompactFlush { .. } => {
+                                unreachable!()
+                            }
                             Reply::Lease(mut outcome) => {
                                 if let Ok(response) = &mut outcome.result {
                                     if let LeaseReply::TimeToLive(response) = response {
@@ -211,7 +220,7 @@ impl Node {
                 }
             }
             Output::Snapshot => {
-                self.compaction.publish(self.state.compact_revision);
+                self.compaction.publish(self.state.physical_revision);
                 self.installed_snapshots += 1;
                 self.options.join = false;
             }

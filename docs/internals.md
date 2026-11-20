@@ -197,27 +197,34 @@ Historical point reads scan one key's versions. Historical range reads currently
 Range responses collect matching keys in memory before sorting or applying a limit.
 These choices favor compatibility testing. Large data sets need bounded scans and a history index.
 
-Compact uses one Raft command and one SlateDB batch for history deletion, the boundary,
-and the apply marker. It does not advance the KV revision. Reads below the boundary return the
-standard compacted-revision error. Reads at the boundary remain valid.
+Compact stores the boundary and a progress record with the apply marker in one SlateDB batch.
+It does not advance the KV revision. Reads below the boundary return the standard
+compacted-revision error at once. Reads at the boundary remain valid.
 
 Compaction keeps the latest version at or before the boundary for each key, including tombstones.
 It keeps all newer versions. Current keys and their revision metadata remain unchanged.
-Restart and snapshot installation restore the boundary with the retained history.
+Restart and snapshot installation restore the boundary, the progress record, and retained history.
 Raft log GC remains separate from MVCC compaction.
 
-Compaction scans all history and builds one deletion batch on the apply worker.
-Quota accounting uses the stored lengths from the history, Watch, and HashKV scans.
-Each deleted row contributes its original size once.
-Large histories can delay state reads and write completion. Raft keeps processing ticks and peers.
-The history scan reads revisions from row keys. Maintenance scans request 64 KiB of read-ahead.
-The cached HashKV checksum uses the deletion batch to identify retained rows.
-Each member flushes a physical Compact outside ordered apply. Writes can apply during this flush.
-One flush can run at a time. The highest queued index covers intervening physical compactions.
-A successful physical reply requires a flush through its own index.
-A forwarding member also waits for its local durable compact revision.
-A repeated physical request waits for the earlier boundary before it returns the compacted error.
-A storage error stops the node. On restart, Raft replays any missing deletion batch.
+Physical removal runs in later `CompactStep` Raft entries. The leader proposes one step at a time
+and pauses 2 ms between steps. Each step scans about 2,048 rows and writes one SlateDB batch.
+A step first hashes the rows for the retained compaction hash. It then removes old history
+versions and their hash records in key order, removes old Watch events, and finishes the hash.
+All versions of one key change in the same step. Every replica applies the same steps at the
+same indexes, so quota accounting and snapshots stay deterministic.
+The progress record shares each step batch with the apply marker. A restart replays lost steps
+from the Raft log. A later Compact waits in the record until earlier boundaries finish.
+HashKV skips rows that the pending pass will remove, so its result does not depend on progress.
+Quota accounting uses the stored row lengths. Each deleted row contributes its original size once.
+Each member flushes SlateDB outside ordered apply when a step finishes a physical boundary.
+Writes can apply during this flush. One flush can run at a time.
+The highest queued index covers intervening requests.
+A physical reply requires the finished pass and a flush through its own Compact index.
+These replies do not use the 5 s proposal timeout. They wait until the client disconnects.
+A forwarding member also waits for its local durable physical boundary.
+A repeated physical request marks the pending boundary as physical. It waits for that boundary
+before it returns the compacted error.
+A storage error stops the node. On restart, Raft replays the missing steps.
 Defragment rewrites the current SST set and waits for manifest publication.
 SlateDB garbage collection reclaims obsolete objects later. Pinned checkpoints can retain them.
 Do not downgrade to an older binary after compaction; older binaries do not enforce its boundary.

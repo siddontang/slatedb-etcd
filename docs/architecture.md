@@ -84,6 +84,7 @@ SlateDB uses these logical keys:
 | `etcd/alarms` | Replicated capacity and corruption alarms |
 | `etcd/hash/` | Canonical etcd revision records for HashKV |
 | `etcd/hash-cache` | Retained compaction hashes |
+| `etcd/compact-pending` | Physical compaction progress |
 
 The full snapshot preserves these keys together. A checkpoint has one pinned apply boundary.
 
@@ -390,7 +391,8 @@ While the prepared result is ahead of local state, new KV reads wait for local p
 A crash discards this temporary group. The durable quorum supplies the same entries on recovery.
 Transactions and administrative operations always use the ordinary apply boundary.
 
-Transactions, Lease changes, Auth changes, membership, compaction, and empty entries end a group.
+Transactions, Lease changes, Auth changes, membership, compaction steps, and empty entries end a
+group.
 Puts with a lease or ignore flags also use the individual path.
 Broad transaction batching needs an overlay that also merges scans and historical reads.
 
@@ -495,7 +497,8 @@ This state cache has a separate budget from Raft log memory. It has no time-base
 The weight limit covers cached entries; allocator and cache overhead can add resident memory.
 Tests compare the counter with a full scan after state changes, restart, and DST recovery.
 
-One background flush per member makes MVCC deletions durable for physical Compact.
+Compact applies its boundary at once. Bounded Raft steps then remove obsolete rows.
+One background flush per member makes the deletions durable after a physical target finishes.
 The apply worker accepts later entries while the flush runs.
 The leader and any forwarding member wait for their local flush before they return success.
 Defragment rewrites SSTs through the SlateDB compactor.

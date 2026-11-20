@@ -1,6 +1,5 @@
 use crate::WriteBatch;
 use prost::Message;
-use slatedb::Db;
 
 use crate::mvcc::{self, KvError};
 #[cfg(test)]
@@ -9,7 +8,7 @@ use crate::proto::etcdserverpb::{ResponseHeader, WatchCreateRequest};
 use crate::proto::mvccpb::{Event, KeyValue};
 use crate::proto::state::Journal;
 
-const EVENTS: &[u8] = b"etcd/events/";
+pub(crate) const EVENTS: &[u8] = b"etcd/events/";
 
 pub(crate) fn key(revision: i64) -> Vec<u8> {
     [EVENTS, &revision.to_be_bytes()].concat()
@@ -74,18 +73,6 @@ async fn previous_value(
         );
     }
     Ok(value)
-}
-
-pub async fn compact(db: &Db, revision: i64, batch: &mut WriteBatch) -> Result<(), KvError> {
-    crate::state::maintenance::compact_hash(db, revision, batch).await?;
-    let mut scan = db
-        .scan_with_options(EVENTS.to_vec()..key(revision), &mvcc::maintenance_scan())
-        .await
-        .map_err(KvError::storage)?;
-    while let Some(row) = scan.next().await.map_err(KvError::storage)? {
-        batch.delete_known(row.key, row.value.len());
-    }
-    Ok(())
 }
 
 /// Capacity of the in-memory event feed, in apply batches.
