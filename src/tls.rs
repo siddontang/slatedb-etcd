@@ -180,9 +180,43 @@ pub async fn serve(
     serve_until(listener, app, tls, std::future::pending()).await
 }
 
-pub(crate) async fn serve_until(
+/// A per-connection HTTP service that can carry the verified client certificate user.
+pub(crate) trait ConnectionService:
+    tower::Service<
+        hyper::Request<hyper::body::Incoming>,
+        Response = hyper::Response<Self::Body>,
+        Error = std::convert::Infallible,
+        Future: Send + 'static,
+    > + Clone
+    + Send
+    + 'static
+{
+    type Body: http_body::Body<Data = bytes::Bytes, Error: Into<Box<dyn std::error::Error + Send + Sync>>>
+        + Send
+        + 'static;
+
+    fn with_user(self, user: VerifiedUser) -> Self;
+}
+
+impl ConnectionService for Router {
+    type Body = axum::body::Body;
+
+    fn with_user(self, user: VerifiedUser) -> Self {
+        self.layer(Extension(user))
+    }
+}
+
+impl ConnectionService for crate::grpc::app::App {
+    type Body = crate::grpc::app::AppBody;
+
+    fn with_user(self, user: VerifiedUser) -> Self {
+        crate::grpc::app::App::with_user(self, user)
+    }
+}
+
+pub(crate) async fn serve_until<S: ConnectionService>(
     listener: TcpListener,
-    app: Router,
+    app: S,
     tls: Option<Arc<rustls::ServerConfig>>,
     stop: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
@@ -240,7 +274,7 @@ pub(crate) async fn serve_until(
                         .map(str::to_owned)
                 });
             let app = if let Some(user) = user {
-                app.layer(Extension(VerifiedUser(user)))
+                app.with_user(VerifiedUser(user))
             } else {
                 app
             };

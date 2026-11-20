@@ -6,6 +6,7 @@ use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status};
 
 mod admission;
+pub(crate) mod app;
 mod auth;
 mod cluster;
 mod forwarding;
@@ -60,39 +61,57 @@ pub(crate) fn service_with_watch_interval(
     transport: crate::tls::Transport,
     interval: Duration,
 ) -> anyhow::Result<axum::Router> {
-    let service = Service::new(member, events, peers, tokens, transport, interval)?;
-    Ok(axum::Router::new()
-        .route_service(
-            "/etcdserverpb.Cluster/{*method}",
-            cluster_server::ClusterServer::new(service.clone()),
-        )
-        .route_service(
-            "/grpc.health.v1.Health/{*method}",
-            tonic_health::pb::health_server::HealthServer::new(service.clone()),
-        )
-        .route_service(
-            "/etcdserverpb.Maintenance/{*method}",
-            maintenance_server::MaintenanceServer::new(service.clone())
+    Ok(Servers::new(member, events, peers, tokens, transport, interval)?.router())
+}
+
+/// The tonic servers for one member, configured once and shared by every listener.
+#[derive(Clone)]
+pub(crate) struct Servers {
+    pub(crate) cluster: cluster_server::ClusterServer<Service>,
+    pub(crate) health: tonic_health::pb::health_server::HealthServer<Service>,
+    pub(crate) maintenance: maintenance_server::MaintenanceServer<Service>,
+    pub(crate) auth: auth_server::AuthServer<Service>,
+    pub(crate) kv: KvServer<Service>,
+    pub(crate) lease: lease_server::LeaseServer<Service>,
+    pub(crate) watch: watch_server::WatchServer<Service>,
+}
+
+impl Servers {
+    pub(crate) fn new(
+        member: u64,
+        events: mpsc::Sender<Event>,
+        peers: &BTreeMap<u64, String>,
+        tokens: crate::auth::TokenIssuer,
+        transport: crate::tls::Transport,
+        interval: Duration,
+    ) -> anyhow::Result<Self> {
+        let service = Service::new(member, events, peers, tokens, transport, interval)?;
+        Ok(Self {
+            cluster: cluster_server::ClusterServer::new(service.clone()),
+            health: tonic_health::pb::health_server::HealthServer::new(service.clone()),
+            maintenance: maintenance_server::MaintenanceServer::new(service.clone())
                 .max_encoding_message_size(64 * 1024 * 1024),
-        )
-        .route_service(
-            "/etcdserverpb.Auth/{*method}",
-            auth_server::AuthServer::new(service.clone()),
-        )
-        .route_service(
-            "/etcdserverpb.KV/{*method}",
-            KvServer::new(service.clone())
+            auth: auth_server::AuthServer::new(service.clone()),
+            kv: KvServer::new(service.clone())
                 .max_decoding_message_size(1536 * 1024)
                 .max_encoding_message_size(64 * 1024 * 1024),
-        )
-        .route_service(
-            "/etcdserverpb.Lease/{*method}",
-            lease_server::LeaseServer::new(service.clone()),
-        )
-        .route_service(
-            "/etcdserverpb.Watch/{*method}",
-            watch_server::WatchServer::new(service).max_encoding_message_size(64 * 1024 * 1024),
-        ))
+            lease: lease_server::LeaseServer::new(service.clone()),
+            watch: watch_server::WatchServer::new(service)
+                .max_encoding_message_size(64 * 1024 * 1024),
+        })
+    }
+
+    /// Route each service by path. `app::App` dispatches the same paths without axum.
+    pub(crate) fn router(self) -> axum::Router {
+        axum::Router::new()
+            .route_service("/etcdserverpb.Cluster/{*method}", self.cluster)
+            .route_service("/grpc.health.v1.Health/{*method}", self.health)
+            .route_service("/etcdserverpb.Maintenance/{*method}", self.maintenance)
+            .route_service("/etcdserverpb.Auth/{*method}", self.auth)
+            .route_service("/etcdserverpb.KV/{*method}", self.kv)
+            .route_service("/etcdserverpb.Lease/{*method}", self.lease)
+            .route_service("/etcdserverpb.Watch/{*method}", self.watch)
+    }
 }
 
 impl Service {

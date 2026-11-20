@@ -6,11 +6,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use anyhow::Result;
-use axum::body::{Body, Bytes};
-use axum::extract::{Request, State};
-use axum::http::HeaderMap;
-use axum::middleware::Next;
-use axum::response::Response;
+use axum::body::Bytes;
+use axum::http::{HeaderMap, Request, Response};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use prometheus::{IntCounter, IntCounterVec, Opts, Registry};
 use prost::Message;
@@ -35,7 +32,7 @@ const CODES: [&str; 17] = [
     "Unauthenticated",
 ];
 
-pub(super) struct Observer {
+pub(crate) struct Observer {
     methods: HashMap<String, Arc<Method>>,
     requests: IntCounterVec,
 }
@@ -45,7 +42,7 @@ struct Traffic {
     bytes: IntCounter,
 }
 
-struct Method {
+pub(crate) struct Method {
     started: IntCounter,
     received: Traffic,
     sent: Traffic,
@@ -176,67 +173,86 @@ fn status(headers: &HeaderMap) -> Option<usize> {
     })
 }
 
-pub(super) async fn observe(
-    State(observer): State<Arc<Observer>>,
-    req: Request,
-    next: Next,
-) -> Response {
-    if req.method() != axum::http::Method::POST
-        || !req
+impl Observer {
+    /// Count a request to a known gRPC method and wrap its body. The returned observation
+    /// belongs to the response: pass it to [`Observer::response`], or drop it to record
+    /// `Canceled` if the response never arrives.
+    pub(crate) fn request<B>(
+        &self,
+        req: Request<B>,
+    ) -> (Request<ObservedBody<B>>, Option<Observation>) {
+        let Some(method) = self.method(&req) else {
+            return (req.map(ObservedBody::plain), None);
+        };
+        method.started.inc();
+        let start = method.duration.as_ref().map(|_| std::time::Instant::now());
+        let version = req
             .headers()
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| {
-                v.split(';')
-                    .next()
-                    .is_some_and(|t| t == "application/grpc" || t.starts_with("application/grpc+"))
-            })
-    {
-        return next.run(req).await;
-    }
-    let Some(method) = observer.methods.get(req.uri().path()).cloned() else {
-        return next.run(req).await;
-    };
-    method.started.inc();
-    let start = method.duration.as_ref().map(|_| std::time::Instant::now());
-    let version = req
-        .headers()
-        .get("client-api-version")
-        .and_then(|v| v.to_str().ok());
-    // Limit client-controlled label values to canonical etcd v3 minor versions.
-    let version = match version {
-        None => "unknown",
-        Some(v)
-            if v.strip_prefix("3.").is_some_and(|n| {
-                !n.is_empty() && n.len() <= 2 && n.bytes().all(|c| c.is_ascii_digit())
-            }) =>
-        {
-            v
+            .get("client-api-version")
+            .and_then(|v| v.to_str().ok());
+        // Limit client-controlled label values to canonical etcd v3 minor versions.
+        let version = match version {
+            None => "unknown",
+            Some(v)
+                if v.strip_prefix("3.").is_some_and(|n| {
+                    !n.is_empty() && n.len() <= 2 && n.bytes().all(|c| c.is_ascii_digit())
+                }) =>
+            {
+                v
+            }
+            Some(_) => "other",
+        };
+        let kind = if method.shape == "unary" {
+            "unary"
+        } else {
+            "stream"
+        };
+        match version {
+            "3.6" => method.current_client.inc(),
+            "unknown" => method.unknown_client.inc(),
+            _ => self.requests.with_label_values(&[kind, version]).inc(),
         }
-        Some(_) => "other",
-    };
-    let kind = if method.shape == "unary" {
-        "unary"
-    } else {
-        "stream"
-    };
-    match version {
-        "3.6" => method.current_client.inc(),
-        "unknown" => method.unknown_client.inc(),
-        _ => observer.requests.with_label_values(&[kind, version]).inc(),
+        let incoming = Observation::Request(method.clone());
+        let outgoing = Observation::Response {
+            method,
+            start,
+            finished: false,
+        };
+        let req = req.map(|body| ObservedBody::new(body, Some(incoming)));
+        (req, Some(outgoing))
     }
-    let incoming = Observation::Request(method.clone());
-    let mut outgoing = Observation::Response {
-        method,
-        start,
-        finished: false,
-    };
-    let req = req.map(|body| Body::new(ObservedBody::new(body, incoming)));
-    let response = next.run(req).await;
-    if let Some(code) = status(response.headers()) {
-        outgoing.finish(code);
+
+    /// Only gRPC POSTs to a method this member serves are counted.
+    fn method<B>(&self, req: &Request<B>) -> Option<Arc<Method>> {
+        let grpc = req.method() == axum::http::Method::POST
+            && req
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| {
+                    v.split(';').next().is_some_and(|t| {
+                        t == "application/grpc" || t.starts_with("application/grpc+")
+                    })
+                });
+        if !grpc {
+            return None;
+        }
+        self.methods.get(req.uri().path()).cloned()
     }
-    response.map(|body| Body::new(ObservedBody::new(body, outgoing)))
+
+    /// Record a trailers-only status now; the body records the trailers of a full response.
+    pub(crate) fn response<B>(
+        outgoing: Option<Observation>,
+        response: Response<B>,
+    ) -> Response<ObservedBody<B>> {
+        let Some(mut outgoing) = outgoing else {
+            return response.map(ObservedBody::plain);
+        };
+        if let Some(code) = status(response.headers()) {
+            outgoing.finish(code);
+        }
+        response.map(|body| ObservedBody::new(body, Some(outgoing)))
+    }
 }
 
 #[derive(Default)]
@@ -273,23 +289,28 @@ impl MessageFrames {
     }
 }
 
-struct ObservedBody {
-    inner: Body,
+/// A request or response body that counts gRPC messages and the final status of its RPC.
+pub(crate) struct ObservedBody<B> {
+    inner: B,
     frames: MessageFrames,
-    observation: Observation,
+    observation: Option<Observation>,
 }
 
-impl ObservedBody {
-    fn new(inner: Body, observation: Observation) -> Self {
+impl<B> ObservedBody<B> {
+    fn new(inner: B, observation: Option<Observation>) -> Self {
         Self {
             inner,
             frames: MessageFrames::default(),
             observation,
         }
     }
+
+    pub(crate) fn plain(inner: B) -> Self {
+        Self::new(inner, None)
+    }
 }
 
-enum Observation {
+pub(crate) enum Observation {
     Request(Arc<Method>),
     Response {
         method: Arc<Method>,
@@ -329,29 +350,36 @@ impl Drop for Observation {
     }
 }
 
-impl HttpBody for ObservedBody {
+impl<B> HttpBody for ObservedBody<B>
+where
+    B: HttpBody<Data = Bytes> + Unpin,
+{
     type Data = Bytes;
-    type Error = axum::Error;
+    type Error = B::Error;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
-        let result = std::task::ready!(Pin::new(&mut self.inner).poll_frame(cx));
+    ) -> Poll<Option<Result<Frame<Bytes>, B::Error>>> {
+        let this = &mut *self;
+        let result = std::task::ready!(Pin::new(&mut this.inner).poll_frame(cx));
+        let Some(observation) = &mut this.observation else {
+            return Poll::Ready(result);
+        };
         match &result {
             Some(Ok(frame)) => {
                 if let Some(data) = frame.data_ref() {
-                    let (n, bytes) = self.frames.consume(data);
+                    let (n, bytes) = this.frames.consume(data);
                     if n != 0 {
-                        let traffic = self.observation.traffic();
+                        let traffic = observation.traffic();
                         traffic.messages.inc_by(n);
                         traffic.bytes.inc_by(bytes);
                     }
                 } else if let Some(code) = frame.trailers_ref().and_then(status) {
-                    self.observation.finish(code);
+                    observation.finish(code);
                 }
             }
-            Some(Err(_)) | None => self.observation.finish(2),
+            Some(Err(_)) | None => observation.finish(2),
         }
         Poll::Ready(result)
     }
