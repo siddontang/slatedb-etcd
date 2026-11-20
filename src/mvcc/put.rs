@@ -217,12 +217,16 @@ pub(crate) async fn prepare_put(
     }
     // The revision row has a fixed width after its first write.
     if revision == 1 {
-        let old_len = view
-            .db
-            .get(REVISION)
-            .await
-            .map_err(KvError::storage)?
-            .map(|v| v.len());
+        // An earlier group member that wrote no revision may still have stored this row.
+        let old_len = match batch.get(REVISION) {
+            Some(value) => value.map(|v| v.len()),
+            None => view
+                .db
+                .get(REVISION)
+                .await
+                .map_err(KvError::storage)?
+                .map(|v| v.len()),
+        };
         batch
             .put_counted(
                 bytes::Bytes::from_static(REVISION),

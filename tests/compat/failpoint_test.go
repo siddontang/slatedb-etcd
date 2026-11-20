@@ -75,9 +75,29 @@ func TestFailpointRecovery(t *testing.T) {
 				mustCall(t, api, clientv3.OpPut("batch-blocker", "ready"))
 				for i := 0; i < 8; i++ {
 					key := fmt.Sprintf("batch/%02d", i)
-					reply := mustCall(t, api, clientv3.OpPut(key, point)).(*pb.PutResponse)
+					if i%2 == 0 {
+						reply := mustCall(t, api, clientv3.OpPut(key, point)).(*pb.PutResponse)
+						batched[key] = reply.Header.Revision
+						continue
+					}
+					// The compare reads the put that the same apply group wrote just before.
+					previous := fmt.Sprintf("batch/%02d", i-1)
+					reply := mustCall(t, api, clientv3.OpTxn(
+						[]clientv3.Cmp{clientv3.Compare(clientv3.ModRevision(previous), "=", batched[previous])},
+						[]clientv3.Op{clientv3.OpPut(key, point)},
+						[]clientv3.Op{clientv3.OpPut("batch/never", "stale compare")},
+					)).(*pb.TxnResponse)
+					require.True(t, reply.Succeeded)
 					batched[key] = reply.Header.Revision
 				}
+				// A failed transaction in the group writes nothing and keeps the revision.
+				failed := mustCall(t, api, clientv3.OpTxn(
+					[]clientv3.Cmp{clientv3.Compare(clientv3.Value("batch/01"), "=", "wrong")},
+					[]clientv3.Op{clientv3.OpPut("batch/never", "failed compare")},
+					[]clientv3.Op{clientv3.OpGet("batch/01")},
+				)).(*pb.TxnResponse)
+				require.False(t, failed.Succeeded)
+				require.Equal(t, batched["batch/07"], failed.Header.Revision)
 				last, err := c.http(leader, "/status", nil)
 				require.NoError(t, err)
 				// Arm only after a delayed job contains the complete multi-entry suffix.
@@ -142,6 +162,8 @@ func TestFailpointRecovery(t *testing.T) {
 				require.Equal(t, revision, got.Kvs[0].ModRevision)
 			}
 			if priorRevision != 0 {
+				never := mustCall(t, recovered, clientv3.OpGet("batch/never")).(*pb.RangeResponse)
+				require.Empty(t, never.Kvs)
 				old := mustCall(t, recovered, clientv3.OpGet("batch/00",
 					clientv3.WithRev(priorRevision))).(*pb.RangeResponse)
 				require.Len(t, old.Kvs, 1)

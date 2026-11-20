@@ -193,6 +193,12 @@ impl Writes {
         self.bytes += key.len() + value.len();
     }
 
+    pub fn merge(&mut self, other: Self) {
+        self.puts += other.puts;
+        self.bytes += other.bytes;
+        self.deletes += other.deletes;
+    }
+
     pub fn publish(self, meters: &StateMeters) {
         if self.puts > 0 {
             meters.puts.inc_by(self.puts);
