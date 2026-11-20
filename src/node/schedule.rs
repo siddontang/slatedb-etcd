@@ -23,6 +23,19 @@ impl Node {
 
     pub(super) fn submit_apply(&mut self, job: Job, target: u64) -> Result<()> {
         ensure!(!self.apply_busy, "apply worker already has a job");
+        self.enqueue_apply(job, target)
+    }
+
+    /// Queue a job behind any running jobs. The worker runs jobs in submission order.
+    fn enqueue_apply(&mut self, job: Job, target: u64) -> Result<()> {
+        // Only a plain committed-entry job lets another Entries job queue behind it.
+        // A configuration change must reach Raft before the worker applies later entries.
+        let chainable = match &job {
+            Job::Entries(entries) => entries
+                .iter()
+                .all(|entry| entry.entry_type == EntryType::EntryNormal as i32),
+            _ => false,
+        };
         self.worker.submit(Work {
             job,
             header: self.header(),
@@ -30,11 +43,66 @@ impl Node {
         })?;
         self.apply_busy = true;
         self.apply_target = target;
+        self.apply_jobs.push_back((target, chainable));
+        Ok(())
+    }
+
+    fn checkpoint_due(&self, applied: u64) -> bool {
+        (self.membership_checkpoint > self.raw.store().snapshot_index()
+            && applied >= self.membership_checkpoint)
+            || self
+                .checkpoint_waiters
+                .iter()
+                .any(|(index, _)| *index <= applied)
+            || self.next_checkpoint.is_some_and(|index| applied >= index)
+    }
+
+    /// Submit committed entries in `(applied, committed]`, up to one apply batch.
+    fn submit_entries(&mut self, applied: u64, committed: u64) -> Result<()> {
+        let low = applied + 1;
+        let high = (low + apply::APPLY_ENTRIES).min(committed + 1);
+        let entries = self.raw.store().entries(
+            low,
+            high,
+            Some(apply::BATCH_BYTES),
+            raft::GetEntriesContext::empty(false),
+        )?;
+        let target = entries.last().context("empty apply batch")?.index;
+        ensure!(
+            target <= self.raw.store().commit_index(),
+            "apply exceeds durable commit"
+        );
+        self.prefer_query = true;
+        self.enqueue_apply(Job::Entries(entries), target)
+    }
+
+    /// Keep the worker busy with committed entries while it runs earlier Entries jobs.
+    /// Any other work waits until the queue drains, so it still sees the state it expects.
+    fn pipeline_apply(&mut self) -> Result<()> {
+        while self.apply_jobs.len() < apply::PIPELINE_DEPTH {
+            let Some(&(last, true)) = self.apply_jobs.back() else {
+                return Ok(());
+            };
+            let committed = self.raw.store().commit_index().min(self.committed_ready);
+            if last >= committed
+                || self.raw.store().snapshot_pending()
+                || last < self.raw.store().snapshot_index()
+                || self.prepared_puts.is_some()
+                || !self.queries.is_empty()
+                || (self.checkpoint_due(last) && !self.checkpoint_running)
+            {
+                return Ok(());
+            }
+            self.submit_entries(last, committed)?;
+        }
         Ok(())
     }
 
     pub(super) fn schedule_apply(&mut self) -> Result<()> {
-        if self.apply_busy || self.raw.store().snapshot_pending() {
+        if self.apply_busy {
+            return self.pipeline_apply();
+        }
+        if self.raw.store().snapshot_pending() {
             return Ok(());
         }
         let snapshot_index = self.raw.store().snapshot_index();
@@ -56,15 +124,7 @@ impl Node {
             }
             return Ok(());
         }
-        let checkpoint_due = (self.membership_checkpoint > snapshot_index
-            && self.state.applied >= self.membership_checkpoint)
-            || self
-                .checkpoint_waiters
-                .iter()
-                .any(|(index, _)| *index <= self.state.applied)
-            || self
-                .next_checkpoint
-                .is_some_and(|index| self.state.applied >= index);
+        let checkpoint_due = self.checkpoint_due(self.state.applied);
         if checkpoint_due && !self.checkpoint_running && self.state.applied > snapshot_index {
             return self.start_checkpoint();
         }
@@ -75,21 +135,8 @@ impl Node {
             }
         }
         if self.state.applied < committed {
-            let low = self.state.applied + 1;
-            let high = (low + apply::BATCH_ENTRIES).min(committed + 1);
-            let entries = self.raw.store().entries(
-                low,
-                high,
-                Some(apply::BATCH_BYTES),
-                raft::GetEntriesContext::empty(false),
-            )?;
-            let target = entries.last().context("empty apply batch")?.index;
-            ensure!(
-                target <= self.raw.store().commit_index(),
-                "apply exceeds durable commit"
-            );
-            self.prefer_query = true;
-            return self.submit_apply(Job::Entries(entries), target);
+            self.submit_entries(self.state.applied, committed)?;
+            return self.pipeline_apply();
         }
         if self.prepare_quorum_puts()? {
             return Ok(());
@@ -102,8 +149,12 @@ impl Node {
 
     pub(super) fn complete_apply(&mut self, completed: Completion) -> Result<()> {
         ensure!(self.apply_busy, "unexpected apply completion");
+        let (target, _) = self
+            .apply_jobs
+            .pop_front()
+            .context("unexpected apply completion")?;
         ensure!(
-            completed.applied == self.apply_target,
+            completed.applied == target,
             "apply completion has the wrong index"
         );
         ensure!(
@@ -114,7 +165,7 @@ impl Node {
             completed.applied <= self.raw.store().commit_index(),
             "apply completion exceeds durable commit"
         );
-        self.apply_busy = false;
+        self.apply_busy = !self.apply_jobs.is_empty();
         self.expire_reads();
         let Some(state) = completed.state else {
             ensure!(
