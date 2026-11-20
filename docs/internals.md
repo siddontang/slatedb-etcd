@@ -196,6 +196,8 @@ Point reads use the current-key index. Current range reads scan the requested ke
 Historical point reads scan one key's versions. Historical range reads currently scan all history.
 Range responses collect matching keys in memory before sorting or applying a limit.
 These choices favor compatibility testing. Large data sets need bounded scans and a history index.
+Range scans set `cache_blocks`, so repeated scans read blocks from the state block cache.
+SlateDB scans otherwise bypass that cache and fetch every block from the object store.
 
 Compact stores the boundary and a progress record with the apply marker in one SlateDB batch.
 It does not advance the KV revision. Reads below the boundary return the standard
