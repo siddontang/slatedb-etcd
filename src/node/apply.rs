@@ -85,6 +85,19 @@ impl Query {
         matches!((self, other), (Self::Linear(a, ca, _), Self::Linear(b, cb, _)) if ca == cb && a == b)
     }
 
+    /// Return true for a current Range that streams rows and can run in a shared scan slot.
+    pub fn is_streaming_range(&self) -> bool {
+        let request = match self {
+            Self::Read(request, ..) | Self::Linear(request, ..) => request,
+            _ => return false,
+        };
+        matches!(
+            &request.request,
+            Some(crate::proto::etcdserverpb::request_op::Request::RequestRange(range))
+                if crate::mvcc::streams_range(range)
+        )
+    }
+
     pub fn is_point_read(&self) -> bool {
         let request = match self {
             Self::Read(request, ..) | Self::Linear(request, ..) => request,

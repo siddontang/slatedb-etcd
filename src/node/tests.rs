@@ -742,6 +742,117 @@ async fn read_index_requires_quorum_and_does_not_write_the_log() {
 }
 
 #[tokio::test]
+async fn scans_run_together_and_rerun_alone_over_their_row_budget() {
+    use crate::proto::etcdserverpb::{
+        request_op::Request as Op, response_op::Response as Resp, PutRequest, RangeRequest,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    for key in 0..8u8 {
+        let (tx, _) = oneshot::channel();
+        node.propose(
+            RaftCommand::Etcd {
+                id: format!("put-{key}"),
+                origin: 1,
+                etcd: RequestOp {
+                    request: Some(Op::RequestPut(PutRequest {
+                        key: vec![b'a' + key],
+                        value: vec![key; 100],
+                        ..Default::default()
+                    })),
+                },
+            },
+            tx,
+        )
+        .unwrap();
+    }
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    let mut ack = Message::default();
+    ack.set_msg_type(MessageType::MsgAppendResponse);
+    ack.from = 2;
+    ack.to = 1;
+    ack.term = node.raw.raft.term;
+    ack.index = node.raw.store().last_index().unwrap();
+    node.raw.step(ack).unwrap();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    node.drain_apply().await.unwrap();
+    let revision = node.state.revision;
+    assert_eq!(revision, 9);
+    // Each row counts more than 200 bytes. Two rows fit the shared budget; eight rows do not.
+    node.read_executor.scan_row_budget = 500;
+
+    let range = |limit, sort_order| RangeRequest {
+        key: b"a".to_vec(),
+        range_end: b"z".to_vec(),
+        limit,
+        sort_order,
+        serializable: true,
+        ..Default::default()
+    };
+    // Two small scans, one large scan, a sorted (exclusive) read, a small scan, then a point read.
+    let requests = [
+        range(1, 0),
+        range(2, 0),
+        range(0, 0),
+        range(0, 2),
+        range(1, 0),
+        RangeRequest {
+            key: b"a".to_vec(),
+            serializable: true,
+            ..Default::default()
+        },
+    ];
+    let mut replies = vec![];
+    for request in &requests {
+        let (tx, rx) = oneshot::channel();
+        node.enqueue_query(Query::Read(
+            RequestOp {
+                request: Some(Op::RequestRange(request.clone())),
+            },
+            None,
+            ClientResponse::Kv(tx),
+        ));
+        replies.push(rx);
+    }
+    node.drive_ready().await.unwrap();
+    // Three scans share the wide slots. The sorted read and later scans wait in queue order.
+    // The point read passes them and uses the remaining task.
+    assert_eq!(node.read_executor.len(), read::executor::MAX_TASKS);
+    assert_eq!(node.read_queries.len(), 2);
+    assert!(!node.read_executor.can_submit(&node.read_queries[0]));
+    node.drain_reads().await.unwrap();
+    assert!(node.read_queries.is_empty());
+    assert_eq!(node.read_executor.reruns, 1);
+    for (request, reply) in requests.iter().zip(replies) {
+        let mut result = reply.await.unwrap().unwrap().into_outcome().result.unwrap();
+        assert_eq!(
+            crate::mvcc::response_header(&mut result).unwrap().revision,
+            revision
+        );
+        let Some(Resp::ResponseRange(range)) = result.response else {
+            panic!("expected a range response");
+        };
+        let keys: Vec<_> = range.kvs.iter().map(|kv| kv.key[0]).collect();
+        let (count, mut expected): (i64, Vec<u8>) = if request.range_end.is_empty() {
+            (1, vec![b'a'])
+        } else {
+            (8, (b'a'..b'i').collect())
+        };
+        if request.sort_order == 2 {
+            expected.reverse();
+        }
+        if request.limit > 0 {
+            expected.truncate(request.limit as usize);
+        }
+        assert_eq!(range.count, count);
+        assert_eq!(range.more, keys.len() < count as usize);
+        assert_eq!(keys, expected);
+    }
+}
+
+#[tokio::test]
 async fn confirmed_scans_share_only_matching_requests_and_credentials() {
     use crate::proto::etcdserverpb::{request_op::Request as Op, RangeRequest};
     let dir = tempfile::tempdir().unwrap();
