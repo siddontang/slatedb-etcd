@@ -6,7 +6,7 @@ pub(super) const BATCH_ENTRIES: u64 = 32;
 /// Committed-entry jobs that may wait in the apply queue behind the running job.
 pub(super) const PIPELINE_DEPTH: usize = 4;
 /// Committed entries in one apply job. A larger job shares the fixed cost of a state write.
-pub(super) const APPLY_ENTRIES: u64 = 128;
+pub(super) const APPLY_ENTRIES: u64 = 64;
 pub(super) const BATCH_BYTES: u64 = 512 * 1024;
 pub(super) const MAX_QUERIES: usize = 64;
 pub(super) const READ_BATCH: usize = 16;
