@@ -219,14 +219,22 @@ impl Lease for Service {
     ) -> Result<Response<Self::LeaseKeepAliveStream>, Status> {
         let credentials = credentials(&request);
         let forwarded = is_forwarded(&request);
-        Ok(Response::new(KeepAliveStream {
+        let mut stream = KeepAliveStream {
             service: self.clone(),
             input: request.into_inner(),
             credentials,
             forwarded,
             timeout: Box::pin(tokio::time::sleep(Duration::ZERO)),
             state: KeepAliveState::Idle,
-        }))
+            first: None,
+        };
+        // Like grpc-go, send the response headers with the first message. Each client
+        // KeepAliveOnce opens a stream, so this saves one HTTP/2 write per renewal.
+        match std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)).await {
+            Some(Err(status)) => return Err(status),
+            first => stream.first = first,
+        }
+        Ok(Response::new(stream))
     }
 }
 
@@ -242,6 +250,8 @@ pub struct KeepAliveStream {
     /// Reused for each request on the stream.
     timeout: Pin<Box<tokio::time::Sleep>>,
     state: KeepAliveState,
+    /// The first reply, which the handler waits for before it returns the response.
+    first: Option<KeepAliveResult>,
 }
 
 enum KeepAliveState {
@@ -290,6 +300,9 @@ impl Stream for KeepAliveStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if let Some(first) = this.first.take() {
+            return Poll::Ready(Some(first));
+        }
         loop {
             match &mut this.state {
                 KeepAliveState::Done => return Poll::Ready(None),
