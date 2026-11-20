@@ -1439,3 +1439,190 @@ async fn applied_state_enforces_the_effective_etcd_quota() {
         assert_eq!(node.worker.state().quota, effective);
     }
 }
+
+async fn commit_with_peer(node: &mut Node) {
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    let ack = Message {
+        msg_type: MessageType::MsgAppendResponse as i32,
+        from: 2,
+        to: 1,
+        term: node.raw.raft.term,
+        index: node.raw.store().last_index().unwrap(),
+        ..Default::default()
+    };
+    node.raw.step(ack).unwrap();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    node.drain_apply().await.unwrap();
+    node.drive_ready().await.unwrap();
+}
+
+async fn grant_lease(node: &mut Node, id: i64, ttl: i64) {
+    let (tx, reply) = oneshot::channel();
+    node.propose(
+        RaftCommand::Lease {
+            origin: 1,
+            id: format!("grant-{id}"),
+            lease: LeaseCommand::Grant { id, ttl },
+        },
+        tx,
+    )
+    .unwrap();
+    commit_with_peer(node).await;
+    reply.await.unwrap().unwrap();
+    node.sync_lease_deadlines();
+}
+
+/// Send a KeepAlive and confirm its ReadIndex proof with the peer heartbeat reply.
+async fn keep_alive(node: &mut Node, id: i64) -> std::result::Result<i64, ApiError> {
+    let (tx, mut reply) = oneshot::channel();
+    node.keep_alive(id, None, tx).unwrap();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    if let Ok(result) = reply.try_recv() {
+        result?;
+        unreachable!("a leader renewal must wait for its proof");
+    }
+    let context = node.renewals.batches.back().unwrap().context;
+    confirm_read(node, &context).await;
+    node.drain_apply().await.unwrap();
+    node.drive_ready().await.unwrap();
+    let value = reply.try_recv().expect("renewal did not finish")?;
+    let outcome: crate::mvcc::Outcome<LeaseReply> = serde_json::from_value(value).unwrap();
+    match outcome.result.unwrap() {
+        LeaseReply::KeepAlive(response) => {
+            assert_eq!(response.id, id);
+            Ok(response.ttl)
+        }
+        _ => panic!("expected a KeepAlive reply"),
+    }
+}
+
+#[tokio::test]
+async fn leader_renews_a_lease_without_a_log_append() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    grant_lease(&mut node, 7, 60).await;
+    let short = Instant::now() + Duration::from_secs(5);
+    node.lease_deadlines.get_mut(&7).unwrap().1 = short;
+    let last = node.raw.store().durable.last_index;
+    let syncs = node.raw.store().durable.sync_writes;
+    let generation = node.state.leases[&7].generation;
+
+    assert_eq!(keep_alive(&mut node, 7).await.unwrap(), 60);
+    assert!(node.lease_deadlines[&7].1 > short + Duration::from_secs(50));
+    assert_eq!(keep_alive(&mut node, 99).await.unwrap(), 0, "unknown lease");
+    assert_eq!(node.raw.store().durable.last_index, last);
+    assert_eq!(node.raw.store().durable.sync_writes, syncs);
+    assert_eq!(node.state.leases[&7].generation, generation);
+    assert!(node.renewals.is_empty());
+
+    // A follower lets the gRPC layer forward the request to the leader.
+    node.raw.raft.become_follower(node.raw.raft.term + 1, 2);
+    let (tx, reply) = oneshot::channel();
+    node.keep_alive(7, None, tx).unwrap();
+    assert_eq!(reply.await.unwrap().unwrap_err().error, "not leader");
+}
+
+#[tokio::test]
+async fn an_expired_lease_is_not_renewed_before_its_expire_entry_applies() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    grant_lease(&mut node, 7, 60).await;
+    grant_lease(&mut node, 8, 60).await;
+    let last = node.raw.raft.raft_log.last_index();
+
+    // A renewal before the deadline moves it, so the owner proposes no expiry.
+    node.lease_deadlines.get_mut(&8).unwrap().1 = Instant::now() + Duration::from_millis(200);
+    assert_eq!(keep_alive(&mut node, 8).await.unwrap(), 60);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    node.expire_leases().unwrap();
+    assert_eq!(node.raw.raft.raft_log.last_index(), last);
+
+    // Past the deadline, a renewal fails and keeps the pending expiry valid.
+    let past = Instant::now() - Duration::from_millis(1);
+    node.lease_deadlines.get_mut(&7).unwrap().1 = past;
+    node.expire_leases().unwrap();
+    assert_eq!(node.raw.raft.raft_log.last_index(), last + 1);
+    assert_eq!(keep_alive(&mut node, 7).await.unwrap(), 0);
+    assert_eq!(node.lease_deadlines[&7].1, past);
+    commit_with_peer(&mut node).await;
+    assert!(!node.state.leases.contains_key(&7));
+    assert!(node.state.leases.contains_key(&8));
+    assert!(node.lease_expiring.is_empty());
+    assert_eq!(keep_alive(&mut node, 7).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn leader_change_cancels_renewals_and_restores_the_full_ttl() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    grant_lease(&mut node, 7, 60).await;
+    node.lease_deadlines.get_mut(&7).unwrap().1 = Instant::now() + Duration::from_secs(1);
+
+    // A proof from the old term cannot renew the lease.
+    let (tx, mut reply) = oneshot::channel();
+    node.keep_alive(7, None, tx).unwrap();
+    node.drive_ready().await.unwrap();
+    let context = node.renewals.batches.back().unwrap().context;
+    let term = node.raw.raft.term;
+    node.raw.raft.become_follower(term + 1, 2);
+    node.raw.raft.become_candidate();
+    node.raw.raft.become_leader();
+    confirm_read(&mut node, &context).await;
+    let error = reply.try_recv().unwrap().unwrap_err();
+    assert!(error.error.contains("renewal cancelled"), "{}", error.error);
+    assert!(node.renewals.is_empty());
+
+    // The new leader does not know the old deadline. Like etcd, it grants the full TTL plus the
+    // longest election timeout, so an in-memory renewal by the old leader cannot outlive it.
+    node.sync_lease_deadlines();
+    let extend = node.promote_extend();
+    assert_eq!(extend, Duration::from_secs(2));
+    let remaining = node.lease_deadlines[&7]
+        .1
+        .saturating_duration_since(Instant::now());
+    assert!(
+        remaining > Duration::from_secs(60) + extend - Duration::from_secs(1),
+        "{remaining:?}"
+    );
+
+    // A lease granted later in the same term gets only its TTL.
+    grant_lease(&mut node, 8, 60).await;
+    let remaining = node.lease_deadlines[&8]
+        .1
+        .saturating_duration_since(Instant::now());
+    assert!(remaining <= Duration::from_secs(60), "{remaining:?}");
+}
+
+#[tokio::test]
+async fn a_renewal_with_a_stale_proof_is_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    grant_lease(&mut node, 7, 60).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    node.lease_deadlines.get_mut(&7).unwrap().1 = deadline;
+
+    let (tx, mut reply) = oneshot::channel();
+    node.keep_alive(7, None, tx).unwrap();
+    node.drive_ready().await.unwrap();
+    // Apply reaches the proof index only after the next leader could have set its deadline.
+    let extend = node.promote_extend();
+    let batch = node.renewals.batches.back_mut().unwrap();
+    batch.issued = Instant::now() - extend - Duration::from_millis(1);
+    let context = batch.context;
+    confirm_read(&mut node, &context).await;
+    node.drain_apply().await.unwrap();
+    node.drive_ready().await.unwrap();
+    let error = reply.try_recv().unwrap().unwrap_err();
+    assert!(error.error.contains("renewal cancelled"), "{}", error.error);
+    assert_eq!(
+        node.lease_deadlines[&7].1, deadline,
+        "a stale proof must not move the deadline"
+    );
+    assert!(node.renewals.is_empty());
+
+    // A fresh proof renews again.
+    assert_eq!(keep_alive(&mut node, 7).await.unwrap(), 60);
+}

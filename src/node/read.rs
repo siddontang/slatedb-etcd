@@ -133,6 +133,7 @@ impl Node {
         for context in retry {
             self.raw.read_index(self.read_context(context));
         }
+        self.retry_renewals();
     }
 
     pub(super) fn confirm_reads(&mut self, reads: Vec<raft::ReadState>) {
@@ -142,6 +143,7 @@ impl Node {
                 continue;
             }
             let id = u64::from_be_bytes(context[16..].try_into().unwrap());
+            self.confirm_renewal(id, state.index);
             for read in self.reads.values_mut() {
                 if read.context == Some(id)
                     && read.index.is_none()
