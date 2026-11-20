@@ -86,7 +86,8 @@ writers share a manifest. A shared SST design needs a separate ownership and ref
 
 The Raft owner stages and replicates entries. A dedicated thread persists them in raft-engine.
 One apply task owns SlateDB.
-The standalone server defaults to two async workers. `--runtime-workers` can change this count.
+The standalone server defaults to one async worker per available CPU. `--runtime-workers` can
+change this count.
 Embedded servers use their caller's runtime.
 Only a completed state write advances `applied_index`. Quorum Put preparation is memory-only.
 Committed work stays in the durable log until the worker can accept it.
