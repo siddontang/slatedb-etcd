@@ -151,9 +151,10 @@ Read evaluation does not construct a discarded write batch.
 The apply owner keeps an in-memory key index with revision metadata for each current key.
 Put, transaction, and quota paths read old metadata from it instead of SlateDB.
 See the [key index](architecture.md#key-index) for its update rules and memory cost.
-Ordinary puts without leases or ignore flags share writes within an apply job.
-A bounded overlay lets repeated keys see earlier puts in that group.
-Transactions, leased puts, administration, compaction, and empty entries end a group.
+Consecutive etcd KV entries, including transactions, share writes within an apply job.
+A bounded overlay lets later point reads and compares see earlier writes in that group.
+A request with a range scan, a historical read, or an authorized leased put starts a new group.
+Lease, Auth, administration, compaction, membership, and empty entries end a group.
 Quota checks use each request's updated logical size. Failed requests do not advance the revision.
 No response leaves the worker before the combined storage write completes.
 `state_write_batches` counts storage writes since startup. It includes non-Put state operations.

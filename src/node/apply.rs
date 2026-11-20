@@ -488,15 +488,18 @@ async fn apply_entries(
                 .as_ref()
                 .map_or(entry.data.as_ref(), |change| change.context.as_ref()),
         )?;
-        if change.is_none() && super::quorum_put::put_command(&command).is_some() {
+        if change.is_none() && super::quorum_put::kv_command(&command).is_some() {
             let mut commands = vec![(entry.index, command)];
+            // Later members read earlier group writes through a point-read overlay only.
             while let Some(next) = entries.peek() {
                 if next.entry_type != EntryType::EntryNormal as i32 || next.data.is_empty() {
                     break;
                 }
                 let command = RaftCommand::decode(&next.data)?;
-                if super::quorum_put::put_command(&command).is_none() {
-                    break;
+                match super::quorum_put::kv_command(&command) {
+                    Some((request, credentials, _))
+                        if !crate::mvcc::needs_scan(request, credentials.is_some()) => {}
+                    _ => break,
                 }
                 commands.push((entries.next().unwrap().index, command));
             }
@@ -671,7 +674,7 @@ mod tests {
     use crate::proto::etcdserverpb::*;
 
     #[tokio::test]
-    async fn put_groups_stop_at_transactions_leases_and_empty_entries() {
+    async fn kv_groups_stop_at_leases_and_empty_entries() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = StateMachine::open(directory.path()).await.unwrap();
         let put = |key: &[u8], value: &[u8], lease| RequestOp {
@@ -742,7 +745,7 @@ mod tests {
         .unwrap();
         assert_eq!(replies.len(), 7);
         assert_eq!(state.applied, 8);
-        assert_eq!(state.write_batches, 6);
+        assert_eq!(state.write_batches, 4);
         let Reply::Kv(outcome) = &replies[2].reply else {
             panic!("expected transaction reply");
         };
@@ -777,5 +780,614 @@ mod tests {
         );
         assert_eq!(result.header.unwrap().revision, 7);
         state.close().await.unwrap();
+    }
+
+    fn put_op(key: &[u8], value: &[u8]) -> RequestOp {
+        RequestOp {
+            request: Some(Op::RequestPut(PutRequest {
+                key: key.to_vec(),
+                value: value.to_vec(),
+                prev_kv: true,
+                ..Default::default()
+            })),
+        }
+    }
+
+    fn range_op(key: &[u8], end: &[u8], revision: i64) -> RequestOp {
+        RequestOp {
+            request: Some(Op::RequestRange(RangeRequest {
+                key: key.to_vec(),
+                range_end: end.to_vec(),
+                revision,
+                ..Default::default()
+            })),
+        }
+    }
+
+    fn delete_op(key: &[u8], end: &[u8]) -> RequestOp {
+        RequestOp {
+            request: Some(Op::RequestDeleteRange(DeleteRangeRequest {
+                key: key.to_vec(),
+                range_end: end.to_vec(),
+                prev_kv: true,
+            })),
+        }
+    }
+
+    fn txn_op(
+        compare: Vec<Compare>,
+        success: Vec<RequestOp>,
+        failure: Vec<RequestOp>,
+    ) -> RequestOp {
+        RequestOp {
+            request: Some(Op::RequestTxn(TxnRequest {
+                compare,
+                success,
+                failure,
+            })),
+        }
+    }
+
+    fn compare(key: &[u8], target: i32, value: compare::TargetUnion) -> Compare {
+        Compare {
+            key: key.to_vec(),
+            target,
+            target_union: Some(value),
+            ..Default::default()
+        }
+    }
+
+    async fn rows(state: &StateMachine) -> Vec<(bytes::Bytes, bytes::Bytes)> {
+        let mut scan = state.db.scan_prefix(b"", ..).await.unwrap();
+        let mut rows = vec![];
+        while let Some(row) = scan.next().await.unwrap() {
+            rows.push((row.key, row.value));
+        }
+        rows
+    }
+
+    #[tokio::test]
+    async fn grouped_transactions_match_sequential_apply() {
+        use compare::TargetUnion as T;
+        let leased = RequestOp {
+            request: Some(Op::RequestPut(PutRequest {
+                key: b"l".to_vec(),
+                value: b"leased".to_vec(),
+                lease: 5,
+                ..Default::default()
+            })),
+        };
+        let keep_value = RequestOp {
+            request: Some(Op::RequestPut(PutRequest {
+                key: b"e".to_vec(),
+                ignore_value: true,
+                prev_kv: true,
+                ..Default::default()
+            })),
+        };
+        let missing_lease = RequestOp {
+            request: Some(Op::RequestPut(PutRequest {
+                key: b"m".to_vec(),
+                value: b"m".to_vec(),
+                lease: 99,
+                ..Default::default()
+            })),
+        };
+        let requests = vec![
+            put_op(b"a", b"1"),
+            // The compare sees the put from the same group.
+            txn_op(
+                vec![compare(b"a", 3, T::Value(b"1".to_vec()))],
+                vec![
+                    put_op(b"a", b"2"),
+                    put_op(b"b", b"x"),
+                    range_op(b"a", b"", 0),
+                ],
+                vec![put_op(b"c", b"no")],
+            ),
+            txn_op(
+                vec![compare(b"a", 2, T::ModRevision(2))],
+                vec![put_op(b"c", b"no")],
+                vec![range_op(b"a", b"", 0), delete_op(b"b", b"")],
+            ),
+            txn_op(
+                vec![compare(b"b", 0, T::Version(0))],
+                vec![put_op(b"b", b"again"), range_op(b"b", b"", 0)],
+                vec![],
+            ),
+            put_op(b"a", b"3"),
+            txn_op(vec![], vec![put_op(b"a", b"4")], vec![]),
+            // Range reads start a new group.
+            txn_op(
+                vec![compare(b"a", 1, T::CreateRevision(0))],
+                vec![range_op(b"a", b"z", 0), put_op(b"d", b"1")],
+                vec![],
+            ),
+            put_op(b"e", b"5"),
+            txn_op(vec![], vec![delete_op(b"a", b"c")], vec![]),
+            txn_op(vec![], vec![put_op(b"x", b"1"), put_op(b"x", b"2")], vec![]),
+            txn_op(vec![], vec![missing_lease], vec![]),
+            delete_op(b"d", b""),
+            txn_op(vec![], vec![range_op(b"a", b"", 2)], vec![]),
+            txn_op(
+                vec![compare(b"e", 3, T::Value(b"5".to_vec()))],
+                vec![txn_op(
+                    vec![compare(b"d", 0, T::Version(0))],
+                    vec![put_op(b"f", b"nested")],
+                    vec![],
+                )],
+                vec![],
+            ),
+            keep_value,
+            leased,
+            txn_op(vec![], vec![range_op(b"a", b"", 0)], vec![]),
+            txn_op(
+                vec![compare(b"l", 4, T::Lease(5))],
+                vec![put_op(b"l", b"kept")],
+                vec![],
+            ),
+        ];
+        let header = Header {
+            cluster: 1,
+            member: 1,
+            term: 1,
+        };
+        let grant = LeaseCommand::Grant { id: 5, ttl: 60 };
+        for quota in [0, 1, 900, 1500, 100000] {
+            let left = tempfile::tempdir().unwrap();
+            let right = tempfile::tempdir().unwrap();
+            let mut grouped = StateMachine::open(left.path()).await.unwrap();
+            let mut separate = StateMachine::open(right.path()).await.unwrap();
+            grouped.quota = quota;
+            separate.quota = quota;
+            let mut commands = vec![RaftCommand::Lease {
+                id: "grant".into(),
+                lease: grant.clone(),
+                origin: 1,
+            }];
+            commands.extend(
+                requests
+                    .iter()
+                    .enumerate()
+                    .map(|(i, etcd)| RaftCommand::Etcd {
+                        id: format!("r{i}"),
+                        etcd: etcd.clone(),
+                        origin: 1,
+                    }),
+            );
+            let entries: Vec<_> = commands
+                .iter()
+                .enumerate()
+                .map(|(offset, command)| Entry {
+                    index: offset as u64 + 1,
+                    term: 1,
+                    data: command.encode().unwrap().into(),
+                    ..Default::default()
+                })
+                .collect();
+            let replies = apply_entries(&mut grouped, entries, header).await.unwrap();
+            assert_eq!(replies.len(), commands.len());
+            separate.apply_lease_from(1, &grant, 1).await.unwrap();
+            for (offset, (reply, request)) in replies[1..].iter().zip(&requests).enumerate() {
+                let mut expected = separate
+                    .apply_etcd_quota(offset as u64 + 2, request, 1)
+                    .await
+                    .unwrap();
+                header.outcome(&mut expected);
+                let Reply::Kv(outcome) = &reply.reply else {
+                    panic!("expected a KV reply");
+                };
+                assert_eq!(
+                    serde_json::to_value(outcome).unwrap(),
+                    serde_json::to_value(&expected).unwrap(),
+                    "quota {quota}, request {offset}"
+                );
+            }
+            // Grant, then groups starting at requests 0, 6, 8, and 12.
+            assert_eq!(grouped.write_batches, 5, "quota {quota}");
+            assert_eq!(rows(&grouped).await, rows(&separate).await, "quota {quota}");
+            assert_eq!(
+                (grouped.applied, grouped.revision),
+                (separate.applied, separate.revision)
+            );
+            assert_eq!(grouped.alarms, separate.alarms);
+            assert_eq!(grouped.logical_size(), separate.logical_size());
+            assert_eq!(
+                grouped.logical_size(),
+                crate::state::maintenance::count_logical_size(&grouped.db)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                separate.logical_size(),
+                crate::state::maintenance::count_logical_size(&separate.db)
+                    .await
+                    .unwrap()
+            );
+            grouped.close().await.unwrap();
+            separate.close().await.unwrap();
+        }
+    }
+
+    /// A small deterministic generator, so a failing seed reproduces exactly.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+
+        fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+            &items[self.below(items.len() as u64) as usize]
+        }
+    }
+
+    const KEYS: [&[u8]; 4] = [b"a", b"b", b"c", b"d"];
+
+    fn random_value(rng: &mut Rng) -> Vec<u8> {
+        let len = rng.below(4) as usize * 40;
+        vec![b'a' + rng.below(3) as u8; len]
+    }
+
+    fn random_end(rng: &mut Rng, key: &[u8]) -> Vec<u8> {
+        match rng.below(3) {
+            0 => vec![0],
+            1 => [key, &[0]].concat(),
+            _ => rng.pick(&KEYS).to_vec(),
+        }
+    }
+
+    fn random_op(rng: &mut Rng, depth: u32) -> RequestOp {
+        let key = rng.pick(&KEYS).to_vec();
+        let kinds = if depth < 2 { 10 } else { 7 };
+        let request = match rng.below(kinds) {
+            0..=2 => Op::RequestPut(PutRequest {
+                key,
+                value: random_value(rng),
+                lease: *rng.pick(&[0, 0, 0, 0, 5, 6, 99]),
+                prev_kv: rng.below(2) == 0,
+                ignore_value: rng.below(8) == 0,
+                ignore_lease: rng.below(8) == 0,
+            }),
+            3 => Op::RequestDeleteRange(DeleteRangeRequest {
+                range_end: if rng.below(4) == 0 {
+                    random_end(rng, &key)
+                } else {
+                    vec![]
+                },
+                key,
+                prev_kv: rng.below(2) == 0,
+            }),
+            4..=6 => Op::RequestRange(RangeRequest {
+                range_end: if rng.below(4) == 0 {
+                    random_end(rng, &key)
+                } else {
+                    vec![]
+                },
+                key,
+                revision: if rng.below(6) == 0 {
+                    rng.below(40) as i64
+                } else {
+                    0
+                },
+                count_only: rng.below(8) == 0,
+                keys_only: rng.below(8) == 0,
+                ..Default::default()
+            }),
+            _ => {
+                use compare::TargetUnion as T;
+                let compares = (0..rng.below(3))
+                    .map(|_| {
+                        let target = rng.below(5) as i32;
+                        let number = rng.below(12) as i64;
+                        let key = rng.pick(&KEYS).to_vec();
+                        Compare {
+                            result: rng.below(4) as i32,
+                            target,
+                            range_end: if rng.below(6) == 0 {
+                                random_end(rng, &key)
+                            } else {
+                                vec![]
+                            },
+                            key,
+                            target_union: Some(match target {
+                                0 => T::Version(number % 4),
+                                1 => T::CreateRevision(number),
+                                2 => T::ModRevision(number),
+                                3 => T::Value(random_value(rng)),
+                                _ => T::Lease(*rng.pick(&[0, 5, 6])),
+                            }),
+                        }
+                    })
+                    .collect();
+                let branch = |rng: &mut Rng| {
+                    (0..rng.below(3))
+                        .map(|_| random_op(rng, depth + 1))
+                        .collect::<Vec<_>>()
+                };
+                let success = branch(rng);
+                let failure = branch(rng);
+                Op::RequestTxn(TxnRequest {
+                    compare: compares,
+                    success,
+                    failure,
+                })
+            }
+        };
+        RequestOp {
+            request: Some(request),
+        }
+    }
+
+    fn reply_value(reply: &Reply) -> serde_json::Value {
+        match reply {
+            Reply::Kv(outcome) => serde_json::to_value(outcome).unwrap(),
+            Reply::Lease(outcome) => serde_json::to_value(outcome).unwrap(),
+            Reply::Encoded(value) => value.clone(),
+            _ => panic!("unexpected reply kind"),
+        }
+    }
+
+    /// The pre-grouping apply path: one storage write per entry.
+    async fn apply_alone(
+        state: &mut StateMachine,
+        index: u64,
+        command: Option<&RaftCommand>,
+        header: Header,
+    ) -> Option<serde_json::Value> {
+        let Some(command) = command else {
+            state.apply(index, None).await.unwrap();
+            return None;
+        };
+        let command = match command {
+            RaftCommand::Secured {
+                credentials,
+                command,
+                ..
+            } => {
+                if let Err(error) = state.authorize(credentials, command).await {
+                    state.apply(index, None).await.unwrap();
+                    return Some(
+                        serde_json::to_value(Outcome::<serde_json::Value> { result: Err(error) })
+                            .unwrap(),
+                    );
+                }
+                command.as_ref()
+            }
+            command => command,
+        };
+        Some(match command {
+            RaftCommand::Etcd { etcd, origin, .. } => {
+                let mut outcome = state.apply_etcd_quota(index, etcd, *origin).await.unwrap();
+                header.outcome(&mut outcome);
+                serde_json::to_value(outcome).unwrap()
+            }
+            RaftCommand::Lease { lease, origin, .. } => {
+                serde_json::to_value(state.apply_lease_from(index, lease, *origin).await.unwrap())
+                    .unwrap()
+            }
+            _ => panic!("unexpected command"),
+        })
+    }
+
+    async fn enable_auth(state: &mut StateMachine) {
+        use crate::auth::Command as A;
+        use crate::proto::authpb::Permission;
+        let user = |name: &str| {
+            A::UserAdd(AuthUserAddRequest {
+                name: name.into(),
+                options: Some(crate::proto::authpb::UserAddOptions { no_password: true }),
+                ..Default::default()
+            })
+        };
+        let grant = |key: &[u8], end: &[u8], perm_type| {
+            A::RoleGrantPermission(AuthRoleGrantPermissionRequest {
+                name: "r".into(),
+                perm: Some(Permission {
+                    perm_type,
+                    key: key.to_vec(),
+                    range_end: end.to_vec(),
+                }),
+            })
+        };
+        let role = |user: &str, role: &str| {
+            A::UserGrantRole(AuthUserGrantRoleRequest {
+                user: user.into(),
+                role: role.into(),
+            })
+        };
+        for command in [
+            user("root"),
+            role("root", "root"),
+            user("u"),
+            A::RoleAdd(AuthRoleAddRequest { name: "r".into() }),
+            // Read and write on a and b, read only on c, nothing on d.
+            grant(b"a", b"c", 2),
+            grant(b"c", b"d", 0),
+            role("u", "r"),
+            A::Enable(AuthEnableRequest {}),
+        ] {
+            state
+                .apply_auth(state.applied + 1, &Default::default(), &command)
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+        }
+    }
+
+    fn journals(state: &mut StateMachine, previous: i64) -> Vec<(i64, Vec<u8>)> {
+        let Some(batch) = state.take_watch_batch(previous) else {
+            return vec![];
+        };
+        batch
+            .journals()
+            .expect("complete watch batch")
+            .iter()
+            .map(|(revision, journal)| (*revision, journal.encode_to_vec()))
+            .collect()
+    }
+
+    fn index_rows(state: &StateMachine) -> Vec<Option<crate::state::key_index::KeyMeta>> {
+        KEYS.iter()
+            .map(|key| state.key_index.get(key).copied())
+            .collect()
+    }
+
+    /// Random command streams applied in random apply jobs must match one-by-one apply exactly.
+    #[tokio::test]
+    async fn random_groups_match_one_by_one_apply_byte_for_byte() {
+        let header = Header {
+            cluster: 1,
+            member: 1,
+            term: 1,
+        };
+        let seeds: u64 = std::env::var("GROUP_EQUIVALENCE_SEEDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(24);
+        for seed in 1..=seeds {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let secured = seed % 3 == 0;
+            let quota = *rng.pick(&[0, 0, 2500, 6000]);
+            let mut commands = vec![];
+            for (offset, id) in [5, 6].into_iter().enumerate() {
+                commands.push(Some(RaftCommand::Lease {
+                    id: format!("grant{offset}"),
+                    lease: LeaseCommand::Grant { id, ttl: 60 },
+                    origin: 1,
+                }));
+            }
+            for i in 0..160 {
+                let command = match rng.below(40) {
+                    0 => None,
+                    1 => Some(RaftCommand::Lease {
+                        id: format!("lease{i}"),
+                        lease: match rng.below(2) {
+                            0 => LeaseCommand::Revoke {
+                                id: *rng.pick(&[5, 6]),
+                            },
+                            _ => LeaseCommand::Grant {
+                                id: *rng.pick(&[5, 6]),
+                                ttl: 60,
+                            },
+                        },
+                        origin: 1,
+                    }),
+                    _ => {
+                        let etcd = RaftCommand::Etcd {
+                            id: format!("r{i}"),
+                            etcd: random_op(&mut rng, 0),
+                            origin: 1 + rng.below(3),
+                        };
+                        Some(if secured {
+                            etcd.secure(Some(crate::auth::Credentials {
+                                user: Some(rng.pick(&["u", "u", "u", "root"]).to_string()),
+                                ..Default::default()
+                            }))
+                        } else {
+                            etcd
+                        })
+                    }
+                };
+                commands.push(command);
+            }
+
+            let left = tempfile::tempdir().unwrap();
+            let right = tempfile::tempdir().unwrap();
+            let mut grouped = StateMachine::open(left.path()).await.unwrap();
+            let mut separate = StateMachine::open(right.path()).await.unwrap();
+            for state in [&mut grouped, &mut separate] {
+                if secured {
+                    enable_auth(state).await;
+                }
+                state.quota = quota;
+                state.watch_capture = Some(Default::default());
+            }
+            let base = grouped.applied;
+            let entries: Vec<_> = commands
+                .iter()
+                .enumerate()
+                .map(|(offset, command)| Entry {
+                    index: base + offset as u64 + 1,
+                    term: 1,
+                    data: command
+                        .as_ref()
+                        .map_or_else(Vec::new, |c| c.encode().unwrap())
+                        .into(),
+                    ..Default::default()
+                })
+                .collect();
+
+            let mut grouped_replies = vec![];
+            let mut grouped_events = vec![];
+            let mut entries = entries.into_iter().peekable();
+            while entries.peek().is_some() {
+                let size = 1 + rng.below(40) as usize;
+                let job: Vec<_> = entries.by_ref().take(size).collect();
+                let previous = grouped.revision;
+                let replies = apply_entries(&mut grouped, job, header).await.unwrap();
+                grouped_replies.extend(replies.iter().map(|r| reply_value(&r.reply)));
+                grouped_events.extend(journals(&mut grouped, previous));
+            }
+
+            let mut separate_replies = vec![];
+            let mut separate_events = vec![];
+            for (offset, command) in commands.iter().enumerate() {
+                let previous = separate.revision;
+                let index = base + offset as u64 + 1;
+                if let Some(reply) =
+                    apply_alone(&mut separate, index, command.as_ref(), header).await
+                {
+                    separate_replies.push(reply);
+                }
+                separate_events.extend(journals(&mut separate, previous));
+            }
+
+            let context = format!("seed {seed}, quota {quota}, auth {secured}");
+            assert_eq!(grouped_replies.len(), separate_replies.len(), "{context}");
+            for (offset, (left, right)) in grouped_replies.iter().zip(&separate_replies).enumerate()
+            {
+                assert_eq!(left, right, "{context}, reply {offset}");
+            }
+            assert_eq!(grouped_events, separate_events, "{context}");
+            assert_eq!(rows(&grouped).await, rows(&separate).await, "{context}");
+            assert_eq!(
+                (grouped.applied, grouped.revision, grouped.logical_size()),
+                (separate.applied, separate.revision, separate.logical_size()),
+                "{context}"
+            );
+            assert_eq!(grouped.alarms, separate.alarms, "{context}");
+            assert_eq!(index_rows(&grouped), index_rows(&separate), "{context}");
+            assert_eq!(
+                grouped.logical_size(),
+                crate::state::maintenance::count_logical_size(&grouped.db)
+                    .await
+                    .unwrap(),
+                "{context}"
+            );
+            assert!(grouped.write_batches < separate.write_batches, "{context}");
+            let expected = (index_rows(&separate), rows(&separate).await);
+            grouped.db.flush().await.unwrap();
+            grouped.close().await.unwrap();
+            separate.close().await.unwrap();
+            // The applied marker and the rows reopen together.
+            let reopened = StateMachine::open(left.path()).await.unwrap();
+            assert_eq!(reopened.applied, separate.applied, "{context}");
+            assert_eq!(reopened.revision, separate.revision, "{context}");
+            assert_eq!(
+                (index_rows(&reopened), rows(&reopened).await),
+                expected,
+                "{context}"
+            );
+            reopened.close().await.unwrap();
+        }
     }
 }

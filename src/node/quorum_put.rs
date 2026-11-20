@@ -2,7 +2,7 @@
 
 use super::apply::AppliedCommand;
 use super::*;
-use crate::state::put_batch::{PreparedPuts, Put};
+use crate::state::put_batch::{KvEntry, PreparedPuts};
 
 impl Node {
     pub(super) fn prepare_quorum_puts(&mut self) -> Result<bool> {
@@ -60,6 +60,13 @@ impl Node {
 pub(super) fn put_command(
     command: &RaftCommand,
 ) -> Option<(&RequestOp, Option<&crate::auth::Credentials>, u64)> {
+    kv_command(command).filter(|(etcd, ..)| crate::mvcc::batchable_put(etcd))
+}
+
+/// Return an etcd KV request that can join an apply group.
+pub(super) fn kv_command(
+    command: &RaftCommand,
+) -> Option<(&RequestOp, Option<&crate::auth::Credentials>, u64)> {
     let (command, credentials) = match command {
         RaftCommand::Secured {
             command,
@@ -69,13 +76,12 @@ pub(super) fn put_command(
         command => (command, None),
     };
     match command {
-        RaftCommand::Etcd { etcd, origin, .. } if crate::mvcc::batchable_put(etcd) => {
-            Some((etcd, credentials, *origin))
-        }
+        RaftCommand::Etcd { etcd, origin, .. } => Some((etcd, credentials, *origin)),
         _ => None,
     }
 }
 
+/// Prepare one apply group. Callers place any member that needs a scan first.
 pub(super) async fn prepare(
     state: &StateMachine,
     commands: &[(u64, RaftCommand)],
@@ -85,8 +91,8 @@ pub(super) async fn prepare(
         .iter()
         .map(|(index, command)| {
             let (request, credentials, origin) =
-                put_command(command).context("expected an ordinary put")?;
-            Ok(Put {
+                kv_command(command).context("expected an etcd KV request")?;
+            Ok(KvEntry {
                 index: *index,
                 request,
                 credentials,

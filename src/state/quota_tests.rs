@@ -393,7 +393,7 @@ async fn scans_keep_new_sst_metadata_after_blocks_fill_the_cache() {
                 .iter()
                 .map(|request| {
                     index += 1;
-                    put_batch::Put {
+                    put_batch::KvEntry {
                         index,
                         request,
                         credentials: None,

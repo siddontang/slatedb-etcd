@@ -377,9 +377,13 @@ On 64-bit hosts, each hash table slot uses 57 bytes. The table keeps 44 to 88 pe
 slots full. A key therefore costs 65 to 130 bytes plus its own heap allocation.
 One million 16-byte keys use about 150 MB. Table growth briefly holds the old and new slots.
 
-The apply worker groups ordinary unleased puts within its 32-entry, 512 KiB job target.
+The apply worker groups consecutive etcd KV entries within its 32-entry, 512 KiB job target.
 One large entry can exceed the byte target. The pending log limit still bounds that entry.
-Each request reads earlier puts from a temporary overlay and retains its own etcd revision.
+Each request reads earlier writes from a temporary overlay and retains its own etcd revision.
+The overlay merges point reads and key index lookups only.
+It checks group writes first, then the key index or the small current-row cache, then SlateDB.
+A request that scans current or historical rows therefore starts a new group.
+Under Auth, a leased put also starts a group, because its permission check scans current keys.
 Quota accounting includes each successful request before it checks the next request.
 The storage write includes all mutations and the last covered apply marker at one SlateDB sequence.
 The owner publishes the read view after the storage write. Most replies also wait for that write.
@@ -397,12 +401,10 @@ The owner can return these results while it holds the prepared changes in memory
 It waits for local log persistence and committed Ready delivery before writing them to SlateDB.
 While the prepared result is ahead of local state, new KV reads wait for local publication.
 A crash discards this temporary group. The durable quorum supplies the same entries on recovery.
-Transactions and administrative operations always use the ordinary apply boundary.
+Early preparation accepts only ordinary puts. Transactions wait for the ordinary apply boundary.
 
-Transactions, Lease changes, Auth changes, membership, compaction steps, and empty entries end a
-group.
-Puts with a lease or ignore flags also use the individual path.
-Broad transaction batching needs an overlay that also merges scans and historical reads.
+Lease changes, Auth changes, membership, compaction steps, and empty entries end a group.
+Grouping more scan requests needs an overlay that also merges scans and historical reads.
 
 ## Snapshot order and recovery
 

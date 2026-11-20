@@ -43,39 +43,7 @@ impl StateMachine {
     ) -> std::result::Result<(), mvcc::KvError> {
         use crate::lease::LeaseCommand as L;
         match command {
-            crate::RaftCommand::Etcd { etcd, .. } => {
-                self.auth.kv(auth, etcd)?;
-                let mut requests = vec![etcd];
-                let mut leases = std::collections::BTreeSet::new();
-                while let Some(request) = requests.pop() {
-                    use crate::proto::etcdserverpb::request_op::Request as Op;
-                    match &request.request {
-                        Some(Op::RequestPut(put)) if put.lease != 0 => {
-                            leases.insert(put.lease);
-                        }
-                        Some(Op::RequestTxn(txn)) => {
-                            requests.extend(txn.success.iter().chain(&txn.failure));
-                        }
-                        _ => (),
-                    }
-                }
-                if self.auth.enabled && !leases.is_empty() {
-                    use prost::Message;
-                    let mut scan = self
-                        .db
-                        .scan_prefix(b"etcd/current/", ..)
-                        .await
-                        .map_err(mvcc::KvError::storage)?;
-                    while let Some(row) = scan.next().await.map_err(mvcc::KvError::storage)? {
-                        let kv = crate::proto::mvccpb::KeyValue::decode(row.value)
-                            .map_err(mvcc::KvError::storage)?;
-                        if leases.contains(&kv.lease) {
-                            self.auth.range(auth, &kv.key, &[], true)?;
-                        }
-                    }
-                }
-                Ok(())
-            }
+            crate::RaftCommand::Etcd { etcd, .. } => self.authorize_kv(auth, etcd).await,
             crate::RaftCommand::Lease { lease, .. } => {
                 self.auth.authenticated(auth)?;
                 let (id, write) = match lease {
@@ -105,5 +73,44 @@ impl StateMachine {
             crate::RaftCommand::Compact { .. } => self.auth.admin(auth),
             _ => Err(crate::auth::denied()),
         }
+    }
+
+    /// Check a KV request. Leased puts also need write access to keys on that lease.
+    pub(crate) async fn authorize_kv(
+        &self,
+        auth: &crate::auth::Credentials,
+        etcd: &RequestOp,
+    ) -> std::result::Result<(), mvcc::KvError> {
+        self.auth.kv(auth, etcd)?;
+        let mut requests = vec![etcd];
+        let mut leases = std::collections::BTreeSet::new();
+        while let Some(request) = requests.pop() {
+            use crate::proto::etcdserverpb::request_op::Request as Op;
+            match &request.request {
+                Some(Op::RequestPut(put)) if put.lease != 0 => {
+                    leases.insert(put.lease);
+                }
+                Some(Op::RequestTxn(txn)) => {
+                    requests.extend(txn.success.iter().chain(&txn.failure));
+                }
+                _ => (),
+            }
+        }
+        if self.auth.enabled && !leases.is_empty() {
+            use prost::Message;
+            let mut scan = self
+                .db
+                .scan_prefix(b"etcd/current/", ..)
+                .await
+                .map_err(mvcc::KvError::storage)?;
+            while let Some(row) = scan.next().await.map_err(mvcc::KvError::storage)? {
+                let kv = crate::proto::mvccpb::KeyValue::decode(row.value)
+                    .map_err(mvcc::KvError::storage)?;
+                if leases.contains(&kv.lease) {
+                    self.auth.range(auth, &kv.key, &[], true)?;
+                }
+            }
+        }
+        Ok(())
     }
 }

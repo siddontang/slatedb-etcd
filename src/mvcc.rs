@@ -244,6 +244,12 @@ fn scan_options() -> slatedb::config::ScanOptions {
 enum ReadDb<'a> {
     Live(&'a Db),
     Pinned(&'a slatedb::DbSnapshot),
+    /// Applied state plus earlier writes of the same apply group.
+    Overlay {
+        db: &'a Db,
+        previous: &'a WriteBatch,
+        rows: &'a crate::state::current::CurrentRows,
+    },
 }
 
 impl ReadDb<'_> {
@@ -251,6 +257,35 @@ impl ReadDb<'_> {
         match self {
             Self::Live(db) => db.get(key).await,
             Self::Pinned(db) => db.get(key).await,
+            Self::Overlay { db, previous, rows } => {
+                if let Some(value) = previous.get(&key) {
+                    return Ok(value);
+                }
+                if let Some(value) = rows.get(&key) {
+                    return Ok(Some(value));
+                }
+                db.get(key).await
+            }
+        }
+    }
+
+    /// Return the group write of a current row, if an earlier group member changed it.
+    fn group_row(&self, key: &[u8]) -> Option<Option<bytes::Bytes>> {
+        match self {
+            Self::Overlay { previous, .. } => previous.get(&current_key(key)),
+            _ => None,
+        }
+    }
+
+    // The overlay merges only point reads. Grouping places scans before earlier group writes.
+    fn scan_base(&self) -> Result<&Db, slatedb::Error> {
+        match self {
+            Self::Overlay { db, previous, .. } if previous.is_empty() => Ok(db),
+            Self::Overlay { .. } => Err(slatedb::Error::unavailable(
+                "scan over an apply group overlay".to_string(),
+            )),
+            Self::Live(db) => Ok(db),
+            Self::Pinned(_) => unreachable!("pinned scans use the snapshot"),
         }
     }
 
@@ -260,19 +295,20 @@ impl ReadDb<'_> {
     ) -> Result<slatedb::DbIterator, slatedb::Error> {
         let options = scan_options();
         match self {
-            Self::Live(db) => db.scan_with_options(range, &options).await,
             Self::Pinned(db) => db.scan_with_options(range, &options).await,
+            _ => self.scan_base()?.scan_with_options(range, &options).await,
         }
     }
 
     async fn scan_prefix(&self, prefix: Vec<u8>) -> Result<slatedb::DbIterator, slatedb::Error> {
         match self {
-            Self::Live(db) => {
+            Self::Pinned(db) => {
                 db.scan_prefix_with_options(prefix, .., &scan_options())
                     .await
             }
-            Self::Pinned(db) => {
-                db.scan_prefix_with_options(prefix, .., &scan_options())
+            _ => {
+                self.scan_base()?
+                    .scan_prefix_with_options(prefix, .., &scan_options())
                     .await
             }
         }
@@ -298,8 +334,18 @@ struct View<'a> {
 impl View<'_> {
     /// Find the base metadata of a key. `None` means that the index is unavailable.
     fn indexed(&self, key: &[u8]) -> Option<Option<KeyValue>> {
-        self.index
-            .map(|index| index.get(key).map(|meta| meta.stub()))
+        let index = self.index?;
+        // Earlier writes of the same apply group are newer than the applied index.
+        // A row that does not decode makes the caller read it and report the error.
+        if let Some(row) = self.db.group_row(key) {
+            return match row {
+                None => Some(None),
+                Some(row) => crate::state::key_index::KeyMeta::decode(&row)
+                    .ok()
+                    .map(|meta| Some(meta.stub())),
+            };
+        }
+        Some(index.get(key).map(|meta| meta.stub()))
     }
 
     async fn point(&self, key: &[u8], overlay: bool) -> KvResult<Option<KeyValue>> {
@@ -835,10 +881,55 @@ pub(crate) async fn prepare_with_counts(
     request: &RequestOp,
     leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
 ) -> KvResult<(ResponseOp, WriteBatch, i64, crate::metrics::Writes)> {
+    prepare_view(
+        ReadDb::Live(db),
+        index,
+        revision,
+        compact_revision,
+        request,
+        leases,
+    )
+    .await
+}
+
+/// Evaluate a request after earlier writes of the same apply group.
+/// Point reads and index lookups see `previous` first. A scan must come before any group write.
+pub(crate) async fn prepare_grouped(
+    current: &CurrentView<'_>,
+    previous: &WriteBatch,
+    revision: i64,
+    compact_revision: i64,
+    request: &RequestOp,
+    leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
+) -> KvResult<(ResponseOp, WriteBatch, i64, crate::metrics::Writes)> {
+    let db = ReadDb::Overlay {
+        db: current.db,
+        previous,
+        rows: current.rows,
+    };
+    prepare_view(
+        db,
+        Some(current.index),
+        revision,
+        compact_revision,
+        request,
+        leases,
+    )
+    .await
+}
+
+async fn prepare_view(
+    db: ReadDb<'_>,
+    index: Option<&crate::state::key_index::KeyIndex>,
+    revision: i64,
+    compact_revision: i64,
+    request: &RequestOp,
+    leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
+) -> KvResult<(ResponseOp, WriteBatch, i64, crate::metrics::Writes)> {
     validate(request)?;
     let mut view = View {
         writes: Default::default(),
-        db: ReadDb::Live(db),
+        db,
         revision,
         compact_revision,
         changes: BTreeMap::new(),
@@ -868,6 +959,24 @@ pub(crate) async fn prepare_with_counts(
         batch.put(REVISION, next.to_be_bytes());
     }
     Ok((response, batch, next, view.writes))
+}
+
+/// Report whether a request needs more than point reads of current rows.
+/// Range scans, historical reads, and leased puts under Auth read state outside the overlay.
+pub(crate) fn needs_scan(request: &RequestOp, secured: bool) -> bool {
+    match &request.request {
+        Some(Op::RequestRange(r)) => !r.range_end.is_empty() || r.revision > 0,
+        Some(Op::RequestPut(p)) => secured && p.lease != 0,
+        Some(Op::RequestDeleteRange(d)) => !d.range_end.is_empty(),
+        Some(Op::RequestTxn(t)) => {
+            t.compare.iter().any(|c| !c.range_end.is_empty())
+                || t.success
+                    .iter()
+                    .chain(&t.failure)
+                    .any(|op| needs_scan(op, secured))
+        }
+        None => false,
+    }
 }
 
 pub(crate) fn batchable_put(request: &RequestOp) -> bool {

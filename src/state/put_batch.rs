@@ -1,6 +1,7 @@
 use super::*;
 
-pub(crate) struct Put<'a> {
+/// One KV entry in an apply group.
+pub(crate) struct KvEntry<'a> {
     pub index: u64,
     pub request: &'a RequestOp,
     pub credentials: Option<&'a crate::auth::Credentials>,
@@ -18,9 +19,9 @@ pub(crate) struct PreparedPuts {
 }
 
 impl StateMachine {
-    /// Commit ordinary puts together. Each request keeps its own result and revision.
+    /// Commit KV entries together. Each request keeps its own result and revision.
     #[cfg(test)]
-    pub(crate) async fn apply_puts(&mut self, puts: &[Put<'_>]) -> Result<Vec<Outcome>> {
+    pub(crate) async fn apply_puts(&mut self, puts: &[KvEntry<'_>]) -> Result<Vec<Outcome>> {
         let (batch, replies) = self.prepare_puts(puts).await?;
         self.publish_puts(batch).await?;
         Ok(replies)
@@ -28,7 +29,7 @@ impl StateMachine {
 
     pub(crate) async fn prepare_puts(
         &self,
-        puts: &[Put<'_>],
+        puts: &[KvEntry<'_>],
     ) -> Result<(PreparedPuts, Vec<Outcome>)> {
         ensure!(!puts.is_empty(), "empty put batch");
         let mut batch = WriteBatch::new();
@@ -42,17 +43,24 @@ impl StateMachine {
                 put.index == self.applied + offset as u64 + 1,
                 "put batch has an index gap"
             );
-            ensure!(mvcc::batchable_put(put.request), "invalid put batch member");
+            let secured = put.credentials.is_some();
+            ensure!(
+                offset == 0 || !mvcc::needs_scan(put.request, secured),
+                "a scan follows earlier group writes"
+            );
             crate::failpoint::hit("apply-before-entry");
-            let permission = put
-                .credentials
-                .map_or(Ok(()), |auth| self.auth.kv(auth, put.request));
+            let permission = match put.credentials {
+                Some(auth) if mvcc::batchable_put(put.request) => self.auth.kv(auth, put.request),
+                Some(auth) => self.authorize_kv(auth, put.request).await,
+                None => Ok(()),
+            };
             let result = if let Err(error) = permission {
                 Err(error)
             } else {
                 let corrupt = alarms.iter().any(|a| a.alarm == 2);
-                let full =
-                    alarms.iter().any(|a| a.alarm == 1) || (self.quota > 0 && size >= self.quota);
+                let full = crate::maintenance::has_put(put.request)
+                    && (alarms.iter().any(|a| a.alarm == 1)
+                        || (self.quota > 0 && size >= self.quota));
                 if corrupt || full {
                     if full && !alarms.iter().any(|a| a.alarm == 1) {
                         alarms.push(crate::proto::etcdserverpb::AlarmMember {
@@ -80,16 +88,47 @@ impl StateMachine {
                         rows: &self.current,
                         index: &self.key_index,
                     };
-                    match mvcc::prepare_put(&view, revision, put.request, &mut batch, &mut size)
+                    let prepared = if mvcc::batchable_put(put.request) {
+                        mvcc::prepare_put(&view, revision, put.request, &mut batch, &mut size)
+                            .await
+                            .map(|(reply, next)| {
+                                if let Some(
+                                    crate::proto::etcdserverpb::request_op::Request::RequestPut(p),
+                                ) = &put.request.request
+                                {
+                                    counts.put(&p.key, &p.value);
+                                }
+                                (reply, next)
+                            })
+                    } else {
+                        match mvcc::prepare_grouped(
+                            &view,
+                            &batch,
+                            revision,
+                            self.compact_revision,
+                            put.request,
+                            &self.leases,
+                        )
                         .await
-                    {
-                        Ok((reply, next)) => {
-                            if let Some(
-                                crate::proto::etcdserverpb::request_op::Request::RequestPut(p),
-                            ) = &put.request.request
-                            {
-                                counts.put(&p.key, &p.value);
+                        {
+                            Ok((reply, writes, next, count)) => {
+                                size = writes
+                                    .logical_size_after(
+                                        &self.db,
+                                        &self.key_index,
+                                        Some(&batch),
+                                        size,
+                                    )
+                                    .await?;
+                                counts.merge(count);
+                                batch.extend(writes);
+                                Ok((reply, next))
                             }
+                            Err(error) => Err(error),
+                        }
+                    };
+                    match prepared {
+                        Ok((reply, next)) => {
                             revision = next;
                             Ok(reply)
                         }
@@ -208,7 +247,7 @@ mod tests {
             let puts: Vec<_> = requests
                 .iter()
                 .enumerate()
-                .map(|(i, request)| Put {
+                .map(|(i, request)| KvEntry {
                     index: i as u64 + 1,
                     request,
                     origin: 9,
@@ -253,7 +292,7 @@ mod tests {
         state.close().await.unwrap();
         let request = request(b"a", b"value");
         assert!(state
-            .apply_puts(&[Put {
+            .apply_puts(&[KvEntry {
                 index: 1,
                 request: &request,
                 origin: 1,

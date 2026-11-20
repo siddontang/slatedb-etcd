@@ -111,7 +111,7 @@ async fn index_follows_puts_transactions_deletes_revocations_snapshots_and_resta
     let puts: Vec<_> = requests
         .iter()
         .enumerate()
-        .map(|(offset, request)| put_batch::Put {
+        .map(|(offset, request)| put_batch::KvEntry {
             index: offset as u64 + 1,
             request,
             credentials: None,
@@ -309,7 +309,7 @@ async fn watch_previous_values_match_the_replaced_rows() {
     let puts: Vec<_> = group
         .iter()
         .enumerate()
-        .map(|(offset, request)| put_batch::Put {
+        .map(|(offset, request)| put_batch::KvEntry {
             index: state.applied + offset as u64 + 1,
             request,
             credentials: None,
