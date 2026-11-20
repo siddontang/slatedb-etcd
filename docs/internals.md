@@ -264,15 +264,29 @@ Existing KV history remains readable. Upgrade all nodes together; mixed-version 
 untested.
 Do not downgrade after lease commands enter the Raft log.
 
-Lease grants, renewals, revocations, TTL queries, and listing enter Raft.
-A minority cannot acknowledge a renewal. The leader measures expiry with a monotonic clock.
-Expiry includes the lease generation, so an old expiry command cannot remove a renewed lease.
+Lease grants, revocations, expiry, TTL queries, and listing enter Raft.
+The leader serves KeepAlive without a Raft entry or a disk write, as etcd does.
+A follower returns `not leader`, and its gRPC layer forwards the request to the leader.
+Each renewal waits for a ReadIndex proof from a quorum in the current term.
+Renewals that arrive during one proof round share the next proof.
+The leader then waits until it applies the proof index and extends its in-memory deadline.
+A minority leader cannot get a proof, so it cannot acknowledge a renewal.
+The leader measures expiry with a monotonic clock.
+
+The leader proposes expiry only after the deadline passes. A renewal after the deadline fails.
+It returns TTL 0, and the deadline does not move again in that term.
+So an expiry proposal in one term cannot race a renewal in the same term.
+An expiry proposal from an older term commits before the first entry of the current term.
+A renewal waits for apply through its proof index, so it sees the result of that expiry.
+Expiry also includes the lease grant generation. An old expiry cannot remove a new grant.
+With Auth enabled, KeepAlive keeps its Raft path, because apply checks attached key permissions.
+That entry sets a new generation, so an older expiry has no effect on the renewed lease.
 Lease metadata, attached key deletion, Watch events, and the apply marker commit together.
 Followers do not expire leases from their local clocks. SlateDB TTL does not control leases.
 
 The minimum TTL is two seconds. A new leader gives each surviving lease its full granted TTL.
-The service does not checkpoint remaining TTL. Repeated leader changes can extend a lease's
-lifetime.
+Local renewals are lost on leader change. The service does not checkpoint remaining TTL.
+Repeated leader changes can extend a lease's lifetime.
 Loss of quorum delays deletion until a majority can commit it. Clients must not treat TTL as a
 maximum lifetime or use lease expiry alone to fence external writes.
 Lease key lookup and revocation scan current keys. Large leases can delay the apply worker.

@@ -7,6 +7,8 @@ impl Node {
         self.drive_compaction()?;
         self.expire_reads();
         self.issue_reads();
+        self.expire_renewals();
+        self.issue_renewals();
         if self.log_queue.len() < log::MAX_JOBS
             && self.log_bytes < log::MAX_BYTES
             && self.log_snapshot_bytes < log::MAX_SNAPSHOT_BYTES
@@ -84,6 +86,7 @@ impl Node {
         }
         self.start_log()?;
         self.schedule_reads();
+        self.finish_renewals()?;
         self.schedule_apply()?;
         Ok(())
     }

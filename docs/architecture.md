@@ -185,7 +185,8 @@ Client replies must remain tied to proposal IDs. A role change can invalidate a 
 Serializable KV reads use a pinned applied view. They may lag the committed log prefix.
 ReadIndex now serves linearizable Range requests and transactions that contain only reads.
 Both transaction branches must contain only reads, including nested transactions.
-Mutating transactions, Lease operations, and the diagnostic JSON API retain their log path.
+Mutating transactions, Lease changes, and the diagnostic JSON API retain their log path.
+The leader serves Lease KeepAlive after a ReadIndex proof and changes only its in-memory deadline.
 KV reads execute outside the apply queue. Diagnostic queries receive service between apply batches.
 
 A slow worker must delay client completion without delaying Raft heartbeats.
@@ -444,12 +445,13 @@ Progress must not pass undelivered events. Compacted history produces a cancella
 Old databases have no complete journal before their first write with Watch support.
 
 The leader proposes lease expiry. Followers never delete keys from local lease clocks.
-Expiry includes a generation, so an obsolete expiry cannot delete a renewed lease.
+The leader proposes expiry only after the deadline passes. Later renewals in that term fail.
+Expiry includes the grant generation, so an obsolete expiry cannot delete a new grant.
 Revocation deletes all attached keys and records their Watch events at one revision.
 
 Leader promotion currently resets each surviving lease to its full granted TTL.
 Remaining TTL is not checkpointed. Loss of quorum delays committed expiry.
-Apply isolation must retain these semantics and must not acknowledge a renewal before apply.
+A renewal waits until the leader applies its ReadIndex proof index.
 
 ## Authentication and administration
 

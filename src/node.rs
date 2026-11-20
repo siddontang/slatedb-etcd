@@ -216,6 +216,8 @@ pub struct Node {
     lease_expiring: BTreeSet<(i64, u64)>,
     compact_step: Option<(u64, u64)>,
     compact_ready_at: Option<Instant>,
+    lease_view: Option<std::sync::Arc<BTreeMap<i64, crate::lease::LeaseRecord>>>,
+    renewals: lease::Renewals,
 }
 
 impl Node {
@@ -434,6 +436,8 @@ impl Node {
             lease_expiring: BTreeSet::new(),
             compact_step: None,
             compact_ready_at: None,
+            lease_view: None,
+            renewals: lease::Renewals::default(),
         };
         node.sync_members();
         Ok(node)
@@ -694,6 +698,9 @@ impl Node {
                     .secure(credentials),
                     response,
                 )?;
+            }
+            Event::Lease(LeaseCommand::KeepAlive { id }, response) => {
+                self.keep_alive(id, credentials, response)?;
             }
             Event::Lease(mut lease, response) => {
                 self.expire_leases()?;
