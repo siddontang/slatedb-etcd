@@ -6,6 +6,8 @@ use anyhow::{Context, Result};
 use prost::bytes::Bytes;
 use slatedb::Db;
 
+use crate::state::key_index::KeyIndex;
+
 /// An atomic state batch. The last mutation for a key replaces earlier mutations.
 #[derive(Clone, Debug, Default)]
 pub struct WriteBatch {
@@ -51,6 +53,16 @@ impl WriteBatch {
         self.insert(key, None, Original::Known(Some(old_len)));
     }
 
+    /// Keep a known old row length for quota accounting.
+    pub(crate) fn put_known(
+        &mut self,
+        key: impl Into<Bytes>,
+        value: impl Into<Bytes>,
+        old_len: Option<usize>,
+    ) {
+        self.insert(key.into(), Some(value.into()), Original::Known(old_len));
+    }
+
     /// Update the quota total before the next put in this batch.
     pub(crate) fn put_counted(
         &mut self,
@@ -92,13 +104,15 @@ impl WriteBatch {
         }
     }
 
-    pub(crate) async fn logical_size(&self, db: &Db, size: u64) -> Result<u64> {
-        self.logical_size_after(db, None, size).await
+    pub(crate) async fn logical_size(&self, db: &Db, index: &KeyIndex, size: u64) -> Result<u64> {
+        self.logical_size_after(db, index, None, size).await
     }
 
+    /// Update the logical size. The key index supplies old current-row lengths without a read.
     pub(crate) async fn logical_size_after(
         &self,
         db: &Db,
+        index: &KeyIndex,
         previous: Option<&Self>,
         mut size: u64,
     ) -> Result<u64> {
@@ -110,6 +124,9 @@ impl WriteBatch {
                 Original::Known(length) => length,
                 Original::Read => match previous.and_then(|batch| batch.get(key)) {
                     Some(value) => value.map(|v| v.len()),
+                    None if key.starts_with(crate::mvcc::CURRENT) => {
+                        index.get_row(key).map(|meta| meta.row_len)
+                    }
                     None => db.get(key).await?.map(|v| v.len()),
                 },
             };

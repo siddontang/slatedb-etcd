@@ -15,7 +15,7 @@ use crate::proto::mvccpb::KeyValue;
 use crate::proto::state::Version;
 
 mod put;
-pub(crate) use put::prepare_put;
+pub(crate) use put::{prepare_put, CurrentView};
 
 pub(crate) const CURRENT: &[u8] = b"etcd/current/";
 const HISTORY: &[u8] = b"etcd/history/";
@@ -81,6 +81,13 @@ fn history_prefix(key: &[u8]) -> Vec<u8> {
         out.push(HEX[(byte & 15) as usize]);
     }
     out.push(b'/');
+    out
+}
+
+/// Name the history version of a key at one revision.
+pub(crate) fn history_key(key: &[u8], revision: i64) -> Vec<u8> {
+    let mut out = history_prefix(key);
+    out.extend_from_slice(&revision.to_be_bytes());
     out
 }
 
@@ -262,10 +269,20 @@ struct View<'a> {
     compact_revision: i64,
     changes: BTreeMap<Vec<u8>, Option<KeyValue>>,
     events: Vec<crate::proto::mvccpb::Event>,
+    /// History revisions of previous values that the Watch journal omits. See `watch::record`.
+    prev_revisions: Vec<i64>,
     leases: &'a BTreeMap<i64, crate::lease::LeaseRecord>,
+    /// Metadata of the live applied rows. Pinned read views have no index.
+    index: Option<&'a crate::state::key_index::KeyIndex>,
 }
 
 impl View<'_> {
+    /// Find the base metadata of a key. `None` means that the index is unavailable.
+    fn indexed(&self, key: &[u8]) -> Option<Option<KeyValue>> {
+        self.index
+            .map(|index| index.get(key).map(|meta| meta.stub()))
+    }
+
     async fn point(&self, key: &[u8], overlay: bool) -> KvResult<Option<KeyValue>> {
         if overlay {
             if let Some(value) = self.changes.get(key) {
@@ -366,7 +383,13 @@ impl View<'_> {
     }
 
     async fn compare(&self, cmp: &Compare) -> KvResult<bool> {
-        let rows = self.latest(&cmp.key, &cmp.range_end, false).await?;
+        let rows = match self.indexed(&cmp.key) {
+            // A metadata row has no value bytes. Value comparisons read the stored row.
+            Some(meta) if cmp.range_end.is_empty() && cmp.target != 3 => {
+                meta.map(|kv| (cmp.key.clone(), kv)).into_iter().collect()
+            }
+            _ => self.latest(&cmp.key, &cmp.range_end, false).await?,
+        };
         if rows.is_empty() && cmp.target == 3 {
             return Ok(false);
         }
@@ -452,9 +475,11 @@ impl View<'_> {
                     if p.lease != 0 && !self.leases.contains_key(&p.lease) {
                         return Err(KvError::new(Code::NotFound, "requested lease not found"));
                     }
-                    if (p.ignore_value || p.ignore_lease)
-                        && self.point(&p.key, false).await?.is_none()
-                    {
+                    let exists = match self.indexed(&p.key) {
+                        Some(meta) => meta.is_some(),
+                        None => self.point(&p.key, false).await?.is_some(),
+                    };
+                    if (p.ignore_value || p.ignore_lease) && !exists {
                         return Err(KvError::invalid("key not found"));
                     }
                     Ok(Plan::Op(op.clone()))
@@ -589,19 +614,32 @@ impl View<'_> {
                     response(Resp::ResponseRange(self.range(&r).await?))
                 }
                 Plan::Op(Op::RequestPut(p)) => {
-                    let old = self.point(&p.key, true).await?;
+                    let old = match self.changes.get(&p.key) {
+                        Some(value) => value.clone().map(put::Old::Full),
+                        None => match self.indexed(&p.key) {
+                            Some(meta) if !put::needs_old_value(&p) => meta.map(put::Old::Meta),
+                            Some(None) => None,
+                            _ => self.point(&p.key, false).await?.map(put::Old::Full),
+                        },
+                    };
                     let revision = self.revision + 1;
-                    let kv = put::value(&p, old.as_ref(), revision);
+                    let kv = put::value(&p, old.as_ref().map(put::Old::kv), revision);
                     self.writes.put(&kv.key, &kv.value);
+                    let (journal_prev, prev_revision) = put::prev_event(old.as_ref(), revision)?;
                     self.events.push(crate::proto::mvccpb::Event {
                         r#type: 0,
                         kv: Some(kv.clone()),
-                        prev_kv: old.clone(),
+                        prev_kv: journal_prev,
                     });
+                    self.prev_revisions.push(prev_revision);
                     self.changes.insert(p.key, Some(kv));
                     response(Resp::ResponsePut(PutResponse {
                         header: header(revision),
-                        prev_kv: if p.prev_kv { old } else { None },
+                        prev_kv: if p.prev_kv {
+                            old.and_then(put::Old::into_full)
+                        } else {
+                            None
+                        },
                     }))
                 }
                 Plan::Op(Op::RequestDeleteRange(d)) => {
@@ -618,6 +656,7 @@ impl View<'_> {
                             }),
                             prev_kv: Some(old.clone()),
                         });
+                        self.prev_revisions.push(0);
                         self.changes.insert(key.clone(), None);
                     }
                     response(Resp::ResponseDeleteRange(DeleteRangeResponse {
@@ -689,7 +728,9 @@ async fn read_from(
         compact_revision,
         changes: BTreeMap::new(),
         events: vec![],
+        prev_revisions: vec![],
         leases,
+        index: None,
     };
     if let Some(Op::RequestRange(range)) = &request.request {
         view.check_revision(range, false)?;
@@ -708,12 +749,14 @@ pub async fn prepare(
     leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
 ) -> KvResult<(ResponseOp, WriteBatch, i64)> {
     let (response, batch, next, _) =
-        prepare_with_counts(db, revision, compact_revision, request, leases).await?;
+        prepare_with_counts(db, None, revision, compact_revision, request, leases).await?;
     Ok((response, batch, next))
 }
 
+/// Evaluate a write on the live applied state. `index` must describe the same applied rows.
 pub(crate) async fn prepare_with_counts(
     db: &Db,
+    index: Option<&crate::state::key_index::KeyIndex>,
     revision: i64,
     compact_revision: i64,
     request: &RequestOp,
@@ -727,13 +770,15 @@ pub(crate) async fn prepare_with_counts(
         compact_revision,
         changes: BTreeMap::new(),
         events: vec![],
+        prev_revisions: vec![],
         leases,
+        index,
     };
     let plan = view.plan(request, false).await?;
     let response = view.execute(plan, false).await?;
     let next = view.current_revision();
     let mut batch = WriteBatch::new();
-    crate::watch::record(next, view.events, &mut batch);
+    crate::watch::record(next, view.events, view.prev_revisions, &mut batch);
     for (key, value) in view.changes {
         if let Some(value) = &value {
             batch.put(current_key(&key), value.encode_to_vec());
@@ -742,7 +787,12 @@ pub(crate) async fn prepare_with_counts(
         }
         put::record_version(&mut batch, key, value, next);
     }
-    batch.put(REVISION, next.to_be_bytes());
+    if revision > 1 {
+        // A revision above one implies a stored revision row.
+        batch.put_known(REVISION, next.to_be_bytes().to_vec(), Some(8));
+    } else {
+        batch.put(REVISION, next.to_be_bytes());
+    }
     Ok((response, batch, next, view.writes))
 }
 
@@ -856,7 +906,9 @@ pub(crate) async fn revoke_keys(
         compact_revision,
         changes: BTreeMap::new(),
         events: vec![],
+        prev_revisions: vec![],
         leases,
+        index: None,
     };
     for key in lease_keys(db, id).await? {
         view.execute(
@@ -884,7 +936,7 @@ pub(crate) async fn revoke_keys(
             .encode_to_vec(),
         );
     }
-    crate::watch::record(next, view.events, &mut batch);
+    crate::watch::record(next, view.events, view.prev_revisions, &mut batch);
     batch.put(REVISION, next.to_be_bytes());
     Ok((batch, next, view.writes.deletes))
 }

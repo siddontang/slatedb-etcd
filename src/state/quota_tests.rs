@@ -9,6 +9,7 @@ async fn check(state: &StateMachine) {
         state.logical_size(),
         maintenance::count_logical_size(&state.db).await.unwrap()
     );
+    assert!(state.key_index.matches(&state.db).await.unwrap());
 }
 
 fn put(key: &[u8], value: &[u8], lease: i64) -> RequestOp {

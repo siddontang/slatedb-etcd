@@ -12,4 +12,7 @@ message Version {
 
 message Journal {
   repeated mvccpb.Event events = 1;
+  // A positive entry names the history revision that holds the previous value of the event at
+  // the same position. The event then omits prev_kv. Zero or a missing entry keeps prev_kv inline.
+  repeated int64 prev_revisions = 2;
 }
