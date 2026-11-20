@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::api::{router, ApiState};
+use crate::grpc::app::{App, Listener};
 use crate::node::{Event, LogMemory, Node, NodeOptions};
 use crate::proto::etcdserverpb::{request_op, RangeRequest, RequestOp};
 
@@ -243,7 +244,7 @@ impl Server {
             transport = peer_options.transport()?;
         }
         let (events, receiver) = mpsc::channel(2048);
-        let grpc = crate::grpc::service_with_watch_interval(
+        let servers = crate::grpc::Servers::new(
             config.id,
             events.clone(),
             &config.peers,
@@ -274,15 +275,33 @@ impl Server {
             events: events.clone(),
             cluster_id: config.cluster_id.clone(),
         });
-        let peer_app = diagnostics
-            .clone()
-            .fallback_service(grpc.clone().layer(axum::Extension(crate::tls::PeerServer)));
+        // Peer gRPC has no RPC metrics; diagnostics paths never collide with gRPC services.
+        let peer_app = App::new(
+            servers.clone(),
+            Some(Listener::Peer),
+            None,
+            None,
+            diagnostics.clone(),
+        );
         let metrics_app = node.metrics.scrape_router(events.clone());
-        let grpc = node.metrics.routes(grpc, events.clone(), config.metrics)?;
+        let (watch_meters, rpc) = node.metrics.rpc(config.metrics)?;
+        let scrape = node.metrics.scrape_router(events.clone());
         let client_app = if peer_listener.is_some() {
-            grpc.layer(axum::Extension(crate::tls::ClientServer))
+            App::new(
+                servers,
+                Some(Listener::Client),
+                Some(watch_meters),
+                Some(rpc),
+                scrape,
+            )
         } else {
-            diagnostics.fallback_service(grpc)
+            App::new(
+                servers,
+                None,
+                Some(watch_meters),
+                Some(rpc),
+                diagnostics.fallback_service(scrape),
+            )
         };
         let (stop, _) = watch::channel(false);
         let mut tasks = tokio::task::JoinSet::new();

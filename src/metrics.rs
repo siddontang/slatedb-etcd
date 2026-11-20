@@ -3,6 +3,7 @@
 mod peer;
 pub(crate) use peer::PeerTraffic;
 mod rpc;
+pub(crate) use rpc::{Observation as RpcObservation, ObservedBody, Observer as RpcObserver};
 mod sample;
 mod state;
 pub(crate) use state::{Active, StateMeters, WatchMeters, Writes};
@@ -136,20 +137,14 @@ impl Member {
         })
     }
 
-    pub fn routes(
-        self: &Arc<Self>,
-        grpc: axum::Router,
-        events: mpsc::Sender<Event>,
+    /// Register the per-RPC and watch meters of the client listener.
+    pub(crate) fn rpc(
+        &self,
         level: crate::server::MetricsLevel,
-    ) -> Result<axum::Router> {
+    ) -> Result<(Arc<WatchMeters>, Arc<RpcObserver>)> {
         let watch = Arc::new(WatchMeters::new(&self.registry)?);
-        let grpc = grpc.layer(axum::Extension(watch));
         let rpc = rpc::Observer::new(&self.registry, level)?;
-        let grpc = grpc.layer(axum::middleware::from_fn_with_state(
-            Arc::new(rpc),
-            rpc::observe,
-        ));
-        Ok(grpc.merge(self.scrape_router(events)))
+        Ok((watch, Arc::new(rpc)))
     }
 
     pub fn scrape_router(self: &Arc<Self>, events: mpsc::Sender<Event>) -> axum::Router {
