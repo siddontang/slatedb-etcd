@@ -186,7 +186,7 @@ async fn point_read_batches_stop_before_scans_and_historical_reads() {
     }
     assert!(node.read_queries.is_empty());
     for reply in replies {
-        assert!(reply.await.unwrap().unwrap().result.is_ok());
+        assert!(reply.await.unwrap().unwrap().into_outcome().result.is_ok());
     }
     assert_eq!(node.raw.store().last_index().unwrap(), 0);
 }
@@ -225,7 +225,7 @@ async fn waiting_scans_do_not_block_current_point_reads() {
     node.drain_reads().await.unwrap();
     assert!(node.read_queries.is_empty());
     for reply in replies {
-        assert!(reply.await.unwrap().unwrap().result.is_ok());
+        assert!(reply.await.unwrap().unwrap().into_outcome().result.is_ok());
     }
 }
 
@@ -738,6 +738,57 @@ async fn read_index_requires_quorum_and_does_not_write_the_log() {
     assert!(reply.await.unwrap().is_ok());
     assert_eq!(node.raw.store().durable.last_index, last);
     assert_eq!(node.raw.store().durable.sync_writes, syncs);
+}
+
+#[tokio::test]
+async fn confirmed_scans_share_only_matching_requests_and_credentials() {
+    use crate::proto::etcdserverpb::{request_op::Request as Op, RangeRequest};
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    let mut replies = Vec::new();
+    for (limit, token) in [(1, "a"), (1, "a"), (1, "b"), (2, "b"), (2, "b")] {
+        let request = RequestOp {
+            request: Some(Op::RequestRange(RangeRequest {
+                key: vec![0],
+                range_end: vec![0],
+                limit,
+                ..Default::default()
+            })),
+        };
+        let credentials = crate::auth::Credentials {
+            token: token.into(),
+            ..Default::default()
+        };
+        let (tx, rx) = oneshot::channel();
+        node.linear_read_auth(request, Some(credentials), ClientResponse::Kv(tx));
+        replies.push(rx);
+    }
+    let first = *node.reads.keys().next().unwrap();
+    node.drive_ready().await.unwrap();
+    assert_eq!(node.read_executor.len(), 0);
+    confirm_read(&mut node, &first).await;
+    let shared = node.read_executor.step().await.unwrap().unwrap();
+    assert!(matches!(&shared, Output::SharedLinear(ids, _) if ids.len() == 2));
+    node.complete_read(shared).unwrap();
+    let second = replies[1].try_recv().unwrap().unwrap();
+    let first = replies[0].try_recv().unwrap().unwrap();
+    let (KvReply::Shared(a), KvReply::Shared(b)) = (first, second) else {
+        panic!("expected one pinned scan");
+    };
+    assert!(std::sync::Arc::ptr_eq(&a, &b));
+    node.drive_ready().await.unwrap();
+    let single = node.read_executor.step().await.unwrap().unwrap();
+    assert!(matches!(&single, Output::Reads(outputs) if outputs.len() == 1));
+    node.complete_read(single).unwrap();
+    assert!(replies[2].try_recv().unwrap().is_ok());
+    node.drive_ready().await.unwrap();
+    let delayed = node.read_executor.step().await.unwrap().unwrap();
+    assert!(matches!(&delayed, Output::SharedLinear(ids, _) if ids.len() == 2));
+    node.raw.raft.become_follower(node.raw.raft.term + 1, 2);
+    node.complete_read(delayed).unwrap();
+    for rx in &mut replies[3..] {
+        assert!(rx.try_recv().unwrap().is_err());
+    }
 }
 
 #[tokio::test]
@@ -1263,7 +1314,7 @@ async fn independent_reads_pin_their_view_and_do_not_wait_for_apply() {
     node.drive_ready().await.unwrap();
     let read = node.read_executor.step().await.unwrap().unwrap();
     node.complete_read(read).unwrap();
-    assert!(reply.await.unwrap().unwrap().result.is_ok());
+    assert!(reply.await.unwrap().unwrap().into_outcome().result.is_ok());
     assert_eq!(node.state.applied, 0);
     assert!(node.apply_busy);
 
@@ -1275,7 +1326,7 @@ async fn independent_reads_pin_their_view_and_do_not_wait_for_apply() {
     assert_eq!(node.state.applied, apply::BATCH_ENTRIES);
     let read = node.read_executor.step().await.unwrap().unwrap();
     node.complete_read(read).unwrap();
-    let mut result = reply.await.unwrap().unwrap().result.unwrap();
+    let mut result = reply.await.unwrap().unwrap().into_outcome().result.unwrap();
     assert_eq!(
         crate::mvcc::response_header(&mut result).unwrap().revision,
         1
@@ -1306,7 +1357,7 @@ async fn independent_read_jobs_and_queue_have_separate_bounds() {
     assert!(!node.apply_busy);
     node.drain_reads().await.unwrap();
     for rx in replies {
-        assert!(rx.await.unwrap().unwrap().result.is_ok());
+        assert!(rx.await.unwrap().unwrap().into_outcome().result.is_ok());
     }
 }
 

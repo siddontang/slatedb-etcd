@@ -77,6 +77,10 @@ pub(super) enum Query {
 }
 
 impl Query {
+    pub fn same_linear_read(&self, other: &Self) -> bool {
+        matches!((self, other), (Self::Linear(a, ca, _), Self::Linear(b, cb, _)) if ca == cb && a == b)
+    }
+
     pub fn is_point_read(&self) -> bool {
         let request = match self {
             Self::Read(request, ..) | Self::Linear(request, ..) => request,
@@ -141,6 +145,7 @@ pub(super) struct AppliedCommand {
 
 pub(super) enum Output {
     Reads(Vec<Output>),
+    SharedLinear(Vec<u64>, std::sync::Arc<Outcome>),
     Linear {
         id: u64,
         outcome: Outcome,

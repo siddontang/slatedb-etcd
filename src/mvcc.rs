@@ -53,13 +53,22 @@ impl KvError {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Outcome<T = ResponseOp> {
     pub result: KvResult<T>,
 }
 
 fn current_key(key: &[u8]) -> Vec<u8> {
     [CURRENT, key].concat()
+}
+
+fn current_bounds(key: &[u8], end: &[u8]) -> std::ops::Range<Vec<u8>> {
+    let upper = if end == [0] {
+        b"etcd/current0".to_vec()
+    } else {
+        current_key(end)
+    };
+    current_key(key)..upper
 }
 
 fn history_prefix(key: &[u8]) -> Vec<u8> {
@@ -301,19 +310,11 @@ impl View<'_> {
                 );
             }
         } else {
-            let upper = if end == [0] {
-                b"etcd/current0".to_vec()
-            } else {
-                current_key(end)
-            };
-            if current_key(key) >= upper {
+            let bounds = current_bounds(key, end);
+            if bounds.is_empty() {
                 return Ok(rows);
             }
-            let mut scan = self
-                .db
-                .scan(current_key(key)..upper)
-                .await
-                .map_err(KvError::storage)?;
+            let mut scan = self.db.scan(bounds).await.map_err(KvError::storage)?;
             while let Some(row) = scan.next().await.map_err(KvError::storage)? {
                 let kv = KeyValue::decode(row.value).map_err(KvError::storage)?;
                 if contains(&kv.key, key, end) {
@@ -467,7 +468,47 @@ impl View<'_> {
         self.revision + i64::from(!self.changes.is_empty())
     }
 
+    async fn ordered_range(&self, r: &RangeRequest) -> KvResult<RangeResponse> {
+        let mut response = RangeResponse {
+            header: header(self.current_revision()),
+            ..Default::default()
+        };
+        let bounds = current_bounds(&r.key, &r.range_end);
+        if bounds.is_empty() {
+            return Ok(response);
+        }
+        let mut scan = self.db.scan(bounds).await.map_err(KvError::storage)?;
+        while let Some(row) = scan.next().await.map_err(KvError::storage)? {
+            response.count += 1;
+            if r.count_only {
+                continue;
+            }
+            if r.limit > 0 && response.count > r.limit {
+                response.more = true;
+                continue;
+            }
+            let mut kv = KeyValue::decode(row.value).map_err(KvError::storage)?;
+            if r.keys_only {
+                kv.value.clear();
+            }
+            response.kvs.push(kv);
+        }
+        Ok(response)
+    }
+
     async fn range(&self, r: &RangeRequest) -> KvResult<RangeResponse> {
+        if !r.range_end.is_empty()
+            && r.revision <= 0
+            && self.changes.is_empty()
+            && r.sort_target == 0
+            && matches!(r.sort_order, 0 | 1)
+            && r.min_mod_revision == 0
+            && r.max_mod_revision == 0
+            && r.min_create_revision == 0
+            && r.max_create_revision == 0
+        {
+            return self.ordered_range(r).await;
+        }
         let rows: Vec<_> = if r.revision > 0 {
             self.historical(&r.key, &r.range_end, r.revision)
                 .await?

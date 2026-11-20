@@ -26,6 +26,11 @@ New repository checks and report normalization are separate changes at the branc
 
 Gitleaks 8.30.1 checks current publication files, all fetched history, and commit and tag messages.
 The metadata check also inspects author fields, sign-offs, deleted blobs, and annotated tags.
+It accepts one owner or maintainer sign-off.
+It also accepts one author sign-off with the author's GitHub public email.
+A GitHub merge by the maintainer `nolouch@gmail.com` needs no sign-off.
+CI checks commit metadata only for the commits an event adds to main or a pull request.
+Main history was checked when it landed, so later rule changes do not fail on it.
 Negative controls reject new private keys, missing sign-offs, private authors, and deleted paths.
 No deployment credential was identified in the audited source, reports, or downloaded Actions logs.
 
@@ -39,13 +44,14 @@ CI pins the Linux archive hash in its workflow.
 python3 scripts/check-public.py
 python3 scripts/test_reporting.py
 python3 scripts/test_history.py
-python3 scripts/check-history.py
+python3 scripts/check-history.py --range origin/main..HEAD
 python3 scripts/test_secret_scan.py
 python3 scripts/check-secrets.py
 ```
 
 Set `GITLEAKS` to the executable path if it is not on PATH.
-The history checks reject shallow clones. They check every fetched ref.
+The history checks reject shallow clones.
+Without `--range`, the metadata check audits every fetched ref, including older history.
 The secret check also snapshots current tracked and unignored files.
 Scanner output redacts credential values and reports locations only.
 

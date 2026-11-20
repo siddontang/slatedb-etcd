@@ -446,7 +446,7 @@ Peer updates publish the member name and client URLs through the trusted Raft tr
 Leader transfer returns after Raft observes the target leader, or reports a timeout.
 
 TLS uses separate client and peer listeners. The peer listener requires a trusted client certificate
-when peer TLS is configured. Use separate certificate authorities for peer and client identities.
+when explicit peer TLS is configured. Use separate certificate authorities for the two listeners.
 Only the peer listener accepts a forwarded certificate identity.
 The client listener ignores peer forwarding headers. Verified client certificate CNs map to users.
 The plaintext local mode retains trusted diagnostics. It is not a hostile multi-user boundary.

@@ -135,7 +135,12 @@ impl Service {
     }
 
     pub(crate) async fn wait_revision(&self, revision: i64) -> Result<(), Status> {
-        if self.forward_view().await?.applied(revision) {
+        let view = self.forward_view().await?;
+        if view.applied(revision) {
+            return Ok(());
+        }
+        let _permit = self.revision_admission.acquire().await?;
+        if view.applied(revision) {
             return Ok(());
         }
         let (tx, rx) = oneshot::channel();

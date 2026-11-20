@@ -51,6 +51,15 @@ struct Args {
     /// Advertised client URL. Repeat as --client-peer ID=URL.
     #[arg(long = "client-peer")]
     client_peers: Vec<String>,
+    /// Generate a self-signed client listener certificate.
+    #[arg(long)]
+    auto_tls: bool,
+    /// Generate a self-signed peer listener certificate.
+    #[arg(long)]
+    peer_auto_tls: bool,
+    /// Validity of generated certificates in years.
+    #[arg(long, default_value = "1")]
+    self_signed_cert_validity: std::num::NonZeroU32,
     /// Client listener certificate chain in PEM format.
     #[arg(long)]
     cert_file: Option<PathBuf>,
@@ -82,7 +91,7 @@ struct Args {
     #[arg(long, default_value = "slatedb-raft-poc")]
     cluster_id: String,
     /// Zero disables automatic snapshots. The checkpoint endpoint remains available.
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, default_value_t = 10_000)]
     snapshot_every: u64,
     /// Interval between idle Watch progress responses. Positive values have a 100 ms minimum.
     #[arg(long, alias = "experimental-watch-progress-notify-interval", default_value = "10s",
@@ -145,6 +154,7 @@ async fn run(args: Args) -> Result<()> {
         client_peers: parse_peers(args.client_peers)?,
         allow_remote: args.allow_remote,
         client_tls: slatedb_etcd::tls::Options {
+            auto_tls: args.auto_tls.then_some(args.self_signed_cert_validity),
             cert: args.cert_file,
             key: args.key_file,
             ca: args.trusted_ca_file,
@@ -152,6 +162,7 @@ async fn run(args: Args) -> Result<()> {
         },
         peer_tls: slatedb_etcd::tls::Options {
             client_auth: args.peer_cert_file.is_some(),
+            auto_tls: args.peer_auto_tls.then_some(args.self_signed_cert_validity),
             cert: args.peer_cert_file,
             key: args.peer_key_file,
             ca: args.peer_trusted_ca_file,

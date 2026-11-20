@@ -146,6 +146,7 @@ impl Node {
 
     pub(super) fn finish_output(&mut self, output: Output) -> Result<()> {
         match output {
+            Output::SharedLinear(ids, outcome) => self.finish_shared_reads(ids, outcome)?,
             Output::Reads(reads) => {
                 for read in reads {
                     self.finish_output(read)?;

@@ -101,7 +101,8 @@ impl Executor {
 async fn execute(work: Work) -> Result<Output> {
     let mut outputs = Vec::with_capacity(work.queries.len());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    for query in work.queries {
+    let mut queries = work.queries.into_iter();
+    while let Some(query) = queries.next() {
         let (request, credentials) = match &query {
             Query::Read(request, credentials, _) | Query::Linear(request, credentials, _) => {
                 (request, credentials)
@@ -121,6 +122,17 @@ async fn execute(work: Work) -> Result<Output> {
                 },
             };
         work.header.outcome(&mut outcome);
+        if work.wide && queries.len() > 0 {
+            // Each request already has a quorum proof. All read the same pinned view.
+            let ids = std::iter::once(query)
+                .chain(queries)
+                .map(|query| match query {
+                    Query::Linear(_, _, id) => id,
+                    _ => unreachable!(),
+                })
+                .collect();
+            return Ok(Output::SharedLinear(ids, Arc::new(outcome)));
+        }
         outputs.push(match query {
             Query::Read(_, _, response) => Output::Read { response, outcome },
             Query::Linear(_, _, id) => Output::Linear { id, outcome },
