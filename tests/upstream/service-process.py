@@ -31,10 +31,11 @@ def service_args(argv=None):
     passthrough = ("quota-backend-bytes", "strict-reconfig-check", "auth-token", "cert-file",
                    "key-file", "trusted-ca-file", "peer-cert-file", "peer-key-file",
                    "peer-trusted-ca-file", "metrics", "watch-progress-notify-interval",
-                   "experimental-watch-progress-notify-interval")
+                   "experimental-watch-progress-notify-interval", "self-signed-cert-validity")
     for flag in passthrough:
         parser.add_argument("--" + flag)
-    parser.add_argument("--client-cert-auth", action="store_true")
+    for flag in ("client-cert-auth", "auto-tls", "peer-auto-tls"):
+        parser.add_argument("--" + flag, action="store_true")
     args = parser.parse_args(argv)
     peers = dict(entry.split("=", 1) for entry in args.initial_cluster.split(","))
     clients = dict(entry.split("=", 1) for entry in args.fixture_client)
@@ -56,8 +57,9 @@ def service_args(argv=None):
                         ",".join(local_url(url) for url in args.listen_metrics_urls.split(","))])
     if args.snapshot_count:
         command.extend(["--snapshot-every", args.snapshot_count])
-    if args.client_cert_auth:
-        command.append("--client-cert-auth")
+    for flag in ("client-cert-auth", "auto-tls", "peer-auto-tls"):
+        if getattr(args, flag.replace("-", "_")):
+            command.append("--" + flag)
     for flag in passthrough:
         value = getattr(args, flag.replace("-", "_"))
         if value is not None:

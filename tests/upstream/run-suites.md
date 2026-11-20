@@ -63,7 +63,7 @@ The examples fixture changes the server endpoints. Each example retains its upst
 and runs in its own process. The cluster uses a 200 ms Watch interval and permits member changes.
 Use a disposable Linux host for full process campaigns. They stop members and mount filesystems.
 
-The service still has gaps in AutoTLS, Unix sockets, gRPC proxy mode, rolling etcd upgrades,
+The service still has gaps in Unix sockets, gRPC proxy mode, rolling etcd upgrades,
 and Go storage failpoints. The native Rust fault and DST suites cover other storage boundaries.
 Use the [fault map](fault-mapping.md) to compare them.
 
@@ -97,7 +97,7 @@ Use the [resource benchmark](../../docs/benchmarks.md) for process CPU and memor
 
 Pull requests run the full CLI smoke profile and the source coverage check.
 They also run the three recipe benchmarks, all runnable client examples, four HashKV cases,
-and two authentication restart cases.
+and the full common suite. The gate requires all 73 named AutoTLS subtests to pass.
 The weekly and manual **Full etcd suites** workflow runs all Go suites and load profiles
 on one and three members. It also checks the upstream Prometheus alert rules, release images,
 and archive checksums from both release mirrors. The heatmap runs on demand from the CLI.
@@ -107,6 +107,5 @@ Go runs write compressed JSON events, stderr, and summary records under `tmp/ups
 The CLI benchmark writes its summary and raw output under `tmp/upstream-benchmarks`.
 Use a separate `--output` directory for each run you want to keep.
 
-The 256-client workload reproduces a service limitation at the current baseline.
-Linearizable prefix transactions can exhaust the pending ReadIndex slots. The benchmark reports
-these reads as failures even when all writes succeed and the upstream driver exits successfully.
+Pull requests run `mixed-256` on both backends with one and three members. Each run must finish
+the preload and all 8,000 transactions. Each read and write error fails the case.

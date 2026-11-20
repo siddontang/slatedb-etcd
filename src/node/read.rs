@@ -64,7 +64,7 @@ impl Node {
             response.error(self.error("read index request contains a write"));
         } else if self.raw.raft.leader_id == 0 {
             response.error(self.error("not leader"));
-        } else if self.reads.len() >= apply::MAX_QUERIES {
+        } else if self.reads.len() >= MAX_PENDING_READS {
             response.error(self.error("too many pending read indexes"));
         } else {
             let Some(id) = self.read_sequence.checked_add(1) else {
@@ -184,12 +184,14 @@ impl Node {
             let first = self.read_queries.remove(position).unwrap();
             let point = first.is_point_read();
             let mut queries = vec![first];
-            while point
-                && queries.len() < apply::READ_BATCH
-                && self
-                    .read_queries
-                    .get(position)
-                    .is_some_and(Query::is_point_read)
+            while queries.len() < apply::READ_BATCH
+                && self.read_queries.get(position).is_some_and(|next| {
+                    if point {
+                        next.is_point_read()
+                    } else {
+                        queries[0].same_linear_read(next)
+                    }
+                })
             {
                 queries.push(self.read_queries.remove(position).unwrap());
             }
@@ -201,6 +203,19 @@ impl Node {
     pub(super) fn complete_read(&mut self, output: Output) -> Result<()> {
         self.expire_reads();
         self.finish_output(output)
+    }
+
+    pub(super) fn finish_shared_reads(
+        &mut self,
+        ids: Vec<u64>,
+        outcome: std::sync::Arc<crate::mvcc::Outcome>,
+    ) -> Result<()> {
+        for id in ids {
+            if let Some(read) = self.reads.remove(&id) {
+                read.response.shared_kv(outcome.clone())?;
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn finish_read(&mut self, id: u64, outcome: crate::mvcc::Outcome) -> Result<()> {

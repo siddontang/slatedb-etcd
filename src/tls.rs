@@ -1,3 +1,6 @@
+mod auto;
+mod self_signed;
+
 use anyhow::{ensure, Context, Result};
 use axum::{Extension, Router};
 use hyper_util::{
@@ -18,12 +21,15 @@ pub struct Options {
     pub key: Option<PathBuf>,
     pub ca: Option<PathBuf>,
     pub client_auth: bool,
+    /// Generate a self-signed identity valid for this many years.
+    pub auto_tls: Option<std::num::NonZeroU32>,
 }
 
 #[derive(Clone, Default)]
 pub struct Transport {
     pub tls: Option<ClientTlsConfig>,
     pub http: reqwest::Client,
+    auto_tls: bool,
 }
 
 #[derive(Clone)]
@@ -109,6 +115,21 @@ impl Options {
         if self.cert.is_none() {
             return Ok(Transport::default());
         }
+        if self.auto_tls.is_some() {
+            let config = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(self_signed::SelfSigned))
+                .with_no_client_auth();
+            let http = reqwest::Client::builder()
+                .https_only(true)
+                .tls_backend_preconfigured(config)
+                .build()?;
+            return Ok(Transport {
+                tls: Some(ClientTlsConfig::new()),
+                http,
+                auto_tls: true,
+            });
+        }
         let ca = std::fs::read(self.ca.as_ref().context("peer TLS requires a trusted CA")?)?;
         let cert = std::fs::read(self.cert.as_ref().unwrap())?;
         let key = std::fs::read(self.key.as_ref().context("peer TLS requires a key")?)?;
@@ -123,6 +144,7 @@ impl Options {
             .build()?;
         Ok(Transport {
             tls: Some(tls),
+            auto_tls: false,
             http,
         })
     }
@@ -130,6 +152,9 @@ impl Options {
 
 impl Transport {
     pub fn channel(&self, address: &str) -> Result<Channel> {
+        if self.auto_tls {
+            validate_url(address, false, true)?;
+        }
         let mut endpoint =
             Endpoint::from_shared(crate::cluster::url(address))?.timeout(Duration::from_secs(10));
         if let Some(tls) = &self.tls {
@@ -137,7 +162,11 @@ impl Transport {
                 address.starts_with("https://"),
                 "peer TLS cannot use a plaintext peer URL"
             );
-            endpoint = endpoint.tls_config(tls.clone())?;
+            endpoint = if self.auto_tls {
+                endpoint.tls_config_with_verifier(tls.clone(), Arc::new(self_signed::SelfSigned))?
+            } else {
+                endpoint.tls_config(tls.clone())?
+            };
         }
         Ok(endpoint.connect_lazy())
     }

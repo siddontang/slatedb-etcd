@@ -5,6 +5,7 @@ use prost::Message;
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status};
 
+mod admission;
 mod auth;
 mod cluster;
 mod forwarding;
@@ -26,6 +27,8 @@ pub const DEFAULT_WATCH_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 pub struct Service {
     events: mpsc::Sender<Event>,
+    read_admission: std::sync::Arc<admission::ReadAdmission>,
+    revision_admission: std::sync::Arc<admission::ReadAdmission>,
     watch_progress_interval: Duration,
     forwarding: std::sync::Arc<forwarding::Forwarding>,
     member: u64,
@@ -103,6 +106,8 @@ impl Service {
     ) -> anyhow::Result<Self> {
         Ok(Self {
             events,
+            read_admission: Default::default(),
+            revision_admission: Default::default(),
             watch_progress_interval: if interval.is_zero() {
                 DEFAULT_WATCH_PROGRESS_INTERVAL
             } else {
@@ -162,6 +167,11 @@ impl Service {
                     .await;
             }
         }
+        let read_permit = if mvcc::read_only(&request, false) && !mvcc::read_only(&request, true) {
+            Some(self.read_admission.acquire().await?)
+        } else {
+            None
+        };
         let redirect = if forwarded {
             None
         } else {
@@ -178,8 +188,9 @@ impl Service {
                 Status::deadline_exceeded("etcdserver: request timed out; outcome unknown")
             })?
             .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?;
+        drop(read_permit);
         match (reply, redirect) {
-            (Ok(outcome), _) => outcome.result.map_err(|e| e.status()),
+            (Ok(reply), _) => reply.into_outcome().result.map_err(|e| e.status()),
             (Err(error), Some((op, credentials))) if error.error == "not leader" => {
                 self.forward_kv(error.leader_id, op, &credentials).await
             }

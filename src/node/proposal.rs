@@ -2,6 +2,23 @@
 
 use super::*;
 
+const MAX_WAITING_PUTS: usize = 256;
+const MAX_WAITING_BYTES: usize = 4 * 1024 * 1024;
+
+struct WaitingPut {
+    id: String,
+    data: Vec<u8>,
+    response: KvResponse,
+    term: u64,
+    expires: Instant,
+}
+
+#[derive(Default)]
+pub(super) struct Waiting {
+    requests: VecDeque<WaitingPut>,
+    bytes: usize,
+}
+
 #[derive(Default)]
 pub(super) struct Group {
     entries: Vec<Entry>,
@@ -26,16 +43,68 @@ impl Node {
             let _ = response.send(Err(self.error("not leader")));
             return Ok(());
         }
-        if self.backlogged() {
-            let _ = response.send(Err(self.error("state apply backlog is full")));
-            return Ok(());
-        }
         if self.pending.len() + self.put_proposals.clients.len() >= 1024 {
             let _ = response.send(Err(self.error("too many pending requests")));
             return Ok(());
         }
         let id = uuid::Uuid::new_v4().to_string();
         let data = RaftCommand::encode_kv(id.clone(), self.options.id, request, credentials);
+        if !self.waiting_puts.requests.is_empty() || self.backlogged() {
+            let waiting = &mut self.waiting_puts;
+            if waiting.requests.len() >= MAX_WAITING_PUTS
+                || waiting.bytes + data.capacity() > MAX_WAITING_BYTES
+            {
+                let _ = response.send(Err(self.error("state apply backlog is full")));
+                return Ok(());
+            }
+            waiting.bytes += data.capacity();
+            waiting.requests.push_back(WaitingPut {
+                id,
+                data,
+                response,
+                term: self.raw.raft.term,
+                expires: Instant::now() + Duration::from_secs(5),
+            });
+        } else {
+            self.append_put(id, data, response);
+        }
+        Ok(())
+    }
+
+    pub(super) fn resume_puts(&mut self) {
+        for _ in 0..apply::BATCH_ENTRIES {
+            let Some(first) = self.waiting_puts.requests.front() else {
+                break;
+            };
+            let current =
+                self.raw.raft.state == StateRole::Leader && first.term == self.raw.raft.term;
+            let expired = Instant::now() >= first.expires;
+            if current
+                && !expired
+                && !first.response.is_closed()
+                && (self.backlogged()
+                    || self.pending.len() + self.put_proposals.clients.len() >= 1024)
+            {
+                break;
+            }
+            let put = self.waiting_puts.requests.pop_front().unwrap();
+            self.waiting_puts.bytes -= put.data.capacity();
+            if put.response.is_closed() {
+                continue;
+            }
+            if !current {
+                let _ = put.response.send(Err(self.error("not leader")));
+            } else if expired {
+                let _ = put
+                    .response
+                    .send(Err(self.error("proposal admission timed out")));
+            } else {
+                self.append_put(put.id, put.data, put.response);
+            }
+        }
+    }
+
+    fn append_put(&mut self, id: String, data: Vec<u8>, response: KvResponse) {
         let charge = data.len() + cache::ENTRY_OVERHEAD + 64;
         if self.put_proposals.bytes + charge > apply::BATCH_BYTES as usize {
             self.flush_puts();
@@ -48,7 +117,7 @@ impl Node {
             )
         {
             let _ = response.send(Err(self.error("pending log memory quota is full")));
-            return Ok(());
+            return;
         }
         self.put_proposals.entries.push(Entry {
             data: data.into(),
@@ -59,7 +128,6 @@ impl Node {
         if self.put_proposals.entries.len() >= apply::BATCH_ENTRIES as usize {
             self.flush_puts();
         }
-        Ok(())
     }
 
     pub(super) fn flush_puts(&mut self) {
@@ -98,6 +166,66 @@ impl Node {
 mod tests {
     use super::*;
     use crate::proto::etcdserverpb::{request_op::Request, response_op::Response, PutRequest};
+
+    fn waiting_put(
+        node: &mut Node,
+        value: Vec<u8>,
+    ) -> oneshot::Receiver<Result<KvReply, ApiError>> {
+        let (tx, rx) = oneshot::channel();
+        let put = PutRequest {
+            key: b"waiting".to_vec(),
+            value,
+            ..Default::default()
+        };
+        node.queue_put(
+            RequestOp {
+                request: Some(Request::RequestPut(put)),
+            },
+            None,
+            tx,
+        )
+        .unwrap();
+        rx
+    }
+
+    #[tokio::test]
+    async fn log_pressure_defers_puts_until_progress_and_drops_stale_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = super::super::tests::leader_node(dir.path()).await;
+        let last = node.raw.raft.raft_log.last_index();
+        let previous_bytes = node.log_bytes;
+        node.log_bytes = log::MAX_BYTES;
+        let expired = waiting_put(&mut node, vec![]);
+        node.waiting_puts.requests.front_mut().unwrap().expires = Instant::now();
+        drop(waiting_put(&mut node, vec![]));
+        let mut live = waiting_put(&mut node, vec![1]);
+        let large = waiting_put(&mut node, vec![0; MAX_WAITING_BYTES]);
+        assert!(large.await.unwrap().unwrap_err().error.contains("backlog"));
+        node.resume_puts();
+        assert!(expired
+            .await
+            .unwrap()
+            .unwrap_err()
+            .error
+            .contains("timed out"));
+        assert_eq!(node.waiting_puts.requests.len(), 1);
+        assert!(matches!(
+            live.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(node.raw.raft.raft_log.last_index(), last);
+        node.log_bytes = previous_bytes;
+        node.drive_ready().await.unwrap();
+        assert_eq!(node.raw.raft.raft_log.last_index(), last + 1);
+        assert_eq!(node.waiting_puts.bytes, 0);
+        node.log_bytes = log::MAX_BYTES;
+        let stale = waiting_put(&mut node, vec![2]);
+        node.raw.raft.become_follower(node.raw.raft.term + 1, 2);
+        node.resume_puts();
+        assert_eq!(stale.await.unwrap().unwrap_err().error, "not leader");
+        assert_eq!(node.waiting_puts.bytes, 0);
+        assert_eq!(node.raw.raft.raft_log.last_index(), last + 1);
+    }
 
     #[tokio::test]
     async fn consecutive_puts_share_replication_and_keep_individual_results() {
@@ -158,7 +286,7 @@ mod tests {
         node.drain_log().await.unwrap();
         node.drain_apply().await.unwrap();
         for (n, reply) in replies.into_iter().enumerate() {
-            let result = reply.await.unwrap().unwrap().result.unwrap();
+            let result = reply.await.unwrap().unwrap().into_outcome().result.unwrap();
             let Some(Response::ResponsePut(put)) = result.response else {
                 panic!("expected Put");
             };

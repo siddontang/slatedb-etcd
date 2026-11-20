@@ -35,8 +35,17 @@ The recovered member store controls the current voters and transport addresses.
 | `--client-cert-auth` | Require verified client certificates; disabled by default. |
 | `--peer-cert-file` | Peer certificate chain, also used for outgoing peer identity. |
 | `--peer-key-file` | Peer private key. |
-| `--peer-trusted-ca-file` | Peer CA roots. Peer TLS always requires mutual authentication. |
+| `--peer-trusted-ca-file` | Peer CA roots for mutual TLS with explicit certificates. |
+| `--auto-tls` | Generate a self-signed certificate for the client listener. |
+| `--peer-auto-tls` | Generate a self-signed certificate for the peer listener. |
+| `--self-signed-cert-validity` | Set certificate validity in years. The default is one year. |
 | `--auth-token` | `simple` by default; also accepts the RS256 configuration below. |
+
+AutoTLS stores each identity in `fixtures/client` or `fixtures/peer` under the data directory.
+Restarts reuse the certificate and key. Explicit certificate and key files take precedence.
+A client can trust its listener's `cert.pem`. Each automatic peer checks the certificate name,
+validity, and signature. Each peer supplies its own trust anchor, so this mode provides encryption
+without trusted cluster membership. Remote mode continues to require mutual TLS on both listeners.
 
 ```text
 jwt,pub-key=/path/public.pem,priv-key=/path/private.pem,sign-method=RS256,ttl=300s

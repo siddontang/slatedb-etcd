@@ -134,10 +134,16 @@ jobs:
           python3 scripts/benchmark-upstream.py --output results/ci/upstream-bench
           python3 scripts/check-upstream-go.py e2e --target service --require-complete \
             --run '^TestVerifyHashKVAfterCompact$/current-version' --output results/ci/upstream-go
-          python3 scripts/check-upstream-go.py common --target service --require-complete \
-            --run '^TestAuth(RevisionConsistency|TestCacheReload)$' --output results/ci/upstream-go
+          python3 scripts/check-upstream-go.py common --target service --timeout 12m \
+            --expect-passes tests/upstream/autotls-cases.txt --output results/ci/upstream-go
           python3 scripts/check-upstream-go.py examples --target service --require-complete \
             --timeout 2m --output results/ci/upstream-go
+      - name: Compare the official 256-client mixed transactions
+        run: |
+          for members in 1 3; do
+            python3 scripts/benchmark-upstream.py --members "$members" --profile stress \
+              --case mixed-256 --output "results/ci/upstream-mixed-$members"
+          done
       - name: Save the upstream results
         if: always()
         uses: actions/upload-artifact@v4

@@ -138,6 +138,49 @@ async fn read_path_matches_transaction_evaluation_without_a_write_batch() {
 }
 
 #[tokio::test]
+async fn ordered_range_keeps_the_total_count_after_the_response_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    for (index, key) in [b"c", b"a", b"b"].into_iter().enumerate() {
+        state
+            .apply_etcd(index as u64 + 1, &put(key, b"value"))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+    }
+    for (limit, keys_only, count_only, expected, more) in [
+        (1, false, false, 1, true),
+        (3, true, false, 3, false),
+        (1, false, true, 0, false),
+    ] {
+        let op = RequestOp {
+            request: Some(Op::RequestRange(RangeRequest {
+                key: vec![0],
+                range_end: vec![0],
+                limit,
+                keys_only,
+                count_only,
+                ..Default::default()
+            })),
+        };
+        let result = state.read_etcd(&op).await.unwrap().result.unwrap().response;
+        let Some(Resp::ResponseRange(result)) = result else {
+            panic!("expected range")
+        };
+        assert_eq!(
+            (result.count, result.kvs.len(), result.more),
+            (3, expected, more)
+        );
+        for (row, key) in result.kvs.iter().zip([b"a", b"b", b"c"]) {
+            assert_eq!(&row.key, key);
+            assert_eq!(row.value.is_empty(), keys_only);
+        }
+    }
+    state.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn compaction_removes_history_and_preserves_boundary_versions() {
     let dir = tempfile::tempdir().unwrap();
     let mut state = StateMachine::open(dir.path()).await.unwrap();

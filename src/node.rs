@@ -16,6 +16,7 @@ use crate::storage::{PreparedCheckpoint, RaftStorage};
 use crate::{ApiError, Command, RaftCommand, Request};
 
 mod apply;
+pub(crate) const MAX_PENDING_READS: usize = apply::MAX_QUERIES;
 mod cache;
 pub use cache::LogMemory;
 mod cluster;
@@ -34,6 +35,7 @@ mod schedule;
 use crate::peer::transport;
 use apply::{AppliedState, Completion, Header, Job, Output, Query, Reply, Work, Worker};
 use response::ClientResponse;
+pub use response::KvReply;
 
 #[cfg(test)]
 mod dst;
@@ -41,7 +43,7 @@ mod dst;
 mod tests;
 
 pub type Response = oneshot::Sender<Result<Value, ApiError>>;
-pub type KvResponse = oneshot::Sender<Result<crate::mvcc::Outcome, ApiError>>;
+pub type KvResponse = oneshot::Sender<Result<KvReply, ApiError>>;
 
 pub enum Event {
     SubscribeApply(oneshot::Sender<tokio::sync::watch::Receiver<u64>>),
@@ -203,6 +205,7 @@ pub struct Node {
     transports: tokio::task::JoinSet<()>,
     pending: HashMap<String, Pending>,
     put_proposals: proposal::Group,
+    waiting_puts: proposal::Waiting,
     blocked: BTreeSet<u64>,
     installed_snapshots: u64,
     recovered_from_index: u64,
@@ -410,6 +413,7 @@ impl Node {
             transports,
             pending: HashMap::new(),
             put_proposals: proposal::Group::default(),
+            waiting_puts: proposal::Waiting::default(),
             blocked: BTreeSet::new(),
             installed_snapshots: 0,
             recovered_from_index,

@@ -69,7 +69,7 @@ def go_cases(source, suite, args):
         yield "tests", ["./" + suite]
 
 
-def run_go(command, cwd, log_path, selector, suite, env=None):
+def run_go(command, cwd, log_path, selector, suite, env=None, required=None):
     print(cwd.name, *command, flush=True)
     counts = {"pass": 0, "fail": 0, "skip": 0}
     samples = set()
@@ -81,6 +81,8 @@ def run_go(command, cwd, log_path, selector, suite, env=None):
         for line in process.stdout:
             log.write(line)
             event = json.loads(line)
+            if required is not None and event["Action"] == "pass":
+                required.discard(event.get("Test"))
             output = event.get("Output", "")
             package = event.get("Package", "")
             if "testing: warning: no tests to run" in output:
@@ -194,11 +196,19 @@ def main():
     parser.add_argument("--output", type=Path, default=ROOT / "tmp/upstream-results")
     parser.add_argument("--last-release", type=Path)
     parser.add_argument("--lazyfs", type=Path)
+    parser.add_argument("--expect-passes", type=Path, help="Require each listed Go test to pass")
     parser.add_argument("--require-complete", action="store_true", help="Fail on upstream skips")
     parser.add_argument("--shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     args = parser.parse_args()
     process_suite = args.suite in ("common", "e2e", "robustness", "proxy-e2e")
+    required = None
+    if args.expect_passes:
+        if not process_suite or args.shards != 1:
+            parser.error("--expect-passes requires one complete process shard")
+        required = set(args.expect_passes.read_text().splitlines())
+        if not required or "" in required:
+            parser.error("Expected test names must be nonempty")
     if args.shard_index < 0 or args.shard_index >= args.shards:
         parser.error("Shard index must be at least zero and less than the shard count")
     if args.shards != 1 and (not process_suite or args.run):
@@ -261,7 +271,7 @@ def main():
             for label, command, cwd in runs:
                 name = f"{args.target}-{args.suite}-{label}"
                 log_path = args.output / (name + ".jsonl.gz")
-                result = run_go(command, cwd, log_path, args.run, args.suite)
+                result = run_go(command, cwd, log_path, args.run, args.suite, required=required)
                 if args.suite == "go-bench":
                     tests = json.loads(INVENTORY.read_text())["tests"]
                     expected = {t["name"] for t in tests if t["name"].startswith("Benchmark")
@@ -277,6 +287,9 @@ def main():
                 if not args.run or result["matched"] or result["exit_code"]:
                     passed &= result["complete" if args.require_complete else "passed"]
                 print(name, result, flush=True)
+    if required:
+        print("Missing test passes:", *sorted(required), sep="\n")
+        passed = False
     raise SystemExit(not passed or (bool(args.run) and not any_match))
 
 

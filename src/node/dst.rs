@@ -10,13 +10,13 @@ use crate::proto::etcdserverpb::{PutRequest, RangeRequest, WatchCreateRequest};
 struct ClientRequest {
     key: String,
     value: String,
-    reply: oneshot::Receiver<Result<Outcome, ApiError>>,
+    reply: oneshot::Receiver<Result<KvReply, ApiError>>,
 }
 
 struct ReadRequest {
     node: u64,
     known: BTreeMap<String, String>,
-    reply: oneshot::Receiver<Result<Outcome, ApiError>>,
+    reply: oneshot::Receiver<Result<KvReply, ApiError>>,
 }
 
 struct RevisionRequest {
@@ -246,7 +246,7 @@ impl Simulation {
         for mut request in self.requests.drain(..) {
             match request.reply.try_recv() {
                 Ok(Ok(result)) => {
-                    let mut result = result.result.unwrap();
+                    let mut result = result.into_outcome().result.unwrap();
                     let revision = crate::mvcc::response_header(&mut result).unwrap().revision;
                     for (&id, node) in &mut self.nodes {
                         let (tx, rx) = oneshot::channel();
@@ -274,7 +274,9 @@ impl Simulation {
         for mut read in self.reads.drain(..) {
             match read.reply.try_recv() {
                 Ok(Ok(result)) => {
-                    let Some(Resp::ResponseRange(response)) = result.result.unwrap().response
+                    let shared = matches!(result, KvReply::Shared(_));
+                    let Some(Resp::ResponseRange(response)) =
+                        result.into_outcome().result.unwrap().response
                     else {
                         panic!("expected range");
                     };
@@ -287,8 +289,11 @@ impl Simulation {
                             "read lost a prior acknowledged write"
                         );
                     }
-                    self.trace
-                        .push(format!("read ack {} {}", read.node, response.kvs.len()));
+                    self.trace.push(format!(
+                        "read ack {} {} shared={shared}",
+                        read.node,
+                        response.kvs.len()
+                    ));
                     self.read_count += 1;
                 }
                 Ok(Err(_)) | Err(oneshot::error::TryRecvError::Closed) => {}
@@ -1123,8 +1128,14 @@ impl Simulation {
         let writes = self.nodes[&leader].state.write_batches - before;
         assert!(writes < 16, "put burst did not share storage writes");
         for (offset, mut reply) in replies.into_iter().enumerate() {
-            let Some(Resp::ResponsePut(value)) =
-                reply.try_recv().unwrap().unwrap().result.unwrap().response
+            let Some(Resp::ResponsePut(value)) = reply
+                .try_recv()
+                .unwrap()
+                .unwrap()
+                .into_outcome()
+                .result
+                .unwrap()
+                .response
             else {
                 panic!("expected put");
             };
@@ -1142,8 +1153,14 @@ impl Simulation {
         }
         self.paused_reads = None;
         self.drive().await;
-        let Some(Resp::ResponseRange(value)) =
-            read.await.unwrap().unwrap().result.unwrap().response
+        let Some(Resp::ResponseRange(value)) = read
+            .await
+            .unwrap()
+            .unwrap()
+            .into_outcome()
+            .result
+            .unwrap()
+            .response
         else {
             panic!("expected range");
         };
@@ -1224,7 +1241,14 @@ impl Simulation {
         for _ in 0..100 {
             self.deliver(false).await;
         }
-        let Some(Resp::ResponsePut(put)) = rx.try_recv().unwrap().unwrap().result.unwrap().response
+        let Some(Resp::ResponsePut(put)) = rx
+            .try_recv()
+            .unwrap()
+            .unwrap()
+            .into_outcome()
+            .result
+            .unwrap()
+            .response
         else {
             panic!("expected a quorum Put reply");
         };

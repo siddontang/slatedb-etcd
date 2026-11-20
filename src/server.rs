@@ -114,16 +114,26 @@ impl Server {
             config.id != 0 && !config.peers.contains_key(&0),
             "invalid member ID"
         );
-        let client_tls = config.client_tls.server()?;
-        let peer_tls = config.peer_tls.server()?;
-        let transport = config.peer_tls.transport()?;
+        let peer_address = config.peer_listen.unwrap_or(config.listen);
+        let mut client_options = config.client_tls.clone();
+        let mut peer_options = config.peer_tls.clone();
+        let mut client_tls = client_options.server()?;
+        let mut peer_tls = peer_options.server()?;
+        let client_auto = client_tls.is_none() && client_options.auto_tls.is_some();
+        let peer_auto = peer_tls.is_none() && peer_options.auto_tls.is_some();
+        let client_secure = client_tls.is_some() || client_auto;
+        let peer_secure = peer_tls.is_some() || peer_auto;
+        if !peer_auto {
+            peer_options.auto_tls = None;
+        }
+        let mut transport = peer_options.transport()?;
         let tokens = crate::auth::TokenIssuer::parse(&config.auth_token)?;
         ensure!(
-            config.peer_listen.is_some() || (client_tls.is_none() && peer_tls.is_none()),
+            config.peer_listen.is_some() || (!client_secure && !peer_secure),
             "TLS requires a separate peer listener"
         );
         ensure!(
-            peer_tls.is_none() || config.peer_tls.client_auth,
+            !peer_secure || peer_options.client_auth || peer_auto,
             "peer TLS requires mutual authentication"
         );
         if config.allow_remote {
@@ -131,7 +141,8 @@ impl Server {
                 config.peer_listen.is_some()
                     && client_tls.is_some()
                     && config.client_tls.client_auth
-                    && peer_tls.is_some(),
+                    && peer_tls.is_some()
+                    && peer_options.client_auth,
                 "remote mode requires separate listeners and mutual client and peer TLS"
             );
         }
@@ -139,16 +150,15 @@ impl Server {
             config.allow_remote || config.listen.ip().is_loopback(),
             "remote listeners require allow_remote"
         );
-        let peer_address = config.peer_listen.unwrap_or(config.listen);
         ensure!(
             config.allow_remote || peer_address.ip().is_loopback(),
             "remote peer listeners require allow_remote"
         );
         for address in config.peers.values() {
-            crate::tls::validate_url(address, config.allow_remote, peer_tls.is_some())?;
+            crate::tls::validate_url(address, config.allow_remote, peer_secure)?;
         }
         for address in config.client_peers.values() {
-            crate::tls::validate_url(address, config.allow_remote, client_tls.is_some())?;
+            crate::tls::validate_url(address, config.allow_remote, client_secure)?;
         }
         ensure!(
             !config.allow_remote
@@ -169,15 +179,11 @@ impl Server {
         for address in &mut config.listen_metrics_urls {
             let url = reqwest::Url::parse(address)?;
             crate::tls::validate_url(address, config.allow_remote, false)?;
-            let tls = if url.scheme() == "https" {
-                Some(
-                    client_tls
-                        .clone()
-                        .context("HTTPS metrics require client TLS settings")?,
-                )
-            } else {
-                None
-            };
+            let secure = url.scheme() == "https";
+            ensure!(
+                !secure || client_secure,
+                "HTTPS metrics require client TLS settings"
+            );
             let host = url
                 .host_str()
                 .context("metrics URL has no host")?
@@ -188,11 +194,11 @@ impl Server {
             let listener = TcpListener::bind((host, port)).await?;
             let bound = listener.local_addr()?;
             ensure!(
-                bound.ip().is_loopback() || (config.allow_remote && tls.is_some()),
+                bound.ip().is_loopback() || (config.allow_remote && secure),
                 "remote metrics require remote mode and client TLS"
             );
             *address = format!("{}://{bound}", url.scheme());
-            metrics_listeners.push((listener, tls));
+            metrics_listeners.push((listener, secure));
         }
         let listener = TcpListener::bind(config.listen).await?;
         config.listen = listener.local_addr()?;
@@ -225,6 +231,16 @@ impl Server {
                 &config.cluster_id,
                 &members,
             )?;
+        }
+        // Snapshot restore must see the original data directory before AutoTLS creates fixtures.
+        if client_auto {
+            client_options.prepare(&config.dir, "client", config.listen.ip())?;
+            client_tls = client_options.server()?;
+        }
+        if peer_auto {
+            peer_options.prepare(&config.dir, "peer", peer_address.ip())?;
+            peer_tls = peer_options.server()?;
+            transport = peer_options.transport()?;
         }
         let (events, receiver) = mpsc::channel(2048);
         let grpc = crate::grpc::service_with_watch_interval(
@@ -270,7 +286,8 @@ impl Server {
         };
         let (stop, _) = watch::channel(false);
         let mut tasks = tokio::task::JoinSet::new();
-        for (metrics_listener, tls) in metrics_listeners {
+        for (metrics_listener, secure) in metrics_listeners {
+            let tls = if secure { client_tls.clone() } else { None };
             tasks.spawn(crate::tls::serve_until(
                 metrics_listener,
                 metrics_app.clone(),
@@ -328,11 +345,12 @@ impl Server {
 
     /// Get the local client endpoint. Remote hosts must use the advertised client URL.
     pub fn client_url(&self) -> String {
-        let scheme = if self.config.client_tls.cert.is_some() {
-            "https"
-        } else {
-            "http"
-        };
+        let scheme =
+            if self.config.client_tls.cert.is_some() || self.config.client_tls.auto_tls.is_some() {
+                "https"
+            } else {
+                "http"
+            };
         format!("{scheme}://{}", self.client_addr())
     }
 
