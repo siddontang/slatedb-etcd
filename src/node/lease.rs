@@ -15,6 +15,8 @@ pub(super) struct Renewal {
 /// A group of renewals that share one ReadIndex proof.
 pub(super) struct RenewBatch {
     pub(super) context: u64,
+    /// When this leader first asked the quorum for the proof.
+    pub(super) issued: Instant,
     pub(super) term: u64,
     pub(super) index: Option<u64>,
     pub(super) retry_ticks: u8,
@@ -47,6 +49,7 @@ impl Node {
             self.lease_deadlines.clear();
             self.lease_expiring.clear();
             self.lease_view = None;
+            self.lease_promoted = false;
             self.lease_term = self.raw.raft.term;
         }
         if self.raw.raft.state != StateRole::Leader {
@@ -64,16 +67,33 @@ impl Node {
         self.lease_deadlines
             .retain(|id, _| self.state.leases.contains_key(id));
         let now = Instant::now();
+        // Like etcd's Promote, a new leader extends inherited leases by an election timeout.
+        let extend = if self.lease_promoted {
+            Duration::ZERO
+        } else {
+            self.promote_extend()
+        };
+        self.lease_promoted = true;
         for (&id, lease) in self.state.leases.iter() {
             let entry = self.lease_deadlines.entry(id).or_insert((0, now));
             if entry.0 != lease.generation {
                 *entry = (
                     lease.generation,
-                    now + Duration::from_secs(lease.ttl as u64),
+                    now + Duration::from_secs(lease.ttl as u64) + extend,
                 );
             }
         }
         self.lease_view = Some(self.state.leases.clone());
+    }
+
+    /// The longest randomized election timeout.
+    ///
+    /// An old leader renews in memory after its ReadIndex proof, so the next leader does not see the
+    /// renewal. The followers that confirmed the proof reject votes for one election timeout. The
+    /// next leader then adds this extension to each inherited deadline. A renewal is cancelled when
+    /// it finishes more than this extension after its proof, so it cannot outlive that deadline.
+    pub(super) fn promote_extend(&self) -> Duration {
+        TICK * (2 * self.raw.raft.election_timeout()) as u32
     }
 
     pub(super) fn expire_leases(&mut self) -> Result<()> {
@@ -172,6 +192,7 @@ impl Node {
         self.read_sequence = context;
         self.renewals.batches.push_back(RenewBatch {
             context,
+            issued: Instant::now(),
             term: self.raw.raft.term,
             index: None,
             retry_ticks: 2,
@@ -253,7 +274,10 @@ impl Node {
             .is_some_and(|index| index <= self.state.applied)
         {
             let batch = self.renewals.batches.pop_front().unwrap();
-            if batch.term != self.raw.raft.term || self.raw.raft.state != StateRole::Leader {
+            // A late apply would renew after the next leader could start its deadline.
+            let stale = batch.issued.elapsed() > self.promote_extend();
+            if stale || batch.term != self.raw.raft.term || self.raw.raft.state != StateRole::Leader
+            {
                 for renewal in batch.renewals {
                     let _ = renewal.response.send(Err(self.error(RENEWAL_CANCELLED)));
                 }

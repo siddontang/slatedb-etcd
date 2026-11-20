@@ -1575,10 +1575,54 @@ async fn leader_change_cancels_renewals_and_restores_the_full_ttl() {
     assert!(error.error.contains("renewal cancelled"), "{}", error.error);
     assert!(node.renewals.is_empty());
 
-    // The new leader does not know the old deadline and grants the full TTL again.
+    // The new leader does not know the old deadline. Like etcd, it grants the full TTL plus the
+    // longest election timeout, so an in-memory renewal by the old leader cannot outlive it.
     node.sync_lease_deadlines();
+    let extend = node.promote_extend();
+    assert_eq!(extend, Duration::from_secs(2));
     let remaining = node.lease_deadlines[&7]
         .1
         .saturating_duration_since(Instant::now());
-    assert!(remaining > Duration::from_secs(59), "{remaining:?}");
+    assert!(
+        remaining > Duration::from_secs(60) + extend - Duration::from_secs(1),
+        "{remaining:?}"
+    );
+
+    // A lease granted later in the same term gets only its TTL.
+    grant_lease(&mut node, 8, 60).await;
+    let remaining = node.lease_deadlines[&8]
+        .1
+        .saturating_duration_since(Instant::now());
+    assert!(remaining <= Duration::from_secs(60), "{remaining:?}");
+}
+
+#[tokio::test]
+async fn a_renewal_with_a_stale_proof_is_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    grant_lease(&mut node, 7, 60).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    node.lease_deadlines.get_mut(&7).unwrap().1 = deadline;
+
+    let (tx, mut reply) = oneshot::channel();
+    node.keep_alive(7, None, tx).unwrap();
+    node.drive_ready().await.unwrap();
+    // Apply reaches the proof index only after the next leader could have set its deadline.
+    let extend = node.promote_extend();
+    let batch = node.renewals.batches.back_mut().unwrap();
+    batch.issued = Instant::now() - extend - Duration::from_millis(1);
+    let context = batch.context;
+    confirm_read(&mut node, &context).await;
+    node.drain_apply().await.unwrap();
+    node.drive_ready().await.unwrap();
+    let error = reply.try_recv().unwrap().unwrap_err();
+    assert!(error.error.contains("renewal cancelled"), "{}", error.error);
+    assert_eq!(
+        node.lease_deadlines[&7].1, deadline,
+        "a stale proof must not move the deadline"
+    );
+    assert!(node.renewals.is_empty());
+
+    // A fresh proof renews again.
+    assert_eq!(keep_alive(&mut node, 7).await.unwrap(), 60);
 }

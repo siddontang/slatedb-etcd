@@ -153,6 +153,9 @@ struct LogTask {
     stats_response: Option<Response>,
 }
 
+/// Raft tick interval. Election timeouts count these ticks.
+pub(crate) const TICK: Duration = Duration::from_millis(100);
+
 pub struct Node {
     pub(crate) metrics: std::sync::Arc<crate::metrics::Member>,
     last_observed_leader: u64,
@@ -217,6 +220,8 @@ pub struct Node {
     compact_step: Option<(u64, u64)>,
     compact_ready_at: Option<Instant>,
     lease_view: Option<std::sync::Arc<BTreeMap<i64, crate::lease::LeaseRecord>>>,
+    /// Whether this leader term has built its lease deadlines.
+    lease_promoted: bool,
     renewals: lease::Renewals,
 }
 
@@ -437,6 +442,7 @@ impl Node {
             compact_step: None,
             compact_ready_at: None,
             lease_view: None,
+            lease_promoted: false,
             renewals: lease::Renewals::default(),
         };
         node.sync_members();
@@ -474,7 +480,7 @@ impl Node {
         self.publish_watch(None);
         // Schedule committed log recovery before accepting client work.
         self.drive_ready().await?;
-        let mut ticks = tokio::time::interval(Duration::from_millis(100));
+        let mut ticks = tokio::time::interval(TICK);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut old_role = (
             self.raw.raft.state,

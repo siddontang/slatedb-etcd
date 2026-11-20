@@ -284,8 +284,11 @@ That entry sets a new generation, so an older expiry has no effect on the renewe
 Lease metadata, attached key deletion, Watch events, and the apply marker commit together.
 Followers do not expire leases from their local clocks. SlateDB TTL does not control leases.
 
-The minimum TTL is two seconds. A new leader gives each surviving lease its full granted TTL.
+The minimum TTL is two seconds. A new leader gives each surviving lease its full granted TTL
+plus the longest election timeout, two seconds by default. etcd's Promote adds the same extension.
 Local renewals are lost on leader change. The service does not checkpoint remaining TTL.
+A renewal is cancelled if apply reaches its proof index more than that extension after the proof.
+The old leader therefore cannot promise a deadline later than the one the next leader sets.
 Repeated leader changes can extend a lease's lifetime.
 Loss of quorum delays deletion until a majority can commit it. Clients must not treat TTL as a
 maximum lifetime or use lease expiry alone to fence external writes.
