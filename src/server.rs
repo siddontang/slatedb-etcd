@@ -43,6 +43,8 @@ pub struct ServerConfig {
     pub snapshot_every: u64,
     /// Interval between idle Watch progress responses.
     pub watch_progress_notify_interval: Duration,
+    /// Automatic log truncation waits for this many appended log bytes.
+    pub snapshot_min_bytes: u64,
     pub log_memory: LogMemory,
     /// Weight budgets for cached SST blocks and SST metadata.
     pub state_cache: crate::state::StateCache,
@@ -74,6 +76,7 @@ impl ServerConfig {
             object_store: crate::object::Config::Local,
             watch_progress_notify_interval: crate::grpc::DEFAULT_WATCH_PROGRESS_INTERVAL,
             snapshot_every: 10_000,
+            snapshot_min_bytes: crate::node::DEFAULT_SNAPSHOT_MIN_BYTES,
             log_memory: LogMemory::default(),
             state_cache: crate::state::StateCache::default(),
             quota_bytes: 0,
@@ -264,6 +267,7 @@ impl Server {
                 peers: config.peers.clone(),
                 client_peers: config.client_peers.clone(),
                 snapshot_every: config.snapshot_every,
+                snapshot_min_bytes: config.snapshot_min_bytes,
                 log_memory: config.log_memory,
                 state_cache: config.state_cache,
                 quota_bytes: config.quota_bytes,

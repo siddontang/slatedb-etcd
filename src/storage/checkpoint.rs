@@ -77,6 +77,14 @@ impl PreparedCheckpoint {
     }
 }
 
+/// Publish snapshot metadata without an image. Flushed SlateDB state covers the removed log.
+pub(super) fn publish_metadata(snapshot: &Snapshot, batch: &mut LogBatch) -> Result<()> {
+    ensure!(snapshot.data.is_empty(), "metadata snapshot has data");
+    batch.put_message(GROUP, SNAPSHOT.to_vec(), snapshot)?;
+    batch.delete(GROUP, REFERENCE.to_vec());
+    Ok(())
+}
+
 fn staged_name(name: &str) -> bool {
     name.strip_prefix(STAGING_PREFIX)
         .and_then(|name| name.strip_suffix(STAGING_SUFFIX))

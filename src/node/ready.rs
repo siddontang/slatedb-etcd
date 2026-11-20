@@ -42,6 +42,12 @@ impl Node {
             self.raw
                 .mut_store()
                 .stage(ready.entries(), ready.hs(), snapshot.as_ref())?;
+            self.appended_bytes = ready
+                .entries()
+                .iter()
+                .fold(self.appended_bytes, |total, entry| {
+                    total.saturating_add(entry.data.len() as u64)
+                });
             let job = log::Job::Ready {
                 entries: ready.take_entries(),
                 hs: ready.hs().cloned(),

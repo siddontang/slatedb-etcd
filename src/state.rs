@@ -58,7 +58,6 @@ pub struct StateMachine {
     logical_bytes: u64,
     pub(crate) current: current::CurrentRows,
     pub(crate) key_index: key_index::KeyIndex,
-    checkpoint_delta: Option<checkpoint::Delta>,
     pub(crate) write_batches: u64,
     pub alarms: Vec<crate::proto::etcdserverpb::AlarmMember>,
     pub applied: u64,
@@ -129,7 +128,13 @@ impl StateMachine {
 
     pub async fn open_with_cache(dir: &Path, cache: StateCache) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let object_store = Arc::new(LocalFileSystem::new_with_prefix(dir)?);
+        // Log truncation relies on flushed state. Sync local objects like a remote object store,
+        // and pace SST writeback so a large flush does not stall Raft log syncs.
+        let local = LocalFileSystem::new_with_prefix(dir)?.with_fsync(true);
+        #[cfg(target_os = "linux")]
+        let object_store = Arc::new(crate::object::paced::PacedStore::new(local));
+        #[cfg(not(target_os = "linux"))]
+        let object_store = Arc::new(local);
         Self::open_store_with_cache(object_store, "state", cache).await
     }
 
@@ -207,7 +212,6 @@ impl StateMachine {
                 quota: 0,
                 current: current::CurrentRows::default(),
                 key_index: key_index::KeyIndex::load(&db).await?,
-                checkpoint_delta: None,
                 logical_bytes: maintenance::count_logical_size(&db).await?,
                 write_batches: 0,
                 alarms,
@@ -251,11 +255,6 @@ impl StateMachine {
             }
             self.current.publish(&key, value.as_ref());
             self.key_index.publish(&key, value.as_ref())?;
-            if let Some(delta) = &mut self.checkpoint_delta {
-                if !delta.record(key, value) {
-                    self.checkpoint_delta = None;
-                }
-            }
         }
         Ok(())
     }

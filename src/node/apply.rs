@@ -137,7 +137,12 @@ pub(super) enum Job {
     PublishPuts(crate::state::put_batch::PreparedPuts),
     Snapshot(Snapshot),
     Query(Query),
-    Checkpoint(Duration, Snapshot, PathBuf),
+    /// Flush the applied prefix. Build a full image only when `image` is set.
+    Checkpoint {
+        delay: Duration,
+        dir: PathBuf,
+        image: bool,
+    },
 }
 
 pub(super) struct Work {
@@ -191,7 +196,14 @@ pub(super) enum Output {
         value: Value,
         require_leader: bool,
     },
-    Checkpoint,
+    /// A test worker returns its checkpoint result inline to keep schedules deterministic.
+    Checkpoint(Option<Built>),
+}
+
+pub struct Built {
+    pub(crate) index: u64,
+    pub(crate) conf: raft::eraftpb::ConfState,
+    pub(crate) result: Result<Option<PreparedCheckpoint>>,
 }
 
 pub(super) struct Completion {
@@ -204,6 +216,7 @@ struct Executor {
     state: StateMachine,
     events: mpsc::Sender<Event>,
     snapshot_task: Option<tokio::task::JoinHandle<()>>,
+    inline_checkpoints: bool,
 }
 
 impl Drop for Executor {
@@ -283,32 +296,39 @@ impl Executor {
                     }
                 }
             },
-            Job::Checkpoint(delay, base, dir) => {
+            Job::Checkpoint { delay, dir, image } => {
                 let index = self.state.applied;
                 let conf = self.state.members.conf();
-                let job = self.state.checkpoint_job(base)?;
-                let events = self.events.clone();
-                self.snapshot_task = Some(tokio::spawn(async move {
+                let job = self.state.checkpoint_job(image)?;
+                let build = async move {
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
                     }
                     let result = async {
-                        let data = job.await?;
+                        let Some(data) = job.await? else {
+                            return Ok(None);
+                        };
                         tokio::task::spawn_blocking(move || {
-                            PreparedCheckpoint::write(&dir, data.into())
+                            PreparedCheckpoint::write(&dir, data.into()).map(Some)
                         })
                         .await?
                     }
                     .await;
-                    let _ = events
-                        .send(Event::SnapshotBuilt {
-                            index,
-                            conf,
-                            result,
-                        })
-                        .await;
-                }));
-                Output::Checkpoint
+                    Built {
+                        index,
+                        conf,
+                        result,
+                    }
+                };
+                if self.inline_checkpoints {
+                    Output::Checkpoint(Some(build.await))
+                } else {
+                    let events = self.events.clone();
+                    self.snapshot_task = Some(tokio::spawn(async move {
+                        let _ = events.send(Event::SnapshotBuilt(build.await)).await;
+                    }));
+                    Output::Checkpoint(None)
+                }
             }
         };
         let state = match copy_state {
@@ -357,6 +377,7 @@ impl Worker {
             state,
             events,
             snapshot_task: None,
+            inline_checkpoints: manual,
         };
         #[cfg(test)]
         if manual {

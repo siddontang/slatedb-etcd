@@ -141,6 +141,7 @@ impl RaftStorage {
                 snapshot.get_metadata().index > self.snapshot_index(),
                 "stale snapshot"
             );
+            ensure!(!snapshot.data.is_empty(), "received snapshot has no image");
             // Replacing a snapshot discards the old log, including its divergent suffix.
             batch.add_command(GROUP, EngineCommand::Clean);
             batch.put(GROUP, IDENTITY.to_vec(), self.identity.clone())?;
@@ -212,27 +213,46 @@ impl RaftStorage {
         conf: ConfState,
     ) -> Result<()> {
         let prepared = PreparedCheckpoint::write(&self.dir, data.into())?;
-        self.publish_checkpoint(index, prepared, conf)
+        self.publish_checkpoint(index, Some(prepared), conf)
     }
 
+    /// Return true when the current snapshot record has no transferable image.
+    pub fn metadata_only(&self) -> bool {
+        self.snapshot_index() > 0 && self.snapshot.data.is_empty()
+    }
+
+    /// Publish a checkpoint and truncate its covered log in one synced batch.
+    ///
+    /// Without an image, the caller must first flush SlateDB through `index`. The flushed state
+    /// and its apply marker then cover the removed entries. An image at the current index can
+    /// replace a record without an image.
     pub(crate) fn publish_checkpoint(
         &mut self,
         index: u64,
-        prepared: PreparedCheckpoint,
+        prepared: Option<PreparedCheckpoint>,
         conf: ConfState,
     ) -> Result<()> {
         ensure!(
             index <= self.hard_state.commit,
             "cannot snapshot uncommitted data"
         );
-        ensure!(index > self.snapshot_index(), "snapshot did not advance");
+        let attach = prepared.is_some() && index == self.snapshot_index() && self.metadata_only();
+        ensure!(
+            index > self.snapshot_index() || attach,
+            "snapshot did not advance"
+        );
         let mut snapshot = Snapshot::default();
         snapshot.mut_metadata().index = index;
         snapshot.mut_metadata().term = self.term(index)?;
         snapshot.mut_metadata().set_conf_state(conf);
-        snapshot.data = prepared.data.clone();
         let mut batch = LogBatch::default();
-        prepared.publish(&self.dir, &snapshot, &mut batch)?;
+        match prepared {
+            Some(prepared) => {
+                snapshot.data = prepared.data.clone();
+                prepared.publish(&self.dir, &snapshot, &mut batch)?;
+            }
+            None => checkpoint::publish_metadata(&snapshot, &mut batch)?,
+        }
         batch.put(GROUP, IDENTITY.to_vec(), self.identity.clone())?;
         batch.put_message(GROUP, HARD_STATE.to_vec(), &self.hard_state)?;
         batch.add_command(GROUP, EngineCommand::Compact { index: index + 1 });
@@ -240,7 +260,9 @@ impl RaftStorage {
         self.engine.write(&mut batch, true)?;
         crate::failpoint::hit("checkpoint-after-save");
         self.sync_writes += 1;
-        checkpoint::retire(&self.dir, self.snapshot_index())?;
+        if !attach {
+            checkpoint::retire(&self.dir, self.snapshot_index())?;
+        }
         self.snapshot = snapshot;
         self.purge()?;
         crate::failpoint::hit("checkpoint-after-gc");
@@ -358,7 +380,10 @@ impl Storage for RaftStorage {
     }
 
     fn snapshot(&self, request_index: u64, _to: u64) -> raft::Result<Snapshot> {
-        if self.snapshot_index() == 0 || self.snapshot_index() < request_index {
+        if self.snapshot_index() == 0
+            || self.snapshot_index() < request_index
+            || self.snapshot.data.is_empty()
+        {
             return Err(StorageError::SnapshotTemporarilyUnavailable.into());
         }
         Ok(self.snapshot.clone())

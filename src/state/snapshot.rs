@@ -47,7 +47,10 @@ impl StateMachine {
         if index <= self.applied {
             return Ok(());
         }
-        self.checkpoint_delta = None;
+        ensure!(
+            !snapshot.data.is_empty(),
+            "state storage is behind the log truncation point"
+        );
         // Installed journal rows reach watchers through storage catch-up.
         if let Some(capture) = &mut self.watch_capture {
             capture.invalidate();

@@ -214,7 +214,7 @@ func TestSlowCheckpointPublicationKeepsRaftLive(t *testing.T) {
 	c := newCluster(t)
 	leader := c.leader()
 	api := client(t, []string{c.addresses[leader-1]})
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	_, err := api.Put(ctx, "checkpoint-io", "value")
 	require.NoError(t, err)
@@ -223,10 +223,13 @@ func TestSlowCheckpointPublicationKeepsRaftLive(t *testing.T) {
 	logFault(t, c, leader, 2500, false)
 	checkpoint := make(chan error, 1)
 	go func() { _, err := c.http(leader, "/checkpoint", map[string]any{}); checkpoint <- err }()
+	// The image reaches the log queue only after a synced state flush and image file sync. Those
+	// fsyncs can take seconds on a busy CI disk. The checks below start once the image waits
+	// behind the delayed log sync, so a longer wait here does not shorten what they cover.
 	require.Eventually(t, func() bool {
 		state, err := c.http(leader, "/status", nil)
 		return err == nil && state["log_busy"] == true && state["queued_snapshot_bytes"].(float64) > 0
-	}, time.Second, 10*time.Millisecond)
+	}, 5*time.Second, 10*time.Millisecond)
 	for n := 0; n < 10; n++ {
 		state, err := c.http(leader, "/status", nil)
 		require.NoError(t, err)

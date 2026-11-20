@@ -35,10 +35,11 @@ pub(super) enum Job {
         hs: Option<HardState>,
         snapshot: Option<Snapshot>,
     },
+    /// Truncate the log through `index`. An image is present only when a peer needs one.
     Checkpoint {
         conf: raft::eraftpb::ConfState,
         index: u64,
-        image: super::PreparedCheckpoint,
+        image: Option<super::PreparedCheckpoint>,
     },
     #[cfg(test)]
     Panic,
@@ -101,7 +102,7 @@ impl Job {
                 snapshot: Some(snapshot),
                 ..
             } => snapshot.data.len(),
-            Self::Checkpoint { image, .. } => image.data.len(),
+            Self::Checkpoint { image, .. } => image.as_ref().map_or(0, |image| image.data.len()),
             _ => 0,
         }
     }
@@ -167,7 +168,11 @@ impl Executor {
                 .storage
                 .persist(&entries, hs.as_ref(), snapshot.as_ref())?,
             Job::Checkpoint { index, image, conf } => {
-                if index > self.storage.snapshot_index() {
+                let attach = image.is_some()
+                    && index == self.storage.snapshot_index()
+                    && self.storage.metadata_only();
+                // A received snapshot can make this result obsolete.
+                if index > self.storage.snapshot_index() || attach {
                     self.storage.publish_checkpoint(index, image, conf)?;
                 }
             }

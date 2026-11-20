@@ -47,14 +47,30 @@ impl Node {
         Ok(())
     }
 
-    fn checkpoint_due(&self, applied: u64) -> bool {
-        (self.membership_checkpoint > self.raw.store().snapshot_index()
+    /// The checkpoint to start once `applied` entries have been applied, if one is due.
+    /// `Some(true)` builds a complete image; `Some(false)` only flushes state and truncates.
+    fn checkpoint_due(&self, applied: u64) -> Option<bool> {
+        let store = self.raw.store();
+        let snapshot_index = store.snapshot_index();
+        // A peer snapshot or a manual checkpoint needs a complete image.
+        let image_can_advance =
+            applied > snapshot_index || (snapshot_index > 0 && !store.has_image());
+        let image_due = image_can_advance
+            && (store.image_wanted()
+                || self
+                    .checkpoint_waiters
+                    .iter()
+                    .any(|(index, _)| *index <= applied));
+        // Automatic checkpoints only flush state and truncate the local log.
+        let truncate_due = ((self.membership_checkpoint > snapshot_index
             && applied >= self.membership_checkpoint)
-            || self
-                .checkpoint_waiters
-                .iter()
-                .any(|(index, _)| *index <= applied)
-            || self.next_checkpoint.is_some_and(|index| applied >= index)
+            || (self.next_checkpoint.is_some_and(|index| applied >= index)
+                && self.appended_bytes >= self.options.snapshot_min_bytes))
+            && applied > snapshot_index
+            && !store.image_wanted()
+            && self.checkpoint_waiters.is_empty()
+            && !self.sending_snapshot();
+        (image_due || truncate_due).then_some(image_due)
     }
 
     /// Submit committed entries in `(applied, committed]`, up to one apply batch.
@@ -89,7 +105,7 @@ impl Node {
                 || last < self.raw.store().snapshot_index()
                 || self.prepared_puts.is_some()
                 || !self.queries.is_empty()
-                || (self.checkpoint_due(last) && !self.checkpoint_running)
+                || (!self.checkpoint_running && self.checkpoint_due(last).is_some())
             {
                 return Ok(());
             }
@@ -124,9 +140,10 @@ impl Node {
             }
             return Ok(());
         }
-        let checkpoint_due = self.checkpoint_due(self.state.applied);
-        if checkpoint_due && !self.checkpoint_running && self.state.applied > snapshot_index {
-            return self.start_checkpoint();
+        if !self.checkpoint_running {
+            if let Some(image) = self.checkpoint_due(self.state.applied) {
+                return self.start_checkpoint(image);
+            }
         }
         if self.prefer_query {
             if let Some(job) = self.next_query_job() {
@@ -289,7 +306,11 @@ impl Node {
             }
             Output::Read { response, outcome } => response.kv(outcome)?,
             Output::Linear { id, outcome } => self.finish_read(id, outcome)?,
-            Output::Checkpoint => {}
+            Output::Checkpoint(built) => {
+                if let Some(built) = built {
+                    self.checkpoint_built(built)?;
+                }
+            }
         }
         Ok(())
     }
