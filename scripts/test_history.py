@@ -1,6 +1,7 @@
 """Check that history validation rejects deleted data and invalid commit metadata."""
 
 import importlib.util
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -48,6 +49,37 @@ class HistoryTests(unittest.TestCase):
     def test_missing_sign_off_fails(self):
         self.commit(b"Missing sign-off\n")
         self.assertIn(MISSING, self.errors())
+
+    def test_maintainer_sign_off_passes(self):
+        self.commit(b"Maintainer change\n\n" + HISTORY.MAINTAINER_SIGN_OFFS[1] + b"\n")
+        self.assertEqual(self.errors(), [])
+
+    def test_two_maintainer_sign_offs_fail(self):
+        self.commit(b"Twice\n\n" + b"\n".join(HISTORY.MAINTAINER_SIGN_OFFS) + b"\n")
+        self.assertIn("missing or repeated owner sign-off", self.errors())
+
+    def web_merge(self, email):
+        self.commit()
+        self.git("switch", "-q", "-c", "feature")
+        self.commit(b"Feature\n\n" + HISTORY.SIGN_OFF + b"\n")
+        self.git("switch", "-q", "-")
+        self.commit(b"Main\n\n" + HISTORY.SIGN_OFF + b"\n")
+        env = dict(os.environ, GIT_AUTHOR_NAME="ShuNing", GIT_AUTHOR_EMAIL=email,
+                   GIT_COMMITTER_NAME="GitHub", GIT_COMMITTER_EMAIL="noreply@github.com")
+        subprocess.check_output(["git", "merge", "-q", "--no-ff", "-m", "Merge pull request #1",
+                                 "feature"], cwd=self.root, env=env, stderr=subprocess.DEVNULL)
+        parents = self.git("rev-list", "--parents", "-1", "HEAD").split()
+        self.assertEqual(len(parents), 3)
+
+    def test_maintainer_web_merge_passes(self):
+        self.web_merge("nolouch@gmail.com")
+        self.assertEqual(self.errors(), [])
+
+    def test_other_web_merge_with_private_email_fails(self):
+        self.web_merge("someone@example.com")
+        errors = self.errors()
+        self.assertIn("author must use a GitHub public email", errors)
+        self.assertIn(MISSING, errors)
 
     def test_body_only_owner_sign_off_fails(self):
         self.commit(HISTORY.SIGN_OFF + b"\n\nLater prose\n")

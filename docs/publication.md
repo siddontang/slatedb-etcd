@@ -26,7 +26,9 @@ New repository checks and report normalization are separate changes at the branc
 
 Gitleaks 8.30.1 checks current publication files, all fetched history, and commit and tag messages.
 The metadata check also inspects author fields, sign-offs, deleted blobs, and annotated tags.
-It accepts the owner sign-off, or one author sign-off with the author's GitHub public email.
+It accepts one owner or maintainer sign-off.
+It also accepts one author sign-off with the author's GitHub public email.
+A GitHub merge by the maintainer `nolouch@gmail.com` needs no sign-off.
 CI checks commit metadata only for the commits an event adds to main or a pull request.
 Main history was checked when it landed, so later rule changes do not fail on it.
 Negative controls reject new private keys, missing sign-offs, private authors, and deleted paths.
