@@ -13,6 +13,29 @@ static ALLOCATOR: slatedb_etcd::write_profile::StageAllocator =
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[cfg(all(
+    feature = "jemalloc",
+    not(feature = "write-profile"),
+    target_os = "linux",
+    target_env = "gnu"
+))]
+mod malloc_conf {
+    /// A C string pointer that jemalloc reads before `main`.
+    #[repr(transparent)]
+    struct Conf(*const std::ffi::c_char);
+
+    // SAFETY: the pointer refers to an immutable static C string.
+    unsafe impl Sync for Conf {}
+
+    /// Default jemalloc options. `_RJEM_MALLOC_CONF` still overrides them at startup.
+    ///
+    /// jemalloc keeps freed dirty pages for 10 s by default. Memtable flushes and compactions
+    /// free hundreds of MiB at once, so RSS stayed near the earlier peak for 10 s. Return dirty
+    /// pages after 1 s. Muzzy decay keeps the jemalloc 5.3 default of 0.
+    #[export_name = "_rjem_malloc_conf"]
+    static CONF: Conf = Conf(c"dirty_decay_ms:1000,muzzy_decay_ms:0".as_ptr());
+}
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;

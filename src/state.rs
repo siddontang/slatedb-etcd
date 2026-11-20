@@ -121,6 +121,29 @@ impl StateCache {
     }
 }
 
+/// Read-ahead buffers per compaction input SST.
+const COMPACTION_FETCH_TASKS: usize = 2;
+/// Bytes of each compaction read-ahead buffer.
+const COMPACTION_FETCH_BYTES: usize = 512 * 1024;
+
+/// Cache SST indexes, filters, and current-row data blocks after a memtable flush.
+///
+/// SlateDB inserts every data block of a flushed L0 SST by default. Each flush then filled the
+/// block cache with history and Watch journal rows that latest reads do not touch. Puts use the
+/// in-memory key index. Range reads at the latest revision read `etcd/current/` rows, so a flush
+/// still caches those blocks. Other blocks are cached when a read loads them.
+fn block_cache_policy() -> slatedb::BlockCachePolicy {
+    use slatedb::CacheTarget;
+    slatedb::BlockCachePolicy::default().with_flush_targets(&[
+        CacheTarget::data(crate::mvcc::CURRENT..CURRENT_END),
+        CacheTarget::Index,
+        CacheTarget::Filters,
+    ])
+}
+
+/// The first key after every `etcd/current/` key.
+const CURRENT_END: &[u8] = b"etcd/current0";
+
 impl StateMachine {
     pub async fn open(dir: &Path) -> Result<Self> {
         Self::open_with_cache(dir, StateCache::default()).await
@@ -165,12 +188,18 @@ impl StateMachine {
             compactor.commit_compacted_interval = Duration::from_millis(100);
             if let Some(worker) = compactor.worker.as_mut() {
                 worker.compactions_poll_interval = Duration::from_millis(100);
+                // Each input SST of each subcompaction reads ahead `max_fetch_tasks` buffers
+                // of `bytes_to_fetch`. The 4 x 2 MiB default held about 256 MiB with 8 L0
+                // inputs and 4 subcompactions. Local objects need little read-ahead.
+                worker.max_fetch_tasks = COMPACTION_FETCH_TASKS;
+                worker.bytes_to_fetch = COMPACTION_FETCH_BYTES;
             }
         }
         let admin = slatedb::admin::Admin::builder(prefix, object_store.clone()).build();
         let db = Db::builder(prefix, object_store)
             .with_db_cache(cache, 0)
             .with_settings(settings)
+            .with_block_cache_policy(block_cache_policy())
             .build()
             .await?;
         let db = Arc::new(db);
