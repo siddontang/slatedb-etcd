@@ -143,7 +143,8 @@ The count includes waiting threads. It does not measure the number of busy CPU c
 The Raft owner retains RawNode, an in-memory log view, peer transport, and pending proposals.
 A dedicated operating-system thread owns raft-engine and all steady-state log I/O.
 One apply worker owns StateMachine and all mutations.
-It executes committed batches, snapshot installation, diagnostic queries, and Watch scans.
+It executes committed batches, snapshot installation, and diagnostic queries.
+Watch streams read the event feed and scan journal history on pinned views.
 Independent KV read tasks use pinned data and matching applied metadata.
 It also pins checkpoints. A separate task builds each pinned snapshot.
 
@@ -431,8 +432,8 @@ A secured proposal carries a token or a verified certificate identity.
 Apply checks permissions after all earlier changes. A queued write cannot use a revoked grant.
 Transactions require permission for comparisons and both branches. Lease operations check attached
 keys.
-Watch polls recheck identity and range permission. Token expiry and auth changes cancel stale
-streams.
+Watch streams recheck identity and range permission on auth changes, before event delivery, and
+every second. Token expiry and auth changes cancel stale streams.
 Password checks use blocking workers. Raft carries bcrypt hashes and issued tokens, never passwords.
 
 Membership changes use Raft configuration entries. Only one configuration change can remain pending.

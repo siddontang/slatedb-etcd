@@ -125,11 +125,11 @@ impl Node {
         };
         let durable = self.state.durable_applied.max(state.durable_applied);
         let membership_changed = !std::sync::Arc::ptr_eq(&self.state.members, &state.members);
+        let mut state = state;
+        let batch = state.watch.take();
         self.state = state;
         self.forwarding.apply(self.state.revision);
-        if *self.applied_notify.borrow() != self.state.applied {
-            self.applied_notify.send_replace(self.state.applied);
-        }
+        self.publish_watch(batch);
         self.state.durable_applied = durable;
         self.finish_revision_waiters();
 

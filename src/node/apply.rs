@@ -15,6 +15,8 @@ pub(super) struct AppliedState {
     pub read: std::sync::Arc<crate::state::ReadView>,
     pub write_batches: u64,
     pub logical_size: u64,
+    /// Watch events that this state publishes after the node installs it.
+    pub watch: Option<std::sync::Arc<crate::watch::Batch>>,
 }
 
 impl std::ops::Deref for AppliedState {
@@ -33,6 +35,7 @@ impl AppliedState {
             read: state.read_view()?,
             write_batches: state.write_batches,
             logical_size: state.logical_size(),
+            watch: None,
         })
     }
 }
@@ -70,13 +73,6 @@ pub(super) enum Query {
     ),
     Read(RequestOp, Option<crate::auth::Credentials>, ClientResponse),
     Linear(RequestOp, Option<crate::auth::Credentials>, u64),
-    Watch(
-        crate::proto::etcdserverpb::WatchCreateRequest,
-        bool,
-        Option<i64>,
-        Option<crate::auth::Credentials>,
-        Response,
-    ),
     Local(String, Response),
 }
 
@@ -106,7 +102,6 @@ impl Query {
             }
             Self::Maintenance(_, _, _, response)
             | Self::AuthLookup(_, response)
-            | Self::Watch(_, _, _, _, response)
             | Self::Local(_, response) => response,
         };
         let _ = response.send(Err(error));
@@ -205,6 +200,7 @@ impl Executor {
             Job::Entries(_) | Job::Snapshot(_) | Job::PublishPuts(_)
         );
         let copy_state = changes_state || matches!(work.job, Job::Query(Query::Maintenance(..)));
+        let previous_revision = self.state.revision;
         if (changes_state || matches!(work.job, Job::PreparePuts(_))) && !work.delay.is_zero() {
             tokio::time::sleep(work.delay).await;
         }
@@ -248,41 +244,6 @@ impl Executor {
                 Query::Linear(..) | Query::Read(..) => {
                     anyhow::bail!("read reached the apply worker")
                 }
-                Query::Watch(request, require_leader, through, credentials, response) => {
-                    let permission = credentials.as_ref().map_or(Ok(()), |auth| {
-                        if request.key.is_empty() {
-                            self.state.auth.authenticated(auth)
-                        } else {
-                            self.state
-                                .auth
-                                .range(auth, &request.key, &request.range_end, false)
-                        }
-                    });
-                    let mut page = if let Err(error) = permission {
-                        return Ok(Completion {
-                            applied: self.state.applied,
-                            state: None,
-                            output: Output::Query {
-                                response,
-                                require_leader,
-                                value: serde_json::to_value(Outcome::<Value> {
-                                    result: Err(error),
-                                })?,
-                            },
-                        });
-                    } else {
-                        self.state.watch(&request, through).await?
-                    };
-                    work.header.fill(page.header.as_mut());
-                    for response in &mut page.responses {
-                        work.header.fill(response.header.as_mut());
-                    }
-                    Output::Query {
-                        response,
-                        value: serde_json::to_value(Outcome { result: Ok(page) })?,
-                        require_leader,
-                    }
-                }
                 Query::Local(key, response) => {
                     let value = self.state.local_value(&key).await?;
                     Output::Query {
@@ -321,11 +282,20 @@ impl Executor {
                 Output::Checkpoint
             }
         };
+        let state = match copy_state {
+            true => {
+                let mut state = AppliedState::new(&self.state)?;
+                state.watch = self
+                    .state
+                    .take_watch_batch(previous_revision)
+                    .map(std::sync::Arc::new);
+                Some(state)
+            }
+            false => None,
+        };
         Ok(Completion {
             applied: self.state.applied,
-            state: copy_state
-                .then(|| AppliedState::new(&self.state))
-                .transpose()?,
+            state,
             output,
         })
     }
@@ -349,7 +319,8 @@ impl Drop for Worker {
 }
 
 impl Worker {
-    pub fn start(state: StateMachine, events: mpsc::Sender<Event>, manual: bool) -> Self {
+    pub fn start(mut state: StateMachine, events: mpsc::Sender<Event>, manual: bool) -> Self {
+        state.watch_capture = Some(Default::default());
         let (work, mut jobs) = mpsc::channel::<Work>(1);
         let (done, completed) = mpsc::channel(1);
         let database = state.db.clone();

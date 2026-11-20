@@ -177,13 +177,14 @@ impl StateMachine {
         Ok(Outcome { result })
     }
 
+    #[cfg(test)]
     pub async fn watch(
         &self,
         request: &crate::proto::etcdserverpb::WatchCreateRequest,
         through: Option<i64>,
     ) -> Result<crate::watch::WatchPage> {
         crate::watch::read(
-            &self.db,
+            &*self.db.snapshot()?,
             through.unwrap_or(self.revision).min(self.revision),
             self.compact_revision,
             request,
