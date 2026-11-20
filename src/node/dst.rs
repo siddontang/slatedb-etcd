@@ -151,6 +151,7 @@ impl Simulation {
                     cache_bytes: 1024,
                     ..LogMemory::default()
                 },
+                state_cache: Default::default(),
             },
             events,
             Some(senders),

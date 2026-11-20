@@ -360,6 +360,85 @@ async fn warm_reads_use_the_state_cache_and_observe_new_versions() {
 }
 
 #[tokio::test]
+async fn scans_keep_new_sst_metadata_after_blocks_fill_the_cache() {
+    use crate::object::faults::{FaultStore, FAIL_SST_GET};
+    use slatedb::object_store::memory::InMemory;
+    const BUDGET: u64 = 1024 * 1024;
+    let store = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    // A single shared cache with twice this budget fails this test.
+    let cache = StateCache {
+        block_bytes: BUDGET,
+        meta_bytes: BUDGET,
+    };
+    let mut state = StateMachine::open_store_with_cache(store.clone(), "meta", cache)
+        .await
+        .unwrap();
+    // Each SST index weighs about 50 data blocks, but fits easily in either budget.
+    let key = |set: u8, i: usize| format!("{}/{i:0>100}", set as char).into_bytes();
+    let range = |set: u8, end: usize, limit: i64| RequestOp {
+        request: Some(Op::RequestRange(RangeRequest {
+            key: key(set, 0),
+            range_end: key(set, end),
+            limit,
+            ..Default::default()
+        })),
+    };
+    let mut index = 0;
+    for set in [b'a', b'b'] {
+        for chunk in 0..if set == b'a' { 64 } else { 32 } {
+            let requests: Vec<_> = (0..256)
+                .map(|i| put(&key(set, chunk * 256 + i), b"value", 0))
+                .collect();
+            let puts: Vec<_> = requests
+                .iter()
+                .map(|request| {
+                    index += 1;
+                    put_batch::Put {
+                        index,
+                        request,
+                        credentials: None,
+                        origin: 1,
+                    }
+                })
+                .collect();
+            state.apply_puts(&puts).await.unwrap();
+        }
+        state.db.flush().await.unwrap();
+        if set == b'a' {
+            // Count every row twice. Set a's blocks now fill the block budget.
+            for _ in 0..2 {
+                let view = state.read_view().unwrap();
+                view.read(&range(b'a', 16384, 1), None)
+                    .await
+                    .unwrap()
+                    .result
+                    .unwrap();
+            }
+        }
+    }
+    // Set b's SST and its index arrive while the cache is full of set a's blocks.
+    let view = state.read_view().unwrap();
+    let small = range(b'b', 10, 0);
+    let expected = view.read(&small, None).await.unwrap().result.unwrap();
+    // Moka decides admission in its maintenance runs. Let several runs happen between reads.
+    for _ in 0..5 {
+        for _ in 0..4 {
+            assert_eq!(
+                view.read(&small, None).await.unwrap().result.unwrap(),
+                expected
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    }
+    store.set(FAIL_SST_GET);
+    let cached = view.read(&small, None).await.unwrap().result;
+    store.set(0);
+    assert_eq!(cached.unwrap(), expected);
+    drop(view);
+    state.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn append_accounting_keeps_original_absence_through_batch_rewrites() {
     let dir = tempfile::tempdir().unwrap();
     let mut state = StateMachine::open(dir.path()).await.unwrap();

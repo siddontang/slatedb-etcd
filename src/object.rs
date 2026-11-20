@@ -177,10 +177,16 @@ struct Binding {
 }
 
 impl Config {
-    pub async fn open(&self, dir: &Path, cluster: &str, member: u64) -> Result<StateMachine> {
+    pub async fn open(
+        &self,
+        dir: &Path,
+        cluster: &str,
+        member: u64,
+        cache: crate::state::StateCache,
+    ) -> Result<StateMachine> {
         #[cfg(test)]
         if let Self::Test(store, path) = self {
-            return StateMachine::open_store(store.clone(), path).await;
+            return StateMachine::open_store_with_cache(store.clone(), path, cache).await;
         }
         let s3 = match self {
             Self::S3(s3) => {
@@ -192,12 +198,12 @@ impl Config {
         };
         let binding = bind(dir, cluster, member, s3)?;
         let Some(s3) = &binding.s3 else {
-            return StateMachine::open(&dir.join("objects")).await;
+            return StateMachine::open_with_cache(&dir.join("objects"), cache).await;
         };
         let store = s3.store()?;
         let prefix = s3.member_prefix(cluster, member);
         claim(store.as_ref(), &prefix, &binding).await?;
-        StateMachine::open_store(store, &format!("{prefix}/state")).await
+        StateMachine::open_store_with_cache(store, &format!("{prefix}/state"), cache).await
     }
 }
 

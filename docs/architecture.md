@@ -494,8 +494,11 @@ Other changed logical keys with unknown lengths cost one point read each.
 Startup performs one O(N) scan over N logical records.
 Snapshot replacement uses the same batch path.
 The counter adds no stored metadata. Snapshot import accepts only the current format, version 3.
-Each member uses a 64 MiB weighted Moka cache for immutable SST blocks and metadata.
-This state cache has a separate budget from Raft log memory. It has no time-based expiry.
+Each member caches immutable SST data in two weighted Moka caches. Each has 64 MiB by default.
+One holds data blocks. The other holds SST indexes, filters, and stats.
+Moka admits an entry only if it is more frequent than all entries it would evict together.
+A shared cache full of 4 KiB blocks thus rejects every multi-MiB SST index.
+These budgets are separate from Raft log memory. They have no time-based expiry.
 The weight limit covers cached entries; allocator and cache overhead can add resident memory.
 Tests compare the counter with a full scan after state changes, restart, and DST recovery.
 
