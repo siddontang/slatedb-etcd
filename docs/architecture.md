@@ -77,7 +77,7 @@ SlateDB uses these logical keys:
 | `etcd/current/` | Current values and key metadata |
 | `etcd/history/` | Historical versions and tombstones |
 | `etcd/revision` and `etcd/compact-revision` | MVCC progress and retained history boundary |
-| `etcd/events/` | Ordered Watch events with previous values |
+| `etcd/events/` | Ordered Watch events with previous values or their history revisions |
 | `etcd/leases/` | Lease TTL and generation |
 | `etcd/auth` | Users, roles, bcrypt hashes, tokens, and authentication revision |
 | `etcd/members` | Voters, learners, addresses, and removed member IDs |
@@ -344,6 +344,30 @@ Apply cannot select entries from a cache prefix that the new snapshot removed.
 Ordinary puts share one immutable encoded value between the current row and the HashKV index.
 History and Watch keep their own records. Both indexes count their full logical size for quota.
 
+## Key index
+
+The apply owner keeps an in-memory index of every current etcd key, like etcd's `treeIndex`.
+Each entry holds the create revision, modification revision, version, lease, and row length.
+Startup builds it with one scan of `etcd/current/`.
+Every state write updates it after SlateDB accepts the batch.
+Snapshot installation, compaction, deletes, transactions, and lease revocation use this path.
+
+Put, transaction, and quota evaluation read metadata from the index.
+They read the old value only for `prev_kv`, `ignore_value`, or a value or range comparison.
+A Put on an existing key therefore needs no SlateDB read in the common case.
+Pinned read views do not use the index.
+
+A Watch journal Put event stores the history revision of its previous value, not the value.
+That history version holds the same `KeyValue` as the replaced current row.
+Compaction keeps it whenever Watch can return the previous value.
+Watch with `prev_kv` reads one history row for each such event. Delete events keep inline values.
+Like etcd, Watch omits `prev_kv` and logs a warning when that history version is missing.
+Storage read errors still fail the Watch request.
+
+On 64-bit hosts, each hash table slot uses 57 bytes. The table keeps 44 to 88 percent of its
+slots full. A key therefore costs 65 to 130 bytes plus its own heap allocation.
+One million 16-byte keys use about 150 MB. Table growth briefly holds the old and new slots.
+
 The apply worker groups ordinary unleased puts within its 32-entry, 512 KiB job target.
 One large entry can exceed the byte target. The pending log limit still bounds that entry.
 Each request reads earlier puts from a temporary overlay and retains its own etcd revision.
@@ -461,7 +485,8 @@ This quota is not a filesystem capacity limit.
 The apply worker keeps a derived count of keys and values under `etcd/`.
 Each batch keeps the final mutation per key and reads each old value once.
 The worker updates the counter only after SlateDB accepts the atomic batch.
-Quota reads cost O(1). Batch accounting uses K point reads for K changed logical keys.
+Quota reads cost O(1). The key index supplies old current-row lengths without a read.
+Other changed logical keys with unknown lengths cost one point read each.
 Startup performs one O(N) scan over N logical records.
 Snapshot replacement uses the same batch path.
 The counter adds no stored metadata. Snapshot import accepts only the current format, version 3.
@@ -580,6 +605,8 @@ The receiving member checks leadership. A forwarded request makes at most one pe
 Forwarded KV writes wait for local revision progress without another quorum round.
 Apply encodes each ordinary Put value once for the current, hash, history, and Watch rows.
 It adds each row to the storage batch and updates quota before it evaluates the next Put.
+The key index supplies the old create revision, version, and row length of an ordinary Put.
+Apply reads the old current row only when the request asks for `prev_kv`.
 Append-only MVCC, Watch, and hash records skip quota lookups for keys absent before the batch.
 Other mutations still read prior values. Final mutations determine the byte counter.
 

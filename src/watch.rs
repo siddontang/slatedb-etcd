@@ -6,7 +6,8 @@ use crate::mvcc::{self, KvError};
 #[cfg(test)]
 use crate::proto::etcdserverpb::WatchResponse;
 use crate::proto::etcdserverpb::{ResponseHeader, WatchCreateRequest};
-use crate::proto::mvccpb::Event;
+use crate::proto::mvccpb::{Event, KeyValue};
+use crate::proto::state::Journal;
 
 const EVENTS: &[u8] = b"etcd/events/";
 
@@ -14,18 +15,65 @@ pub(crate) fn key(revision: i64) -> Vec<u8> {
     [EVENTS, &revision.to_be_bytes()].concat()
 }
 
-pub fn record(revision: i64, events: Vec<Event>, batch: &mut WriteBatch) {
+/// Record HashKV and Watch rows. `prev_revisions` follows `record_journal`.
+pub fn record(revision: i64, events: Vec<Event>, prev_revisions: Vec<i64>, batch: &mut WriteBatch) {
     crate::state::maintenance::record_hash(revision, &events, batch);
-    record_journal(revision, events, batch);
+    record_journal(revision, events, prev_revisions, batch);
 }
 
-pub(crate) fn record_journal(revision: i64, events: Vec<Event>, batch: &mut WriteBatch) {
+/// Store the events of one revision. A positive `prev_revisions` entry replaces the inline
+/// previous value with the history revision of that value.
+pub(crate) fn record_journal(
+    revision: i64,
+    events: Vec<Event>,
+    mut prev_revisions: Vec<i64>,
+    batch: &mut WriteBatch,
+) {
     if !events.is_empty() {
+        if prev_revisions.iter().all(|&revision| revision == 0) {
+            prev_revisions.clear();
+        }
         batch.put_new(
             key(revision),
-            crate::proto::state::Journal { events }.encode_to_vec(),
+            Journal {
+                events,
+                prev_revisions,
+            }
+            .encode_to_vec(),
         );
     }
+}
+
+/// Load a previous value from the history version that the journal names.
+///
+/// etcd fetches prev_kv with a Range at `mod_revision - 1` and omits it when the Range finds
+/// nothing. A missing or deleted version therefore yields `None`. Storage errors still fail.
+async fn previous_value(
+    db: &slatedb::DbSnapshot,
+    key: &[u8],
+    revision: i64,
+) -> Result<Option<KeyValue>, KvError> {
+    let Some(row) = db
+        .get(mvcc::history_key(key, revision))
+        .await
+        .map_err(KvError::storage)?
+    else {
+        tracing::warn!(
+            revision,
+            "Watch previous value is missing; omitting prev_kv"
+        );
+        return Ok(None);
+    };
+    let value = crate::proto::state::Version::decode(row)
+        .map_err(KvError::storage)?
+        .value;
+    if value.is_none() {
+        tracing::warn!(
+            revision,
+            "Watch previous value is a deletion; omitting prev_kv"
+        );
+    }
+    Ok(value)
 }
 
 pub async fn compact(db: &Db, revision: i64, batch: &mut WriteBatch) -> Result<(), KvError> {
@@ -47,7 +95,16 @@ pub(crate) const FEED_BATCH_BYTES: usize = 128 * 1024;
 /// Maximum journal revisions in one storage catch-up page.
 pub(crate) const PAGE_REVISIONS: usize = 32;
 
-type Journals = Vec<(i64, Vec<Event>)>;
+type Journals = Vec<(i64, Journal)>;
+
+/// Decode one journal row and check that `prev_revisions` matches the events.
+fn decode(value: bytes::Bytes) -> Result<Journal, KvError> {
+    let journal = Journal::decode(value).map_err(KvError::storage)?;
+    if !journal.prev_revisions.is_empty() && journal.prev_revisions.len() != journal.events.len() {
+        return Err(KvError::storage("invalid Watch journal"));
+    }
+    Ok(journal)
+}
 
 /// Collect journal rows that one apply job writes.
 #[derive(Debug)]
@@ -116,16 +173,13 @@ pub(crate) struct Batch {
 
 impl Batch {
     /// Decode once on the first reader. `None` means that watchers must read storage.
-    pub(crate) fn journals(&self) -> Option<&[(i64, Vec<Event>)]> {
+    pub(crate) fn journals(&self) -> Option<&[(i64, Journal)]> {
         self.decoded
             .get_or_init(|| {
                 self.rows
                     .as_ref()?
                     .iter()
-                    .map(|(revision, value)| {
-                        let journal = crate::proto::state::Journal::decode(value.clone()).ok()?;
-                        Some((*revision, journal.events))
-                    })
+                    .map(|(revision, value)| Some((*revision, decode(value.clone()).ok()?)))
                     .collect()
             })
             .as_deref()
@@ -157,31 +211,41 @@ pub struct Subscription {
 }
 
 /// Select the events of one revision that a watch request accepts.
-pub(crate) fn select(
+///
+/// A journal can name the history revision of a previous value instead of storing it inline.
+/// `db` must be a view that includes `revision`.
+pub(crate) async fn select(
+    db: &slatedb::DbSnapshot,
     request: &WatchCreateRequest,
     revision: i64,
     compact_revision: i64,
-    events: &[Event],
-) -> Vec<Event> {
+    journal: &Journal,
+) -> Result<Vec<Event>, KvError> {
     let keep_prev = request.prev_kv && revision > compact_revision;
-    events
-        .iter()
-        .filter(|event| {
-            event.kv.as_ref().is_some_and(|kv| {
-                mvcc::contains(&kv.key, &request.key, &request.range_end)
-                    && !request.filters.contains(&event.r#type)
-            })
-        })
-        .map(|event| Event {
+    let mut events = vec![];
+    for (position, event) in journal.events.iter().enumerate() {
+        let Some(kv) = event.kv.as_ref() else {
+            continue;
+        };
+        if !mvcc::contains(&kv.key, &request.key, &request.range_end)
+            || request.filters.contains(&event.r#type)
+        {
+            continue;
+        }
+        let prev_kv = if !keep_prev {
+            None
+        } else if let Some(&prev) = journal.prev_revisions.get(position).filter(|&&r| r > 0) {
+            previous_value(db, &kv.key, prev).await?
+        } else {
+            event.prev_kv.clone()
+        };
+        events.push(Event {
             r#type: event.r#type,
             kv: event.kv.clone(),
-            prev_kv: if keep_prev {
-                event.prev_kv.clone()
-            } else {
-                None
-            },
-        })
-        .collect()
+            prev_kv,
+        });
+    }
+    Ok(events)
 }
 
 /// Read at most `limit` journal revisions in `[from, through]` from a pinned view.
@@ -206,10 +270,7 @@ pub(crate) async fn scan(
                 .try_into()
                 .map_err(KvError::storage)?,
         );
-        let events = crate::proto::state::Journal::decode(row.value)
-            .map_err(KvError::storage)?
-            .events;
-        rows.push((revision, events));
+        rows.push((revision, decode(row.value)?));
         if rows.len() >= limit {
             return Ok((rows, revision));
         }
@@ -252,8 +313,8 @@ pub(crate) async fn read(
     }
     let (rows, through) = scan(db, request.start_revision, current, PAGE_REVISIONS).await?;
     page.next_revision = through + 1;
-    for (revision, events) in rows {
-        let events = select(request, revision, compact_revision, &events);
+    for (revision, journal) in rows {
+        let events = select(db, request, revision, compact_revision, &journal).await?;
         if !events.is_empty() {
             page.responses.push(WatchResponse {
                 header: mvcc::header(revision),

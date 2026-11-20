@@ -1,5 +1,4 @@
 use super::*;
-use crate::proto::mvccpb::Event as KvEvent;
 use crate::watch::{Batch, FeedState, PAGE_REVISIONS};
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
@@ -135,7 +134,7 @@ impl Stream {
         // A missing or incomplete batch leaves the covered watchers for storage catch-up.
         if let Some(journals) = batch.journals() {
             let credentials = self.credentials();
-            for (revision, events) in journals {
+            for (revision, journal) in journals {
                 for watcher in self.watchers.values_mut() {
                     let start = watcher.request.start_revision;
                     if start > batch.previous && start <= *revision {
@@ -146,7 +145,7 @@ impl Stream {
                             &credentials,
                             watcher,
                             *revision,
-                            events,
+                            journal,
                         )
                         .await?;
                     }
@@ -240,7 +239,7 @@ impl Stream {
         let (rows, covered) = crate::watch::scan(&view.snapshot, from, limit, PAGE_REVISIONS)
             .await
             .map_err(|e| Status::unavailable(format!("etcdserver: {}", e.message)))?;
-        for (revision, events) in &rows {
+        for (revision, journal) in &rows {
             for (id, start) in &pending {
                 if start <= revision {
                     let watcher = self.watchers.get_mut(id).expect("pending watcher");
@@ -251,7 +250,7 @@ impl Stream {
                         &credentials,
                         watcher,
                         *revision,
-                        events,
+                        journal,
                     )
                     .await?;
                 }
@@ -421,14 +420,17 @@ async fn deliver(
     credentials: &crate::auth::Credentials,
     watcher: &mut Watcher,
     revision: i64,
-    events: &[KvEvent],
+    journal: &crate::proto::state::Journal,
 ) -> Result<(), Status> {
     let events = crate::watch::select(
+        &state.view.snapshot,
         &watcher.request,
         revision,
         state.view.compact_revision,
-        events,
-    );
+        journal,
+    )
+    .await
+    .map_err(|e| Status::unavailable(format!("etcdserver: {}", e.message)))?;
     if events.is_empty() {
         return Ok(());
     }

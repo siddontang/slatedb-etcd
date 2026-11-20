@@ -140,6 +140,9 @@ Read completion does not move the apply index or copy state metadata.
 The owner still checks the read proof and apply position before it sends a response.
 Read evaluation does not construct a discarded write batch.
 
+The apply owner keeps an in-memory key index with revision metadata for each current key.
+Put, transaction, and quota paths read old metadata from it instead of SlateDB.
+See the [key index](architecture.md#key-index) for its update rules and memory cost.
 Ordinary puts without leases or ignore flags share writes within an apply job.
 A bounded overlay lets repeated keys see earlier puts in that group.
 Transactions, leased puts, administration, compaction, and empty entries end a group.
@@ -224,6 +227,8 @@ The diagnostic JSON keyspace is separate from the etcd keyspace and does not aff
 ## Watch and Lease recovery
 
 Each MVCC write stores ordered Watch events with the key changes and revision in one batch.
+A Put event stores the history revision of its previous value. Watch reads that version only
+when the request asks for `prev_kv`. Delete events keep the previous value inline.
 A transaction keeps request order within one revision. Lease revocation deletes all attached keys
 at one revision. Watch replay uses this journal after restart and snapshot installation.
 Compaction removes events below the boundary. Events at the boundary remain available.

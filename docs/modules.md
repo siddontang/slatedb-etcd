@@ -23,6 +23,7 @@ The CLI and embedded API share the same lifecycle and runtime paths.
 | `node/proposal` | Group consecutive leader Put proposals within one event turn |
 | `node/quorum_put` | Prepare exact Put results after quorum commit |
 | `state/checkpoint` | Merge bounded row changes into a complete checkpoint |
+| `state/key_index` | Keep revision metadata for every current key in memory |
 | `node/read` | Confirm Safe ReadIndex and reject obsolete proofs |
 | `node/read/executor` | Run bounded reads on immutable applied views |
 | `node/lease` | Schedule leader lease expiry from replicated generations |

@@ -63,7 +63,7 @@ impl StateMachine {
                     let mut alarm_write = WriteBatch::new();
                     alarm_write.put(crate::maintenance::ALARMS, serde_json::to_vec(&alarms)?);
                     size = alarm_write
-                        .logical_size_after(&self.db, Some(&batch), size)
+                        .logical_size_after(&self.db, &self.key_index, Some(&batch), size)
                         .await?;
                     batch.extend(alarm_write);
                     Err(if corrupt {
@@ -75,15 +75,13 @@ impl StateMachine {
                         )
                     })
                 } else {
-                    match mvcc::prepare_put(
-                        &self.db,
-                        revision,
-                        put.request,
-                        &mut batch,
-                        &mut size,
-                        &self.current,
-                    )
-                    .await
+                    let view = mvcc::CurrentView {
+                        db: &self.db,
+                        rows: &self.current,
+                        index: &self.key_index,
+                    };
+                    match mvcc::prepare_put(&view, revision, put.request, &mut batch, &mut size)
+                        .await
                     {
                         Ok((reply, next)) => {
                             if let Some(

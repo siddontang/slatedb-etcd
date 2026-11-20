@@ -1040,6 +1040,7 @@ impl Simulation {
                     .await
                     .unwrap()
             );
+            assert!(state.key_index.matches(&state.db).await.unwrap());
             assert!(node.state.auth.range(&writer, b"admin", b"", true).is_err());
             assert!(node.state.auth.range(&token, b"admin", b"", true).is_err());
             let value = node
@@ -1212,6 +1213,7 @@ impl Simulation {
                     .await
                     .unwrap()
             );
+            assert!(state.key_index.matches(&state.db).await.unwrap());
         }
         self.trace.push("batched put history recovered".into());
     }
@@ -1543,6 +1545,10 @@ impl Simulation {
                 size += (row.key.len() + row.value.len()) as u64;
             }
             assert_eq!(state.logical_size(), size, "seed {seed}");
+            assert!(
+                state.key_index.matches(&state.db).await.unwrap(),
+                "seed {seed}"
+            );
             assert!(node.state.leases[&77].generation > generation);
             let mut request = WatchCreateRequest {
                 key: vec![0],

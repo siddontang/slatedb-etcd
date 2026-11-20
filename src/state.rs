@@ -21,12 +21,15 @@ mod checkpoint;
 mod cluster;
 pub(crate) mod current;
 mod diagnostic;
+pub(crate) mod key_index;
 mod kv;
 mod lease;
 pub(crate) mod put_batch;
 mod read;
 mod snapshot;
 pub(crate) use read::ReadView;
+#[cfg(test)]
+mod key_index_tests;
 pub(crate) mod maintenance;
 #[cfg(test)]
 mod quota_tests;
@@ -50,6 +53,7 @@ pub struct StateMachine {
     pub quota: u64,
     logical_bytes: u64,
     pub(crate) current: current::CurrentRows,
+    pub(crate) key_index: key_index::KeyIndex,
     checkpoint_delta: Option<checkpoint::Delta>,
     pub(crate) write_batches: u64,
     pub alarms: Vec<crate::proto::etcdserverpb::AlarmMember>,
@@ -137,6 +141,7 @@ impl StateMachine {
                 metrics: Arc::new(crate::metrics::StateMeters::new()?),
                 quota: 0,
                 current: current::CurrentRows::default(),
+                key_index: key_index::KeyIndex::load(&db).await?,
                 checkpoint_delta: None,
                 logical_bytes: maintenance::count_logical_size(&db).await?,
                 write_batches: 0,
@@ -161,7 +166,9 @@ impl StateMachine {
     }
 
     async fn write_batch(&mut self, batch: WriteBatch, index: u64) -> Result<()> {
-        let size = batch.logical_size(&self.db, self.logical_bytes).await?;
+        let size = batch
+            .logical_size(&self.db, &self.key_index, self.logical_bytes)
+            .await?;
         self.store_batch(batch, index).await?;
         self.logical_bytes = size;
         Ok(())
@@ -177,6 +184,7 @@ impl StateMachine {
                 capture.record(&key, value.as_ref());
             }
             self.current.publish(&key, value.as_ref());
+            self.key_index.publish(&key, value.as_ref())?;
             if let Some(delta) = &mut self.checkpoint_delta {
                 if !delta.record(key, value) {
                     self.checkpoint_delta = None;

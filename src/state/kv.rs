@@ -66,6 +66,7 @@ impl StateMachine {
         );
         let (result, mut batch, revision, counts) = match mvcc::prepare_with_counts(
             &self.db,
+            Some(&self.key_index),
             self.revision,
             self.compact_revision,
             request,
