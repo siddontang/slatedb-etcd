@@ -361,6 +361,7 @@ impl Kv for Service {
                 let result = KvClient::new(channel)
                     .compact(forward_auth(request, &credentials))
                     .await;
+                let result = self.forwarded(error.leader_id, result);
                 let compacted = result.as_ref().is_err_and(|s| {
                     s.code() == tonic::Code::OutOfRange
                         && s.message().strip_prefix("etcdserver: ") == Some(crate::mvcc::COMPACTED)

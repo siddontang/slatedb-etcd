@@ -186,24 +186,32 @@ impl Node {
         while self.transports.try_join_next().is_some() {}
         self.traffic.retain(|id, _| peers.contains_key(id));
         self.senders.retain(|id, _| peers.contains_key(id));
+        self.peer_addresses.retain(|id, _| peers.contains_key(id));
         for (&id, address) in &peers {
             if id == self.options.id {
                 continue;
             }
-            let unchanged = self
-                .options
-                .peers
-                .get(&id)
-                .is_some_and(|old| crate::cluster::url(old) == crate::cluster::url(address));
-            if unchanged && self.senders.contains_key(&id) {
-                continue;
+            if self.senders.contains_key(&id) {
+                // A running sender keeps its connection and dials the new URL after a failure.
+                if let Some(sender) = self.peer_addresses.get(&id) {
+                    sender.send_if_modified(|old| {
+                        let changed = crate::cluster::url(old) != crate::cluster::url(address);
+                        if changed {
+                            *old = address.clone();
+                        }
+                        changed
+                    });
+                    continue;
+                }
             }
             let (tx, rx) = mpsc::channel(256);
             self.senders.insert(id, tx);
             self.peer_health.remove(&id);
-            self.transports.spawn(transport(
+            let (address_tx, address_rx) = tokio::sync::watch::channel(address.clone());
+            self.peer_addresses.insert(id, address_tx);
+            self.transports.spawn(transport_to(
                 id,
-                address.clone(),
+                address_rx,
                 self.options.cluster_id.clone(),
                 rx,
                 self.events.clone(),

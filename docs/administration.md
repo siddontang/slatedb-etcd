@@ -63,6 +63,9 @@ Use a learner when replacing or adding a server. The service allows one learner 
 4. Wait for snapshot installation and log catch-up. Then call `member promote ID`.
 5. Use `move-leader ID` when the new voter should become leader.
 
+MemberUpdate changes where members dial that peer. As in etcd, a working connection stays open.
+Raft and forwarded requests use the new URL after that connection fails.
+
 Keep the same bootstrap arguments when restarting an existing data directory.
 The persisted membership controls voting and transport after recovery.
 A removed member ID cannot rejoin. Do not reuse its old data directory for a new member.

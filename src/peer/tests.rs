@@ -474,3 +474,57 @@ async fn receiver_pipelines_with_count_bytes_and_ordered_receipt_limits() {
         let _ = server.await;
     }
 }
+
+#[tokio::test]
+async fn changed_address_applies_when_the_sender_dials_again() {
+    let (first_address, mut first, first_server) = server().await;
+    let (address, receiver) = tokio::sync::watch::channel(first_address);
+    let (messages, queue) = mpsc::channel(256);
+    let (events, mut reports) = mpsc::channel(256);
+    let sender = tokio::spawn(transport_to(
+        2,
+        receiver,
+        "stream-test".into(),
+        queue,
+        events,
+        crate::tls::Transport::default(),
+        Default::default(),
+    ));
+    let reports = tokio::spawn(async move { while reports.recv().await.is_some() {} });
+    messages.send(message(false)).await.unwrap();
+    step(&mut first, false)
+        .await
+        .send(Ok(json!({"accepted": true})))
+        .unwrap();
+
+    // A member update to an unreachable URL keeps the working stream, as in etcd.
+    address.send_replace("127.0.0.1:1".into());
+    messages.send(message(false)).await.unwrap();
+    step(&mut first, false)
+        .await
+        .send(Ok(json!({"accepted": true})))
+        .unwrap();
+
+    // After the stream fails, the sender dials the current URL.
+    let (second_address, mut second, second_server) = server().await;
+    address.send_replace(second_address);
+    first_server.abort();
+    drop(first);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            messages.send(message(false)).await.unwrap();
+            if let Ok(Some(Event::PeerFrame(_, _, response))) =
+                tokio::time::timeout(Duration::from_millis(200), second.recv()).await
+            {
+                response.send(Ok(json!({"accepted": true}))).unwrap();
+                break;
+            }
+        }
+    })
+    .await
+    .expect("sender did not dial the updated URL");
+    drop(messages);
+    sender.await.unwrap();
+    reports.abort();
+    second_server.abort();
+}
