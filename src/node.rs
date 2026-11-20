@@ -78,11 +78,7 @@ pub enum Event {
     Checkpoint(Response),
     LocalValue(String, Response),
     BlockPeers(BTreeSet<u64>, Response),
-    SnapshotBuilt {
-        index: u64,
-        conf: raft::eraftpb::ConfState,
-        result: Result<PreparedCheckpoint>,
-    },
+    SnapshotBuilt(apply::Built),
     SnapshotDelay(u64, Response),
     ApplyDelay(u64, Response),
     LogFault(u64, bool, Response),
@@ -94,12 +90,18 @@ pub enum Event {
     },
 }
 
+/// Flush SlateDB for log truncation about once per L0 SST instead of once per entry interval.
+pub const DEFAULT_SNAPSHOT_MIN_BYTES: u64 = 64 * 1024 * 1024;
+
 pub struct NodeOptions {
     pub id: u64,
     pub cluster_id: String,
     pub peers: BTreeMap<u64, String>,
     pub dir: PathBuf,
     pub snapshot_every: u64,
+    /// Automatic log truncation also waits for this many appended log bytes. Each truncation
+    /// flushes SlateDB with synced writes, so small flushes cost more than the log they free.
+    pub snapshot_min_bytes: u64,
     pub log_memory: LogMemory,
     pub state_cache: crate::state::StateCache,
     pub quota_bytes: i64,
@@ -190,7 +192,7 @@ pub struct Node {
     log_read_delay_ms: u64,
     log_read_fail: bool,
     peer_waiters: Vec<Response>,
-    built_checkpoint: Option<(u64, raft::eraftpb::ConfState, PreparedCheckpoint)>,
+    built_checkpoint: Option<(u64, raft::eraftpb::ConfState, Option<PreparedCheckpoint>)>,
     read_executor: read::executor::Executor,
     read_queries: VecDeque<Query>,
     reads: BTreeMap<u64, read::PendingRead>,
@@ -222,6 +224,12 @@ pub struct Node {
     recovered_from_index: u64,
     send_failures: Vec<(u64, bool)>,
     checkpoint_running: bool,
+    // Full backlog checks by cause: apply lag, queued log jobs, queued log bytes.
+    backlog_rejects: [u64; 3],
+    // Log bytes appended since the last checkpoint started.
+    appended_bytes: u64,
+    // Count full images started for peers or manual checkpoints.
+    snapshot_images: u64,
     next_checkpoint: Option<u64>,
     checkpoint_waiters: Vec<(u64, Response)>,
     snapshot_delay_ms: u64,
@@ -450,6 +458,9 @@ impl Node {
             recovered_from_index,
             send_failures: vec![],
             checkpoint_running: false,
+            backlog_rejects: [0; 3],
+            appended_bytes: 0,
+            snapshot_images: 0,
             next_checkpoint,
             checkpoint_waiters: vec![],
             snapshot_delay_ms: 0,
@@ -841,17 +852,7 @@ impl Node {
                     self.schedule_apply()?;
                 }
             }
-            Event::SnapshotBuilt {
-                index,
-                conf,
-                result,
-            } => {
-                ensure!(
-                    self.built_checkpoint.is_none(),
-                    "overlapping checkpoint results"
-                );
-                self.built_checkpoint = Some((index, conf, result?));
-            }
+            Event::SnapshotBuilt(built) => self.checkpoint_built(built)?,
             Event::SnapshotDelay(delay_ms, response) => {
                 self.snapshot_delay_ms = delay_ms.min(5000);
                 let _ = response.send(Ok(self.status()?));
@@ -909,15 +910,22 @@ impl Node {
         Ok(())
     }
 
-    fn backlogged(&self) -> bool {
-        self.raw
-            .store()
-            .commit_index()
-            .max(self.raw.raft.raft_log.committed)
-            .saturating_sub(self.state.applied)
-            >= apply::MAX_APPLY_LAG
-            || self.log_queue.len() >= log::MAX_JOBS
-            || self.log_bytes >= log::MAX_BYTES
+    /// Return true when a new proposal must wait. Count each full check by cause for `/status`.
+    fn backlogged(&mut self) -> bool {
+        let causes = [
+            self.raw
+                .store()
+                .commit_index()
+                .max(self.raw.raft.raft_log.committed)
+                .saturating_sub(self.state.applied)
+                >= apply::MAX_APPLY_LAG,
+            self.log_queue.len() >= log::MAX_JOBS,
+            self.log_bytes >= log::MAX_BYTES,
+        ];
+        for (count, hit) in self.backlog_rejects.iter_mut().zip(causes) {
+            *count += u64::from(hit);
+        }
+        causes.contains(&true)
     }
 
     fn propose(&mut self, command: RaftCommand, response: impl Into<ClientResponse>) -> Result<()> {
@@ -1031,23 +1039,49 @@ impl Node {
         }
     }
 
-    fn start_checkpoint(&mut self) -> Result<()> {
+    fn start_checkpoint(&mut self, image: bool) -> Result<()> {
         if self.checkpoint_running || self.apply_busy || self.prepared_puts.is_some() {
             return Ok(());
         }
-        if self.state.applied <= self.raw.store().snapshot_index() {
+        let store = self.raw.store();
+        let advances = self.state.applied > store.snapshot_index();
+        // An image can replace a record without an image at the same index.
+        let attaches = image && store.snapshot_index() > 0 && !store.has_image();
+        if !advances && !attaches {
             return Ok(());
         }
         self.submit_apply(
-            Job::Checkpoint(
-                Duration::from_millis(self.snapshot_delay_ms),
-                self.raw.store().recovery_snapshot().clone(),
-                self.options.dir.join("raft"),
-            ),
+            Job::Checkpoint {
+                delay: Duration::from_millis(self.snapshot_delay_ms),
+                dir: self.options.dir.join("raft"),
+                image,
+            },
             self.state.applied,
         )?;
         self.checkpoint_running = true;
+        self.appended_bytes = 0;
+        if image {
+            self.snapshot_images += 1;
+        }
         Ok(())
+    }
+
+    fn checkpoint_built(&mut self, built: apply::Built) -> Result<()> {
+        ensure!(
+            self.built_checkpoint.is_none(),
+            "overlapping checkpoint results"
+        );
+        self.built_checkpoint = Some((built.index, built.conf, built.result?));
+        Ok(())
+    }
+
+    /// Return true while a peer receives an image. Truncation would discard that image.
+    fn sending_snapshot(&self) -> bool {
+        self.raw
+            .raft
+            .prs()
+            .iter()
+            .any(|(_, progress)| progress.state == raft::ProgressState::Snapshot)
     }
 
     fn finish_checkpoint_waiters(&mut self) -> Result<()> {
@@ -1056,7 +1090,12 @@ impl Node {
             if response.is_closed() {
                 continue;
             }
-            if index <= self.raw.store().snapshot_index() && index <= self.state.applied {
+            // A manual checkpoint completes only with a complete image.
+            let store = self.raw.store();
+            if index <= store.snapshot_index()
+                && index <= self.state.applied
+                && (index == 0 || store.has_image())
+            {
                 let _ = response.send(Ok(self.status()?));
             } else {
                 waiting.push((index, response));
@@ -1136,6 +1175,14 @@ impl Node {
             status["write_profile"] = crate::write_profile::snapshot();
         }
         status["quorum_reply_index"] = self.quorum_reply_index.into();
+        status["snapshot_has_image"] = self.raw.store().has_image().into();
+        status["snapshot_image_wanted"] = self.raw.store().image_wanted().into();
+        status["snapshot_images_built"] = self.snapshot_images.into();
+        status["backlog_full_checks"] = json!({
+            "apply_lag": self.backlog_rejects[0],
+            "log_jobs": self.backlog_rejects[1],
+            "log_bytes": self.backlog_rejects[2],
+        });
         Ok(status)
     }
 }

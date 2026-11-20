@@ -15,6 +15,7 @@ fn options(dir: &std::path::Path) -> NodeOptions {
         dir: dir.to_owned(),
         peers: (1..=3).map(|id| (id, format!("127.0.0.1:{id}"))).collect(),
         snapshot_every: 0,
+        snapshot_min_bytes: 0,
         log_memory: LogMemory::default(),
         state_cache: Default::default(),
     }
@@ -1223,8 +1224,10 @@ async fn checkpoint_memory_does_not_use_the_entry_admission_budget() {
         log::Job::Checkpoint {
             conf: node.state.members.conf(),
             index: node.state.applied,
-            image: PreparedCheckpoint::write(&node.options.dir.join("raft"), vec![0; size].into())
-                .unwrap(),
+            image: Some(
+                PreparedCheckpoint::write(&node.options.dir.join("raft"), vec![0; size].into())
+                    .unwrap(),
+            ),
         },
         None,
         None,
@@ -1820,4 +1823,171 @@ async fn committed_batches_queue_behind_running_apply_in_log_order() {
     node.drain_apply().await.unwrap();
     assert_eq!(node.state.applied, total);
     assert!(node.apply_jobs.is_empty() && !node.apply_busy);
+}
+
+fn seed_puts(dir: &std::path::Path, count: u64) {
+    let mut store = RaftStorage::open(&dir.join("raft"), 1, "worker-test", vec![1, 2, 3]).unwrap();
+    let entries: Vec<_> = (1..=count)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            data: RaftCommand::Diagnostic(Command {
+                id: index.to_string(),
+                request: Request {
+                    operations: vec![crate::Operation::Put {
+                        key: "key".into(),
+                        value: index.to_string(),
+                    }],
+                },
+            })
+            .encode()
+            .unwrap()
+            .into(),
+            ..Default::default()
+        })
+        .collect();
+    let hs = HardState {
+        term: 1,
+        vote: 1,
+        commit: count,
+    };
+    store.persist(&entries, Some(&hs), None).unwrap();
+}
+
+#[tokio::test]
+async fn automatic_checkpoints_wait_for_appended_log_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_puts(dir.path(), 100);
+    let (events, _) = mpsc::channel(256);
+    let mut config = options(dir.path());
+    config.snapshot_every = 32;
+    config.snapshot_min_bytes = u64::MAX;
+    let mut node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    for _ in 0..1000 {
+        node.drive_ready().await.unwrap();
+        node.drain_log().await.unwrap();
+        node.drain_apply().await.unwrap();
+        if node.state.applied == 100 {
+            break;
+        }
+    }
+    assert_eq!(node.state.applied, 100);
+    // Small writes keep the log until enough bytes justify a synced SlateDB flush.
+    assert_eq!(node.raw.store().snapshot_index(), 0);
+    assert!(!node.checkpoint_running);
+}
+
+#[tokio::test]
+async fn automatic_checkpoints_truncate_without_an_image_and_recover_after_a_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_puts(dir.path(), 100);
+    let (events, _) = mpsc::channel(256);
+    let mut config = options(dir.path());
+    config.snapshot_every = 32;
+    let mut node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    for _ in 0..1000 {
+        node.drive_ready().await.unwrap();
+        node.drain_log().await.unwrap();
+        node.drain_apply().await.unwrap();
+        if node.state.applied == 100 && node.raw.store().snapshot_index() >= 96 {
+            break;
+        }
+    }
+    let truncated = node.raw.store().snapshot_index();
+    // Apply batches can pass the scheduled index before the checkpoint starts.
+    assert!(truncated >= 96);
+    assert!(!node.raw.store().has_image());
+    assert_eq!(node.snapshot_images, 0);
+    assert_eq!(node.raw.store().first_index().unwrap(), truncated + 1);
+    assert!(node.state.durable_applied >= truncated);
+    let raft = dir.path().join("raft");
+    let files = || -> Vec<String> {
+        std::fs::read_dir(&raft)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("checkpoint-"))
+            .collect()
+    };
+    assert!(files().is_empty());
+    // Drop the node without a state flush. Flushed state covers the truncated prefix.
+    drop(node);
+    let storage = RaftStorage::open(&raft, 1, "worker-test", vec![1, 2, 3]).unwrap();
+    assert_eq!(storage.snapshot_index(), truncated);
+    assert!(storage.recovery_snapshot().data.is_empty());
+    assert!(storage
+        .entries(
+            truncated,
+            truncated + 1,
+            None,
+            raft::GetEntriesContext::empty(false)
+        )
+        .is_err());
+    drop(storage);
+    let (events, _) = mpsc::channel(256);
+    let mut node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    assert!(node.recovered_from_index >= truncated);
+    assert_eq!(node.installed_snapshots, 0);
+    for _ in 0..100 {
+        node.drive_ready().await.unwrap();
+        node.drain_log().await.unwrap();
+        node.drain_apply().await.unwrap();
+    }
+    assert_eq!(node.state.applied, 100);
+    assert_eq!(
+        node.worker
+            .state()
+            .local_value("key")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("100")
+    );
+    // A manual checkpoint still writes a complete image for backup and peer transfer.
+    let (tx, mut reply) = oneshot::channel();
+    node.handle(Event::Checkpoint(tx), &mut vec![])
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        node.drive_ready().await.unwrap();
+        node.drain_log().await.unwrap();
+        node.drain_apply().await.unwrap();
+        node.finish_checkpoint_waiters().unwrap();
+        if reply.try_recv().is_ok() {
+            break;
+        }
+    }
+    assert_eq!(node.raw.store().snapshot_index(), 100);
+    assert!(node.raw.store().has_image());
+    assert_eq!(files(), vec![format!("checkpoint-{:016x}.data", 100)]);
+}
+
+#[tokio::test]
+async fn state_behind_a_truncated_log_stops_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_log(dir.path(), 10);
+    let mut storage =
+        RaftStorage::open(&dir.path().join("raft"), 1, "worker-test", vec![1, 2, 3]).unwrap();
+    // Model lost object storage after a truncation without an image.
+    storage
+        .publish_checkpoint(
+            5,
+            None,
+            raft::eraftpb::ConfState::from((vec![1, 2, 3], vec![])),
+        )
+        .unwrap();
+    drop(storage);
+    let (events, _) = mpsc::channel(256);
+    let error = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .err()
+        .unwrap();
+    assert!(error
+        .to_string()
+        .contains("state storage is behind the log truncation point"));
 }

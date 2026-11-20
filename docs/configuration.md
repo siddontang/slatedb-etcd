@@ -84,6 +84,7 @@ For example, use `--watch-progress-notify-interval=200ms` for the upstream clien
 | Flag | Default | Meaning |
 | --- | ---: | --- |
 | `--snapshot-every` | 10000 | Applied entries between checkpoint opportunities; zero disables it. |
+| `--snapshot-min-bytes` | 67108864 | Log bytes needed before auto truncation; zero disables it. |
 | `--quota-backend-bytes` | 0 | Zero selects 2 GiB. A negative value disables the quota. |
 | `--log-cache-bytes` | 8388608 | Cache budget for log entries. |
 | `--log-pending-bytes` | 33554432 | Pending entry budget, including unapplied entries. |
@@ -96,6 +97,14 @@ The read budget must hold one maximum entry. An encoded entry cannot exceed 8 Mi
 The two state cache budgets add up to 128 MiB by default. Each must be positive.
 Keep the metadata budget above total SST metadata. With 32-byte keys and 256-byte values,
 metadata is about 2% of live SST data.
+
+An automatic checkpoint flushes state to synced local storage and then truncates the Raft log.
+It needs both `--snapshot-every` applied entries and `--snapshot-min-bytes` appended log bytes.
+Small writes therefore keep more log between truncations, and each synced flush covers about one
+L0 table. Delaying truncation keeps more log; it never removes entries early.
+State recovers to its last synced flush. A restart can replay up to the larger of the two
+thresholds: by default 10,000 entries or 64 MiB of log, plus the entries applied after them.
+Membership changes and peer snapshot requests do not wait for the byte threshold.
 These flags do not bound process RSS, SlateDB, state scans, or snapshot buffers.
 The quota can be exceeded by one operation and does not reserve free disk space.
 Native backups and peer snapshot transfers have a 64 MiB limit.

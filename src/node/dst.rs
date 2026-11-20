@@ -147,6 +147,7 @@ impl Simulation {
                 dir: self.root.path().join(id.to_string()),
                 peers: (1..=3).map(|n| (n, format!("127.0.0.1:{n}"))).collect(),
                 snapshot_every: 0,
+                snapshot_min_bytes: 0,
                 log_memory: LogMemory {
                     cache_bytes: 1024,
                     ..LogMemory::default()
@@ -518,11 +519,12 @@ impl Simulation {
             }
             let data = node.worker.state().snapshot_job().unwrap().await.unwrap();
             node.handle(
-                Event::SnapshotBuilt {
+                Event::SnapshotBuilt(apply::Built {
                     index,
                     conf: node.worker.state().members.conf(),
-                    result: PreparedCheckpoint::write(&node.options.dir.join("raft"), data.into()),
-                },
+                    result: PreparedCheckpoint::write(&node.options.dir.join("raft"), data.into())
+                        .map(Some),
+                }),
                 &mut vec![],
             )
             .await
@@ -531,6 +533,64 @@ impl Simulation {
                 .push(format!("snapshot {} {index}", node.options.id));
         }
         self.drive().await;
+    }
+
+    /// Flush state and truncate each log without an image, as automatic checkpoints do.
+    async fn truncate(&mut self) {
+        for (&id, node) in &mut self.nodes {
+            let index = node.state.applied;
+            if index <= node.raw.store().snapshot_index() {
+                continue;
+            }
+            let conf = node.worker.state().members.conf();
+            let job = node.worker.state().checkpoint_job(false).unwrap();
+            assert!(job.await.unwrap().is_none());
+            node.handle(
+                Event::SnapshotBuilt(apply::Built {
+                    index,
+                    conf,
+                    result: Ok(None),
+                }),
+                &mut vec![],
+            )
+            .await
+            .unwrap();
+            self.trace.push(format!("truncate {id} {index}"));
+        }
+        self.drive().await;
+    }
+
+    async fn assert_acknowledged(&self, id: u64) {
+        let state = self.nodes[&id].worker.state();
+        for (key, value) in &self.acknowledged {
+            let outcome = state
+                .read_etcd(&RequestOp {
+                    request: Some(Op::RequestRange(RangeRequest {
+                        key: key.as_bytes().to_vec(),
+                        ..Default::default()
+                    })),
+                })
+                .await
+                .unwrap();
+            let Some(Resp::ResponseRange(response)) = outcome.result.unwrap().response else {
+                panic!("expected range");
+            };
+            assert_eq!(response.kvs.len(), 1, "member {id} lost {key}");
+            assert_eq!(response.kvs[0].value, value.as_bytes());
+        }
+    }
+
+    /// Tick every member `rounds` times and deliver the resulting messages.
+    /// 25 rounds pass an election timeout.
+    async fn settle(&mut self, rounds: usize) {
+        for _ in 0..rounds {
+            for id in 1..=3 {
+                self.tick(id).await;
+            }
+            for _ in 0..30 {
+                self.deliver(false).await;
+            }
+        }
     }
 
     async fn restart_between_checkpoint_file_and_reference(&mut self) {
@@ -598,11 +658,11 @@ impl Simulation {
                 .get_mut(&id)
                 .unwrap()
                 .handle(
-                    Event::SnapshotBuilt {
+                    Event::SnapshotBuilt(apply::Built {
                         index,
                         conf,
-                        result: Ok(staged),
-                    },
+                        result: Ok(Some(staged)),
+                    }),
                     &mut vec![],
                 )
                 .await
@@ -1067,18 +1127,6 @@ impl Simulation {
             .push("auth and physical compact recovered".into());
     }
 
-    /// Let every member tick past an election timeout and deliver the resulting messages.
-    async fn settle(&mut self) {
-        for _ in 0..25 {
-            for id in 1..=3 {
-                self.tick(id).await;
-            }
-            for _ in 0..30 {
-                self.deliver(false).await;
-            }
-        }
-    }
-
     /// Renew a lease in leader memory, as the gRPC KeepAlive path does.
     async fn renew(&mut self, member: u64, lease: i64) -> std::result::Result<i64, ApiError> {
         let (tx, mut rx) = oneshot::channel();
@@ -1110,14 +1158,14 @@ impl Simulation {
                 Ok(ttl) => return ttl,
                 Err(error) => assert!(error.error.contains("renewal cancelled"), "{error:?}"),
             }
-            self.settle().await;
+            self.settle(25).await;
         }
         panic!("leader did not renew lease {lease}");
     }
 
     /// An isolated leader cannot renew in memory. The next leader extends inherited leases.
     async fn renew_under_partition(&mut self) {
-        self.settle().await;
+        self.settle(25).await;
         let ttl = self.nodes[&self.leader().unwrap()].state.leases[&77].ttl;
         assert_eq!(self.renew_on_leader(77).await, ttl);
         let old = self.leader().unwrap();
@@ -1138,7 +1186,7 @@ impl Simulation {
             .unwrap()
             .keep_alive(77, None, tx)
             .unwrap();
-        self.settle().await;
+        self.settle(25).await;
         let error = rx
             .try_recv()
             .expect("the isolated renewal must finish")
@@ -1173,7 +1221,7 @@ impl Simulation {
 
         self.isolated = None;
         self.trace.push("heal renewing leader".into());
-        self.settle().await;
+        self.settle(25).await;
         assert_eq!(self.renew_on_leader(77).await, ttl);
     }
 
@@ -1589,7 +1637,8 @@ impl Simulation {
                             sim.deliver(false).await;
                         }
                     }
-                    sim.checkpoint().await;
+                    // The offline follower must now catch up from an image built on demand.
+                    sim.truncate().await;
                 }
                 300 => {
                     sim.paused_log = Some(offline);
@@ -1757,5 +1806,65 @@ async fn seeded_fault_schedules_replay_identically() {
         }
         assert_eq!(first, second, "seed {seed}: simulation schedule changed");
         eprintln!("DST seed {seed}: {} events replayed", first.len());
+    }
+}
+
+#[tokio::test]
+async fn truncation_without_an_image_recovers_and_serves_an_on_demand_snapshot() {
+    let mut sim = Simulation::new(7).await;
+    for _ in 0..100 {
+        sim.deliver(false).await;
+    }
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    let offline = sim.leader().unwrap() % 3 + 1;
+    sim.stop(offline);
+    for _ in 0..6 {
+        sim.propose().await;
+        for _ in 0..100 {
+            sim.deliver(false).await;
+        }
+    }
+    assert!(sim.acknowledged.len() >= 3);
+    sim.truncate().await;
+    for (&id, node) in &sim.nodes {
+        let store = node.raw.store();
+        assert!(store.snapshot_index() > 0);
+        assert!(!store.has_image());
+        assert_eq!(node.log_worker.storage().recovery_snapshot().data.len(), 0);
+        let dir = sim.root.path().join(id.to_string()).join("raft");
+        assert!(std::fs::read_dir(dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("checkpoint-")
+        }));
+        assert_eq!(node.snapshot_images, 0);
+    }
+    // Restart a truncated member. Flushed state must cover the removed entries.
+    let restarted = sim.leader().unwrap() % 3 + 1;
+    let restarted = if restarted == offline {
+        restarted % 3 + 1
+    } else {
+        restarted
+    };
+    let truncated = sim.nodes[&restarted].raw.store().snapshot_index();
+    sim.stop(restarted);
+    sim.start(restarted).await;
+    let node = &sim.nodes[&restarted];
+    assert_eq!(node.raw.store().snapshot_index(), truncated);
+    assert!(node.state.applied >= truncated);
+    assert_eq!(node.installed_snapshots, 0);
+    sim.assert_acknowledged(restarted).await;
+    sim.settle(25).await;
+    // The returning member needs entries that no live log retains.
+    sim.start(offline).await;
+    sim.settle(60).await;
+    assert!(sim.nodes[&offline].installed_snapshots > 0);
+    assert!(sim.nodes.values().map(|n| n.snapshot_images).sum::<u64>() > 0);
+    sim.propose().await;
+    sim.settle(10).await;
+    for id in 1..=3 {
+        sim.assert_acknowledged(id).await;
     }
 }

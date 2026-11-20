@@ -99,6 +99,7 @@ The service must preserve these rules across every implementation phase:
 5. Require quorum commit and an exact state-machine result for every successful write reply.
 6. Advance RawNode's applied position only after the apply owner reports completion.
 7. Reclaim log entries only after a durable snapshot covers them.
+   Flushed SlateDB state with its apply marker is such a snapshot.
 8. Stop the node after a state storage failure. Do not continue from uncertain state.
 
 The SlateDB sequence number equals the Raft apply index.
@@ -127,11 +128,11 @@ Each task can resume on another runtime worker after it yields.
 | WAL | One dedicated `raft-log-io` OS thread per member writes, syncs, and reads the log. |
 | Apply | One Tokio task per member writes SlateDB and publishes revisions in log order. |
 | KV reads | Up to four Tokio tasks read pinned views. Three budgeted scans may share them. |
-| Checkpoint | The builder uses blocking workers to merge changes and sync the image. |
+| Checkpoint | A task flushes state. Peer images use blocking workers to sync the file. |
 | Other work | Blocking workers handle password checks, metrics encoding, and local object I/O. |
 
 The client and peer tasks submit events through a queue with 2,048 slots.
-The WAL thread publishes a synced local checkpoint file and syncs the log truncation.
+The WAL thread publishes checkpoint metadata, or a synced image file, and syncs the truncation.
 It prepares incoming peer snapshots in order before reporting durable completion.
 The owner sends ordered work to WAL and apply. Each worker sends its result back to the owner.
 Leader replication can proceed while the WAL thread waits for the disk.
@@ -406,20 +407,22 @@ Broad transaction batching needs an overlay that also merges scans and historica
 
 ## Snapshot order and recovery
 
-A checkpoint request waits for the Raft commit index observed when the request arrived.
-The first builder pins the applied view and scans its rows. Later builders track changed rows.
-Each builder flushes SlateDB. With a matching base, it copies unchanged rows from the last full
-snapshot and merges replacements and deletes. It writes a complete, independently usable snapshot.
-The apply owner charges keys, values, and 128 bytes per change against an 8 MiB tracking budget.
-Overflow, restart, or installation of a new snapshot selects a fresh pinned scan.
-One frozen change set and one active change set can coexist. The builder also needs output space.
+Automatic and membership checkpoints flush SlateDB at an applied index and then truncate the log.
+Their Raft snapshot holds only the index, term, and configuration. SlateDB is the local image.
+This follows etcd, where the Raft snapshot holds metadata and bbolt holds the state.
+Local object writes sync files and directories, so a flush is durable before truncation.
+
+A manual checkpoint request waits for the Raft commit index observed when the request arrived.
+It pins the applied view, flushes SlateDB, and scans all rows into a complete image.
+A leader builds the same image when Raft requests a snapshot that local storage cannot supply.
+Automatic truncation pauses while that request waits or while a peer receives an image.
 A blocking worker writes and syncs each local image under a unique temporary name.
 The WAL worker renames the image and syncs its directory before it publishes the reference.
 One synced WAL batch publishes its index, size, CRC32C, and metadata with log truncation.
 The worker can then retire the previous file and reclaim covered WAL segments.
 On restart, the worker verifies the referenced file before removing unpublished or retired files.
 
-The local checkpoint and the peer snapshot contain the full logical state.
+A checkpoint image and the peer snapshot contain the full logical state.
 The peer transport has a 64 MiB limit. Large deployments need a different transfer design.
 
 On receipt, persist the file and its WAL reference before installing the snapshot in SlateDB.
@@ -475,6 +478,7 @@ Membership changes use Raft configuration entries. Only one configuration change
 Apply validates the change again and produces either the new configuration or a no-op.
 The Raft owner applies that configuration before advancing its applied index.
 Each membership change triggers a checkpoint with the configuration at that snapshot's index.
+A new member receives an image that the leader builds on demand.
 A new learner starts with an empty configuration and installs a membership snapshot before replay.
 Durable membership takes precedence over startup transport addresses after recovery.
 Peer updates publish the member name and client URLs through the trusted Raft transport.

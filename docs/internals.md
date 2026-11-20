@@ -43,21 +43,37 @@ Its thread cache separates open log instances, including reopened instances.
 Explicit sync reaches the file system even when no new write batch exists.
 Regressions check cross-engine values and count the underlying sync calls.
 
-For a checkpoint, the node:
+An automatic or membership checkpoint does not copy state. The node:
 
-1. Freezes tracked changes at the applied index or pins a full SlateDB scan.
-2. Flushes SlateDB and builds a complete snapshot from the prior image or the pinned scan.
-3. Writes and syncs a private temporary file on a blocking worker. The worker computes its CRC.
-4. Renames the complete image and syncs its directory on the WAL thread.
-5. Syncs its reference, checksum, metadata, commit marker, and truncation in one WAL batch.
-6. Removes the prior file and asks raft-engine to reclaim obsolete WAL segments.
+1. Records the applied index and membership after the apply worker finishes earlier entries.
+2. Flushes SlateDB. The flushed state holds the apply marker at the same sequence number.
+3. Syncs snapshot metadata without an image, the commit marker, and truncation in one WAL batch.
+4. Removes any prior image file and asks raft-engine to reclaim obsolete WAL segments.
+
+Local objects use synced writes, so a flush survives power loss like an S3 write.
+Restart reads an apply marker at or above the truncation index and replays the later entries.
+If state is behind a record without an image, startup stops with an explicit error.
+
+A manual checkpoint, or a leader whose peer needs a snapshot, builds a complete image:
+
+1. Pins a full SlateDB scan at the applied index, then flushes SlateDB and encodes the scan.
+2. Writes and syncs a private temporary file on a blocking worker. The worker computes its CRC.
+3. Renames the complete image and syncs its directory on the WAL thread.
+4. Syncs its reference, checksum, metadata, commit marker, and truncation in one WAL batch.
+5. Removes the prior file and asks raft-engine to reclaim obsolete WAL segments.
+
+Raft asks for a snapshot through synchronous storage. Without an image, storage reports a
+temporary failure and records the request. The owner then builds an image at the applied index.
+That image can replace a record without an image at the same index. Raft retries on a later
+heartbeat and sends the image. Automatic truncation waits while a peer receives a snapshot.
+The image stays in memory until the next truncation replaces it.
 
 The saved snapshot retains the boundary term and membership at the same applied index. On snapshot
 receipt,
 the node atomically replaces its persistent Raft state before changing SlateDB. A crash in between
 is safe: startup can repeat the state replacement from the durable snapshot payload.
 
-The checkpoint file contains a full copy of the state. This makes recovery independent of
+An image file contains a full copy of the state. This makes recovery independent of
 uncopied local object files, but limits the PoC to small data sets. Snapshots use the peer HTTP body
 limit of 64 MiB. Snapshot creation runs in the background.
 The file writer samples four 4 KiB regions in images of at least 64 KiB.

@@ -18,7 +18,3 @@ pub(crate) fn write(
 ) -> Result<usize, EncodeError> {
     bincode::serde::encode_into_std_write(value, out, legacy())
 }
-
-pub(crate) fn read<T: DeserializeOwned>(input: &mut &[u8]) -> Result<T, DecodeError> {
-    bincode::serde::decode_from_std_read(input, legacy())
-}

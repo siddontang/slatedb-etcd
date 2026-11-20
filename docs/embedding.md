@@ -76,6 +76,7 @@ Create one `ServerConfig` for each member. Set these fields before `Server::star
 | `object_store` | Select `object::Config::Local` or `object::Config::S3`. |
 | `log_memory`, `quota_bytes` | Set separate log budgets and the logical data quota. |
 | `snapshot_every` | Set the automatic checkpoint interval. Zero disables it. |
+| `snapshot_min_bytes` | Set the log bytes an automatic checkpoint waits for. Zero disables it. |
 | `auth_token` | Select the same simple or JWT token configuration as the CLI. |
 | `join`, `restore_snapshot` | Select member join or native restore. They cannot both be enabled. |
 | `strict_reconfiguration` | Enable quorum health checks for membership changes. |

@@ -22,7 +22,7 @@ The CLI and embedded API share the same lifecycle and runtime paths.
 | `node/apply` | Apply committed entries in order and group ordinary puts |
 | `node/proposal` | Group consecutive leader Put proposals within one event turn |
 | `node/quorum_put` | Prepare exact Put results after quorum commit |
-| `state/checkpoint` | Merge bounded row changes into a complete checkpoint |
+| `state/checkpoint` | Flush an applied prefix, or build a complete image for a peer |
 | `state/key_index` | Keep revision metadata for every current key in memory |
 | `node/read` | Confirm Safe ReadIndex and reject obsolete proofs |
 | `node/read/executor` | Run bounded reads on immutable applied views |
@@ -60,8 +60,9 @@ Serializable reads use a local view without a quorum proof.
 Watch streams take events from an in-memory feed and scan history on pinned views.
 Administrative scans still use the apply owner.
 
-A checkpoint freezes one applied prefix. The builder flushes and encodes that prefix outside Raft.
-The log worker saves the snapshot and truncates its covered entries in one synced batch.
+A checkpoint freezes one applied prefix and flushes it outside Raft.
+The log worker saves the snapshot metadata and truncates its covered entries in one synced batch.
+A manual checkpoint or a peer snapshot request also encodes a complete image.
 Restart installs a newer durable snapshot, then replays the remaining committed entries.
 
 ## Change rules

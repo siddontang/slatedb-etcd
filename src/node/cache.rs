@@ -1,5 +1,5 @@
 use super::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use raft::eraftpb::{HardState, Snapshot};
 use raft::{GetEntriesContext, RaftState, StorageError};
@@ -125,6 +125,8 @@ pub(super) struct Cache {
     snapshot: Snapshot,
     pub initial_conf: Option<raft::eraftpb::ConfState>,
     hard_state: HardState,
+    // Raft asked for a transferable image that the durable snapshot does not contain.
+    image_wanted: Cell<bool>,
     pub durable: log::Durable,
 }
 
@@ -144,6 +146,7 @@ impl Cache {
             snapshot: durable.snapshot.clone(),
             initial_conf: None,
             hard_state: durable.hard_state,
+            image_wanted: Cell::new(false),
             durable,
         };
         let mut low = storage.first_index()?;
@@ -250,6 +253,12 @@ impl Cache {
             durable.hard_state.commit >= self.commit_index(),
             "durable commit regressed"
         );
+        let new_image = !durable.snapshot.data.is_empty()
+            && (durable.snapshot.get_metadata().index > self.snapshot_index()
+                || self.durable.snapshot.data.is_empty());
+        if new_image {
+            self.image_wanted.set(false);
+        }
         if durable.snapshot.get_metadata().index > self.snapshot.get_metadata().index {
             let end = durable.snapshot.get_metadata().index + 1;
             let term = self.terms.range(..=end).next_back().map(|(_, t)| *t);
@@ -399,6 +408,13 @@ impl Cache {
     pub fn recovery_snapshot(&self) -> &Snapshot {
         &self.durable.snapshot
     }
+    /// Return true after Raft asked for an image that the durable snapshot cannot supply.
+    pub fn image_wanted(&self) -> bool {
+        self.image_wanted.get()
+    }
+    pub fn has_image(&self) -> bool {
+        !self.durable.snapshot.data.is_empty()
+    }
 }
 
 impl Storage for Cache {
@@ -489,7 +505,11 @@ impl Storage for Cache {
         Ok(self.last)
     }
     fn snapshot(&self, request_index: u64, _: u64) -> raft::Result<Snapshot> {
-        if self.snapshot_index() == 0 || self.snapshot_index() < request_index {
+        // A record without an image only truncates the local log. Raft retries after the owner
+        // builds and publishes a complete image.
+        if self.snapshot_index() == 0 || self.snapshot_index() < request_index || !self.has_image()
+        {
+            self.image_wanted.set(true);
             return Err(StorageError::SnapshotTemporarilyUnavailable.into());
         }
         Ok(self.durable.snapshot.clone())
@@ -716,6 +736,7 @@ mod tests {
                 dir: dir.path().to_owned(),
                 peers: (1..=3).map(|id| (id, format!("127.0.0.1:{id}"))).collect(),
                 snapshot_every: 0,
+                snapshot_min_bytes: 0,
                 log_memory: LogMemory::default(),
                 state_cache: Default::default(),
             },
