@@ -86,8 +86,13 @@ For example, use `--watch-progress-notify-interval=200ms` for the upstream clien
 | `--log-pending-bytes` | 33554432 | Pending entry budget, including unapplied entries. |
 | `--log-read-bytes` | 16777216 | Budget for asynchronous log read results. |
 | `--log-term-bytes` | 1048576 | Budget for compressed term metadata. |
+| `--state-block-cache-bytes` | 67108864 | Weight budget for cached SST data blocks. |
+| `--state-meta-cache-bytes` | 67108864 | Budget for cached SST indexes, filters, and stats. |
 
 The read budget must hold one maximum entry. An encoded entry cannot exceed 8 MiB.
+The two state cache budgets add up to 128 MiB by default. Each must be positive.
+Keep the metadata budget above total SST metadata. With 32-byte keys and 256-byte values,
+metadata is about 2% of live SST data.
 These flags do not bound process RSS, SlateDB, state scans, or snapshot buffers.
 The quota can be exceeded by one operation and does not reserve free disk space.
 Native backups and peer snapshot transfers have a 64 MiB limit.

@@ -8,6 +8,7 @@ use raft::eraftpb::Snapshot;
 use serde::{Deserialize, Serialize};
 use slatedb::config::{Settings, WriteOptions};
 use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
+use slatedb::db_cache::{DbCache, SplitCache};
 use slatedb::object_store::local::LocalFileSystem;
 use slatedb::Db;
 
@@ -71,17 +72,81 @@ pub struct StateMachine {
     pub(crate) watch_capture: Option<crate::watch::Capture>,
 }
 
+/// Weight budgets of the state cache. Both are separate from Raft log memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateCache {
+    /// Budget for cached SST data blocks.
+    pub block_bytes: u64,
+    /// Budget for cached SST indexes, filters, and stats.
+    pub meta_bytes: u64,
+}
+
+impl Default for StateCache {
+    fn default() -> Self {
+        Self {
+            block_bytes: 64 * 1024 * 1024,
+            meta_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl StateCache {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.block_bytes > 0 && self.meta_bytes > 0,
+            "state cache budgets must be positive"
+        );
+        Ok(())
+    }
+
+    /// Build the cache. SST metadata needs its own cache.
+    ///
+    /// Moka admits a new entry only when its frequency exceeds the summed frequency of the
+    /// entries it would evict. An SST index is often several MiB and would displace hundreds
+    /// of 4 KiB data blocks. In a shared cache that is full of blocks, indexes and filters are
+    /// therefore always rejected, and every scan reads and verifies them again.
+    pub(crate) fn build(self) -> Arc<dyn DbCache> {
+        let moka = |max_capacity| {
+            Some(Arc::new(MokaCache::new_with_opts(MokaCacheOptions {
+                max_capacity,
+                time_to_live: None,
+                time_to_idle: None,
+            })) as Arc<dyn DbCache>)
+        };
+        Arc::new(
+            SplitCache::new()
+                .with_block_cache(moka(self.block_bytes))
+                .with_meta_cache(moka(self.meta_bytes))
+                .build(),
+        )
+    }
+}
+
 impl StateMachine {
     pub async fn open(dir: &Path) -> Result<Self> {
+        Self::open_with_cache(dir, StateCache::default()).await
+    }
+
+    pub async fn open_with_cache(dir: &Path, cache: StateCache) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let object_store = Arc::new(LocalFileSystem::new_with_prefix(dir)?);
-        Self::open_store(object_store, "state").await
+        Self::open_store_with_cache(object_store, "state", cache).await
     }
 
     pub async fn open_store(
         object_store: Arc<dyn slatedb::object_store::ObjectStore>,
         prefix: &str,
     ) -> Result<Self> {
+        Self::open_store_with_cache(object_store, prefix, StateCache::default()).await
+    }
+
+    pub async fn open_store_with_cache(
+        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+        prefix: &str,
+        cache: StateCache,
+    ) -> Result<Self> {
+        cache.validate()?;
+        let cache = cache.build();
         let mut settings = Settings {
             wal_enabled: false,
             flush_interval: None,
@@ -98,14 +163,8 @@ impl StateMachine {
             }
         }
         let admin = slatedb::admin::Admin::builder(prefix, object_store.clone()).build();
-        // Keep state cache weights separate from Raft log memory budgets.
-        let cache = MokaCache::new_with_opts(MokaCacheOptions {
-            max_capacity: 64 * 1024 * 1024,
-            time_to_live: None,
-            time_to_idle: None,
-        });
         let db = Db::builder(prefix, object_store)
-            .with_db_cache(Arc::new(cache), 0)
+            .with_db_cache(cache, 0)
             .with_settings(settings)
             .build()
             .await?;

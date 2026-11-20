@@ -43,6 +43,8 @@ pub struct ServerConfig {
     /// Interval between idle Watch progress responses.
     pub watch_progress_notify_interval: Duration,
     pub log_memory: LogMemory,
+    /// Weight budgets for cached SST blocks and SST metadata.
+    pub state_cache: crate::state::StateCache,
     /// Zero selects the default 2 GiB quota. A negative value disables the quota.
     pub quota_bytes: i64,
     pub auth_token: String,
@@ -72,6 +74,7 @@ impl ServerConfig {
             watch_progress_notify_interval: crate::grpc::DEFAULT_WATCH_PROGRESS_INTERVAL,
             snapshot_every: 10_000,
             log_memory: LogMemory::default(),
+            state_cache: crate::state::StateCache::default(),
             quota_bytes: 0,
             auth_token: "simple".into(),
             strict_reconfiguration: true,
@@ -106,6 +109,7 @@ impl Server {
     async fn start_inner(mut config: ServerConfig) -> Result<Self> {
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
         config.log_memory.validate()?;
+        config.state_cache.validate()?;
         ensure!(
             !config.join || config.restore_snapshot.is_none(),
             "join cannot restore a snapshot"
@@ -260,6 +264,7 @@ impl Server {
                 client_peers: config.client_peers.clone(),
                 snapshot_every: config.snapshot_every,
                 log_memory: config.log_memory,
+                state_cache: config.state_cache,
                 quota_bytes: config.quota_bytes,
                 strict_reconfiguration: config.strict_reconfiguration,
                 join: config.join,

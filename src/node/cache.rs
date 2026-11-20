@@ -717,6 +717,7 @@ mod tests {
                 peers: (1..=3).map(|id| (id, format!("127.0.0.1:{id}"))).collect(),
                 snapshot_every: 0,
                 log_memory: LogMemory::default(),
+                state_cache: Default::default(),
             },
             events,
             Some(BTreeMap::from([(2, peer)])),

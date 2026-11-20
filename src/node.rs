@@ -93,6 +93,7 @@ pub struct NodeOptions {
     pub dir: PathBuf,
     pub snapshot_every: u64,
     pub log_memory: LogMemory,
+    pub state_cache: crate::state::StateCache,
     pub quota_bytes: i64,
     pub strict_reconfiguration: bool,
     pub join: bool,
@@ -258,7 +259,12 @@ impl Node {
         )?;
         let mut state = options
             .object_store
-            .open(&options.dir, &options.cluster_id, options.id)
+            .open(
+                &options.dir,
+                &options.cluster_id,
+                options.id,
+                options.state_cache,
+            )
             .await?;
         let recovered = async {
             state.quota = options.effective_quota().max(0) as u64;

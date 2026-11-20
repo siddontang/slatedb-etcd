@@ -121,7 +121,7 @@ Object request counts, remote bytes, and provider charges require separate S3 te
 
 The initial 1,000-operation baseline uses 100 keys and 256-byte values.
 It is a smoke-scale measurement on one Apple Silicon host, not a capacity or cross-AZ result.
-The service uses a separate 64 MiB weighted SST cache per member.
+The service uses separate 64 MiB weighted caches for SST blocks and SST metadata per member.
 Current quota checks use a derived byte counter. Each atomic batch updates only its changed keys.
 Startup rebuilds this counter from stored state. No storage format change is required.
 The previous implementation scanned all logical etcd state before each quota-limited write.
