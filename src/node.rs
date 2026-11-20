@@ -33,7 +33,7 @@ mod ready;
 mod response;
 mod schedule;
 mod watch;
-use crate::peer::transport;
+use crate::peer::transport_to;
 use apply::{AppliedState, Completion, Header, Job, Output, Query, Reply, Work, Worker};
 use response::ClientResponse;
 pub use response::KvReply;
@@ -197,6 +197,8 @@ pub struct Node {
     apply_delay_ms: u64,
     options: NodeOptions,
     senders: BTreeMap<u64, mpsc::Sender<Message>>,
+    /// The URL that each peer sender uses on its next dial.
+    peer_addresses: BTreeMap<u64, tokio::sync::watch::Sender<String>>,
     transports: tokio::task::JoinSet<()>,
     pending: HashMap<String, Pending>,
     put_proposals: proposal::Group,
@@ -325,6 +327,7 @@ impl Node {
         let manual_apply = transport_override.is_some();
         let mut traffic = BTreeMap::<u64, std::sync::Arc<crate::metrics::PeerTraffic>>::new();
         let mut transports = tokio::task::JoinSet::new();
+        let mut peer_addresses = BTreeMap::new();
         let senders = if let Some(senders) = transport_override {
             senders
         } else {
@@ -335,9 +338,11 @@ impl Node {
                 }
                 let (tx, rx) = mpsc::channel(256);
                 senders.insert(peer, tx);
-                transports.spawn(transport(
+                let (address_tx, address_rx) = tokio::sync::watch::channel(address.clone());
+                peer_addresses.insert(peer, address_tx);
+                transports.spawn(transport_to(
                     peer,
-                    address.clone(),
+                    address_rx,
                     options.cluster_id.clone(),
                     rx,
                     events.clone(),
@@ -409,6 +414,7 @@ impl Node {
             apply_delay_ms: 0,
             options,
             senders,
+            peer_addresses,
             transports,
             pending: HashMap::new(),
             put_proposals: proposal::Group::default(),

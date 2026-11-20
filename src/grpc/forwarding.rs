@@ -2,13 +2,18 @@
 
 use super::*;
 use crate::node::ForwardView;
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 use tokio::sync::OnceCell;
 use tonic::transport::Channel;
 
 pub(super) struct Forwarding {
     view: OnceCell<ForwardView>,
+    /// Like etcd, a changed peer URL applies when the connection fails. A cached channel can
+    /// therefore use an older address than the current route.
     channels: Mutex<BTreeMap<u64, (String, Channel)>>,
+    /// Peers whose cached channel failed. The next request dials the current route.
+    failed: Mutex<BTreeSet<u64>>,
     transport: crate::tls::Transport,
 }
 
@@ -24,6 +29,7 @@ impl Forwarding {
         Ok(Self {
             view: OnceCell::new(),
             channels: Mutex::new(channels),
+            failed: Mutex::default(),
             transport,
         })
     }
@@ -43,26 +49,32 @@ impl Service {
     ) -> Result<ResponseOp, Status> {
         let channel = self.peer_channel(leader).await?;
         let mut client = KvClient::new(channel).max_decoding_message_size(64 * 1024 * 1024);
-        let response = match op {
-            Op::RequestRange(r) => Resp::ResponseRange(
-                client
-                    .range(forward_auth(r, credentials))
-                    .await?
-                    .into_inner(),
-            ),
-            Op::RequestPut(r) => {
-                Resp::ResponsePut(client.put(forward_auth(r, credentials)).await?.into_inner())
+        let response = self.forwarded(
+            leader,
+            async {
+                Ok(match op {
+                    Op::RequestRange(r) => Resp::ResponseRange(
+                        client
+                            .range(forward_auth(r, credentials))
+                            .await?
+                            .into_inner(),
+                    ),
+                    Op::RequestPut(r) => Resp::ResponsePut(
+                        client.put(forward_auth(r, credentials)).await?.into_inner(),
+                    ),
+                    Op::RequestDeleteRange(r) => Resp::ResponseDeleteRange(
+                        client
+                            .delete_range(forward_auth(r, credentials))
+                            .await?
+                            .into_inner(),
+                    ),
+                    Op::RequestTxn(r) => Resp::ResponseTxn(
+                        client.txn(forward_auth(r, credentials)).await?.into_inner(),
+                    ),
+                })
             }
-            Op::RequestDeleteRange(r) => Resp::ResponseDeleteRange(
-                client
-                    .delete_range(forward_auth(r, credentials))
-                    .await?
-                    .into_inner(),
-            ),
-            Op::RequestTxn(r) => {
-                Resp::ResponseTxn(client.txn(forward_auth(r, credentials)).await?.into_inner())
-            }
-        };
+            .await,
+        )?;
         let mut response = ResponseOp {
             response: Some(response),
         };
@@ -98,9 +110,18 @@ impl Service {
     pub(crate) async fn peer_channel(&self, id: u64) -> Result<Channel, Status> {
         let view = self.forward_view().await?;
         let routes = view.peers.borrow().clone();
-        let address = routes
-            .get(&id)
-            .ok_or_else(|| Status::unavailable("etcdserver: no leader"))?;
+        let failed = self
+            .forwarding
+            .failed
+            .lock()
+            .map_err(|_| Status::internal("peer channel lock failed"))?
+            .remove(&id);
+        let Some(address) = routes.get(&id) else {
+            if let Ok(mut channels) = self.forwarding.channels.lock() {
+                channels.remove(&id);
+            }
+            return Err(Status::unavailable("etcdserver: no leader"));
+        };
         let cache = &self.forwarding.channels;
         #[cfg(feature = "write-profile")]
         let guard = crate::write_profile::Lock::Forwarding.acquire(cache);
@@ -108,7 +129,7 @@ impl Service {
         let guard = cache.lock();
         let mut channels = guard.map_err(|_| Status::internal("peer channel lock failed"))?;
         if let Some((old, channel)) = channels.get(&id) {
-            if old == address {
+            if old == address || !failed {
                 return Ok(channel.clone());
             }
         }
@@ -120,6 +141,20 @@ impl Service {
         channels.retain(|peer, _| routes.contains_key(peer));
         channels.insert(id, (address.clone(), channel.clone()));
         Ok(channel)
+    }
+
+    /// Record the result of a forwarded call. A connection failure makes the next call dial the
+    /// current route of that peer.
+    pub(crate) fn forwarded<T>(&self, id: u64, result: Result<T, Status>) -> Result<T, Status> {
+        if result
+            .as_ref()
+            .is_err_and(|status| status.code() == tonic::Code::Unavailable)
+        {
+            if let Ok(mut failed) = self.forwarding.failed.lock() {
+                failed.insert(id);
+            }
+        }
+        result
     }
 
     pub(super) async fn wait_compaction(&self, revision: i64) -> Result<(), Status> {

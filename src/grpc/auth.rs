@@ -16,17 +16,23 @@ impl Service {
     {
         let channel = self.peer_channel(leader).await?;
         let mut client = tonic::client::Grpc::new(channel);
-        client
-            .ready()
-            .await
-            .map_err(|e| Status::unavailable(e.to_string()))?;
-        let response: Response<R> = client
-            .unary(
-                forward_auth(body, credentials),
-                tonic::codegen::http::uri::PathAndQuery::from_static(path),
-                tonic_prost::ProstCodec::default(),
-            )
-            .await?;
+        let response: Response<R> = self.forwarded(
+            leader,
+            async {
+                client
+                    .ready()
+                    .await
+                    .map_err(|e| Status::unavailable(e.to_string()))?;
+                client
+                    .unary(
+                        forward_auth(body, credentials),
+                        tonic::codegen::http::uri::PathAndQuery::from_static(path),
+                        tonic_prost::ProstCodec::default(),
+                    )
+                    .await
+            }
+            .await,
+        )?;
         if !path.starts_with("/etcdserverpb.Cluster/")
             && path != "/etcdserverpb.Maintenance/MoveLeader"
         {

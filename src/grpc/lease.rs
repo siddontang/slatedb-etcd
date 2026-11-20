@@ -30,54 +30,67 @@ impl Service {
                 .result
                 .map_err(|e| e.status())?,
             Err(error) if error.error == "not leader" && !forwarded => {
-                let channel = self.peer_channel(error.leader_id).await?;
+                let leader = error.leader_id;
+                let channel = self.peer_channel(leader).await?;
                 let mut client = LeaseClient::new(channel);
-                let response = match command {
-                    LeaseCommand::Grant { id, ttl } => LeaseReply::Grant(
-                        client
-                            .lease_grant(forward_auth(LeaseGrantRequest { id, ttl }, &credentials))
-                            .await?
-                            .into_inner(),
-                    ),
-                    LeaseCommand::Revoke { id } => LeaseReply::Revoke(
-                        client
-                            .lease_revoke(forward_auth(LeaseRevokeRequest { id }, &credentials))
-                            .await?
-                            .into_inner(),
-                    ),
-                    LeaseCommand::TimeToLive { id, keys } => LeaseReply::TimeToLive(
-                        client
-                            .lease_time_to_live(forward_auth(
-                                LeaseTimeToLiveRequest { id, keys },
-                                &credentials,
-                            ))
-                            .await?
-                            .into_inner(),
-                    ),
-                    LeaseCommand::List => LeaseReply::List(
-                        client
-                            .lease_leases(forward_auth(LeaseLeasesRequest {}, &credentials))
-                            .await?
-                            .into_inner(),
-                    ),
-                    LeaseCommand::KeepAlive { id } => {
-                        let request = forward_auth(
-                            tokio_stream::iter([LeaseKeepAliveRequest { id }]),
-                            &credentials,
-                        );
-                        let response = client
-                            .lease_keep_alive(request)
-                            .await?
-                            .into_inner()
-                            .message()
-                            .await?
-                            .ok_or_else(|| Status::unavailable("lease stream closed"))?;
-                        LeaseReply::KeepAlive(response)
+                let response = self.forwarded(
+                    leader,
+                    async {
+                        Ok(match command {
+                            LeaseCommand::Grant { id, ttl } => LeaseReply::Grant(
+                                client
+                                    .lease_grant(forward_auth(
+                                        LeaseGrantRequest { id, ttl },
+                                        &credentials,
+                                    ))
+                                    .await?
+                                    .into_inner(),
+                            ),
+                            LeaseCommand::Revoke { id } => LeaseReply::Revoke(
+                                client
+                                    .lease_revoke(forward_auth(
+                                        LeaseRevokeRequest { id },
+                                        &credentials,
+                                    ))
+                                    .await?
+                                    .into_inner(),
+                            ),
+                            LeaseCommand::TimeToLive { id, keys } => LeaseReply::TimeToLive(
+                                client
+                                    .lease_time_to_live(forward_auth(
+                                        LeaseTimeToLiveRequest { id, keys },
+                                        &credentials,
+                                    ))
+                                    .await?
+                                    .into_inner(),
+                            ),
+                            LeaseCommand::List => LeaseReply::List(
+                                client
+                                    .lease_leases(forward_auth(LeaseLeasesRequest {}, &credentials))
+                                    .await?
+                                    .into_inner(),
+                            ),
+                            LeaseCommand::KeepAlive { id } => {
+                                let request = forward_auth(
+                                    tokio_stream::iter([LeaseKeepAliveRequest { id }]),
+                                    &credentials,
+                                );
+                                let response = client
+                                    .lease_keep_alive(request)
+                                    .await?
+                                    .into_inner()
+                                    .message()
+                                    .await?
+                                    .ok_or_else(|| Status::unavailable("lease stream closed"))?;
+                                LeaseReply::KeepAlive(response)
+                            }
+                            LeaseCommand::Expire { .. } => {
+                                return Err(Status::internal("internal lease command"))
+                            }
+                        })
                     }
-                    LeaseCommand::Expire { .. } => {
-                        return Err(Status::internal("internal lease command"))
-                    }
-                };
+                    .await,
+                )?;
                 self.local_barrier().await?;
                 response
             }

@@ -100,21 +100,51 @@ async fn failed(
     }
 }
 
+/// Send to a fixed address. Tests use this form.
+#[cfg(test)]
 pub(crate) async fn transport(
     peer: u64,
     address: String,
+    cluster_id: String,
+    messages: mpsc::Receiver<Message>,
+    events: mpsc::Sender<Event>,
+    transport: crate::tls::Transport,
+    traffic: std::sync::Arc<crate::metrics::PeerTraffic>,
+) {
+    let (_address, receiver) = tokio::sync::watch::channel(address);
+    transport_to(
+        peer, receiver, cluster_id, messages, events, transport, traffic,
+    )
+    .await;
+}
+
+/// Send Raft messages to one peer.
+///
+/// Like etcd, a changed peer URL applies when the sender dials again. A healthy stream keeps its
+/// connection, so a member update to an unreachable URL does not cut off a working peer.
+pub(crate) async fn transport_to(
+    peer: u64,
+    mut address: tokio::sync::watch::Receiver<String>,
     cluster_id: String,
     mut messages: mpsc::Receiver<Message>,
     events: mpsc::Sender<Event>,
     transport: crate::tls::Transport,
     traffic: std::sync::Arc<crate::metrics::PeerTraffic>,
 ) {
-    let Ok(channel) = transport.channel(&address) else {
+    let current = address.borrow_and_update().clone();
+    let Ok(mut channel) = transport.channel(&current) else {
         report(&events, peer, false, false).await;
         return;
     };
-    let url = format!("{}/raft", crate::cluster::url(&address));
+    let mut url = format!("{}/raft", crate::cluster::url(&current));
     while let Some(first) = messages.recv().await {
+        if address.has_changed().unwrap_or(false) {
+            let next = address.borrow_and_update().clone();
+            if let Ok(next_channel) = transport.channel(&next) {
+                channel = next_channel;
+                url = format!("{}/raft", crate::cluster::url(&next));
+            }
+        }
         if first.get_msg_type() == MessageType::MsgSnapshot {
             let success = post_snapshot(&transport.http, &url, &cluster_id, first, &traffic).await;
             report(&events, peer, true, success).await;
