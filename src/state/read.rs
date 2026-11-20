@@ -34,9 +34,21 @@ impl ReadView {
         request: &RequestOp,
         credentials: Option<&crate::auth::Credentials>,
     ) -> Result<Outcome> {
+        let outcome = self.read_within(request, credentials, None).await?;
+        Ok(outcome.expect("an unbounded read always completes"))
+    }
+
+    /// Read with an optional budget for materialized Range rows.
+    /// `Ok(None)` means the rows exceed `budget`; the same read without a budget returns the result.
+    pub async fn read_within(
+        &self,
+        request: &RequestOp,
+        credentials: Option<&crate::auth::Credentials>,
+        budget: Option<usize>,
+    ) -> Result<Option<Outcome>> {
         if let Some(credentials) = credentials {
             if let Err(error) = self.auth.kv(credentials, request) {
-                return Ok(Outcome { result: Err(error) });
+                return Ok(Some(Outcome { result: Err(error) }));
             }
         }
         let start = matches!(
@@ -44,14 +56,31 @@ impl ReadView {
             Some(crate::proto::etcdserverpb::request_op::Request::RequestRange(_))
         )
         .then(std::time::Instant::now);
-        let result = mvcc::read_snapshot(
-            &self.snapshot,
-            self.revision,
-            self.compact_revision,
-            request,
-            &self.leases,
-        )
-        .await;
+        let result = match budget {
+            Some(budget) => match mvcc::read_snapshot_within(
+                &self.snapshot,
+                self.revision,
+                self.compact_revision,
+                request,
+                &self.leases,
+                budget,
+            )
+            .await
+            {
+                Some(result) => result,
+                None => return Ok(None),
+            },
+            None => {
+                mvcc::read_snapshot(
+                    &self.snapshot,
+                    self.revision,
+                    self.compact_revision,
+                    request,
+                    &self.leases,
+                )
+                .await
+            }
+        };
         if let Some(start) = start {
             let histogram = if result.is_ok() {
                 &self.metrics.range_ok
@@ -67,7 +96,7 @@ impl ReadView {
                 error.message
             );
         }
-        Ok(Outcome { result })
+        Ok(Some(Outcome { result }))
     }
 }
 

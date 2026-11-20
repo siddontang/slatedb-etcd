@@ -123,7 +123,7 @@ Each task can resume on another runtime worker after it yields.
 | Raft | One task owns RawNode. It orders events, advances consensus, and dispatches work. |
 | WAL | One dedicated `raft-log-io` OS thread per member writes, syncs, and reads the log. |
 | Apply | One Tokio task per member writes SlateDB and publishes revisions in log order. |
-| KV reads | Up to four Tokio tasks read pinned views. At most one wide read runs at a time. |
+| KV reads | Up to four Tokio tasks read pinned views. Three budgeted scans may share them. |
 | Checkpoint | The builder uses blocking workers to merge changes and sync the image. |
 | Other work | Blocking workers handle password checks, metrics encoding, and local object I/O. |
 
@@ -207,8 +207,10 @@ Local application already requires quorum commit and durable local entries.
 The read executor evaluates the entire read-only transaction against one pinned applied view.
 That view includes matching revision, compaction, Auth, and Lease metadata.
 Later apply and snapshot installation cannot change the selected view.
-Four read jobs can run, with at most 16 point reads per job and one wide read in total.
-Historical reads use the wide-read slot. Current point reads can pass queued wide reads.
+Four read jobs can run, with at most 16 point reads per job.
+Up to three current key-ordered Range scans can run together with a 4 MiB row budget each.
+A scan over budget, historical reads, sorted or filtered Ranges, and transactions run alone.
+Wide reads start in queue order. Current point reads can pass queued wide reads.
 The queue holds at most 64 requests. Each running job has a five-second deadline.
 Shutdown stops these jobs before closing the state database.
 The owner checks the term, role, and leader identity again before returning the result.

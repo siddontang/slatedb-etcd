@@ -176,11 +176,15 @@ impl Node {
             }
         }
         while self.read_executor.has_capacity() {
-            let Some(position) = self
-                .read_queries
-                .iter()
-                .position(|query| self.read_executor.can_submit(query))
-            else {
+            // Point reads can pass queued wide reads. Wide reads start in queue order,
+            // so shared scans cannot starve an older exclusive read.
+            let mut first_wide = true;
+            let Some(position) = self.read_queries.iter().position(|query| {
+                if query.is_point_read() {
+                    return self.read_executor.can_submit(query);
+                }
+                std::mem::take(&mut first_wide) && self.read_executor.can_submit(query)
+            }) else {
                 break;
             };
             let first = self.read_queries.remove(position).unwrap();

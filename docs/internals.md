@@ -96,9 +96,16 @@ KV reads use separate bounded tasks. Diagnostic queries still receive service be
 
 The owner queues at most 64 state queries, 64 KV reads, and 64 checkpoint requests.
 At most four KV read jobs run. Each point-read job contains at most 16 requests.
-Only one range scan, historical read, or read-only transaction runs at a time.
-Current point reads can pass queued scans. Each job has a five-second deadline.
-These bounds limit tasks and retained views, not total response bytes.
+Up to three streaming scans run together. A streaming scan is a current Range in key order
+without revision filters. It decodes at most `limit` rows and stops the scan at a 4 MiB row budget.
+A scan over budget runs again alone on the same pinned view and with the same deadline.
+Historical reads, sorted or filtered Ranges, and read-only transactions also run alone.
+While one of these reads runs or waits, no new scan starts. Wide reads start in queue order.
+Current point reads can pass queued scans and keep at least one task.
+Each job has a five-second deadline.
+Shared scans hold at most 3 x (4 MiB + one row) of decoded rows. The exclusive read keeps the old
+single-read bound: its result size, up to the logical data size. The two cases never overlap.
+These bounds limit tasks, retained views, and scan rows, not encoded response bytes.
 At 1,024 committed but unapplied entries, the owner stops admitting new Raft proposals.
 A leader can hold up to 256 ordinary puts before proposal when apply or log I/O falls behind.
 The queue holds up to 4 MiB of encoded data. Each put expires after five seconds.
