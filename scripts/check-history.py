@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SIGN_OFF = b"Signed-off-by: siddontang <siddontang@gmail.com>"
 # Maintainer sign-offs. These emails remain public by request.
 MAINTAINER_SIGN_OFFS = (SIGN_OFF, b"Signed-off-by: nolouch <nolouch@gmail.com>")
-# Maintainers who merge pull requests on GitHub with these emails as the author.
+# Maintainers who commit, or merge pull requests on GitHub, with these emails.
 MAINTAINER_EMAILS = (b"nolouch@gmail.com",)
 PUBLIC_EMAIL = re.compile(rb"(?:[\w.+-]+@users\.noreply\.github\.com|noreply@github\.com)\Z")
 SIGN_OFF_LINE = re.compile(rb"Signed-off-by: [^<>\n]+ <([^<>\s]+)>")
@@ -61,10 +61,10 @@ def sign_off_error(trailers, lines, author):
 def web_merge(headers, emails):
     """Return whether a maintainer merged a pull request on GitHub.
 
-    GitHub commits the merge, so the merge itself records the maintainer approval.
+    GitHub commits merge and squash merges, so the merge itself records the maintainer approval.
+    A squash merge repeats the sign-offs of the squashed commits.
     """
-    return (len(re.findall(rb"(?m)^parent ", headers)) >= 2
-            and emails[b"author"] in MAINTAINER_EMAILS
+    return (emails[b"author"] in MAINTAINER_EMAILS
             and emails[b"committer"] == b"noreply@github.com")
 
 
@@ -76,7 +76,7 @@ def commit_errors(root, raw):
         match = re.search(rb"(?m)^" + field + rb" .* <([^<>]+)> ", headers)
         emails[field] = match[1] if match else None
         if match is None or (PUBLIC_EMAIL.fullmatch(match[1]) is None
-                             and not (field == b"author" and match[1] in MAINTAINER_EMAILS)):
+                             and match[1] not in MAINTAINER_EMAILS):
             errors.append(field.decode() + " must use a GitHub public email")
     trailers = git(root, "interpret-trailers", "--parse", data=message).splitlines()
     error = sign_off_error(trailers, message.splitlines(), emails[b"author"])
