@@ -126,6 +126,13 @@ const COMPACTION_FETCH_TASKS: usize = 2;
 /// Bytes of each compaction read-ahead buffer.
 const COMPACTION_FETCH_BYTES: usize = 512 * 1024;
 
+/// Subcompactions per compaction job. SlateDB defaults to 4.
+///
+/// Each subcompaction holds one SST writer, which buffers up to 90 MiB of SST data until the
+/// paced store writes it, and the read-ahead of every input SST. With 4 jobs of 4
+/// subcompactions this held about 185 MiB in put-v4096 on a server with 4 CPU threads.
+const SUBCOMPACTIONS: usize = 2;
+
 /// Cache SST indexes, filters, and current-row data blocks after a memtable flush.
 ///
 /// SlateDB inserts every data block of a flushed L0 SST by default. Each flush then filled the
@@ -139,6 +146,32 @@ fn block_cache_policy() -> slatedb::BlockCachePolicy {
         CacheTarget::Index,
         CacheTarget::Filters,
     ])
+}
+
+/// SlateDB settings for the state machine.
+fn slatedb_settings() -> Settings {
+    let mut settings = Settings {
+        wal_enabled: false,
+        flush_interval: None,
+        object_store_max_retries: Some(3),
+        manifest_poll_interval: Duration::from_millis(100),
+        ..Settings::default()
+    };
+    // Frequent checkpoints need prompt L0 compaction and manifest refreshes.
+    if let Some(compactor) = settings.compactor_options.as_mut() {
+        compactor.poll_interval = Duration::from_millis(100);
+        compactor.commit_compacted_interval = Duration::from_millis(100);
+        if let Some(worker) = compactor.worker.as_mut() {
+            worker.compactions_poll_interval = Duration::from_millis(100);
+            worker.max_subcompactions = SUBCOMPACTIONS;
+            // Each input SST of each subcompaction reads ahead `max_fetch_tasks` buffers
+            // of `bytes_to_fetch`. The 4 x 2 MiB default held about 256 MiB with 8 L0
+            // inputs and 4 subcompactions. Local objects need little read-ahead.
+            worker.max_fetch_tasks = COMPACTION_FETCH_TASKS;
+            worker.bytes_to_fetch = COMPACTION_FETCH_BYTES;
+        }
+    }
+    settings
 }
 
 /// The first key after every `etcd/current/` key.
@@ -175,26 +208,7 @@ impl StateMachine {
     ) -> Result<Self> {
         cache.validate()?;
         let cache = cache.build();
-        let mut settings = Settings {
-            wal_enabled: false,
-            flush_interval: None,
-            object_store_max_retries: Some(3),
-            manifest_poll_interval: Duration::from_millis(100),
-            ..Settings::default()
-        };
-        // Frequent checkpoints need prompt L0 compaction and manifest refreshes.
-        if let Some(compactor) = settings.compactor_options.as_mut() {
-            compactor.poll_interval = Duration::from_millis(100);
-            compactor.commit_compacted_interval = Duration::from_millis(100);
-            if let Some(worker) = compactor.worker.as_mut() {
-                worker.compactions_poll_interval = Duration::from_millis(100);
-                // Each input SST of each subcompaction reads ahead `max_fetch_tasks` buffers
-                // of `bytes_to_fetch`. The 4 x 2 MiB default held about 256 MiB with 8 L0
-                // inputs and 4 subcompactions. Local objects need little read-ahead.
-                worker.max_fetch_tasks = COMPACTION_FETCH_TASKS;
-                worker.bytes_to_fetch = COMPACTION_FETCH_BYTES;
-            }
-        }
+        let settings = slatedb_settings();
         let admin = slatedb::admin::Admin::builder(prefix, object_store.clone()).build();
         let db = Db::builder(prefix, object_store)
             .with_db_cache(cache, 0)
