@@ -47,6 +47,8 @@ Recovery requires a covering local log and rejects a state position beyond its e
 
 The state batch adds `apply-batch-before-write` and `apply-batch-after-write` crash boundaries.
 These hooks require at least two entries. Process tests stage a delayed multi-entry apply job.
+`apply-after-early-reply` crashes the leader after a Put reply and before its state write.
+Recovery must replay the replied revision on every member.
 Repeated Put tests preserve each request's revision and Watch event across group recovery.
 The separate checkpoint cases cover before-save, after-save, and after-GC crashes.
 The snapshot cases also distinguish buffered state replacement from completed object flush.

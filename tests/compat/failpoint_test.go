@@ -22,7 +22,7 @@ func TestFailpointRecovery(t *testing.T) {
 		"wal-before-sync", "wal-after-sync",
 		"raft-before-advance", "raft-before-leader-send", "raft-before-follower-send",
 		"snapshot-before-save", "snapshot-after-save", "apply-before-entry", "apply-after-entry",
-		"apply-batch-before-write", "apply-batch-after-write",
+		"apply-batch-before-write", "apply-batch-after-write", "apply-after-early-reply",
 		"checkpoint-after-file-sync", "checkpoint-file-before-reference", "checkpoint-before-save",
 		"checkpoint-after-save", "checkpoint-after-gc",
 		"snapshot-before-install", "snapshot-after-install-write", "snapshot-after-install-flush",
@@ -34,7 +34,7 @@ func TestFailpointRecovery(t *testing.T) {
 			c := newCluster(t)
 			leader := c.leader()
 			target := leader%3 + 1
-			if point == "raft-before-leader-send" {
+			if point == "raft-before-leader-send" || point == "apply-after-early-reply" {
 				target = leader
 			}
 			api := client(t, []string{c.addresses[leader-1]})
@@ -108,6 +108,13 @@ func TestFailpointRecovery(t *testing.T) {
 						state["apply_target"].(float64)-state["applied_index"].(float64) > 1
 				}, 10*time.Second, 10*time.Millisecond, "no multi-entry apply job")
 				require.NoError(t, os.WriteFile(trigger, []byte(point), 0600))
+			} else if point == "apply-after-early-reply" {
+				// The leader replies after prepare. The delay lets the reply reach the client
+				// before the publish job crashes ahead of the state write.
+				applyDelay(t, c, target, 500)
+				require.NoError(t, os.WriteFile(trigger, []byte(point), 0600))
+				reply := mustCall(t, api, clientv3.OpPut("early", point)).(*pb.PutResponse)
+				batched["early"] = reply.Header.Revision
 			} else if point == "lease-before-expire" {
 				// Only the leader proposes expiration. Its follower must replay that entry.
 				grant, err := api.Grant(ctx, 2)
@@ -160,6 +167,15 @@ func TestFailpointRecovery(t *testing.T) {
 				require.Len(t, got.Kvs, 1)
 				require.Equal(t, point, string(got.Kvs[0].Value))
 				require.Equal(t, revision, got.Kvs[0].ModRevision)
+			}
+			if point == "apply-after-early-reply" {
+				// Every member, including the replayed leader, has the replied revision.
+				for _, endpoint := range c.addresses {
+					got := mustCall(t, client(t, []string{endpoint}),
+						clientv3.OpGet("early")).(*pb.RangeResponse)
+					require.Len(t, got.Kvs, 1)
+					require.Equal(t, batched["early"], got.Kvs[0].ModRevision)
+				}
 			}
 			if priorRevision != 0 {
 				never := mustCall(t, recovered, clientv3.OpGet("batch/never")).(*pb.RangeResponse)

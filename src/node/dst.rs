@@ -334,7 +334,11 @@ impl Simulation {
                 );
             }
             let store = node.raw.store();
-            assert!(node.state.applied <= store.commit_index());
+            // Apply may pass the volatile commit marker, but never Raft commit or local persistence.
+            assert!(node.state.applied <= node.raw.raft.raft_log.committed);
+            assert!(
+                node.state.applied <= node.raw.raft.raft_log.persisted.max(store.snapshot_index())
+            );
             assert!(store.commit_index() <= store.last_index().unwrap());
             let stats = store.stats();
             for (used, limit) in [

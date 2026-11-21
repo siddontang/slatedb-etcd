@@ -1,4 +1,4 @@
-//! Prepare a committed Put reply while the leader waits for its local log device.
+//! Prepare a committed Put reply before its state write.
 
 use super::apply::AppliedCommand;
 use super::*;
@@ -10,19 +10,37 @@ impl Node {
         let low = self.state.applied + 1;
         // Raft counts the leader's own replica for an entry only after local persistence.
         // A commit above the persisted index therefore has a durable quorum on other voters.
-        if raft.state != StateRole::Leader
-            || self.pending.is_empty()
-            || low <= raft.raft_log.persisted
-            || low > raft.raft_log.committed
-            || self.state.applied < self.quorum_reply_index
-            || raft.pending_conf_index > self.state.applied
-            || self.raw.store().durable.hard_state.term != raft.term
-        {
+        if low <= raft.raft_log.persisted || low > raft.raft_log.committed {
             return Ok(false);
         }
         let high = (low + apply::BATCH_ENTRIES).min(raft.raft_log.committed + 1);
         let high = high.min(self.raw.store().last_index()? + 1);
-        if high <= low {
+        self.prepare_puts(high)
+    }
+
+    /// Reply to a small committed group of local Puts before the state write.
+    ///
+    /// Raft delivered these entries, so they are committed and durable in the local log. The
+    /// reply needs only the evaluated outcome. Reads still wait for the published state.
+    pub(super) fn prepare_local_puts(&mut self) -> Result<bool> {
+        let low = self.state.applied + 1;
+        if self.committed_ready < low || self.committed_ready - self.state.applied > QUICK_REPLY {
+            return Ok(false);
+        }
+        self.prepare_puts(self.committed_ready + 1)
+    }
+
+    /// Evaluate the Puts in `[applied + 1, high)` for an early reply.
+    fn prepare_puts(&mut self, high: u64) -> Result<bool> {
+        let raft = &self.raw.raft;
+        let low = self.state.applied + 1;
+        if raft.state != StateRole::Leader
+            || self.pending.is_empty()
+            || high <= low
+            || self.state.applied < self.quorum_reply_index
+            || raft.pending_conf_index > self.state.applied
+            || self.raw.store().durable.hard_state.term != raft.term
+        {
             return Ok(false);
         }
         let entries = self.raw.store().entries(
@@ -56,6 +74,10 @@ impl Node {
         Ok(true)
     }
 }
+
+/// Use the early reply for at most this many committed entries. A larger backlog gains more
+/// from one pipelined apply job than from a split prepare and publish.
+const QUICK_REPLY: u64 = 8;
 
 pub(super) fn put_command(
     command: &RaftCommand,
@@ -190,5 +212,78 @@ mod tests {
             .result
             .is_ok());
         assert!(node.prepared_puts.is_none());
+    }
+    #[tokio::test]
+    async fn a_locally_durable_put_replies_before_its_state_write_and_commit_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = super::super::tests::leader_node(dir.path()).await;
+        let applied = node.state.applied;
+        let (tx, mut reply) = oneshot::channel();
+        node.propose(
+            RaftCommand::Etcd {
+                id: "local".into(),
+                origin: 1,
+                etcd: RequestOp {
+                    request: Some(Request::RequestPut(PutRequest {
+                        key: b"key".to_vec(),
+                        value: b"value".to_vec(),
+                        ..Default::default()
+                    })),
+                },
+            },
+            ClientResponse::Kv(tx),
+        )
+        .unwrap();
+        node.drive_ready().await.unwrap();
+        let index = node.raw.store().last_index().unwrap();
+        // Persist the entry locally. One peer ack then makes a quorum.
+        let persisted = node.log_worker.step().unwrap().unwrap();
+        node.complete_log(persisted).unwrap();
+        node.drive_ready().await.unwrap();
+        assert!(node.raw.raft.raft_log.persisted >= index);
+        let mut ack = Message::default();
+        ack.set_msg_type(MessageType::MsgAppendResponse);
+        ack.from = 2;
+        ack.to = 1;
+        ack.term = node.raw.raft.term;
+        ack.index = index;
+        node.raw.step(ack).unwrap();
+        node.drive_ready().await.unwrap();
+        assert!(node.raw.raft.raft_log.committed >= index);
+        // The log thread has not written the commit marker yet.
+        assert!(node.log_worker.storage().commit_index() < index);
+        let completed = node.worker.step().await.unwrap().unwrap();
+        node.complete_apply(completed).unwrap();
+        assert!(reply
+            .try_recv()
+            .unwrap()
+            .unwrap()
+            .into_outcome()
+            .result
+            .is_ok());
+        assert_eq!(node.state.applied, applied);
+        assert_eq!(node.quorum_reply_index, index);
+        // A read must not see the state before the prepared write is published.
+        let (tx, mut read) = oneshot::channel();
+        node.enqueue_query(Query::Read(
+            super::super::tests::range_request(),
+            None,
+            ClientResponse::Kv(tx),
+        ));
+        node.drive_ready().await.unwrap();
+        node.drain_reads().await.unwrap();
+        assert!(read.try_recv().is_err());
+        node.drain_apply().await.unwrap();
+        assert_eq!(node.state.applied, index);
+        assert!(node.log_worker.storage().commit_index() < index);
+        let outcome = read.try_recv().unwrap().unwrap().into_outcome();
+        let Some(crate::proto::etcdserverpb::response_op::Response::ResponseRange(range)) =
+            outcome.result.unwrap().response
+        else {
+            panic!("expected a Range reply");
+        };
+        assert_eq!(range.kvs[0].value, b"value");
+        node.drain_log().await.unwrap();
+        assert!(node.log_worker.storage().commit_index() >= index);
     }
 }
