@@ -106,6 +106,9 @@ State recovers to its last synced flush. A restart can replay up to the larger o
 thresholds: by default 10,000 entries or 64 MiB of log, plus the entries applied after them.
 Membership changes and peer snapshot requests do not wait for the byte threshold.
 These flags do not bound process RSS, SlateDB, state scans, or snapshot buffers.
+A memtable flush caches the SST index, filters, and current-row blocks; reads cache the rest.
+Compaction reads ahead 2 x 512 KiB per input SST. On Linux, jemalloc returns freed pages to
+the OS after 1 s; `_RJEM_MALLOC_CONF` overrides that default.
 The quota can be exceeded by one operation and does not reserve free disk space.
 Native backups and peer snapshot transfers have a 64 MiB limit.
 See [log pool accounting](architecture.md#bounded-log-pools) for admission and recovery rules.

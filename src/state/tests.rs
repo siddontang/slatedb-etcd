@@ -545,3 +545,19 @@ async fn lease_revoke_deletes_more_keys_than_the_user_transaction_limit() {
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn flush_cache_range_covers_only_current_rows() {
+    let range = crate::mvcc::CURRENT..CURRENT_END;
+    for key in [b"".as_slice(), b"\x00", b"\xff\xff", b"a/b"] {
+        assert!(range.contains(&[crate::mvcc::CURRENT, key].concat().as_slice()));
+    }
+    for key in [
+        crate::mvcc::HISTORY,
+        crate::watch::EVENTS,
+        crate::mvcc::REVISION,
+        APPLIED,
+    ] {
+        assert!(!range.contains(&key));
+    }
+}
