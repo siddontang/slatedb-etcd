@@ -1,4 +1,5 @@
 mod auto;
+mod coalesce;
 mod self_signed;
 
 use anyhow::{ensure, Context, Result};
@@ -248,7 +249,7 @@ pub(crate) async fn serve_until<S: ConnectionService>(
             let Some(acceptor) = acceptor else {
                 let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
                     .serve_connection_with_upgrades(
-                        TokioIo::new(stream),
+                        TokioIo::new(coalesce::Coalesce::new(stream)),
                         TowerToHyperService::new(app),
                     )
                     .await;
@@ -279,7 +280,10 @@ pub(crate) async fn serve_until<S: ConnectionService>(
                 app
             };
             let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-                .serve_connection_with_upgrades(TokioIo::new(stream), TowerToHyperService::new(app))
+                .serve_connection_with_upgrades(
+                    TokioIo::new(coalesce::Coalesce::new(stream)),
+                    TowerToHyperService::new(app),
+                )
                 .await;
         });
     };
