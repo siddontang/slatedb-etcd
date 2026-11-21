@@ -14,6 +14,12 @@ pub(crate) fn key(revision: i64) -> Vec<u8> {
     [EVENTS, &revision.to_be_bytes()].concat()
 }
 
+/// Append `key(revision)` to `buf`.
+pub(crate) fn write_key(revision: i64, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(EVENTS);
+    buf.extend_from_slice(&revision.to_be_bytes());
+}
+
 /// Record HashKV and Watch rows. `prev_revisions` follows `record_journal`.
 ///
 /// `history` holds the history version that this revision writes for each changed key. When every

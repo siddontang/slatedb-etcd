@@ -164,6 +164,71 @@ impl WriteBatch {
     }
 }
 
+/// Rows that share one buffer.
+///
+/// SlateDB keeps each memtable key and value as its own `Bytes` until the memtable is flushed. A
+/// Put writes four rows. Built separately, they cost eight heap buffers, and cloning them into
+/// the SlateDB batch adds one shared reference count allocation each. All rows of one write enter
+/// the same memtable and leave it with the same flush, so one buffer frees no later than eight.
+#[derive(Default)]
+pub(crate) struct RowPack {
+    buf: Vec<u8>,
+    rows: Vec<PackedRow>,
+}
+
+struct PackedRow {
+    key: std::ops::Range<usize>,
+    value: std::ops::Range<usize>,
+    old_len: Option<usize>,
+}
+
+impl RowPack {
+    /// Reserve room for `bytes` more bytes, so that the buffer is allocated once.
+    pub(crate) fn reserve(&mut self, bytes: usize) {
+        self.buf.reserve_exact(bytes);
+    }
+
+    /// Append the bytes that `write` adds to the buffer and return their range.
+    pub(crate) fn write(&mut self, write: impl FnOnce(&mut Vec<u8>)) -> std::ops::Range<usize> {
+        let start = self.buf.len();
+        write(&mut self.buf);
+        start..self.buf.len()
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.buf
+    }
+
+    pub(crate) fn append(&mut self, bytes: &[u8]) -> std::ops::Range<usize> {
+        self.write(|buf| buf.extend_from_slice(bytes))
+    }
+
+    /// Add a row from ranges of the buffer. Rows may share bytes.
+    pub(crate) fn row(
+        &mut self,
+        key: std::ops::Range<usize>,
+        value: std::ops::Range<usize>,
+        old_len: Option<usize>,
+    ) {
+        self.rows.push(PackedRow {
+            key,
+            value,
+            old_len,
+        });
+    }
+
+    /// Add the rows to `batch` in order, as `WriteBatch::put_counted` does.
+    pub(crate) fn put_into(mut self, batch: &mut WriteBatch, size: &mut u64) -> Result<()> {
+        // An exact buffer converts to `Bytes` without a copy and wastes no capacity.
+        self.buf.shrink_to_fit();
+        let buf = Bytes::from(self.buf);
+        for row in self.rows {
+            batch.put_counted(buf.slice(row.key), buf.slice(row.value), row.old_len, size)?;
+        }
+        Ok(())
+    }
+}
+
 fn row_size_after(
     size: u64,
     key_len: usize,
@@ -175,4 +240,59 @@ fn row_size_after(
         .context("logical size counter underflow")?
         .checked_add(new.map_or(0, bytes))
         .context("logical size counter overflow")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packed_rows_match_separate_rows_and_share_one_buffer() {
+        let rows: [(&[u8], &[u8], Option<usize>); 3] = [
+            (b"etcd/a", b"value-a", Some(9)),
+            (b"etcd/b", b"", None),
+            (b"etcd/c", b"value-c", None),
+        ];
+        let mut separate = WriteBatch::new();
+        let mut separate_size = 100;
+        for (key, value, old) in rows {
+            separate
+                .put_counted(
+                    Bytes::copy_from_slice(key),
+                    Bytes::copy_from_slice(value),
+                    old,
+                    &mut separate_size,
+                )
+                .unwrap();
+        }
+        let mut pack = RowPack::default();
+        pack.reserve(64);
+        for (key, value, old) in rows {
+            let key = pack.append(key);
+            let value = pack.append(value);
+            pack.row(key, value, old);
+        }
+        // A row may also reuse bytes of an earlier row.
+        let shared = 6..12;
+        let key = pack.append(b"etcd/d");
+        pack.row(key, shared, None);
+        let mut packed = WriteBatch::new();
+        let mut packed_size = 100;
+        pack.put_into(&mut packed, &mut packed_size).unwrap();
+        separate
+            .put_counted(
+                Bytes::from_static(b"etcd/d"),
+                Bytes::from_static(b"value-"),
+                None,
+                &mut separate_size,
+            )
+            .unwrap();
+        assert_eq!(packed_size, separate_size);
+        let packed: Vec<_> = packed.into_rows().collect();
+        assert_eq!(packed, separate.into_rows().collect::<Vec<_>>());
+        let base = packed[0].0.as_ptr() as usize;
+        for (key, _) in &packed {
+            assert!((key.as_ptr() as usize - base) < 64);
+        }
+    }
 }

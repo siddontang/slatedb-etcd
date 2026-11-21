@@ -74,16 +74,31 @@ fn current_bounds(key: &[u8], end: &[u8]) -> std::ops::Range<Vec<u8>> {
 }
 
 fn history_prefix(key: &[u8]) -> Vec<u8> {
-    const HEX: &[u8] = b"0123456789abcdef";
     // Reserve the revision suffix for history writes.
-    let mut out = Vec::with_capacity(HISTORY.len() + key.len() * 2 + 1 + 8);
+    let mut out = Vec::with_capacity(history_key_len(key));
+    write_history_prefix(key, &mut out);
+    out
+}
+
+fn write_history_prefix(key: &[u8], out: &mut Vec<u8>) {
+    const HEX: &[u8] = b"0123456789abcdef";
     out.extend_from_slice(HISTORY);
     for byte in key {
         out.push(HEX[(byte >> 4) as usize]);
         out.push(HEX[(byte & 15) as usize]);
     }
     out.push(b'/');
-    out
+}
+
+/// The length of `history_key(key, revision)`.
+fn history_key_len(key: &[u8]) -> usize {
+    HISTORY.len() + key.len() * 2 + 1 + 8
+}
+
+/// Append `history_key(key, revision)` to `out`.
+fn write_history_key(key: &[u8], revision: i64, out: &mut Vec<u8>) {
+    write_history_prefix(key, out);
+    out.extend_from_slice(&revision.to_be_bytes());
 }
 
 /// Name the history version of a key at one revision.

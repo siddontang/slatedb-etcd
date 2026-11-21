@@ -1,6 +1,7 @@
 //! Build ordinary Put mutations from one current-value lookup.
 
 use super::*;
+use crate::batch::RowPack;
 use crate::state::key_index::KeyMeta;
 
 pub(super) fn value(p: &PutRequest, old: Option<&KeyValue>, revision: i64) -> KeyValue {
@@ -106,10 +107,6 @@ fn distinct_keys(ops: &[RequestOp]) -> bool {
     keys.windows(2).all(|pair| pair[0] != pair[1])
 }
 
-fn encode_version(kv: &KeyValue) -> (bytes::Bytes, bytes::Bytes) {
-    encode_version_at(kv, kv.mod_revision)
-}
-
 /// Encode the history `Version` of `kv` at `revision`. The second value is the `KeyValue` part.
 fn encode_version_at(kv: &KeyValue, revision: i64) -> (bytes::Bytes, bytes::Bytes) {
     use prost::encoding::{bytes as field, int64, message};
@@ -124,6 +121,25 @@ fn encode_version_at(kv: &KeyValue, revision: i64) -> (bytes::Bytes, bytes::Byte
     let version = bytes::Bytes::from(version);
     let current = version.slice(version.len() - kv.encoded_len()..);
     (version, current)
+}
+
+/// Append the history `Version` of `kv` at its mod revision to `buf`, as `encode_version_at` does.
+/// The `KeyValue` part, which the current row stores, ends the version.
+fn write_version(kv: &KeyValue, buf: &mut Vec<u8>) {
+    use prost::encoding::{bytes as field, int64, message};
+
+    field::encode(1, &kv.key, buf);
+    int64::encode(2, &kv.mod_revision, buf);
+    message::encode(3, kv, buf);
+}
+
+/// Bytes that `write_version` appends.
+fn version_len(kv: &KeyValue) -> usize {
+    use prost::encoding::{bytes as field, int64, message};
+
+    field::encoded_len(1, &kv.key)
+        + int64::encoded_len(2, &kv.mod_revision)
+        + message::encoded_len(3, kv)
 }
 
 /// A new value and its encoded `KeyValue` bytes.
@@ -305,7 +321,9 @@ pub(crate) async fn prepare_put(
     key_check(&p.key)?;
     let next = revision + 1;
     // One put writes the only history version of its key at `next`.
-    let (reply, event, prev_revision) = put_rows(view, next, 0, true, p, batch, size).await?;
+    let mut pack = RowPack::default();
+    let (reply, event, prev_revision) =
+        put_rows(view, next, 0, true, p, batch, &mut pack, true).await?;
     let journal = PutJournal {
         event: PutEvent {
             kv: event.kv,
@@ -317,11 +335,13 @@ pub(crate) async fn prepare_put(
             vec![]
         },
         values_in_history: true,
-    }
-    .encode_to_vec();
-    batch
-        .put_counted(crate::watch::key(next).into(), journal.into(), None, size)
-        .map_err(KvError::storage)?;
+    };
+    // The journal row shares the buffer of the put rows.
+    pack.reserve(crate::watch::EVENTS.len() + 8 + journal.encoded_len());
+    let journal_key = pack.write(|buf| crate::watch::write_key(next, buf));
+    let journal = pack.write(|buf| journal.encode_raw(buf));
+    pack.row(journal_key, journal, None);
+    pack.put_into(batch, size).map_err(KvError::storage)?;
     put_revision_row(view, revision, batch, size).await?;
     Ok((response(Resp::ResponsePut(reply)), next))
 }
@@ -396,8 +416,20 @@ pub(crate) async fn prepare_txn_puts(
         let Some(Op::RequestPut(p)) = &op.request else {
             return Err(KvError::invalid("expected an ordinary put"));
         };
-        let (reply, event, prev_revision) =
-            put_rows(view, next, sub, values_in_history, p, batch, size).await?;
+        // A later put of the same key reads this one from `batch`.
+        let mut pack = RowPack::default();
+        let (reply, event, prev_revision) = put_rows(
+            view,
+            next,
+            sub,
+            values_in_history,
+            p,
+            batch,
+            &mut pack,
+            false,
+        )
+        .await?;
+        pack.put_into(batch, size).map_err(KvError::storage)?;
         counts.put(&p.key, &p.value);
         responses.push(response(Resp::ResponsePut(reply)));
         events.push(event);
@@ -410,11 +442,13 @@ pub(crate) async fn prepare_txn_puts(
         events,
         prev_revisions,
         values_in_history,
-    }
-    .encode_to_vec();
-    batch
-        .put_counted(crate::watch::key(next).into(), journal.into(), None, size)
-        .map_err(KvError::storage)?;
+    };
+    let mut pack = RowPack::default();
+    pack.reserve(crate::watch::EVENTS.len() + 8 + journal.encoded_len());
+    let journal_key = pack.write(|buf| crate::watch::write_key(next, buf));
+    let journal = pack.write(|buf| journal.encode_raw(buf));
+    pack.row(journal_key, journal, None);
+    pack.put_into(batch, size).map_err(KvError::storage)?;
     put_revision_row(view, revision, batch, size).await?;
     #[cfg(test)]
     DIRECT_TXNS.with(|count| count.set(count.get() + 1));
@@ -471,6 +505,9 @@ async fn compares(
 ///
 /// With `values_in_history`, the event omits the value: the caller writes a journal that sets
 /// `values_in_history`, so its history row at `next` must be the final version of the key.
+///
+/// The rows go to `pack`. With `journal`, it also reserves room for the journal row of
+/// `prepare_put`.
 #[allow(clippy::too_many_arguments)]
 async fn put_rows(
     view: &CurrentView<'_>,
@@ -478,8 +515,9 @@ async fn put_rows(
     sub: usize,
     values_in_history: bool,
     p: &PutRequest,
-    batch: &mut WriteBatch,
-    size: &mut u64,
+    batch: &WriteBatch,
+    pack: &mut RowPack,
+    journal: bool,
 ) -> KvResult<(PutResponse, EventRow, i64)> {
     let key = current_key(&p.key);
     // An earlier put in this batch may have replaced the applied row.
@@ -515,7 +553,6 @@ async fn put_rows(
         version: meta.map_or(1, |m| m.version + 1),
         lease: 0,
     };
-    let (history, current) = encode_version(&kv);
     let (journal_prev, prev_revision) = match meta {
         None => (None, 0),
         Some(m) if has_history(m.mod_revision, next) => (None, m.mod_revision),
@@ -525,28 +562,47 @@ async fn put_rows(
             None => return Err(KvError::storage("indexed row has no older revision")),
         },
     };
-    // The hash row holds a digest of the KeyValue, not its bytes.
-    let hash = crate::state::maintenance::hash_record(&p.key, &current);
     // With values in history, the journal event omits the value. The history row holds it.
     let event_kv = if values_in_history {
-        without_value(&kv)
+        Some(without_value(&kv))
     } else {
-        current.clone()
+        None
     };
-    let rows = [
-        (key.into(), current, old_len),
-        (
-            crate::state::maintenance::hash_key(next, sub as i64, false).into(),
-            hash.into(),
-            None,
-        ),
-        (history_key(&p.key, next).into(), history, None),
-    ];
-    for (key, value, old_len) in rows {
-        batch
-            .put_counted(key, value, old_len, size)
-            .map_err(KvError::storage)?;
-    }
+    let kv_len = kv.encoded_len();
+    // The hash row holds a digest of the KeyValue, not its bytes.
+    let hash_len = crate::state::maintenance::hash_record_len(&p.key, kv_len);
+    let journal_room = if journal {
+        // An upper bound of the single-event journal of `prepare_put`.
+        let event = event_kv.as_ref().map_or(kv_len, bytes::Bytes::len);
+        let prev = journal_prev.as_ref().map_or(0, bytes::Bytes::len);
+        crate::watch::EVENTS.len() + 8 + event + prev + 40
+    } else {
+        0
+    };
+    pack.reserve(
+        key.len()
+            + history_key_len(&p.key)
+            + version_len(&kv)
+            + crate::state::maintenance::hash_key_len(false)
+            + hash_len
+            + journal_room,
+    );
+    let current_key = pack.append(&key);
+    let history_key = pack.write(|buf| write_history_key(&p.key, next, buf));
+    let history = pack.write(|buf| write_version(&kv, buf));
+    let current = history.end - kv_len..history.end;
+    let hash_key =
+        pack.write(|buf| crate::state::maintenance::write_hash_key(next, sub as i64, false, buf));
+    let digest = crate::state::maintenance::hash_digest(&p.key, &pack.bytes()[current.clone()]);
+    let hash = pack.write(|buf| digest.encode_raw(buf));
+    debug_assert_eq!(hash.len(), hash_len);
+    let event_kv = match event_kv {
+        Some(kv) => kv,
+        None => bytes::Bytes::copy_from_slice(&pack.bytes()[current.clone()]),
+    };
+    pack.row(current_key, current, old_len);
+    pack.row(hash_key, hash, None);
+    pack.row(history_key, history, None);
     Ok((
         PutResponse {
             header: header(next),
@@ -642,6 +698,42 @@ mod tests {
             (&b"key"[..], revision)
         );
         assert!(kv.value.is_empty());
+        // All rows of the put share one buffer of exactly their bytes.
+        // The first revision also writes the revision row.
+        let rows: Vec<_> = batch
+            .into_rows()
+            .filter(|(key, _)| key.as_ref() != crate::mvcc::REVISION)
+            .collect();
+        assert_eq!(rows.len(), 4);
+        let start = rows
+            .iter()
+            .map(|(key, _)| key.as_ptr() as usize)
+            .min()
+            .unwrap();
+        let end = rows
+            .iter()
+            .flat_map(|(key, value)| {
+                [
+                    key.as_ptr_range().end,
+                    value.as_ref().unwrap().as_ptr_range().end,
+                ]
+            })
+            .map(|end| end as usize)
+            .max()
+            .unwrap();
+        // The current row is a slice of the history row.
+        let bytes: usize = rows
+            .iter()
+            .map(|(key, value)| {
+                key.len()
+                    + if key.starts_with(crate::mvcc::CURRENT) {
+                        0
+                    } else {
+                        value.as_ref().unwrap().len()
+                    }
+            })
+            .sum();
+        assert_eq!(end - start, bytes);
         state.close().await.unwrap();
     }
 

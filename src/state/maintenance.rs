@@ -321,7 +321,18 @@ pub(crate) fn record_hash(
 }
 
 pub(crate) fn hash_key(revision: i64, sub: i64, deleted: bool) -> Vec<u8> {
-    let mut key = Vec::with_capacity(HASH.len() + 17 + usize::from(deleted));
+    let mut key = Vec::with_capacity(hash_key_len(deleted));
+    write_hash_key(revision, sub, deleted, &mut key);
+    key
+}
+
+/// The length of `hash_key(_, _, deleted)`.
+pub(crate) fn hash_key_len(deleted: bool) -> usize {
+    HASH.len() + 17 + usize::from(deleted)
+}
+
+/// Append `hash_key(revision, sub, deleted)` to `key`.
+pub(crate) fn write_hash_key(revision: i64, sub: i64, deleted: bool, key: &mut Vec<u8>) {
     key.extend_from_slice(HASH);
     key.extend_from_slice(&revision.to_be_bytes());
     key.push(b'_');
@@ -329,7 +340,6 @@ pub(crate) fn hash_key(revision: i64, sub: i64, deleted: bool) -> Vec<u8> {
     if deleted {
         key.push(b't');
     }
-    key
 }
 
 // Hash records use the etcd KeyValue wire format. Retention only needs field one.
@@ -358,12 +368,28 @@ struct HashDigest {
 /// HashKV feeds the record through [`hash_append`], which gives the same CRC as the full bytes.
 /// The record does not repeat the value, so large values are not written a further time.
 pub(crate) fn hash_record(key: &[u8], kv: &[u8]) -> Vec<u8> {
+    hash_digest(key, kv).encode_to_vec()
+}
+
+/// The message that `hash_record` encodes.
+pub(crate) fn hash_digest(key: &[u8], kv: &[u8]) -> impl Message {
     HashDigest {
         key: key.to_vec(),
         crc: Some(crc32c::crc32c(kv)),
         len: Some(kv.len() as u64),
     }
-    .encode_to_vec()
+}
+
+/// The length of `hash_record(key, kv)` for a `kv` of `kv_len` bytes.
+pub(crate) fn hash_record_len(key: &[u8], kv_len: usize) -> usize {
+    use prost::encoding::{encoded_len_varint, key_len};
+
+    let key_field = if key.is_empty() {
+        0
+    } else {
+        key_len(1) + encoded_len_varint(key.len() as u64) + key.len()
+    };
+    key_field + key_len(14) + 4 + key_len(15) + encoded_len_varint(kv_len as u64)
 }
 
 /// Append the bytes that a hash record stands for to `crc`.
