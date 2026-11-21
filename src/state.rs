@@ -30,6 +30,9 @@ mod kv;
 mod lease;
 pub(crate) mod put_batch;
 mod read;
+pub(crate) mod rows;
+#[cfg(test)]
+mod rows_tests;
 mod snapshot;
 pub(crate) use read::ReadView;
 #[cfg(test)]
@@ -58,6 +61,8 @@ pub struct StateMachine {
     logical_bytes: u64,
     pub(crate) current: current::CurrentRows,
     pub(crate) key_index: key_index::KeyIndex,
+    /// Current rows shared by pinned point reads.
+    pub(crate) rows: Arc<rows::RowCache>,
     pub(crate) write_batches: u64,
     pub alarms: Vec<crate::proto::etcdserverpb::AlarmMember>,
     pub applied: u64,
@@ -78,6 +83,8 @@ pub struct StateCache {
     pub block_bytes: u64,
     /// Budget for cached SST indexes, filters, and stats.
     pub meta_bytes: u64,
+    /// Budget for current rows of linearizable point reads. Zero disables the row cache.
+    pub row_bytes: u64,
 }
 
 impl Default for StateCache {
@@ -85,6 +92,7 @@ impl Default for StateCache {
         Self {
             block_bytes: 64 * 1024 * 1024,
             meta_bytes: 64 * 1024 * 1024,
+            row_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -174,6 +182,7 @@ impl StateMachine {
         cache: StateCache,
     ) -> Result<Self> {
         cache.validate()?;
+        let rows = Arc::new(rows::RowCache::new(cache.row_bytes));
         let cache = cache.build();
         let mut settings = Settings {
             wal_enabled: false,
@@ -241,6 +250,7 @@ impl StateMachine {
                 quota: 0,
                 current: current::CurrentRows::default(),
                 key_index: key_index::KeyIndex::load(&db).await?,
+                rows,
                 logical_bytes: maintenance::count_logical_size(&db).await?,
                 write_batches: 0,
                 alarms,
@@ -274,6 +284,12 @@ impl StateMachine {
     }
 
     async fn store_batch(&mut self, batch: WriteBatch, index: u64) -> Result<()> {
+        // Drop shared rows before SlateDB may expose the change. See `rows`.
+        for key in batch.keys() {
+            if let Some(key) = key.strip_prefix(mvcc::CURRENT) {
+                self.rows.invalidate(key, index);
+            }
+        }
         self.db
             .write_with_options(batch.to_storage(), &WriteOptions { seqnum: index })
             .await?;
