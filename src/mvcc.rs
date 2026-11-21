@@ -15,7 +15,9 @@ use crate::proto::mvccpb::KeyValue;
 use crate::proto::state::Version;
 
 mod put;
-pub(crate) use put::{prepare_put, CurrentView};
+#[cfg(test)]
+pub(crate) use put::DIRECT_TXNS;
+pub(crate) use put::{batchable_txn, prepare_put, prepare_txn_puts, CurrentView};
 
 pub(crate) const CURRENT: &[u8] = b"etcd/current/";
 pub(crate) const HISTORY: &[u8] = b"etcd/history/";
@@ -223,11 +225,12 @@ fn intervals(ops: &[RequestOp]) -> KvResult<Intervals> {
     Ok((puts, deletes))
 }
 
-enum Plan {
-    Op(Op),
+/// A resolved request. Operations borrow the request, so planning copies no keys or values.
+enum Plan<'r> {
+    Op(std::borrow::Cow<'r, Op>),
     Txn {
         succeeded: bool,
-        children: Vec<Plan>,
+        children: Vec<Plan<'r>>,
     },
 }
 
@@ -504,7 +507,7 @@ impl View<'_> {
     }
 
     // Resolve nested predicates and validate state-dependent errors against the base view.
-    fn plan<'a>(&'a self, request: &'a RequestOp, nested: bool) -> KvFuture<'a, Plan> {
+    fn plan<'a, 'r: 'a>(&'a self, request: &'r RequestOp, nested: bool) -> KvFuture<'a, Plan<'r>> {
         Box::pin(async move {
             let op = request
                 .request
@@ -534,22 +537,25 @@ impl View<'_> {
                 }
                 Op::RequestRange(r) => {
                     self.check_revision(r, nested)?;
-                    Ok(Plan::Op(op.clone()))
+                    Ok(Plan::Op(std::borrow::Cow::Borrowed(op)))
                 }
                 Op::RequestPut(p) => {
                     if p.lease != 0 && !self.leases.contains_key(&p.lease) {
                         return Err(KvError::new(Code::NotFound, "requested lease not found"));
                     }
-                    let exists = match self.indexed(&p.key) {
-                        Some(meta) => meta.is_some(),
-                        None => self.point(&p.key, false).await?.is_some(),
-                    };
-                    if (p.ignore_value || p.ignore_lease) && !exists {
-                        return Err(KvError::invalid("key not found"));
+                    // Only a put that keeps the old value or lease needs an existing key.
+                    if p.ignore_value || p.ignore_lease {
+                        let exists = match self.indexed(&p.key) {
+                            Some(meta) => meta.is_some(),
+                            None => self.point(&p.key, false).await?.is_some(),
+                        };
+                        if !exists {
+                            return Err(KvError::invalid("key not found"));
+                        }
                     }
-                    Ok(Plan::Op(op.clone()))
+                    Ok(Plan::Op(std::borrow::Cow::Borrowed(op)))
                 }
-                _ => Ok(Plan::Op(op.clone())),
+                _ => Ok(Plan::Op(std::borrow::Cow::Borrowed(op))),
             }
         })
     }
@@ -653,37 +659,38 @@ impl View<'_> {
         })
     }
 
-    fn execute<'a>(&'a mut self, plan: Plan, nested: bool) -> KvFuture<'a, ResponseOp> {
+    fn execute<'a, 'r: 'a>(&'a mut self, plan: Plan<'r>, nested: bool) -> KvFuture<'a, ResponseOp> {
         Box::pin(async move {
-            Ok(match plan {
+            let op = match plan {
+                Plan::Op(op) => op,
                 Plan::Txn {
                     succeeded,
                     children,
                 } => {
-                    let mut responses = vec![];
+                    let mut responses = Vec::with_capacity(children.len());
                     for child in children {
                         responses.push(self.execute(child, true).await?);
                     }
-                    response(Resp::ResponseTxn(TxnResponse {
+                    return Ok(response(Resp::ResponseTxn(TxnResponse {
                         header: header(if nested { 0 } else { self.current_revision() }),
                         succeeded,
                         responses,
-                    }))
+                    })));
                 }
-                Plan::Op(Op::RequestRange(r)) => {
-                    response(Resp::ResponseRange(self.range(&r).await?))
-                }
-                Plan::Op(Op::RequestPut(p)) => {
+            };
+            Ok(match op.as_ref() {
+                Op::RequestRange(r) => response(Resp::ResponseRange(self.range(r).await?)),
+                Op::RequestPut(p) => {
                     let old = match self.changes.get(&p.key) {
                         Some(value) => value.clone().map(put::Old::Full),
                         None => match self.indexed(&p.key) {
-                            Some(meta) if !put::needs_old_value(&p) => meta.map(put::Old::Meta),
+                            Some(meta) if !put::needs_old_value(p) => meta.map(put::Old::Meta),
                             Some(None) => None,
                             _ => self.point(&p.key, false).await?.map(put::Old::Full),
                         },
                     };
                     let revision = self.revision + 1;
-                    let kv = put::value(&p, old.as_ref().map(put::Old::kv), revision);
+                    let kv = put::value(p, old.as_ref().map(put::Old::kv), revision);
                     self.writes.put(&kv.key, &kv.value);
                     let (journal_prev, prev_revision) = put::prev_event(old.as_ref(), revision)?;
                     self.events.push(crate::proto::mvccpb::Event {
@@ -692,7 +699,7 @@ impl View<'_> {
                         prev_kv: journal_prev,
                     });
                     self.prev_revisions.push(prev_revision);
-                    self.changes.insert(p.key, Some(kv));
+                    self.changes.insert(p.key.clone(), Some(kv));
                     response(Resp::ResponsePut(PutResponse {
                         header: header(revision),
                         prev_kv: if p.prev_kv {
@@ -702,7 +709,7 @@ impl View<'_> {
                         },
                     }))
                 }
-                Plan::Op(Op::RequestDeleteRange(d)) => {
+                Op::RequestDeleteRange(d) => {
                     let rows = self.latest(&d.key, &d.range_end, true).await?;
                     let deleted = rows.len() as i64;
                     self.writes.deletes += 1;
@@ -729,7 +736,7 @@ impl View<'_> {
                         },
                     }))
                 }
-                Plan::Op(Op::RequestTxn(_)) => unreachable!("transactions use a resolved plan"),
+                Op::RequestTxn(_) => unreachable!("transactions use a resolved plan"),
             })
         })
     }
@@ -943,15 +950,13 @@ async fn prepare_view(
     let response = view.execute(plan, false).await?;
     let next = view.current_revision();
     let mut batch = WriteBatch::new();
-    crate::watch::record(next, view.events, view.prev_revisions, &mut batch);
-    for (key, value) in view.changes {
-        if let Some(value) = &value {
-            batch.put(current_key(&key), value.encode_to_vec());
-        } else {
-            batch.delete(current_key(&key));
-        }
-        put::record_version(&mut batch, key, value, next);
-    }
+    put::record_changes(
+        &mut batch,
+        next,
+        view.events,
+        view.prev_revisions,
+        view.changes,
+    );
     if revision > 1 {
         // A revision above one implies a stored revision row.
         batch.put_known(REVISION, next.to_be_bytes().to_vec(), Some(8));
@@ -1067,10 +1072,12 @@ pub(crate) async fn revoke_keys(
     };
     for key in lease_keys(db, id).await? {
         view.execute(
-            Plan::Op(Op::RequestDeleteRange(DeleteRangeRequest {
-                key,
-                ..Default::default()
-            })),
+            Plan::Op(std::borrow::Cow::Owned(Op::RequestDeleteRange(
+                DeleteRangeRequest {
+                    key,
+                    ..Default::default()
+                },
+            ))),
             true,
         )
         .await?;

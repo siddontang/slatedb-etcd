@@ -55,19 +55,129 @@ struct PutJournal {
     prev_revisions: Vec<i64>,
 }
 
+// The wire form of `mvccpb.Event` with encoded `KeyValue` payloads.
+#[derive(prost::Message)]
+struct EventRow {
+    #[prost(int32, tag = "1")]
+    r#type: i32,
+    #[prost(bytes = "bytes", required, tag = "2")]
+    kv: bytes::Bytes,
+    #[prost(bytes = "bytes", optional, tag = "3")]
+    prev_kv: Option<bytes::Bytes>,
+}
+
+// The wire form of `state.Journal` with encoded events.
+#[derive(prost::Message)]
+struct JournalRow {
+    #[prost(message, repeated, tag = "1")]
+    events: Vec<EventRow>,
+    #[prost(int64, repeated, tag = "2")]
+    prev_revisions: Vec<i64>,
+}
+
 fn encode_version(kv: &KeyValue) -> (bytes::Bytes, bytes::Bytes) {
+    encode_version_at(kv, kv.mod_revision)
+}
+
+/// Encode the history `Version` of `kv` at `revision`. The second value is the `KeyValue` part.
+fn encode_version_at(kv: &KeyValue, revision: i64) -> (bytes::Bytes, bytes::Bytes) {
     use prost::encoding::{bytes as field, int64, message};
 
     let len = field::encoded_len(1, &kv.key)
-        + int64::encoded_len(2, &kv.mod_revision)
+        + int64::encoded_len(2, &revision)
         + message::encoded_len(3, kv);
     let mut version = Vec::with_capacity(len);
     field::encode(1, &kv.key, &mut version);
-    int64::encode(2, &kv.mod_revision, &mut version);
+    int64::encode(2, &revision, &mut version);
     message::encode(3, kv, &mut version);
     let version = bytes::Bytes::from(version);
     let current = version.slice(version.len() - kv.encoded_len()..);
     (version, current)
+}
+
+/// A new value and its encoded `KeyValue` bytes.
+type Encoded = (KeyValue, bytes::Bytes);
+
+/// Add the rows of one revision: current, history, HashKV, and Watch journal rows.
+///
+/// The result matches `watch::record` followed by a current-row write and `record_version` for
+/// each change. Each put value is encoded once. The current, history, HashKV, and journal rows
+/// share those bytes.
+pub(super) fn record_changes(
+    batch: &mut WriteBatch,
+    next: i64,
+    events: Vec<crate::proto::mvccpb::Event>,
+    mut prev_revisions: Vec<i64>,
+    changes: BTreeMap<Vec<u8>, Option<KeyValue>>,
+) {
+    // Sorted by key, because the map iterates in key order.
+    let mut encoded: Vec<(Vec<u8>, Option<Encoded>)> = Vec::with_capacity(changes.len());
+    for (key, value) in changes {
+        let current = match value {
+            Some(kv) => {
+                let (version, current) = encode_version_at(&kv, next);
+                batch.put_new(history_key(&key, next), version);
+                batch.put_bytes(current_key(&key).into(), current.clone());
+                Some((kv, current))
+            }
+            None => {
+                batch.delete(current_key(&key));
+                record_version(batch, key.clone(), None, next);
+                None
+            }
+        };
+        encoded.push((key, current));
+    }
+    let shared = |kv: &KeyValue| -> Option<bytes::Bytes> {
+        let at = encoded
+            .binary_search_by(|(key, _)| key.as_slice().cmp(&kv.key))
+            .ok()?;
+        match &encoded[at].1 {
+            Some((stored, current)) if stored == kv => Some(current.clone()),
+            _ => None,
+        }
+    };
+    let mut rows = Vec::with_capacity(events.len());
+    for (sub, event) in events.into_iter().enumerate() {
+        let kv = event.kv.unwrap_or_default();
+        let deleted = event.r#type == 1;
+        let bytes = match shared(&kv) {
+            Some(bytes) if !deleted => bytes,
+            _ => kv.encode_to_vec().into(),
+        };
+        let hash = if deleted {
+            KeyValue {
+                key: kv.key,
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .into()
+        } else {
+            bytes.clone()
+        };
+        batch.put_new(
+            crate::state::maintenance::hash_key(next, sub as i64, deleted),
+            hash,
+        );
+        rows.push(EventRow {
+            r#type: event.r#type,
+            kv: bytes,
+            prev_kv: event.prev_kv.map(|kv| kv.encode_to_vec().into()),
+        });
+    }
+    if !rows.is_empty() {
+        if prev_revisions.iter().all(|&revision| revision == 0) {
+            prev_revisions.clear();
+        }
+        batch.put_new(
+            crate::watch::key(next),
+            JournalRow {
+                events: rows,
+                prev_revisions,
+            }
+            .encode_to_vec(),
+        );
+    }
 }
 
 /// The applied current state that an ordinary Put reads on the apply worker.
@@ -147,6 +257,170 @@ pub(crate) async fn prepare_put(
         return Err(KvError::invalid("expected an ordinary put"));
     };
     key_check(&p.key)?;
+    let next = revision + 1;
+    let (reply, event, prev_revision) = put_rows(view, next, 0, p, batch, size).await?;
+    let journal = PutJournal {
+        event: PutEvent {
+            kv: event.kv,
+            prev_kv: event.prev_kv,
+        },
+        prev_revisions: if prev_revision > 0 {
+            vec![prev_revision]
+        } else {
+            vec![]
+        },
+    }
+    .encode_to_vec();
+    batch
+        .put_counted(crate::watch::key(next).into(), journal.into(), None, size)
+        .map_err(KvError::storage)?;
+    put_revision_row(view, revision, batch, size).await?;
+    Ok((response(Resp::ResponsePut(reply)), next))
+}
+
+/// Return true when a transaction can use `prepare_txn_puts`: both branches hold only
+/// ordinary puts, and each compare reads one key.
+pub(crate) fn batchable_txn(request: &RequestOp) -> bool {
+    match &request.request {
+        Some(Op::RequestTxn(txn)) => {
+            txn.compare.iter().all(|cmp| cmp.range_end.is_empty())
+                && txn
+                    .success
+                    .iter()
+                    .chain(&txn.failure)
+                    .all(super::batchable_put)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Transactions that took the direct path on this thread.
+    pub(crate) static DIRECT_TXNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Add a transaction of ordinary puts to `batch` and update the quota total in place.
+///
+/// This is the multi-key form of `prepare_put`. All puts share one revision, and each put is
+/// the next HashKV sub-revision. The result matches the general evaluator byte for byte.
+/// `None` means that the chosen branch is empty. The caller then uses the general evaluator.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn prepare_txn_puts(
+    view: &CurrentView<'_>,
+    revision: i64,
+    compact_revision: i64,
+    request: &RequestOp,
+    leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
+    batch: &mut WriteBatch,
+    size: &mut u64,
+    counts: &mut crate::metrics::Writes,
+) -> KvResult<Option<(ResponseOp, i64)>> {
+    validate(request)?;
+    let Some(Op::RequestTxn(txn)) = &request.request else {
+        return Err(KvError::invalid("expected a transaction"));
+    };
+    let succeeded = compares(
+        view,
+        batch,
+        revision,
+        compact_revision,
+        &txn.compare,
+        leases,
+    )
+    .await?;
+    let ops = if succeeded {
+        &txn.success
+    } else {
+        &txn.failure
+    };
+    if ops.is_empty() {
+        return Ok(None);
+    }
+    let next = revision + 1;
+    let mut responses = Vec::with_capacity(ops.len());
+    let mut events = Vec::with_capacity(ops.len());
+    let mut prev_revisions = Vec::with_capacity(ops.len());
+    for (sub, op) in ops.iter().enumerate() {
+        let Some(Op::RequestPut(p)) = &op.request else {
+            return Err(KvError::invalid("expected an ordinary put"));
+        };
+        let (reply, event, prev_revision) = put_rows(view, next, sub, p, batch, size).await?;
+        counts.put(&p.key, &p.value);
+        responses.push(response(Resp::ResponsePut(reply)));
+        events.push(event);
+        prev_revisions.push(prev_revision);
+    }
+    if prev_revisions.iter().all(|&revision| revision == 0) {
+        prev_revisions.clear();
+    }
+    let journal = JournalRow {
+        events,
+        prev_revisions,
+    }
+    .encode_to_vec();
+    batch
+        .put_counted(crate::watch::key(next).into(), journal.into(), None, size)
+        .map_err(KvError::storage)?;
+    put_revision_row(view, revision, batch, size).await?;
+    #[cfg(test)]
+    DIRECT_TXNS.with(|count| count.set(count.get() + 1));
+    Ok(Some((
+        response(Resp::ResponseTxn(TxnResponse {
+            header: header(next),
+            succeeded,
+            responses,
+        })),
+        next,
+    )))
+}
+
+/// Evaluate transaction compares on the applied state plus the earlier group writes.
+async fn compares(
+    current: &CurrentView<'_>,
+    previous: &WriteBatch,
+    revision: i64,
+    compact_revision: i64,
+    compares: &[Compare],
+    leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
+) -> KvResult<bool> {
+    if compares.is_empty() {
+        return Ok(true);
+    }
+    let view = View {
+        writes: Default::default(),
+        db: ReadDb::Overlay {
+            db: current.db,
+            previous,
+            rows: current.rows,
+        },
+        revision,
+        compact_revision,
+        changes: BTreeMap::new(),
+        events: vec![],
+        prev_revisions: vec![],
+        leases,
+        index: Some(current.index),
+        row_budget: None,
+    };
+    for cmp in compares {
+        if !view.compare(cmp).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Write the current, HashKV, and history rows of one ordinary put at revision `next`.
+/// Return the reply, the Watch event, and the history revision of the previous value, or zero.
+async fn put_rows(
+    view: &CurrentView<'_>,
+    next: i64,
+    sub: usize,
+    p: &PutRequest,
+    batch: &mut WriteBatch,
+    size: &mut u64,
+) -> KvResult<(PutResponse, EventRow, i64)> {
     let key = current_key(&p.key);
     // An earlier put in this batch may have replaced the applied row.
     let (meta, raw) = match batch.get(&key) {
@@ -168,7 +442,6 @@ pub(crate) async fn prepare_put(
         },
     };
     let old_len = meta.map(|m| m.row_len);
-    let next = revision + 1;
     let prev_kv = raw
         .clone()
         .map(KeyValue::decode)
@@ -183,66 +456,72 @@ pub(crate) async fn prepare_put(
         lease: 0,
     };
     let (history, current) = encode_version(&kv);
-    let (journal_prev, prev_revisions) = match meta {
-        None => (None, vec![]),
-        Some(m) if has_history(m.mod_revision, next) => (None, vec![m.mod_revision]),
-        // Ordinary puts in a batch have distinct revisions, so this is not expected.
+    let (journal_prev, prev_revision) = match meta {
+        None => (None, 0),
+        Some(m) if has_history(m.mod_revision, next) => (None, m.mod_revision),
+        // Earlier group members have lower revisions, so this is not expected.
         Some(_) => match raw {
-            Some(raw) => (Some(raw), vec![]),
+            Some(raw) => (Some(raw), 0),
             None => return Err(KvError::storage("indexed row has no older revision")),
         },
     };
-    let journal = PutJournal {
-        event: PutEvent {
-            kv: current.clone(),
-            prev_kv: journal_prev,
-        },
-        prev_revisions,
-    }
-    .encode_to_vec();
     let rows = [
         (key.into(), current.clone(), old_len),
         (
-            crate::state::maintenance::hash_key(next, 0, false).into(),
-            current,
+            crate::state::maintenance::hash_key(next, sub as i64, false).into(),
+            current.clone(),
             None,
         ),
         (history_key(&p.key, next).into(), history, None),
-        (crate::watch::key(next).into(), journal.into(), None),
     ];
     for (key, value, old_len) in rows {
         batch
             .put_counted(key, value, old_len, size)
             .map_err(KvError::storage)?;
     }
-    // The revision row has a fixed width after its first write.
-    if revision == 1 {
-        // An earlier group member that wrote no revision may still have stored this row.
-        let old_len = match batch.get(REVISION) {
-            Some(value) => value.map(|v| v.len()),
-            None => view
-                .db
-                .get(REVISION)
-                .await
-                .map_err(KvError::storage)?
-                .map(|v| v.len()),
-        };
-        batch
-            .put_counted(
-                bytes::Bytes::from_static(REVISION),
-                next.to_be_bytes().to_vec().into(),
-                old_len,
-                size,
-            )
-            .map_err(KvError::storage)?;
-    }
     Ok((
-        response(Resp::ResponsePut(PutResponse {
+        PutResponse {
             header: header(next),
             prev_kv,
-        })),
-        next,
+        },
+        EventRow {
+            r#type: 0,
+            kv: current,
+            prev_kv: journal_prev,
+        },
+        prev_revision,
     ))
+}
+
+/// Count the revision row. It has a fixed width after its first write, so only revision one
+/// changes the logical size. The group writes the final value.
+async fn put_revision_row(
+    view: &CurrentView<'_>,
+    revision: i64,
+    batch: &mut WriteBatch,
+    size: &mut u64,
+) -> KvResult<()> {
+    if revision != 1 {
+        return Ok(());
+    }
+    // An earlier group member that wrote no revision may still have stored this row.
+    let old_len = match batch.get(REVISION) {
+        Some(value) => value.map(|v| v.len()),
+        None => view
+            .db
+            .get(REVISION)
+            .await
+            .map_err(KvError::storage)?
+            .map(|v| v.len()),
+    };
+    batch
+        .put_counted(
+            bytes::Bytes::from_static(REVISION),
+            (revision + 1).to_be_bytes().to_vec().into(),
+            old_len,
+            size,
+        )
+        .map_err(KvError::storage)
 }
 
 #[cfg(test)]
@@ -277,5 +556,106 @@ mod tests {
         assert_eq!(current.as_ptr(), hash.as_ptr());
         assert_eq!(KeyValue::decode(hash).unwrap().value.len(), 4096);
         state.close().await.unwrap();
+    }
+
+    /// The writer before `record_changes`: encode each row from the decoded values.
+    fn record_separately(
+        batch: &mut WriteBatch,
+        next: i64,
+        events: Vec<crate::proto::mvccpb::Event>,
+        prev_revisions: Vec<i64>,
+        changes: BTreeMap<Vec<u8>, Option<KeyValue>>,
+    ) {
+        crate::watch::record(next, events, prev_revisions, batch);
+        for (key, value) in changes {
+            if let Some(value) = &value {
+                batch.put(current_key(&key), value.encode_to_vec());
+            } else {
+                batch.delete(current_key(&key));
+            }
+            record_version(batch, key, value, next);
+        }
+    }
+
+    #[test]
+    fn shared_encoding_matches_separate_encoding() {
+        use crate::proto::mvccpb::Event;
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next_u64 = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..500 {
+            let next = 1 + (next_u64() % 1000) as i64;
+            let mut events = vec![];
+            let mut prev_revisions = vec![];
+            let mut changes = BTreeMap::new();
+            let count = next_u64() % 10;
+            for _ in 0..count {
+                let key = vec![b'a' + (next_u64() % 6) as u8; 1 + (next_u64() % 3) as usize];
+                let old = KeyValue {
+                    key: key.clone(),
+                    value: vec![7; (next_u64() % 40) as usize],
+                    create_revision: 1,
+                    mod_revision: (next_u64() % next as u64) as i64,
+                    version: 3,
+                    lease: (next_u64() % 2) as i64,
+                };
+                let inline = next_u64() % 2 == 0;
+                let prev_kv = (next_u64() % 3 != 0).then(|| old.clone());
+                let prev_revision = match &prev_kv {
+                    Some(old) if !inline => old.mod_revision,
+                    _ => 0,
+                };
+                match next_u64() % 4 {
+                    0 => {
+                        events.push(Event {
+                            r#type: 1,
+                            kv: Some(KeyValue {
+                                key: key.clone(),
+                                mod_revision: next,
+                                ..Default::default()
+                            }),
+                            prev_kv: Some(old),
+                        });
+                        prev_revisions.push(0);
+                        changes.insert(key, None);
+                    }
+                    choice => {
+                        let kv = KeyValue {
+                            key: key.clone(),
+                            value: vec![choice as u8; (next_u64() % 300) as usize],
+                            create_revision: next - 1,
+                            mod_revision: next,
+                            version: 1 + (next_u64() % 5) as i64,
+                            lease: (next_u64() % 3) as i64,
+                        };
+                        events.push(Event {
+                            r#type: 0,
+                            kv: Some(kv.clone()),
+                            prev_kv: if prev_revision > 0 { None } else { prev_kv },
+                        });
+                        prev_revisions.push(prev_revision);
+                        // A later change of the same key replaces the stored value.
+                        changes.insert(key, Some(kv));
+                    }
+                }
+            }
+            let mut shared = WriteBatch::new();
+            record_changes(
+                &mut shared,
+                next,
+                events.clone(),
+                prev_revisions.clone(),
+                changes.clone(),
+            );
+            let mut separate = WriteBatch::new();
+            record_separately(&mut separate, next, events, prev_revisions, changes);
+            let shared: Vec<_> = shared.into_rows().collect();
+            let separate: Vec<_> = separate.into_rows().collect();
+            assert_eq!(shared, separate, "round {round}");
+        }
     }
 }

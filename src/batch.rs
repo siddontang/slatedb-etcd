@@ -39,6 +39,11 @@ impl WriteBatch {
         );
     }
 
+    /// Add a put without copying the key or value. Quota accounting reads the old length.
+    pub(crate) fn put_bytes(&mut self, key: Bytes, value: Bytes) {
+        self.insert(key, Some(value), Original::Read);
+    }
+
     /// Add a key that the current revision has not stored before.
     pub(crate) fn put_new(&mut self, key: impl Into<Bytes>, value: impl Into<Bytes>) {
         self.insert(key.into(), Some(value.into()), Original::Known(None));
