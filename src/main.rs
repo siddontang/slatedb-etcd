@@ -30,10 +30,16 @@ mod malloc_conf {
     /// Default jemalloc options. `_RJEM_MALLOC_CONF` still overrides them at startup.
     ///
     /// jemalloc keeps freed dirty pages for 10 s by default. Memtable flushes and compactions
-    /// free hundreds of MiB at once, so RSS stayed near the earlier peak for 10 s. Return dirty
-    /// pages after 1 s. Muzzy decay keeps the jemalloc 5.3 default of 0.
+    /// free hundreds of MiB at once, so RSS stayed near the earlier peak for 10 s.
+    ///
+    /// Without a background thread, jemalloc purges an arena only when that arena allocates.
+    /// Arenas that went idle after a flush kept their dirty pages: in put-c256, jemalloc held
+    /// 100 MiB of resident pages above its active pages several seconds after the load ended.
+    /// Background threads purge on a timer, and dirty pages return after 200 ms.
+    /// Muzzy decay keeps the jemalloc 5.3 default of 0.
     #[export_name = "_rjem_malloc_conf"]
-    static CONF: Conf = Conf(c"dirty_decay_ms:1000,muzzy_decay_ms:0".as_ptr());
+    static CONF: Conf =
+        Conf(c"background_thread:true,dirty_decay_ms:200,muzzy_decay_ms:0".as_ptr());
 }
 
 use std::collections::BTreeMap;
