@@ -402,6 +402,8 @@ async fn compares(
         leases,
         index: Some(current.index),
         row_budget: None,
+        // Compares read single keys from the live overlay, never a pinned key order.
+        keys: None,
     };
     for cmp in compares {
         if !view.compare(cmp).await? {
