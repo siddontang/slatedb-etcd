@@ -2,7 +2,7 @@ use super::*;
 
 impl Node {
     pub(super) async fn drive_ready(&mut self) -> Result<()> {
-        self.resume_puts();
+        self.resume_proposals();
         self.flush_puts();
         self.drive_compaction()?;
         self.expire_reads();
