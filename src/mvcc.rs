@@ -1115,6 +1115,13 @@ pub(crate) async fn revoke_keys(
     }
     let next = view.current_revision();
     let mut batch = WriteBatch::new();
+    crate::watch::record(
+        next,
+        view.events,
+        view.prev_revisions,
+        &view.changes,
+        &mut batch,
+    );
     for (key, value) in view.changes {
         batch.delete(current_key(&key));
         let mut history_key = history_prefix(&key);
@@ -1129,7 +1136,6 @@ pub(crate) async fn revoke_keys(
             .encode_to_vec(),
         );
     }
-    crate::watch::record(next, view.events, view.prev_revisions, &mut batch);
     batch.put(REVISION, next.to_be_bytes());
     Ok((batch, next, view.writes.deletes))
 }

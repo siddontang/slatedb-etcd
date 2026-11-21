@@ -15,28 +15,57 @@ pub(crate) fn key(revision: i64) -> Vec<u8> {
 }
 
 /// Record HashKV and Watch rows. `prev_revisions` follows `record_journal`.
-pub fn record(revision: i64, events: Vec<Event>, prev_revisions: Vec<i64>, batch: &mut WriteBatch) {
+///
+/// `history` holds the history version that this revision writes for each changed key. When every
+/// Put event equals that version, the journal omits the values and names the versions instead.
+pub fn record(
+    revision: i64,
+    events: Vec<Event>,
+    prev_revisions: Vec<i64>,
+    history: &std::collections::BTreeMap<Vec<u8>, Option<KeyValue>>,
+    batch: &mut WriteBatch,
+) {
     crate::state::maintenance::record_hash(revision, &events, batch);
-    record_journal(revision, events, prev_revisions, batch);
+    let puts = || events.iter().filter(|event| is_put(event));
+    let values_in_history = puts().next().is_some()
+        && puts().all(|event| {
+            event.kv.as_ref().is_some_and(|kv| {
+                kv.mod_revision == revision
+                    && matches!(history.get(&kv.key), Some(Some(version)) if version == kv)
+            })
+        });
+    record_journal(revision, events, prev_revisions, values_in_history, batch);
 }
 
 /// Store the events of one revision. A positive `prev_revisions` entry replaces the inline
 /// previous value with the history revision of that value.
+///
+/// With `values_in_history`, Put events omit `kv.value`. The caller must write the history
+/// version of each Put event key at `revision` with the same `KeyValue`.
 pub(crate) fn record_journal(
     revision: i64,
-    events: Vec<Event>,
+    mut events: Vec<Event>,
     mut prev_revisions: Vec<i64>,
+    values_in_history: bool,
     batch: &mut WriteBatch,
 ) {
     if !events.is_empty() {
         if prev_revisions.iter().all(|&revision| revision == 0) {
             prev_revisions.clear();
         }
+        if values_in_history {
+            for event in events.iter_mut().filter(|event| is_put(event)) {
+                if let Some(kv) = event.kv.as_mut() {
+                    kv.value = vec![];
+                }
+            }
+        }
         batch.put_new(
             key(revision),
             Journal {
                 events,
                 prev_revisions,
+                values_in_history,
             }
             .encode_to_vec(),
         );
@@ -84,6 +113,30 @@ pub(crate) const PAGE_REVISIONS: usize = 32;
 
 type Journals = Vec<(i64, Journal)>;
 
+/// Return the full `KeyValue` of a Put event whose journal omits the value.
+///
+/// `row` is the history version of `kv.key` at `kv.mod_revision`. It must be a live version of the
+/// same key and revision.
+fn stored_value(kv: &KeyValue, row: Option<bytes::Bytes>) -> Result<KeyValue, KvError> {
+    let row = row.ok_or_else(|| KvError::storage("Watch value has no history version"))?;
+    let version = crate::proto::state::Version::decode(row).map_err(KvError::storage)?;
+    match version.value {
+        Some(value) if value.key == kv.key && value.mod_revision == kv.mod_revision => Ok(value),
+        _ => Err(KvError::storage(
+            "Watch value does not match its history version",
+        )),
+    }
+}
+
+/// Return true when the event of `journal` stores its value in a history version.
+fn value_in_history(journal: &Journal, event: &Event) -> bool {
+    journal.values_in_history && is_put(event)
+}
+
+fn is_put(event: &Event) -> bool {
+    event.r#type == crate::proto::mvccpb::event::EventType::Put as i32
+}
+
 /// Decode one journal row and check that `prev_revisions` matches the events.
 fn decode(value: bytes::Bytes) -> Result<Journal, KvError> {
     let journal = Journal::decode(value).map_err(KvError::storage)?;
@@ -97,6 +150,8 @@ fn decode(value: bytes::Bytes) -> Result<Journal, KvError> {
 #[derive(Debug)]
 pub(crate) struct Capture {
     rows: Vec<(i64, bytes::Bytes)>,
+    /// History versions of the job. They hold the values that journal rows omit.
+    history: Vec<(bytes::Bytes, bytes::Bytes)>,
     bytes: usize,
     complete: bool,
 }
@@ -105,6 +160,7 @@ impl Default for Capture {
     fn default() -> Self {
         Self {
             rows: vec![],
+            history: vec![],
             bytes: 0,
             complete: true,
         }
@@ -112,7 +168,17 @@ impl Default for Capture {
 }
 
 impl Capture {
-    pub(crate) fn record(&mut self, key: &[u8], value: Option<&bytes::Bytes>) {
+    pub(crate) fn record(&mut self, key: &bytes::Bytes, value: Option<&bytes::Bytes>) {
+        if let (true, Some(value)) = (key.starts_with(mvcc::HISTORY), value) {
+            if self.complete {
+                self.bytes += value.len();
+                if self.bytes > FEED_BATCH_BYTES {
+                    return self.invalidate();
+                }
+                self.history.push((key.clone(), value.clone()));
+            }
+            return;
+        }
         let (Some(value), Some(revision)) = (value, key.strip_prefix(EVENTS)) else {
             return;
         };
@@ -132,6 +198,7 @@ impl Capture {
     /// Make the batch incomplete, for example after snapshot installation.
     pub(crate) fn invalidate(&mut self) {
         self.rows = vec![];
+        self.history = vec![];
         self.complete = false;
     }
 
@@ -144,6 +211,7 @@ impl Capture {
             previous,
             revision,
             rows: capture.complete.then_some(capture.rows),
+            history: capture.history,
             decoded: std::sync::OnceLock::new(),
         })
     }
@@ -155,18 +223,41 @@ pub(crate) struct Batch {
     pub previous: i64,
     pub revision: i64,
     rows: Option<Vec<(i64, bytes::Bytes)>>,
+    history: Vec<(bytes::Bytes, bytes::Bytes)>,
     decoded: std::sync::OnceLock<Option<Journals>>,
 }
 
 impl Batch {
     /// Decode once on the first reader. `None` means that watchers must read storage.
+    /// Journals that omit values get them from the history versions of the same job.
     pub(crate) fn journals(&self) -> Option<&[(i64, Journal)]> {
         self.decoded
             .get_or_init(|| {
+                let history: std::collections::HashMap<&[u8], &bytes::Bytes> = self
+                    .history
+                    .iter()
+                    .map(|(key, value)| (key.as_ref(), value))
+                    .collect();
                 self.rows
                     .as_ref()?
                     .iter()
-                    .map(|(revision, value)| Some((*revision, decode(value.clone()).ok()?)))
+                    .map(|(revision, value)| {
+                        let mut journal = decode(value.clone()).ok()?;
+                        if journal.values_in_history {
+                            for event in &mut journal.events {
+                                if !is_put(event) {
+                                    continue;
+                                }
+                                let kv = event.kv.as_ref()?;
+                                let row = history
+                                    .get(mvcc::history_key(&kv.key, kv.mod_revision).as_slice())
+                                    .map(|&row| row.clone());
+                                event.kv = Some(stored_value(kv, row).ok()?);
+                            }
+                            journal.values_in_history = false;
+                        }
+                        Some((*revision, journal))
+                    })
                     .collect()
             })
             .as_deref()
@@ -219,6 +310,15 @@ pub(crate) async fn select(
         {
             continue;
         }
+        let kv = if value_in_history(journal, event) {
+            let row = db
+                .get(mvcc::history_key(&kv.key, kv.mod_revision))
+                .await
+                .map_err(KvError::storage)?;
+            stored_value(kv, row)?
+        } else {
+            kv.clone()
+        };
         let prev_kv = if !keep_prev {
             None
         } else if let Some(&prev) = journal.prev_revisions.get(position).filter(|&&r| r > 0) {
@@ -228,7 +328,7 @@ pub(crate) async fn select(
         };
         events.push(Event {
             r#type: event.r#type,
-            kv: event.kv.clone(),
+            kv: Some(kv),
             prev_kv,
         });
     }

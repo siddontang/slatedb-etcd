@@ -284,11 +284,14 @@ impl StateMachine {
             if kept {
                 empty_hash = None;
             }
-            let append = |crc| crc32c::crc32c_append(crc32c::crc32c_append(crc, key), &row.value);
+            let append = |crc| -> std::result::Result<u32, KvError> {
+                let crc = crc32c::crc32c_append(crc, key);
+                Ok(hash_append(crc, &row.value).map_err(KvError::storage)?.0)
+            };
             if recent || kept {
-                hash = append(hash);
+                hash = append(hash)?;
             }
-            empty_hash = empty_hash.map(append);
+            empty_hash = empty_hash.map(append).transpose()?;
         }
         let hash = empty_hash.unwrap_or(hash);
         Ok(json!({"header": mvcc::header(self.revision), "hash": hash,
@@ -311,7 +314,7 @@ pub(crate) fn record_hash(
             }
             .encode_to_vec()
         } else {
-            kv.encode_to_vec()
+            hash_record(&kv.key, &kv.encode_to_vec())
         };
         batch.put_new(hash_key(revision, sub as i64, deleted), value);
     }
@@ -334,6 +337,47 @@ pub(crate) fn hash_key(revision: i64, sub: i64, deleted: bool) -> Vec<u8> {
 struct HashUserKey {
     #[prost(bytes = "vec", tag = "1")]
     key: Vec<u8>,
+}
+
+/// A hash record that stores the CRC-32C and length of an encoded `KeyValue`, not its bytes.
+///
+/// Field one is the user key, as in `KeyValue`. `KeyValue` has no field 14 or 15, so a record
+/// with a CRC is never a stored `KeyValue`. Older records and tombstones keep the full bytes.
+#[derive(prost::Message)]
+struct HashDigest {
+    #[prost(bytes = "vec", tag = "1")]
+    key: Vec<u8>,
+    #[prost(fixed32, optional, tag = "14")]
+    crc: Option<u32>,
+    #[prost(uint64, optional, tag = "15")]
+    len: Option<u64>,
+}
+
+/// Encode the hash record of a live `KeyValue`. `kv` is its etcd wire encoding.
+///
+/// HashKV feeds the record through [`hash_append`], which gives the same CRC as the full bytes.
+/// The record does not repeat the value, so large values are not written a further time.
+pub(crate) fn hash_record(key: &[u8], kv: &[u8]) -> Vec<u8> {
+    HashDigest {
+        key: key.to_vec(),
+        crc: Some(crc32c::crc32c(kv)),
+        len: Some(kv.len() as u64),
+    }
+    .encode_to_vec()
+}
+
+/// Append the bytes that a hash record stands for to `crc`.
+/// Returns the new CRC and the number of bytes that it added.
+pub(crate) fn hash_append(crc: u32, record: &[u8]) -> Result<(u32, u64)> {
+    let digest = HashDigest::decode(record)?;
+    Ok(match (digest.crc, digest.len) {
+        (Some(part), Some(len)) => (
+            crc32c::crc32c_combine(crc, part, usize::try_from(len)?),
+            len,
+        ),
+        (None, None) => (crc32c::crc32c_append(crc, record), record.len() as u64),
+        _ => anyhow::bail!("invalid hash record"),
+    })
 }
 
 fn hash_main(key: &[u8]) -> std::result::Result<i64, KvError> {

@@ -343,6 +343,20 @@ async fn watch_previous_values_match_the_replaced_rows() {
         }
         apply(&mut state, &request).await;
     }
+    let values: Vec<(i64, Vec<u8>, Vec<u8>)> = [
+        (base - 1, "a", "first"),
+        (base, "b", "first"),
+        (base + 1, "a", "g1"),
+        (base + 2, "a", "g2"),
+        (base + 3, "b", "g3"),
+        (base + 4, "a", "txn"),
+        (base + 4, "c", "new"),
+        (base + 6, "a", "again"),
+    ]
+    .into_iter()
+    .map(|(r, k, v)| (r, k.into(), v.into()))
+    .collect();
+    assert_eq!(state.revision, base + 6);
     let check_events = |events: Vec<Event>, start: i64, compact: i64| {
         let wanted: Vec<_> = expected
             .iter()
@@ -354,6 +368,17 @@ async fn watch_previous_values_match_the_replaced_rows() {
             assert_eq!((kv.mod_revision, &kv.key), (*revision, key));
             let prev = prev.clone().filter(|_| *revision > compact);
             assert_eq!(&event.prev_kv, &prev, "revision {revision}");
+            // Journals omit Put values. Watch must load them from the history versions.
+            let value = values.iter().find(|(r, k, _)| (r, k) == (revision, key));
+            if event.r#type == 0 {
+                assert_eq!(
+                    Some(&kv.value),
+                    value.map(|(_, _, v)| v),
+                    "revision {revision}"
+                );
+            } else {
+                assert!(value.is_none());
+            }
         }
     };
     check_events(events(&state, 1).await, 1, -1);
@@ -365,7 +390,7 @@ async fn watch_previous_values_match_the_replaced_rows() {
             state.applied + 1,
             &CompactionRequest {
                 revision: boundary,
-                physical: false,
+                physical: true,
             },
         )
         .await
@@ -375,6 +400,9 @@ async fn watch_previous_values_match_the_replaced_rows() {
     let after = events(&state, boundary).await;
     assert!(after[0].prev_kv.is_none());
     check_events(after, boundary, boundary);
+    // The physical pass keeps the history version of every event at or after the boundary.
+    super::compaction_tests::finish(&mut state).await;
+    check_events(events(&state, boundary).await, boundary, boundary);
 
     let mut snapshot = Snapshot::default();
     snapshot.mut_metadata().index = state.applied;
