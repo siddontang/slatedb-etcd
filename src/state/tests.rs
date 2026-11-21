@@ -561,3 +561,25 @@ fn flush_cache_range_covers_only_current_rows() {
         assert!(!range.contains(&key));
     }
 }
+
+#[test]
+fn slatedb_settings_bound_compaction_buffers() {
+    let defaults = Settings::default();
+    let settings = slatedb_settings();
+    settings.validate().unwrap();
+    // Durability comes from the Raft log and explicit flushes, not from a SlateDB WAL.
+    assert!(!settings.wal_enabled);
+    assert_eq!(settings.flush_interval, None);
+    assert_eq!(settings.max_unflushed_bytes, defaults.max_unflushed_bytes);
+    assert_eq!(settings.l0_sst_size_bytes, defaults.l0_sst_size_bytes);
+    let worker = settings
+        .compactor_options
+        .as_ref()
+        .and_then(|compactor| compactor.worker.as_ref())
+        .unwrap();
+    assert_eq!(worker.max_subcompactions, SUBCOMPACTIONS);
+    assert!(
+        worker.max_subcompactions >= 2,
+        "a subcompaction overlaps one merge with its I/O"
+    );
+}
