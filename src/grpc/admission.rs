@@ -8,25 +8,41 @@ pub(super) struct ReadAdmission {
     active: Semaphore,
 }
 
-impl Default for ReadAdmission {
-    fn default() -> Self {
+/// Client reads that may wait for an active slot. A waiter holds only its decoded
+/// request, so this bounds memory while a burst of clients queues instead of failing.
+const MAX_WAITING_READS: usize = 8192;
+/// How long a read may wait for an active slot before the node reports overload.
+const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl ReadAdmission {
+    /// Linearizable reads entering the ReadIndex table.
+    pub fn reads() -> Self {
         Self {
-            waiting: Semaphore::new(512),
+            waiting: Semaphore::new(MAX_WAITING_READS),
             // Leave slots for health checks, authorization, and local barriers.
             active: Semaphore::new(crate::node::MAX_PENDING_READS * 3 / 4),
         }
     }
-}
 
-impl ReadAdmission {
+    /// Follower reads waiting for the local apply barrier.
+    pub fn barriers() -> Self {
+        Self {
+            waiting: Semaphore::new(512),
+            active: Semaphore::new(crate::node::MAX_APPLY_BARRIERS * 3 / 4),
+        }
+    }
+
+    /// Wait for an active slot. Dropping the future (client cancel or deadline) releases
+    /// the waiting slot. A full waiting queue or a timeout means real overload.
     pub async fn acquire(&self) -> Result<SemaphorePermit<'_>, Status> {
         let _queue = self
             .waiting
             .try_acquire()
             .map_err(|_| Status::resource_exhausted("etcdserver: too many queued reads"))?;
-        tokio::time::timeout(std::time::Duration::from_secs(10), self.active.acquire())
+        tokio::time::timeout(ADMISSION_TIMEOUT, self.active.acquire())
             .await
-            .map_err(|_| Status::deadline_exceeded("etcdserver: read admission timed out"))?
+            // etcd reports an expired server-side request wait as ErrGRPCTimeout.
+            .map_err(|_| Status::unavailable("etcdserver: request timed out"))?
             .map_err(|_| Status::unavailable("etcdserver: node unavailable"))
     }
 }
@@ -53,5 +69,23 @@ mod tests {
         assert!(futures::poll!(&mut next).is_pending());
         drop(active);
         assert!(next.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_clients_waits_for_read_slots_instead_of_failing() {
+        let admission = ReadAdmission::reads();
+        let mut active = vec![];
+        for _ in 0..crate::node::MAX_PENDING_READS * 3 / 4 {
+            active.push(admission.acquire().await.unwrap());
+        }
+        // A thousand concurrent clients wait; none is rejected while slots are busy.
+        let mut waiting: Vec<_> = (0..1000).map(|_| Box::pin(admission.acquire())).collect();
+        for waiter in &mut waiting {
+            assert!(futures::poll!(waiter).is_pending());
+        }
+        drop(active);
+        for waiter in waiting {
+            drop(waiter.await.unwrap());
+        }
     }
 }
