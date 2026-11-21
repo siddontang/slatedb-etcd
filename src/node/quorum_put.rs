@@ -310,6 +310,8 @@ mod tests {
             .is_ok());
         assert_eq!(node.state.applied, applied);
         assert_eq!(node.quorum_reply_index, index);
+        // A serializable read outside the owner must not use the view from before this reply.
+        assert!(node.forwarding.local().is_none());
         // A read must not see the state before the prepared write is published.
         let (tx, mut read) = oneshot::channel();
         node.enqueue_query(Query::Read(
@@ -322,6 +324,12 @@ mod tests {
         assert!(read.try_recv().is_err());
         node.drain_apply().await.unwrap();
         assert_eq!(node.state.applied, index);
+        // The applied view is published again once the replied Put is applied.
+        let after = node
+            .forwarding
+            .local()
+            .expect("applied view published again");
+        assert_eq!(after.applied_revision(), node.state.revision);
         assert!(node.log_worker.storage().commit_index() < index);
         let outcome = read.try_recv().unwrap().unwrap().into_outcome();
         let Some(crate::proto::etcdserverpb::response_op::Response::ResponseRange(range)) =
