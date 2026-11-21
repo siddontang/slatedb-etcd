@@ -218,7 +218,7 @@ pub struct Node {
     transports: tokio::task::JoinSet<()>,
     pending: HashMap<String, Pending>,
     put_proposals: proposal::Group,
-    waiting_puts: proposal::Waiting,
+    waiting_proposals: proposal::Waiting,
     blocked: BTreeSet<u64>,
     installed_snapshots: u64,
     recovered_from_index: u64,
@@ -452,7 +452,7 @@ impl Node {
             transports,
             pending: HashMap::new(),
             put_proposals: proposal::Group::default(),
-            waiting_puts: proposal::Waiting::default(),
+            waiting_proposals: proposal::Waiting::default(),
             blocked: BTreeSet::new(),
             installed_snapshots: 0,
             recovered_from_index,
@@ -928,60 +928,91 @@ impl Node {
         causes.contains(&true)
     }
 
+    /// Propose a client write. Ordinary writes wait in a bounded FIFO while apply or log
+    /// I/O is behind. Membership changes still fail at once because their checks ran now.
     fn propose(&mut self, command: RaftCommand, response: impl Into<ClientResponse>) -> Result<()> {
         let response = response.into();
         if self.raw.raft.state != StateRole::Leader {
             response.error(self.error("not leader"));
-        } else if self.backlogged() {
-            response.error(self.error("state apply backlog is full"));
-        } else if self.pending.len() >= 1024 {
+            return Ok(());
+        }
+        if self.pending.len() >= 1024 {
             response.error(self.error("too many pending requests"));
-        } else {
-            let data = command.encode()?;
-            if data.len() + 64 > cache::MAX_ENTRY_BYTES
-                || !self.raw.store().admits(
-                    self.raw.raft.raft_log.unstable_entries(),
-                    &[],
-                    data.len() + cache::ENTRY_OVERHEAD + 64,
-                )
-            {
-                response.error(self.error("pending log memory quota is full"));
-                return Ok(());
-            }
-            let proposed = if let RaftCommand::Cluster { request, .. } = &command {
-                if matches!(
+            return Ok(());
+        }
+        let data = command.encode()?;
+        let id = command.id().to_owned();
+        let change = match &command {
+            RaftCommand::Cluster { request, .. }
+                if !matches!(
                     request,
                     crate::cluster::Command::List(_)
                         | crate::cluster::Command::Update(_)
                         | crate::cluster::Command::Publish { .. }
-                ) {
-                    self.raw.propose(vec![], data)
-                } else {
-                    let mut change = request.change();
-                    change.context = data.into();
-                    self.raw.propose_conf_change(vec![], change)
-                }
+                ) =>
+            {
+                Some(request.change())
+            }
+            _ => None,
+        };
+        let Some(mut change) = change else {
+            if self.must_wait() {
+                self.defer_command(id, data, response);
             } else {
-                self.raw.propose(vec![], data)
-            };
-            match proposed {
-                Ok(()) => {
-                    self.pending.insert(
-                        command.id().to_owned(),
-                        Pending {
-                            response,
-                            started: Instant::now(),
-                            term: self.raw.raft.term,
-                        },
-                    );
-                }
-                Err(error) => {
-                    self.metrics.failed_proposals.inc();
-                    response.error(self.error(&error.to_string()));
-                }
+                self.propose_data(id, data, response);
+            }
+            return Ok(());
+        };
+        if self.backlogged() {
+            response.error(self.error("state apply backlog is full"));
+            return Ok(());
+        }
+        if !self.admits_proposal(&data) {
+            response.error(self.error("pending log memory quota is full"));
+            return Ok(());
+        }
+        change.context = data.into();
+        let proposed = self.raw.propose_conf_change(vec![], change);
+        self.track_proposal(id, proposed, response);
+        Ok(())
+    }
+
+    fn admits_proposal(&self, data: &[u8]) -> bool {
+        data.len() + 64 <= cache::MAX_ENTRY_BYTES
+            && self.raw.store().admits(
+                self.raw.raft.raft_log.unstable_entries(),
+                &[],
+                data.len() + cache::ENTRY_OVERHEAD + 64,
+            )
+    }
+
+    /// Append one normal entry now. The caller has checked leadership and capacity.
+    fn propose_data(&mut self, id: String, data: Vec<u8>, response: ClientResponse) {
+        if !self.admits_proposal(&data) {
+            response.error(self.error("pending log memory quota is full"));
+            return;
+        }
+        let proposed = self.raw.propose(vec![], data);
+        self.track_proposal(id, proposed, response);
+    }
+
+    fn track_proposal(&mut self, id: String, proposed: raft::Result<()>, response: ClientResponse) {
+        match proposed {
+            Ok(()) => {
+                self.pending.insert(
+                    id,
+                    Pending {
+                        response,
+                        started: Instant::now(),
+                        term: self.raw.raft.term,
+                    },
+                );
+            }
+            Err(error) => {
+                self.metrics.failed_proposals.inc();
+                response.error(self.error(&error.to_string()));
             }
         }
-        Ok(())
     }
 
     fn header(&self) -> Header {

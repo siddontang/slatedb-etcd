@@ -124,9 +124,12 @@ Shared scans hold at most 3 x (4 MiB + one row) of decoded rows. The exclusive r
 single-read bound: its result size, up to the logical data size. The two cases never overlap.
 These bounds limit tasks, retained views, and scan rows, not encoded response bytes.
 At 1,024 committed but unapplied entries, the owner stops admitting new Raft proposals.
-A leader can hold up to 256 ordinary puts before proposal when apply or log I/O falls behind.
-The queue holds up to 4 MiB of encoded data. Each put expires after five seconds.
-A leadership change discards queued puts before Raft can propose them.
+A leader can hold up to 256 client writes before proposal when apply or log I/O falls behind.
+Puts, transactions, deletes, lease and auth writes, and compactions share one FIFO queue.
+Membership changes still fail at once. The queue holds up to 4 MiB of encoded data.
+A write that waits five seconds fails with `too many requests`, like etcd's apply-lag error.
+A leadership change fails queued writes with `not leader` before Raft can propose them.
+A cancelled client drops its queued write. Every queued-write error means it was not proposed.
 Worker failure or panic stops the node. Shutdown joins reads before closing state storage.
 The log thread performs steady-state disk I/O, file reclamation, and disk statistics.
 Apply waits for committed Ready delivery and local entry durability.

@@ -232,7 +232,8 @@ async fn waiting_scans_do_not_block_current_point_reads() {
 }
 
 #[tokio::test]
-async fn committed_backlog_rejects_new_proposals_before_log_growth() {
+async fn committed_backlog_defers_new_proposals_before_log_growth() {
+    use crate::proto::etcdserverpb::{request_op::Request as Op, PutRequest, TxnRequest};
     let dir = tempfile::tempdir().unwrap();
     seed_log(dir.path(), apply::MAX_APPLY_LAG);
     let (events, _) = mpsc::channel(256);
@@ -257,7 +258,7 @@ async fn committed_backlog_rejects_new_proposals_before_log_growth() {
     assert_eq!(node.raw.raft.state, StateRole::Leader);
     node.drive_ready().await.unwrap();
     let last = node.raw.store().last_index().unwrap();
-    let (tx, rx) = oneshot::channel();
+    let (tx, mut rx) = oneshot::channel();
     node.propose(
         RaftCommand::Lease {
             origin: 1,
@@ -267,8 +268,37 @@ async fn committed_backlog_rejects_new_proposals_before_log_growth() {
         tx,
     )
     .unwrap();
-    assert!(rx.await.unwrap().unwrap_err().error.contains("backlog"));
+    // A slow apply holds the write before proposal instead of rejecting it.
+    let (tx, mut txn) = oneshot::channel();
+    node.handle(
+        Event::Kv(
+            RequestOp {
+                request: Some(Op::RequestTxn(TxnRequest {
+                    success: vec![RequestOp {
+                        request: Some(Op::RequestPut(PutRequest {
+                            key: b"after-backlog".to_vec(),
+                            value: b"v".to_vec(),
+                            ..Default::default()
+                        })),
+                    }],
+                    ..Default::default()
+                })),
+            },
+            tx,
+        ),
+        &mut vec![],
+    )
+    .await
+    .unwrap();
     node.drive_ready().await.unwrap();
+    assert!(matches!(
+        rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        txn.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
     assert_eq!(node.raw.store().last_index().unwrap(), last);
     assert_eq!(node.state.applied, 0);
     assert!(node.apply_busy);
@@ -293,6 +323,11 @@ async fn committed_backlog_rejects_new_proposals_before_log_growth() {
     node.drive_ready().await.unwrap();
     node.drain_apply().await.unwrap();
     assert_eq!(node.state.applied, apply::MAX_APPLY_LAG);
+    // Once apply catches up, both waiting writes reach the log in arrival order.
+    node.drive_ready().await.unwrap();
+    assert!(node.waiting_proposals.is_empty());
+    assert_eq!(node.raw.raft.raft_log.last_index(), last + 2);
+    assert!(node.pending.contains_key("overflow"));
 }
 
 #[tokio::test]
@@ -1252,7 +1287,7 @@ async fn checkpoint_memory_does_not_use_the_entry_admission_budget() {
     ));
     assert_eq!(node.pending.len(), 1);
     node.log_bytes = log::MAX_BYTES;
-    let (tx, rx) = oneshot::channel();
+    let (tx, mut rx) = oneshot::channel();
     node.propose(
         RaftCommand::Lease {
             origin: 1,
@@ -1262,7 +1297,13 @@ async fn checkpoint_memory_does_not_use_the_entry_admission_budget() {
         tx,
     )
     .unwrap();
-    assert!(rx.await.unwrap().unwrap_err().error.contains("backlog"));
+    // A full log byte budget holds the write before proposal.
+    assert!(matches!(
+        rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert_eq!(node.pending.len(), 1);
+    assert_eq!(node.waiting_proposals.len(), 1);
 }
 
 #[tokio::test]
