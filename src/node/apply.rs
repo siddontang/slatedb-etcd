@@ -258,6 +258,8 @@ impl Executor {
                 Output::PreparedPuts(batch, replies)
             }
             Job::PublishPuts(batch) => {
+                // The clients already have their replies. Recovery must replay the same outcome.
+                crate::failpoint::hit("apply-after-early-reply");
                 self.state.publish_puts(batch).await?;
                 Output::Entries(Vec::new())
             }
