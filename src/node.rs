@@ -31,6 +31,7 @@ mod log;
 mod maintenance;
 mod proposal;
 pub use forwarding::ForwardView;
+pub(crate) use forwarding::LocalRead;
 mod quorum_put;
 mod read;
 mod ready;
@@ -499,6 +500,8 @@ impl Node {
             result = owner => result,
             _ = stop => Ok(()),
         };
+        // A stopped owner no longer applies entries. Its last view must not serve reads.
+        self.forwarding.publish_local(None);
         self.transports.shutdown().await;
         // Keep the Raft directory locked until the state worker has stopped.
         self.compaction.cancel();
@@ -510,6 +513,7 @@ impl Node {
 
     async fn run_loop(&mut self, mut events: mpsc::Receiver<Event>) -> Result<()> {
         self.publish_watch(None);
+        self.publish_local_reads();
         // Schedule committed log recovery before accepting client work.
         self.drive_ready().await?;
         let mut ticks = tokio::time::interval(TICK);
@@ -566,6 +570,7 @@ impl Node {
             );
             if role != old_role {
                 self.publish_watch(None);
+                self.publish_local_reads();
                 tracing::info!(node = self.options.id, role = ?role.0, term = role.1,
                     leader = role.2, "Raft state changed");
                 old_role = role;
@@ -1050,6 +1055,16 @@ impl Node {
             },
             batch,
         );
+    }
+
+    /// Publish the applied view for serializable point reads outside the owner.
+    ///
+    /// While a prepared Put reply runs ahead of the local apply (`quorum_reply_index`), reads
+    /// wait in the owner so that a client that saw the reply also reads its effect here.
+    fn publish_local_reads(&self) {
+        let local = (self.state.applied >= self.quorum_reply_index)
+            .then(|| LocalRead::new(self.state.read.clone(), self.header()));
+        self.forwarding.publish_local(local);
     }
 
     fn fill_header(&self, header: Option<&mut ResponseHeader>) {
