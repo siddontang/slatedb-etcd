@@ -329,6 +329,8 @@ struct View<'a> {
     index: Option<&'a crate::state::key_index::KeyIndex>,
     /// Bytes of rows a streaming Range may materialize. `None` means unbounded.
     row_budget: Option<usize>,
+    /// Current keys at the pinned snapshot. Live views count rows by scanning.
+    keys: Option<&'a crate::state::key_index::KeyPin>,
 }
 
 impl View<'_> {
@@ -567,6 +569,14 @@ impl View<'_> {
         if bounds.is_empty() {
             return Ok(response);
         }
+        // The key order of a pinned view holds the count, so the scan stops after `limit + 1`
+        // rows. Debug builds scan the whole interval and check the count against the rows.
+        let total = self.keys.map(|keys| keys.count(&r.key, &r.range_end));
+        let full_scan = total.is_none() || cfg!(debug_assertions);
+        if let Some(total) = total.filter(|_| r.count_only && !full_scan) {
+            response.count = total;
+            return Ok(response);
+        }
         let mut budget = self.row_budget;
         let mut scan = self.db.scan(bounds).await.map_err(KvError::storage)?;
         while let Some(row) = scan.next().await.map_err(KvError::storage)? {
@@ -576,6 +586,9 @@ impl View<'_> {
             }
             if r.limit > 0 && response.count > r.limit {
                 response.more = true;
+                if !full_scan {
+                    break;
+                }
                 continue;
             }
             let mut kv = KeyValue::decode(row.value).map_err(KvError::storage)?;
@@ -586,6 +599,15 @@ impl View<'_> {
                 *budget = budget.checked_sub(row_bytes(&kv)).ok_or_else(over_budget)?;
             }
             response.kvs.push(kv);
+        }
+        if let Some(total) = total {
+            if full_scan {
+                debug_assert_eq!(
+                    total, response.count,
+                    "key order count differs from the rows"
+                );
+            }
+            response.count = total;
         }
         Ok(response)
     }
@@ -750,6 +772,7 @@ pub async fn read(
         request,
         leases,
         None,
+        None,
     )
     .await
 }
@@ -760,6 +783,7 @@ pub(crate) async fn read_snapshot(
     compact_revision: i64,
     request: &RequestOp,
     leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
+    keys: &crate::state::key_index::KeyPin,
 ) -> KvResult<ResponseOp> {
     read_from(
         ReadDb::Pinned(db),
@@ -767,6 +791,7 @@ pub(crate) async fn read_snapshot(
         compact_revision,
         request,
         leases,
+        Some(keys),
         None,
     )
     .await
@@ -805,6 +830,7 @@ pub(crate) async fn read_snapshot_within(
     compact_revision: i64,
     request: &RequestOp,
     leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
+    keys: &crate::state::key_index::KeyPin,
     budget: usize,
 ) -> Option<KvResult<ResponseOp>> {
     let result = read_from(
@@ -813,6 +839,7 @@ pub(crate) async fn read_snapshot_within(
         compact_revision,
         request,
         leases,
+        Some(keys),
         Some(budget),
     )
     .await;
@@ -827,12 +854,13 @@ pub(crate) async fn read_snapshot_within(
     }
 }
 
-async fn read_from(
-    db: ReadDb<'_>,
+async fn read_from<'a>(
+    db: ReadDb<'a>,
     revision: i64,
     compact_revision: i64,
     request: &RequestOp,
-    leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
+    leases: &'a BTreeMap<i64, crate::lease::LeaseRecord>,
+    keys: Option<&'a crate::state::key_index::KeyPin>,
     row_budget: Option<usize>,
 ) -> KvResult<ResponseOp> {
     validate(request)?;
@@ -850,6 +878,7 @@ async fn read_from(
         leases,
         index: None,
         row_budget,
+        keys,
     };
     if let Some(Op::RequestRange(range)) = &request.request {
         view.check_revision(range, false)?;
@@ -938,6 +967,7 @@ async fn prepare_view(
         leases,
         index,
         row_budget: None,
+        keys: None,
     };
     let plan = view.plan(request, false).await?;
     let response = view.execute(plan, false).await?;
@@ -1064,6 +1094,7 @@ pub(crate) async fn revoke_keys(
         leases,
         index: None,
         row_budget: None,
+        keys: None,
     };
     for key in lease_keys(db, id).await? {
         view.execute(

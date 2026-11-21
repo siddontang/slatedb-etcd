@@ -256,6 +256,7 @@ impl StateMachine {
             self.current.publish(&key, value.as_ref());
             self.key_index.publish(&key, value.as_ref())?;
         }
+        self.key_index.commit(index);
         Ok(())
     }
 

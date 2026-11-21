@@ -8,6 +8,8 @@ pub(crate) struct ReadView {
     pub compact_revision: i64,
     pub auth: Arc<crate::auth::Store>,
     pub leases: Arc<std::collections::BTreeMap<i64, crate::lease::LeaseRecord>>,
+    /// Current keys at the snapshot's sequence number, for Range counts.
+    keys: key_index::KeyPin,
 }
 
 impl StateMachine {
@@ -24,6 +26,7 @@ impl StateMachine {
             compact_revision: self.compact_revision,
             auth: self.auth.clone(),
             leases: self.leases.clone(),
+            keys: self.key_index.pin(self.applied),
         }))
     }
 }
@@ -63,6 +66,7 @@ impl ReadView {
                 self.compact_revision,
                 request,
                 &self.leases,
+                &self.keys,
                 budget,
             )
             .await
@@ -77,6 +81,7 @@ impl ReadView {
                     self.compact_revision,
                     request,
                     &self.leases,
+                    &self.keys,
                 )
                 .await
             }
@@ -242,6 +247,101 @@ mod tests {
         }
         drop(old);
         drop(current);
+        state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pinned_range_counts_follow_their_snapshot_after_later_writes() {
+        use crate::proto::etcdserverpb::{DeleteRangeRequest, TxnRequest};
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = StateMachine::open(dir.path()).await.unwrap();
+        let put = |key: &[u8]| RequestOp {
+            request: Some(Op::RequestPut(PutRequest {
+                key: key.to_vec(),
+                value: b"v".to_vec(),
+                ..Default::default()
+            })),
+        };
+        let delete = |key: &[u8], end: &[u8]| RequestOp {
+            request: Some(Op::RequestDeleteRange(DeleteRangeRequest {
+                key: key.to_vec(),
+                range_end: end.to_vec(),
+                ..Default::default()
+            })),
+        };
+        let mut index = 0;
+        let mut apply = async |state: &mut StateMachine, request: RequestOp| {
+            index += 1;
+            state
+                .apply_etcd(index, &request)
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+        };
+        for key in [b"a", b"b", b"c", b"d"] {
+            apply(&mut state, put(key)).await;
+        }
+        let first = state.read_view().unwrap();
+        apply(&mut state, put(b"b")).await;
+        apply(&mut state, delete(b"b", b"d")).await;
+        apply(&mut state, put(b"e")).await;
+        let second = state.read_view().unwrap();
+        apply(&mut state, put(b"c")).await;
+        apply(&mut state, delete(b"a", b"")).await;
+        let third = state.read_view().unwrap();
+        // (key, end, limit) -> (count, rows, more) at each view.
+        // (count, rows, more) at the first, second, and third view.
+        type Expected = [(i64, usize, bool); 3];
+        let cases: [(&[u8], &[u8], i64, Expected); 5] = [
+            (&[0], &[0], 2, [(4, 2, true), (3, 2, true), (3, 2, true)]),
+            (b"b", &[0], 0, [(3, 3, false), (2, 2, false), (3, 3, false)]),
+            (b"a", b"d", 1, [(3, 1, true), (1, 1, false), (1, 1, false)]),
+            (b"c", b"e", 5, [(2, 2, false), (1, 1, false), (2, 2, false)]),
+            (b"f", &[0], 1, [(0, 0, false), (0, 0, false), (0, 0, false)]),
+        ];
+        for (key, end, limit, expected) in cases {
+            for count_only in [false, true] {
+                let range = RequestOp {
+                    request: Some(Op::RequestRange(RangeRequest {
+                        key: key.to_vec(),
+                        range_end: end.to_vec(),
+                        limit,
+                        count_only,
+                        ..Default::default()
+                    })),
+                };
+                let txn = RequestOp {
+                    request: Some(Op::RequestTxn(TxnRequest {
+                        success: vec![range.clone()],
+                        ..Default::default()
+                    })),
+                };
+                for (view, (count, rows, more)) in
+                    [&first, &second, &third].into_iter().zip(expected)
+                {
+                    for request in [&range, &txn] {
+                        let mut response = view.read(request, None).await.unwrap().result.unwrap();
+                        if let Some(Resp::ResponseTxn(txn)) = response.response {
+                            response = txn.responses.into_iter().next().unwrap();
+                        }
+                        let Some(Resp::ResponseRange(reply)) = response.response else {
+                            panic!("expected range");
+                        };
+                        let rows = if count_only { 0 } else { rows };
+                        let more = more && !count_only;
+                        assert_eq!(
+                            (reply.count, reply.kvs.len(), reply.more),
+                            (count, rows, more),
+                            "{key:?}..{end:?} limit {limit} count_only {count_only}"
+                        );
+                    }
+                }
+            }
+        }
+        drop((first, second, third));
+        apply(&mut state, put(b"z")).await;
+        assert!(state.key_index.matches(&state.db).await.unwrap());
         state.close().await.unwrap();
     }
 }
