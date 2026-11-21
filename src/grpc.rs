@@ -125,8 +125,8 @@ impl Service {
     ) -> anyhow::Result<Self> {
         Ok(Self {
             events,
-            read_admission: Default::default(),
-            revision_admission: Default::default(),
+            read_admission: std::sync::Arc::new(admission::ReadAdmission::reads()),
+            revision_admission: std::sync::Arc::new(admission::ReadAdmission::barriers()),
             watch_progress_interval: if interval.is_zero() {
                 DEFAULT_WATCH_PROGRESS_INTERVAL
             } else {

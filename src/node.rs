@@ -16,7 +16,11 @@ use crate::storage::{PreparedCheckpoint, RaftStorage};
 use crate::{ApiError, Command, RaftCommand, Request};
 
 mod apply;
-pub(crate) const MAX_PENDING_READS: usize = apply::MAX_QUERIES;
+/// ReadIndex reads that may wait in the Raft owner's table. One quorum round confirms
+/// every read in a batch, so a larger table lets one round cover more clients.
+pub(crate) const MAX_PENDING_READS: usize = 256;
+/// Apply barriers that may wait for the local state to reach a revision.
+pub(crate) const MAX_APPLY_BARRIERS: usize = apply::MAX_QUERIES;
 mod cache;
 pub use cache::LogMemory;
 mod cluster;

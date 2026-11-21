@@ -1066,7 +1066,7 @@ async fn pending_read_indexes_are_bounded_and_cancelled_on_leader_loss() {
     let dir = tempfile::tempdir().unwrap();
     let mut node = leader_node(dir.path()).await;
     let mut replies = vec![];
-    for _ in 0..apply::MAX_QUERIES {
+    for _ in 0..MAX_PENDING_READS {
         let (tx, rx) = oneshot::channel();
         node.linear_read(range_request(), tx);
         replies.push(rx);

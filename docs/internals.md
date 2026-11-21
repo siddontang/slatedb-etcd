@@ -150,8 +150,10 @@ Forwarded KV results wait for local apply through the leader response revision.
 Lease and Compact results still require a local ReadIndex barrier.
 Later STM reads on that member can then use their revisions.
 Both branches of nested transactions must contain only reads.
-Leadership loss, timeout, or cancellation removes the pending read. At most 64 reads can wait.
-The gRPC service admits 48 linearizable KV reads at a time. Up to 512 more can wait for admission.
+Leadership loss, timeout, or cancellation removes the pending read. At most 256 reads can wait.
+The gRPC service admits 192 linearizable KV reads at a time. Up to 8,192 more wait for admission.
+A waiter that gets no slot in ten seconds fails with `Unavailable: request timed out`.
+A cancelled client releases its waiting slot.
 Forwarded writes use a separate admission queue while they wait for local apply.
 Matching wide reads can share a scan after each has a quorum proof. They use one pinned view,
 the same request, and the same credentials. Each RPC owns its response before encoding it.
