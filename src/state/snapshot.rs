@@ -22,7 +22,7 @@ impl StateMachine {
         );
         Ok(async move {
             metrics.flush_db(&db).await?;
-            let mut data = crate::codec::encode(&(STORAGE_FORMAT, applied))?;
+            let mut data = crate::codec::encode(&(crate::SNAPSHOT_FORMAT, applied))?;
             let count_offset = data.len();
             crate::codec::write(&mut data, &0_u64)?;
             let mut count = 0_u64;
@@ -57,7 +57,7 @@ impl StateMachine {
         }
         let data: SnapshotData = crate::codec::decode(snapshot.get_data())?;
         ensure!(
-            data.version == STORAGE_FORMAT && data.applied == index,
+            crate::readable_snapshot(data.version) && data.applied == index,
             "invalid snapshot metadata"
         );
         let mut batch = WriteBatch::new();

@@ -357,7 +357,8 @@ History and Watch keep their own records. Both indexes count their full logical 
 A transaction whose branches hold only ordinary puts, and whose compares each read one key, uses
 the same direct path. It writes into the group batch without the general evaluator. All its puts
 share one revision, and each put is the next HashKV sub-revision. Other writes use the general
-evaluator. It also encodes each new value once for the current, history, HashKV, and Watch rows.
+evaluator. It also encodes each new value once. The current and history rows share those bytes.
+The HashKV row stores their CRC and length, and the Watch journal omits the value.
 
 ## Key index
 
@@ -629,7 +630,9 @@ The Raft owner publishes the current leader ID to the gRPC service.
 A follower can route an ordinary Put directly to that leader.
 The receiving member checks leadership. A forwarded request makes at most one peer RPC.
 Forwarded KV writes wait for local revision progress without another quorum round.
-Apply encodes each ordinary Put value once for the current, hash, history, and Watch rows.
+Apply encodes each ordinary Put value once. The current and history rows share those bytes.
+The hash row stores their CRC and length. The Watch journal omits the value and names the history
+version.
 It adds each row to the storage batch and updates quota before it evaluates the next Put.
 The key index supplies the old create revision, version, and row length of an ordinary Put.
 Apply reads the old current row only when the request asks for `prev_kv`.
