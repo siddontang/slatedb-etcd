@@ -145,6 +145,10 @@ impl WriteBatch {
         Ok(size)
     }
 
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &Bytes> {
+        self.changes.keys()
+    }
+
     pub(crate) fn into_rows(self) -> impl Iterator<Item = (Bytes, Option<Bytes>)> {
         self.changes
             .into_iter()
