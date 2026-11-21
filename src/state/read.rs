@@ -344,4 +344,291 @@ mod tests {
         assert!(state.key_index.matches(&state.db).await.unwrap());
         state.close().await.unwrap();
     }
+
+    /// Range answers of one pinned view against the key set it should hold.
+    async fn check_view(
+        view: &ReadView,
+        model: &std::collections::BTreeSet<Vec<u8>>,
+        random: &mut impl FnMut(u64) -> u64,
+    ) {
+        use crate::proto::etcdserverpb::TxnRequest;
+        for _ in 0..3 {
+            let a = format!("k{:02}", random(26)).into_bytes();
+            let (key, end) = match random(4) {
+                0 => (vec![0], vec![0]),
+                1 => (a, vec![0]),
+                _ => (a, format!("k{:02}", random(26)).into_bytes()),
+            };
+            let limit = random(4) as i64;
+            let count_only = random(5) == 0;
+            let keys_only = random(3) == 0;
+            let expected: Vec<&Vec<u8>> = model
+                .iter()
+                .filter(|k| crate::mvcc::contains(k, &key, &end))
+                .collect();
+            let range = RequestOp {
+                request: Some(Op::RequestRange(RangeRequest {
+                    key: key.clone(),
+                    range_end: end.clone(),
+                    limit,
+                    count_only,
+                    keys_only,
+                    ..Default::default()
+                })),
+            };
+            let request = if random(2) == 0 {
+                range
+            } else {
+                RequestOp {
+                    request: Some(Op::RequestTxn(TxnRequest {
+                        success: vec![range],
+                        ..Default::default()
+                    })),
+                }
+            };
+            let mut response = view.read(&request, None).await.unwrap().result.unwrap();
+            if let Some(Resp::ResponseTxn(txn)) = response.response {
+                response = txn.responses.into_iter().next().unwrap();
+            }
+            let Some(Resp::ResponseRange(reply)) = response.response else {
+                panic!("expected range");
+            };
+            let count = expected.len() as i64;
+            let rows = if count_only {
+                0
+            } else if limit > 0 {
+                count.min(limit)
+            } else {
+                count
+            };
+            let context = format!("{key:?}..{end:?} limit {limit} count_only {count_only}");
+            assert_eq!(reply.count, count, "{context}");
+            assert_eq!(reply.kvs.len() as i64, rows, "{context}");
+            assert_eq!(
+                reply.more,
+                !count_only && limit > 0 && count > limit,
+                "{context}"
+            );
+            assert_eq!(reply.header.unwrap().revision, view.revision, "{context}");
+            for (kv, key) in reply.kvs.iter().zip(&expected) {
+                assert_eq!(&&kv.key, key, "{context}");
+                assert_eq!(kv.value.is_empty(), keys_only, "{context}");
+            }
+        }
+    }
+
+    /// Random writes, lease revocation and expiry, compaction, snapshot installation, and restart,
+    /// with read views pinned at random points. Every Range count must match the key set of its
+    /// view. Debug builds also check each count against a full scan of the same snapshot.
+    #[tokio::test]
+    async fn random_pinned_range_counts_match_their_snapshots() {
+        use crate::lease::LeaseCommand;
+        use crate::proto::etcdserverpb::{DeleteRangeRequest, TxnRequest};
+        use std::collections::{BTreeMap, BTreeSet};
+        for seed in 1..=3u64 {
+            let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            let mut random = move |n: u64| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x % n
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let mirror_dir = tempfile::tempdir().unwrap();
+            let mut state = StateMachine::open(dir.path()).await.unwrap();
+            let mut mirror = StateMachine::open(mirror_dir.path()).await.unwrap();
+            let mut model = BTreeSet::new();
+            let mut leases: BTreeMap<i64, BTreeSet<Vec<u8>>> = BTreeMap::new();
+            let mut next_lease = 1;
+            let mut views: Vec<(Arc<ReadView>, BTreeSet<Vec<u8>>)> = vec![];
+            let mut mirror_views: Vec<(Arc<ReadView>, BTreeSet<Vec<u8>>)> = vec![];
+            for _ in 0..150 {
+                let key =
+                    |random: &mut dyn FnMut(u64) -> u64| format!("k{:02}", random(24)).into_bytes();
+                let index = state.applied + 1;
+                match random(16) {
+                    0..=5 => {
+                        let k = key(&mut random);
+                        let lease = match leases.keys().copied().collect::<Vec<_>>() {
+                            live if !live.is_empty() && random(2) == 0 => {
+                                live[random(live.len() as u64) as usize]
+                            }
+                            _ => 0,
+                        };
+                        let put = RequestOp {
+                            request: Some(Op::RequestPut(PutRequest {
+                                key: k.clone(),
+                                value: b"v".to_vec(),
+                                lease,
+                                ..Default::default()
+                            })),
+                        };
+                        state.apply_etcd(index, &put).await.unwrap().result.unwrap();
+                        for keys in leases.values_mut() {
+                            keys.remove(&k);
+                        }
+                        if lease != 0 {
+                            leases.get_mut(&lease).unwrap().insert(k.clone());
+                        }
+                        model.insert(k);
+                    }
+                    6 | 7 => {
+                        let (a, b) = (key(&mut random), key(&mut random));
+                        let end = if random(4) == 0 { vec![] } else { b };
+                        let delete = RequestOp {
+                            request: Some(Op::RequestDeleteRange(DeleteRangeRequest {
+                                key: a.clone(),
+                                range_end: end.clone(),
+                                ..Default::default()
+                            })),
+                        };
+                        state
+                            .apply_etcd(index, &delete)
+                            .await
+                            .unwrap()
+                            .result
+                            .unwrap();
+                        model.retain(|k| !crate::mvcc::contains(k, &a, &end));
+                        for keys in leases.values_mut() {
+                            keys.retain(|k| !crate::mvcc::contains(k, &a, &end));
+                        }
+                    }
+                    8 => {
+                        // One transaction creates a key and deletes another.
+                        let (a, b) = (key(&mut random), key(&mut random));
+                        let txn = RequestOp {
+                            request: Some(Op::RequestTxn(TxnRequest {
+                                success: vec![
+                                    RequestOp {
+                                        request: Some(Op::RequestPut(PutRequest {
+                                            key: a.clone(),
+                                            value: b"t".to_vec(),
+                                            ..Default::default()
+                                        })),
+                                    },
+                                    RequestOp {
+                                        request: Some(Op::RequestDeleteRange(DeleteRangeRequest {
+                                            key: b.clone(),
+                                            ..Default::default()
+                                        })),
+                                    },
+                                ],
+                                ..Default::default()
+                            })),
+                        };
+                        // Etcd rejects a put and a delete of the same key in one transaction.
+                        let outcome = state.apply_etcd(index, &txn).await.unwrap();
+                        if outcome.result.is_ok() {
+                            model.insert(a.clone());
+                            model.remove(&b);
+                            for keys in leases.values_mut() {
+                                keys.remove(&a);
+                                keys.remove(&b);
+                            }
+                        }
+                    }
+                    9 => {
+                        let command = LeaseCommand::Grant {
+                            id: next_lease,
+                            ttl: 60,
+                        };
+                        state
+                            .apply_lease(index, &command)
+                            .await
+                            .unwrap()
+                            .result
+                            .unwrap();
+                        leases.insert(next_lease, BTreeSet::new());
+                        next_lease += 1;
+                    }
+                    10 => {
+                        let Some(&id) = leases.keys().next() else {
+                            continue;
+                        };
+                        let command = if random(2) == 0 {
+                            LeaseCommand::Revoke { id }
+                        } else {
+                            let generation = state.leases[&id].generation;
+                            LeaseCommand::Expire { id, generation }
+                        };
+                        state
+                            .apply_lease(index, &command)
+                            .await
+                            .unwrap()
+                            .result
+                            .unwrap();
+                        for k in leases.remove(&id).unwrap() {
+                            model.remove(&k);
+                        }
+                    }
+                    11 if state.revision > state.compact_revision.max(1) => {
+                        let request = CompactionRequest {
+                            revision: state.revision,
+                            physical: false,
+                        };
+                        state
+                            .apply_compaction(index, &request)
+                            .await
+                            .unwrap()
+                            .result
+                            .unwrap();
+                    }
+                    12 => {
+                        // The mirror installs a snapshot of the current state over its old one.
+                        let mut snapshot = Snapshot::default();
+                        snapshot.mut_metadata().index = state.applied;
+                        snapshot.data = state.snapshot_job().unwrap().await.unwrap().into();
+                        if state.applied > mirror.applied {
+                            mirror.install_snapshot(&snapshot).await.unwrap();
+                            mirror_views.push((mirror.read_view().unwrap(), model.clone()));
+                        }
+                    }
+                    13 if random(4) == 0 => {
+                        // Without a SlateDB WAL, unflushed rows return through Raft replay. Flush
+                        // so the reopened state holds every applied row.
+                        views.clear();
+                        state.db.flush().await.unwrap();
+                        state.close().await.unwrap();
+                        drop(state);
+                        state = StateMachine::open(dir.path()).await.unwrap();
+                    }
+                    _ => {
+                        views.push((state.read_view().unwrap(), model.clone()));
+                        if views.len() > 4 {
+                            views.remove(random(views.len() as u64) as usize);
+                        }
+                    }
+                }
+                for (view, expected) in views.iter().chain(&mirror_views) {
+                    check_view(view, expected, &mut random).await;
+                }
+                check_view(&state.read_view().unwrap(), &model, &mut random).await;
+                if mirror_views.len() > 3 {
+                    mirror_views.remove(0);
+                }
+            }
+            views.clear();
+            mirror_views.clear();
+            // One more batch folds the remaining history.
+            let index = state.applied + 1;
+            state
+                .apply_etcd(
+                    index,
+                    &RequestOp {
+                        request: Some(Op::RequestPut(PutRequest {
+                            key: b"k00".to_vec(),
+                            ..Default::default()
+                        })),
+                    },
+                )
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            assert!(state.key_index.matches(&state.db).await.unwrap());
+            assert!(mirror.key_index.matches(&mirror.db).await.unwrap());
+            state.close().await.unwrap();
+            mirror.close().await.unwrap();
+        }
+    }
 }
