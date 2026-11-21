@@ -46,7 +46,7 @@ fn native_snapshot_bytes_use_fixed_width_lengths() {
     ))
     .unwrap();
     let data: SnapshotData = crate::codec::decode(&bytes).unwrap();
-    assert_eq!(data.version, STORAGE_FORMAT);
+    assert_eq!(data.version, crate::STORAGE_FORMAT);
     assert_eq!(data.applied, 42);
     assert_eq!(data.rows, vec![(vec![b'k'], vec![0, 127])]);
     assert_eq!(crate::codec::encode(&data).unwrap(), bytes);
@@ -305,7 +305,7 @@ async fn streamed_snapshot_matches_the_complete_state_encoding() {
     ));
     assert!(rows.len() > 255);
     let expected = crate::codec::encode(&SnapshotData {
-        version: STORAGE_FORMAT,
+        version: crate::SNAPSHOT_FORMAT,
         applied: state.applied,
         rows,
     })
@@ -607,6 +607,102 @@ fn format_3_rows(rows: SnapshotRows) -> (SnapshotRows, usize) {
         })
         .collect();
     (rows, rewritten)
+}
+
+#[tokio::test]
+async fn a_format_3_snapshot_installs_and_older_readers_reject_format_4() {
+    use crate::proto::etcdserverpb::WatchCreateRequest;
+    let dir = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let big = vec![b'v'; 16 << 10];
+    let txn = RequestOp {
+        request: Some(Op::RequestTxn(crate::proto::etcdserverpb::TxnRequest {
+            success: vec![put(b"c", &big), put(b"d", b"d")],
+            ..Default::default()
+        })),
+    };
+    let delete = RequestOp {
+        request: Some(Op::RequestDeleteRange(DeleteRangeRequest {
+            key: b"b".to_vec(),
+            ..Default::default()
+        })),
+    };
+    for request in [put(b"a", b"one"), put(b"b", &big), txn, delete] {
+        state
+            .apply_etcd(state.applied + 1, &request)
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+    }
+    let grouped = [put(b"a", &big), put(b"b", b"two"), put(b"a", b"three")];
+    let puts: Vec<_> = grouped
+        .iter()
+        .enumerate()
+        .map(|(offset, request)| put_batch::KvEntry {
+            index: state.applied + offset as u64 + 1,
+            request,
+            credentials: None,
+            origin: 1,
+        })
+        .collect();
+    state.apply_puts(&puts).await.unwrap();
+
+    let bytes = state.snapshot_data().await.unwrap();
+    let mut data: SnapshotData = crate::codec::decode(&bytes).unwrap();
+    // Binaries that read only format 3 compare the version with their storage format.
+    assert_eq!(data.version, crate::SNAPSHOT_FORMAT);
+    assert_ne!(data.version, crate::STORAGE_FORMAT);
+    let (rows, rewritten) = format_3_rows(std::mem::take(&mut data.rows));
+    assert!(rewritten >= 10, "{rewritten} rows changed");
+    data.rows = rows;
+    data.version = crate::STORAGE_FORMAT;
+
+    assert_eq!(data.applied, state.applied);
+    let install = |version: u32| {
+        let data = SnapshotData {
+            version,
+            applied: data.applied,
+            rows: data.rows.clone(),
+        };
+        let mut snapshot = Snapshot::default();
+        snapshot.mut_metadata().index = state.applied;
+        snapshot.set_data(crate::codec::encode(&data).unwrap().into());
+        snapshot
+    };
+    let mut restored = StateMachine::open(other.path()).await.unwrap();
+    assert!(restored.install_snapshot(&install(5)).await.is_err());
+    restored
+        .install_snapshot(&install(crate::STORAGE_FORMAT))
+        .await
+        .unwrap();
+    for revision in 0..=state.revision {
+        assert_eq!(
+            serde_json::to_value(restored.hash_kv(revision).await).unwrap(),
+            serde_json::to_value(state.hash_kv(revision).await).unwrap(),
+            "HashKV revision {revision}"
+        );
+    }
+    let request = WatchCreateRequest {
+        key: vec![0],
+        range_end: vec![0],
+        start_revision: 1,
+        prev_kv: true,
+        ..Default::default()
+    };
+    let events = |page: crate::watch::WatchPage| -> Vec<_> {
+        page.responses.into_iter().flat_map(|r| r.events).collect()
+    };
+    let expected = events(state.watch(&request, None).await.unwrap());
+    assert_eq!(expected.len(), 8);
+    assert!(expected.iter().any(|e| e.kv.as_ref().unwrap().value == big));
+    assert_eq!(
+        events(restored.watch(&request, None).await.unwrap()),
+        expected
+    );
+    restored.close().await.unwrap();
+    state.close().await.unwrap();
 }
 
 /// A put-only transaction on the direct apply path must write the value-once rows. Its HashKV

@@ -44,6 +44,27 @@ pub struct LogStats {
     pub bytes: u64,
 }
 
+/// The identity marker of data directories whose state rows can omit Put values outside the
+/// current and history rows. Binaries without it reject such a directory.
+const ROW_MARKER: &str = "history-values";
+
+/// Encode the identity record. Each marker names a storage change that older binaries cannot read.
+fn identity_record(
+    node_id: u64,
+    cluster_id: &str,
+    voters: &[u64],
+    markers: &[&str],
+) -> Result<Vec<u8>> {
+    let mut fields = vec![
+        serde_json::json!(crate::STORAGE_FORMAT),
+        serde_json::json!(node_id),
+        serde_json::json!(cluster_id),
+        serde_json::json!(voters),
+    ];
+    fields.extend(markers.iter().map(|marker| serde_json::json!(marker)));
+    Ok(serde_json::to_vec(&fields)?)
+}
+
 impl RaftStorage {
     pub fn open(dir: &Path, node_id: u64, cluster_id: &str, voters: Vec<u64>) -> Result<Self> {
         let config = Config {
@@ -59,29 +80,34 @@ impl RaftStorage {
             config,
             std::sync::Arc::new(LogFileSystem(wal_metrics.clone())),
         )?;
-        let identity = serde_json::to_vec(&(
-            crate::STORAGE_FORMAT,
+        let identity = identity_record(
             node_id,
             cluster_id,
             &voters,
-            "checkpoint-files",
-        ))?;
+            &["checkpoint-files", ROW_MARKER],
+        )?;
         let stored = engine.get(GROUP, IDENTITY);
         let mut snapshot = engine
             .get_message::<Snapshot>(GROUP, SNAPSHOT)?
             .unwrap_or_default();
         if let Some(stored) = stored {
+            // Earlier forms: before file checkpoints, and before history-backed rows.
+            let earlier = [
+                identity_record(node_id, cluster_id, &voters, &[])?,
+                identity_record(node_id, cluster_id, &voters, &["checkpoint-files"])?,
+            ];
             ensure!(
-                stored == identity
-                    || stored
-                        == serde_json::to_vec(&(
-                            crate::STORAGE_FORMAT,
-                            node_id,
-                            cluster_id,
-                            &voters
-                        ))?,
+                stored == identity || earlier.contains(&stored),
                 "data directory has another format, node, or cluster"
             );
+            if stored != identity {
+                // Mark the directory before state rows in the new form can exist. Older binaries
+                // then refuse it instead of misreading hash digests and Watch journals. One synced
+                // batch replaces the record, so a crash leaves either the old or the new marker.
+                let mut batch = LogBatch::default();
+                batch.put(GROUP, IDENTITY.to_vec(), identity.clone())?;
+                engine.write(&mut batch, true)?;
+            }
         } else {
             ensure!(engine.last_index(GROUP).is_none(), "log has no identity");
             snapshot
@@ -393,6 +419,45 @@ impl Storage for RaftStorage {
 #[cfg(test)]
 mod checkpoint_tests {
     use super::*;
+
+    #[test]
+    fn opening_an_older_directory_writes_the_row_marker() {
+        let tuple4 = serde_json::to_vec(&(crate::STORAGE_FORMAT, 1, "test", vec![1])).unwrap();
+        let tuple5 = serde_json::to_vec(&(
+            crate::STORAGE_FORMAT,
+            1,
+            "test",
+            vec![1],
+            "checkpoint-files",
+        ))
+        .unwrap();
+        for old_id in [tuple4.clone(), tuple5.clone()] {
+            let root = tempfile::tempdir().unwrap();
+            let store = RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
+            let mut batch = LogBatch::default();
+            batch.put(GROUP, IDENTITY.to_vec(), old_id).unwrap();
+            store.engine.write(&mut batch, true).unwrap();
+            drop(store);
+            let store = RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
+            let stored = store.engine.get(GROUP, IDENTITY).unwrap();
+            // Older binaries accept only these two forms, so they now refuse the directory.
+            assert!(stored != tuple4 && stored != tuple5);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&stored).unwrap(),
+                serde_json::json!([
+                    crate::STORAGE_FORMAT,
+                    1,
+                    "test",
+                    [1],
+                    "checkpoint-files",
+                    ROW_MARKER
+                ])
+            );
+            drop(store);
+            RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
+            assert!(RaftStorage::open(root.path(), 2, "test", vec![1]).is_err());
+        }
+    }
 
     #[test]
     fn an_inline_checkpoint_upgrades_with_the_first_file_reference() {

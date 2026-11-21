@@ -96,6 +96,13 @@ untested.
 Native backup and backend Hash formats differ from etcd bbolt.
 Storage format 3 requires fresh directories and object prefixes.
 Old backups and logs are unsupported.
+Native backups and peer snapshots use format 4. This binary installs formats 3 and 4.
+Format 4 rows keep a Put value only in the current and history rows.
+Hash records keep a CRC of the value, and Watch journals read the value from history.
+Older binaries reject format 4 snapshots and backups, and data directories that this binary opened.
+They fail explicitly and do not misread the rows. A downgrade is not supported.
+To upgrade a cluster, upgrade the followers first. Then transfer leadership and upgrade the old
+leader. A follower on an older binary cannot install a snapshot from an upgraded leader.
 Use `--restore-snapshot` for native backups; `etcdutl` cannot restore them.
 Use the [native export tool](docs/operations.md#backups-and-restoration) to save a backup.
 `etcdctl snapshot save` can reject the native image because it requires bbolt page alignment.
