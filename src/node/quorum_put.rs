@@ -149,6 +149,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut node = super::super::tests::leader_node(dir.path()).await;
         let applied = node.state.applied;
+        let before = node.forwarding.local().expect("applied view published");
+        assert_eq!(before.applied_revision(), node.state.revision);
         let (tx, mut reply) = oneshot::channel();
         node.propose(
             RaftCommand::Etcd {
@@ -192,6 +194,9 @@ mod tests {
             .result
             .is_ok());
         assert_eq!(node.quorum_reply_index, index);
+        // The Put reply left before the local apply. Serializable reads outside the owner must
+        // not use the older view, or a client that saw the reply could miss its write here.
+        assert!(node.forwarding.local().is_none());
         let (tx, mut read) = oneshot::channel();
         node.enqueue_query(Query::Read(
             super::super::tests::range_request(),
@@ -212,6 +217,48 @@ mod tests {
             .result
             .is_ok());
         assert!(node.prepared_puts.is_none());
+        let after = node
+            .forwarding
+            .local()
+            .expect("applied view published again");
+        assert_eq!(after.applied_revision(), node.state.revision);
+        assert!(after.applied_revision() > before.applied_revision());
+        let get = RequestOp {
+            request: Some(Request::RequestRange(
+                crate::proto::etcdserverpb::RangeRequest {
+                    key: b"slow".to_vec(),
+                    serializable: true,
+                    ..Default::default()
+                },
+            )),
+        };
+        let Some(crate::proto::etcdserverpb::response_op::Response::ResponseRange(range)) = after
+            .read(&get, None)
+            .await
+            .unwrap()
+            .result
+            .unwrap()
+            .response
+        else {
+            panic!("expected range");
+        };
+        assert_eq!(range.kvs[0].value, b"disk");
+        let header = range.header.unwrap();
+        assert_eq!(header.revision, node.state.revision);
+        assert_eq!(header.member_id, node.options.id);
+        assert_eq!(header.raft_term, node.raw.raft.term);
+        // The view taken before the write still answers from its own snapshot.
+        let Some(crate::proto::etcdserverpb::response_op::Response::ResponseRange(old)) = before
+            .read(&get, None)
+            .await
+            .unwrap()
+            .result
+            .unwrap()
+            .response
+        else {
+            panic!("expected range");
+        };
+        assert!(old.kvs.is_empty());
     }
     #[tokio::test]
     async fn a_locally_durable_put_replies_before_its_state_write_and_commit_marker() {
