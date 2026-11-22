@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{ensure, Context, Result};
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
@@ -28,11 +30,11 @@ impl MessageExt for EntryCodec {
 
 /// Stores Raft metadata, log entries, and a full recovery snapshot on local disk.
 pub struct RaftStorage {
-    engine: Engine<LogFileSystem>,
+    engine: Arc<Engine<LogFileSystem>>,
     pub(crate) wal_metrics: crate::metrics::Wal,
     hard_state: HardState,
     snapshot: Snapshot,
-    identity: Vec<u8>,
+    rows: Arc<RowMarker>,
     dir: PathBuf,
     ready_batch: Option<LogBatch>,
     pub sync_writes: u64,
@@ -47,6 +49,67 @@ pub struct LogStats {
 /// The identity marker of data directories whose state rows can omit Put values outside the
 /// current and history rows. Binaries without it reject such a directory.
 const ROW_MARKER: &str = "history-values";
+
+/// The identity record of the data directory and whether it carries [`ROW_MARKER`].
+///
+/// A directory gets the marker just before it first holds a format 4 row or image, not when
+/// this binary opens it. A directory that this binary only opened stays readable by older
+/// binaries. The state machine calls [`RowMarker::mark`] before its first SlateDB write of a
+/// hash or Watch journal row. Raft storage writes the marked record with every snapshot image.
+pub struct RowMarker {
+    engine: Arc<Engine<LogFileSystem>>,
+    /// The record without the marker. Older binaries since file checkpoints accept it.
+    unmarked: Vec<u8>,
+    marked: Vec<u8>,
+    /// Whether the stored record is `marked`. Writers of the record hold this lock across the
+    /// synced write, so a batch never stores the unmarked record after the marked one.
+    stored: Mutex<bool>,
+    /// A lock-free copy of `stored` for the apply path.
+    done: AtomicBool,
+}
+
+impl RowMarker {
+    /// Return true when the stored identity carries the marker.
+    pub(crate) fn is_marked(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+
+    /// Store the marked identity in one synced batch, unless it is already stored.
+    ///
+    /// Call this before writing a format 4 row. The record is durable when this returns, so a
+    /// crash leaves no such row in a directory without the marker.
+    pub(crate) fn mark(&self) -> Result<()> {
+        let mut stored = self.lock();
+        if !*stored {
+            let mut batch = LogBatch::default();
+            batch.put(GROUP, IDENTITY.to_vec(), self.marked.clone())?;
+            self.engine.write(&mut batch, true)?;
+            self.set(&mut stored);
+        }
+        Ok(())
+    }
+
+    fn lock(&self) -> MutexGuard<'_, bool> {
+        self.stored
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The record that a batch which rewrites the identity stores. `marking` is true when the
+    /// batch also stores format 4 data, such as a snapshot image.
+    fn record(&self, stored: &MutexGuard<'_, bool>, marking: bool) -> Vec<u8> {
+        if **stored || marking {
+            self.marked.clone()
+        } else {
+            self.unmarked.clone()
+        }
+    }
+
+    fn set(&self, stored: &mut MutexGuard<'_, bool>) {
+        **stored = true;
+        self.done.store(true, Ordering::Release);
+    }
+}
 
 /// Encode the identity record. Each marker names a storage change that older binaries cannot read.
 fn identity_record(
@@ -76,56 +139,60 @@ impl RaftStorage {
             ..Config::default()
         };
         let wal_metrics = crate::metrics::Wal::new()?;
-        let engine = Engine::open_with_file_system(
+        let engine = Arc::new(Engine::open_with_file_system(
             config,
             std::sync::Arc::new(LogFileSystem(wal_metrics.clone())),
-        )?;
+        )?);
         let identity = identity_record(
             node_id,
             cluster_id,
             &voters,
             &["checkpoint-files", ROW_MARKER],
         )?;
+        let unmarked = identity_record(node_id, cluster_id, &voters, &["checkpoint-files"])?;
         let stored = engine.get(GROUP, IDENTITY);
+        let mut marked = false;
         let mut snapshot = engine
             .get_message::<Snapshot>(GROUP, SNAPSHOT)?
             .unwrap_or_default();
         if let Some(stored) = stored {
-            // Earlier forms: before file checkpoints, and before history-backed rows.
+            // Earlier forms: before file checkpoints, and before history-backed rows. Opening
+            // does not rewrite them. `RowMarker::mark` adds the marker before the first format 4
+            // row, so a directory that this binary only opened stays readable by older binaries.
             let earlier = [
                 identity_record(node_id, cluster_id, &voters, &[])?,
-                identity_record(node_id, cluster_id, &voters, &["checkpoint-files"])?,
+                unmarked.clone(),
             ];
             ensure!(
                 stored == identity || earlier.contains(&stored),
                 "data directory has another format, node, or cluster"
             );
-            if stored != identity {
-                // Mark the directory before state rows in the new form can exist. Older binaries
-                // then refuse it instead of misreading hash digests and Watch journals. One synced
-                // batch replaces the record, so a crash leaves either the old or the new marker.
-                let mut batch = LogBatch::default();
-                batch.put(GROUP, IDENTITY.to_vec(), identity.clone())?;
-                engine.write(&mut batch, true)?;
-            }
+            marked = stored == identity;
         } else {
             ensure!(engine.last_index(GROUP).is_none(), "log has no identity");
             snapshot
                 .mut_metadata()
                 .set_conf_state(ConfState::from((voters, vec![])));
             let mut batch = LogBatch::default();
-            batch.put(GROUP, IDENTITY.to_vec(), identity.clone())?;
+            batch.put(GROUP, IDENTITY.to_vec(), unmarked.clone())?;
             batch.put_message(GROUP, SNAPSHOT.to_vec(), &snapshot)?;
             engine.write(&mut batch, true)?;
         }
         let referenced = checkpoint::load(dir, &engine, &mut snapshot)?;
         let hard_state = engine.get_message(GROUP, HARD_STATE)?.unwrap_or_default();
+        let rows = Arc::new(RowMarker {
+            engine: Arc::clone(&engine),
+            unmarked,
+            marked: identity,
+            stored: Mutex::new(marked),
+            done: AtomicBool::new(marked),
+        });
         let this = Self {
             engine,
             wal_metrics,
             hard_state,
             snapshot,
-            identity,
+            rows,
             dir: dir.to_owned(),
             ready_batch: None,
             sync_writes: 0,
@@ -162,6 +229,9 @@ impl RaftStorage {
             .ready_batch
             .take()
             .unwrap_or_else(|| LogBatch::with_capacity(4));
+        // A snapshot image holds format 4 rows. Its batch stores the marked identity.
+        let rows = Arc::clone(&self.rows);
+        let mut identity = snapshot.map(|_| rows.lock());
         if let Some(snapshot) = snapshot {
             ensure!(
                 snapshot.get_metadata().index > self.snapshot_index(),
@@ -170,7 +240,8 @@ impl RaftStorage {
             ensure!(!snapshot.data.is_empty(), "received snapshot has no image");
             // Replacing a snapshot discards the old log, including its divergent suffix.
             batch.add_command(GROUP, EngineCommand::Clean);
-            batch.put(GROUP, IDENTITY.to_vec(), self.identity.clone())?;
+            let record = rows.record(identity.as_ref().unwrap(), true);
+            batch.put(GROUP, IDENTITY.to_vec(), record)?;
             let hs = hard_state.context("snapshot Ready has no HardState")?;
             ensure!(
                 hs.commit >= snapshot.get_metadata().index,
@@ -190,6 +261,10 @@ impl RaftStorage {
             crate::failpoint::hit("wal-before-sync");
         }
         let written = self.engine.write(&mut batch, must_sync)?;
+        if let Some(identity) = &mut identity {
+            rows.set(identity);
+        }
+        drop(identity);
         if written <= 512 * 1024 {
             self.ready_batch = Some(batch);
         }
@@ -272,6 +347,9 @@ impl RaftStorage {
         snapshot.mut_metadata().term = self.term(index)?;
         snapshot.mut_metadata().set_conf_state(conf);
         let mut batch = LogBatch::default();
+        let rows = Arc::clone(&self.rows);
+        let mut identity = rows.lock();
+        let image = prepared.is_some();
         match prepared {
             Some(prepared) => {
                 snapshot.data = prepared.data.clone();
@@ -279,11 +357,16 @@ impl RaftStorage {
             }
             None => checkpoint::publish_metadata(&snapshot, &mut batch)?,
         }
-        batch.put(GROUP, IDENTITY.to_vec(), self.identity.clone())?;
+        // An image holds format 4 rows, so its batch stores the marked identity.
+        batch.put(GROUP, IDENTITY.to_vec(), rows.record(&identity, image))?;
         batch.put_message(GROUP, HARD_STATE.to_vec(), &self.hard_state)?;
         batch.add_command(GROUP, EngineCommand::Compact { index: index + 1 });
         crate::failpoint::hit("checkpoint-before-save");
         self.engine.write(&mut batch, true)?;
+        if image {
+            rows.set(&mut identity);
+        }
+        drop(identity);
         crate::failpoint::hit("checkpoint-after-save");
         self.sync_writes += 1;
         if !attach {
@@ -293,6 +376,11 @@ impl RaftStorage {
         self.purge()?;
         crate::failpoint::hit("checkpoint-after-gc");
         Ok(())
+    }
+
+    /// The identity marker that the state machine sets before it writes format 4 rows.
+    pub fn row_marker(&self) -> Arc<RowMarker> {
+        Arc::clone(&self.rows)
     }
 
     pub fn purge(&self) -> Result<()> {
@@ -420,8 +508,8 @@ impl Storage for RaftStorage {
 mod checkpoint_tests {
     use super::*;
 
-    #[test]
-    fn opening_an_older_directory_writes_the_row_marker() {
+    /// The identity check of binaries before the row marker. They accept only these forms.
+    fn older_binary_opens(stored: &[u8]) -> bool {
         let tuple4 = serde_json::to_vec(&(crate::STORAGE_FORMAT, 1, "test", vec![1])).unwrap();
         let tuple5 = serde_json::to_vec(&(
             crate::STORAGE_FORMAT,
@@ -431,32 +519,136 @@ mod checkpoint_tests {
             "checkpoint-files",
         ))
         .unwrap();
-        for old_id in [tuple4.clone(), tuple5.clone()] {
+        stored == tuple4 || stored == tuple5
+    }
+
+    fn marked_record() -> serde_json::Value {
+        serde_json::json!([
+            crate::STORAGE_FORMAT,
+            1,
+            "test",
+            [1],
+            "checkpoint-files",
+            ROW_MARKER
+        ])
+    }
+
+    #[test]
+    fn opening_keeps_an_older_directory_readable_until_the_first_row() {
+        let tuple4 = serde_json::to_vec(&(crate::STORAGE_FORMAT, 1, "test", vec![1])).unwrap();
+        // `None` is a new directory. Some(record) is a directory of an older binary.
+        for old_id in [None, Some(tuple4)] {
             let root = tempfile::tempdir().unwrap();
             let store = RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
-            let mut batch = LogBatch::default();
-            batch.put(GROUP, IDENTITY.to_vec(), old_id).unwrap();
-            store.engine.write(&mut batch, true).unwrap();
+            if let Some(old_id) = &old_id {
+                let mut batch = LogBatch::default();
+                batch.put(GROUP, IDENTITY.to_vec(), old_id.clone()).unwrap();
+                store.engine.write(&mut batch, true).unwrap();
+            }
             drop(store);
+            let created = RaftStorage::open(root.path(), 1, "test", vec![1])
+                .unwrap()
+                .engine
+                .get(GROUP, IDENTITY)
+                .unwrap();
+            // This binary opens and closes the directory twice without writing a row.
+            for _ in 0..2 {
+                let store = RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
+                assert!(!store.row_marker().is_marked());
+                let stored = store.engine.get(GROUP, IDENTITY).unwrap();
+                assert_eq!(stored, created);
+                assert!(older_binary_opens(&stored));
+                if let Some(old_id) = &old_id {
+                    assert_eq!(&stored, old_id);
+                }
+            }
+            // The first format 4 row marks the directory in one synced batch.
             let store = RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
+            let marker = store.row_marker();
+            marker.mark().unwrap();
+            assert!(marker.is_marked());
+            marker.mark().unwrap();
+            drop((store, marker));
+            let store = RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
+            assert!(store.row_marker().is_marked());
             let stored = store.engine.get(GROUP, IDENTITY).unwrap();
-            // Older binaries accept only these two forms, so they now refuse the directory.
-            assert!(stored != tuple4 && stored != tuple5);
+            assert!(!older_binary_opens(&stored));
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&stored).unwrap(),
-                serde_json::json!([
-                    crate::STORAGE_FORMAT,
-                    1,
-                    "test",
-                    [1],
-                    "checkpoint-files",
-                    ROW_MARKER
-                ])
+                marked_record()
             );
             drop(store);
-            RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
             assert!(RaftStorage::open(root.path(), 2, "test", vec![1]).is_err());
         }
+    }
+
+    #[test]
+    fn identity_rewrites_never_drop_the_row_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let open = || RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
+        let entries = |range: std::ops::RangeInclusive<u64>| -> Vec<Entry> {
+            range
+                .map(|index| Entry {
+                    index,
+                    term: 1,
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let hs = |commit| HardState {
+            commit,
+            term: 1,
+            ..Default::default()
+        };
+        let mut store = open();
+        store.persist(&entries(1..=3), Some(&hs(3)), None).unwrap();
+        // A checkpoint without an image keeps the directory readable by older binaries.
+        store
+            .publish_checkpoint(
+                1,
+                None,
+                store.snapshot.get_metadata().get_conf_state().clone(),
+            )
+            .unwrap();
+        assert!(older_binary_opens(
+            &store.engine.get(GROUP, IDENTITY).unwrap()
+        ));
+        assert!(!store.row_marker().is_marked());
+        // An image holds format 4 rows, so its checkpoint stores the marker.
+        store.checkpoint(2, b"image".to_vec()).unwrap();
+        assert!(store.row_marker().is_marked());
+        drop(store);
+        let mut store = open();
+        assert!(store.row_marker().is_marked());
+        // Later checkpoints without an image keep the marker.
+        store
+            .publish_checkpoint(
+                3,
+                None,
+                store.snapshot.get_metadata().get_conf_state().clone(),
+            )
+            .unwrap();
+        drop(store);
+        let stored = open().engine.get(GROUP, IDENTITY).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&stored).unwrap(),
+            marked_record()
+        );
+
+        // A received snapshot replaces the log and stores the marker with its image.
+        let root = tempfile::tempdir().unwrap();
+        let mut store = RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
+        let mut snapshot = Snapshot::default();
+        snapshot.mut_metadata().index = 5;
+        snapshot.mut_metadata().term = 1;
+        snapshot.data = bytes::Bytes::from_static(b"image");
+        store.persist(&[], Some(&hs(5)), Some(&snapshot)).unwrap();
+        assert!(store.row_marker().is_marked());
+        drop(store);
+        let store = RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
+        assert!(!older_binary_opens(
+            &store.engine.get(GROUP, IDENTITY).unwrap()
+        ));
     }
 
     #[test]

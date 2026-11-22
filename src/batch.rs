@@ -145,6 +145,15 @@ impl WriteBatch {
         Ok(size)
     }
 
+    /// Return true when the batch puts a row whose key starts with `prefix`.
+    pub(crate) fn puts_under(&self, prefix: &[u8]) -> bool {
+        use std::ops::Bound;
+        self.changes
+            .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .any(|(_, change)| change.value.is_some())
+    }
+
     pub(crate) fn keys(&self) -> impl Iterator<Item = &Bytes> {
         self.changes.keys()
     }

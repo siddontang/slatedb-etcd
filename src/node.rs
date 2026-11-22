@@ -288,6 +288,8 @@ impl Node {
                 options.state_cache,
             )
             .await?;
+        // Mark the directory before the first format 4 row, not on open. See `RowMarker`.
+        state.row_marker = Some(storage.row_marker());
         let recovered = async {
             state.quota = options.effective_quota().max(0) as u64;
             // Flushed state proves this prefix was committed, even if its commit marker was lost.
