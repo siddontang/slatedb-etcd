@@ -116,6 +116,25 @@ async fn flushed_state_recovers_a_lost_commit_marker_but_not_missing_entries() {
     }
 }
 
+/// A node that only opens a data directory leaves it readable by older binaries. The first
+/// hash or Watch journal row adds the row marker first.
+#[tokio::test]
+async fn opening_a_node_does_not_mark_the_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_log(dir.path(), 2);
+    for _ in 0..2 {
+        let (events, _) = mpsc::channel(256);
+        let node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+            .await
+            .unwrap();
+        assert!(!node.log_worker.storage().row_marker().is_marked());
+        drop(node);
+        let storage =
+            RaftStorage::open(&dir.path().join("raft"), 1, "worker-test", vec![1, 2, 3]).unwrap();
+        assert!(!storage.row_marker().is_marked());
+    }
+}
+
 #[tokio::test]
 async fn queued_state_reads_are_bounded_and_complete_without_raft_writes() {
     let dir = tempfile::tempdir().unwrap();
