@@ -31,6 +31,18 @@ pub const ETCD_API_VERSION: &str = "3.6.5";
 
 pub(crate) const STORAGE_FORMAT: u32 = 3;
 
+/// The format of native snapshots and backups that this binary writes.
+///
+/// Format 4 rows can hold hash digests and Watch journals without Put values. Binaries that read
+/// only format 3 reject format 4 and do not misread those rows.
+pub(crate) const SNAPSHOT_FORMAT: u32 = 4;
+
+/// Return true when this binary can install snapshot rows of `version`.
+/// Format 3 rows hold full hash values and inline journal values, which this binary still reads.
+pub(crate) fn readable_snapshot(version: u32) -> bool {
+    version == STORAGE_FORMAT || version == SNAPSHOT_FORMAT
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Operation {

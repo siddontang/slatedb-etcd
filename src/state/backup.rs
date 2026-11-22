@@ -39,7 +39,7 @@ impl StateMachine {
         .context("invalid native snapshot")?;
         ensure!(consumed == payload.len(), "trailing native snapshot data");
         ensure!(
-            data.version == STORAGE_FORMAT,
+            crate::readable_snapshot(data.version),
             "unsupported snapshot version"
         );
         let mut seen = std::collections::BTreeSet::new();
@@ -73,7 +73,7 @@ impl StateMachine {
         data.rows
             .push((crate::cluster::KEY.to_vec(), serde_json::to_vec(members)?));
         data.applied = 1;
-        data.version = STORAGE_FORMAT;
+        data.version = crate::SNAPSHOT_FORMAT;
         let mut snapshot = Snapshot::default();
         snapshot.mut_metadata().index = 1;
         snapshot.mut_metadata().term = 1;

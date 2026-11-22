@@ -14,7 +14,7 @@ use slatedb::Db;
 
 use crate::mvcc::{self, Outcome};
 use crate::proto::etcdserverpb::{CompactionRequest, CompactionResponse, RequestOp};
-use crate::{Command, Operation, Reply, STORAGE_FORMAT};
+use crate::{Command, Operation, Reply};
 
 mod auth;
 mod backup;

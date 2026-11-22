@@ -318,13 +318,14 @@ impl StateMachine {
             if main <= target.previous {
                 // The previous pass left one retained record for each key.
                 if !(main == target.previous && key.len() == 18) {
-                    state.crc_all = crc32c::crc32c_append(state.crc_all, key);
-                    state.crc_all = crc32c::crc32c_append(state.crc_all, &row.value);
+                    let crc = crc32c::crc32c_append(state.crc_all, key);
+                    state.crc_all = maintenance::hash_append(crc, &row.value)?.0;
                 }
             } else {
-                state.crc_new = crc32c::crc32c_append(state.crc_new, key);
-                state.crc_new = crc32c::crc32c_append(state.crc_new, &row.value);
-                state.len_new += (key.len() + row.value.len()) as u64;
+                let crc = crc32c::crc32c_append(state.crc_new, key);
+                let (crc, len) = maintenance::hash_append(crc, &row.value)?;
+                state.crc_new = crc;
+                state.len_new += key.len() as u64 + len;
             }
         }
         Ok(true)
@@ -348,8 +349,8 @@ impl StateMachine {
             }
             *budget -= 1;
             // History pruning left only records that are live at the new boundary.
-            state.crc_keep = crc32c::crc32c_append(state.crc_keep, &row.key[HASH.len()..]);
-            state.crc_keep = crc32c::crc32c_append(state.crc_keep, &row.value);
+            let crc = crc32c::crc32c_append(state.crc_keep, &row.key[HASH.len()..]);
+            state.crc_keep = maintenance::hash_append(crc, &row.value)?.0;
         }
         Ok(true)
     }

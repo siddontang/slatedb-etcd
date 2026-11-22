@@ -2,6 +2,7 @@ package compat
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,6 +77,11 @@ func TestDifferentialHashKV(t *testing.T) {
 		clientv3.OpPut("a", "three"), clientv3.OpDelete("b"),
 		clientv3.OpTxn(nil, []clientv3.Op{clientv3.OpPut("c", "c"), clientv3.OpPut("d", "d")}, nil),
 		clientv3.OpDelete("c", clientv3.WithRange("e")), clientv3.OpPut("b", "again"),
+		// Large values: hash records store a CRC of the KeyValue, not its bytes.
+		clientv3.OpPut("a", strings.Repeat("x", 16<<10)), clientv3.OpPut("big", strings.Repeat("y", 512<<10)),
+		clientv3.OpTxn(nil, []clientv3.Op{
+			clientv3.OpPut("c", strings.Repeat("c", 64<<10)), clientv3.OpPut("d", strings.Repeat("d", 64<<10)),
+		}, nil),
 	}
 	for _, op := range ops {
 		_, err := actual.Do(ctx, op)
@@ -84,10 +90,10 @@ func TestDifferentialHashKV(t *testing.T) {
 		require.NoError(t, err)
 		check(0)
 	}
-	for revision := int64(2); revision <= 8; revision++ {
+	for revision := int64(2); revision <= 11; revision++ {
 		check(revision)
 	}
-	for _, revision := range []int64{4, 5, 7, 8} {
+	for _, revision := range []int64{4, 5, 7, 8, 10} {
 		for _, api := range []*clientv3.Client{actual, expected} {
 			_, err := api.Compact(ctx, revision, clientv3.WithCompactPhysical())
 			require.NoError(t, err)

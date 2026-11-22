@@ -15,4 +15,7 @@ message Journal {
   // A positive entry names the history revision that holds the previous value of the event at
   // the same position. The event then omits prev_kv. Zero or a missing entry keeps prev_kv inline.
   repeated int64 prev_revisions = 2;
+  // When true, Put events omit kv.value. The history version of kv.key at kv.mod_revision holds
+  // the full KeyValue.
+  bool values_in_history = 3;
 }

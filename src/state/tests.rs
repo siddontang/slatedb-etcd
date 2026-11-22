@@ -46,7 +46,7 @@ fn native_snapshot_bytes_use_fixed_width_lengths() {
     ))
     .unwrap();
     let data: SnapshotData = crate::codec::decode(&bytes).unwrap();
-    assert_eq!(data.version, STORAGE_FORMAT);
+    assert_eq!(data.version, crate::STORAGE_FORMAT);
     assert_eq!(data.applied, 42);
     assert_eq!(data.rows, vec![(vec![b'k'], vec![0, 127])]);
     assert_eq!(crate::codec::encode(&data).unwrap(), bytes);
@@ -305,7 +305,7 @@ async fn streamed_snapshot_matches_the_complete_state_encoding() {
     ));
     assert!(rows.len() > 255);
     let expected = crate::codec::encode(&SnapshotData {
-        version: STORAGE_FORMAT,
+        version: crate::SNAPSHOT_FORMAT,
         applied: state.applied,
         rows,
     })
@@ -560,4 +560,381 @@ fn flush_cache_range_covers_only_current_rows() {
     ] {
         assert!(!range.contains(&key));
     }
+}
+
+type SnapshotRows = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// Rewrite format 4 rows into format 3: full hash values and inline Watch journal values.
+fn format_3_rows(rows: SnapshotRows) -> (SnapshotRows, usize) {
+    use crate::proto::mvccpb::KeyValue;
+    use crate::proto::state::{Journal, Version};
+    use prost::Message;
+    let history: std::collections::HashMap<Vec<u8>, KeyValue> = rows
+        .iter()
+        .filter(|(key, _)| key.starts_with(mvcc::HISTORY))
+        .filter_map(|(key, value)| {
+            let kv = Version::decode(value.as_slice()).unwrap().value?;
+            Some((key.clone(), kv))
+        })
+        .collect();
+    let full = |key: &[u8], revision: i64| history[&mvcc::history_key(key, revision)].clone();
+    let mut rewritten = 0;
+    let rows = rows
+        .into_iter()
+        .map(|(key, value)| {
+            let hash = crate::maintenance::HASH;
+            if key.starts_with(hash) && key.len() == hash.len() + 17 {
+                let kv = KeyValue::decode(value.as_slice()).unwrap();
+                let revision =
+                    i64::from_be_bytes(key[hash.len()..hash.len() + 8].try_into().unwrap());
+                let old = full(&kv.key, revision).encode_to_vec();
+                rewritten += usize::from(old != value);
+                return (key, old);
+            }
+            if key.starts_with(crate::watch::EVENTS) {
+                let mut journal = Journal::decode(value.as_slice()).unwrap();
+                if journal.values_in_history {
+                    for event in journal.events.iter_mut().filter(|e| e.r#type == 0) {
+                        let kv = event.kv.as_ref().unwrap();
+                        event.kv = Some(full(&kv.key, kv.mod_revision));
+                    }
+                    journal.values_in_history = false;
+                    rewritten += 1;
+                    return (key, journal.encode_to_vec());
+                }
+            }
+            (key, value)
+        })
+        .collect();
+    (rows, rewritten)
+}
+
+#[tokio::test]
+async fn a_format_3_snapshot_installs_and_older_readers_reject_format_4() {
+    use crate::proto::etcdserverpb::WatchCreateRequest;
+    let dir = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let big = vec![b'v'; 16 << 10];
+    let txn = RequestOp {
+        request: Some(Op::RequestTxn(crate::proto::etcdserverpb::TxnRequest {
+            success: vec![put(b"c", &big), put(b"d", b"d")],
+            ..Default::default()
+        })),
+    };
+    let delete = RequestOp {
+        request: Some(Op::RequestDeleteRange(DeleteRangeRequest {
+            key: b"b".to_vec(),
+            ..Default::default()
+        })),
+    };
+    for request in [put(b"a", b"one"), put(b"b", &big), txn, delete] {
+        state
+            .apply_etcd(state.applied + 1, &request)
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+    }
+    let grouped = [put(b"a", &big), put(b"b", b"two"), put(b"a", b"three")];
+    let puts: Vec<_> = grouped
+        .iter()
+        .enumerate()
+        .map(|(offset, request)| put_batch::KvEntry {
+            index: state.applied + offset as u64 + 1,
+            request,
+            credentials: None,
+            origin: 1,
+        })
+        .collect();
+    state.apply_puts(&puts).await.unwrap();
+
+    let bytes = state.snapshot_data().await.unwrap();
+    let mut data: SnapshotData = crate::codec::decode(&bytes).unwrap();
+    // Binaries that read only format 3 compare the version with their storage format.
+    assert_eq!(data.version, crate::SNAPSHOT_FORMAT);
+    assert_ne!(data.version, crate::STORAGE_FORMAT);
+    let (rows, rewritten) = format_3_rows(std::mem::take(&mut data.rows));
+    assert!(rewritten >= 10, "{rewritten} rows changed");
+    data.rows = rows;
+    data.version = crate::STORAGE_FORMAT;
+
+    assert_eq!(data.applied, state.applied);
+    let install = |version: u32| {
+        let data = SnapshotData {
+            version,
+            applied: data.applied,
+            rows: data.rows.clone(),
+        };
+        let mut snapshot = Snapshot::default();
+        snapshot.mut_metadata().index = state.applied;
+        snapshot.set_data(crate::codec::encode(&data).unwrap().into());
+        snapshot
+    };
+    let mut restored = StateMachine::open(other.path()).await.unwrap();
+    assert!(restored.install_snapshot(&install(5)).await.is_err());
+    restored
+        .install_snapshot(&install(crate::STORAGE_FORMAT))
+        .await
+        .unwrap();
+    for revision in 0..=state.revision {
+        assert_eq!(
+            serde_json::to_value(restored.hash_kv(revision).await).unwrap(),
+            serde_json::to_value(state.hash_kv(revision).await).unwrap(),
+            "HashKV revision {revision}"
+        );
+    }
+    let request = WatchCreateRequest {
+        key: vec![0],
+        range_end: vec![0],
+        start_revision: 1,
+        prev_kv: true,
+        ..Default::default()
+    };
+    let events = |page: crate::watch::WatchPage| -> Vec<_> {
+        page.responses.into_iter().flat_map(|r| r.events).collect()
+    };
+    let expected = events(state.watch(&request, None).await.unwrap());
+    assert_eq!(expected.len(), 8);
+    assert!(expected.iter().any(|e| e.kv.as_ref().unwrap().value == big));
+    assert_eq!(
+        events(restored.watch(&request, None).await.unwrap()),
+        expected
+    );
+    restored.close().await.unwrap();
+    state.close().await.unwrap();
+}
+
+/// A put-only transaction on the direct apply path must write the value-once rows. Its HashKV
+/// rows hold digests, and its Watch journal omits Put values and sets `values_in_history`. Rows, HashKV, Watch catch-up, and the in-memory Watch feed must
+/// match the general evaluator. HashKV and Watch must also match the same rows in format 3.
+#[tokio::test]
+async fn direct_put_txns_write_value_once_rows_like_the_evaluator() {
+    use crate::proto::etcdserverpb::{TxnRequest, WatchCreateRequest};
+    use crate::proto::mvccpb::KeyValue;
+    use crate::proto::state::{Journal, Version};
+    use prost::Message;
+
+    async fn all_rows(state: &StateMachine) -> Vec<(bytes::Bytes, bytes::Bytes)> {
+        let mut scan = state.db.scan_prefix(b"", ..).await.unwrap();
+        let mut rows = vec![];
+        while let Some(row) = scan.next().await.unwrap() {
+            rows.push((row.key, row.value));
+        }
+        rows
+    }
+    fn feed(state: &mut StateMachine, previous: i64) -> Vec<(i64, Journal)> {
+        state
+            .take_watch_batch(previous)
+            .unwrap()
+            .journals()
+            .expect("complete watch batch")
+            .to_vec()
+    }
+    let txn = |success: Vec<RequestOp>| RequestOp {
+        request: Some(Op::RequestTxn(TxnRequest {
+            success,
+            ..Default::default()
+        })),
+    };
+    let with_prev = |key: &[u8], value: &[u8]| RequestOp {
+        request: Some(Op::RequestPut(PutRequest {
+            key: key.to_vec(),
+            value: value.to_vec(),
+            prev_kv: true,
+            ..Default::default()
+        })),
+    };
+    let big = vec![b'v'; 64 << 10];
+    // New keys, then overwrites whose previous values are in history.
+    let requests = [
+        txn(vec![put(b"a", &big), put(b"b", b"small")]),
+        txn(vec![with_prev(b"a", b"again"), put(b"c", &big)]),
+        txn(vec![
+            with_prev(b"c", b"1"),
+            put(b"d", &big),
+            put(b"e", b"e"),
+        ]),
+    ];
+    let values: [Vec<&[u8]>; 3] = [
+        vec![&big, b"small"],
+        vec![b"again", &big],
+        vec![b"1", &big, b"e"],
+    ];
+
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut direct = StateMachine::open(left.path()).await.unwrap();
+    let mut evaluator = StateMachine::open(right.path()).await.unwrap();
+    for state in [&mut direct, &mut evaluator] {
+        state.watch_capture = Some(Default::default());
+    }
+    let mut revisions = vec![];
+    for (i, request) in requests.iter().enumerate() {
+        let previous = direct.revision;
+        let before = crate::mvcc::DIRECT_TXNS.with(|count| count.get());
+        let replies = direct
+            .apply_puts(&[put_batch::KvEntry {
+                index: direct.applied + 1,
+                request,
+                credentials: None,
+                origin: 1,
+            }])
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::mvcc::DIRECT_TXNS.with(|count| count.get()),
+            before + 1,
+            "request {i} took the direct path"
+        );
+        let reply = evaluator
+            .apply_etcd(evaluator.applied + 1, request)
+            .await
+            .unwrap();
+        assert!(reply.result.is_ok());
+        assert_eq!(
+            serde_json::to_value(&replies[0]).unwrap(),
+            serde_json::to_value(&reply).unwrap(),
+            "request {i}"
+        );
+        // The in-memory feed restores the omitted values from the history rows of the job.
+        let direct_feed = feed(&mut direct, previous);
+        assert_eq!(direct_feed, feed(&mut evaluator, previous), "request {i}");
+        let [(revision, journal)] = direct_feed.as_slice() else {
+            panic!("request {i} has one journal");
+        };
+        assert!(!journal.values_in_history);
+        let fed: Vec<&[u8]> = journal
+            .events
+            .iter()
+            .map(|e| e.kv.as_ref().unwrap().value.as_slice())
+            .collect();
+        assert_eq!(fed, values[i], "request {i}");
+        revisions.push(*revision);
+    }
+    // A repeated key is invalid in etcd, so no direct journal holds an event that history lacks.
+    let repeated = txn(vec![put(b"d", b"1"), put(b"d", &big)]);
+    let rejected = direct
+        .apply_puts(&[put_batch::KvEntry {
+            index: direct.applied + 1,
+            request: &repeated,
+            credentials: None,
+            origin: 1,
+        }])
+        .await
+        .unwrap();
+    let reply = evaluator
+        .apply_etcd(evaluator.applied + 1, &repeated)
+        .await
+        .unwrap();
+    assert!(reply.result.is_err());
+    assert_eq!(
+        serde_json::to_value(&rejected[0]).unwrap(),
+        serde_json::to_value(&reply).unwrap()
+    );
+    assert_eq!(all_rows(&direct).await, all_rows(&evaluator).await);
+
+    // The stored rows use the value-once format.
+    let get = |state: &StateMachine, key: Vec<u8>| {
+        let db = state.db.clone();
+        async move { db.get(key).await.unwrap().unwrap() }
+    };
+    for (i, &revision) in revisions.iter().enumerate() {
+        let journal = Journal::decode(get(&direct, crate::watch::key(revision)).await).unwrap();
+        assert!(journal.values_in_history, "request {i}");
+        for (sub, event) in journal.events.iter().enumerate() {
+            let kv = event.kv.as_ref().unwrap();
+            assert_eq!(kv.mod_revision, revision);
+            assert!(kv.value.is_empty(), "request {i}, event {sub}");
+            let hash = get(
+                &direct,
+                crate::state::maintenance::hash_key(revision, sub as i64, false),
+            )
+            .await;
+            assert!(hash.len() < 64, "request {i}, event {sub}");
+            let full = KeyValue {
+                value: values[i][sub].to_vec(),
+                ..kv.clone()
+            }
+            .encode_to_vec();
+            let seed = crc32c::crc32c(b"seed");
+            assert_eq!(
+                crate::state::maintenance::hash_append(seed, &hash).unwrap(),
+                (crc32c::crc32c_append(seed, &full), full.len() as u64),
+                "request {i}, event {sub}"
+            );
+            // The history version at the revision holds the omitted value.
+            let version = Version::decode(get(&direct, mvcc::history_key(&kv.key, revision)).await)
+                .unwrap()
+                .value
+                .unwrap();
+            assert_eq!(version.encode_to_vec(), full, "request {i}, event {sub}");
+        }
+    }
+
+    // Rewrite the rows to format 3 with full hash values and inline journal values.
+    let bytes = direct.snapshot_data().await.unwrap();
+    let mut data: SnapshotData = crate::codec::decode(&bytes).unwrap();
+    let (rows, rewritten) = format_3_rows(std::mem::take(&mut data.rows));
+    // Seven hash rows and three journals omit values.
+    assert_eq!(rewritten, 10);
+    data.rows = rows;
+    data.version = crate::STORAGE_FORMAT;
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = direct.applied;
+    snapshot.set_data(crate::codec::encode(&data).unwrap().into());
+    let mut inline = StateMachine::open(other.path()).await.unwrap();
+    inline.install_snapshot(&snapshot).await.unwrap();
+
+    for revision in 0..=direct.revision {
+        let expected = serde_json::to_value(inline.hash_kv(revision).await).unwrap();
+        for state in [&direct, &evaluator] {
+            assert_eq!(
+                serde_json::to_value(state.hash_kv(revision).await).unwrap(),
+                expected,
+                "HashKV revision {revision}"
+            );
+        }
+    }
+    let request = WatchCreateRequest {
+        key: vec![0],
+        range_end: vec![0],
+        start_revision: 1,
+        prev_kv: true,
+        ..Default::default()
+    };
+    let events = |page: crate::watch::WatchPage| -> Vec<_> {
+        page.responses.into_iter().flat_map(|r| r.events).collect()
+    };
+    let expected = events(inline.watch(&request, None).await.unwrap());
+    let stored: Vec<Vec<u8>> = expected
+        .iter()
+        .map(|e| e.kv.as_ref().unwrap().value.clone())
+        .collect();
+    let all: Vec<Vec<u8>> = values.iter().flatten().map(|v| v.to_vec()).collect();
+    assert_eq!(stored, all);
+    // The overwrites return their previous values from history.
+    let prev = |key: &[u8]| {
+        expected
+            .iter()
+            .find(|e| e.kv.as_ref().unwrap().key == key && e.prev_kv.is_some())
+            .map(|e| e.prev_kv.clone().unwrap().value)
+    };
+    assert_eq!(prev(b"a"), Some(big.clone()));
+    assert_eq!(prev(b"c"), Some(big.clone()));
+    for state in [&direct, &evaluator] {
+        assert_eq!(events(state.watch(&request, None).await.unwrap()), expected);
+    }
+    // Watch catch-up reads the history rows after a reopen too.
+    direct.db.flush().await.unwrap();
+    direct.close().await.unwrap();
+    let reopened = StateMachine::open(left.path()).await.unwrap();
+    assert_eq!(
+        events(reopened.watch(&request, None).await.unwrap()),
+        expected
+    );
+    reopened.close().await.unwrap();
+    inline.close().await.unwrap();
+    evaluator.close().await.unwrap();
 }
