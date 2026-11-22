@@ -38,9 +38,9 @@ async fn reference_compaction(state: &mut StateMachine, request: &CompactionRequ
         if main > request.revision {
             break;
         }
-        let kv = crate::proto::mvccpb::KeyValue::decode(row.value.clone()).unwrap();
+        let user_key = crate::state::maintenance::hash_record_key(&row.value).unwrap();
         let len = row.value.len();
-        if let Some((old, old_len)) = latest.insert(kv.key, (row.key.clone(), len)) {
+        if let Some((old, old_len)) = latest.insert(user_key, (row.key.clone(), len)) {
             batch.delete_known(old, old_len);
         }
         if row.key.len() == HASH.len() + 18 && main < request.revision {
