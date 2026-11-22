@@ -6,7 +6,7 @@ Each branch carries an open upstream pull request. Cargo.lock pins the exact com
 | Crate | Fork branch | Upstream work |
 |---|---|---|
 | `raft`, `raft-proto` | [`codex/prost-0-14`][raft] | [tikv/raft-rs#603] |
-| `raft-engine` | [`codex/cache-identity`][engine] | [tikv/raft-engine#415], [tikv/raft-engine#416] |
+| `raft-engine` | [`codex/cache-identity`][engine] | [#415][re415], [#416][re416] |
 | `protobuf-build` | Pinned by `raft-proto` | [tikv/protobuf-build#78] |
 
 Replace each branch with a crates.io release after its pull request merges and ships.
@@ -52,5 +52,7 @@ python3 scripts/check-dst.py --seeds 58,70
 [tikv/raft-engine#415]: https://github.com/tikv/raft-engine/pull/415
 [tikv/protobuf-build#78]: https://github.com/tikv/protobuf-build/pull/78
 [tikv/raft-engine#416]: https://github.com/tikv/raft-engine/pull/416
+[re415]: https://github.com/tikv/raft-engine/pull/415
+[re416]: https://github.com/tikv/raft-engine/pull/416
 [tikv/raft-engine#386]: https://github.com/tikv/raft-engine/issues/386
 [tikv/raft-engine#395]: https://github.com/tikv/raft-engine/issues/395
