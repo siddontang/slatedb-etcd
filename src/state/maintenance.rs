@@ -235,14 +235,14 @@ impl StateMachine {
         if compact >= 0 {
             let mut scan = hash_rows(&self.db, revision).await?;
             while let Some(row) = scan.next().await.map_err(KvError::storage)? {
-                let kv = HashUserKey::decode(row.value).map_err(KvError::storage)?;
+                let user_key = hash_record_key(&row.value).map_err(KvError::storage)?;
                 if pending && hash_main(&row.key)? <= compact {
-                    survivors.insert(kv.key.clone(), row.key.clone());
+                    survivors.insert(user_key.clone(), row.key.clone());
                 }
                 if row.key.len() == HASH.len() + 18 {
-                    latest.remove(&kv.key);
+                    latest.remove(&user_key);
                 } else {
-                    latest.insert(kv.key, row.key[HASH.len()..].to_vec());
+                    latest.insert(user_key, row.key[HASH.len()..].to_vec());
                 }
             }
         }
@@ -339,12 +339,23 @@ struct HashUserKey {
     key: Vec<u8>,
 }
 
-/// A hash record that stores the CRC-32C and length of an encoded `KeyValue`, not its bytes.
+/// The first byte of a hash digest record.
 ///
-/// Field one is the user key, as in `KeyValue`. `KeyValue` has no field 14 or 15, so a record
-/// with a CRC is never a stored `KeyValue`. Older records and tombstones keep the full bytes.
+/// A record is either an etcd `KeyValue` encoding (format 3 rows and tombstones) or a digest.
+/// A protobuf field number is never zero, so no `KeyValue` encoding, now or after etcd adds
+/// fields, starts with a zero byte. The marker does not depend on which fields exist.
+const DIGEST: u8 = 0;
+/// The digest layout after [`DIGEST`]: version, CRC-32C (big endian), length (big endian), key.
+const DIGEST_V1: u8 = 1;
+const DIGEST_HEADER: usize = 2 + 4 + 8;
+
+/// A digest record of the first format 4 binaries, before the explicit [`DIGEST`] byte.
+///
+/// Field one is the user key, as in `KeyValue`. Those binaries encoded `KeyValue` with fields
+/// one to six only, so a record that they wrote with fields 14 and 15 is a digest. New records
+/// never use this form. Rows that it wrote remain readable.
 #[derive(prost::Message)]
-struct HashDigest {
+struct LegacyDigest {
     #[prost(bytes = "vec", tag = "1")]
     key: Vec<u8>,
     #[prost(fixed32, optional, tag = "14")]
@@ -358,25 +369,63 @@ struct HashDigest {
 /// HashKV feeds the record through [`hash_append`], which gives the same CRC as the full bytes.
 /// The record does not repeat the value, so large values are not written a further time.
 pub(crate) fn hash_record(key: &[u8], kv: &[u8]) -> Vec<u8> {
-    HashDigest {
-        key: key.to_vec(),
-        crc: Some(crc32c::crc32c(kv)),
-        len: Some(kv.len() as u64),
+    let mut record = Vec::with_capacity(DIGEST_HEADER + key.len());
+    record.extend_from_slice(&[DIGEST, DIGEST_V1]);
+    record.extend_from_slice(&crc32c::crc32c(kv).to_be_bytes());
+    record.extend_from_slice(&(kv.len() as u64).to_be_bytes());
+    record.extend_from_slice(key);
+    record
+}
+
+/// A decoded hash record.
+enum HashRecord<'a> {
+    /// The CRC-32C and length of a `KeyValue` encoding.
+    Digest { key: Vec<u8>, crc: u32, len: u64 },
+    /// The full bytes of a `KeyValue` encoding.
+    Full(&'a [u8]),
+}
+
+fn parse_hash_record(record: &[u8]) -> Result<HashRecord<'_>> {
+    if record.first() == Some(&DIGEST) {
+        anyhow::ensure!(
+            record.len() >= DIGEST_HEADER && record[1] == DIGEST_V1,
+            "unsupported hash record"
+        );
+        return Ok(HashRecord::Digest {
+            key: record[DIGEST_HEADER..].to_vec(),
+            crc: u32::from_be_bytes(record[2..6].try_into()?),
+            len: u64::from_be_bytes(record[6..14].try_into()?),
+        });
     }
-    .encode_to_vec()
+    let legacy = LegacyDigest::decode(record)?;
+    Ok(match (legacy.crc, legacy.len) {
+        (Some(crc), Some(len)) => HashRecord::Digest {
+            key: legacy.key,
+            crc,
+            len,
+        },
+        (None, None) => HashRecord::Full(record),
+        _ => anyhow::bail!("invalid hash record"),
+    })
+}
+
+/// Return the user key of a hash record in any stored form.
+pub(crate) fn hash_record_key(record: &[u8]) -> Result<Vec<u8>> {
+    Ok(match parse_hash_record(record)? {
+        HashRecord::Digest { key, .. } => key,
+        HashRecord::Full(bytes) => HashUserKey::decode(bytes)?.key,
+    })
 }
 
 /// Append the bytes that a hash record stands for to `crc`.
 /// Returns the new CRC and the number of bytes that it added.
 pub(crate) fn hash_append(crc: u32, record: &[u8]) -> Result<(u32, u64)> {
-    let digest = HashDigest::decode(record)?;
-    Ok(match (digest.crc, digest.len) {
-        (Some(part), Some(len)) => (
+    Ok(match parse_hash_record(record)? {
+        HashRecord::Digest { crc: part, len, .. } => (
             crc32c::crc32c_combine(crc, part, usize::try_from(len)?),
             len,
         ),
-        (None, None) => (crc32c::crc32c_append(crc, record), record.len() as u64),
-        _ => anyhow::bail!("invalid hash record"),
+        HashRecord::Full(bytes) => (crc32c::crc32c_append(crc, bytes), bytes.len() as u64),
     })
 }
 
@@ -406,4 +455,83 @@ pub(crate) async fn count_logical_size(db: &Db) -> Result<u64> {
             .context("logical size counter overflow")?;
     }
     Ok(size)
+}
+
+/// Encode a digest record the way the first format 4 binaries did, for tests of older rows.
+#[cfg(test)]
+pub(crate) fn legacy_hash_record(key: &[u8], kv: &[u8]) -> Vec<u8> {
+    LegacyDigest {
+        key: key.to_vec(),
+        crc: Some(crc32c::crc32c(kv)),
+        len: Some(kv.len() as u64),
+    }
+    .encode_to_vec()
+}
+
+#[cfg(test)]
+mod hash_record_tests {
+    use super::*;
+    use crate::proto::mvccpb::KeyValue;
+
+    #[test]
+    fn every_stored_form_hashes_like_the_full_bytes() {
+        let seed = crc32c::crc32c(b"seed");
+        for (key, value) in [
+            (b"k".to_vec(), vec![]),
+            (b"key".to_vec(), vec![7; 300]),
+            (vec![0xff; 200], vec![1; 70_000]),
+        ] {
+            let kv = KeyValue {
+                key: key.clone(),
+                create_revision: 2,
+                mod_revision: 9,
+                version: 3,
+                value,
+                lease: 5,
+            }
+            .encode_to_vec();
+            let expected = (crc32c::crc32c_append(seed, &kv), kv.len() as u64);
+            let digest = hash_record(&key, &kv);
+            assert_eq!(digest[..2], [DIGEST, DIGEST_V1]);
+            for record in [digest, legacy_hash_record(&key, &kv), kv.clone()] {
+                assert_eq!(hash_append(seed, &record).unwrap(), expected);
+                assert_eq!(hash_record_key(&record).unwrap(), key);
+            }
+        }
+        // Tombstones keep the KeyValue bytes with only the key.
+        let tombstone = KeyValue {
+            key: b"gone".to_vec(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert_eq!(hash_record_key(&tombstone).unwrap(), b"gone");
+        assert_eq!(
+            hash_append(seed, &tombstone).unwrap(),
+            (
+                crc32c::crc32c_append(seed, &tombstone),
+                tombstone.len() as u64
+            )
+        );
+    }
+
+    #[test]
+    fn digests_do_not_depend_on_keyvalue_fields() {
+        // A protobuf field number is never zero, so no KeyValue encoding starts with DIGEST.
+        // This holds for fields that etcd may add later too, unlike a check for fields 14 and 15.
+        for field in [1_u32, 5, 6, 7, 14, 15, 16, 1000, (1 << 29) - 1] {
+            for wire in [0_u32, 1, 2, 5] {
+                let tag = (field << 3) | wire;
+                let mut encoded = vec![];
+                prost::encoding::encode_varint(u64::from(tag), &mut encoded);
+                assert_ne!(encoded[0], DIGEST, "field {field}, wire type {wire}");
+            }
+        }
+        assert!(!KeyValue::default().encode_to_vec().starts_with(&[DIGEST]));
+        // A later digest layout fails explicitly instead of being misread.
+        let mut later = hash_record(b"k", b"kv");
+        later[1] = DIGEST_V1 + 1;
+        assert!(hash_append(0, &later).is_err());
+        assert!(hash_record_key(&later).is_err());
+        assert!(hash_append(0, &[DIGEST, DIGEST_V1, 0]).is_err());
+    }
 }
