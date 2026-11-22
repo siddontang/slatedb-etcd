@@ -2398,7 +2398,7 @@ dependencies = [
 [[package]]
 name = "raft-engine"
 version = "0.4.2"
-source = "git+https://github.com/siddontang/raft-engine?branch=codex%2Fcache-identity#d5c08a82b82f1c098c413a0ed125431aac341c8f"
+source = "git+https://github.com/siddontang/raft-engine?branch=codex%2Fcache-identity#c5a630efbcb314a8453e7d8d0269efecbf77d7a3"
 dependencies = [
  "byteorder",
  "crc32fast",
@@ -3373,7 +3373,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.6",
  "windows-sys 0.52.0",

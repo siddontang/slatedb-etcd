@@ -6,7 +6,7 @@ Each branch carries an open upstream pull request. Cargo.lock pins the exact com
 | Crate | Fork branch | Upstream work |
 |---|---|---|
 | `raft`, `raft-proto` | [`codex/prost-0-14`][raft] | [tikv/raft-rs#603] |
-| `raft-engine` | [`codex/cache-identity`][engine] | [tikv/raft-engine#415] and a cache fix |
+| `raft-engine` | [`codex/cache-identity`][engine] | [tikv/raft-engine#415], [tikv/raft-engine#416] |
 | `protobuf-build` | Pinned by `raft-proto` | [tikv/protobuf-build#78] |
 
 Replace each branch with a crates.io release after its pull request merges and ships.
@@ -27,6 +27,7 @@ The `codex/cache-identity` branch adds a cache fix on top of the Prost codec.
 Each open log gets a unique identity, and the thread block cache keys on it.
 Separate engines in one process can have equal file positions and different bytes.
 DST seed 70 reproduced this collision. Upstream report: [tikv/raft-engine#386].
+Upstream fix: [tikv/raft-engine#416].
 
 Upstream `master` already sends explicit sync and empty synchronous batches to the file system.
 See [tikv/raft-engine#395].
@@ -50,5 +51,6 @@ python3 scripts/check-dst.py --seeds 58,70
 [tikv/raft-rs#603]: https://github.com/tikv/raft-rs/pull/603
 [tikv/raft-engine#415]: https://github.com/tikv/raft-engine/pull/415
 [tikv/protobuf-build#78]: https://github.com/tikv/protobuf-build/pull/78
+[tikv/raft-engine#416]: https://github.com/tikv/raft-engine/pull/416
 [tikv/raft-engine#386]: https://github.com/tikv/raft-engine/issues/386
 [tikv/raft-engine#395]: https://github.com/tikv/raft-engine/issues/395
