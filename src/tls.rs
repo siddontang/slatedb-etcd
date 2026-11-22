@@ -1,13 +1,11 @@
 mod auto;
 mod coalesce;
+mod local;
 mod self_signed;
 
 use anyhow::{ensure, Context, Result};
 use axum::{Extension, Router};
-use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
-    service::TowerToHyperService,
-};
+use hyper_util::{rt::TokioIo, service::TowerToHyperService};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -247,12 +245,13 @@ pub(crate) async fn serve_until<S: ConnectionService>(
         connections.spawn(async move {
             let _permit = permit;
             let Some(acceptor) = acceptor else {
-                let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-                    .serve_connection_with_upgrades(
-                        TokioIo::new(coalesce::Coalesce::new(stream)),
-                        TowerToHyperService::new(app),
-                    )
-                    .await;
+                let (executor, streams) = local::executor();
+                let builder = hyper_util::server::conn::auto::Builder::new(executor);
+                let connection = builder.serve_connection_with_upgrades(
+                    TokioIo::new(coalesce::Coalesce::new(stream)),
+                    TowerToHyperService::new(app),
+                );
+                let _ = local::drive(connection, streams).await;
                 return;
             };
             let stream =
@@ -279,12 +278,13 @@ pub(crate) async fn serve_until<S: ConnectionService>(
             } else {
                 app
             };
-            let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-                .serve_connection_with_upgrades(
-                    TokioIo::new(coalesce::Coalesce::new(stream)),
-                    TowerToHyperService::new(app),
-                )
-                .await;
+            let (executor, streams) = local::executor();
+            let builder = hyper_util::server::conn::auto::Builder::new(executor);
+            let connection = builder.serve_connection_with_upgrades(
+                TokioIo::new(coalesce::Coalesce::new(stream)),
+                TowerToHyperService::new(app),
+            );
+            let _ = local::drive(connection, streams).await;
         });
     };
     drop(listener);

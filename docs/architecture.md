@@ -123,7 +123,7 @@ Each task can resume on another runtime worker after it yields.
 
 | Work | Execution and ownership |
 | --- | --- |
-| Client and peer I/O | Tokio tasks handle connections, RPCs, streams, and peer transport. |
+| Client and peer I/O | One Tokio task polls each connection and its HTTP/2 streams. |
 | Raft | One task owns RawNode. It orders events, advances consensus, and dispatches work. |
 | WAL | One dedicated `raft-log-io` OS thread per member writes, syncs, and reads the log. |
 | Apply | One Tokio task per member writes SlateDB and publishes revisions in log order. |
