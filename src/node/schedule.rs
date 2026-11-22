@@ -85,8 +85,8 @@ impl Node {
         )?;
         let target = entries.last().context("empty apply batch")?.index;
         ensure!(
-            target <= self.raw.store().commit_index(),
-            "apply exceeds durable commit"
+            target <= self.committed_ready,
+            "apply exceeds delivered commit"
         );
         self.prefer_query = true;
         self.enqueue_apply(Job::Entries(entries), target)
@@ -99,7 +99,7 @@ impl Node {
             let Some(&(last, true)) = self.apply_jobs.back() else {
                 return Ok(());
             };
-            let committed = self.raw.store().commit_index().min(self.committed_ready);
+            let committed = self.committed_ready;
             if last >= committed
                 || self.raw.store().snapshot_pending()
                 || last < self.raw.store().snapshot_index()
@@ -131,7 +131,9 @@ impl Node {
                 snapshot_index,
             );
         }
-        let committed = self.raw.store().commit_index().min(self.committed_ready);
+        // Raft delivers committed entries only after local persistence. The commit marker in the
+        // log is volatile, so apply need not wait for the log thread to write it.
+        let committed = self.committed_ready;
         if let Some(batch) = &self.prepared_puts {
             let last = batch.last;
             if last <= committed {
@@ -152,6 +154,9 @@ impl Node {
             }
         }
         if self.state.applied < committed {
+            if self.prepare_local_puts()? {
+                return Ok(());
+            }
             self.submit_entries(self.state.applied, committed)?;
             return self.pipeline_apply();
         }
@@ -179,8 +184,8 @@ impl Node {
             "apply position regressed"
         );
         ensure!(
-            completed.applied <= self.raw.store().commit_index(),
-            "apply completion exceeds durable commit"
+            completed.applied <= self.committed_ready.max(self.state.applied),
+            "apply completion exceeds delivered commit"
         );
         self.apply_busy = !self.apply_jobs.is_empty();
         self.expire_reads();

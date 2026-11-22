@@ -536,9 +536,14 @@ impl Node {
                 }
                 event = events.recv() => {
                     let Some(event) = event else { return Ok(()); };
+                    let peer = matches!(
+                        event,
+                        Event::PeerFrame(..) | Event::Step(..) | Event::NetworkResult { .. }
+                    );
                     self.handle(event, &mut step_responses).await?;
                     // Let ready tasks add proposals before starting the next durable log write.
-                    if !self.pending.is_empty() || !self.put_proposals.is_empty() {
+                    // A peer reply only moves commit forward, so the yield would delay apply.
+                    if !peer && (!self.pending.is_empty() || !self.put_proposals.is_empty()) {
                         tokio::task::yield_now().await;
                     }
                     // Accumulate proposals so concurrent clients can share one durable log write.
