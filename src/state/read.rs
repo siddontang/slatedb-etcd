@@ -4,6 +4,7 @@ use super::*;
 pub(crate) struct ReadView {
     metrics: Arc<crate::metrics::StateMeters>,
     pub snapshot: Arc<slatedb::DbSnapshot>,
+    rows: Arc<super::rows::RowCache>,
     pub revision: i64,
     pub compact_revision: i64,
     pub auth: Arc<crate::auth::Store>,
@@ -22,6 +23,7 @@ impl StateMachine {
         Ok(Arc::new(ReadView {
             metrics: self.metrics.clone(),
             snapshot,
+            rows: self.rows.clone(),
             revision: self.revision,
             compact_revision: self.compact_revision,
             auth: self.auth.clone(),
@@ -62,6 +64,7 @@ impl ReadView {
         let result = match budget {
             Some(budget) => match mvcc::read_snapshot_within(
                 &self.snapshot,
+                &self.rows,
                 self.revision,
                 self.compact_revision,
                 request,
@@ -77,6 +80,7 @@ impl ReadView {
             None => {
                 mvcc::read_snapshot(
                     &self.snapshot,
+                    &self.rows,
                     self.revision,
                     self.compact_revision,
                     request,
@@ -156,6 +160,70 @@ mod tests {
         }
         state.close().await.unwrap();
         source.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_rows_match_each_pinned_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = StateMachine::open(dir.path()).await.unwrap();
+        let put = |value: &[u8]| RequestOp {
+            request: Some(Op::RequestPut(PutRequest {
+                key: b"key".to_vec(),
+                value: value.to_vec(),
+                ..Default::default()
+            })),
+        };
+        let get = RequestOp {
+            request: Some(Op::RequestRange(RangeRequest {
+                key: b"key".to_vec(),
+                ..Default::default()
+            })),
+        };
+        let value = |view: Arc<ReadView>| {
+            let get = get.clone();
+            async move {
+                let Some(Resp::ResponseRange(reply)) = view
+                    .read(&get, None)
+                    .await
+                    .unwrap()
+                    .result
+                    .unwrap()
+                    .response
+                else {
+                    panic!("expected range");
+                };
+                reply.kvs.first().map(|kv| kv.value.clone())
+            }
+        };
+        state.apply_etcd(1, &put(b"v1")).await.unwrap();
+        let first = state.read_view().unwrap();
+        // Fill the shared row, then hit it.
+        for _ in 0..2 {
+            assert_eq!(value(first.clone()).await.unwrap(), b"v1");
+        }
+        assert!(state.rows.get(b"key", state.applied, |_| ()).is_some());
+        state.apply_etcd(2, &put(b"v2")).await.unwrap();
+        assert!(state.rows.get(b"key", state.applied, |_| ()).is_none());
+        let second = state.read_view().unwrap();
+        // The older view cannot install its row after the newer write.
+        assert_eq!(value(first.clone()).await.unwrap(), b"v1");
+        assert!(state.rows.get(b"key", state.applied, |_| ()).is_none());
+        for _ in 0..2 {
+            assert_eq!(value(second.clone()).await.unwrap(), b"v2");
+        }
+        assert!(state.rows.get(b"key", state.applied, |_| ()).is_some());
+        // A cached newer row does not answer the older view.
+        assert_eq!(value(first.clone()).await.unwrap(), b"v1");
+        let delete = RequestOp {
+            request: Some(Op::RequestDeleteRange(DeleteRangeRequest {
+                key: b"key".to_vec(),
+                ..Default::default()
+            })),
+        };
+        state.apply_etcd(3, &delete).await.unwrap();
+        assert!(value(state.read_view().unwrap()).await.is_none());
+        assert_eq!(value(second).await.unwrap(), b"v2");
+        state.close().await.unwrap();
     }
 
     #[tokio::test]

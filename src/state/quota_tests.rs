@@ -369,6 +369,7 @@ async fn scans_keep_new_sst_metadata_after_blocks_fill_the_cache() {
     let cache = StateCache {
         block_bytes: BUDGET,
         meta_bytes: BUDGET,
+        row_bytes: BUDGET,
     };
     let mut state = StateMachine::open_store_with_cache(store.clone(), "meta", cache)
         .await

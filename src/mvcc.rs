@@ -246,7 +246,7 @@ fn scan_options() -> slatedb::config::ScanOptions {
 
 enum ReadDb<'a> {
     Live(&'a Db),
-    Pinned(&'a slatedb::DbSnapshot),
+    Pinned(&'a slatedb::DbSnapshot, &'a crate::state::rows::RowCache),
     /// Applied state plus earlier writes of the same apply group.
     Overlay {
         db: &'a Db,
@@ -259,7 +259,7 @@ impl ReadDb<'_> {
     async fn get(&self, key: Vec<u8>) -> Result<Option<bytes::Bytes>, slatedb::Error> {
         match self {
             Self::Live(db) => db.get(key).await,
-            Self::Pinned(db) => db.get(key).await,
+            Self::Pinned(db, _) => db.get(key).await,
             Self::Overlay { db, previous, rows } => {
                 if let Some(value) = previous.get(&key) {
                     return Ok(value);
@@ -270,6 +270,26 @@ impl ReadDb<'_> {
                 db.get(key).await
             }
         }
+    }
+
+    /// Read the current row of a user key. Pinned views share rows through the row cache.
+    async fn current(&self, key: &[u8]) -> KvResult<Option<KeyValue>> {
+        let decode = |row: &[u8]| KeyValue::decode(row).map_err(KvError::storage);
+        let Self::Pinned(db, rows) = self else {
+            let row = self.get(current_key(key)).await.map_err(KvError::storage)?;
+            return row.as_deref().map(decode).transpose();
+        };
+        let seq = db.seq();
+        if let Some(kv) = rows.get(key, seq, decode) {
+            return kv.map(Some);
+        }
+        let row = db.get(current_key(key)).await.map_err(KvError::storage)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let kv = decode(&row)?;
+        rows.fill(key, &row, seq);
+        Ok(Some(kv))
     }
 
     /// Return the group write of a current row, if an earlier group member changed it.
@@ -288,7 +308,7 @@ impl ReadDb<'_> {
                 "scan over an apply group overlay".to_string(),
             )),
             Self::Live(db) => Ok(db),
-            Self::Pinned(_) => unreachable!("pinned scans use the snapshot"),
+            Self::Pinned(..) => unreachable!("pinned scans use the snapshot"),
         }
     }
 
@@ -298,14 +318,14 @@ impl ReadDb<'_> {
     ) -> Result<slatedb::DbIterator, slatedb::Error> {
         let options = scan_options();
         match self {
-            Self::Pinned(db) => db.scan_with_options(range, &options).await,
+            Self::Pinned(db, _) => db.scan_with_options(range, &options).await,
             _ => self.scan_base()?.scan_with_options(range, &options).await,
         }
     }
 
     async fn scan_prefix(&self, prefix: Vec<u8>) -> Result<slatedb::DbIterator, slatedb::Error> {
         match self {
-            Self::Pinned(db) => {
+            Self::Pinned(db, _) => {
                 db.scan_prefix_with_options(prefix, .., &scan_options())
                     .await
             }
@@ -359,12 +379,7 @@ impl View<'_> {
                 return Ok(value.clone());
             }
         }
-        self.db
-            .get(current_key(key))
-            .await
-            .map_err(KvError::storage)?
-            .map(|value| KeyValue::decode(value).map_err(KvError::storage))
-            .transpose()
+        self.db.current(key).await
     }
 
     fn check_revision(&self, request: &RangeRequest, nested: bool) -> KvResult<()> {
@@ -385,16 +400,8 @@ impl View<'_> {
     async fn latest(&self, key: &[u8], end: &[u8], overlay: bool) -> KvResult<Rows> {
         let mut rows = BTreeMap::new();
         if end.is_empty() {
-            if let Some(value) = self
-                .db
-                .get(current_key(key))
-                .await
-                .map_err(KvError::storage)?
-            {
-                rows.insert(
-                    key.to_vec(),
-                    KeyValue::decode(value).map_err(KvError::storage)?,
-                );
+            if let Some(kv) = self.db.current(key).await? {
+                rows.insert(key.to_vec(), kv);
             }
         } else {
             let bounds = current_bounds(key, end);
@@ -786,6 +793,7 @@ pub async fn read(
 
 pub(crate) async fn read_snapshot(
     db: &slatedb::DbSnapshot,
+    rows: &crate::state::rows::RowCache,
     revision: i64,
     compact_revision: i64,
     request: &RequestOp,
@@ -793,7 +801,7 @@ pub(crate) async fn read_snapshot(
     keys: &crate::state::key_index::KeyPin,
 ) -> KvResult<ResponseOp> {
     read_from(
-        ReadDb::Pinned(db),
+        ReadDb::Pinned(db, rows),
         revision,
         compact_revision,
         request,
@@ -831,8 +839,10 @@ fn row_bytes(kv: &KeyValue) -> usize {
 /// Read a streaming Range from a pinned snapshot within `budget` bytes of rows.
 /// `None` means the rows exceed the budget. The caller can repeat the read on the same snapshot
 /// without a budget and get the same result.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_snapshot_within(
     db: &slatedb::DbSnapshot,
+    rows: &crate::state::rows::RowCache,
     revision: i64,
     compact_revision: i64,
     request: &RequestOp,
@@ -841,7 +851,7 @@ pub(crate) async fn read_snapshot_within(
     budget: usize,
 ) -> Option<KvResult<ResponseOp>> {
     let result = read_from(
-        ReadDb::Pinned(db),
+        ReadDb::Pinned(db, rows),
         revision,
         compact_revision,
         request,

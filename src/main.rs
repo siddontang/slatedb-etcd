@@ -143,6 +143,9 @@ struct Args {
     /// State cache budget for SST indexes, filters, and stats, in bytes.
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     state_meta_cache_bytes: u64,
+    /// Budget for current rows of linearizable point reads, in bytes. Zero disables the row cache.
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    state_row_cache_bytes: u64,
     /// Logical quota in bytes. Zero selects 2 GiB. A negative value disables the quota.
     #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
     quota_backend_bytes: i64,
@@ -228,6 +231,7 @@ async fn run(args: Args) -> Result<()> {
         state_cache: slatedb_etcd::state::StateCache {
             block_bytes: args.state_block_cache_bytes,
             meta_bytes: args.state_meta_cache_bytes,
+            row_bytes: args.state_row_cache_bytes,
         },
         quota_bytes: args.quota_backend_bytes,
         auth_token: args.auth_token,
