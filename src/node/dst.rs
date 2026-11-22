@@ -608,7 +608,7 @@ impl Simulation {
         let dir = self.root.path().join(id.to_string()).join("raft");
         let file = dir.join(format!("checkpoint-{index:016x}.data"));
         assert!(std::fs::metadata(file).unwrap().len() < saved.data.len() as u64);
-        let staged = PreparedCheckpoint::write(&dir, saved.data.clone()).unwrap();
+        let staged = PreparedCheckpoint::write(&dir, saved.data.clone().into()).unwrap();
         self.read().await;
         self.drive().await;
         assert_eq!(self.nodes[&id].raw.store().snapshot_index(), index);

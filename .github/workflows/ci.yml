@@ -73,9 +73,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            .
-            third_party/raft
+          workspaces: .
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build release binaries
         run: |
@@ -100,9 +98,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            .
-            third_party/raft
+          workspaces: .
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Select test seeds
         env:
@@ -120,15 +116,19 @@ jobs:
         run: |
           cargo metadata --locked --all-features --format-version 1 | python3 -c '
           import json, sys
-          packages = json.load(sys.stdin)["packages"]
-          assert not any(p["name"] == "protobuf" for p in packages)
+          metadata = json.load(sys.stdin)
+          packages = metadata["packages"]
+          names = {p["id"]: p["name"] for p in packages}
+          # Raft Engine and its Prometheus 0.13 link rust-protobuf 2. No other crate may use it.
+          users = {names[n["id"]] for n in metadata["resolve"]["nodes"]
+                   for d in n["deps"] if names[d["pkg"]] == "protobuf"}
+          assert users <= {"raft-engine", "prometheus"}, users
           versions = {p["version"] for p in packages if p["name"] in
                       {"prost", "prost-build", "prost-derive", "prost-types"}}
           assert len(versions) == 1 and versions.pop().startswith("0.14.")'
       - name: Check Rust
         run: |
           cargo fmt --check
-          cargo test --locked --manifest-path third_party/raft/Cargo.toml --lib --features default-logger
           cargo run --locked -- --help >/dev/null
           scripts/cargo.sh clippy --locked --all-targets --all-features -- -D warnings
           scripts/cargo.sh test --locked --features write-profile --lib write_profile::tests

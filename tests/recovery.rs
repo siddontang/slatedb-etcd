@@ -23,9 +23,9 @@ fn separate_logs_do_not_share_cached_entries() {
     let mut left = storage(left_dir.path());
     let mut right = storage(right_dir.path());
     let mut left_entry = entry(1, 1);
-    left_entry.data = b"left".to_vec().into();
+    left_entry.data = b"left".to_vec();
     let mut right_entry = entry(1, 2);
-    right_entry.data = b"rght".to_vec().into();
+    right_entry.data = b"rght".to_vec();
     left.persist(&[left_entry.clone()], None, None).unwrap();
     right.persist(&[right_entry.clone()], None, None).unwrap();
     for _ in 0..3 {
@@ -301,7 +301,7 @@ fn checkpoint_recovery_requires_the_referenced_bytes_and_discards_only_orphans()
     }
     std::fs::write(&current, b"new").unwrap();
     let store = storage(root);
-    assert_eq!(store.recovery_snapshot().data.as_ref(), b"new");
+    assert_eq!(store.recovery_snapshot().data.as_slice(), b"new");
     assert!(current.exists() && unrelated.exists());
     assert!(!older.exists() && !future.exists() && !pending.exists());
 }
@@ -361,12 +361,16 @@ fn prost_reads_and_writes_the_previous_raft_wire_format() {
         10, 4, 115, 110, 97, 112, 18, 15, 10, 8, 8, 1, 8, 2, 8, 3, 16, 4, 16, 129, 1, 24, 3,
     ];
     let state = Snapshot::decode(snapshot.as_slice()).unwrap();
-    assert_eq!(state.data.as_ref(), b"snap");
+    assert_eq!(state.data.as_slice(), b"snap");
     let metadata = state.get_metadata();
     assert_eq!((metadata.term, metadata.index), (3, 129));
     assert_eq!(metadata.get_conf_state().voters, [1, 2, 3]);
     assert_eq!(metadata.get_conf_state().learners, [4]);
-    assert_eq!(state.encode_to_vec(), snapshot);
+    // Raft 0.7.0 wrote unpacked node IDs. Upstream Prost writes packed IDs, and both decoders
+    // accept either form.
+    let packed = state.encode_to_vec();
+    assert_ne!(packed, snapshot);
+    assert_eq!(Snapshot::decode(packed.as_slice()).unwrap(), state);
 
     let entry = [
         8, 1, 16, 3, 24, 130, 1, 34, 3, 108, 111, 103, 50, 2, 105, 100,
@@ -374,8 +378,8 @@ fn prost_reads_and_writes_the_previous_raft_wire_format() {
     let record = Entry::decode(entry.as_slice()).unwrap();
     assert_eq!(record.entry_type(), EntryType::EntryConfChange);
     assert_eq!((record.term, record.index), (3, 130));
-    assert_eq!(record.data.as_ref(), b"log");
-    assert_eq!(record.context.as_ref(), b"id");
+    assert_eq!(record.data.as_slice(), b"log");
+    assert_eq!(record.context.as_slice(), b"id");
     assert_eq!(record.encode_to_vec(), entry);
 
     let append = [

@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{ensure, Context, Result};
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
 use raft::{GetEntriesContext, RaftState, Storage, StorageError};
-use raft_engine::{Command as EngineCommand, Config, Engine, LogBatch, MessageExt, ReadableSize};
+use raft_engine::{
+    Command as EngineCommand, Config, Engine, LogBatch, MessageExt, ProstCodec, ReadableSize,
+};
 use serde::Serialize;
 
 mod checkpoint;
@@ -18,7 +20,7 @@ const IDENTITY: &[u8] = b"identity";
 
 struct EntryCodec;
 
-impl MessageExt for EntryCodec {
+impl MessageExt<ProstCodec> for EntryCodec {
     type Entry = Entry;
 
     fn index(entry: &Entry) -> u64 {
@@ -88,7 +90,7 @@ impl RaftStorage {
         )?;
         let stored = engine.get(GROUP, IDENTITY);
         let mut snapshot = engine
-            .get_message::<Snapshot>(GROUP, SNAPSHOT)?
+            .get_value::<Snapshot, ProstCodec>(GROUP, SNAPSHOT)?
             .unwrap_or_default();
         if let Some(stored) = stored {
             // Earlier forms: before file checkpoints, and before history-backed rows.
@@ -115,11 +117,13 @@ impl RaftStorage {
                 .set_conf_state(ConfState::from((voters, vec![])));
             let mut batch = LogBatch::default();
             batch.put(GROUP, IDENTITY.to_vec(), identity.clone())?;
-            batch.put_message(GROUP, SNAPSHOT.to_vec(), &snapshot)?;
+            batch.put_value::<ProstCodec, _>(GROUP, SNAPSHOT.to_vec(), &snapshot)?;
             engine.write(&mut batch, true)?;
         }
         let referenced = checkpoint::load(dir, &engine, &mut snapshot)?;
-        let hard_state = engine.get_message(GROUP, HARD_STATE)?.unwrap_or_default();
+        let hard_state = engine
+            .get_value::<HardState, ProstCodec>(GROUP, HARD_STATE)?
+            .unwrap_or_default();
         let this = Self {
             engine,
             wal_metrics,
@@ -176,12 +180,12 @@ impl RaftStorage {
                 hs.commit >= snapshot.get_metadata().index,
                 "snapshot exceeds commit"
             );
-            PreparedCheckpoint::write(&self.dir, snapshot.data.clone())?
+            PreparedCheckpoint::write(&self.dir, snapshot.data.clone().into())?
                 .publish(&self.dir, snapshot, &mut batch)?;
         }
-        batch.add_entries::<EntryCodec>(GROUP, entries)?;
+        batch.add_entries_with::<EntryCodec, ProstCodec>(GROUP, entries)?;
         if let Some(hs) = hard_state {
-            batch.put_message(GROUP, HARD_STATE.to_vec(), hs)?;
+            batch.put_value::<ProstCodec, _>(GROUP, HARD_STATE.to_vec(), hs)?;
         }
         if snapshot.is_some() {
             crate::failpoint::hit("snapshot-before-save");
@@ -274,13 +278,13 @@ impl RaftStorage {
         let mut batch = LogBatch::default();
         match prepared {
             Some(prepared) => {
-                snapshot.data = prepared.data.clone();
+                snapshot.data = prepared.data.to_vec();
                 prepared.publish(&self.dir, &snapshot, &mut batch)?;
             }
             None => checkpoint::publish_metadata(&snapshot, &mut batch)?,
         }
         batch.put(GROUP, IDENTITY.to_vec(), self.identity.clone())?;
-        batch.put_message(GROUP, HARD_STATE.to_vec(), &self.hard_state)?;
+        batch.put_value::<ProstCodec, _>(GROUP, HARD_STATE.to_vec(), &self.hard_state)?;
         batch.add_command(GROUP, EngineCommand::Compact { index: index + 1 });
         crate::failpoint::hit("checkpoint-before-save");
         self.engine.write(&mut batch, true)?;
@@ -363,7 +367,7 @@ impl Storage for RaftStorage {
             return Ok(entries);
         }
         self.engine
-            .fetch_entries_to::<EntryCodec>(
+            .fetch_entries_to_with::<EntryCodec, ProstCodec>(
                 GROUP,
                 low,
                 high,
@@ -387,7 +391,7 @@ impl Storage for RaftStorage {
             return Err(StorageError::Compacted.into());
         }
         self.engine
-            .get_entry::<EntryCodec>(GROUP, index)
+            .get_entry_with::<EntryCodec, ProstCodec>(GROUP, index)
             .map_err(storage_error)?
             .map(|entry| entry.term)
             .ok_or_else(|| StorageError::Unavailable.into())
@@ -468,7 +472,7 @@ mod checkpoint_tests {
         let mut old = store.recovery_snapshot().clone();
         old.mut_metadata().index = 1;
         old.mut_metadata().term = 1;
-        old.data = bytes::Bytes::from_static(b"inline");
+        old.data = b"inline".to_vec();
         let hs = HardState {
             commit: 1,
             term: 1,
@@ -476,8 +480,12 @@ mod checkpoint_tests {
         };
         let mut batch = LogBatch::default();
         batch.put(GROUP, IDENTITY.to_vec(), old_id.clone()).unwrap();
-        batch.put_message(GROUP, SNAPSHOT.to_vec(), &old).unwrap();
-        batch.put_message(GROUP, HARD_STATE.to_vec(), &hs).unwrap();
+        batch
+            .put_value::<ProstCodec, _>(GROUP, SNAPSHOT.to_vec(), &old)
+            .unwrap();
+        batch
+            .put_value::<ProstCodec, _>(GROUP, HARD_STATE.to_vec(), &hs)
+            .unwrap();
         store.engine.write(&mut batch, true).unwrap();
         drop(store);
         let mut store = open();
@@ -493,6 +501,6 @@ mod checkpoint_tests {
         store.checkpoint(2, b"separate".to_vec()).unwrap();
         assert_ne!(store.engine.get(GROUP, IDENTITY).unwrap(), old_id);
         drop(store);
-        assert_eq!(open().recovery_snapshot().data.as_ref(), b"separate");
+        assert_eq!(open().recovery_snapshot().data.as_slice(), b"separate");
     }
 }

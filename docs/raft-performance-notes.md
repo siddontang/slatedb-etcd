@@ -47,7 +47,7 @@ but the current hot-cache matrix does not measure that benefit.
 
 The extended DST run also exposed a dependency cache collision across log instances.
 Cache keys must identify the open log as well as the file position.
-The [local dependency notes](../third_party/raft-engine/README.md) describe this fix and an explicit
+The [dependency notes](dependencies.md#raft-engine-fixes) describe this fix and an explicit
 sync fix. Both have regressions that fail with the published Raft Engine 0.4.2 crate.
 
 ## Batch at distinct boundaries

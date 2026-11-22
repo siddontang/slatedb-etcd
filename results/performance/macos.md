@@ -326,7 +326,7 @@ A focused regression also proved that the published crate can return another log
 The local dependency patch isolates cache identities and restores explicit sync.
 A second regression counts actual file sync calls; the published crate issued none.
 Both regressions failed before their fixes and passed after them.
-See the [dependency notes](../../third_party/raft-engine/README.md) for provenance and patch scope.
+See the [dependency notes](../../docs/dependencies.md#raft-engine-fixes) for provenance and scope.
 The follow-up measurements use this corrected dependency.
 An external Cargo consumer also resolves the corrected copy through the direct path dependency.
 

@@ -2,7 +2,7 @@
 
 mod encoding;
 
-use super::{Engine, LogBatch, LogFileSystem, Snapshot, GROUP, SNAPSHOT};
+use super::{Engine, LogBatch, LogFileSystem, ProstCodec, Snapshot, GROUP, SNAPSHOT};
 use anyhow::{ensure, Context, Result};
 use std::fs::{self, File};
 use std::io::ErrorKind;
@@ -70,8 +70,8 @@ impl PreparedCheckpoint {
             reference.extend_from_slice(&len.to_le_bytes());
         }
         let mut metadata = snapshot.clone();
-        metadata.data = bytes::Bytes::new();
-        batch.put_message(GROUP, SNAPSHOT.to_vec(), &metadata)?;
+        metadata.data = Vec::new();
+        batch.put_value::<ProstCodec, _>(GROUP, SNAPSHOT.to_vec(), &metadata)?;
         batch.put(GROUP, REFERENCE.to_vec(), reference)?;
         Ok(())
     }
@@ -80,7 +80,7 @@ impl PreparedCheckpoint {
 /// Publish snapshot metadata without an image. Flushed SlateDB state covers the removed log.
 pub(super) fn publish_metadata(snapshot: &Snapshot, batch: &mut LogBatch) -> Result<()> {
     ensure!(snapshot.data.is_empty(), "metadata snapshot has data");
-    batch.put_message(GROUP, SNAPSHOT.to_vec(), snapshot)?;
+    batch.put_value::<ProstCodec, _>(GROUP, SNAPSHOT.to_vec(), snapshot)?;
     batch.delete(GROUP, REFERENCE.to_vec());
     Ok(())
 }
@@ -111,7 +111,7 @@ pub(super) fn load(
             crc32c::crc32c(&data) == checksum,
             "checkpoint checksum mismatch"
         );
-        snapshot.data = data.into();
+        snapshot.data = data;
         return Ok(Some(snapshot.get_metadata().index));
     }
     Ok(None)

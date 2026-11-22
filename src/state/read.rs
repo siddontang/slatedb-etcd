@@ -135,7 +135,7 @@ mod tests {
         source.apply_etcd(2, &put(b"new")).await.unwrap();
         let mut snapshot = Snapshot::default();
         snapshot.mut_metadata().index = 2;
-        snapshot.data = source.snapshot_job().unwrap().await.unwrap().into();
+        snapshot.data = source.snapshot_job().unwrap().await.unwrap();
         state.install_snapshot(&snapshot).await.unwrap();
         let current = state.read_view().unwrap();
         let request = RequestOp {
@@ -645,7 +645,7 @@ mod tests {
                         // The mirror installs a snapshot of the current state over its old one.
                         let mut snapshot = Snapshot::default();
                         snapshot.mut_metadata().index = state.applied;
-                        snapshot.data = state.snapshot_job().unwrap().await.unwrap().into();
+                        snapshot.data = state.snapshot_job().unwrap().await.unwrap();
                         if state.applied > mirror.applied {
                             mirror.install_snapshot(&snapshot).await.unwrap();
                             mirror_views.push((mirror.read_view().unwrap(), model.clone()));
