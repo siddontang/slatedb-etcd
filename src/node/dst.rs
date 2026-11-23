@@ -521,7 +521,16 @@ impl Simulation {
             if index <= node.raw.store().snapshot_index() {
                 continue;
             }
-            let data = node.worker.state().snapshot_job().unwrap().await.unwrap();
+            // Build the same checkpoint descriptor that a peer snapshot request builds.
+            let data = node
+                .worker
+                .state()
+                .checkpoint_job(true)
+                .await
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
             node.handle(
                 Event::SnapshotBuilt(apply::Built {
                     index,
@@ -547,7 +556,7 @@ impl Simulation {
                 continue;
             }
             let conf = node.worker.state().members.conf();
-            let job = node.worker.state().checkpoint_job(false).unwrap();
+            let job = node.worker.state().checkpoint_job(false).await.unwrap();
             assert!(job.await.unwrap().is_none());
             node.handle(
                 Event::SnapshotBuilt(apply::Built {
@@ -607,7 +616,8 @@ impl Simulation {
         // Keep a synced local image pending while Raft processes more messages.
         let dir = self.root.path().join(id.to_string()).join("raft");
         let file = dir.join(format!("checkpoint-{index:016x}.data"));
-        assert!(std::fs::metadata(file).unwrap().len() < saved.data.len() as u64);
+        // The image is a small checkpoint descriptor. Recovery tests cover compressed images.
+        assert!(std::fs::metadata(file).unwrap().len() > 0);
         let staged = PreparedCheckpoint::write(&dir, saved.data.clone().into()).unwrap();
         self.read().await;
         self.drive().await;

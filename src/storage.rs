@@ -40,6 +40,7 @@ pub struct RaftStorage {
     dir: PathBuf,
     ready_batch: Option<LogBatch>,
     pub sync_writes: u64,
+    member: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -200,6 +201,7 @@ impl RaftStorage {
             dir: dir.to_owned(),
             ready_batch: None,
             sync_writes: 0,
+            member: node_id,
         };
         ensure!(
             this.hard_state.commit >= this.snapshot_index(),
@@ -322,8 +324,15 @@ impl RaftStorage {
     }
 
     /// Return true when the current snapshot record has no transferable image.
+    ///
+    /// A received or aged checkpoint descriptor is not transferable. See `transfer::sendable`.
     pub fn metadata_only(&self) -> bool {
-        self.snapshot_index() > 0 && self.snapshot.data.is_empty()
+        self.snapshot_index() > 0
+            && !crate::state::transfer::sendable(&self.snapshot.data, self.member)
+    }
+
+    pub fn member(&self) -> u64 {
+        self.member
     }
 
     /// Publish a checkpoint and truncate its covered log in one synced batch.

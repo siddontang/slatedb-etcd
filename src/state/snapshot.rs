@@ -44,6 +44,10 @@ impl StateMachine {
 
     pub async fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<()> {
         let index = snapshot.get_metadata().index;
+        if let Some(descriptor) = transfer::Descriptor::decode(snapshot.get_data())? {
+            // Box the copy and database open. They are large futures on the apply stack.
+            return Box::pin(self.install_object(descriptor, index)).await;
+        }
         if index <= self.applied {
             return Ok(());
         }
@@ -101,6 +105,45 @@ impl StateMachine {
             self.compact_revision <= self.revision,
             "compaction exceeds current revision"
         );
+        Ok(())
+    }
+
+    /// Open the copied checkpoint as the new database and replace the current one.
+    async fn install_object(&mut self, descriptor: transfer::Descriptor, index: u64) -> Result<()> {
+        if index <= self.applied {
+            // A bootstrap membership is stored by the first write after the install.
+            if index == self.applied && self.db.get(crate::cluster::KEY).await?.is_none() {
+                self.members = Arc::new(serde_json::from_slice(&descriptor.members)?);
+                self.members_unsaved = true;
+            }
+            return Ok(());
+        }
+        ensure!(descriptor.applied == index, "invalid snapshot metadata");
+        // Installed journal rows reach watchers through storage catch-up.
+        if let Some(capture) = &mut self.watch_capture {
+            capture.invalidate();
+        }
+        let location = self.location.clone();
+        let staging = location.prepare(&descriptor).await?;
+        crate::failpoint::hit("snapshot-before-install");
+        let mut next = StateMachine::open_at(location.clone(), &location.path(&staging)).await?;
+        if next.applied != index {
+            let _ = next.close().await;
+            anyhow::bail!("copied state does not match the snapshot index");
+        }
+        let old_name = location.switch(&staging).await?;
+        crate::failpoint::hit("snapshot-after-install-write");
+        next.metrics = self.metrics.clone();
+        next.quota = self.quota;
+        next.write_batches = self.write_batches;
+        next.row_marker = self.row_marker.take();
+        next.watch_capture = self.watch_capture.take();
+        next.members = Arc::new(serde_json::from_slice(&descriptor.members)?);
+        next.members_unsaved = true;
+        let old = std::mem::replace(self, next);
+        location.retire(old.db.clone(), old_name);
+        drop(old);
+        crate::failpoint::hit("snapshot-after-install-flush");
         Ok(())
     }
 }

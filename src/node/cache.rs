@@ -127,6 +127,7 @@ pub(super) struct Cache {
     hard_state: HardState,
     // Raft asked for a transferable image that the durable snapshot does not contain.
     image_wanted: Cell<bool>,
+    member: u64,
     pub durable: log::Durable,
 }
 
@@ -147,6 +148,7 @@ impl Cache {
             initial_conf: None,
             hard_state: durable.hard_state,
             image_wanted: Cell::new(false),
+            member: storage.member(),
             durable,
         };
         let mut low = storage.first_index()?;
@@ -253,9 +255,10 @@ impl Cache {
             durable.hard_state.commit >= self.commit_index(),
             "durable commit regressed"
         );
+        // An image at the same index can replace a record that is no longer transferable.
         let new_image = !durable.snapshot.data.is_empty()
             && (durable.snapshot.get_metadata().index > self.snapshot_index()
-                || self.durable.snapshot.data.is_empty());
+                || durable.snapshot.data != self.durable.snapshot.data);
         if new_image {
             self.image_wanted.set(false);
         }
@@ -412,8 +415,9 @@ impl Cache {
     pub fn image_wanted(&self) -> bool {
         self.image_wanted.get()
     }
+    /// Return true when the durable snapshot holds an image that this member can send.
     pub fn has_image(&self) -> bool {
-        !self.durable.snapshot.data.is_empty()
+        crate::state::transfer::sendable(&self.durable.snapshot.data, self.member)
     }
 }
 

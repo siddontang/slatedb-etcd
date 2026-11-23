@@ -273,7 +273,9 @@ async fn post_snapshot(
         let response = client
             .post(url)
             .header("x-cluster-id", cluster)
-            .timeout(Duration::from_secs(30))
+            // The follower copies the checkpoint objects before it replies. A retry continues
+            // from the objects that it already copied.
+            .timeout(Duration::from_secs(600))
             .body(payload)
             .send()
             .await?;

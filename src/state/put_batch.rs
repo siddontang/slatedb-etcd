@@ -197,7 +197,7 @@ impl StateMachine {
         if first < last {
             crate::failpoint::hit("apply-batch-before-write");
         }
-        self.store_batch(writes, last).await?;
+        let size = self.store_batch(writes, last, size).await?;
         if first < last {
             crate::failpoint::hit("apply-batch-after-write");
         }

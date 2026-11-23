@@ -56,7 +56,7 @@ impl Wal {
 
 pub(crate) struct Member {
     registry: Registry,
-    admin: Arc<slatedb::admin::Admin>,
+    admin: std::sync::RwLock<Arc<slatedb::admin::Admin>>,
     permits: Arc<tokio::sync::Semaphore>,
     scraping: IntGauge,
     scraped: IntCounter,
@@ -129,12 +129,21 @@ impl Member {
                 "Failed Raft read proofs.",
             )?,
             registry,
-            admin,
+            admin: std::sync::RwLock::new(admin),
             permits: Arc::new(tokio::sync::Semaphore::new(2)),
             scraping,
             scraped: scrapes.with_label_values(&["200"]),
             unavailable: scrapes.with_label_values(&["503"]),
         })
+    }
+
+    /// Read the manifest of the database that a snapshot install opened.
+    pub fn rebind(&self, admin: Arc<slatedb::admin::Admin>) {
+        *self.admin.write().unwrap() = admin;
+    }
+
+    fn admin(&self) -> Arc<slatedb::admin::Admin> {
+        self.admin.read().unwrap().clone()
     }
 
     /// Register the per-RPC and watch meters of the client listener.
@@ -168,7 +177,7 @@ async fn scrape(State((member, events)): State<(Arc<Member>, mpsc::Sender<Event>
         let sample = rx.await?;
         let physical = tokio::time::timeout(
             Duration::from_secs(1),
-            crate::state::StateMachine::manifest_size(&member.admin),
+            crate::state::StateMachine::manifest_size(&member.admin()),
         )
         .await
         .ok()

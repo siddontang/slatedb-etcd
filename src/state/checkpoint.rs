@@ -10,10 +10,16 @@ impl StateMachine {
     ///
     /// The flush makes the state and its apply marker durable through the pinned index. That
     /// state covers the local log without a copy. Only a peer that needs a snapshot requests an
-    /// image, which uses the complete pinned scan.
-    pub(crate) fn checkpoint_job(&self, image: bool) -> Result<CheckpointJob> {
+    /// image. The image is a descriptor of a SlateDB checkpoint at the pinned index.
+    pub(crate) async fn checkpoint_job(&self, image: bool) -> Result<CheckpointJob> {
         if image {
-            let job = self.snapshot_job()?;
+            // A peer copies the SlateDB checkpoint objects. See `transfer`.
+            ensure!(
+                self.db.snapshot()?.seq() == self.applied,
+                "checkpoint does not match the apply marker"
+            );
+            let members = serde_json::to_vec(self.members.as_ref())?;
+            let job = Box::pin(self.location.begin(&self.db, self.applied, members)).await?;
             return Ok(Box::pin(async move { job.await.map(Some) }));
         }
         ensure!(
@@ -53,12 +59,22 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let job = state.checkpoint_job(false).unwrap();
+        let job = state.checkpoint_job(false).await.unwrap();
         // Later entries can apply while the flush runs.
         state.apply(4, None).await.unwrap();
         assert!(job.await.unwrap().is_none());
-        let image = state.checkpoint_job(true).unwrap().await.unwrap().unwrap();
-        assert_eq!(image, state.snapshot_job().unwrap().await.unwrap());
+        let image = state
+            .checkpoint_job(true)
+            .await
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        let descriptor = super::transfer::Descriptor::decode(&image)
+            .unwrap()
+            .unwrap();
+        assert_eq!(descriptor.applied, 4);
+        assert!(!descriptor.ssts.is_empty());
         // Model a crash: close without the shutdown flush.
         state.close().await.unwrap();
         drop(state);

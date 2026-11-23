@@ -16,10 +16,14 @@ The endpoint cannot contain credentials, a path, a query, or a fragment.
 ```text
 <prefix>/<sha256(cluster-id)>/member-<id>/
     owner.json
-    state/
+    namespace-id
+    current-state
+    state/ or state-N/
 ```
 
 Each member owns its own manifests and SST files. Members never share writer ownership.
+A Raft snapshot install copies the leader checkpoint into a new `state-N/` database.
+See [object storage snapshots](object-snapshots.md).
 A synced `object-store.json` file binds the local directory to the backend and a random owner ID.
 An atomic conditional PUT claims the remote prefix. A different local owner cannot reuse it.
 A lost claim response is safe to retry with the same directory and identity.
@@ -39,6 +43,8 @@ Credentials come from AWS access-key, session-token, web-identity, container-ide
 metadata providers. Shared AWS profile files are not read by this adapter.
 Secret values have no command-line flags and do not appear in the binding file.
 Grant access to the selected bucket and prefix for object read, write, list, and delete operations.
+For server-side snapshot copies, also grant object read on the other member prefixes of the
+cluster. Without it, a follower copies snapshot objects through the leader over HTTP.
 Conditional object creation and update must work correctly.
 
 The HTTP client uses a three-second connection timeout and a ten-second request timeout.

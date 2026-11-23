@@ -295,7 +295,9 @@ impl Node {
                     }
                 }
             }
-            Output::Snapshot => {
+            Output::Snapshot(rebound) => {
+                self.compaction.rebind(rebound.db);
+                self.metrics.rebind(rebound.admin);
                 self.compaction.publish(self.state.physical_revision);
                 self.installed_snapshots += 1;
                 self.options.join = false;
