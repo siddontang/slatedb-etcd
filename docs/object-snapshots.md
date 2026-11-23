@@ -108,7 +108,9 @@ therefore opens as an independent family with its own pointer.
    complete staging copy for Raft under the lock. A new copy claims a staging database under the
    same lock and removes it from the complete set. A claimed copy therefore cannot be reserved,
    and a reserved copy cannot be claimed. If Raft skips the snapshot, the node releases the
-   reservation at once.
+   reservation at once. An install changes the current database and releases its reservation
+   under the same lock. A copy reads the current database again when it claims, so it never
+   claims the current database.
 3. It copies each missing SST. An SST ID is unique, so an existing SST is already complete.
 4. It copies the manifest. It removes the copied checkpoints from the copy with SlateDB `Admin`.
 5. It writes the ready marker.

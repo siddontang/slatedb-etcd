@@ -399,3 +399,51 @@ async fn a_staging_copy_that_a_new_copy_claims_cannot_be_reserved() {
     follower.close().await.unwrap();
     leader.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_copy_never_claims_a_database_that_an_install_made_current() {
+    let leader_dir = tempfile::tempdir().unwrap();
+    let follower_dir = tempfile::tempdir().unwrap();
+    let mut leader = open(leader_dir.path(), 1).await;
+    put(&mut leader, 1, "key", "first").await;
+    let first = Descriptor::decode(&image(&leader).await.data)
+        .unwrap()
+        .unwrap();
+    put(&mut leader, 2, "key", "second").await;
+    let second = Descriptor::decode(&image(&leader).await.data)
+        .unwrap()
+        .unwrap();
+
+    let follower = open(follower_dir.path(), 2).await;
+    let location = follower.location.clone();
+    let staging = location.prepare(&first).await.unwrap();
+    assert_eq!(location.reserve(1, &first.checkpoint), Some(true));
+    // The second copy scans while the first snapshot is still a reserved staging database.
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    *location.pause_after_scan.lock().unwrap() = Some((reached.clone(), resume.clone()));
+    let copy = tokio::spawn({
+        let location = location.clone();
+        async move { location.prepare(&second).await }
+    });
+    reached.notified().await;
+    // The install of the first snapshot finishes during the pause.
+    location.switch(&staging, 1).await.unwrap();
+    resume.notify_one();
+    let other = copy.await.unwrap().unwrap();
+    assert_ne!(other, staging, "the copy claimed the current database");
+    follower.close().await.unwrap();
+    drop(follower);
+    drop(location);
+
+    // The published files hold the first snapshot only.
+    let follower = open(follower_dir.path(), 2).await;
+    assert_eq!(follower.location.root(), staging);
+    assert_eq!(follower.applied, 1);
+    assert_eq!(
+        follower.local_value("key").await.unwrap().as_deref(),
+        Some("first")
+    );
+    follower.close().await.unwrap();
+    leader.close().await.unwrap();
+}

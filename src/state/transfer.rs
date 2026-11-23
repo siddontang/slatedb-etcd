@@ -151,6 +151,10 @@ pub struct Location {
     staging: Mutex<Staging>,
     peer: Mutex<Peer>,
     prepare: tokio::sync::Mutex<()>,
+    /// A test pauses a copy after its scan here: (reached, resume).
+    #[cfg(test)]
+    pub(crate) pause_after_scan:
+        Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 impl Location {
@@ -202,6 +206,8 @@ impl Location {
                 http: None,
             }),
             prepare: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            pause_after_scan: Mutex::new(None),
         });
         let mut sources = SOURCES.lock().unwrap();
         sources.retain(|_, source| source.strong_count() > 0);
@@ -413,6 +419,14 @@ impl Location {
         let _guard = self.prepare.lock().await;
         let current = generation(&self.first, &self.current()).unwrap_or(0);
         let databases = self.scan().await?;
+        #[cfg(test)]
+        {
+            let pause = self.pause_after_scan.lock().unwrap().take();
+            if let Some((reached, resume)) = pause {
+                reached.notify_one();
+                resume.notified().await;
+            }
+        }
         let staged = databases
             .iter()
             .filter(|db| db.owned && db.generation > current);
@@ -431,7 +445,11 @@ impl Location {
         // Select and claim under the reservation lock: Raft cannot reserve a claimed copy.
         let mut reusable: Vec<&Database> = {
             let mut lock = self.staging.lock().unwrap();
+            // An install can switch the current database after the scan. `switch` changes it
+            // under this lock, so read it again here and never claim it.
+            let active = generation(&self.first, &self.current()).unwrap_or(0);
             let reusable: Vec<&Database> = staged
+                .filter(|db| db.generation > active)
                 .filter(|db| {
                     db.ready.as_ref().is_none_or(|id| {
                         !lock.protected.iter().any(|(_, protected)| protected == id)
@@ -677,8 +695,10 @@ impl Location {
                 PutPayload::from(name.to_owned().into_bytes()),
             )
             .await?;
-        let old = std::mem::replace(&mut *self.current.lock().unwrap(), name.to_owned());
+        // Change the current database and release its reservation in one step. A copy that
+        // claims a staging database takes the same lock, so it sees the new current database.
         let mut staging = self.staging.lock().unwrap();
+        let old = std::mem::replace(&mut *self.current.lock().unwrap(), name.to_owned());
         staging.prepared.retain(|_, staged| staged != name);
         staging.protected.retain(|(i, _)| *i > index);
         drop(staging);
