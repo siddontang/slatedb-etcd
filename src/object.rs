@@ -18,6 +18,8 @@ use crate::state::StateMachine;
 pub(crate) mod faults;
 #[cfg(target_os = "linux")]
 pub(crate) mod paced;
+#[cfg(target_os = "linux")]
+mod sst_reads;
 
 #[derive(Clone, Debug, Default)]
 pub enum Config {
