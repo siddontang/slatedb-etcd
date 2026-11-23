@@ -146,8 +146,15 @@ pub(crate) async fn transport_to(
             }
         }
         if first.get_msg_type() == MessageType::MsgSnapshot {
-            let success = post_snapshot(&transport.http, &url, &cluster_id, first, &traffic).await;
-            report(&events, peer, true, success).await;
+            spawn_snapshot(
+                &transport.http,
+                &url,
+                &cluster_id,
+                first,
+                &traffic,
+                &events,
+                peer,
+            );
             continue;
         }
         let mut client =
@@ -193,9 +200,7 @@ pub(crate) async fn transport_to(
             loop {
                 if acknowledged == sent {
                     if let Some(message) = snapshot.take() {
-                        let success = post_snapshot(&transport.http, &url, &cluster_id, message, &traffic).await;
-                        report(&events, peer, true, success).await;
-                        healthy = success;
+                        spawn_snapshot(&transport.http, &url, &cluster_id, message, &traffic, &events, peer);
                     }
                 }
                 tokio::select! {
@@ -260,6 +265,25 @@ pub(crate) async fn transport_to(
     }
 }
 
+/// Send a snapshot in its own task. The follower copies the checkpoint objects before it
+/// replies, so the request can take minutes. Heartbeats continue on the stream meanwhile.
+fn spawn_snapshot(
+    client: &reqwest::Client,
+    url: &str,
+    cluster: &str,
+    message: Message,
+    traffic: &std::sync::Arc<crate::metrics::PeerTraffic>,
+    events: &mpsc::Sender<Event>,
+    peer: u64,
+) {
+    let (client, url, cluster) = (client.clone(), url.to_owned(), cluster.to_owned());
+    let (traffic, events) = (traffic.clone(), events.clone());
+    tokio::spawn(async move {
+        let success = post_snapshot(&client, &url, &cluster, message, &traffic).await;
+        report(&events, peer, true, success).await;
+    });
+}
+
 async fn post_snapshot(
     client: &reqwest::Client,
     url: &str,
@@ -273,7 +297,9 @@ async fn post_snapshot(
         let response = client
             .post(url)
             .header("x-cluster-id", cluster)
-            .timeout(Duration::from_secs(30))
+            // The follower copies the checkpoint objects before it replies. A retry continues
+            // from the objects that it already copied.
+            .timeout(Duration::from_secs(600))
             .body(payload)
             .send()
             .await?;

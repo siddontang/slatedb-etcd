@@ -17,6 +17,7 @@ Commands use the repository root unless a guide states otherwise.
 | Compare gRPC and local write latency | [Benchmarks](benchmarks.md) |
 | Compare Raft optimization techniques | [etcd and TiKV notes](raft-performance-notes.md) |
 | Configure S3 and remote hosts | [Remote storage](remote-storage.md) |
+| Understand Raft snapshot transfer | [Object storage snapshots](object-snapshots.md) |
 | Assess etcd compatibility | [Compatibility report](../COMPATIBILITY.md) |
 | Monitor a member with Prometheus | [Metrics and compatibility](metrics.md) |
 | Run tests, Jepsen, fuzzing, and DST | [Test guide](../tests/README.md) |

@@ -40,6 +40,9 @@ pub struct RaftStorage {
     dir: PathBuf,
     ready_batch: Option<LogBatch>,
     pub sync_writes: u64,
+    member: u64,
+    /// The image file that the published reference names.
+    checkpoint_file: Option<checkpoint::FileId>,
 }
 
 #[derive(Debug, Serialize)]
@@ -200,6 +203,8 @@ impl RaftStorage {
             dir: dir.to_owned(),
             ready_batch: None,
             sync_writes: 0,
+            member: node_id,
+            checkpoint_file: referenced,
         };
         ensure!(
             this.hard_state.commit >= this.snapshot_index(),
@@ -236,6 +241,7 @@ impl RaftStorage {
         // A snapshot image holds format 4 rows. Its batch stores the marked identity.
         let rows = Arc::clone(&self.rows);
         let mut identity = snapshot.map(|_| rows.lock());
+        let mut received = None;
         if let Some(snapshot) = snapshot {
             ensure!(
                 snapshot.get_metadata().index > self.snapshot_index(),
@@ -251,8 +257,10 @@ impl RaftStorage {
                 hs.commit >= snapshot.get_metadata().index,
                 "snapshot exceeds commit"
             );
-            PreparedCheckpoint::write(&self.dir, snapshot.data.clone().into())?
-                .publish(&self.dir, snapshot, &mut batch)?;
+            received = Some(
+                PreparedCheckpoint::write(&self.dir, snapshot.data.clone().into())?
+                    .publish(&self.dir, snapshot, 0, &mut batch)?,
+            );
         }
         batch.add_entries_with::<EntryCodec, ProstCodec>(GROUP, entries)?;
         if let Some(hs) = hard_state {
@@ -283,7 +291,8 @@ impl RaftStorage {
             self.hard_state = *hs;
         }
         if let Some(snapshot) = snapshot {
-            checkpoint::retire(&self.dir, self.snapshot_index())?;
+            checkpoint::retire(&self.dir, self.checkpoint_file)?;
+            self.checkpoint_file = received;
             self.snapshot = snapshot.clone();
         }
         Ok(())
@@ -322,8 +331,15 @@ impl RaftStorage {
     }
 
     /// Return true when the current snapshot record has no transferable image.
+    ///
+    /// A received or aged checkpoint descriptor is not transferable. See `transfer::sendable`.
     pub fn metadata_only(&self) -> bool {
-        self.snapshot_index() > 0 && self.snapshot.data.is_empty()
+        self.snapshot_index() > 0
+            && !crate::state::transfer::sendable(&self.snapshot.data, self.member)
+    }
+
+    pub fn member(&self) -> u64 {
+        self.member
     }
 
     /// Publish a checkpoint and truncate its covered log in one synced batch.
@@ -354,13 +370,21 @@ impl RaftStorage {
         let rows = Arc::clone(&self.rows);
         let mut identity = rows.lock();
         let image = prepared.is_some();
-        match prepared {
+        let file = match prepared {
             Some(prepared) => {
                 snapshot.data = prepared.data.to_vec();
-                prepared.publish(&self.dir, &snapshot, &mut batch)?;
+                // A replacement at the same index must not overwrite the referenced file.
+                let generation = match self.checkpoint_file {
+                    Some(old) if attach && old.index == index => old.generation + 1,
+                    _ => 0,
+                };
+                Some(prepared.publish(&self.dir, &snapshot, generation, &mut batch)?)
             }
-            None => checkpoint::publish_metadata(&snapshot, &mut batch)?,
-        }
+            None => {
+                checkpoint::publish_metadata(&snapshot, &mut batch)?;
+                None
+            }
+        };
         // An image holds format 4 rows, so its batch stores the marked identity.
         batch.put(GROUP, IDENTITY.to_vec(), rows.record(&identity, image))?;
         batch.put_value::<ProstCodec, _>(GROUP, HARD_STATE.to_vec(), &self.hard_state)?;
@@ -373,9 +397,11 @@ impl RaftStorage {
         drop(identity);
         crate::failpoint::hit("checkpoint-after-save");
         self.sync_writes += 1;
-        if !attach {
-            checkpoint::retire(&self.dir, self.snapshot_index())?;
+        // The new reference is durable. Only now remove the file that the old one named.
+        if self.checkpoint_file != file {
+            checkpoint::retire(&self.dir, self.checkpoint_file)?;
         }
+        self.checkpoint_file = file;
         self.snapshot = snapshot;
         self.purge()?;
         crate::failpoint::hit("checkpoint-after-gc");
@@ -409,12 +435,14 @@ impl RaftStorage {
             files: vec![],
             bytes: 0,
         };
-        let data_file = checkpoint::path(&self.dir, self.snapshot_index());
+        let data_file = self
+            .checkpoint_file
+            .map(|id| checkpoint::path(&self.dir, id));
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
             if entry.file_type()?.is_file() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.ends_with(".raftlog") || entry.path() == data_file {
+                if name.ends_with(".raftlog") || Some(entry.path()) == data_file {
                     stats.bytes += entry.metadata()?.len();
                     stats.files.push(name);
                 }
@@ -535,6 +563,65 @@ mod checkpoint_tests {
             "checkpoint-files",
             ROW_MARKER
         ])
+    }
+
+    /// A descriptor that this member did not build. It does not count as a transferable image.
+    fn foreign_image(index: u64, tag: &str) -> Vec<u8> {
+        crate::state::transfer::Descriptor {
+            version: crate::state::transfer::OBJECT_SNAPSHOT_FORMAT,
+            applied: index,
+            member: 9,
+            namespace: tag.into(),
+            backend: crate::state::transfer::Backend::Local,
+            peer_url: None,
+            root: "state".into(),
+            checkpoint: uuid::Uuid::new_v4().to_string(),
+            manifest: 1,
+            ssts: vec![],
+            members: vec![],
+            created_ms: 0,
+        }
+        .encode()
+        .unwrap()
+    }
+
+    #[test]
+    fn a_replacement_image_keeps_the_referenced_file_until_its_reference_is_durable() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
+        let entries: Vec<Entry> = (1..=3)
+            .map(|index| Entry {
+                index,
+                term: 1,
+                ..Default::default()
+            })
+            .collect();
+        let hs = HardState {
+            term: 1,
+            vote: 1,
+            commit: 3,
+        };
+        store.persist(&entries, Some(&hs), None).unwrap();
+        let first = foreign_image(3, "first");
+        store.checkpoint(3, first.clone()).unwrap();
+        assert!(store.metadata_only());
+        // Model a stop after the replacement file exists but before its reference is saved.
+        let snapshot = store.snapshot.clone();
+        let staged = PreparedCheckpoint::write(root.path(), foreign_image(3, "lost").into())
+            .unwrap()
+            .publish(root.path(), &snapshot, 1, &mut LogBatch::default())
+            .unwrap();
+        drop(store);
+        let mut store = RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
+        assert_eq!(store.recovery_snapshot().data, first);
+        assert!(!checkpoint::path(root.path(), staged).exists());
+        // A completed replacement uses a new file and then removes the old one.
+        let second = foreign_image(3, "second");
+        store.checkpoint(3, second.clone()).unwrap();
+        assert!(!checkpoint::path(root.path(), checkpoint::FileId::first(3)).exists());
+        drop(store);
+        let store = RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
+        assert_eq!(store.recovery_snapshot().data, second);
     }
 
     #[test]

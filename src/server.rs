@@ -283,6 +283,7 @@ impl Server {
         let diagnostics = router(ApiState {
             events: events.clone(),
             cluster_id: config.cluster_id.clone(),
+            location: Some(node.location.clone()),
         });
         // Peer gRPC has no RPC metrics; diagnostics paths never collide with gRPC services.
         let peer_app = App::new(

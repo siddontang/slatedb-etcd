@@ -11,6 +11,7 @@ async fn server() -> (
     let address = listener.local_addr().unwrap().to_string();
     let (events, received) = mpsc::channel(256);
     let router = crate::api::router(ApiState {
+        location: None,
         events,
         cluster_id: "stream-test".into(),
     });
@@ -90,13 +91,31 @@ async fn stream_window_and_snapshot_storage_ack_bound_the_sender() {
                 .send(Ok(json!({"accepted": true})))
                 .unwrap();
         }
-        let snapshot = step(&mut received, true).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), received.recv())
+        // The snapshot waits for earlier frames. Later heartbeats flow while the follower copies.
+        let mut pending = None;
+        let mut heartbeat = None;
+        for _ in 0..2 {
+            match tokio::time::timeout(Duration::from_secs(3), received.recv())
                 .await
-                .is_err()
-        );
-        snapshot
+                .unwrap()
+                .unwrap()
+            {
+                Event::PeerFrame(message, _, response) => {
+                    if message.get_msg_type() == MessageType::MsgSnapshot {
+                        pending = Some(response);
+                    } else {
+                        heartbeat = Some(response);
+                    }
+                }
+                _ => panic!("expected a peer message"),
+            }
+        }
+        heartbeat
+            .expect("a heartbeat waited for the snapshot")
+            .send(Ok(json!({"accepted": true})))
+            .unwrap();
+        pending
+            .expect("the snapshot was not sent")
             .send(if snapshot_success {
                 Ok(json!({"accepted": true}))
             } else {
@@ -105,10 +124,6 @@ async fn stream_window_and_snapshot_storage_ack_bound_the_sender() {
                     leader_id: 0,
                 })
             })
-            .unwrap();
-        step(&mut received, false)
-            .await
-            .send(Ok(json!({"accepted": true})))
             .unwrap();
         loop {
             match tokio::time::timeout(Duration::from_secs(3), completed.recv())

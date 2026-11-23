@@ -34,6 +34,7 @@ pub(crate) mod rows;
 #[cfg(test)]
 mod rows_tests;
 mod snapshot;
+pub(crate) mod transfer;
 pub(crate) use read::ReadView;
 #[cfg(test)]
 mod key_index_tests;
@@ -77,6 +78,10 @@ pub struct StateMachine {
     /// The data directory identity. The first write of a hash or Watch journal row marks it,
     /// so older binaries refuse the directory only once it can hold format 4 rows.
     pub(crate) row_marker: Option<Arc<crate::storage::RowMarker>>,
+    /// The object namespace and current database path. Snapshot installs replace the database.
+    pub(crate) location: Arc<transfer::Location>,
+    /// The membership exists only in memory. The next write batch stores it.
+    pub(crate) members_unsaved: bool,
 }
 
 /// Weight budgets of the state cache. Both are separate from Raft log memory.
@@ -217,12 +222,33 @@ impl StateMachine {
         prefix: &str,
         cache: StateCache,
     ) -> Result<Self> {
+        Self::open_backend(object_store, prefix, cache, transfer::Backend::Local).await
+    }
+
+    pub(crate) async fn open_backend(
+        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+        prefix: &str,
+        cache: StateCache,
+        backend: transfer::Backend,
+    ) -> Result<Self> {
         cache.validate()?;
+        let location = transfer::Location::open(object_store, prefix, backend, cache).await?;
+        let state = Self::open_at(location.clone(), &location.root()).await?;
+        if let Err(error) = location.remove_orphans().await {
+            tracing::warn!(%error, "cannot delete unused state databases");
+        }
+        Ok(state)
+    }
+
+    /// Open the database at `root` in the namespace of `location`.
+    pub(crate) async fn open_at(location: Arc<transfer::Location>, root: &str) -> Result<Self> {
+        let cache = location.cache;
+        let object_store = location.store();
         let rows = Arc::new(rows::RowCache::new(cache.row_bytes));
         let cache = cache.build();
         let settings = slatedb_settings();
-        let admin = slatedb::admin::Admin::builder(prefix, object_store.clone()).build();
-        let db = Db::builder(prefix, object_store)
+        let admin = slatedb::admin::Admin::builder(root, object_store.clone()).build();
+        let db = Db::builder(root, object_store)
             .with_db_cache(cache, 0)
             .with_settings(settings)
             .with_block_cache_policy(block_cache_policy())
@@ -281,6 +307,8 @@ impl StateMachine {
                 leases: Arc::new(leases),
                 watch_capture: None,
                 row_marker: None,
+                location,
+                members_unsaved: false,
             })
         }
         .await;
@@ -296,12 +324,26 @@ impl StateMachine {
         let size = batch
             .logical_size(&self.db, &self.key_index, self.logical_bytes)
             .await?;
-        self.store_batch(batch, index).await?;
+        let size = self.store_batch(batch, index, size).await?;
         self.logical_bytes = size;
         Ok(())
     }
 
-    async fn store_batch(&mut self, batch: WriteBatch, index: u64) -> Result<()> {
+    /// Store `batch` and return `size` with the added membership row, if any.
+    async fn store_batch(&mut self, mut batch: WriteBatch, index: u64, size: u64) -> Result<u64> {
+        let members_saved = self.members_unsaved;
+        let mut size = size;
+        if members_saved && !batch.contains(crate::cluster::KEY) {
+            let value = serde_json::to_vec(self.members.as_ref())?;
+            let old = self.db.get(crate::cluster::KEY).await?.map(|v| v.len());
+            size = crate::batch::row_size_after(
+                size,
+                crate::cluster::KEY.len(),
+                old,
+                Some(value.len()),
+            )?;
+            batch.put(crate::cluster::KEY, value);
+        }
         // Format 4 rows are hash digests and Watch journals without Put values. Mark the
         // directory durably before SlateDB can hold the first of them. Earlier batches, such as
         // empty entries and membership changes, leave the directory readable by older binaries.
@@ -323,6 +365,9 @@ impl StateMachine {
             .write_with_options(batch.to_storage(), &WriteOptions { seqnum: index })
             .await?;
         self.write_batches += 1;
+        if members_saved {
+            self.members_unsaved = false;
+        }
         for (key, value) in batch.into_rows() {
             if let Some(capture) = &mut self.watch_capture {
                 capture.record(&key, value.as_ref());
@@ -331,7 +376,7 @@ impl StateMachine {
             self.key_index.publish(&key, value.as_ref())?;
         }
         self.key_index.commit(index);
-        Ok(())
+        Ok(size)
     }
 
     /// Return the Watch events of the work since `previous`, if capture is enabled.

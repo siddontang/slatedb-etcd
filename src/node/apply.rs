@@ -190,7 +190,7 @@ pub(super) enum Output {
     },
     Entries(Vec<AppliedCommand>),
     PreparedPuts(crate::state::put_batch::PreparedPuts, Vec<AppliedCommand>),
-    Snapshot,
+    Snapshot(Rebound),
     Query {
         response: Response,
         value: Value,
@@ -198,6 +198,12 @@ pub(super) enum Output {
     },
     /// A test worker returns its checkpoint result inline to keep schedules deterministic.
     Checkpoint(Option<Built>),
+}
+
+/// The database handles after a snapshot install.
+pub struct Rebound {
+    pub db: std::sync::Arc<slatedb::Db>,
+    pub admin: std::sync::Arc<slatedb::admin::Admin>,
 }
 
 pub struct Built {
@@ -265,7 +271,11 @@ impl Executor {
             }
             Job::Snapshot(snapshot) => {
                 self.state.install_snapshot(&snapshot).await?;
-                Output::Snapshot
+                // An object snapshot replaces the database. The node rebinds its handles.
+                Output::Snapshot(Rebound {
+                    db: self.state.db.clone(),
+                    admin: self.state.admin.clone(),
+                })
             }
             Job::Query(query) => match query {
                 Query::Maintenance(command, credentials, status, response) => {
@@ -301,7 +311,7 @@ impl Executor {
             Job::Checkpoint { delay, dir, image } => {
                 let index = self.state.applied;
                 let conf = self.state.members.conf();
-                let job = self.state.checkpoint_job(image)?;
+                let job = self.state.checkpoint_job(image).await?;
                 let build = async move {
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
@@ -448,10 +458,15 @@ impl Worker {
     }
 
     pub async fn next(&mut self) -> Result<Completion> {
-        self.completed
+        let completion = self
+            .completed
             .recv()
             .await
-            .context("apply worker stopped")?
+            .context("apply worker stopped")??;
+        if let Output::Snapshot(rebound) = &completion.output {
+            self.database = rebound.db.clone();
+        }
+        Ok(completion)
     }
 
     #[cfg(test)]
@@ -468,7 +483,13 @@ impl Worker {
     pub async fn step(&mut self) -> Result<Option<Completion>> {
         let (executor, jobs) = self.manual.as_mut().context("worker is not manual")?;
         match jobs.try_recv() {
-            Ok(work) => executor.execute(work).await.map(Some),
+            Ok(work) => {
+                let completion = executor.execute(work).await?;
+                if let Output::Snapshot(rebound) = &completion.output {
+                    self.database = rebound.db.clone();
+                }
+                Ok(Some(completion))
+            }
             Err(mpsc::error::TryRecvError::Empty) => Ok(None),
             Err(error) => Err(error.into()),
         }

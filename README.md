@@ -53,7 +53,10 @@ for Auth and separate TLS client and peer listeners.
 
 Native backups and the deprecated backend Hash differ from etcd bbolt.
 Use the native restore flag, not `etcdutl`. Binary Downgrade returns Unimplemented.
-Lease remaining TTL is not checkpointed. Large scans and full snapshots still need memory controls.
+Lease remaining TTL is not checkpointed.
+Large scans and native backups still need memory controls.
+Raft snapshots copy SlateDB checkpoint objects.
+See [object storage snapshots](docs/object-snapshots.md).
 See [compatibility results and limits](COMPATIBILITY.md) before choosing a workload.
 
 ## Verification

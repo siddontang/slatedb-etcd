@@ -53,6 +53,11 @@ impl Flush {
         }
     }
 
+    /// Use the database that a snapshot install opened. A running flush finishes on the old one.
+    pub fn rebind(&mut self, db: std::sync::Arc<slatedb::Db>) {
+        self.db = db;
+    }
+
     pub fn cancel(&mut self) {
         self.running = None;
         self.queued = None;

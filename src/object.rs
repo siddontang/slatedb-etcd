@@ -205,7 +205,12 @@ impl Config {
         let store = s3.store()?;
         let prefix = s3.member_prefix(cluster, member);
         claim(store.as_ref(), &prefix, &binding).await?;
-        StateMachine::open_store_with_cache(store, &format!("{prefix}/state"), cache).await
+        let backend = crate::state::transfer::Backend::S3 {
+            bucket: s3.bucket.clone(),
+            endpoint: s3.endpoint.clone(),
+            region: s3.region.clone(),
+        };
+        StateMachine::open_backend(store, &format!("{prefix}/state"), cache, backend).await
     }
 }
 

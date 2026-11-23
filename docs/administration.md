@@ -95,7 +95,7 @@ Snapshot streams the native state image with a trailing SHA-256 digest.
 Use the [native export tool](operations.md#backups-and-restoration) to save it.
 `etcdctl snapshot save` expects bbolt page alignment and can reject this native image.
 It includes auth, membership, alarms, leases, and MVCC metadata.
-This image uses the same format as Raft recovery snapshots.
+Earlier Raft recovery snapshots used this format. Current ones use checkpoint descriptors.
 It is not an etcd bbolt backup and cannot be restored with `etcdutl`.
 
 Restore it with `--restore-snapshot /path/native.snapshot` when starting each new member.
@@ -105,8 +105,8 @@ The restore path verifies the checksum, replaces membership, and invalidates old
 It retains KV revisions, compaction, leases, users, roles, and alarm types.
 Remove `--restore-snapshot` when restarting the restored cluster. Existing directories are never
 replaced. A damaged checksum stops restoration before any data directory is created.
-The server builds the complete snapshot in memory.
-Native backups and peer snapshots have a 64 MiB limit.
+The server builds the complete snapshot in memory. Native backups have a 64 MiB limit.
+Peer snapshots copy SlateDB objects and have no such limit.
 
 Downgrade authenticates the administrator and returns Unimplemented.
 The SlateDB format cannot run an older etcd binary. No rolling binary downgrade is claimed.

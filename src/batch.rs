@@ -154,6 +154,10 @@ impl WriteBatch {
             .any(|(_, change)| change.value.is_some())
     }
 
+    pub(crate) fn contains(&self, key: &[u8]) -> bool {
+        self.changes.contains_key(key)
+    }
+
     pub(crate) fn keys(&self) -> impl Iterator<Item = &Bytes> {
         self.changes.keys()
     }
@@ -177,7 +181,7 @@ impl WriteBatch {
     }
 }
 
-fn row_size_after(
+pub(crate) fn row_size_after(
     size: u64,
     key_len: usize,
     old: Option<usize>,

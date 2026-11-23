@@ -59,7 +59,7 @@ The diagnostic JSON API uses a separate keyspace from the etcd API.
 | Apply owner | Execute committed entries in order and publish matching read views |
 | Read executor | Evaluate bounded KV reads on pinned data and metadata |
 | SlateDB | Store current values, history, event journals, leases, and the apply marker |
-| Snapshot builder | Flush and serialize a pinned state view |
+| Snapshot builder | Create a SlateDB checkpoint and describe its objects |
 | Object binding | Bind local identity to an exclusive S3 namespace |
 | Test drivers | Compare etcd behavior and check recovery, histories, and schedules |
 
@@ -178,7 +178,7 @@ The implementation allows one active apply job and four KV read jobs.
 It bounds queued reads and rejects excess requests with an explicit retryable error.
 It also rejects new proposals when the local apply backlog reaches its admission limit.
 Each entry batch contains at most 32 entries with a 512 KiB byte target.
-A single larger entry can exceed that byte target. Full snapshots retain the 64 MiB peer limit.
+A single larger entry can exceed that byte target. Peer snapshots carry only a descriptor.
 At most 64 state queries, 64 KV reads, and 64 checkpoint requests can wait at the Raft owner.
 New proposals are rejected at 1,024 committed but unapplied entries.
 These limits bound queued work; they do not impose a total storage quota.
@@ -421,8 +421,9 @@ This follows etcd, where the Raft snapshot holds metadata and bbolt holds the st
 Local object writes sync files and directories, so a flush is durable before truncation.
 
 A manual checkpoint request waits for the Raft commit index observed when the request arrived.
-It pins the applied view, flushes SlateDB, and scans all rows into a complete image.
+It creates a SlateDB checkpoint at the applied index. The image is a small descriptor of it.
 A leader builds the same image when Raft requests a snapshot that local storage cannot supply.
+See [object storage snapshots](object-snapshots.md) for the transfer and cleanup rules.
 Automatic truncation pauses while that request waits or while a peer receives an image.
 A blocking worker writes and syncs each local image under a unique temporary name.
 The WAL worker renames the image and syncs its directory before it publishes the reference.
@@ -430,8 +431,8 @@ One synced WAL batch publishes its index, size, CRC32C, and metadata with log tr
 The worker can then retire the previous file and reclaim covered WAL segments.
 On restart, the worker verifies the referenced file before removing unpublished or retired files.
 
-A checkpoint image and the peer snapshot contain the full logical state.
-The peer transport has a 64 MiB limit. Large deployments need a different transfer design.
+The follower copies the checkpoint SST objects into its own prefix before Raft accepts the
+snapshot. The copy size does not depend on the peer request limit.
 
 On receipt, persist the file and its WAL reference before installing the snapshot in SlateDB.
 The worker must install it before applying later entries.
@@ -549,9 +550,9 @@ Shared SST ownership requires a separate design for publication, fencing, retent
 A shared bucket alone does not make multiple manifest writers safe.
 That work must not weaken recovery or let one replica delete another replica's required data.
 
-Target checkpoints should refer to durable immutable objects where possible.
-They need ownership rules, integrity checks, bounded transfer, cancellation, and resumable recovery.
-Until that design exists, full snapshots remain the supported mechanism.
+Raft snapshots now refer to SlateDB checkpoint objects. Each follower copies them into its own
+prefix, so no replica depends on another replica's data after an install.
+See [object storage snapshots](object-snapshots.md).
 
 Cross-host operation needs secure peer transport, identity checks, and operational controls.
 Measurements must include the real gRPC and MVCC path, remote storage, and independent disks.
@@ -570,7 +571,7 @@ Local JSON benchmarks do not establish remote-store latency or cost.
 
 Phases 1 and 2 now separate state work and log I/O from the Raft owner.
 The apply worker remains a Tokio task and shares CPU and disk resources with other process work.
-Large scans, full snapshots, and lease metadata copies still need bounded work and memory controls.
+Large scans, native backups, and lease metadata copies still need bounded work and memory controls.
 Phase 4 now includes S3, remote mutual TLS, object faults, and three-guest recovery tests.
 Independent physical hosts, availability zones, and object cost measurements remain open.
 Object-reference snapshots remain future work.

@@ -25,7 +25,8 @@ func TestFailpointRecovery(t *testing.T) {
 		"apply-batch-before-write", "apply-batch-after-write", "apply-after-early-reply",
 		"checkpoint-after-file-sync", "checkpoint-file-before-reference", "checkpoint-before-save",
 		"checkpoint-after-save", "checkpoint-after-gc",
-		"snapshot-before-install", "snapshot-after-install-write", "snapshot-after-install-flush",
+		"snapshot-before-ready", "snapshot-before-install", "snapshot-after-install-write",
+		"snapshot-after-install-flush",
 		"compact-before-apply", "compact-after-apply", "compact-before-flush", "compact-after-flush",
 		"watch-before-send", "lease-before-expire",
 	}

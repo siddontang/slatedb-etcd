@@ -18,6 +18,8 @@ use crate::{ApiError, Request};
 pub struct ApiState {
     pub events: mpsc::Sender<Event>,
     pub cluster_id: String,
+    /// The object namespace that serves and receives snapshot objects.
+    pub(crate) location: Option<std::sync::Arc<crate::state::transfer::Location>>,
 }
 
 impl IntoResponse for ApiError {
@@ -39,6 +41,7 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/kv", post(propose))
         .route("/raft", post(raft_message))
+        .route(crate::state::transfer::FILE_ROUTE, get(snapshot_file))
         .route("/status", get(status))
         .route("/debug/log-stats", get(log_stats))
         .route("/checkpoint", post(checkpoint))
@@ -94,11 +97,55 @@ async fn raft_message(State(state): State<ApiState>, headers: HeaderMap, body: B
         return StatusCode::FORBIDDEN.into_response();
     }
     let size = body.len();
-    match crate::peer::decode_message(body) {
-        Ok(message) => dispatch(state, |tx| Event::PeerFrame(message, size, tx))
-            .await
-            .into_response(),
-        Err(_) => StatusCode::BAD_REQUEST.into_response(),
+    let Ok(message) = crate::peer::decode_message(body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if message.get_msg_type() == raft::eraftpb::MessageType::MsgSnapshot {
+        // Copy the checkpoint objects before Raft accepts the snapshot. A failed copy fails the
+        // request, so the leader reports the snapshot as failed and retries later.
+        let descriptor =
+            match crate::state::transfer::Descriptor::decode(message.get_snapshot().get_data()) {
+                Ok(descriptor) => descriptor,
+                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            };
+        if let (Some(descriptor), Some(location)) = (descriptor, &state.location) {
+            if let Err(error) = location.prepare(&descriptor).await {
+                tracing::warn!(%error, "cannot copy snapshot objects");
+                return (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response();
+            }
+        }
+    }
+    dispatch(state, |tx| Event::PeerFrame(message, size, tx))
+        .await
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct FileQuery {
+    root: String,
+    path: String,
+}
+
+/// Serve one object of the current database to a peer that copies a snapshot.
+async fn snapshot_file(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<FileQuery>,
+) -> Response {
+    if headers
+        .get("x-cluster-id")
+        .and_then(|value| value.to_str().ok())
+        != Some(&state.cluster_id)
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(location) = &state.location else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match location.serve(&query.root, &query.path).await {
+        Ok(Some(result)) => axum::body::Body::from_stream(result.into_stream()).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
     }
 }
 
