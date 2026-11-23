@@ -9,7 +9,6 @@ use std::collections::VecDeque;
 
 use super::*;
 use crate::maintenance::HASH;
-use crate::proto::mvccpb::KeyValue;
 use crate::proto::state::Version;
 use bytes::Bytes;
 use prost::Message;
@@ -466,7 +465,7 @@ impl StateMachine {
     ) -> Result<()> {
         *budget = budget.saturating_sub(LOOKUP_COST);
         let matches = |value: &Bytes| -> Result<bool> {
-            Ok(KeyValue::decode(value.clone())?.key == version.user_key)
+            Ok(maintenance::hash_record_key(value)? == version.user_key)
         };
         let key = maintenance::hash_key(version.revision, 0, version.tombstone);
         if let Some(value) = self.db.get(&key).await? {

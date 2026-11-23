@@ -35,7 +35,45 @@ impl Forwarding {
     }
 }
 
+/// A current single-key Range that may read stale but applied state, like the owner's
+/// point-read slot.
+fn local_point_read(request: &RequestOp) -> bool {
+    matches!(
+        &request.request,
+        Some(Op::RequestRange(range))
+            if range.serializable && range.range_end.is_empty() && range.revision <= 0
+    )
+}
+
 impl Service {
+    /// Serve a serializable point read from the latest published applied view, as etcd reads
+    /// its local backend. `None` sends the read through the Raft owner: no view is published
+    /// (a prepared Put reply is ahead of the local apply, or the owner stopped), or too many
+    /// local reads run.
+    pub(super) async fn local_read(
+        &self,
+        request: &RequestOp,
+        credentials: &crate::auth::Credentials,
+    ) -> Result<Option<ResponseOp>, Status> {
+        if !local_point_read(request) || self.events.is_closed() {
+            return Ok(None);
+        }
+        let Some(local) = self.forward_view().await?.local_read() else {
+            return Ok(None);
+        };
+        let Ok(_permit) = self.local_reads.try_acquire() else {
+            return Ok(None);
+        };
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            local.read(request, Some(credentials)),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("etcdserver: read execution timed out"))?
+        .map_err(|e| Status::unavailable(format!("etcdserver: {e}")))?;
+        outcome.result.map(Some).map_err(|e| e.status())
+    }
+
     pub(super) fn cached_remote_leader(&self) -> Option<u64> {
         let leader = self.forwarding.view.get()?.leader();
         (leader != 0 && leader != self.member).then_some(leader)

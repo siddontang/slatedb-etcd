@@ -23,6 +23,9 @@ use crate::proto::etcdserverpb::request_op::Request as Op;
 use crate::proto::etcdserverpb::response_op::Response as Resp;
 use crate::proto::etcdserverpb::*;
 
+/// Serializable point reads evaluated in gRPC tasks at once. More wait in the owner's queue.
+const MAX_LOCAL_READS: usize = 1024;
+
 pub const DEFAULT_WATCH_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
@@ -32,6 +35,8 @@ pub struct Service {
     revision_admission: std::sync::Arc<admission::ReadAdmission>,
     watch_progress_interval: Duration,
     forwarding: std::sync::Arc<forwarding::Forwarding>,
+    /// Serializable point reads that run on the published applied view at once.
+    local_reads: std::sync::Arc<tokio::sync::Semaphore>,
     member: u64,
     tokens: crate::auth::TokenIssuer,
 }
@@ -133,6 +138,7 @@ impl Service {
                 interval.max(Duration::from_millis(100))
             },
             forwarding: std::sync::Arc::new(forwarding::Forwarding::new(peers, transport)?),
+            local_reads: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_LOCAL_READS)),
             member,
             tokens,
         })
@@ -179,6 +185,9 @@ impl Service {
             ));
         }
         mvcc::validate(&request).map_err(|e| e.status())?;
+        if let Some(response) = self.local_read(&request, &credentials).await? {
+            return Ok(response);
+        }
         if !forwarded && mvcc::batchable_put(&request) {
             if let Some(leader) = self.cached_remote_leader() {
                 return self

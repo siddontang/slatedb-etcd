@@ -584,10 +584,10 @@ fn format_3_rows(rows: SnapshotRows) -> (SnapshotRows, usize) {
         .map(|(key, value)| {
             let hash = crate::maintenance::HASH;
             if key.starts_with(hash) && key.len() == hash.len() + 17 {
-                let kv = KeyValue::decode(value.as_slice()).unwrap();
+                let user_key = crate::state::maintenance::hash_record_key(&value).unwrap();
                 let revision =
                     i64::from_be_bytes(key[hash.len()..hash.len() + 8].try_into().unwrap());
-                let old = full(&kv.key, revision).encode_to_vec();
+                let old = full(&user_key, revision).encode_to_vec();
                 rewritten += usize::from(old != value);
                 return (key, old);
             }
@@ -702,6 +702,130 @@ async fn a_format_3_snapshot_installs_and_older_readers_reject_format_4() {
         expected
     );
     restored.close().await.unwrap();
+    state.close().await.unwrap();
+}
+
+/// Hash rows in all three stored forms must give the same HashKV and compaction results.
+///
+/// A directory written by earlier binaries holds full KeyValue rows (format 3) and digests that
+/// are marked by protobuf fields 14 and 15 (the first format 4 binaries). This binary writes
+/// digests that start with an explicit marker byte. All three can share one directory.
+#[tokio::test]
+async fn hash_rows_in_every_stored_form_hash_and_compact_alike() {
+    use crate::proto::mvccpb::KeyValue;
+    use crate::proto::state::Version;
+    use prost::Message;
+    let dir = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let big = vec![b'v'; 16 << 10];
+    let txn = RequestOp {
+        request: Some(Op::RequestTxn(crate::proto::etcdserverpb::TxnRequest {
+            success: vec![put(b"c", &big), put(b"d", b"d")],
+            ..Default::default()
+        })),
+    };
+    let delete = RequestOp {
+        request: Some(Op::RequestDeleteRange(DeleteRangeRequest {
+            key: b"b".to_vec(),
+            ..Default::default()
+        })),
+    };
+    let requests = [
+        put(b"a", b"one"),
+        put(b"b", &big),
+        txn,
+        delete,
+        put(b"a", &big),
+        put(b"b", b"two"),
+        put(b"c", b"three"),
+        put(b"a", b"four"),
+    ];
+    for request in &requests {
+        state
+            .apply_etcd(state.applied + 1, request)
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+    }
+    let bytes = state.snapshot_data().await.unwrap();
+    let mut data: SnapshotData = crate::codec::decode(&bytes).unwrap();
+    let history: std::collections::HashMap<Vec<u8>, Vec<u8>> = data
+        .rows
+        .iter()
+        .filter(|(key, _)| key.starts_with(mvcc::HISTORY))
+        .filter_map(|(key, value)| {
+            let kv: KeyValue = Version::decode(value.as_slice()).unwrap().value?;
+            Some((key.clone(), kv.encode_to_vec()))
+        })
+        .collect();
+    let hash = crate::maintenance::HASH;
+    let mut forms = [0; 3];
+    let mut digests = 0;
+    for (key, value) in &mut data.rows {
+        if !key.starts_with(hash) || key.len() != hash.len() + 17 {
+            continue;
+        }
+        let user_key = maintenance::hash_record_key(value).unwrap();
+        let revision = i64::from_be_bytes(key[hash.len()..hash.len() + 8].try_into().unwrap());
+        let kv = &history[&mvcc::history_key(&user_key, revision)];
+        assert_eq!(*value, maintenance::hash_record(&user_key, kv));
+        let form = digests % 3;
+        digests += 1;
+        forms[form] += 1;
+        *value = match form {
+            0 => value.clone(),
+            1 => maintenance::legacy_hash_record(&user_key, kv),
+            _ => kv.clone(),
+        };
+    }
+    assert!(forms.iter().all(|&count| count >= 2), "{forms:?}");
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = state.applied;
+    snapshot.set_data(crate::codec::encode(&data).unwrap());
+    let mut mixed = StateMachine::open(other.path()).await.unwrap();
+    mixed.install_snapshot(&snapshot).await.unwrap();
+    async fn compare(state: &StateMachine, mixed: &StateMachine, from: i64) {
+        for revision in from..=state.revision {
+            assert_eq!(
+                serde_json::to_value(mixed.hash_kv(revision).await).unwrap(),
+                serde_json::to_value(state.hash_kv(revision).await).unwrap(),
+                "HashKV revision {revision}"
+            );
+        }
+    }
+    compare(&state, &mixed, 0).await;
+    // Physical compaction deletes hash rows by user key and combines their CRCs.
+    for target in [3, 6] {
+        let request = CompactionRequest {
+            revision: target,
+            physical: false,
+        };
+        for state in [&mut state, &mut mixed] {
+            state
+                .apply_compaction(state.applied + 1, &request)
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            compaction_tests::finish(state).await;
+        }
+        compare(&state, &mixed, target).await;
+        let hash_keys = |state: &StateMachine| {
+            let db = state.db.clone();
+            async move {
+                let mut scan = db.scan_prefix(hash, ..).await.unwrap();
+                let mut keys = vec![];
+                while let Some(row) = scan.next().await.unwrap() {
+                    keys.push(row.key);
+                }
+                keys
+            }
+        };
+        assert_eq!(hash_keys(&mixed).await, hash_keys(&state).await);
+    }
+    mixed.close().await.unwrap();
     state.close().await.unwrap();
 }
 
@@ -959,4 +1083,79 @@ fn slatedb_settings_bound_compaction_buffers() {
         worker.max_subcompactions >= 2,
         "a subcompaction overlaps one merge with its I/O"
     );
+}
+
+/// The directory gets the row marker before its first hash or Watch journal row, on both the
+/// general and the batched put path, and not for writes that keep format 3 rows.
+#[tokio::test]
+async fn the_first_hash_or_journal_row_marks_the_directory() {
+    for batched in [false, true] {
+        let raft = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::RaftStorage::open(raft.path(), 1, "test", vec![1]).unwrap();
+        let marker = storage.row_marker();
+        let mut state = StateMachine::open(dir.path()).await.unwrap();
+        state.row_marker = Some(marker.clone());
+        // Empty entries, failed compactions, and reads write no hash or journal row.
+        state.apply(1, None).await.unwrap();
+        state.apply(2, None).await.unwrap();
+        let outcome = state
+            .apply_compaction(
+                3,
+                &CompactionRequest {
+                    revision: 5,
+                    physical: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(outcome.result.is_err());
+        read(&state, b"a", 0).await;
+        assert!(!marker.is_marked());
+        let hash_or_journal = |state: &StateMachine| {
+            let db = state.db.clone();
+            async move {
+                for prefix in [crate::maintenance::HASH, crate::watch::EVENTS] {
+                    if db
+                        .scan_prefix(prefix, ..)
+                        .await
+                        .unwrap()
+                        .next()
+                        .await
+                        .unwrap()
+                        .is_some()
+                    {
+                        return true;
+                    }
+                }
+                false
+            }
+        };
+        assert!(!hash_or_journal(&state).await);
+        if batched {
+            let request = put(b"a", b"one");
+            state
+                .apply_puts(&[put_batch::KvEntry {
+                    index: state.applied + 1,
+                    request: &request,
+                    credentials: None,
+                    origin: 1,
+                }])
+                .await
+                .unwrap();
+        } else {
+            state
+                .apply_etcd(state.applied + 1, &put(b"a", b"one"))
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+        }
+        assert!(hash_or_journal(&state).await);
+        assert!(marker.is_marked());
+        state.close().await.unwrap();
+        drop((storage, marker, state));
+        let storage = crate::storage::RaftStorage::open(raft.path(), 1, "test", vec![1]).unwrap();
+        assert!(storage.row_marker().is_marked());
+    }
 }

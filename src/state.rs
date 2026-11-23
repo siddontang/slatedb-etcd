@@ -74,6 +74,9 @@ pub struct StateMachine {
     pub leases: Arc<std::collections::BTreeMap<i64, crate::lease::LeaseRecord>>,
     /// Journal rows of the current apply job for the in-memory Watch feed.
     pub(crate) watch_capture: Option<crate::watch::Capture>,
+    /// The data directory identity. The first write of a hash or Watch journal row marks it,
+    /// so older binaries refuse the directory only once it can hold format 4 rows.
+    pub(crate) row_marker: Option<Arc<crate::storage::RowMarker>>,
 }
 
 /// Weight budgets of the state cache. Both are separate from Raft log memory.
@@ -277,6 +280,7 @@ impl StateMachine {
                 compaction,
                 leases: Arc::new(leases),
                 watch_capture: None,
+                row_marker: None,
             })
         }
         .await;
@@ -298,6 +302,17 @@ impl StateMachine {
     }
 
     async fn store_batch(&mut self, batch: WriteBatch, index: u64) -> Result<()> {
+        // Format 4 rows are hash digests and Watch journals without Put values. Mark the
+        // directory durably before SlateDB can hold the first of them. Earlier batches, such as
+        // empty entries and membership changes, leave the directory readable by older binaries.
+        if let Some(marker) = &self.row_marker {
+            if !marker.is_marked()
+                && (batch.puts_under(crate::maintenance::HASH)
+                    || batch.puts_under(crate::watch::EVENTS))
+            {
+                marker.mark()?;
+            }
+        }
         // Drop shared rows before SlateDB may expose the change. See `rows`.
         for key in batch.keys() {
             if let Some(key) = key.strip_prefix(mvcc::CURRENT) {

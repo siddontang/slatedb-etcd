@@ -202,6 +202,7 @@ impl Node {
         let batch = state.watch.take();
         self.state = state;
         self.forwarding.apply(self.state.revision);
+        self.publish_local_reads();
         self.publish_watch(batch);
         self.state.durable_applied = durable;
         self.finish_revision_waiters();
@@ -227,6 +228,8 @@ impl Node {
             }
             Output::PreparedPuts(batch, replies) => {
                 self.quorum_reply_index = batch.last;
+                // Withdraw the published view before any of these replies leaves.
+                self.publish_local_reads();
                 self.prepared_puts = Some(batch);
                 self.expire_pending();
                 self.finish_output(Output::Entries(replies))?;
