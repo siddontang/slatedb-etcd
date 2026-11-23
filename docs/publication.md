@@ -25,13 +25,12 @@ It preserved business and test code during the history rewrite.
 New repository checks and report normalization are separate changes at the branch tip.
 
 Gitleaks 8.30.1 checks current publication files, all fetched history, and commit and tag messages.
-The metadata check also inspects author fields, sign-offs, deleted blobs, and annotated tags.
-It accepts one owner or maintainer sign-off.
-It also accepts one author sign-off with the author's GitHub public email.
-A GitHub merge or squash merge by `siddontang@gmail.com` or `nolouch@gmail.com` needs no sign-off.
+The history check inspects commit messages, deleted blobs, and annotated tags for workstation paths.
+It requires a DCO sign-off on each commit except merges and commits that GitHub creates.
+It does not restrict author, committer, or sign-off emails.
 CI checks commit metadata only for the commits an event adds to main or a pull request.
 Main history was checked when it landed, so later rule changes do not fail on it.
-Negative controls reject new private keys, missing sign-offs, private authors, and deleted paths.
+Negative controls reject new private keys, missing sign-offs, and deleted paths.
 No deployment credential was identified in the audited source, reports, or downloaded Actions logs.
 
 ## Repeat the checks
@@ -79,7 +78,7 @@ Historical commit subjects retain PR numbers from the private archive.
 Those numbers do not identify PRs in the new repository.
 
 Verification uses a fresh clone from the new repository and enumerates all advertised refs.
-It checks sign-offs, commit metadata, historical blobs, current files, and secret patterns.
+It checks sign-offs, historical blobs, current files, and secret patterns.
 It also checks that representative old commits cannot be fetched from the new repository.
 Full CI runs against the imported branch in the new repository.
 
