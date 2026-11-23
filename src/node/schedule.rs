@@ -126,6 +126,7 @@ impl Node {
             // The incoming snapshot covers the prepared prefix or establishes a new base.
             // Apply any remaining suffix through the normal committed log path.
             self.prepared_puts.take();
+            self.held_puts.take();
             return self.submit_apply(
                 Job::Snapshot(self.raw.store().recovery_snapshot().clone()),
                 snapshot_index,
@@ -134,11 +135,17 @@ impl Node {
         // Raft delivers committed entries only after local persistence. The commit marker in the
         // log is volatile, so apply need not wait for the log thread to write it.
         let committed = self.committed_ready;
+        let released = self.release_held_puts();
         if let Some(batch) = &self.prepared_puts {
             let last = batch.last;
-            if last <= committed {
+            if last <= committed && self.held_puts.is_none() {
                 let batch = self.prepared_puts.take().unwrap();
-                return self.submit_apply(Job::PublishPuts(batch), last);
+                self.submit_apply(Job::PublishPuts(batch), last)?;
+            }
+            // Send the replies after the PublishPuts wake, so a handler runs on this worker.
+            if let Some(replies) = released {
+                self.expire_pending();
+                self.finish_output(Output::Entries(replies))?;
             }
             return Ok(());
         }
@@ -227,6 +234,16 @@ impl Node {
                 }
             }
             Output::PreparedPuts(batch, replies) => {
+                // A term change can replace uncommitted entries at these indices. The held group
+                // is then dropped before any reply leaves.
+                let raft = &self.raw.raft;
+                if batch.last > raft.raft_log.committed
+                    || raft.term != self.prepare_term
+                    || raft.state != StateRole::Leader
+                {
+                    self.hold_puts(batch, replies);
+                    return Ok(());
+                }
                 self.quorum_reply_index = batch.last;
                 // Withdraw the published view before any of these replies leaves.
                 self.publish_local_reads();
