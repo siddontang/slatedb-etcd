@@ -214,6 +214,10 @@ pub struct Node {
     apply_jobs: VecDeque<(u64, bool)>,
     committed_ready: u64,
     prepared_puts: Option<crate::state::put_batch::PreparedPuts>,
+    /// Replies for `prepared_puts` evaluated before commit. See `quorum_put::HeldPuts`.
+    held_puts: Option<quorum_put::HeldPuts>,
+    /// The term of the entries in the last submitted PreparePuts job.
+    prepare_term: u64,
     quorum_reply_index: u64,
     queries: VecDeque<Query>,
     prefer_query: bool,
@@ -471,6 +475,8 @@ impl Node {
             apply_jobs: VecDeque::new(),
             committed_ready: applied.applied,
             prepared_puts: None,
+            held_puts: None,
+            prepare_term: 0,
             quorum_reply_index: 0,
             state: applied,
             worker,
@@ -576,7 +582,10 @@ impl Node {
                     self.handle(event, &mut step_responses).await?;
                     // Let ready tasks add proposals before starting the next durable log write.
                     // A peer reply only moves commit forward, so the yield would delay apply.
-                    if !peer && (!self.pending.is_empty() || !self.put_proposals.is_empty()) {
+                    // A lone Put with no other request in flight has no proposal to wait for.
+                    let lone = self.pending.is_empty() && self.put_proposals.len() == 1;
+                    if !peer && !lone && (!self.pending.is_empty() || !self.put_proposals.is_empty())
+                    {
                         tokio::task::yield_now().await;
                     }
                     // Accumulate proposals so concurrent clients can share one durable log write.

@@ -4,18 +4,72 @@ use super::apply::AppliedCommand;
 use super::*;
 use crate::state::put_batch::{KvEntry, PreparedPuts};
 
+/// Put replies evaluated before their entries committed.
+///
+/// The replies leave only after Raft commits `last` in `term`. Raft can replace an
+/// uncommitted entry only after this member sees a higher term, so a term or role change
+/// drops the group. The entries then take the normal apply path.
+pub(super) struct HeldPuts {
+    term: u64,
+    last: u64,
+    replies: Vec<AppliedCommand>,
+}
+
 impl Node {
+    /// Evaluate the Puts after `applied` before they commit, while their log write runs.
+    ///
+    /// Raft counts the leader's own replica for an entry only after local persistence. So a
+    /// commit above the persisted index has a durable quorum on other voters, and an entry
+    /// that is not yet committed gets its reply only when it commits (`hold_puts`).
     pub(super) fn prepare_quorum_puts(&mut self) -> Result<bool> {
         let raft = &self.raw.raft;
         let low = self.state.applied + 1;
-        // Raft counts the leader's own replica for an entry only after local persistence.
-        // A commit above the persisted index therefore has a durable quorum on other voters.
-        if low <= raft.raft_log.persisted || low > raft.raft_log.committed {
+        if low <= raft.raft_log.persisted && low <= raft.raft_log.committed {
             return Ok(false);
         }
-        let high = (low + apply::BATCH_ENTRIES).min(raft.raft_log.committed + 1);
-        let high = high.min(self.raw.store().last_index()? + 1);
+        let last = self.raw.store().last_index()?;
+        // A large uncommitted group gains more from one pipelined apply job after commit.
+        if low > raft.raft_log.committed
+            && (!self.queries.is_empty() || last.saturating_sub(self.state.applied) > QUICK_REPLY)
+        {
+            return Ok(false);
+        }
+        let high = (low + apply::BATCH_ENTRIES).min(last + 1);
         self.prepare_puts(high)
+    }
+
+    /// Keep the replies of a prepared group that Raft has not committed yet.
+    pub(super) fn hold_puts(&mut self, batch: PreparedPuts, replies: Vec<AppliedCommand>) {
+        self.held_puts = Some(HeldPuts {
+            term: self.prepare_term,
+            last: batch.last,
+            replies,
+        });
+        self.prepared_puts = Some(batch);
+    }
+
+    /// Return the held replies once their group commits. Drop the group if its entries can
+    /// still be replaced, or if a state query waits behind it.
+    pub(super) fn release_held_puts(&mut self) -> Option<Vec<AppliedCommand>> {
+        let held = self.held_puts.as_ref()?;
+        let raft = &self.raw.raft;
+        if raft.term != held.term || raft.state != StateRole::Leader {
+            self.held_puts = None;
+            self.prepared_puts = None;
+            return None;
+        }
+        if held.last > raft.raft_log.committed {
+            if !self.queries.is_empty() {
+                self.held_puts = None;
+                self.prepared_puts = None;
+            }
+            return None;
+        }
+        let held = self.held_puts.take()?;
+        self.quorum_reply_index = held.last;
+        // Withdraw the published view before any of these replies leaves.
+        self.publish_local_reads();
+        Some(held.replies)
     }
 
     /// Reply to a small committed group of local Puts before the state write.
@@ -70,6 +124,7 @@ impl Node {
         {
             return Ok(false);
         }
+        self.prepare_term = raft.term;
         self.submit_apply(Job::PreparePuts(commands), self.state.applied)?;
         Ok(true)
     }
@@ -340,5 +395,132 @@ mod tests {
         assert_eq!(range.kvs[0].value, b"value");
         node.drain_log().await.unwrap();
         assert!(node.log_worker.storage().commit_index() >= index);
+    }
+
+    fn put(id: &str, node: &mut Node) -> oneshot::Receiver<Result<KvReply, ApiError>> {
+        let (tx, reply) = oneshot::channel();
+        node.propose(
+            RaftCommand::Etcd {
+                id: id.into(),
+                origin: 1,
+                etcd: RequestOp {
+                    request: Some(Request::RequestPut(PutRequest {
+                        key: id.as_bytes().to_vec(),
+                        value: b"value".to_vec(),
+                        ..Default::default()
+                    })),
+                },
+            },
+            ClientResponse::Kv(tx),
+        )
+        .unwrap();
+        reply
+    }
+
+    fn ack(node: &mut Node, index: u64) {
+        let mut ack = Message::default();
+        ack.set_msg_type(MessageType::MsgAppendResponse);
+        ack.from = 2;
+        ack.to = 1;
+        ack.term = node.raw.raft.term;
+        ack.index = index;
+        node.raw.step(ack).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_uncommitted_put_is_prepared_during_its_log_write_and_replies_at_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = super::super::tests::leader_node(dir.path()).await;
+        let applied = node.state.applied;
+        let mut reply = put("early", &mut node);
+        node.drive_ready().await.unwrap();
+        let index = node.raw.store().last_index().unwrap();
+        // The log write is still queued. Prepare runs now and keeps its reply.
+        node.drain_apply().await.unwrap();
+        assert!(node.held_puts.is_some());
+        assert_eq!(node.prepared_puts.as_ref().unwrap().last, index);
+        assert!(node.raw.raft.raft_log.committed < index);
+        assert!(reply.try_recv().is_err());
+        assert_eq!(node.state.applied, applied);
+        assert!(node.quorum_reply_index < index);
+        // The local write alone is not a quorum.
+        node.drain_log().await.unwrap();
+        node.drain_apply().await.unwrap();
+        assert!(reply.try_recv().is_err());
+        assert!(node.held_puts.is_some());
+        ack(&mut node, index);
+        node.drive_ready().await.unwrap();
+        assert!(node.held_puts.is_none());
+        assert_eq!(node.quorum_reply_index, index);
+        assert!(node.forwarding.local().is_none());
+        assert!(reply
+            .try_recv()
+            .unwrap()
+            .unwrap()
+            .into_outcome()
+            .result
+            .is_ok());
+        node.drain_log().await.unwrap();
+        node.drain_apply().await.unwrap();
+        assert_eq!(node.state.applied, index);
+        assert!(node.prepared_puts.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_term_change_drops_held_put_replies() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = super::super::tests::leader_node(dir.path()).await;
+        let applied = node.state.applied;
+        let mut reply = put("replaced", &mut node);
+        node.drive_ready().await.unwrap();
+        let index = node.raw.store().last_index().unwrap();
+        node.drain_apply().await.unwrap();
+        assert!(node.held_puts.is_some());
+        // A new leader can replace the uncommitted entry.
+        let mut heartbeat = Message::default();
+        heartbeat.set_msg_type(MessageType::MsgHeartbeat);
+        heartbeat.from = 2;
+        heartbeat.to = 1;
+        heartbeat.term = node.raw.raft.term + 1;
+        node.raw.step(heartbeat).unwrap();
+        node.drive_ready().await.unwrap();
+        assert!(node.held_puts.is_none());
+        assert!(node.prepared_puts.is_none());
+        assert!(node.quorum_reply_index < index);
+        node.expire_pending();
+        assert!(reply.try_recv().unwrap().is_err());
+        node.drain_log().await.unwrap();
+        node.drain_apply().await.unwrap();
+        assert_eq!(node.state.applied, applied);
+    }
+
+    #[tokio::test]
+    async fn a_state_query_drops_held_put_replies() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = super::super::tests::leader_node(dir.path()).await;
+        let mut reply = put("query", &mut node);
+        node.drive_ready().await.unwrap();
+        let index = node.raw.store().last_index().unwrap();
+        node.drain_apply().await.unwrap();
+        assert!(node.held_puts.is_some());
+        let (tx, mut status) = oneshot::channel();
+        node.enqueue_query(Query::AuthLookup("root".into(), tx));
+        node.drive_ready().await.unwrap();
+        node.drain_apply().await.unwrap();
+        assert!(status.try_recv().unwrap().is_ok());
+        // The Put now waits for commit and takes the normal apply path.
+        node.drain_log().await.unwrap();
+        ack(&mut node, index);
+        node.drive_ready().await.unwrap();
+        node.drain_log().await.unwrap();
+        node.drain_apply().await.unwrap();
+        assert_eq!(node.state.applied, index);
+        assert!(reply
+            .try_recv()
+            .unwrap()
+            .unwrap()
+            .into_outcome()
+            .result
+            .is_ok());
     }
 }
