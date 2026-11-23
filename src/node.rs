@@ -825,13 +825,27 @@ impl Node {
                     || self.peer_waiters.len() + step_responses.len() >= 256
                 {
                     let _ = response.send(Err(self.error("peer message rejected")));
-                } else if !self.snapshot_objects_ready(&message) {
-                    // Raft must not accept a snapshot whose objects this member lacks. The copy
-                    // runs in the background, and the leader retries the snapshot later.
-                    let _ = response.send(Err(self.error("snapshot objects are not copied")));
-                } else {
+                } else if let Some(reserved) = self.snapshot_objects_ready(&message) {
                     let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
-                    match self.raw.step(message) {
+                    let stepped = self.raw.step(message);
+                    if let Some(checkpoint) = reserved {
+                        // Raft can skip a snapshot: an older commit, or a log that already
+                        // matches. Then no install releases the staging copy.
+                        let accepted = self
+                            .raw
+                            .raft
+                            .raft_log
+                            .unstable_snapshot()
+                            .as_ref()
+                            .and_then(|s| {
+                                crate::state::transfer::Descriptor::decode(s.get_data()).ok()?
+                            })
+                            .is_some_and(|d| d.checkpoint == checkpoint);
+                        if !accepted {
+                            self.location.release(&checkpoint);
+                        }
+                    }
+                    match stepped {
                         Ok(()) if snapshot => step_responses.push(response),
                         Ok(()) => {
                             // HTTP receipt is not a Raft vote or append acknowledgement.
@@ -841,6 +855,10 @@ impl Node {
                             let _ = response.send(Err(self.error(&error.to_string())));
                         }
                     }
+                } else {
+                    // Raft must not accept a snapshot whose objects this member lacks. The copy
+                    // runs in the background, and the leader retries the snapshot later.
+                    let _ = response.send(Err(self.error("snapshot objects are not copied")));
                 }
             }
             Event::SubscribeWatch(response) => {
@@ -1123,24 +1141,28 @@ impl Node {
         }
     }
 
-    /// Return false for an object snapshot that is not copied yet. Start the copy then.
-    fn snapshot_objects_ready(&self, message: &Message) -> bool {
+    /// Return `None` for an object snapshot that is not copied yet, and start the copy then.
+    /// Otherwise return the checkpoint of a new staging reservation, if any.
+    fn snapshot_objects_ready(&self, message: &Message) -> Option<Option<String>> {
         if message.get_msg_type() != MessageType::MsgSnapshot {
-            return true;
+            return Some(None);
         }
         let snapshot = message.get_snapshot();
         let Ok(Some(descriptor)) = crate::state::transfer::Descriptor::decode(snapshot.get_data())
         else {
-            return true;
+            return Some(None);
         };
         if snapshot.get_metadata().index <= self.state.applied {
-            return true;
+            return Some(None);
         }
-        if self.location.is_prepared(&descriptor.checkpoint) {
-            // Raft may persist it now. Keep its staging copy until the install finishes.
-            self.location
-                .protect(snapshot.get_metadata().index, &descriptor.checkpoint);
-            return true;
+        // Raft may persist it now. Keep its staging copy until the install finishes.
+        match self
+            .location
+            .reserve(snapshot.get_metadata().index, &descriptor.checkpoint)
+        {
+            Some(true) => return Some(Some(descriptor.checkpoint)),
+            Some(false) => return Some(None),
+            None => (),
         }
         let location = self.location.clone();
         tokio::spawn(async move {
@@ -1148,7 +1170,7 @@ impl Node {
                 tracing::warn!(%error, "cannot copy snapshot objects");
             }
         });
-        false
+        None
     }
 
     fn start_checkpoint(&mut self, image: bool) -> Result<()> {

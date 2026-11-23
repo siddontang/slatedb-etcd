@@ -19,10 +19,11 @@ const CHECKPOINT_LIFETIME: Duration = Duration::from_secs(60 * 60);
 /// A node sends its descriptor for this time. Then it builds a new checkpoint.
 pub(crate) const IMAGE_REUSE: Duration = Duration::from_secs(20 * 60);
 const CHECKPOINT_NAME: &str = "raft-snapshot";
-/// The object that names the current database of a member.
-const POINTER: &str = "current-state";
-/// The object that holds the stable random ID of a member namespace.
-const NAMESPACE: &str = "namespace-id";
+/// The suffix of the object that names the current database: `<first>.current`.
+const POINTER: &str = ".current";
+/// The suffix of the object that holds the stable random ID of a database family:
+/// `<first>.namespace`.
+const NAMESPACE: &str = ".namespace";
 const COPIES: usize = 8;
 const CHUNK_BYTES: usize = 8 * 1024 * 1024;
 /// The HTTP path that serves checkpoint objects to peers.
@@ -146,11 +147,8 @@ pub struct Location {
     first: String,
     pub(crate) cache: super::StateCache,
     current: Mutex<String>,
-    /// Staging databases that hold a checkpoint completely, by checkpoint ID.
-    prepared: Mutex<HashMap<String, String>>,
-    /// Snapshots that Raft accepted but the state machine has not installed: (index, checkpoint).
-    /// A new copy must not reuse their staging databases.
-    protected: Mutex<Vec<(u64, String)>>,
+    /// Staging state. One lock covers admission and reuse, so they cannot interleave.
+    staging: Mutex<Staging>,
     peer: Mutex<Peer>,
     prepare: tokio::sync::Mutex<()>,
 }
@@ -168,10 +166,12 @@ impl Location {
             None => (String::new(), prefix.to_owned()),
         };
         ensure!(
-            !first.is_empty() && !first.contains('.') && first != POINTER && first != NAMESPACE,
+            !first.is_empty() && !first.contains('.'),
             "invalid state path"
         );
-        let pointer = Path::from(join(&base, POINTER));
+        // Each family has its own pointer and identity. A sibling prefix such as `state-5`
+        // opens as an independent family.
+        let pointer = Path::from(join(&base, &format!("{first}{POINTER}")));
         let current = match store.get(&pointer).await {
             Ok(result) => {
                 let name = String::from_utf8(result.bytes().await?.to_vec())?;
@@ -184,7 +184,8 @@ impl Location {
             Err(slatedb::object_store::Error::NotFound { .. }) => first.clone(),
             Err(error) => return Err(error.into()),
         };
-        let namespace = namespace(store.as_ref(), &base).await?;
+        let namespace =
+            namespace(store.as_ref(), &join(&base, &format!("{first}{NAMESPACE}"))).await?;
         let location = Arc::new(Self {
             store,
             base,
@@ -193,8 +194,7 @@ impl Location {
             first,
             cache,
             current: Mutex::new(current),
-            prepared: Mutex::new(HashMap::new()),
-            protected: Mutex::new(Vec::new()),
+            staging: Mutex::new(Staging::default()),
             peer: Mutex::new(Peer {
                 member: 0,
                 cluster: String::new(),
@@ -287,11 +287,39 @@ impl Location {
     }
 
     /// Keep the staging database of a snapshot that Raft accepts until its install finishes.
-    pub(crate) fn protect(&self, index: u64, checkpoint: &str) {
-        let mut protected = self.protected.lock().unwrap();
-        if !protected.iter().any(|(_, id)| id == checkpoint) {
-            protected.push((index, checkpoint.to_owned()));
+    pub(crate) fn protect(&self, index: u64, checkpoint: &str) -> bool {
+        let mut staging = self.staging.lock().unwrap();
+        if staging.protected.iter().any(|(_, id)| id == checkpoint) {
+            return false;
         }
+        staging.protected.push((index, checkpoint.to_owned()));
+        true
+    }
+
+    /// Protect a prepared snapshot for Raft. Return `Some(true)` for a new reservation,
+    /// `Some(false)` for an existing one, and `None` when no complete staging copy exists.
+    ///
+    /// A copy claims a staging database for reuse under the same lock, so a reserved copy
+    /// stays intact and a claimed copy cannot be reserved.
+    pub(crate) fn reserve(&self, index: u64, checkpoint: &str) -> Option<bool> {
+        let mut staging = self.staging.lock().unwrap();
+        if !staging.prepared.contains_key(checkpoint) {
+            return None;
+        }
+        if staging.protected.iter().any(|(_, id)| id == checkpoint) {
+            return Some(false);
+        }
+        staging.protected.push((index, checkpoint.to_owned()));
+        Some(true)
+    }
+
+    /// Release a reservation that Raft did not use.
+    pub(crate) fn release(&self, checkpoint: &str) {
+        self.staging
+            .lock()
+            .unwrap()
+            .protected
+            .retain(|(_, id)| id != checkpoint);
     }
 
     /// Start a checkpoint of the applied prefix. Call it between apply jobs.
@@ -392,23 +420,30 @@ impl Location {
             .clone()
             .find(|db| db.ready.as_deref() == Some(descriptor.checkpoint.as_str()))
         {
-            self.prepared
+            self.staging
                 .lock()
                 .unwrap()
+                .prepared
                 .insert(descriptor.checkpoint.clone(), db.name.clone());
             return Ok(db.name.clone());
         }
         // Reuse the newest staging database that no accepted snapshot needs. It keeps its SSTs.
-        let protected: Vec<String> = self
-            .protected
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, id)| id.clone())
-            .collect();
-        let mut reusable: Vec<&Database> = staged
-            .filter(|db| db.ready.as_ref().is_none_or(|id| !protected.contains(id)))
-            .collect();
+        // Select and claim under the reservation lock: Raft cannot reserve a claimed copy.
+        let mut reusable: Vec<&Database> = {
+            let mut lock = self.staging.lock().unwrap();
+            let reusable: Vec<&Database> = staged
+                .filter(|db| {
+                    db.ready.as_ref().is_none_or(|id| {
+                        !lock.protected.iter().any(|(_, protected)| protected == id)
+                    })
+                })
+                .collect();
+            lock.prepared.retain(|_, name| {
+                !reusable.iter().any(|db| db.name == *name)
+                    && databases.iter().any(|db| db.name == *name)
+            });
+            reusable
+        };
         reusable.sort_by_key(|db| db.generation);
         let staging = match reusable.pop() {
             Some(db) => db.name.clone(),
@@ -422,10 +457,6 @@ impl Location {
         for db in reusable {
             self.remove(&db.name).await?;
         }
-        self.prepared
-            .lock()
-            .unwrap()
-            .retain(|_, name| *name != staging && databases.iter().any(|db| db.name == *name));
         let root = self.path(&staging);
         let ready = Path::from(format!("{root}.ready"));
         delete(self.store.as_ref(), &ready).await?;
@@ -478,16 +509,12 @@ impl Location {
                 PutPayload::from(descriptor.checkpoint.clone().into_bytes()),
             )
             .await?;
-        self.prepared
+        self.staging
             .lock()
             .unwrap()
+            .prepared
             .insert(descriptor.checkpoint.clone(), staging.clone());
         Ok(staging)
-    }
-
-    /// Return true when the staging database holds `checkpoint` completely.
-    pub(crate) fn is_prepared(&self, checkpoint: &str) -> bool {
-        self.prepared.lock().unwrap().contains_key(checkpoint)
     }
 
     async fn copy_missing(
@@ -646,16 +673,15 @@ impl Location {
         self.own(&self.current()).await?;
         self.store
             .put(
-                &Path::from(join(&self.base, POINTER)),
+                &Path::from(join(&self.base, &format!("{}{POINTER}", self.first))),
                 PutPayload::from(name.to_owned().into_bytes()),
             )
             .await?;
         let old = std::mem::replace(&mut *self.current.lock().unwrap(), name.to_owned());
-        self.prepared
-            .lock()
-            .unwrap()
-            .retain(|_, staged| staged != name);
-        self.protected.lock().unwrap().retain(|(i, _)| *i > index);
+        let mut staging = self.staging.lock().unwrap();
+        staging.prepared.retain(|_, staged| staged != name);
+        staging.protected.retain(|(i, _)| *i > index);
+        drop(staging);
         Ok(old)
     }
 
@@ -706,6 +732,15 @@ impl Location {
     }
 }
 
+#[derive(Default)]
+struct Staging {
+    /// Staging databases that hold a checkpoint completely, by checkpoint ID.
+    prepared: HashMap<String, String>,
+    /// Snapshots that Raft accepted but the state machine has not installed: (index, checkpoint).
+    /// A new copy must not reuse their staging databases.
+    protected: Vec<(u64, String)>,
+}
+
 struct Database {
     name: String,
     generation: u64,
@@ -731,8 +766,8 @@ enum Source {
 }
 
 /// Read the namespace ID, or create it with a conditional PUT.
-async fn namespace(store: &dyn ObjectStore, base: &str) -> Result<String> {
-    let path = Path::from(join(base, NAMESPACE));
+async fn namespace(store: &dyn ObjectStore, path: &str) -> Result<String> {
+    let path = Path::from(path);
     loop {
         match store.get(&path).await {
             Ok(result) => return Ok(String::from_utf8(result.bytes().await?.to_vec())?),

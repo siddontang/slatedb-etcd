@@ -16,8 +16,8 @@ The endpoint cannot contain credentials, a path, a query, or a fragment.
 ```text
 <prefix>/<sha256(cluster-id)>/member-<id>/
     owner.json
-    namespace-id
-    current-state
+    state.namespace
+    state.current
     state/ or state-N/
 ```
 

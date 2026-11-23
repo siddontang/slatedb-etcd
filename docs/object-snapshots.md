@@ -87,19 +87,28 @@ The follower database path changes on each install:
 
 ```text
 <member prefix>/
-    current-state      the name of the current database, for example "state-3"
+    state.current      the name of the current database, for example "state-3"
+    state.namespace    the random ID of this database family
     state-3/           the current database
     state-4/           the staging database for the next install
     state-4.ready      the checkpoint ID that state-4 holds completely
     state-4.owner      the namespace ID: this member created state-4 and can delete it
 ```
 
-`state` without a number is the first database. A missing `current-state` object selects it.
+`state` without a number is the first database. A missing `state.current` object selects it.
+The pointer and the ID belong to the first database name. A sibling prefix such as `state-5`
+therefore opens as an independent family with its own pointer.
 
 1. If an owned `state-N.ready` names the descriptor checkpoint, the staging copy is complete.
 2. Otherwise the follower selects an owned staging database. It does not select a database whose
    checkpoint Raft accepted but the node has not installed. It then deletes the ready marker and
    every staging object outside `compacted/`.
+
+   One lock covers this selection and the node admission of a snapshot. The node reserves a
+   complete staging copy for Raft under the lock. A new copy claims a staging database under the
+   same lock and removes it from the complete set. A claimed copy therefore cannot be reserved,
+   and a reserved copy cannot be claimed. If Raft skips the snapshot, the node releases the
+   reservation at once.
 3. It copies each missing SST. An SST ID is unique, so an existing SST is already complete.
 4. It copies the manifest. It removes the copied checkpoints from the copy with SlateDB `Admin`.
 5. It writes the ready marker.
@@ -114,7 +123,7 @@ The apply worker installs a snapshot after Raft persists it:
 
 1. It prepares staging again if the ready marker is missing. This path also serves DST.
 2. It opens the staging database. The apply marker must equal the snapshot index.
-3. It writes `current-state` with one atomic object PUT.
+3. It writes `state.current` with one atomic object PUT.
 4. It replaces the state machine contents. It keeps metrics, the row marker, and Watch capture.
 5. The node rebinds the compaction flush and the manifest metrics to the new database.
 6. A background task closes the old database after its readers finish, then deletes its prefix.

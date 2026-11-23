@@ -2047,3 +2047,55 @@ async fn state_behind_a_truncated_log_stops_startup() {
         .to_string()
         .contains("state storage is behind the log truncation point"));
 }
+
+#[tokio::test]
+async fn a_snapshot_that_raft_skips_releases_its_staging_reservation() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = tempfile::tempdir().unwrap();
+    // Apply lags a durable commit at 300. Raft skips a snapshot at 200.
+    seed_log(dir.path(), 300);
+    let (events, _) = mpsc::channel(256);
+    let mut node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    node.drive_ready().await.unwrap();
+    assert_eq!(node.state.applied, 0);
+    let mut state = StateMachine::open(source.path()).await.unwrap();
+    state.location.bind(2, "worker-test", None, None);
+    for index in 1..=200 {
+        state.apply(index, None).await.unwrap();
+    }
+    let data = state
+        .checkpoint_job(true)
+        .await
+        .unwrap()
+        .await
+        .unwrap()
+        .unwrap();
+    let descriptor = crate::state::transfer::Descriptor::decode(&data)
+        .unwrap()
+        .unwrap();
+    node.location.prepare(&descriptor).await.unwrap();
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = 200;
+    snapshot.mut_metadata().term = 1;
+    snapshot.mut_metadata().mut_conf_state().voters = vec![1, 2, 3];
+    snapshot.data = data;
+    let mut message = Message::default();
+    message.set_msg_type(MessageType::MsgSnapshot);
+    message.from = 2;
+    message.to = 1;
+    message.term = 2;
+    message.set_snapshot(snapshot);
+    let (tx, _rx) = oneshot::channel();
+    node.handle(Event::PeerFrame(message, 0, tx), &mut vec![])
+        .await
+        .unwrap();
+    assert!(node.raw.raft.raft_log.unstable_snapshot().is_none());
+    // No install follows, so the reservation is gone. A new reservation succeeds.
+    assert_eq!(
+        node.location.reserve(200, &descriptor.checkpoint),
+        Some(true)
+    );
+    state.close().await.unwrap();
+}

@@ -208,7 +208,7 @@ async fn a_member_serves_only_checkpoint_objects_of_its_current_database() {
         ("state-1", descriptor.ssts[0].as_str()),
         ("state", "../object-store.json"),
         ("state", "compacted/../../x.sst"),
-        ("state", "current-state"),
+        ("state", "../state.current"),
     ] {
         assert!(location.serve(root, path).await.unwrap().is_none());
     }
@@ -272,9 +272,12 @@ async fn an_accepted_snapshot_keeps_its_staging_copy_when_a_newer_copy_starts() 
         .await
         .unwrap();
     // Raft accepts the first snapshot. A newer transfer then starts before the install.
-    follower
-        .location
-        .protect(20, &accepted_descriptor.checkpoint);
+    assert_eq!(
+        follower
+            .location
+            .reserve(20, &accepted_descriptor.checkpoint),
+        Some(true)
+    );
     let other = follower.location.prepare(&newer).await.unwrap();
     assert_ne!(staging, other);
     assert!(exists(&follower, &format!("{staging}.ready")).await);
@@ -321,15 +324,14 @@ async fn cleanup_keeps_a_sibling_database_that_this_member_does_not_own() {
     assert!(!exists(&follower, "state.owner").await);
     follower.close().await.unwrap();
 
-    // The sibling database keeps its manifest and its SSTs.
-    let admin = slatedb::admin::Admin::builder("state-5", store.clone()).build();
-    let manifest = admin.read_manifest(None).await.unwrap().unwrap();
-    let resolver = slatedb::PathResolver::new("state-5", &manifest);
-    let ssts: Vec<_> = manifest.all_sst_views().collect();
-    assert!(!ssts.is_empty());
-    for view in ssts {
-        store.head(&resolver.sst_path(&view.sst.id)).await.unwrap();
-    }
+    // The sibling opens as its own family and keeps its data.
+    let sibling = StateMachine::open_store(store, "state-5").await.unwrap();
+    assert_eq!(sibling.location.root(), "state-5");
+    assert_eq!(
+        sibling.local_value("sibling").await.unwrap().as_deref(),
+        Some("kept")
+    );
+    sibling.close().await.unwrap();
     leader.close().await.unwrap();
 }
 
@@ -366,6 +368,34 @@ async fn a_read_view_keeps_the_replaced_database_open() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+    follower.close().await.unwrap();
+    leader.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_staging_copy_that_a_new_copy_claims_cannot_be_reserved() {
+    let leader_dir = tempfile::tempdir().unwrap();
+    let follower_dir = tempfile::tempdir().unwrap();
+    let mut leader = open(leader_dir.path(), 1).await;
+    put(&mut leader, 1, "key", "first").await;
+    let first = Descriptor::decode(&image(&leader).await.data)
+        .unwrap()
+        .unwrap();
+    put(&mut leader, 2, "key", "second").await;
+    let second = Descriptor::decode(&image(&leader).await.data)
+        .unwrap()
+        .unwrap();
+    let follower = open(follower_dir.path(), 2).await;
+    let staging = follower.location.prepare(&first).await.unwrap();
+    // The newer copy claims the unreserved staging database of the first checkpoint.
+    assert_eq!(follower.location.prepare(&second).await.unwrap(), staging);
+    // Raft then cannot reserve the first checkpoint. The node copies it again instead.
+    assert_eq!(follower.location.reserve(1, &first.checkpoint), None);
+    assert_eq!(follower.location.reserve(2, &second.checkpoint), Some(true));
+    assert_eq!(
+        follower.location.reserve(2, &second.checkpoint),
+        Some(false)
+    );
     follower.close().await.unwrap();
     leader.close().await.unwrap();
 }
