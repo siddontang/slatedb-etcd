@@ -310,6 +310,15 @@ impl Node {
                 storage.persist_commit(state.applied)?;
             }
             let recovered_from_index = state.applied;
+            let recovery = storage.recovery_snapshot();
+            if let Ok(Some(descriptor)) =
+                crate::state::transfer::Descriptor::decode(recovery.get_data())
+            {
+                // The durable snapshot may still need its staging copy.
+                state
+                    .location
+                    .protect(recovery.get_metadata().index, &descriptor.checkpoint);
+            }
             state.install_snapshot(storage.recovery_snapshot()).await?;
             if state.members.members.is_empty() && !options.join {
                 let mut members = crate::cluster::Store::initial(&options.peers);
@@ -1124,9 +1133,13 @@ impl Node {
         else {
             return true;
         };
-        if snapshot.get_metadata().index <= self.state.applied
-            || self.location.is_prepared(&descriptor.checkpoint)
-        {
+        if snapshot.get_metadata().index <= self.state.applied {
+            return true;
+        }
+        if self.location.is_prepared(&descriptor.checkpoint) {
+            // Raft may persist it now. Keep its staging copy until the install finishes.
+            self.location
+                .protect(snapshot.get_metadata().index, &descriptor.checkpoint);
             return true;
         }
         let location = self.location.clone();

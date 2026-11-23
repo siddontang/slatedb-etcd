@@ -15,8 +15,47 @@ const STAGING_PREFIX: &str = "checkpoint-stage-";
 const STAGING_SUFFIX: &str = ".tmp";
 const RANDOM_CHARS: usize = 12;
 
-pub(super) fn path(dir: &Path, index: u64) -> PathBuf {
-    dir.join(format!("checkpoint-{index:016x}.data"))
+/// The file of one checkpoint image. A replacement at the same index gets a new generation,
+/// so the previous file stays intact until the new reference is durable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FileId {
+    pub index: u64,
+    pub generation: u64,
+}
+
+impl FileId {
+    #[cfg(test)]
+    pub fn first(index: u64) -> Self {
+        Self {
+            index,
+            generation: 0,
+        }
+    }
+}
+
+/// A reference field that marks a generation suffix after the original fields.
+const GENERATION_TAG: u8 = 1;
+
+pub(super) fn path(dir: &Path, id: FileId) -> PathBuf {
+    match id.generation {
+        0 => dir.join(format!("checkpoint-{:016x}.data", id.index)),
+        generation => dir.join(format!(
+            "checkpoint-{:016x}-{generation:016x}.data",
+            id.index
+        )),
+    }
+}
+
+fn parse(name: &str) -> Option<FileId> {
+    let id = name.strip_prefix("checkpoint-")?.strip_suffix(".data")?;
+    let (index, generation) = match id.split_once('-') {
+        Some((index, generation)) => (index, u64::from_str_radix(generation, 16).ok()?),
+        None => (id, 0),
+    };
+    Some(FileId {
+        index: u64::from_str_radix(index, 16).ok()?,
+        generation,
+    })
 }
 
 fn remove(path: &Path) -> Result<()> {
@@ -57,10 +96,14 @@ impl PreparedCheckpoint {
         self,
         dir: &Path,
         snapshot: &Snapshot,
+        generation: u64,
         batch: &mut LogBatch,
-    ) -> Result<()> {
-        self.file
-            .persist(path(dir, snapshot.get_metadata().index))?;
+    ) -> Result<FileId> {
+        let id = FileId {
+            index: snapshot.get_metadata().index,
+            generation,
+        };
+        self.file.persist(path(dir, id))?;
         File::open(dir)?.sync_all()?;
         crate::failpoint::hit("checkpoint-file-before-reference");
 
@@ -69,11 +112,15 @@ impl PreparedCheckpoint {
         if let Some(len) = self.compressed_len {
             reference.extend_from_slice(&len.to_le_bytes());
         }
+        if generation != 0 {
+            reference.push(GENERATION_TAG);
+            reference.extend_from_slice(&generation.to_le_bytes());
+        }
         let mut metadata = snapshot.clone();
         metadata.data = Vec::new();
         batch.put_value::<ProstCodec, _>(GROUP, SNAPSHOT.to_vec(), &metadata)?;
         batch.put(GROUP, REFERENCE.to_vec(), reference)?;
-        Ok(())
+        Ok(id)
     }
 }
 
@@ -95,36 +142,48 @@ pub(super) fn load(
     dir: &Path,
     engine: &Engine<LogFileSystem>,
     snapshot: &mut Snapshot,
-) -> Result<Option<u64>> {
+) -> Result<Option<FileId>> {
     if let Some(reference) = engine.get(GROUP, REFERENCE) {
         ensure!(
-            matches!(reference.len(), 12 | 20) && snapshot.data.is_empty(),
+            matches!(reference.len(), 12 | 20 | 21 | 29) && snapshot.data.is_empty(),
             "invalid checkpoint reference"
         );
+        let (reference, generation) = match reference.len() {
+            21 | 29 => {
+                let (fields, suffix) = reference.split_at(reference.len() - 9);
+                ensure!(suffix[0] == GENERATION_TAG, "invalid checkpoint reference");
+                (fields, u64::from_le_bytes(suffix[1..].try_into()?))
+            }
+            _ => (&reference[..], 0),
+        };
         let len = u64::from_le_bytes(reference[..8].try_into()?);
         let checksum = u32::from_le_bytes(reference[8..12].try_into()?);
         let compressed_len = reference[12..].try_into().ok().map(u64::from_le_bytes);
-        let file = File::open(path(dir, snapshot.get_metadata().index))
-            .context("missing checkpoint file")?;
+        let id = FileId {
+            index: snapshot.get_metadata().index,
+            generation,
+        };
+        let file = File::open(path(dir, id)).context("missing checkpoint file")?;
         let data = encoding::read(file, len, compressed_len)?;
         ensure!(
             crc32c::crc32c(&data) == checksum,
             "checkpoint checksum mismatch"
         );
         snapshot.data = data;
-        return Ok(Some(snapshot.get_metadata().index));
+        return Ok(Some(id));
     }
     Ok(None)
 }
 
-pub(super) fn retire(dir: &Path, index: u64) -> Result<()> {
-    if index != 0 {
-        remove(&path(dir, index))?;
+/// Remove a file that the published reference no longer names.
+pub(super) fn retire(dir: &Path, id: Option<FileId>) -> Result<()> {
+    if let Some(id) = id.filter(|id| id.index != 0) {
+        remove(&path(dir, id))?;
     }
     Ok(())
 }
 
-pub(super) fn remove_orphans(dir: &Path, current: Option<u64>) -> Result<()> {
+pub(super) fn remove_orphans(dir: &Path, current: Option<FileId>) -> Result<()> {
     remove(&dir.join(PENDING))?;
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -133,15 +192,10 @@ pub(super) fn remove_orphans(dir: &Path, current: Option<u64>) -> Result<()> {
             remove(&entry.path())?;
             continue;
         }
-        let Some(index) = name
-            .to_str()
-            .and_then(|s| s.strip_prefix("checkpoint-"))
-            .and_then(|s| s.strip_suffix(".data"))
-            .and_then(|s| u64::from_str_radix(s, 16).ok())
-        else {
+        let Some(id) = name.to_str().and_then(parse) else {
             continue;
         };
-        if Some(index) != current && entry.path() == path(dir, index) {
+        if Some(id) != current && entry.path() == path(dir, id) {
             remove(&entry.path())?;
         }
     }
@@ -164,19 +218,34 @@ mod tests {
         let mut snapshot = Snapshot::default();
         snapshot.mut_metadata().index = 11;
         incoming
-            .publish(dir.path(), &snapshot, &mut LogBatch::default())
+            .publish(dir.path(), &snapshot, 0, &mut LogBatch::default())
             .unwrap();
         drop(older);
         assert!(!orphan.exists());
-        assert_eq!(fs::read(path(dir.path(), 11)).unwrap(), b"from leader");
+        assert_eq!(
+            fs::read(path(dir.path(), FileId::first(11))).unwrap(),
+            b"from leader"
+        );
 
         let abandoned = image(b"synced before process exit");
         let (_, abandoned) = abandoned.file.keep().unwrap();
         let unrelated = dir.path().join("checkpoint-stage-personal.tmp");
         fs::write(&unrelated, b"other file").unwrap();
-        remove_orphans(dir.path(), Some(11)).unwrap();
+        let replaced = path(
+            dir.path(),
+            FileId {
+                index: 11,
+                generation: 2,
+            },
+        );
+        fs::write(&replaced, b"replaced image").unwrap();
+        remove_orphans(dir.path(), Some(FileId::first(11))).unwrap();
         assert!(!abandoned.exists());
+        assert!(!replaced.exists());
         assert!(unrelated.exists());
-        assert_eq!(fs::read(path(dir.path(), 11)).unwrap(), b"from leader");
+        assert_eq!(
+            fs::read(path(dir.path(), FileId::first(11))).unwrap(),
+            b"from leader"
+        );
     }
 }

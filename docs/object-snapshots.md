@@ -55,10 +55,11 @@ A received descriptor is not transferable. A new leader builds its own checkpoin
 
 ## Transfer
 
-The leader sends the descriptor in the `MsgSnapshot` HTTP request, as before. The follower copies
-the objects before it passes the message to Raft. A copy error fails the request. The leader then
-reports the snapshot as failed, and Raft retries later. Raft does not accept a snapshot whose
-objects are missing.
+The leader sends the descriptor in the `MsgSnapshot` HTTP request, as before. The request runs
+in its own task, so heartbeats continue during a long copy. The descriptor names the peer URL of
+the applied membership. The follower copies the objects before it passes the message to Raft.
+A copy error fails the request. The leader then reports the snapshot as failed, and Raft retries
+later. Raft does not accept a snapshot whose objects are missing.
 
 The follower selects the source in this order:
 
@@ -90,12 +91,15 @@ The follower database path changes on each install:
     state-3/           the current database
     state-4/           the staging database for the next install
     state-4.ready      the checkpoint ID that state-4 holds completely
+    state-4.owner      the namespace ID: this member created state-4 and can delete it
 ```
 
 `state` without a number is the first database. A missing `current-state` object selects it.
 
-1. If `state-N.ready` names the descriptor checkpoint, the staging copy is complete.
-2. Otherwise the follower deletes the ready marker and every staging object outside `compacted/`.
+1. If an owned `state-N.ready` names the descriptor checkpoint, the staging copy is complete.
+2. Otherwise the follower selects an owned staging database. It does not select a database whose
+   checkpoint Raft accepted but the node has not installed. It then deletes the ready marker and
+   every staging object outside `compacted/`.
 3. It copies each missing SST. An SST ID is unique, so an existing SST is already complete.
 4. It copies the manifest. It removes the copied checkpoints from the copy with SlateDB `Admin`.
 5. It writes the ready marker.
@@ -117,7 +121,12 @@ The apply worker installs a snapshot after Raft persists it:
 
 A crash before step 3 opens the old database. Its apply marker is below the Raft snapshot index,
 so the node installs the snapshot again. A crash after step 3 opens the new database. Startup
-deletes database prefixes other than the current and staging databases.
+deletes owned databases older than the current database. A prefix without an owner marker stays
+intact, because another database can use a similar name. The delete removes the owner marker
+last, so an interrupted delete continues after a restart.
+
+Step 6 waits until no read view holds the old database. A pinned read therefore never fails
+because of an install.
 
 The descriptor membership is kept in memory. The next write batch also stores it, because a
 bootstrap membership exists only in memory until then.

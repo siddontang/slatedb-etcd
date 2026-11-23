@@ -146,8 +146,11 @@ pub struct Location {
     first: String,
     pub(crate) cache: super::StateCache,
     current: Mutex<String>,
-    /// The checkpoint that the staging database holds completely.
-    prepared: Mutex<Option<String>>,
+    /// Staging databases that hold a checkpoint completely, by checkpoint ID.
+    prepared: Mutex<HashMap<String, String>>,
+    /// Snapshots that Raft accepted but the state machine has not installed: (index, checkpoint).
+    /// A new copy must not reuse their staging databases.
+    protected: Mutex<Vec<(u64, String)>>,
     peer: Mutex<Peer>,
     prepare: tokio::sync::Mutex<()>,
 }
@@ -190,7 +193,8 @@ impl Location {
             first,
             cache,
             current: Mutex::new(current),
-            prepared: Mutex::new(None),
+            prepared: Mutex::new(HashMap::new()),
+            protected: Mutex::new(Vec::new()),
             peer: Mutex::new(Peer {
                 member: 0,
                 cluster: String::new(),
@@ -234,13 +238,60 @@ impl Location {
         join(&self.base, name)
     }
 
-    fn staging(&self) -> String {
-        let current = self.current.lock().unwrap();
-        format!(
-            "{}-{}",
-            self.first,
-            generation(&self.first, &current).unwrap_or(0) + 1
-        )
+    fn current(&self) -> String {
+        self.current.lock().unwrap().clone()
+    }
+
+    /// List the databases of this family with their ownership and ready markers.
+    async fn scan(&self) -> Result<Vec<Database>> {
+        let base = (!self.base.is_empty()).then(|| Path::from(self.base.as_str()));
+        let listing = self.store.list_with_delimiter(base.as_ref()).await?;
+        let mut names = BTreeSet::new();
+        for prefix in listing.common_prefixes {
+            if let Some(name) = prefix.filename() {
+                names.insert(name.to_owned());
+            }
+        }
+        for object in listing.objects {
+            if let Some(name) = object.location.filename() {
+                let name = name.strip_suffix(".ready").unwrap_or(name);
+                names.insert(name.strip_suffix(".owner").unwrap_or(name).to_owned());
+            }
+        }
+        let mut databases = vec![];
+        for name in names {
+            let Some(generation) = generation(&self.first, &name) else {
+                continue;
+            };
+            let root = self.path(&name);
+            let owner = read(self.store.as_ref(), &format!("{root}.owner")).await?;
+            databases.push(Database {
+                owned: owner.as_deref() == Some(self.namespace.as_str()),
+                ready: read(self.store.as_ref(), &format!("{root}.ready")).await?,
+                name,
+                generation,
+            });
+        }
+        Ok(databases)
+    }
+
+    /// Mark `name` as a database of this namespace. Only marked databases are deleted.
+    async fn own(&self, name: &str) -> Result<()> {
+        self.store
+            .put(
+                &Path::from(format!("{}.owner", self.path(name))),
+                PutPayload::from(self.namespace.clone().into_bytes()),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Keep the staging database of a snapshot that Raft accepts until its install finishes.
+    pub(crate) fn protect(&self, index: u64, checkpoint: &str) {
+        let mut protected = self.protected.lock().unwrap();
+        if !protected.iter().any(|(_, id)| id == checkpoint) {
+            protected.push((index, checkpoint.to_owned()));
+        }
     }
 
     /// Start a checkpoint of the applied prefix. Call it between apply jobs.
@@ -305,13 +356,18 @@ impl Location {
             ssts.insert(relative.to_owned());
         }
         let peer = self.peer.lock().unwrap().clone();
+        // A member update can change the peer URL after startup. Prefer the applied membership.
+        let peer_url = serde_json::from_slice::<crate::cluster::Store>(&members)
+            .ok()
+            .and_then(|store| store.members.get(&peer.member)?.peer_ur_ls.first().cloned())
+            .or(peer.peer_url);
         Descriptor {
             version: OBJECT_SNAPSHOT_FORMAT,
             applied,
             member: peer.member,
             namespace: self.namespace.clone(),
             backend: self.backend.clone(),
-            peer_url: peer.peer_url,
+            peer_url,
             root,
             checkpoint: checkpoint.to_string(),
             manifest,
@@ -327,20 +383,51 @@ impl Location {
     /// The copy is idempotent. A retry keeps the SSTs that an earlier attempt copied.
     pub(crate) async fn prepare(&self, descriptor: &Descriptor) -> Result<String> {
         let _guard = self.prepare.lock().await;
-        let staging = self.staging();
+        let current = generation(&self.first, &self.current()).unwrap_or(0);
+        let databases = self.scan().await?;
+        let staged = databases
+            .iter()
+            .filter(|db| db.owned && db.generation > current);
+        if let Some(db) = staged
+            .clone()
+            .find(|db| db.ready.as_deref() == Some(descriptor.checkpoint.as_str()))
+        {
+            self.prepared
+                .lock()
+                .unwrap()
+                .insert(descriptor.checkpoint.clone(), db.name.clone());
+            return Ok(db.name.clone());
+        }
+        // Reuse the newest staging database that no accepted snapshot needs. It keeps its SSTs.
+        let protected: Vec<String> = self
+            .protected
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, id)| id.clone())
+            .collect();
+        let mut reusable: Vec<&Database> = staged
+            .filter(|db| db.ready.as_ref().is_none_or(|id| !protected.contains(id)))
+            .collect();
+        reusable.sort_by_key(|db| db.generation);
+        let staging = match reusable.pop() {
+            Some(db) => db.name.clone(),
+            None => {
+                let next = databases.iter().map(|db| db.generation).max().unwrap_or(0);
+                let name = format!("{}-{}", self.first, next.max(current) + 1);
+                self.own(&name).await?;
+                name
+            }
+        };
+        for db in reusable {
+            self.remove(&db.name).await?;
+        }
+        self.prepared
+            .lock()
+            .unwrap()
+            .retain(|_, name| *name != staging && databases.iter().any(|db| db.name == *name));
         let root = self.path(&staging);
         let ready = Path::from(format!("{root}.ready"));
-        match self.store.get(&ready).await {
-            Ok(result) => {
-                if result.bytes().await? == descriptor.checkpoint.as_bytes() {
-                    *self.prepared.lock().unwrap() = Some(descriptor.checkpoint.clone());
-                    return Ok(staging);
-                }
-            }
-            Err(slatedb::object_store::Error::NotFound { .. }) => {}
-            Err(error) => return Err(error.into()),
-        }
-        *self.prepared.lock().unwrap() = None;
         delete(self.store.as_ref(), &ready).await?;
         // Keep copied SSTs. Remove manifests, boundaries, and compaction state of other attempts.
         let compacted = format!("{root}/compacted/");
@@ -391,13 +478,16 @@ impl Location {
                 PutPayload::from(descriptor.checkpoint.clone().into_bytes()),
             )
             .await?;
-        *self.prepared.lock().unwrap() = Some(descriptor.checkpoint.clone());
+        self.prepared
+            .lock()
+            .unwrap()
+            .insert(descriptor.checkpoint.clone(), staging.clone());
         Ok(staging)
     }
 
     /// Return true when the staging database holds `checkpoint` completely.
     pub(crate) fn is_prepared(&self, checkpoint: &str) -> bool {
-        self.prepared.lock().unwrap().as_deref() == Some(checkpoint)
+        self.prepared.lock().unwrap().contains_key(checkpoint)
     }
 
     async fn copy_missing(
@@ -546,12 +636,14 @@ impl Location {
         }
     }
 
-    /// Make the prepared staging database current with one atomic PUT.
-    pub(crate) async fn switch(&self, name: &str) -> Result<String> {
+    /// Make the prepared staging database of snapshot `index` current with one atomic PUT.
+    pub(crate) async fn switch(&self, name: &str, index: u64) -> Result<String> {
         ensure!(
             generation(&self.first, name).is_some(),
             "invalid state name"
         );
+        // A restart after the switch deletes the old database only when it carries this mark.
+        self.own(&self.current()).await?;
         self.store
             .put(
                 &Path::from(join(&self.base, POINTER)),
@@ -559,7 +651,11 @@ impl Location {
             )
             .await?;
         let old = std::mem::replace(&mut *self.current.lock().unwrap(), name.to_owned());
-        *self.prepared.lock().unwrap() = None;
+        self.prepared
+            .lock()
+            .unwrap()
+            .retain(|_, staged| staged != name);
+        self.protected.lock().unwrap().retain(|(i, _)| *i > index);
         Ok(old)
     }
 
@@ -567,8 +663,15 @@ impl Location {
     pub(crate) fn retire(self: &Arc<Self>, db: Arc<Db>, name: String) {
         let location = self.clone();
         tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-            while Arc::strong_count(&db) > 1 && tokio::time::Instant::now() < deadline {
+            // Each read view holds the database. Wait for the views instead of a fixed time,
+            // because a closed database fails the reads of a pinned snapshot.
+            let start = tokio::time::Instant::now();
+            let mut warned = false;
+            while Arc::strong_count(&db) > 1 {
+                if !warned && start.elapsed() > Duration::from_secs(60) {
+                    warned = true;
+                    tracing::warn!(name, "a replaced state database still has readers");
+                }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             let _ = db
@@ -581,30 +684,12 @@ impl Location {
         });
     }
 
-    /// Delete databases other than the current and staging databases.
+    /// Delete replaced databases of this namespace. Other databases in the store stay intact.
     pub(crate) async fn remove_orphans(&self) -> Result<()> {
-        let current = self.current.lock().unwrap().clone();
-        let keep = [current, self.staging()];
-        let base = (!self.base.is_empty()).then(|| Path::from(self.base.as_str()));
-        let listing = self.store.list_with_delimiter(base.as_ref()).await?;
-        let mut names = BTreeSet::new();
-        for prefix in listing.common_prefixes {
-            if let Some(name) = prefix.filename() {
-                names.insert(name.to_owned());
-            }
-        }
-        for object in listing.objects {
-            if let Some(name) = object
-                .location
-                .filename()
-                .and_then(|n| n.strip_suffix(".ready"))
-            {
-                names.insert(name.to_owned());
-            }
-        }
-        for name in names {
-            if generation(&self.first, &name).is_some() && !keep.contains(&name) {
-                self.remove(&name).await?;
+        let current = generation(&self.first, &self.current()).unwrap_or(0);
+        for db in self.scan().await? {
+            if db.owned && db.generation < current {
+                self.remove(&db.name).await?;
             }
         }
         Ok(())
@@ -615,7 +700,24 @@ impl Location {
         for path in list(self.store.as_ref(), &root).await? {
             delete(self.store.as_ref(), &path).await?;
         }
-        delete(self.store.as_ref(), &Path::from(format!("{root}.ready"))).await
+        delete(self.store.as_ref(), &Path::from(format!("{root}.ready"))).await?;
+        // The ownership mark goes last, so an interrupted delete can finish after a restart.
+        delete(self.store.as_ref(), &Path::from(format!("{root}.owner"))).await
+    }
+}
+
+struct Database {
+    name: String,
+    generation: u64,
+    owned: bool,
+    ready: Option<String>,
+}
+
+async fn read(store: &dyn ObjectStore, path: &str) -> Result<Option<String>> {
+    match store.get(&Path::from(path)).await {
+        Ok(result) => Ok(Some(String::from_utf8(result.bytes().await?.to_vec())?)),
+        Err(slatedb::object_store::Error::NotFound { .. }) => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 

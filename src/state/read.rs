@@ -4,6 +4,8 @@ use super::*;
 pub(crate) struct ReadView {
     metrics: Arc<crate::metrics::StateMeters>,
     pub snapshot: Arc<slatedb::DbSnapshot>,
+    /// Keep the database open while the view reads it. A snapshot install replaces it.
+    _database: Arc<Db>,
     rows: Arc<super::rows::RowCache>,
     pub revision: i64,
     pub compact_revision: i64,
@@ -23,6 +25,7 @@ impl StateMachine {
         Ok(Arc::new(ReadView {
             metrics: self.metrics.clone(),
             snapshot,
+            _database: self.db.clone(),
             rows: self.rows.clone(),
             revision: self.revision,
             compact_revision: self.compact_revision,

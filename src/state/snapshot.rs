@@ -131,7 +131,7 @@ impl StateMachine {
             let _ = next.close().await;
             anyhow::bail!("copied state does not match the snapshot index");
         }
-        let old_name = location.switch(&staging).await?;
+        let old_name = location.switch(&staging, index).await?;
         crate::failpoint::hit("snapshot-after-install-write");
         next.metrics = self.metrics.clone();
         next.quota = self.quota;

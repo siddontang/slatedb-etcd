@@ -164,7 +164,13 @@ async fn a_restart_restores_the_membership_of_an_installed_snapshot() {
     peers.insert(1, "127.0.0.1:1".to_owned());
     peers.insert(2, "127.0.0.1:2".to_owned());
     leader.members = Arc::new(crate::cluster::Store::initial(&peers));
+    // A member update changed the peer URL after startup. The applied membership wins.
+    leader
+        .location
+        .bind(1, "transfer-test", Some("http://127.0.0.1:9".into()), None);
     let snapshot = image(&leader).await;
+    let descriptor = Descriptor::decode(&snapshot.data).unwrap().unwrap();
+    assert_eq!(descriptor.peer_url.as_deref(), Some("http://127.0.0.1:1"));
     let mut follower = open(follower_dir.path(), 2).await;
     follower.install_snapshot(&snapshot).await.unwrap();
     assert_eq!(follower.members.members.len(), 2);
@@ -240,4 +246,126 @@ fn only_fresh_own_descriptors_are_transferable() {
     assert_eq!(generation("state", "state-01"), None);
     assert_eq!(generation("state", "state-+1"), None);
     assert_eq!(generation("state", "states"), None);
+}
+
+#[tokio::test]
+async fn an_accepted_snapshot_keeps_its_staging_copy_when_a_newer_copy_starts() {
+    let leader_dir = tempfile::tempdir().unwrap();
+    let follower_dir = tempfile::tempdir().unwrap();
+    let mut leader = open(leader_dir.path(), 1).await;
+    for index in 1..=20 {
+        put(&mut leader, index, &format!("key-{index}"), "first").await;
+    }
+    let accepted = image(&leader).await;
+    let accepted_descriptor = Descriptor::decode(&accepted.data).unwrap().unwrap();
+    for index in 21..=40 {
+        put(&mut leader, index, &format!("key-{index}"), "second").await;
+    }
+    let newer = Descriptor::decode(&image(&leader).await.data)
+        .unwrap()
+        .unwrap();
+
+    let mut follower = open(follower_dir.path(), 2).await;
+    let staging = follower
+        .location
+        .prepare(&accepted_descriptor)
+        .await
+        .unwrap();
+    // Raft accepts the first snapshot. A newer transfer then starts before the install.
+    follower
+        .location
+        .protect(20, &accepted_descriptor.checkpoint);
+    let other = follower.location.prepare(&newer).await.unwrap();
+    assert_ne!(staging, other);
+    assert!(exists(&follower, &format!("{staging}.ready")).await);
+
+    // The install must not need the source again.
+    leader.close().await.unwrap();
+    drop(leader);
+    follower.install_snapshot(&accepted).await.unwrap();
+    assert_eq!(follower.applied, 20);
+    assert_eq!(follower.location.root(), staging);
+    assert_eq!(
+        follower.local_value("key-20").await.unwrap().as_deref(),
+        Some("first")
+    );
+    assert_eq!(follower.local_value("key-21").await.unwrap(), None);
+    follower.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cleanup_keeps_a_sibling_database_that_this_member_does_not_own() {
+    let leader_dir = tempfile::tempdir().unwrap();
+    let follower_dir = tempfile::tempdir().unwrap();
+    let mut leader = open(leader_dir.path(), 1).await;
+    put(&mut leader, 1, "key", "leader").await;
+    let snapshot = image(&leader).await;
+
+    let mut follower = open(follower_dir.path(), 2).await;
+    // An independent database uses a name that looks like a generation of this family.
+    let store = follower.location.store();
+    let mut sibling = StateMachine::open_store(store.clone(), "state-5")
+        .await
+        .unwrap();
+    put(&mut sibling, 1, "sibling", "kept").await;
+    sibling.db.flush().await.unwrap();
+    sibling.close().await.unwrap();
+    drop(sibling);
+
+    follower.install_snapshot(&snapshot).await.unwrap();
+    assert_eq!(follower.location.root(), "state-6");
+    follower.close().await.unwrap();
+    drop(follower);
+    let follower = open(follower_dir.path(), 2).await;
+    assert_eq!(follower.location.root(), "state-6");
+    assert!(!exists(&follower, "state.owner").await);
+    follower.close().await.unwrap();
+
+    // The sibling database keeps its manifest and its SSTs.
+    let admin = slatedb::admin::Admin::builder("state-5", store.clone()).build();
+    let manifest = admin.read_manifest(None).await.unwrap().unwrap();
+    let resolver = slatedb::PathResolver::new("state-5", &manifest);
+    let ssts: Vec<_> = manifest.all_sst_views().collect();
+    assert!(!ssts.is_empty());
+    for view in ssts {
+        store.head(&resolver.sst_path(&view.sst.id)).await.unwrap();
+    }
+    leader.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_read_view_keeps_the_replaced_database_open() {
+    let leader_dir = tempfile::tempdir().unwrap();
+    let follower_dir = tempfile::tempdir().unwrap();
+    let mut leader = open(leader_dir.path(), 1).await;
+    for index in 1..=5 {
+        put(&mut leader, index, "key", "leader").await;
+    }
+    let snapshot = image(&leader).await;
+    let mut follower = open(follower_dir.path(), 2).await;
+    put(&mut follower, 1, "key", "follower").await;
+    let view = follower.read_view().unwrap();
+    follower.install_snapshot(&snapshot).await.unwrap();
+    assert_eq!(follower.location.root(), "state-1");
+
+    // The retire task waits for the view. The pinned snapshot stays readable.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(view
+        .snapshot
+        .get(crate::state::APPLIED)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(exists(&follower, "state.owner").await);
+    drop(view);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while exists(&follower, "state.owner").await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "old database was not deleted"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    follower.close().await.unwrap();
+    leader.close().await.unwrap();
 }
