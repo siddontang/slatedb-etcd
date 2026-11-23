@@ -28,6 +28,8 @@ use slatedb::object_store::local::LocalFileSystem;
 use slatedb::object_store::path::Path;
 use slatedb::object_store::*;
 
+use super::sst_reads::{self, SstReads};
+
 const PACE_BYTES: u64 = 1024 * 1024;
 /// SST windows in writeback across the process. About 4 MiB in flight keeps a SATA SSD busy
 /// with SST data while a Raft log sync waits behind only a few milliseconds of it.
@@ -40,6 +42,7 @@ const MAX_COMPACTION_WINDOWS: usize = 1;
 #[derive(Debug)]
 pub(crate) struct PacedStore {
     inner: Arc<LocalFileSystem>,
+    reads: Arc<SstReads>,
 }
 
 impl PacedStore {
@@ -47,6 +50,7 @@ impl PacedStore {
     pub fn new(inner: LocalFileSystem) -> Self {
         Self {
             inner: Arc::new(inner),
+            reads: Arc::default(),
         }
     }
 
@@ -294,6 +298,78 @@ impl ObjectStore for PacedStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult> {
+        // A put may replace an SST that reads have open.
+        self.reads.evict(location);
+        let result = self.put_opts_inner(location, payload, opts).await;
+        self.reads.evict(location);
+        result
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>> {
+        self.reads.evict(location);
+        self.put_multipart_opts_inner(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        if !sst_reads::serves(location, &options) {
+            return self.inner.get_opts(location, options).await;
+        }
+        let path = self.inner.path_to_filesystem(location)?;
+        self.reads.get(location, path, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        paths: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        use futures::StreamExt;
+        // Close descriptors before the delete and again after it, so a read that opened the
+        // path in between cannot keep a deleted SST open.
+        let (before, after) = (self.reads.clone(), self.reads.clone());
+        let paths = paths
+            .inspect(move |path| {
+                if let Ok(path) = path {
+                    before.evict(path);
+                }
+            })
+            .boxed();
+        self.inner
+            .delete_stream(paths)
+            .inspect(move |path| {
+                if let Ok(path) = path {
+                    after.evict(path);
+                }
+            })
+            .boxed()
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+        self.reads.evict(to);
+        let result = self.inner.copy_opts(from, to, options).await;
+        self.reads.evict(to);
+        result
+    }
+}
+
+impl PacedStore {
+    async fn put_opts_inner(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult> {
         if !Self::paced(location, &opts.mode) {
             return self.inner.put_opts(location, payload, opts).await;
         }
@@ -313,7 +389,7 @@ impl ObjectStore for PacedStore {
         self.result(location).await
     }
 
-    async fn put_multipart_opts(
+    async fn put_multipart_opts_inner(
         &self,
         location: &Path,
         opts: PutMultipartOptions,
@@ -331,6 +407,7 @@ impl ObjectStore for PacedStore {
         };
         Ok(Box::new(PacedUpload {
             store: self.inner.clone(),
+            reads: self.reads.clone(),
             location: location.clone(),
             dest,
             staged,
@@ -339,34 +416,12 @@ impl ObjectStore for PacedStore {
             writer,
         }))
     }
-
-    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        self.inner.get_opts(location, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        paths: BoxStream<'static, Result<Path>>,
-    ) -> BoxStream<'static, Result<Path>> {
-        self.inner.delete_stream(paths)
-    }
-
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-        self.inner.list(prefix)
-    }
-
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-        self.inner.copy_opts(from, to, options).await
-    }
 }
 
 #[derive(Debug)]
 struct PacedUpload {
     store: Arc<LocalFileSystem>,
+    reads: Arc<SstReads>,
     location: Path,
     dest: PathBuf,
     staged: PathBuf,
@@ -416,9 +471,12 @@ impl MultipartUpload for PacedUpload {
             source: "upload completed before its parts".into(),
         })?;
         let (staged, dest) = (self.staged.clone(), self.dest.clone());
-        tokio::task::spawn_blocking(move || publish(file, &staged, &dest))
+        let published = tokio::task::spawn_blocking(move || publish(file, &staged, &dest))
             .await
-            .map_err(join_error)??;
+            .map_err(join_error)
+            .and_then(|r| r);
+        self.reads.evict(&self.location);
+        published?;
         let meta = self.store.head(&self.location).await?;
         Ok(PutResult {
             e_tag: meta.e_tag,
@@ -533,6 +591,107 @@ mod tests {
             .filter(|name| name.contains('#'))
             .collect();
         assert!(staged.is_empty(), "{staged:?}");
+    }
+
+    /// Cached SST descriptors serve the bytes the path holds now, through overwrites, renames,
+    /// and deletes, for inline, blocking, partial, and whole-object reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sst_reads_follow_the_current_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PacedStore::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let data = |seed: u8, len: usize| -> Vec<u8> {
+            (0..len).map(|i| (i % 251) as u8 ^ seed).collect()
+        };
+        let path = Path::from("state/compacted/x.sst");
+        let first = data(1, 3 * 1024 * 1024);
+        store.put(&path, first.clone().into()).await.unwrap();
+        for _ in 0..2 {
+            // The first read opens the file; the second uses the cached descriptor.
+            for range in [0..4096, 10..10_000, 5000..(1 << 20), 0..first.len() as u64] {
+                let got = store.get_range(&path, range.clone()).await.unwrap();
+                assert_eq!(&got[..], &first[range.start as usize..range.end as usize]);
+            }
+            let whole = store.get(&path).await.unwrap();
+            assert_eq!(whole.meta.size, first.len() as u64);
+            assert_eq!(whole.bytes().await.unwrap(), first);
+        }
+        // Ranges past the end behave as in the inner store: clamped, or an error from the end on.
+        let len = first.len() as u64;
+        assert_eq!(store.get_range(&path, 0..len + 1).await.unwrap(), first);
+        let inner = store.inner.get_range(&path, 0..len + 1).await.unwrap();
+        assert_eq!(inner, first);
+        assert!(store.get_range(&path, len..len + 1).await.is_err());
+        assert!(store.inner.get_range(&path, len..len + 1).await.is_err());
+
+        // A replaced SST is read from its new file, through both put paths.
+        let second = data(2, 8192);
+        store.put(&path, second.clone().into()).await.unwrap();
+        assert_eq!(store.get_range(&path, 0..8192).await.unwrap(), second);
+        let third = data(3, 8192);
+        let mut upload = store.put_multipart(&path).await.unwrap();
+        upload.put_part(third.clone().into()).await.unwrap();
+        upload.complete().await.unwrap();
+        assert_eq!(store.get_range(&path, 0..8192).await.unwrap(), third);
+
+        // A copy or rename onto a cached path replaces it too.
+        let other = Path::from("state/compacted/y.sst");
+        let fourth = data(4, 8192);
+        store.put(&other, fourth.clone().into()).await.unwrap();
+        assert_eq!(store.get_range(&other, 0..8192).await.unwrap(), fourth);
+        store.copy(&other, &path).await.unwrap();
+        assert_eq!(store.get_range(&path, 0..8192).await.unwrap(), fourth);
+        store.put(&other, second.clone().into()).await.unwrap();
+        store.rename(&other, &path).await.unwrap();
+        assert_eq!(store.get_range(&path, 0..8192).await.unwrap(), second);
+        assert!(matches!(
+            store.get_range(&other, 0..1).await,
+            Err(Error::NotFound { .. })
+        ));
+
+        // A deleted SST is gone, and its descriptor is closed.
+        store.delete(&path).await.unwrap();
+        assert!(matches!(
+            store.get_range(&path, 0..1).await,
+            Err(Error::NotFound { .. })
+        ));
+        assert!(!store.reads.is_open(&path));
+
+        // Preconditioned and head requests keep the inner store's handling.
+        store.put(&path, first.clone().into()).await.unwrap();
+        let meta = store.head(&path).await.unwrap();
+        let opts = GetOptions {
+            if_none_match: meta.e_tag.clone(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            store.get_opts(&path, opts).await,
+            Err(Error::NotModified { .. })
+        ));
+        // The cached metadata matches what the inner store reports.
+        let cached = store.get(&path).await.unwrap().meta;
+        assert_eq!((cached.size, &cached.e_tag), (meta.size, &meta.e_tag));
+    }
+
+    /// A read that opened a path before it changed does not cache its descriptor.
+    #[test]
+    fn sst_reads_drop_descriptors_opened_before_a_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("a.sst");
+        std::fs::write(&file_path, b"old").unwrap();
+        let reads = SstReads::default();
+        let path = Path::from("a.sst");
+        let generation = reads.generation();
+        let file = File::open(&file_path).unwrap();
+        let meta = ObjectMeta {
+            location: path.clone(),
+            last_modified: Default::default(),
+            size: 3,
+            e_tag: None,
+            version: None,
+        };
+        reads.evict(&path);
+        reads.insert_for_test(&path, file, meta, generation);
+        assert!(!reads.is_open(&path));
     }
 
     #[test]
