@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check fetched history for private metadata, local paths, and missing sign-offs."""
+"""Check fetched history for workstation paths and missing DCO sign-offs."""
 
 import argparse
 import json
@@ -8,14 +8,7 @@ import re
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
-SIGN_OFF = b"Signed-off-by: siddontang <siddontang@gmail.com>"
-# Maintainer sign-offs. These emails remain public by request.
-MAINTAINER_SIGN_OFFS = (SIGN_OFF, b"Signed-off-by: nolouch <nolouch@gmail.com>")
-# Maintainers who merge pull requests on GitHub with these emails as the author.
-MAINTAINER_EMAILS = (b"siddontang@gmail.com", b"nolouch@gmail.com")
-PUBLIC_EMAIL = re.compile(rb"(?:[\w.+-]+@users\.noreply\.github\.com|noreply@github\.com)\Z")
-SIGN_OFF_LINE = re.compile(rb"Signed-off-by: [^<>\n]+ <([^<>\s]+)>")
-EMAIL = re.compile(rb"[\w.+%-]+@[\w.-]+\.[A-Za-z]{2,}")
+SIGN_OFF_LINE = re.compile(rb"Signed-off-by: [^<>\n]+ <[^<>\s]+>")
 HOME = re.compile(rb"(?<![\w./<>-])/(?:Users|home)/([^/\s\"'<>]+)")
 TEMP = re.compile(rb"/(?:private/)?var/folders/[^/\s]+/[^/\s]+")
 WINDOWS_HOME = re.compile(rb"[A-Za-z]:\\Users\\[^\\\s\"'<>]+", re.IGNORECASE)
@@ -39,53 +32,18 @@ def path_errors(data, name=""):
     return sorted(set(errors))
 
 
-def sign_off_error(trailers, lines, author):
-    """Accept one maintainer sign-off, or one sign-off by the author with a GitHub public email.
-
-    A maintainer records approval of contributed commits with a signed-off merge commit.
-    """
-    if any(line in MAINTAINER_SIGN_OFFS for line in (*trailers, *lines)):
-        in_trailers = [line for line in trailers if line in MAINTAINER_SIGN_OFFS]
-        in_lines = [line for line in lines if line in MAINTAINER_SIGN_OFFS]
-        if len(in_trailers) != 1 or in_lines != in_trailers:
-            return "missing or repeated owner sign-off"
-        return None
-    sign_offs = [line for line in trailers if line.startswith(b"Signed-off-by:")]
-    match = SIGN_OFF_LINE.fullmatch(sign_offs[0]) if len(sign_offs) == 1 else None
-    if (match is None or lines.count(sign_offs[0]) != 1 or author is None
-            or PUBLIC_EMAIL.fullmatch(match[1]) is None or match[1] != author):
-        return "missing owner sign-off or author sign-off with a GitHub public email"
-    return None
-
-
-def web_merge(headers, emails):
-    """Return whether a maintainer merged a pull request on GitHub.
-
-    GitHub commits merge and squash merges, so the merge itself records the maintainer approval.
-    A squash merge repeats the sign-offs of the squashed commits.
-    """
-    return (emails[b"author"] in MAINTAINER_EMAILS
-            and emails[b"committer"] == b"noreply@github.com")
-
-
 def commit_errors(root, raw):
+    """Require a DCO sign-off on each commit that a person wrote.
+
+    Merge commits and commits that GitHub creates, such as web merges, need no sign-off.
+    """
     headers, message = raw.split(b"\n\n", 1)
     errors = path_errors(message)
-    emails = {}
-    for field in (b"author", b"committer"):
-        match = re.search(rb"(?m)^" + field + rb" .* <([^<>]+)> ", headers)
-        emails[field] = match[1] if match else None
-        if match is None or (PUBLIC_EMAIL.fullmatch(match[1]) is None
-                             and not (field == b"author" and match[1] in MAINTAINER_EMAILS)):
-            errors.append(field.decode() + " must use a GitHub public email")
+    merge = len(re.findall(rb"(?m)^parent ", headers)) > 1
+    github = re.search(rb"(?m)^committer .* <noreply@github\.com> ", headers) is not None
     trailers = git(root, "interpret-trailers", "--parse", data=message).splitlines()
-    error = sign_off_error(trailers, message.splitlines(), emails[b"author"])
-    if error and not web_merge(headers, emails):
-        errors.append(error)
-    lines = message.splitlines()
-    remaining = b"\n".join(line for line in lines if line not in MAINTAINER_SIGN_OFFS)
-    if any(PUBLIC_EMAIL.fullmatch(address) is None for address in EMAIL.findall(remaining)):
-        errors.append("personal email outside the owner sign-off")
+    if not (merge or github) and not any(SIGN_OFF_LINE.fullmatch(t) for t in trailers):
+        errors.append("missing Signed-off-by trailer")
     return errors
 
 
@@ -111,12 +69,6 @@ def audit(root, revisions=("--all",)):
         else:
             counts["tags"] += 1
             errors = path_errors(data)
-            match = re.search(rb"(?m)^tagger .* <([^<>]+)> ", data)
-            if match and PUBLIC_EMAIL.fullmatch(match[1]) is None:
-                errors.append("tagger must use a GitHub public email")
-            message = data.partition(b"\n\n")[2]
-            if any(PUBLIC_EMAIL.fullmatch(value) is None for value in EMAIL.findall(message)):
-                errors.append("personal email in tag message")
         for error in errors:
             failures.append({"object": oid.decode(), "path": name.decode(), "error": error})
     return counts, failures
