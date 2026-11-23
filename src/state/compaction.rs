@@ -127,6 +127,143 @@ struct HistoryRow {
     tombstone: bool,
 }
 
+/// The result of one bounded step.
+struct Step {
+    progress: Progress,
+    batch: WriteBatch,
+    finished: bool,
+}
+
+/// A step that a background task reads before its `CompactStep` entry applies.
+struct Plan {
+    input: Progress,
+    task: tokio::task::JoinHandle<Result<Step>>,
+}
+
+impl Drop for Plan {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Read the next step outside ordered apply.
+///
+/// A step reads only rows at or below its boundary: hash records, history versions, and Watch
+/// events. Later entries add rows only above the boundary, and only compaction steps remove
+/// rows. So a step that starts after the previous step is written reads the same rows as an
+/// inline step at its own index. Apply uses a plan only when its input equals the current
+/// progress, and it reads the step inline otherwise.
+pub(crate) struct Planner {
+    plan: Option<Plan>,
+    generation: u64,
+    /// Steps that applied a background read.
+    pub planned: u64,
+    /// The newest generation whose step is ready. The leader proposes a step after this.
+    ready: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+impl Default for Planner {
+    fn default() -> Self {
+        Self {
+            plan: None,
+            generation: 0,
+            planned: 0,
+            ready: Arc::new(tokio::sync::watch::channel(0).0),
+        }
+    }
+}
+
+impl Planner {
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.ready.subscribe()
+    }
+
+    /// The generation that the next step needs. Zero means that no step is pending.
+    pub fn generation(&self) -> u64 {
+        self.plan.as_ref().map_or(0, |_| self.generation)
+    }
+
+    pub fn clear(&mut self) {
+        self.plan = None;
+    }
+
+    fn start(&mut self, db: &Arc<Db>, progress: Option<&Progress>) {
+        let Some(progress) = progress else {
+            self.plan = None;
+            return;
+        };
+        if self
+            .plan
+            .as_ref()
+            .is_some_and(|plan| &plan.input == progress)
+        {
+            return;
+        }
+        self.generation += 1;
+        let generation = self.generation;
+        let ready = self.ready.clone();
+        let db = db.clone();
+        let input = progress.clone();
+        let task = tokio::spawn(async move {
+            // Publish also after a failure or panic, so the leader proposes the step and reads
+            // it inline.
+            let _ready = Ready(ready, generation);
+            read_step(&db, input).await
+        });
+        self.plan = Some(Plan {
+            input: progress.clone(),
+            task,
+        });
+    }
+
+    /// Take the planned step for `progress`, if one exists.
+    async fn take(&mut self, progress: &Progress) -> Option<Step> {
+        let mut plan = self.plan.take().filter(|plan| &plan.input == progress)?;
+        match (&mut plan.task).await {
+            Ok(Ok(step)) => {
+                self.planned += 1;
+                Some(step)
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "planned compaction step failed; reading it inline");
+                None
+            }
+            Err(error) => {
+                tracing::warn!(%error, "planned compaction step stopped; reading it inline");
+                None
+            }
+        }
+    }
+}
+
+struct Ready(Arc<tokio::sync::watch::Sender<u64>>, u64);
+
+impl Drop for Ready {
+    fn drop(&mut self) {
+        let generation = self.1;
+        self.0.send_if_modified(|old| {
+            let newer = *old < generation;
+            *old = (*old).max(generation);
+            newer
+        });
+    }
+}
+
+async fn read_step(db: &Db, mut progress: Progress) -> Result<Step> {
+    let mut batch = WriteBatch::new();
+    let finished = Reader { db }.work(&mut progress, &mut batch).await?;
+    Ok(Step {
+        progress,
+        batch,
+        finished,
+    })
+}
+
+/// Read-only compaction work. It reads storage and records deletes in the step batch.
+struct Reader<'a> {
+    db: &'a Db,
+}
+
 impl StateMachine {
     /// The highest boundary whose obsolete rows are physically removed.
     pub fn physical_revision(&self) -> i64 {
@@ -194,6 +331,7 @@ impl StateMachine {
         if result.is_ok() {
             self.compact_revision = request.revision;
         }
+        self.plan_compaction();
         crate::failpoint::hit("compact-after-apply");
         Ok(Outcome { result })
     }
@@ -208,26 +346,41 @@ impl StateMachine {
             "non-contiguous state machine apply"
         );
         let mut batch = WriteBatch::new();
-        let mut progress = self.compaction.clone();
+        let mut progress = None;
         let mut finished = false;
-        if let Some(state) = &mut progress {
-            finished = self.compaction_work(state, &mut batch).await?;
-            if state.targets.is_empty() {
+        if let Some(current) = self.compaction.clone() {
+            let step = match self.compaction_plan.take(&current).await {
+                Some(step) => step,
+                None => read_step(&self.db, current).await?,
+            };
+            batch = step.batch;
+            finished = step.finished;
+            if step.progress.targets.is_empty() {
                 batch.delete(PENDING);
             } else {
-                batch.put(PENDING, serde_json::to_vec(state)?);
+                batch.put(PENDING, serde_json::to_vec(&step.progress)?);
             }
+            progress = Some(step.progress);
         }
         crate::failpoint::hit("compact-step-before-apply");
         batch.put(APPLIED, index.to_be_bytes());
         self.write_batch(batch, index).await?;
         self.applied = index;
         self.compaction = progress.filter(|state| !state.targets.is_empty());
+        self.plan_compaction();
         Ok(finished.then(|| self.physical_revision()))
     }
 
+    /// Start reading the next step for the current progress in the background.
+    pub(crate) fn plan_compaction(&mut self) {
+        self.compaction_plan
+            .start(&self.db, self.compaction.as_ref());
+    }
+}
+
+impl Reader<'_> {
     /// Return true when at least one physical target is complete.
-    async fn compaction_work(&self, state: &mut Progress, batch: &mut WriteBatch) -> Result<bool> {
+    async fn work(&self, state: &mut Progress, batch: &mut WriteBatch) -> Result<bool> {
         let mut budget = STEP_COST;
         let mut finished = false;
         let mut cache: Option<Vec<Value>> = None;
@@ -266,7 +419,7 @@ impl StateMachine {
                     } else {
                         state.crc_all
                     };
-                    let hash = crc32c::crc32c_combine(part, state.crc_new, state.len_new as usize);
+                    let hash = crate::crc::combine(part, state.crc_new, state.len_new as usize);
                     let hashes = match &mut cache {
                         Some(hashes) => hashes,
                         None => cache.insert(self.hash_cache().await?),
@@ -285,6 +438,13 @@ impl StateMachine {
             }
         }
         Ok(finished)
+    }
+
+    async fn hash_cache(&self) -> Result<Vec<Value>> {
+        match self.db.get(HASH_CACHE).await? {
+            Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            None => Ok(vec![]),
+        }
     }
 
     fn start(state: &Progress, prefix: &[u8]) -> Vec<u8> {
@@ -398,6 +558,12 @@ impl StateMachine {
                 "invalid history key"
             );
             let split = row.key.len() - 8;
+            let revision = i64::from_be_bytes(row.key[split..].try_into()?);
+            if revision > target.revision {
+                // Later entries add these rows while a planned step reads. They must not change
+                // the step budget or its cursor.
+                continue;
+            }
             if prefix
                 .as_ref()
                 .is_some_and(|prefix| prefix[..] != row.key[..split])
@@ -413,10 +579,6 @@ impl StateMachine {
             }
             prefix = Some(row.key.slice(..split));
             *budget = budget.saturating_sub(1);
-            let revision = i64::from_be_bytes(row.key[split..].try_into()?);
-            if revision > target.revision {
-                continue;
-            }
             let len = row.value.len();
             let version = Version::decode(row.value)?;
             group.push(HistoryRow {

@@ -22,6 +22,8 @@ pub(super) struct AppliedState {
     /// Watch events that this state publishes after the node installs it.
     pub watch: Option<std::sync::Arc<crate::watch::Batch>>,
     pub compaction_pending: bool,
+    /// The background read generation that the next compaction step needs.
+    pub compaction_plan: u64,
     pub physical_revision: i64,
 }
 
@@ -43,6 +45,7 @@ impl AppliedState {
             logical_size: state.logical_size(),
             watch: None,
             compaction_pending: state.compaction_pending(),
+            compaction_plan: state.compaction_plan.generation(),
             physical_revision: state.physical_revision(),
         })
     }

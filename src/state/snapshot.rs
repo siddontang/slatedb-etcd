@@ -55,6 +55,8 @@ impl StateMachine {
             !snapshot.data.is_empty(),
             "state storage is behind the log truncation point"
         );
+        // The installed rows replace the rows that a planned compaction step reads.
+        self.compaction_plan.clear();
         // Installed journal rows reach watchers through storage catch-up.
         if let Some(capture) = &mut self.watch_capture {
             capture.invalidate();
@@ -88,6 +90,7 @@ impl StateMachine {
         self.revision = read_revision(&self.db).await?;
         self.compact_revision = read_compact_revision(&self.db).await?;
         self.compaction = compaction::load(&self.db).await?;
+        self.plan_compaction();
         self.leases = Arc::new(crate::lease::load(&self.db).await?);
         self.alarms = match self.db.get(crate::maintenance::ALARMS).await? {
             Some(data) => serde_json::from_slice(&data)?,

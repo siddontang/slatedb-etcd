@@ -421,10 +421,9 @@ pub(crate) fn hash_record_key(record: &[u8]) -> Result<Vec<u8>> {
 /// Returns the new CRC and the number of bytes that it added.
 pub(crate) fn hash_append(crc: u32, record: &[u8]) -> Result<(u32, u64)> {
     Ok(match parse_hash_record(record)? {
-        HashRecord::Digest { crc: part, len, .. } => (
-            crc32c::crc32c_combine(crc, part, usize::try_from(len)?),
-            len,
-        ),
+        HashRecord::Digest { crc: part, len, .. } => {
+            (crate::crc::combine(crc, part, usize::try_from(len)?), len)
+        }
         HashRecord::Full(bytes) => (crc32c::crc32c_append(crc, bytes), bytes.len() as u64),
     })
 }
