@@ -1,5 +1,6 @@
 use super::*;
 use crate::watch::{Batch, FeedState, PAGE_REVISIONS};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 use tokio_stream::wrappers::ReceiverStream;
@@ -12,8 +13,11 @@ const MAX_WATCHERS: usize = 1024;
 
 struct Watcher {
     _active: Option<crate::metrics::Active>,
-    /// `start_revision` is the next revision that this watcher can receive.
+    /// The create request. `Stream` keeps its start revision in `start`.
     request: WatchCreateRequest,
+    /// The next revision that this watcher can receive.
+    /// `None` means `position + 1` of the stream: the watcher follows the feed.
+    start: Option<i64>,
     progress: tokio::time::Instant,
 }
 
@@ -22,9 +26,13 @@ type Output = mpsc::Sender<Result<WatchResponse, Status>>;
 /// The state of one watch stream.
 ///
 /// The stream has received every feed batch through `position`.
-/// A watcher with `start_revision > position` is synced and takes events from the feed.
+/// A watcher with a start revision above `position` is synced and takes events from the feed.
 /// Other watchers read the journal from a pinned view until they pass that view.
-/// Each journal revision reaches a watcher once because delivery advances `start_revision`.
+/// Each journal revision reaches a watcher once because delivery advances its start revision.
+///
+/// Most synced watchers follow the feed: their start revision is `position + 1`. They do not
+/// store it, so a feed batch does not visit them one by one. Only watchers in `pinned` store a
+/// start revision.
 struct Stream {
     tx: Output,
     require_leader: bool,
@@ -35,6 +43,12 @@ struct Stream {
     checked_auth: Arc<crate::auth::Store>,
     position: i64,
     watchers: BTreeMap<i64, Watcher>,
+    /// Single-key watchers by key. A batch visits only the watchers that its events can match.
+    keys: HashMap<Vec<u8>, BTreeSet<i64>>,
+    /// Watchers of a key range.
+    ranges: BTreeSet<i64>,
+    /// Watchers that store their start revision.
+    pinned: BTreeSet<i64>,
     next_id: i64,
 }
 
@@ -74,6 +88,9 @@ impl Stream {
             checked_auth,
             position,
             watchers: BTreeMap::new(),
+            keys: HashMap::new(),
+            ranges: BTreeSet::new(),
+            pinned: BTreeSet::new(),
             next_id: 0,
         }
     }
@@ -95,11 +112,94 @@ impl Stream {
         }
     }
 
+    /// Return the next revision that `watcher` can receive.
+    fn start(&self, watcher: &Watcher) -> i64 {
+        watcher.start.unwrap_or(self.position + 1)
+    }
+
     fn unsynced(&self) -> bool {
+        // A following watcher starts after `position`, so only pinned watchers can be unsynced.
         let bound = self.position.min(self.state.borrow().view.revision);
-        self.watchers
-            .values()
-            .any(|w| w.request.start_revision <= bound)
+        self.pinned
+            .iter()
+            .any(|id| self.watchers[id].start.is_some_and(|start| start <= bound))
+    }
+
+    /// Store `position + 1` in every following watcher. Call it before `position` moves past
+    /// revisions that the following watchers did not receive.
+    fn pin_all(&mut self) {
+        let start = self.position + 1;
+        for (&id, watcher) in &mut self.watchers {
+            if watcher.start.is_none() {
+                watcher.start = Some(start);
+                self.pinned.insert(id);
+            }
+        }
+    }
+
+    /// Let pinned watchers with start revision `position + 1` follow the feed.
+    fn unpin(&mut self) {
+        let next = self.position + 1;
+        let watchers = &mut self.watchers;
+        self.pinned.retain(|id| {
+            let watcher = watchers.get_mut(id).expect("pinned watcher");
+            if watcher.start == Some(next) {
+                watcher.start = None;
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Add a watcher that starts at `start`.
+    fn insert(&mut self, mut watcher: Watcher, start: i64) {
+        let id = watcher.request.watch_id;
+        if start == self.position + 1 {
+            watcher.start = None;
+        } else {
+            watcher.start = Some(start);
+            self.pinned.insert(id);
+        }
+        if watcher.request.range_end.is_empty() {
+            self.keys
+                .entry(watcher.request.key.clone())
+                .or_default()
+                .insert(id);
+        } else {
+            self.ranges.insert(id);
+        }
+        self.watchers.insert(id, watcher);
+    }
+
+    fn remove(&mut self, id: i64) -> Option<Watcher> {
+        let watcher = self.watchers.remove(&id)?;
+        self.pinned.remove(&id);
+        if watcher.request.range_end.is_empty() {
+            if let Some(ids) = self.keys.get_mut(&watcher.request.key) {
+                ids.remove(&id);
+                if ids.is_empty() {
+                    self.keys.remove(&watcher.request.key);
+                }
+            }
+        } else {
+            self.ranges.remove(&id);
+        }
+        Some(watcher)
+    }
+
+    /// Put the IDs of the watchers that can match an event of `journal` in `ids`, in ID order.
+    /// The caller still filters by revision, key range, and event type.
+    fn candidates(&self, journal: &crate::proto::state::Journal, ids: &mut Vec<i64>) {
+        ids.clear();
+        ids.extend(self.ranges.iter().copied());
+        for event in &journal.events {
+            if let Some(found) = event.kv.as_ref().and_then(|kv| self.keys.get(&kv.key)) {
+                ids.extend(found.iter().copied());
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
     }
 
     /// Recheck identity and range permission for every watcher.
@@ -131,12 +231,23 @@ impl Stream {
         if !Arc::ptr_eq(&state.view.auth, &self.checked_auth) {
             self.check_all(&state)?;
         }
+        let journals = batch.journals();
+        // Following watchers start at `position + 1`. If this batch does not deliver that
+        // revision, they must keep it as a pinned start and catch up from storage.
+        let follows = batch.revision <= self.position
+            || (journals.is_some() && batch.previous <= self.position);
+        if !follows {
+            self.pin_all();
+        }
         // A missing or incomplete batch leaves the covered watchers for storage catch-up.
-        if let Some(journals) = batch.journals() {
+        if let Some(journals) = journals {
             let credentials = self.credentials();
+            let mut ids = vec![];
             for (revision, journal) in journals {
-                for watcher in self.watchers.values_mut() {
-                    let start = watcher.request.start_revision;
+                self.candidates(journal, &mut ids);
+                for id in &ids {
+                    let start = self.start(&self.watchers[id]);
+                    let watcher = self.watchers.get_mut(id).expect("indexed watcher");
                     if start > batch.previous && start <= *revision {
                         deliver(
                             &self.tx,
@@ -151,14 +262,17 @@ impl Stream {
                     }
                 }
             }
-            for watcher in self.watchers.values_mut() {
-                let start = &mut watcher.request.start_revision;
+            // Pinned watchers that this batch covers start after it.
+            for id in &self.pinned {
+                let start = self.watchers.get_mut(id).expect("pinned watcher");
+                let start = start.start.as_mut().expect("pinned start");
                 if *start > batch.previous && *start <= batch.revision {
                     *start = batch.revision + 1;
                 }
             }
         }
         self.position = self.position.max(batch.revision);
+        self.unpin();
         Ok(())
     }
 
@@ -195,6 +309,12 @@ impl Stream {
     /// `None` serves unsynced watchers. `Some(goal)` serves every watcher at or below `goal`.
     /// Returns true while those watchers still need more pages.
     async fn catch_up(&mut self, through: Option<i64>) -> Result<bool, Status> {
+        let more = self.catch_up_page(through).await;
+        self.unpin();
+        more
+    }
+
+    async fn catch_up_page(&mut self, through: Option<i64>) -> Result<bool, Status> {
         let state = self.current(through.is_none())?;
         let view = state.view.clone();
         let limit = through.map_or(view.revision, |t| t.min(view.revision));
@@ -202,10 +322,16 @@ impl Stream {
             Some(_) => limit,
             None => self.position.min(limit),
         };
+        // A progress request can serve revisions that the feed has not delivered yet.
+        // The following watchers then need them too, so they store their start revision.
+        if bound > self.position {
+            self.pin_all();
+        }
         let mut compacted = vec![];
         let mut pending = vec![];
-        for (&id, watcher) in &self.watchers {
-            let start = watcher.request.start_revision;
+        // Following watchers start after `position`, which is now at least `bound`.
+        for &id in &self.pinned {
+            let start = self.watchers[&id].start.expect("pinned start");
             if start > bound {
                 continue;
             }
@@ -216,7 +342,7 @@ impl Stream {
             }
         }
         for id in compacted {
-            self.watchers.remove(&id);
+            self.remove(id);
             send(
                 &self.tx,
                 WatchResponse {
@@ -239,10 +365,15 @@ impl Stream {
         let (rows, covered) = crate::watch::scan(&view.snapshot, from, limit, PAGE_REVISIONS)
             .await
             .map_err(|e| Status::unavailable(format!("etcdserver: {}", e.message)))?;
+        let mut ids = vec![];
         for (revision, journal) in &rows {
-            for (id, start) in &pending {
-                if start <= revision {
-                    let watcher = self.watchers.get_mut(id).expect("pending watcher");
+            self.candidates(journal, &mut ids);
+            for id in &ids {
+                // Starts do not change in this loop. A pending watcher has `start <= bound` and
+                // is not compacted, so this condition selects the pending watchers.
+                let watcher = self.watchers.get_mut(id).expect("indexed watcher");
+                let start = watcher.start.unwrap_or(i64::MAX);
+                if start <= bound && start <= *revision {
                     deliver(
                         &self.tx,
                         &self.meters,
@@ -257,8 +388,9 @@ impl Stream {
             }
         }
         for (id, _) in &pending {
-            let start = &mut self.watchers.get_mut(id).expect("pending watcher").request;
-            start.start_revision = start.start_revision.max(covered + 1);
+            let watcher = self.watchers.get_mut(id).expect("pending watcher");
+            let start = watcher.start.as_mut().expect("pending start");
+            *start = (*start).max(covered + 1);
         }
         Ok(covered < limit)
     }
@@ -273,9 +405,10 @@ impl Stream {
         let state = self.current(true)?;
         self.check_all(&state)?;
         let header = state.header(self.position);
+        let next = self.position + 1;
         for watcher in self.watchers.values_mut() {
             if watcher.request.progress_notify
-                && watcher.request.start_revision == self.position + 1
+                && watcher.start.unwrap_or(next) == next
                 && watcher.progress.elapsed() >= self.progress_interval
             {
                 send(
@@ -350,11 +483,13 @@ impl Stream {
                 .meters
                 .as_ref()
                 .map(|m| crate::metrics::Active::new(&m.watchers)),
+            start: None,
             request,
             progress: tokio::time::Instant::now(),
         };
-        let historical = watcher.request.start_revision <= self.position;
-        self.watchers.insert(watcher.request.watch_id, watcher);
+        let start = watcher.request.start_revision;
+        let historical = start <= self.position;
+        self.insert(watcher, start);
         if historical {
             self.catch_up_all(None).await?;
         }
@@ -362,7 +497,7 @@ impl Stream {
     }
 
     async fn cancel(&mut self, id: i64) -> Result<(), Status> {
-        if self.watchers.remove(&id).is_some() {
+        if self.remove(id).is_some() {
             let state = self.current(false)?;
             send(
                 &self.tx,
@@ -383,12 +518,7 @@ impl Stream {
         let goal = self.current(false)?.view.revision;
         self.catch_up_all(Some(goal)).await?;
         let state = self.current(false)?;
-        if !self.watchers.is_empty()
-            && self
-                .watchers
-                .values()
-                .all(|w| w.request.start_revision <= goal + 1)
-        {
+        if !self.watchers.is_empty() && self.watchers.values().all(|w| self.start(w) <= goal + 1) {
             send(
                 &self.tx,
                 WatchResponse {
@@ -731,6 +861,80 @@ mod tests {
         let revisions: Vec<_> = f.events().into_iter().map(|(_, r, _)| r).collect();
         assert_eq!(revisions, [2, 3, 4, 5, 6]);
         assert!(!f.stream.unsynced());
+        f.close().await;
+    }
+
+    #[tokio::test]
+    async fn key_index_routes_events_and_followers_track_the_feed() {
+        let mut f = Fixture::new().await;
+        f.watch(request(1, "a", 0)).await;
+        f.watch(request(2, "b", 0)).await;
+        f.watch(WatchCreateRequest {
+            watch_id: 3,
+            key: "a".into(),
+            range_end: "c".into(),
+            ..Default::default()
+        })
+        .await;
+        // Watcher 4 starts in the future, so it stores its start revision.
+        f.watch(request(4, "a", 4)).await;
+        assert!(
+            f.stream
+                .watchers
+                .values()
+                .filter(|w| w.start.is_none())
+                .count()
+                == 3
+        );
+        assert_eq!(f.stream.pinned.iter().copied().collect::<Vec<_>>(), [4]);
+        let batch = f.put("a", "1").await;
+        f.stream.batch(&batch).await.unwrap();
+        let batch = f.put("b", "1").await;
+        f.stream.batch(&batch).await.unwrap();
+        assert_eq!(f.events(), [(1, 2, 0), (3, 2, 0), (2, 3, 0), (3, 3, 0)]);
+        // The feed reached revision 3, so watcher 4 now follows it.
+        assert!(f.stream.pinned.is_empty());
+        f.stream.cancel(1).await.unwrap();
+        assert!(f.responses()[0].canceled);
+        assert_eq!(f.stream.keys[b"a".as_slice()], BTreeSet::from([4]));
+        let batch = f.put("a", "2").await;
+        f.stream.batch(&batch).await.unwrap();
+        assert_eq!(f.events(), [(3, 4, 0), (4, 4, 0)]);
+        // An incomplete batch leaves the followers at their start revision for catch-up.
+        let large = "x".repeat(crate::watch::FEED_BATCH_BYTES + 1);
+        let gap = f.put("b", &large).await;
+        assert!(gap.journals().is_none());
+        f.stream.batch(&gap).await.unwrap();
+        assert_eq!(f.stream.pinned.len(), 3);
+        assert!(f.stream.unsynced());
+        f.stream.catch_up_all(None).await.unwrap();
+        assert_eq!(f.events(), [(2, 5, 0), (3, 5, 0)]);
+        assert!(f.stream.pinned.is_empty() && !f.stream.unsynced());
+        f.close().await;
+    }
+
+    #[tokio::test]
+    async fn progress_request_serves_following_watchers_before_the_feed() {
+        let mut f = Fixture::new().await;
+        f.watch(request(1, "k", 0)).await;
+        f.watch(request(2, "other", 0)).await;
+        // The view has revision 2, but the stream has not received its batch yet.
+        let late = f.put("k", "1").await;
+        f.stream.progress().await.unwrap();
+        let responses = f.responses();
+        assert_eq!(responses.len(), 2);
+        assert_eq!((responses[0].watch_id, responses[0].events.len()), (1, 1));
+        assert_eq!(
+            (responses[1].watch_id, responses[1].header.unwrap().revision),
+            (-1, 2)
+        );
+        // The late batch must not deliver revision 2 again.
+        f.stream.batch(&late).await.unwrap();
+        assert!(f.events().is_empty());
+        assert!(f.stream.pinned.is_empty());
+        let next = f.put("k", "2").await;
+        f.stream.batch(&next).await.unwrap();
+        assert_eq!(f.events(), [(1, 3, 0)]);
         f.close().await;
     }
 
