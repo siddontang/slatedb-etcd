@@ -987,7 +987,7 @@ impl Node {
             response.error(self.error("pending log memory quota is full"));
             return Ok(());
         }
-        change.context = data.into();
+        change.context = data;
         let proposed = self.raw.propose_conf_change(vec![], change);
         self.track_proposal(id, proposed, response);
         Ok(())

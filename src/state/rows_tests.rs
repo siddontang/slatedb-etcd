@@ -202,7 +202,7 @@ async fn cached_reads_match_uncached_reads() {
                 }
                 let mut snapshot = Snapshot::default();
                 snapshot.mut_metadata().index = source.applied;
-                snapshot.data = source.snapshot_job().unwrap().await.unwrap().into();
+                snapshot.data = source.snapshot_job().unwrap().await.unwrap();
                 cached.install_snapshot(&snapshot).await.unwrap();
                 plain.install_snapshot(&snapshot).await.unwrap();
                 cached_lease = source_lease;

@@ -524,7 +524,7 @@ mod tests {
         Entry {
             index,
             term,
-            data: vec![index as u8; 1024].into(),
+            data: vec![index as u8; 1024],
             ..Default::default()
         }
     }

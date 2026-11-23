@@ -187,7 +187,7 @@ impl Node {
             return;
         }
         self.put_proposals.entries.push(Entry {
-            data: data.into(),
+            data,
             ..Default::default()
         });
         self.put_proposals.clients.push((id, response));

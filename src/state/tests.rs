@@ -359,7 +359,7 @@ async fn snapshot_keeps_the_boundary_at_its_pinned_apply_position() {
     super::compaction_tests::finish(&mut state).await;
     let mut snapshot = Snapshot::default();
     snapshot.mut_metadata().index = 3;
-    snapshot.data = snapshot_job.await.unwrap().into();
+    snapshot.data = snapshot_job.await.unwrap();
     let mut restored = StateMachine::open(other.path()).await.unwrap();
     restored.install_snapshot(&snapshot).await.unwrap();
     assert_eq!((restored.applied, restored.compact_revision), (3, 2));
@@ -428,7 +428,7 @@ async fn renewed_lease_and_watch_history_survive_snapshot_and_stale_expiry() {
     super::compaction_tests::finish(&mut state).await;
     let mut snapshot = Snapshot::default();
     snapshot.mut_metadata().index = 3;
-    snapshot.data = state.snapshot_data().await.unwrap().into();
+    snapshot.data = state.snapshot_data().await.unwrap();
     let mut restored = StateMachine::open(other.path()).await.unwrap();
     restored.install_snapshot(&snapshot).await.unwrap();
     assert_eq!(restored.leases[&7].generation, 3);
@@ -668,7 +668,7 @@ async fn a_format_3_snapshot_installs_and_older_readers_reject_format_4() {
         };
         let mut snapshot = Snapshot::default();
         snapshot.mut_metadata().index = state.applied;
-        snapshot.set_data(crate::codec::encode(&data).unwrap().into());
+        snapshot.set_data(crate::codec::encode(&data).unwrap());
         snapshot
     };
     let mut restored = StateMachine::open(other.path()).await.unwrap();
@@ -783,7 +783,7 @@ async fn hash_rows_in_every_stored_form_hash_and_compact_alike() {
     assert!(forms.iter().all(|&count| count >= 2), "{forms:?}");
     let mut snapshot = Snapshot::default();
     snapshot.mut_metadata().index = state.applied;
-    snapshot.set_data(crate::codec::encode(&data).unwrap().into());
+    snapshot.set_data(crate::codec::encode(&data).unwrap());
     let mut mixed = StateMachine::open(other.path()).await.unwrap();
     mixed.install_snapshot(&snapshot).await.unwrap();
     async fn compare(state: &StateMachine, mixed: &StateMachine, from: i64) {
@@ -1007,7 +1007,7 @@ async fn direct_put_txns_write_value_once_rows_like_the_evaluator() {
     data.version = crate::STORAGE_FORMAT;
     let mut snapshot = Snapshot::default();
     snapshot.mut_metadata().index = direct.applied;
-    snapshot.set_data(crate::codec::encode(&data).unwrap().into());
+    snapshot.set_data(crate::codec::encode(&data).unwrap());
     let mut inline = StateMachine::open(other.path()).await.unwrap();
     inline.install_snapshot(&snapshot).await.unwrap();
 

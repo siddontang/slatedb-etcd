@@ -26,8 +26,8 @@ The separate `grpc` 0.9 client crate is a preview. Its server examples use Tonic
 
 Three packages need specific version lines.
 
-- The [pinned Raft source](../third_party/raft/README.md) uses the same Prost codec as gRPC.
-- Raft Engine 0.4.2 needs [local storage changes](../third_party/raft-engine/README.md).
+- Raft uses the same Prost version as gRPC through [Git forks](dependencies.md).
+- Raft Engine needs a [cache fix](dependencies.md#raft-engine-fixes) from its fork.
 - Bincode 2.0.1 uses fixed-width little-endian fields for snapshots and lease records.
   The published 3.0.0 crate contains only a compile error.
 

@@ -173,7 +173,7 @@ async fn index_follows_puts_transactions_deletes_revocations_snapshots_and_resta
         .unwrap();
     let mut snapshot = Snapshot::default();
     snapshot.mut_metadata().index = state.applied;
-    snapshot.set_data(state.snapshot_data().await.unwrap().into());
+    snapshot.set_data(state.snapshot_data().await.unwrap());
     target.install_snapshot(&snapshot).await.unwrap();
     check(&target).await;
     assert!(target.key_index.get(b"removed-by-snapshot").is_none());
@@ -406,7 +406,7 @@ async fn watch_previous_values_match_the_replaced_rows() {
 
     let mut snapshot = Snapshot::default();
     snapshot.mut_metadata().index = state.applied;
-    snapshot.set_data(state.snapshot_data().await.unwrap().into());
+    snapshot.set_data(state.snapshot_data().await.unwrap());
     let mut restored = StateMachine::open(other.path()).await.unwrap();
     restored.install_snapshot(&snapshot).await.unwrap();
     assert_eq!(

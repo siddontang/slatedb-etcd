@@ -500,7 +500,7 @@ async fn apply_entries(
         let change = match kind {
             EntryType::EntryNormal => None,
             EntryType::EntryConfChange => {
-                let change = raft::eraftpb::ConfChange::decode(entry.data.clone())?;
+                let change = raft::eraftpb::ConfChange::decode(entry.data.as_slice())?;
                 raft::eraftpb::ConfChangeType::try_from(change.change_type)?;
                 Some(change)
             }
@@ -746,7 +746,7 @@ mod tests {
             .map(|(offset, command)| Entry {
                 index: offset as u64 + 1,
                 term: 1,
-                data: command.encode().unwrap().into(),
+                data: command.encode().unwrap(),
                 ..Default::default()
             })
             .collect();
@@ -984,7 +984,7 @@ mod tests {
                 .map(|(offset, command)| Entry {
                     index: offset as u64 + 1,
                     term: 1,
-                    data: command.encode().unwrap().into(),
+                    data: command.encode().unwrap(),
                     ..Default::default()
                 })
                 .collect();
@@ -1397,8 +1397,7 @@ mod tests {
                     term: 1,
                     data: command
                         .as_ref()
-                        .map_or_else(Vec::new, |c| c.encode().unwrap())
-                        .into(),
+                        .map_or_else(Vec::new, |c| c.encode().unwrap()),
                     ..Default::default()
                 })
                 .collect();

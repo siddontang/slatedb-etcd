@@ -65,10 +65,7 @@ async fn flushed_state_recovers_a_lost_commit_marker_but_not_missing_entries() {
                     &[Entry {
                         index: 1,
                         term: 1,
-                        data: RaftCommand::Diagnostic(command.clone())
-                            .encode()
-                            .unwrap()
-                            .into(),
+                        data: RaftCommand::Diagnostic(command.clone()).encode().unwrap(),
                         ..Default::default()
                     }],
                     Some(&HardState {
@@ -379,7 +376,7 @@ async fn invalid_state_snapshot_stops_the_node() {
     let mut node = Node::open(options(dir.path()), events).await.unwrap();
     let mut snapshot = Snapshot::default();
     snapshot.mut_metadata().index = 1;
-    snapshot.data = b"invalid snapshot".to_vec().into();
+    snapshot.data = b"invalid snapshot".to_vec();
     node.submit_apply(Job::Snapshot(snapshot), 1).unwrap();
     let result = tokio::time::timeout(Duration::from_secs(2), node.run(receiver))
         .await
@@ -479,7 +476,7 @@ async fn received_snapshot_fences_an_older_batch_and_later_entries() {
     snapshot.mut_metadata().index = 200;
     snapshot.mut_metadata().term = 2;
     snapshot.mut_metadata().mut_conf_state().voters = vec![1, 2, 3];
-    snapshot.data = state.snapshot_data().await.unwrap().into();
+    snapshot.data = state.snapshot_data().await.unwrap();
     let mut message = Message::default();
     message.set_msg_type(MessageType::MsgSnapshot);
     message.from = 2;
@@ -510,10 +507,7 @@ async fn received_snapshot_fences_an_older_batch_and_later_entries() {
     append.entries.push(Entry {
         index: 201,
         term: 2,
-        data: RaftCommand::Diagnostic(command("after"))
-            .encode()
-            .unwrap()
-            .into(),
+        data: RaftCommand::Diagnostic(command("after")).encode().unwrap(),
         ..Default::default()
     });
     node.raw.step(append).unwrap();
@@ -620,7 +614,7 @@ async fn confirm_read(node: &mut Node, id: &u64) {
     message.from = 2;
     message.to = 1;
     message.term = node.raw.raft.term;
-    message.context = node.read_context(*id).into();
+    message.context = node.read_context(*id);
     node.raw.step(message).unwrap();
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
@@ -1152,7 +1146,7 @@ async fn recovery_replays_a_backlog_larger_than_the_pending_quota() {
         .map(|index| Entry {
             index,
             term: 1,
-            context: vec![0; 900 * 1024].into(),
+            context: vec![0; 900 * 1024],
             ..Default::default()
         })
         .collect();
@@ -1904,8 +1898,7 @@ fn seed_puts(dir: &std::path::Path, count: u64) {
                 },
             })
             .encode()
-            .unwrap()
-            .into(),
+            .unwrap(),
             ..Default::default()
         })
         .collect();

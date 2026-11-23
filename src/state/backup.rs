@@ -78,7 +78,7 @@ impl StateMachine {
         snapshot.mut_metadata().index = 1;
         snapshot.mut_metadata().term = 1;
         snapshot.mut_metadata().set_conf_state(members.conf());
-        snapshot.data = crate::codec::encode(&data)?.into();
+        snapshot.data = crate::codec::encode(&data)?;
         std::fs::create_dir_all(dir)?;
         let mut storage = crate::storage::RaftStorage::open(
             &dir.join("raft"),

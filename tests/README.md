@@ -65,7 +65,7 @@ python3 scripts/check-dst.py --seeds 1,2,42,58,70
 Seed 58 covers reordered appends before object-store fault injection.
 The setup waits for a new applied write and checks that each PUT fault runs.
 Seed 70 covers log-cache isolation across three engine instances on one thread.
-See the [local Raft Engine fixes](../third_party/raft-engine/README.md) for dependency regressions.
+See the [Raft Engine fixes](../docs/dependencies.md#raft-engine-fixes) for dependency regressions.
 
 The runner writes traces under `target/dst/`.
 Direct Cargo tests accept `SLATEDB_DST_TRACE_DIR` to select another trace directory.

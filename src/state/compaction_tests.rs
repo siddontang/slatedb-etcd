@@ -459,7 +459,7 @@ async fn snapshot_install_carries_a_pending_compaction() {
     assert!(source.compaction_pending());
     let mut snapshot = Snapshot::default();
     snapshot.mut_metadata().index = source.applied;
-    snapshot.set_data(source.snapshot_data().await.unwrap().into());
+    snapshot.set_data(source.snapshot_data().await.unwrap());
     let mut target = StateMachine::open(&dir.path().join("target"))
         .await
         .unwrap();

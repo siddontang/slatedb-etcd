@@ -316,7 +316,7 @@ async fn large_frames_stop_at_the_independent_byte_target() {
     ));
     let mut large = message(false);
     large.entries.push(raft::eraftpb::Entry {
-        data: vec![0; 3 * 1024 * 1024].into(),
+        data: vec![0; 3 * 1024 * 1024],
         ..Default::default()
     });
     for _ in 0..8 {
@@ -427,7 +427,7 @@ async fn receiver_pipelines_with_count_bytes_and_ordered_receipt_limits() {
         let channel = crate::tls::Transport::default().channel(&address).unwrap();
         let mut client = TransportClient::new(channel).max_encoding_message_size(FRAME_LIMIT);
         let mut message = message(false);
-        message.context = vec![0; payload_bytes].into();
+        message.context = vec![0; payload_bytes];
         let frames: Vec<_> = (1..=window + 1)
             .map(|sequence| Frame {
                 sequence: sequence as u64,

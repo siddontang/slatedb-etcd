@@ -260,7 +260,7 @@ async fn quota_matches_scan_across_state_changes_and_recovery() {
         .unwrap();
     let mut snapshot = Snapshot::default();
     snapshot.mut_metadata().index = state.applied;
-    snapshot.set_data(state.snapshot_data().await.unwrap().into());
+    snapshot.set_data(state.snapshot_data().await.unwrap());
     target.install_snapshot(&snapshot).await.unwrap();
     check(&target).await;
     assert_eq!(target.logical_bytes, state.logical_bytes);
@@ -288,7 +288,7 @@ async fn snapshot_import_requires_the_current_format() {
     let mut snapshot = Snapshot::default();
     snapshot.mut_metadata().index = 1;
     let mut bytes = crate::codec::encode(&data).unwrap();
-    snapshot.set_data(bytes.clone().into());
+    snapshot.set_data(bytes.clone());
     assert!(state.install_snapshot(&snapshot).await.is_err());
     assert_eq!(state.applied, 0);
     check(&state).await;
