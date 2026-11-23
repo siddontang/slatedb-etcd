@@ -86,6 +86,10 @@ class HistoryTests(unittest.TestCase):
         self.squash_merge("nolouch@gmail.com")
         self.assertEqual(self.errors(), [])
 
+    def test_owner_squash_merge_passes(self):
+        self.squash_merge("siddontang@gmail.com")
+        self.assertEqual(self.errors(), [])
+
     def test_other_squash_merge_with_private_email_fails(self):
         self.squash_merge("someone@example.com")
         self.assertIn("author must use a GitHub public email", self.errors())

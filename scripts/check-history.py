@@ -12,7 +12,7 @@ SIGN_OFF = b"Signed-off-by: siddontang <siddontang@gmail.com>"
 # Maintainer sign-offs. These emails remain public by request.
 MAINTAINER_SIGN_OFFS = (SIGN_OFF, b"Signed-off-by: nolouch <nolouch@gmail.com>")
 # Maintainers who merge pull requests on GitHub with these emails as the author.
-MAINTAINER_EMAILS = (b"nolouch@gmail.com",)
+MAINTAINER_EMAILS = (b"siddontang@gmail.com", b"nolouch@gmail.com")
 PUBLIC_EMAIL = re.compile(rb"(?:[\w.+-]+@users\.noreply\.github\.com|noreply@github\.com)\Z")
 SIGN_OFF_LINE = re.compile(rb"Signed-off-by: [^<>\n]+ <([^<>\s]+)>")
 EMAIL = re.compile(rb"[\w.+%-]+@[\w.-]+\.[A-Za-z]{2,}")
