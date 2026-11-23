@@ -245,6 +245,7 @@ pub struct Node {
     lease_expiring: BTreeSet<(i64, u64)>,
     compact_step: Option<(u64, u64)>,
     compact_ready_at: Option<Instant>,
+    compact_plan: compaction::PlanReady,
     lease_view: Option<std::sync::Arc<BTreeMap<i64, crate::lease::LeaseRecord>>>,
     /// Whether this leader term has built its lease deadlines.
     lease_promoted: bool,
@@ -421,6 +422,7 @@ impl Node {
             state.metrics.registry.clone(),
         )?);
         let compaction = compaction::Flush::new(&state);
+        let compact_plan = compaction::PlanReady::new(&state, manual_apply);
         let worker = Worker::start(state, events.clone(), manual_apply);
         let log_worker = log::Worker::start(storage, manual_apply)?;
         let next_checkpoint = options.next_checkpoint(raw.store().snapshot_index());
@@ -499,6 +501,7 @@ impl Node {
             lease_expiring: BTreeSet::new(),
             compact_step: None,
             compact_ready_at: None,
+            compact_plan,
             lease_view: None,
             lease_promoted: false,
             renewals: lease::Renewals::default(),
@@ -556,6 +559,7 @@ impl Node {
                 ), if self.compact_ready_at.is_some() => { self.compact_ready_at = None; }
                 _ = ticks.tick() => { self.raw.tick(); self.retry_reads(); self.expire_leases()?; self.publish_member()?; }
                 persisted = self.log_worker.next() => { self.complete_log(persisted?)?; }
+                _ = self.compact_plan.changed() => {}
                 target = self.compaction.next(), if self.compaction.active() => {
                     self.finish_compaction_flush(target?)?;
                 }

@@ -26,6 +26,33 @@ pub(super) struct Flush {
     pub replies: Vec<Waiter>,
 }
 
+/// The newest ready background compaction step. Manual test nodes leave it unset, so their
+/// step proposals do not depend on task timing.
+pub(super) struct PlanReady(Option<watch::Receiver<u64>>);
+
+impl PlanReady {
+    pub fn new(state: &StateMachine, manual: bool) -> Self {
+        Self((!manual).then(|| state.compaction_plan.subscribe()))
+    }
+
+    /// Return true when this replica has read the step for `generation`.
+    pub fn ready(&self, generation: u64) -> bool {
+        self.0
+            .as_ref()
+            .is_none_or(|ready| *ready.borrow() >= generation)
+    }
+
+    /// Wait until another background step is ready.
+    pub async fn changed(&mut self) {
+        if let Some(ready) = &mut self.0 {
+            if ready.changed().await.is_ok() {
+                return;
+            }
+        }
+        std::future::pending().await
+    }
+}
+
 pub(super) struct Waiter {
     /// The reply needs a flush through the Compact entry.
     index: u64,
@@ -160,7 +187,8 @@ impl Node {
             return Ok(());
         }
         self.compact_ready_at = None;
-        if self.backlogged() {
+        // The step reads storage in the background. Proposing it earlier makes apply wait.
+        if self.backlogged() || !self.compact_plan.ready(self.state.compaction_plan) {
             return Ok(());
         }
         let data = RaftCommand::CompactStep {

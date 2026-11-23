@@ -72,6 +72,8 @@ pub struct StateMachine {
     pub compact_revision: i64,
     /// Physical removal that follows the logical boundary.
     pub(crate) compaction: Option<compaction::Progress>,
+    /// The next physical compaction step, read in the background.
+    pub(crate) compaction_plan: compaction::Planner,
     pub leases: Arc<std::collections::BTreeMap<i64, crate::lease::LeaseRecord>>,
     /// Journal rows of the current apply job for the in-memory Watch feed.
     pub(crate) watch_capture: Option<crate::watch::Capture>,
@@ -304,6 +306,7 @@ impl StateMachine {
                 revision,
                 compact_revision,
                 compaction,
+                compaction_plan: compaction::Planner::default(),
                 leases: Arc::new(leases),
                 watch_capture: None,
                 row_marker: None,
@@ -317,7 +320,9 @@ impl StateMachine {
                 .close_with_options(slatedb::config::CloseOptions { flush_type: None })
                 .await;
         }
-        result
+        let mut state = result?;
+        state.plan_compaction();
+        Ok(state)
     }
 
     async fn write_batch(&mut self, batch: WriteBatch, index: u64) -> Result<()> {

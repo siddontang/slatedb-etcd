@@ -526,3 +526,208 @@ async fn boundary_tombstones_select_the_retained_hash() {
     state.close().await.unwrap();
     reference.close().await.unwrap();
 }
+
+/// Write new versions of the compacted keys, so steps scan rows above the boundary.
+async fn churn(state: &mut StateMachine, round: usize) {
+    for n in 0..40 {
+        let request = put(
+            &format!("key-{}", (round * 37 + n) % 300),
+            &format!("new-{round}"),
+        );
+        state.apply_etcd(state.applied + 1, &request).await.unwrap();
+    }
+}
+
+async fn history(path: &std::path::Path) -> StateMachine {
+    let mut state = StateMachine::open(path).await.unwrap();
+    for n in 0..6000 {
+        let request = put(&format!("key-{}", n % 300), &n.to_string());
+        state.apply_etcd(state.applied + 1, &request).await.unwrap();
+    }
+    state
+}
+
+/// Background reads race with later writes. Each step must still match an inline step, so all
+/// replicas store the same progress record at the same index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn planned_steps_match_inline_steps_under_concurrent_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut planned = history(&dir.path().join("planned")).await;
+    let mut inline = history(&dir.path().join("inline")).await;
+    let request = CompactionRequest {
+        revision: planned.revision - 500,
+        physical: false,
+    };
+    for state in [&mut planned, &mut inline] {
+        state
+            .apply_compaction(state.applied + 1, &request)
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+    }
+    let mut round = 0;
+    while planned.compaction_pending() {
+        for state in [&mut planned, &mut inline] {
+            churn(state, round).await;
+        }
+        // Give some planned reads time to finish before the writes, and some after.
+        if round % 2 == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        inline.compaction_plan.clear();
+        let a = planned
+            .apply_compaction_step(planned.applied + 1)
+            .await
+            .unwrap();
+        let b = inline
+            .apply_compaction_step(inline.applied + 1)
+            .await
+            .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(planned.compaction, inline.compaction, "step {round}");
+        assert_eq!(
+            planned.db.get(compaction::PENDING).await.unwrap(),
+            inline.db.get(compaction::PENDING).await.unwrap()
+        );
+        round += 1;
+    }
+    assert!(round > 3, "{round}");
+    assert!(!inline.compaction_pending());
+    assert!(planned.compaction_plan.planned > 0);
+    assert_eq!(inline.compaction_plan.planned, 0);
+    assert_eq!(rows(&planned).await, rows(&inline).await);
+    assert_eq!(planned.logical_bytes, inline.logical_bytes);
+    for revision in [request.revision, request.revision + 1, planned.revision] {
+        assert_eq!(
+            serde_json::to_value(planned.hash_kv(revision).await).unwrap(),
+            serde_json::to_value(inline.hash_kv(revision).await).unwrap()
+        );
+    }
+    planned.close().await.unwrap();
+    inline.close().await.unwrap();
+}
+
+/// The rows and count of a Range at `revision`, without the header.
+async fn expected(state: &StateMachine, revision: i64) -> serde_json::Value {
+    let mut value = serde_json::to_value(state.read_etcd(&range(revision)).await.unwrap()).unwrap();
+    value["result"]["Ok"]["response"]["ResponseRange"]
+        .as_object_mut()
+        .unwrap()
+        .remove("header");
+    value
+}
+
+/// Reads at the boundary see the boundary view during the whole pass. Reads below it fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reads_at_and_below_the_boundary_during_a_pending_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = history(&dir.path().join("state")).await;
+    let boundary = state.revision - 700;
+    let at = expected(&state, boundary).await;
+    let after = expected(&state, boundary + 1).await;
+    state
+        .apply_compaction(
+            state.applied + 1,
+            &CompactionRequest {
+                revision: boundary,
+                physical: false,
+            },
+        )
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    let mut round = 0;
+    loop {
+        assert_eq!(expected(&state, boundary).await, at, "step {round}");
+        assert_eq!(expected(&state, boundary + 1).await, after, "step {round}");
+        for revision in [1, boundary - 1] {
+            let outcome = state.read_etcd(&range(revision)).await.unwrap();
+            assert_eq!(
+                outcome.result.unwrap_err().code,
+                tonic::Code::OutOfRange as i32
+            );
+        }
+        if !state.compaction_pending() {
+            break;
+        }
+        churn(&mut state, round).await;
+        state
+            .apply_compaction_step(state.applied + 1)
+            .await
+            .unwrap();
+        round += 1;
+    }
+    assert!(round > 3, "{round}");
+    assert_eq!(state.physical_revision(), boundary);
+    state.close().await.unwrap();
+}
+
+/// A restart drops the planned read. Replay reads the lost steps again and reaches the same rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_during_a_planned_step_replays_the_same_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state");
+    let mut state = history(&path).await;
+    let mut reference = history(&dir.path().join("reference")).await;
+    let boundary = state.revision - 400;
+    let mut log = vec![Entry::Compact(boundary)];
+    for round in 0..12 {
+        for n in 0..40 {
+            log.push(Entry::Kv(put(
+                &format!("key-{}", (round * 37 + n) % 300),
+                &format!("new-{round}"),
+            )));
+        }
+        log.push(Entry::Step);
+    }
+    for entry in &log {
+        match entry {
+            Entry::Kv(request) => {
+                reference
+                    .apply_etcd(reference.applied + 1, request)
+                    .await
+                    .unwrap();
+            }
+            Entry::Compact(revision) => {
+                let request = CompactionRequest {
+                    revision: *revision,
+                    physical: false,
+                };
+                assert!(reference_compaction(&mut reference, &request).await);
+            }
+            Entry::Step => {}
+        }
+    }
+    let first = state.applied + 1;
+    for (position, entry) in log.iter().enumerate() {
+        apply(&mut state, entry).await;
+        if position == 41 * 3 {
+            // The first steps become durable. Later steps stay in the memtable.
+            state.db.flush().await.unwrap();
+        }
+    }
+    assert!(state.compaction_pending());
+    // A background read for the next step may still run when the process stops.
+    state.close().await.unwrap();
+    drop(state);
+    let mut state = StateMachine::open(&path).await.unwrap();
+    assert!(state.compaction_pending());
+    let durable = (state.applied + 1 - first) as usize;
+    assert!(durable > 41 * 3 && durable <= log.len(), "{durable}");
+    for entry in &log[durable..] {
+        apply(&mut state, entry).await;
+    }
+    finish(&mut state).await;
+    assert_eq!(rows(&state).await, rows(&reference).await);
+    assert_eq!(state.logical_bytes, reference.logical_bytes);
+    for revision in [boundary, boundary + 1, state.revision] {
+        assert_eq!(
+            serde_json::to_value(state.hash_kv(revision).await).unwrap(),
+            serde_json::to_value(reference.hash_kv(revision).await).unwrap()
+        );
+    }
+    state.close().await.unwrap();
+    reference.close().await.unwrap();
+}
