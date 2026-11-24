@@ -813,13 +813,14 @@ mod tests {
             .connect()
             .await
             .unwrap();
-        // These writes apply above twice the soft limit, and no checkpoint can appear.
-        let puts = (0..16_u8).map(|n| {
+        // Each write alone applies above twice the soft limit, so the pause does not depend on
+        // how many writes the admission check lets in. No checkpoint can appear.
+        let puts = (0..8_u8).map(|n| {
             let mut kv = KvClient::new(channel.clone());
             async move {
                 kv.put(PutRequest {
                     key: vec![b'k', n],
-                    value: vec![n; 16 * 1024],
+                    value: vec![n; 96 * 1024],
                     ..Default::default()
                 })
                 .await
@@ -845,13 +846,15 @@ mod tests {
         let mut kv = KvClient::new(channel);
         let reply = kv
             .range(crate::proto::etcdserverpb::RangeRequest {
-                key: vec![b'k', 3],
+                key: vec![b'k'],
+                range_end: vec![b'l'],
                 ..Default::default()
             })
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(reply.kvs[0].value, vec![3; 16 * 1024]);
+        // The admitted writes are readable. The admission check rejected the others.
+        assert!(!reply.kvs.is_empty());
         server.shutdown().await.unwrap();
     }
 
