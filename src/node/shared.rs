@@ -115,6 +115,10 @@ impl Progress {
 /// for `REPORT_LIFETIME`.
 type Reports = Arc<Mutex<HashMap<u64, (Instant, HashSet<uuid::Uuid>)>>>;
 
+/// A new leader deletes no checkpoint for this time. Each member reports twice in it, so the
+/// leader knows the pins of the members before it deletes.
+const RETENTION_GRACE: Duration = Duration::from_secs(2 * REPORT_TICKS * 100 / 1000);
+
 /// A member's report protects its checkpoints for this time after it arrives.
 const REPORT_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
@@ -127,7 +131,8 @@ pub(super) struct Writer {
     max_age: Duration,
     /// Set while this member leads. Sending `true` closes the writer.
     stop: Option<tokio::sync::watch::Sender<bool>>,
-    tasks: tokio::task::JoinSet<Result<()>>,
+    /// Writer tasks with the term that started each one.
+    tasks: tokio::task::JoinSet<(u64, Result<()>)>,
     reports: Reports,
     /// `ViewCheckpoint` entries that this node proposed.
     pub announced: u64,
@@ -150,6 +155,8 @@ pub(super) struct Writer {
     pub(super) transfer: Option<(u64, u64)>,
     /// Writer opens after a fence while this member still led.
     reopens: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) retention: crate::state::ViewRetention,
+    pub(super) retained: Option<prometheus::IntGauge>,
 }
 
 impl Writer {
@@ -160,6 +167,8 @@ impl Writer {
             clock,
             transfer: None,
             reopens: Arc::default(),
+            retention: crate::state::ViewRetention::Off,
+            retained: None,
             progress: Arc::new(Progress::new(0)),
             admin: handles.admin.clone(),
             queue: handles.queue.clone(),
@@ -199,7 +208,7 @@ impl Writer {
         self.term = term;
         let (stop, stopped) = tokio::sync::watch::channel(false);
         self.stop = Some(stop);
-        self.tasks.spawn(lead(
+        let task = lead(
             Publisher {
                 db: None,
                 admin: self.admin.clone(),
@@ -207,6 +216,8 @@ impl Writer {
                 progress: self.progress.clone(),
                 max_age: self.max_age,
                 reports: self.reports.clone(),
+                retention: self.retention,
+                retained: self.retained.clone(),
             },
             Leading {
                 queue: self.queue.clone(),
@@ -217,7 +228,8 @@ impl Writer {
                 clock: self.clock.clone(),
                 reopens: self.reopens.clone(),
             },
-        ));
+        );
+        self.tasks.spawn(async move { (term, task.await) });
     }
 
     pub async fn stop(&mut self) {
@@ -292,17 +304,22 @@ pub(super) async fn next(writer: &mut Option<Writer>) -> WriterEvent {
         return std::future::pending().await;
     };
     let leading = writer.stop.is_some();
+    let current = writer.term;
     let failed = async {
         loop {
             match writer.tasks.join_next().await {
-                Some(Ok(Ok(()))) if !leading => continue,
-                // A newer writer can fence the old one before it sees the stop.
-                Some(Ok(Err(error))) if !leading => {
-                    tracing::warn!(%error, "the stopped shared writer failed");
+                // A task of an older term, or of a term that this member left, is obsolete. A
+                // newer writer can fence it before it sees its stop.
+                Some(Ok((term, result))) if !leading || term != current => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, term, "a stopped shared writer failed");
+                    }
                     continue;
                 }
-                Some(Ok(Ok(()))) => return anyhow::anyhow!("a shared state writer task stopped"),
-                Some(Ok(Err(error))) => return error.context("shared state writer failed"),
+                Some(Ok((_, Ok(())))) => {
+                    return anyhow::anyhow!("a shared state writer task stopped")
+                }
+                Some(Ok((_, Err(error)))) => return error.context("shared state writer failed"),
                 Some(Err(error)) if error.is_cancelled() => continue,
                 Some(Err(error)) => {
                     return anyhow::Error::from(error).context("shared state writer stopped")
@@ -431,9 +448,19 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
     } = leading;
     let current = || *leadership.borrow() == (true, term);
     loop {
-        let db = tokio::select! {
-            db = publisher.source.open_writer() => Arc::new(db?),
+        let opened = tokio::select! {
+            opened = publisher.source.open_writer() => opened,
             _ = stop_requested(&mut stopped) => return Ok(()),
+        };
+        let db = match opened {
+            Ok(db) => Arc::new(db),
+            // A newer open fenced this one while the member still leads the same term.
+            Err(error) if fenced(&error) && current() && !*stopped.borrow() => {
+                tracing::warn!(term, "the shared writer open was fenced; open it again");
+                reopens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+            Err(error) => return Err(error),
         };
         let close = |db: Arc<slatedb::Db>| async move {
             // A writer that a newer writer fenced cannot close cleanly. GC closes with it.
@@ -516,6 +543,9 @@ struct Publisher {
     progress: Arc<Progress>,
     max_age: Duration,
     reports: Reports,
+    retention: crate::state::ViewRetention,
+    /// The number of `view-` checkpoints after the last publication.
+    retained: Option<prometheus::IntGauge>,
 }
 
 /// Flush the shared `Db` when its oldest write reaches the age limit or on request. Create one
@@ -530,8 +560,12 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
         progress,
         max_age,
         reports,
+        retention,
+        retained,
     } = publisher;
     let db = db.context("the publisher needs the writer")?;
+    let led = Instant::now();
+    let epoch = db.manifest().writer_epoch();
     let mut published = view_checkpoints(&admin)
         .await?
         .last()
@@ -592,9 +626,54 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
         {
             return Ok(());
         }
-        crate::state::shared::retain(&admin, &source, &reported(&reports), KEEP_CHECKPOINTS)
-            .await?;
+        let views = view_checkpoints(&admin).await?.len();
+        if let Some(gauge) = &retained {
+            gauge.set(views as i64);
+        }
+        // A new leader has no reports yet. It waits until each member has reported twice.
+        if retention == crate::state::ViewRetention::Fenced && led.elapsed() >= RETENTION_GRACE {
+            let reported = reported(&reports);
+            crate::state::shared::retain(&admin, &source, &reported, KEEP_CHECKPOINTS, Some(epoch))
+                .await?;
+        }
     }
+}
+
+/// Bring Raft's voters and learners to `target` with single membership changes.
+///
+/// An in-process adopt skips the log entries up to the checkpoint, and those entries can hold
+/// membership changes. Raft changes its configuration only through `apply_conf_change`, so this
+/// applies the difference: new voters and promotions, new learners, then removals.
+pub(super) fn reconcile_conf(
+    raw: &mut RawNode<log::Cache>,
+    target: &raft::eraftpb::ConfState,
+) -> Result<()> {
+    use raft::eraftpb::{ConfChange, ConfChangeType};
+    let current = raw.raft.prs().conf().to_conf_state();
+    let mut changes = vec![];
+    for &id in &target.voters {
+        if !current.voters.contains(&id) {
+            changes.push((id, ConfChangeType::AddNode));
+        }
+    }
+    for &id in &target.learners {
+        if !current.learners.contains(&id) && !current.voters.contains(&id) {
+            changes.push((id, ConfChangeType::AddLearnerNode));
+        }
+    }
+    for &id in current.voters.iter().chain(&current.learners) {
+        if !target.voters.contains(&id) && !target.learners.contains(&id) {
+            changes.push((id, ConfChangeType::RemoveNode));
+        }
+    }
+    for (node_id, change_type) in changes {
+        raw.apply_conf_change(&ConfChange {
+            node_id,
+            change_type: change_type as i32,
+            ..Default::default()
+        })?;
+    }
+    Ok(())
 }
 
 /// Ticks between two `ViewAck` reports.
@@ -818,16 +897,26 @@ impl Node {
 
     /// Return the index and log term of an opened base that a paused member can adopt: the
     /// base is above the applied index, and the delivered commit covers it.
-    pub(super) fn adoptable(&self) -> Option<(u64, u64)> {
+    ///
+    /// The node takes the base from the slot and verifies that one. A newer open cannot replace
+    /// it before the job runs. A base that fails the check goes back to the slot.
+    pub(super) fn adoptable(&self) -> Option<(Arc<crate::state::view::Base>, u64)> {
         let writer = self.writer.as_ref()?;
         if !writer.paused || self.prepared_puts.is_some() || self.held_puts.is_some() {
             return None;
         }
-        let index = writer.opened_slot.newest()?;
-        if index <= self.state.applied || index > self.committed_ready {
-            return None;
+        let base = writer.opened_slot.take()?;
+        let index = base.applied;
+        let term = (index > self.state.applied && index <= self.committed_ready)
+            .then(|| self.raw.raft.raft_log.term(index).ok())
+            .flatten();
+        match term {
+            Some(term) => Some((base, term)),
+            None => {
+                writer.opened_slot.offer(base);
+                None
+            }
         }
-        Some((index, self.raw.raft.raft_log.term(index).ok()?))
     }
 
     /// Take a due switch job.
@@ -1318,6 +1407,88 @@ mod tests {
         }
         writer.sync(false, 2, &events);
         writer.stop().await;
+        state.close().await.unwrap();
+    }
+
+    /// An adopt across membership changes leaves Raft with the checkpoint's ConfState, also
+    /// after an election.
+    #[tokio::test]
+    async fn an_adopt_takes_the_checkpoint_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = super::super::tests::leader_node(dir.path()).await;
+        // The skipped entries added learner 4, promoted it, added learner 5, and removed 3.
+        let target = raft::eraftpb::ConfState::from((vec![1, 2, 4], vec![5]));
+        reconcile_conf(&mut node.raw, &target).unwrap();
+        let conf = |node: &Node| {
+            let mut conf = node.raw.raft.prs().conf().to_conf_state();
+            conf.voters.sort_unstable();
+            conf.learners.sort_unstable();
+            conf
+        };
+        assert_eq!(conf(&node), target);
+        // A new election asks the new voters, not the removed one or the learner.
+        let term = node.raw.raft.term;
+        node.raw.raft.become_follower(term + 1, raft::INVALID_ID);
+        node.raw.raft.msgs.clear();
+        node.raw.campaign().unwrap();
+        assert_eq!(conf(&node), target);
+        let mut asked: Vec<_> = node
+            .raw
+            .raft
+            .msgs
+            .iter()
+            .map(|message| message.to)
+            .collect();
+        asked.sort_unstable();
+        asked.dedup();
+        assert_eq!(asked, [2, 4]);
+        // A second reconcile changes nothing.
+        reconcile_conf(&mut node.raw, &target).unwrap();
+        assert_eq!(conf(&node), target);
+    }
+
+    /// A member steps down and leads again before it collects the old task. The old term's
+    /// normal end is not a failure of the new term.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_old_term_task_end_is_not_a_failure() {
+        let options = crate::state::shared::Options {
+            quota: 0,
+            voters: vec![1],
+            join: false,
+            empty_log: false,
+            pin_max: Duration::from_secs(300),
+        };
+        let mut state = StateMachine::open_shared(
+            Arc::new(InMemory::new()),
+            "root",
+            "test",
+            crate::state::StateCache::default(),
+            &options,
+            crate::state::transfer::Backend::Local,
+        )
+        .await
+        .unwrap();
+        let handles = state.shared_handles().unwrap();
+        let (events, _announced) = mpsc::channel(64);
+        let clock = Clock::system(Duration::from_secs(5), None);
+        let mut writer = Some(Writer::new(&handles, Duration::from_millis(50), clock));
+        let leader = writer.as_mut().unwrap();
+        leader.sync(true, 2, &events);
+        leader.sync(false, 2, &events);
+        leader.sync(true, 3, &events);
+        let failure = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if let WriterEvent::Failed(error) = next(&mut writer).await {
+                    return error;
+                }
+            }
+        })
+        .await;
+        assert!(failure.is_err(), "{failure:?}");
+        let mut leader = writer.unwrap();
+        leader.sync(false, 3, &events);
+        leader.stop().await;
+        state.apply(1, None).await.unwrap();
         state.close().await.unwrap();
     }
 }

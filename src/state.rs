@@ -40,7 +40,7 @@ mod source;
 pub(crate) mod transfer;
 pub(crate) mod view;
 pub(crate) use read::ReadView;
-pub use shared::StateMode;
+pub use shared::{StateMode, ViewRetention};
 pub use source::{Row, StateRead, StateScan};
 use view::StateView;
 #[cfg(test)]

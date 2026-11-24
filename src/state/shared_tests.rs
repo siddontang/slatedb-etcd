@@ -485,7 +485,7 @@ async fn retention_keeps_the_checkpoint_of_a_live_base() {
     // A slow open still uses the second checkpoint. Retention keeps it and all newer ones.
     let pinned = bases.remove(1);
     drop(bases);
-    shared::retain(&state.admin, &source, &Default::default(), 2)
+    shared::retain(&state.admin, &source, &Default::default(), 2, None)
         .await
         .unwrap();
     assert_eq!(count().await, 4);
@@ -494,7 +494,7 @@ async fn retention_keeps_the_checkpoint_of_a_live_base() {
         2_u64.to_be_bytes()
     );
     drop(pinned);
-    shared::retain(&state.admin, &source, &Default::default(), 2)
+    shared::retain(&state.admin, &source, &Default::default(), 2, None)
         .await
         .unwrap();
     assert_eq!(count().await, 2);
@@ -673,7 +673,7 @@ async fn an_open_in_flight_keeps_its_checkpoint() {
     let source = state.shared.as_ref().unwrap().source.clone();
     // The open reserved its checkpoint and waits for storage.
     let opening = source.reserve_open(views[0].1).unwrap();
-    shared::retain(&state.admin, &source, &Default::default(), 2)
+    shared::retain(&state.admin, &source, &Default::default(), 2, None)
         .await
         .unwrap();
     assert_eq!(
@@ -681,7 +681,7 @@ async fn an_open_in_flight_keeps_its_checkpoint() {
         5
     );
     drop(opening);
-    shared::retain(&state.admin, &source, &Default::default(), 2)
+    shared::retain(&state.admin, &source, &Default::default(), 2, None)
         .await
         .unwrap();
     assert_eq!(
@@ -885,37 +885,93 @@ async fn a_member_behind_a_checkpoint_adopts_it() {
     for state in [&mut ahead, &mut behind] {
         state.entry_term = 4;
     }
-    for n in 1..=6 {
+    let writer = writer(&ahead).await;
+    let mut written = 0;
+    for n in 1..=4 {
         ahead
             .apply_etcd(n, &put(&format!("k{n}"), "v"))
             .await
             .unwrap();
     }
+    let at_four = checkpoint(&ahead, &writer, &mut written).await;
+    let rows_at_four = rows(&ahead, b"etcd/").await;
+    for n in 5..=6 {
+        ahead
+            .apply_etcd(n, &put(&format!("k{n}"), "v"))
+            .await
+            .unwrap();
+    }
+    let at_six = checkpoint(&ahead, &writer, &mut written).await;
     for n in 1..=2 {
         behind
             .apply_etcd(n, &put(&format!("k{n}"), "v"))
             .await
             .unwrap();
     }
-    let writer = writer(&ahead).await;
-    let mut written = 0;
-    let base = checkpoint(&ahead, &writer, &mut written).await;
     let opened = behind.shared_handles().unwrap().opened;
-    opened.offer(base);
+    opened.offer(at_six.clone());
     // A switch cannot use a base above the applied index.
     behind.switch_base();
     assert_eq!(behind.applied, 2);
-    behind.adopt_opened(4).await.unwrap();
+    // The node verified checkpoint 4. A newer open in the slot does not replace it.
+    behind.adopt_opened(at_four, 4).await.unwrap();
+    assert_eq!(behind.applied, 4);
+    assert_eq!(rows(&behind, b"etcd/").await, rows_at_four);
+    assert_eq!(opened.newest(), Some(6));
+    behind
+        .adopt_opened(opened.take().unwrap(), 4)
+        .await
+        .unwrap();
     assert_eq!(behind.applied, 6);
     assert_eq!(behind.revision, ahead.revision);
     assert_eq!(rows(&behind, b"etcd/").await, rows(&ahead, b"etcd/").await);
     // A base with another term at its index fails.
     let mut wrong = open_shared(Arc::new(InMemory::new())).await;
     wrong.apply_etcd(1, &put("x", "y")).await.unwrap();
-    let base = checkpoint(&ahead, &writer, &mut written).await;
-    wrong.shared_handles().unwrap().opened.offer(base);
-    assert!(wrong.adopt_opened(5).await.is_err());
+    assert!(wrong.adopt_opened(at_six, 5).await.is_err());
     for state in [ahead, behind, wrong] {
         state.close().await.unwrap();
     }
+}
+
+/// A deposed writer cannot delete checkpoints. Retention reads the writer epoch before each
+/// deletion and stops when a newer writer holds the shared state.
+#[tokio::test]
+async fn a_fenced_writer_deletes_no_checkpoint() {
+    let mut state = open_shared(Arc::new(InMemory::new())).await;
+    let views = five_checkpoints(&mut state).await;
+    let source = state.shared.as_ref().unwrap().source.clone();
+    let old = writer(&state).await;
+    let old_epoch = old.manifest().writer_epoch();
+    // A successor opens the writer. Its members pin the oldest checkpoint.
+    let successor = writer(&state).await;
+    let new_epoch = successor.manifest().writer_epoch();
+    assert!(new_epoch > old_epoch);
+    let pinned = std::collections::HashSet::from([views[0].1]);
+    // The deposed publisher resumes its retention. It deletes nothing.
+    shared::retain(
+        &state.admin,
+        &source,
+        &Default::default(),
+        2,
+        Some(old_epoch),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        shared::view_checkpoints(&state.admin).await.unwrap().len(),
+        5
+    );
+    // The successor keeps the reported pin and deletes the others.
+    shared::retain(&state.admin, &source, &pinned, 2, Some(new_epoch))
+        .await
+        .unwrap();
+    let left: Vec<_> = shared::view_checkpoints(&state.admin)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, checkpoint)| checkpoint.id)
+        .collect();
+    assert_eq!(left, [views[0].1, views[3].1, views[4].1]);
+    state.close().await.unwrap();
 }

@@ -158,6 +158,10 @@ struct Args {
     /// writer clock by more than this.
     #[arg(long, default_value = "5s", value_parser = humantime::parse_duration)]
     max_clock_skew: std::time::Duration,
+    /// Shared mode: `off` keeps every view checkpoint. `fenced` deletes unpinned old ones, with
+    /// a known race against a new leader.
+    #[arg(long, value_enum, default_value = "off")]
+    view_retention: slatedb_etcd::state::ViewRetention,
     /// Log entry cache budget in bytes.
     #[arg(long, default_value_t = 8 * 1024 * 1024)]
     log_cache_bytes: usize,
@@ -267,6 +271,7 @@ async fn run(args: Args) -> Result<()> {
         view_pin_max: args.view_pin_max,
         overlay_max_bytes: args.overlay_max_bytes,
         max_clock_skew: args.max_clock_skew,
+        view_retention: args.view_retention,
     };
     let mut server = Server::start(config).await?;
     tracing::info!(node = args.id, listen = %server.client_addr(), "Node started");

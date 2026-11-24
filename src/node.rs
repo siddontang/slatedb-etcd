@@ -136,6 +136,8 @@ pub struct NodeOptions {
     /// Shared mode: a new writer does not start while the local clock is behind the manifest
     /// clock by more than this.
     pub max_clock_skew: Duration,
+    /// Shared mode: whether the leader deletes old view checkpoints.
+    pub view_retention: crate::state::ViewRetention,
 }
 
 impl NodeOptions {
@@ -481,7 +483,18 @@ impl Node {
                 )?;
                 state.metrics.registry.register(Box::new(gauge.clone()))?;
                 let clock = shared::Clock::system(options.max_clock_skew, Some(gauge));
-                Some(shared::Writer::new(handles, options.view_max_age, clock))
+                let retained = prometheus::IntGauge::new(
+                    "slatedb_etcd_shared_view_checkpoints",
+                    "View checkpoints of the shared state. Each one pins its SSTs.",
+                )?;
+                state
+                    .metrics
+                    .registry
+                    .register(Box::new(retained.clone()))?;
+                let mut writer = shared::Writer::new(handles, options.view_max_age, clock);
+                writer.retention = options.view_retention;
+                writer.retained = Some(retained);
+                Some(writer)
             }
             None => None,
         };

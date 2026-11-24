@@ -11,6 +11,7 @@ fn options(dir: &std::path::Path) -> NodeOptions {
         view_pin_max: std::time::Duration::from_secs(300),
         overlay_max_bytes: 1 << 30,
         max_clock_skew: std::time::Duration::from_secs(5),
+        view_retention: Default::default(),
         object_store: crate::object::Config::Local,
         strict_reconfiguration: false,
         join: false,

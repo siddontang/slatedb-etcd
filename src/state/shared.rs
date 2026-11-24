@@ -31,6 +31,17 @@ pub enum StateMode {
     Shared,
 }
 
+/// How the leader deletes old `view-` checkpoints.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum ViewRetention {
+    /// Keep every checkpoint. Each one pins its SSTs, so storage grows until a manual cleanup.
+    #[default]
+    Off,
+    /// Delete old checkpoints that no member pins. SlateDB deletes without an epoch check, so a
+    /// deposed leader can still race a new one between its epoch check and the deletion.
+    Fenced,
+}
+
 impl StateMode {
     pub fn is_replicated(&self) -> bool {
         *self == Self::Replicated
@@ -459,11 +470,16 @@ pub(crate) fn retired(
 
 /// Delete the old `view-` checkpoints that no live base of this member pins and that no member
 /// reported. Other checkpoints are not ours.
+///
+/// Deletion writes the manifest without an epoch check, so a deposed writer could delete a
+/// checkpoint that the new leader's members pin. With `epoch`, retention reads the manifest
+/// before each deletion and stops when another writer holds a newer epoch.
 pub(crate) async fn retain(
     admin: &slatedb::admin::Admin,
     source: &Source,
     reported: &HashSet<uuid::Uuid>,
     keep: usize,
+    epoch: Option<u64>,
 ) -> Result<()> {
     let views: Vec<_> = view_checkpoints(admin)
         .await?
@@ -473,6 +489,20 @@ pub(crate) async fn retain(
     let candidates = source.begin_retire(&views, reported, keep);
     let mut result = Ok(());
     for id in &candidates {
+        if let Some(epoch) = epoch {
+            let current = admin.read_manifest(None).await.map_err(anyhow::Error::from);
+            match current.map(|manifest| manifest.map(|manifest| manifest.writer_epoch())) {
+                Ok(Some(current)) if current == epoch => {}
+                Ok(current) => {
+                    tracing::warn!(?current, epoch, "a newer writer holds the shared state");
+                    break;
+                }
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
         if let Err(error) = admin.delete_checkpoint(*id).await {
             result = Err(error.into());
             break;
@@ -585,11 +615,13 @@ impl Opened {
     }
 
     /// The `F` of the opened base that waits in the slot.
+    #[cfg(test)]
     pub(crate) fn newest(&self) -> Option<u64> {
         self.slot.lock().unwrap().as_ref().map(|base| base.applied)
     }
 
-    fn take(&self) -> Option<Arc<Base>> {
+    /// Take the opened base. The caller holds it until it adopts it or offers it back.
+    pub(crate) fn take(&self) -> Option<Arc<Base>> {
         self.slot.lock().unwrap().take()
     }
 }
@@ -895,12 +927,7 @@ impl StateMachine {
 
     /// Adopt the opened base above the applied index. A paused member uses this when its log
     /// commits the base index, so the Raft log needs no change. `term` is the log term there.
-    pub(crate) async fn adopt_opened(&mut self, term: u64) -> Result<()> {
-        let shared = self
-            .shared
-            .as_ref()
-            .context("adopt needs shared state mode")?;
-        let base = shared.opened.take().context("no opened base")?;
+    pub(crate) async fn adopt_opened(&mut self, base: Arc<Base>, term: u64) -> Result<()> {
         ensure!(base.applied > self.applied, "the opened base is not ahead");
         self.adopt_base(base, term).await
     }

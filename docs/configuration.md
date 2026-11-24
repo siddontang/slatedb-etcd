@@ -142,6 +142,7 @@ checkpoint of it, its base, under an in-memory overlay of the newer applied batc
 | `--view-pin-max` | `5m` | Age after which a read view fails with a retryable error. |
 | `--overlay-max-bytes` | 1073741824 | Leader admission limit of the overlay. Apply waits at 2x. |
 | `--max-clock-skew` | `5s` | A new writer does not start with its clock this far behind. |
+| `--view-retention` | `off` | `off` keeps all view checkpoints. `fenced` deletes unpinned ones. |
 
 Rules and limits:
 
@@ -166,6 +167,24 @@ Rules and limits:
 - A member that waits on its overlay limit adopts a newer checkpoint in process when its log
   commits the checkpoint index.
 - Manual checkpoints, Defragment, and snapshot restore are unavailable.
+
+### View checkpoint retention
+
+Automatic deletion of `view-` checkpoints is off by default. SlateDB 0.18.1 deletes a
+checkpoint without a writer epoch check. A deposed leader can pass its own epoch check, and a new
+leader can take the writer before the deletion. The deletion can then remove a checkpoint that a
+member of the new leader pins.
+
+- Each kept checkpoint pins its SSTs, so object storage grows with the number of checkpoints.
+  `slatedb_etcd_shared_view_checkpoints` reports their number after each publication.
+- `--view-retention fenced` deletes old checkpoints that no member reported in the last 10
+  minutes. It checks the writer epoch before each deletion, and a new leader waits 10 seconds
+  for member reports first. The race above remains.
+- Manual cleanup is safe with the whole cluster stopped. Keep the newest checkpoint and the
+  checkpoint of each member's Raft snapshot record, then delete older `view-` checkpoints with
+  the SlateDB admin API. Start the members again after the deletion.
+- Checkpoint expiry is future work. It needs recovery after an offline period longer than the
+  lifetime, and follower reads across missed renewals.
 - `object::Config::SharedDirectory` lets members of one host share a local directory in tests.
   A member-local store serves one voter.
 

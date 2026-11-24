@@ -74,6 +74,8 @@ pub struct ServerConfig {
     /// Shared mode: a new leader does not start its writer while its clock is behind the
     /// shared writer clock by more than this.
     pub max_clock_skew: Duration,
+    /// Shared mode: whether the leader deletes old view checkpoints. Off by default.
+    pub view_retention: crate::state::ViewRetention,
 }
 
 impl ServerConfig {
@@ -109,6 +111,7 @@ impl ServerConfig {
             view_pin_max: DEFAULT_VIEW_PIN_MAX,
             overlay_max_bytes: DEFAULT_OVERLAY_MAX_BYTES,
             max_clock_skew: Duration::from_secs(5),
+            view_retention: crate::state::ViewRetention::Off,
         }
     }
 }
@@ -309,6 +312,7 @@ impl Server {
                 view_pin_max: config.view_pin_max,
                 overlay_max_bytes: config.overlay_max_bytes,
                 max_clock_skew: config.max_clock_skew,
+                view_retention: config.view_retention,
                 transport,
             },
             events.clone(),

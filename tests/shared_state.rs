@@ -269,9 +269,10 @@ async fn one_write_makes_one_checkpoint_and_one_announcement() {
     tokio::time::sleep(age * 5).await;
     let (applied, announced, base) = views(&server).await;
     assert_eq!((applied, announced), (idle + 1, idle + 1));
-    // The new base covers the write. The publisher keeps the two newest checkpoints.
+    // The new base covers the write.
     assert!(base > 0);
-    assert_eq!(checkpoints(dir.path()).await, 2.min(applied as usize));
+    // Retention is off by default, so every published checkpoint stays.
+    assert_eq!(checkpoints(dir.path()).await, applied as usize);
     let reply = kv.range(all()).await.unwrap().into_inner();
     assert_eq!(reply.kvs[0].value, b"value");
     assert_eq!(reply.header.unwrap().revision, revision);
