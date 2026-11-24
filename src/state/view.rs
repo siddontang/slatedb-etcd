@@ -80,6 +80,9 @@ impl Base {
     }
 }
 
+/// The message of a read that held its view past the pin limit.
+pub(crate) const EXPIRED: &str = "read view expired; retry";
+
 /// A base plus the overlay batches at or below `seq`.
 #[derive(Clone)]
 pub(crate) struct SharedView {
@@ -87,6 +90,8 @@ pub(crate) struct SharedView {
     /// Oldest first.
     pub(super) segments: Arc<[Arc<Segment>]>,
     pub(super) seq: u64,
+    /// The end of one read's pin. Each read takes its own deadline on a shared view.
+    deadline: Option<std::time::Instant>,
 }
 
 impl SharedView {
@@ -95,6 +100,17 @@ impl SharedView {
             base,
             segments,
             seq,
+            deadline: None,
+        }
+    }
+
+    /// Fail when the read holds the view past its deadline. Gets and each scan step check it.
+    fn check(&self) -> Result<(), slatedb::Error> {
+        match self.deadline {
+            Some(deadline) if std::time::Instant::now() >= deadline => {
+                Err(slatedb::Error::unavailable(EXPIRED.to_owned()))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -143,6 +159,7 @@ pub(crate) struct SharedScan<'a> {
 impl StateScan for SharedScan<'_> {
     async fn next(&mut self) -> Result<Option<Row>, slatedb::Error> {
         loop {
+            self.view.check()?;
             if self.base_row.is_none() {
                 if let Some(base) = &mut self.base {
                     self.base_row = StateScan::next(base).await?;
@@ -189,6 +206,7 @@ impl StateRead for SharedView {
     type Scan<'a> = SharedScan<'a>;
 
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, slatedb::Error> {
+        self.check()?;
         for segment in self.segments.iter().rev() {
             if let Some(value) = segment.get(key, self.seq) {
                 return Ok(value);
@@ -238,6 +256,24 @@ impl StateRead for SharedView {
             overlay_done: false,
         })
     }
+}
+
+impl StateView {
+    /// The same state for one read that must end by `deadline`. Only shared views pin a base.
+    pub(crate) fn until(&self, deadline: Option<std::time::Instant>) -> Self {
+        match self {
+            Self::Shared(view) => Self::Shared(SharedView {
+                deadline,
+                ..view.clone()
+            }),
+            other => other.clone(),
+        }
+    }
+}
+
+/// Return true when an error message comes from a read that held its view too long.
+pub(crate) fn expired(message: &str) -> bool {
+    message.contains(EXPIRED)
 }
 
 /// The rows of a `StateView` scan.

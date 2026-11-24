@@ -44,6 +44,8 @@ const VIEW: &str = "view-";
 const CLAIM: &str = "shared/owner.json";
 const BOOTSTRAP: &str = "shared/bootstrap.json";
 const STATE: &str = "shared/state";
+/// A received snapshot that Raft did not install releases its checkpoint after this time.
+const RECEIPT_LIFETIME: Duration = Duration::from_secs(60);
 /// The cluster-wide mode claim. Both modes create it before they write state on S3.
 const MODE: &str = "mode.json";
 
@@ -226,8 +228,9 @@ pub(crate) struct Source {
     pub cache: Arc<dyn slatedb::db_cache::DbCache>,
     /// Opens and deletions of checkpoints. One lock orders them. See `Pins`.
     pins: Mutex<Pins>,
-    /// Bases of received snapshots. Each one stays open until its install takes it.
-    received: Mutex<std::collections::HashMap<uuid::Uuid, Arc<Base>>>,
+    /// Bases of received snapshots, with their receive time. Install takes the base. Raft can
+    /// also drop a snapshot, so a receipt expires after `RECEIPT_LIFETIME`.
+    received: Mutex<std::collections::HashMap<uuid::Uuid, (std::time::Instant, Arc<Base>)>>,
 }
 
 /// The checkpoints that this member uses, and the ones that retention deletes.
@@ -308,15 +311,24 @@ impl Source {
 
     /// The checkpoints that this member uses: live bases and opens in flight.
     pub fn pinned(&self) -> HashSet<uuid::Uuid> {
+        self.received
+            .lock()
+            .unwrap()
+            .retain(|_, (at, _)| at.elapsed() < RECEIPT_LIFETIME);
         self.pins.lock().unwrap().pinned()
     }
 
     /// Select the checkpoints to delete and mark them, under the lock that opens take. A later
     /// open of a marked checkpoint fails. Call `end_retire` after the deletions.
-    pub(crate) fn begin_retire(&self, views: &[(u64, uuid::Uuid)], keep: usize) -> Vec<uuid::Uuid> {
+    pub(crate) fn begin_retire(
+        &self,
+        views: &[(u64, uuid::Uuid)],
+        reported: &HashSet<uuid::Uuid>,
+        keep: usize,
+    ) -> Vec<uuid::Uuid> {
         let mut pins = self.pins.lock().unwrap();
         let pinned = pins.pinned();
-        let candidates = retired(views, &pinned, keep);
+        let candidates = retired(views, &pinned, reported, keep);
         pins.retiring.extend(candidates.iter().copied());
         candidates
     }
@@ -336,12 +348,17 @@ impl Source {
         }
         let base = self.open_base(id).await?;
         // Raft can drop an older snapshot without an install. Keep only the newest one.
-        *self.received.lock().unwrap() = std::collections::HashMap::from([(id, base)]);
+        *self.received.lock().unwrap() =
+            std::collections::HashMap::from([(id, (std::time::Instant::now(), base))]);
         Ok(())
     }
 
     fn take_received(&self, id: uuid::Uuid) -> Option<Arc<Base>> {
-        self.received.lock().unwrap().remove(&id)
+        self.received
+            .lock()
+            .unwrap()
+            .remove(&id)
+            .map(|(_, base)| base)
     }
 
     /// Open the writable shared database. Opening it fences an older writer.
@@ -463,6 +480,25 @@ pub(crate) async fn retain(
     }
     source.end_retire(&candidates);
     result
+}
+
+/// Open the newest `view-` checkpoint at or below index `limit` that holds the membership.
+async fn newest_base_through(
+    admin: &slatedb::admin::Admin,
+    source: &Source,
+    limit: u64,
+) -> Result<Option<Arc<Base>>> {
+    for (seq, checkpoint) in view_checkpoints(admin).await?.into_iter().rev() {
+        // The name holds a lower bound of `F`. The base holds `F` itself.
+        if seq > limit {
+            continue;
+        }
+        let base = source.open_base(checkpoint.id).await?;
+        if base.applied <= limit && base.get(crate::cluster::KEY).await?.is_some() {
+            return Ok(Some(base));
+        }
+    }
+    Ok(None)
 }
 
 /// Open the newest `view-` checkpoint that holds the membership. The publisher deletes a
@@ -815,24 +851,16 @@ impl StateMachine {
         Ok(())
     }
 
-    /// Rebuild the state from the newest checkpoint after a missing object. The caller replays
-    /// the local log from the new `applied` to its old position.
-    ///
-    /// A checkpoint above the applied index needs an adopt of the Raft log. A restart does that.
-    pub(crate) async fn rebase(&mut self) -> Result<()> {
+    /// Rebuild the state from the newest checkpoint at or below `limit` after a missing object.
+    /// The caller replays the local log from the new `applied` to `limit`.
+    pub(crate) async fn rebase(&mut self, limit: u64) -> Result<()> {
         let shared = self
             .shared
             .as_ref()
             .context("rebase needs shared state mode")?;
-        let base = newest_base(&self.admin, &shared.source)
+        let base = newest_base_through(&self.admin, &shared.source, limit)
             .await?
-            .context("the shared state has no view checkpoint")?;
-        ensure!(
-            base.applied <= self.applied,
-            "the newest checkpoint {} is above applied index {}; restart the member to adopt it",
-            base.applied,
-            self.applied
-        );
+            .context("the shared state has no view checkpoint at or below the rebase index")?;
         tracing::warn!(
             base = base.applied,
             applied = self.applied,
@@ -852,11 +880,13 @@ impl StateMachine {
             .shared
             .as_ref()
             .context("a format 6 snapshot needs shared state mode")?;
+        let id = descriptor.checkpoint()?;
+        // Release the receipt on every path, also for a snapshot that applies nothing.
+        let received = shared.source.take_received(id);
         if index <= self.applied {
             return Ok(());
         }
-        let id = descriptor.checkpoint()?;
-        let base = match shared.source.take_received(id) {
+        let base = match received {
             Some(base) => base,
             None => shared.source.open_base(id).await?,
         };

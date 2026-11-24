@@ -13,8 +13,9 @@ pub(crate) struct ReadView {
     pub leases: Arc<std::collections::BTreeMap<i64, crate::lease::LeaseRecord>>,
     /// Current keys at the snapshot's sequence number, for Range counts.
     keys: key_index::KeyPin,
-    /// Shared mode: reads fail after this time, so a view does not pin its checkpoint forever.
-    expires: Option<std::time::Instant>,
+    /// Shared mode: the longest time that one read may pin the base. Each read starts its own
+    /// deadline, so an old view stays usable for new reads.
+    pin_max: Option<std::time::Duration>,
 }
 
 impl StateMachine {
@@ -29,18 +30,23 @@ impl StateMachine {
             auth: self.auth.clone(),
             leases: self.leases.clone(),
             keys: self.key_index.pin(self.applied),
-            expires: self
-                .shared
-                .as_ref()
-                .map(|shared| std::time::Instant::now() + shared.pin_max),
+            pin_max: self.shared.as_ref().map(|shared| shared.pin_max),
         }))
     }
 }
 
 impl ReadView {
     /// The pinned state. Watch catch-up reads it beside the view's revisions.
+    #[cfg(test)]
     pub(crate) fn state(&self) -> &StateView {
         &self.state
+    }
+
+    /// The state for one read. In shared mode the read must end within the pin limit, which
+    /// starts now.
+    pub(crate) fn read_state(&self) -> StateView {
+        self.state
+            .until(self.pin_max.map(|limit| std::time::Instant::now() + limit))
     }
 
     pub async fn read(
@@ -60,18 +66,7 @@ impl ReadView {
         credentials: Option<&crate::auth::Credentials>,
         budget: Option<usize>,
     ) -> Result<Option<Outcome>> {
-        // The caller retries on a new view. A Watch catch-up takes a new view for each page.
-        if self
-            .expires
-            .is_some_and(|expires| std::time::Instant::now() >= expires)
-        {
-            return Ok(Some(Outcome {
-                result: Err(mvcc::KvError::new(
-                    tonic::Code::Unavailable,
-                    "etcdserver: read view expired; retry",
-                )),
-            }));
-        }
+        let state = self.read_state();
         if let Some(credentials) = credentials {
             if let Err(error) = self.auth.kv(credentials, request) {
                 return Ok(Some(Outcome { result: Err(error) }));
@@ -84,7 +79,7 @@ impl ReadView {
         .then(std::time::Instant::now);
         let result = match budget {
             Some(budget) => match mvcc::read_snapshot_within(
-                self.state(),
+                &state,
                 &self.rows,
                 self.revision,
                 self.compact_revision,
@@ -100,7 +95,7 @@ impl ReadView {
             },
             None => {
                 mvcc::read_snapshot(
-                    self.state(),
+                    &state,
                     &self.rows,
                     self.revision,
                     self.compact_revision,
@@ -120,9 +115,11 @@ impl ReadView {
             histogram.observe(start.elapsed().as_secs_f64());
         }
         if let Err(error) = &result {
-            // A deleted checkpoint object fails only this read. The client retries on a new view.
-            if self.expires.is_some()
-                && super::shared::missing_object(&anyhow::anyhow!("{}", error.message))
+            // A deleted checkpoint object or an expired pin fails only this read. The client
+            // retries on a new view.
+            if self.pin_max.is_some()
+                && (super::shared::missing_object(&anyhow::anyhow!("{}", error.message))
+                    || super::view::expired(&error.message))
             {
                 return Ok(Some(Outcome {
                     result: Err(mvcc::KvError::new(

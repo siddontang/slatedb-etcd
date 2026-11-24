@@ -605,3 +605,57 @@ async fn a_restarted_follower_adopts_a_checkpoint_above_its_log() {
         server.shutdown().await.unwrap();
     }
 }
+
+/// Reads after an idle time longer than the pin limit succeed in both read modes, and Watch
+/// replays the history. Each read starts its own pin deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reads_after_an_idle_pin_limit_succeed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path(), StateMode::Shared, Duration::from_millis(200));
+    config.view_pin_max = Duration::from_millis(250);
+    let (server, channel) = start(config).await;
+    let mut kv = KvClient::new(channel.clone());
+    kv.put(put("key", "value")).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for serializable in [true, false] {
+        let reply = kv
+            .range(RangeRequest {
+                key: b"key".to_vec(),
+                serializable,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reply.kvs[0].value, b"value");
+    }
+    let (send, receive) = tokio::sync::mpsc::channel(1);
+    send.send(WatchRequest {
+        request_union: Some(watch_request::RequestUnion::CreateRequest(
+            WatchCreateRequest {
+                key: b"key".to_vec(),
+                start_revision: 1,
+                ..Default::default()
+            },
+        )),
+    })
+    .await
+    .unwrap();
+    let mut stream = WatchClient::new(channel)
+        .watch(tokio_stream::wrappers::ReceiverStream::new(receive))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut events = vec![];
+    while events.is_empty() {
+        let message = tokio::time::timeout(Duration::from_secs(5), stream.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        events.extend(message.events);
+    }
+    assert_eq!(events[0].kv.as_ref().unwrap().value, b"value");
+    drop(send);
+    server.shutdown().await.unwrap();
+}

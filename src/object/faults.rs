@@ -27,6 +27,8 @@ pub(crate) const FAIL_GET: u8 = 4;
 pub(crate) const FAIL_SST_GET: u8 = 5;
 /// Hold every put until the mode changes, like a stalled object store.
 pub(crate) const STALL_PUT: u8 = 6;
+/// Hold every put of the shared database, but not the claims beside it.
+pub(crate) const STALL_STATE_PUT: u8 = 8;
 /// Report the next SST read as missing, like an SST that GC deleted.
 pub(crate) const LOSE_SST_ONCE: u8 = 7;
 
@@ -46,11 +48,13 @@ impl FaultStore {
         self.resumed.notify_waiters();
     }
 
-    async fn stall(&self) {
+    async fn stall(&self, path: &Path) {
         loop {
             let resumed = self.resumed.notified();
-            if self.mode.load(Ordering::SeqCst) != STALL_PUT {
-                return;
+            match self.mode.load(Ordering::SeqCst) {
+                STALL_PUT => {}
+                STALL_STATE_PUT if path.as_ref().contains("shared/state/") => {}
+                _ => return,
             }
             resumed.await;
         }
@@ -77,7 +81,7 @@ impl ObjectStore for FaultStore {
         payload: PutPayload,
         options: PutOptions,
     ) -> Result<PutResult> {
-        self.stall().await;
+        self.stall(path).await;
         if path.as_ref().ends_with(".sst") {
             match self.mode.load(Ordering::SeqCst) {
                 FAIL_PUT => {
@@ -110,7 +114,7 @@ impl ObjectStore for FaultStore {
         path: &Path,
         options: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
-        self.stall().await;
+        self.stall(path).await;
         self.inner.put_multipart_opts(path, options).await
     }
 

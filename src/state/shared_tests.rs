@@ -3,7 +3,7 @@
 use super::*;
 use crate::proto::etcdserverpb::request_op::Request as Op;
 use crate::proto::etcdserverpb::*;
-use slatedb::config::{CheckpointOptions, CheckpointScope};
+use slatedb::config::{CheckpointOptions, CheckpointScope, ScanOptions};
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
 
@@ -624,12 +624,13 @@ async fn readers_drop_a_logical_size_row() {
 /// Five checkpoints with no live base, and their `(seq, id)` list.
 async fn five_checkpoints(state: &mut StateMachine) -> Vec<(u64, uuid::Uuid)> {
     let mut written = 0;
+    let writer = writer(state).await;
     for n in 0..5 {
         state
             .apply_etcd(state.applied + 1, &put(&format!("k{n}"), "v"))
             .await
             .unwrap();
-        drop(checkpoint(state, &mut written).await);
+        drop(checkpoint(state, &writer, &mut written).await);
     }
     shared::view_checkpoints(&state.admin)
         .await
@@ -647,7 +648,7 @@ async fn an_open_after_the_retention_choice_fails() {
     let views = five_checkpoints(&mut state).await;
     let source = state.shared.as_ref().unwrap().source.clone();
     let oldest = views[0].1;
-    let candidates = source.begin_retire(&views, 2);
+    let candidates = source.begin_retire(&views, &Default::default(), 2);
     assert_eq!(candidates, [views[0].1, views[1].1, views[2].1]);
     // The open runs between the choice and the deletion.
     let error = source.open_base(oldest).await.err().unwrap();
@@ -672,13 +673,17 @@ async fn an_open_in_flight_keeps_its_checkpoint() {
     let source = state.shared.as_ref().unwrap().source.clone();
     // The open reserved its checkpoint and waits for storage.
     let opening = source.reserve_open(views[0].1).unwrap();
-    shared::retain(&state.admin, &source, 2).await.unwrap();
+    shared::retain(&state.admin, &source, &Default::default(), 2)
+        .await
+        .unwrap();
     assert_eq!(
         shared::view_checkpoints(&state.admin).await.unwrap().len(),
         5
     );
     drop(opening);
-    shared::retain(&state.admin, &source, 2).await.unwrap();
+    shared::retain(&state.admin, &source, &Default::default(), 2)
+        .await
+        .unwrap();
     assert_eq!(
         shared::view_checkpoints(&state.admin).await.unwrap().len(),
         2
@@ -711,11 +716,64 @@ async fn an_old_view_fails_reads_with_a_retryable_error() {
     };
     let view = state.read_view().unwrap();
     assert!(view.read(&get, None).await.unwrap().result.is_ok());
+    // An idle view stays usable. Each read starts its own deadline.
     tokio::time::sleep(Duration::from_millis(80)).await;
-    let error = view.read(&get, None).await.unwrap().result.unwrap_err();
-    assert_eq!(error.code, tonic::Code::Unavailable as i32);
-    // A new view reads again.
-    let fresh = state.read_view().unwrap();
-    assert!(fresh.read(&get, None).await.unwrap().result.is_ok());
+    assert!(view.read(&get, None).await.unwrap().result.is_ok());
+    // One read that holds its pin past the limit fails at its next get or scan step.
+    let held = view.read_state();
+    let mut scan = held
+        .scan_under(b"etcd/", &ScanOptions::default())
+        .await
+        .unwrap();
+    assert!(scan.next().await.unwrap().is_some());
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let error = scan.next().await.err().unwrap();
+    assert!(view::expired(&error.to_string()), "{error}");
+    let error = held.get(b"etcd/current/key").await.unwrap_err();
+    assert!(view::expired(&error.to_string()), "{error}");
+    assert!(view.read(&get, None).await.unwrap().result.is_ok());
+    state.close().await.unwrap();
+}
+
+/// A format 6 snapshot at the applied index must have the applied term.
+#[tokio::test]
+async fn an_equal_index_snapshot_with_another_term_fails() {
+    let mut state = open_shared(Arc::new(InMemory::new())).await;
+    state.entry_term = 2;
+    state.apply_etcd(1, &put("key", "value")).await.unwrap();
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = 1;
+    snapshot.mut_metadata().term = 3;
+    snapshot.data = transfer::ViewDescriptor::new(uuid::Uuid::new_v4())
+        .encode()
+        .unwrap();
+    let error = state.install_snapshot(&snapshot).await.unwrap_err();
+    assert!(error.to_string().contains("differs"), "{error}");
+    snapshot.mut_metadata().term = 2;
+    state.install_snapshot(&snapshot).await.unwrap();
+    state.close().await.unwrap();
+}
+
+/// A received snapshot that applies nothing releases its checkpoint.
+#[tokio::test]
+async fn a_skipped_snapshot_releases_its_receipt() {
+    let mut state = open_shared(Arc::new(InMemory::new())).await;
+    state.apply_etcd(1, &put("a", "1")).await.unwrap();
+    let mut written = 0;
+    let writer = writer(&state).await;
+    let id = checkpoint(&state, &writer, &mut written)
+        .await
+        .checkpoint
+        .unwrap();
+    state.apply_etcd(2, &put("b", "2")).await.unwrap();
+    let source = state.shared.as_ref().unwrap().source.clone();
+    source.receive(id).await.unwrap();
+    assert!(source.pinned().contains(&id));
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = 1;
+    snapshot.data = transfer::ViewDescriptor::new(id).encode().unwrap();
+    state.install_snapshot(&snapshot).await.unwrap();
+    assert_eq!(state.applied, 2);
+    assert!(!source.pinned().contains(&id));
     state.close().await.unwrap();
 }

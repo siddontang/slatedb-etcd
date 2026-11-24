@@ -249,23 +249,23 @@ impl Drop for Executor {
 }
 
 impl Executor {
-    /// Run one job. In shared mode a missing checkpoint object rebases the state on the newest
-    /// checkpoint, and the job runs again for its entries above the new position.
+    /// Run one job. In shared mode a missing checkpoint object rebases the state to the position
+    /// before the job, and the whole job runs again. Each entry then completes exactly once.
     async fn execute(&mut self, work: Work) -> Result<Completion> {
+        let start = self.state.applied;
         let retry = match (&work.job, &self.log) {
             (Job::Entries(entries), Some(_)) => Some((entries.clone(), work.header)),
             _ => None,
         };
         // Box the inner jobs. Their futures are large, and DST runs them on a test stack.
         let result = Box::pin(self.execute_once(work)).await;
-        let Some((mut entries, header)) = retry else {
+        let Some((entries, header)) = retry else {
             return result;
         };
         match result {
             Err(error) if crate::state::shared::missing_object(&error) => {
                 tracing::warn!(%error, "an apply read lost its checkpoint object");
-                Box::pin(self.rebase(header)).await?;
-                entries.retain(|entry| entry.index > self.state.applied);
+                Box::pin(self.rebase(header, start)).await?;
                 Box::pin(self.execute_once(Work {
                     job: Job::Entries(entries),
                     header,
@@ -277,13 +277,13 @@ impl Executor {
         }
     }
 
-    /// Rebuild the state from the newest checkpoint and replay the local log to the old applied
-    /// index. No view is published until the replay ends, so reads see no older state. The
-    /// replayed entries send no replies, and Raft already applied their membership changes.
-    async fn rebase(&mut self, header: Header) -> Result<()> {
+    /// Rebuild the state from the newest checkpoint at or below `applied`, and replay the local
+    /// log to `applied`. No view is published until the replay ends, so reads see no older
+    /// state. Earlier jobs already sent the replies of the replayed entries, and Raft already
+    /// applied their membership changes.
+    async fn rebase(&mut self, header: Header, applied: u64) -> Result<()> {
         let log = self.log.clone().context("rebase needs the log")?;
-        let applied = self.state.applied;
-        self.state.rebase().await?;
+        self.state.rebase(applied).await?;
         while self.state.applied < applied {
             let low = self.state.applied + 1;
             let entries = log.entries(low, (low + BATCH_ENTRIES).min(applied + 1))?;
@@ -343,10 +343,27 @@ impl Executor {
             }
             Job::Query(query) => match query {
                 Query::Maintenance(command, credentials, status, response) => {
-                    let mut outcome = self
+                    let result = self
                         .state
                         .maintenance(&command, &credentials, *status)
-                        .await?;
+                        .await;
+                    // A storage error of a read-only diagnostic fails only its request.
+                    // Defragment changes storage, so its errors still stop the member.
+                    let mut outcome = match result {
+                        Ok(outcome) => outcome,
+                        Err(error)
+                            if !matches!(command, crate::maintenance::Command::Defragment) =>
+                        {
+                            tracing::warn!(%error, "a maintenance read failed");
+                            crate::mvcc::Outcome {
+                                result: Err(crate::mvcc::KvError::new(
+                                    tonic::Code::Unavailable,
+                                    &format!("etcdserver: {error}"),
+                                )),
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    };
                     fill_value_header(work.header, &mut outcome)?;
                     Output::Query {
                         response,
@@ -842,6 +859,33 @@ mod tests {
                 ..Default::default()
             })
             .collect();
+        // Entry 21 is a physical Compact, and entry 22 adds a learner. Their completions come
+        // before the lost read of entry 23 in the same job.
+        entries[20].data = RaftCommand::Compact {
+            id: "21".into(),
+            compact: CompactionRequest {
+                revision: 3,
+                physical: true,
+            },
+        }
+        .encode()
+        .unwrap();
+        let request = crate::cluster::Command::Add(Member {
+            id: 9,
+            peer_ur_ls: vec!["http://127.0.0.1:9".into()],
+            is_learner: true,
+            ..Default::default()
+        });
+        let mut change = request.change();
+        change.context = RaftCommand::Cluster {
+            id: "22".into(),
+            request,
+            credentials: Default::default(),
+        }
+        .encode()
+        .unwrap();
+        entries[21].entry_type = EntryType::EntryConfChange as i32;
+        entries[21].data = change.encode_to_vec();
         // Entry 23 reads an old revision. Only the base holds that history row.
         entries[22].data = command(
             23,
@@ -921,9 +965,6 @@ mod tests {
             .offer(handles.source.open_base(id).await.unwrap());
         state.switch_base();
         assert_eq!(*handles.based.borrow(), 20);
-        apply_entries(&mut state, entries[20..22].to_vec(), header)
-            .await
-            .unwrap();
 
         let (events, _) = mpsc::channel(8);
         let mut executor = Executor {
@@ -936,19 +977,24 @@ mod tests {
         faults.set(LOSE_SST_ONCE);
         let completion = executor
             .execute(Work {
-                job: Job::Entries(entries[22..].to_vec()),
+                job: Job::Entries(entries[20..].to_vec()),
                 header,
                 delay: Duration::ZERO,
             })
             .await
             .unwrap();
-        // The read lost its object once. The rebase and the retry applied both entries.
+        // The read lost its object once. The rebase restarted the job, and every entry of the
+        // job completes exactly once, with the Compact notice and the membership change.
         assert_eq!(faults.entered.available_permits(), 1);
         assert_eq!(completion.applied, 24);
         let Output::Entries(replies) = completion.output else {
             panic!("expected entries");
         };
-        let Reply::Kv(outcome) = &replies[0].reply else {
+        let ids: Vec<_> = replies.iter().map(|reply| reply.id.as_str()).collect();
+        assert_eq!(ids, ["21", "22", "23", "24"]);
+        assert!(matches!(replies[0].reply, Reply::PhysicalCompact { .. }));
+        assert_eq!(replies[1].change.as_ref().unwrap().node_id, 9);
+        let Reply::Kv(outcome) = &replies[2].reply else {
             panic!("expected a KV reply");
         };
         let Some(Resp::ResponseTxn(txn)) = &outcome.result.as_ref().unwrap().response else {

@@ -148,10 +148,10 @@ impl StateMachine {
     }
 
     pub(crate) async fn manifest_size(admin: &slatedb::admin::Admin) -> Result<u64> {
-        let manifest = admin
-            .read_manifest(None)
-            .await?
-            .context("missing manifest")?;
+        // A shared database has no manifest until its first leader opens the writer.
+        let Some(manifest) = admin.read_manifest(None).await? else {
+            return Ok(0);
+        };
         Ok(manifest
             .all_sst_views()
             .map(|v| v.sst.estimate_size())

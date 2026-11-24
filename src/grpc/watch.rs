@@ -242,6 +242,7 @@ impl Stream {
         // A missing or incomplete batch leaves the covered watchers for storage catch-up.
         if let Some(journals) = journals {
             let credentials = self.credentials();
+            let reads = state.view.read_state();
             let mut ids = vec![];
             for (revision, journal) in journals {
                 self.candidates(journal, &mut ids);
@@ -253,6 +254,7 @@ impl Stream {
                             &self.tx,
                             &self.meters,
                             &state,
+                            &reads,
                             &credentials,
                             watcher,
                             *revision,
@@ -362,30 +364,65 @@ impl Stream {
         for (id, _) in &pending {
             permit(&view.auth, &credentials, &self.watchers[id].request)?;
         }
-        let (rows, covered) = crate::watch::scan(view.state(), from, limit, PAGE_REVISIONS)
-            .await
-            .map_err(|e| Status::unavailable(format!("etcdserver: {}", e.message)))?;
+        // Each page is one read with its own pin deadline. An expired page resumes on a new
+        // view after the last revision that each watcher received.
+        let reads = view.read_state();
+        let (rows, covered) = match crate::watch::scan(&reads, from, limit, PAGE_REVISIONS).await {
+            Ok(page) => page,
+            Err(error) if crate::state::view::expired(&error.message) => return Ok(true),
+            Err(error) => {
+                return Err(Status::unavailable(format!(
+                    "etcdserver: {}",
+                    error.message
+                )));
+            }
+        };
         let mut ids = vec![];
-        for (revision, journal) in &rows {
+        let mut expired = None;
+        'rows: for (revision, journal) in &rows {
             self.candidates(journal, &mut ids);
+            let mut sent = vec![];
             for id in &ids {
                 // Starts do not change in this loop. A pending watcher has `start <= bound` and
                 // is not compacted, so this condition selects the pending watchers.
                 let watcher = self.watchers.get_mut(id).expect("indexed watcher");
                 let start = watcher.start.unwrap_or(i64::MAX);
                 if start <= bound && start <= *revision {
-                    deliver(
+                    let delivered = deliver(
                         &self.tx,
                         &self.meters,
                         &state,
+                        &reads,
                         &credentials,
                         watcher,
                         *revision,
                         journal,
                     )
-                    .await?;
+                    .await;
+                    match delivered {
+                        Ok(()) => sent.push(*id),
+                        Err(status) if crate::state::view::expired(status.message()) => {
+                            expired = Some((*revision, sent));
+                            break 'rows;
+                        }
+                        Err(status) => return Err(status),
+                    }
                 }
             }
+        }
+        if let Some((revision, sent)) = expired {
+            // Watchers that received this revision resume after it. The others resume at it.
+            for (id, _) in &pending {
+                let watcher = self.watchers.get_mut(id).expect("pending watcher");
+                let start = watcher.start.as_mut().expect("pending start");
+                let resume = if sent.contains(id) {
+                    revision + 1
+                } else {
+                    revision
+                };
+                *start = (*start).max(resume);
+            }
+            return Ok(true);
         }
         for (id, _) in &pending {
             let watcher = self.watchers.get_mut(id).expect("pending watcher");
@@ -543,17 +580,19 @@ fn permit(
         .map_err(|e| e.status())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn deliver(
     tx: &Output,
     meters: &Option<Arc<crate::metrics::WatchMeters>>,
     state: &FeedState,
+    reads: &crate::state::view::StateView,
     credentials: &crate::auth::Credentials,
     watcher: &mut Watcher,
     revision: i64,
     journal: &crate::proto::state::Journal,
 ) -> Result<(), Status> {
     let events = crate::watch::select(
-        state.view.state(),
+        reads,
         &watcher.request,
         revision,
         state.view.compact_revision,

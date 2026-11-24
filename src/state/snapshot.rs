@@ -49,6 +49,10 @@ impl StateMachine {
     pub async fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<()> {
         let index = snapshot.get_metadata().index;
         let term = snapshot.get_metadata().term;
+        // Known terms at the same index must agree, for every snapshot format.
+        if index == self.applied {
+            self.reconcile_term(term)?;
+        }
         if let Some(view) = transfer::ViewDescriptor::decode(snapshot.get_data())? {
             return Box::pin(self.install_view(view, index, term)).await;
         }
@@ -56,9 +60,6 @@ impl StateMachine {
             !self.is_shared() || index <= self.applied,
             "shared state mode installs only format 6 snapshots"
         );
-        if index == self.applied {
-            self.reconcile_term(term)?;
-        }
         if let Some(descriptor) = transfer::Descriptor::decode(snapshot.get_data())? {
             // Box the copy and database open. They are large futures on the apply stack.
             return Box::pin(self.install_object(descriptor, index, term)).await;

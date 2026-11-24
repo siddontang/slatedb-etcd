@@ -314,12 +314,18 @@ async fn claim_shared(
         !crate::state::shared::has_replicated_member(store, root).await?,
         "the cluster uses Replicated state mode"
     );
+    // A joining member is not an initial voter. It checks the existing cluster before it writes
+    // anything, so a failed join leaves an empty namespace empty.
+    let joined = if shared.join {
+        Some(crate::state::shared::claimed_quota(store, root, cluster).await?)
+    } else {
+        None
+    };
     crate::state::shared::claim_mode(store, root, cluster, StateMode::Shared).await?;
     // A shared-mode member keeps no state of its own. Its binding records the mode.
     claim(store, prefix, BINDING, binding).await?;
-    if shared.join {
-        // A joining member is not an initial voter. The cluster claim must already exist.
-        return crate::state::shared::claimed_quota(store, root, cluster).await;
+    if let Some(quota) = joined {
+        return Ok(quota);
     }
     crate::state::shared::claim(store, root, cluster, shared.quota, &shared.voters).await
 }
@@ -404,6 +410,7 @@ async fn claim(store: &dyn ObjectStore, prefix: &str, name: &str, binding: &Bind
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use slatedb::object_store::memory::InMemory;
 
     fn s3() -> S3 {
@@ -569,6 +576,36 @@ mod tests {
                 .await
                 .is_err());
         }
+        // A failed join writes nothing, so a replicated bootstrap still succeeds.
+        let dirs = tempfile::tempdir().unwrap();
+        let store = InMemory::new();
+        let config = s3();
+        let binding = bind(
+            &dirs.path().join("4"),
+            "cluster",
+            4,
+            Some(config.clone()),
+            StateMode::Shared,
+        )
+        .unwrap();
+        let joining = crate::state::shared::Options {
+            quota: 0,
+            voters: vec![],
+            join: true,
+            empty_log: true,
+            pin_max: Duration::from_secs(300),
+        };
+        let root = config.cluster_prefix("cluster");
+        let prefix = config.member_prefix("cluster", 4);
+        assert!(
+            claim_shared(&store, &root, &prefix, "cluster", &binding, &joining)
+                .await
+                .is_err()
+        );
+        assert!(store.list(None).next().await.is_none());
+        start(&store, dirs.path(), 1, StateMode::Replicated, &[1])
+            .await
+            .unwrap();
         // A shared cluster accepts its bootstrap voters in any order.
         let dirs = tempfile::tempdir().unwrap();
         let store = InMemory::new();

@@ -451,7 +451,17 @@ impl Node {
     /// rebuild. Otherwise the member adopts the checkpoint as its snapshot record.
     pub(super) fn align_log(storage: &mut RaftStorage, state: &StateMachine) -> Result<()> {
         let index = state.applied;
-        if !state.is_shared() || index == 0 || index == storage.snapshot_index() {
+        if !state.is_shared() || index == 0 {
+            return Ok(());
+        }
+        if index == storage.snapshot_index() {
+            // Known terms at the same index must agree.
+            let term = storage.recovery_snapshot().get_metadata().term;
+            ensure!(
+                term == 0 || state.applied_term == 0 || term == state.applied_term,
+                "base term {} differs from snapshot term {term} at {index}",
+                state.applied_term
+            );
             return Ok(());
         }
         ensure!(
@@ -853,5 +863,95 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_stall_before_the_first_announcement_releases_the_open_segment() {
         stall_and_recover(true).await;
+    }
+
+    /// Status answers while the first leader cannot create the shared manifest, and after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn status_answers_before_the_writer_creates_the_manifest() {
+        use crate::object::faults::{FaultStore, STALL_STATE_PUT};
+        use crate::proto::etcdserverpb::{
+            kv_client::KvClient, maintenance_client::MaintenanceClient, PutRequest, StatusRequest,
+        };
+        let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+        // The claims succeed. The writer cannot create the shared manifest.
+        faults.set(STALL_STATE_PUT);
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::server::ServerConfig::single_node(dir.path());
+        config.state_mode = crate::state::StateMode::Shared;
+        config.object_store = crate::object::Config::Test(faults.clone(), "root".into());
+        let server = crate::server::Server::start(config).await.unwrap();
+        server.wait_ready(Duration::from_secs(15)).await.unwrap();
+        let channel = tonic::transport::Endpoint::from_shared(server.client_url())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut maintenance = MaintenanceClient::new(channel.clone());
+        for _ in 0..3 {
+            // No SST exists yet, so the size is the logical size of the overlay.
+            let reply = maintenance
+                .status(StatusRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(reply.db_size, reply.db_size_in_use);
+        }
+        faults.set(0);
+        let mut kv = KvClient::new(channel);
+        kv.put(PutRequest {
+            key: b"key".to_vec(),
+            value: b"value".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        eventually("the first checkpoint", async || {
+            status(&server).await["shared_state"]["applied_view_checkpoints"]
+                .as_u64()
+                .unwrap()
+                > 0
+        })
+        .await;
+        maintenance.status(StatusRequest {}).await.unwrap();
+        server.shutdown().await.unwrap();
+    }
+
+    /// A restart whose base and snapshot record share an index must agree on its term.
+    #[tokio::test]
+    async fn a_restart_refuses_a_base_with_another_term_at_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = RaftStorage::open(dir.path(), 1, "test", vec![1]).unwrap();
+        let mut snapshot = raft::eraftpb::Snapshot::default();
+        snapshot.mut_metadata().index = 1;
+        snapshot.mut_metadata().term = 3;
+        snapshot.data = crate::state::transfer::ViewDescriptor::new(uuid::Uuid::new_v4())
+            .encode()
+            .unwrap();
+        storage.adopt(&snapshot).unwrap();
+        let options = crate::state::shared::Options {
+            quota: 0,
+            voters: vec![1],
+            join: false,
+            empty_log: false,
+            pin_max: Duration::from_secs(300),
+        };
+        let mut state = StateMachine::open_shared(
+            Arc::new(InMemory::new()),
+            "root",
+            "test",
+            crate::state::StateCache::default(),
+            &options,
+            crate::state::transfer::Backend::Local,
+        )
+        .await
+        .unwrap();
+        state.entry_term = 2;
+        state.apply(1, None).await.unwrap();
+        let error = Node::align_log(&mut storage, &state).unwrap_err();
+        assert!(error.to_string().contains("differs"), "{error}");
+        state.entry_term = 3;
+        state.applied_term = 3;
+        Node::align_log(&mut storage, &state).unwrap();
+        state.close().await.unwrap();
     }
 }
