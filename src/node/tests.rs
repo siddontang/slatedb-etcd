@@ -16,6 +16,8 @@ fn options(dir: &std::path::Path) -> NodeOptions {
         strict_reconfiguration: false,
         join: false,
         quota_bytes: 0,
+        quota_warning_fraction: 0.0,
+        auto_compaction: None,
         id: 1,
         cluster_id: "worker-test".into(),
         dir: dir.to_owned(),

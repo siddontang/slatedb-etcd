@@ -7,6 +7,7 @@ pub use batch::WriteBatch;
 pub mod api;
 pub mod auth;
 pub mod cluster;
+pub mod compactor;
 mod failpoint;
 pub mod grpc;
 pub mod lease;

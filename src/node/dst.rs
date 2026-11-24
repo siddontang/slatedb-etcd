@@ -213,6 +213,8 @@ impl Simulation {
                 strict_reconfiguration: false,
                 join: false,
                 quota_bytes: 0,
+                quota_warning_fraction: 0.0,
+                auto_compaction: None,
                 id,
                 cluster_id: "dst".into(),
                 dir: self.root.path().join(id.to_string()),
@@ -1246,8 +1248,8 @@ impl Simulation {
             assert_eq!(node.state.compact_revision, revision);
             let state = node.worker.state();
             assert_eq!(
-                state.logical_size(),
-                crate::state::maintenance::count_logical_size(state.db().as_ref())
+                state.logical_usage(),
+                crate::state::maintenance::count_logical_usage(state.db().as_ref())
                     .await
                     .unwrap()
             );
@@ -1517,8 +1519,8 @@ impl Simulation {
                 assert_eq!(event.prev_kv.as_ref(), previous);
             }
             assert_eq!(
-                state.logical_size(),
-                crate::state::maintenance::count_logical_size(state.db().as_ref())
+                state.logical_usage(),
+                crate::state::maintenance::count_logical_usage(state.db().as_ref())
                     .await
                     .unwrap()
             );
@@ -2378,5 +2380,199 @@ async fn shared_store_schedules_replay_identically() {
             "shared seed {seed}: simulation schedule changed"
         );
         eprintln!("shared DST seed {seed}: {} events replayed", first.len());
+    }
+}
+
+impl Simulation {
+    /// Give every member the same automatic compaction schedule, starting at `start`.
+    fn enable_auto_compaction(&mut self, period: Duration, start: Instant) {
+        for node in self.nodes.values_mut() {
+            node.auto_compaction = Some(auto_compaction::AutoCompaction::new(
+                crate::compactor::Retention::Periodic(period),
+                start,
+                node.state.revision,
+            ));
+        }
+    }
+
+    /// Run one automatic compaction turn on every member with the logical time `now`.
+    async fn auto_compaction_turn(&mut self, now: Instant) {
+        for node in self.nodes.values_mut() {
+            // The run loop fails a pending proposal after a leadership change.
+            node.expire_pending();
+            node.drive_auto_compaction(now).unwrap();
+        }
+        self.trace.push("auto compaction turn".into());
+        self.drive().await;
+    }
+
+    fn auto_running(&self, id: u64) -> bool {
+        self.nodes[&id]
+            .auto_compaction
+            .as_ref()
+            .is_some_and(|auto| auto.running())
+    }
+
+    async fn rows(&self, id: u64) -> Vec<(bytes::Bytes, bytes::Bytes)> {
+        let state = self.nodes[&id].worker.state();
+        let mut rows = state.db().scan_prefix(b"etcd/", ..).await.unwrap();
+        let mut all = vec![];
+        while let Some(row) = rows.next().await.unwrap() {
+            all.push((row.key, row.value));
+        }
+        all
+    }
+}
+
+/// Automatic compaction stays correct when leadership moves twice: once between the first
+/// leader's Compact proposal and its commit, and once while replicas remove compacted rows.
+#[tokio::test]
+async fn auto_compaction_survives_leader_changes_mid_compaction() {
+    let mut sim = Simulation::new(23).await;
+    for _ in 0..100 {
+        sim.deliver(false).await;
+    }
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    let start = Instant::now();
+    let period = Duration::from_secs(10);
+    let step = period / 10;
+    sim.enable_auto_compaction(period, start);
+    let mut clock = 0;
+    let mut now;
+    // Write until the leader proposes its first automatic Compact.
+    let first = loop {
+        clock += 1;
+        assert!(clock < 100, "no automatic Compact was proposed");
+        now = start + step * clock;
+        for _ in 0..3 {
+            sim.propose().await;
+            for _ in 0..30 {
+                sim.deliver(false).await;
+            }
+        }
+        let leader = sim.leader().unwrap();
+        // Cut the leader off before its Compact entry reaches any follower.
+        sim.isolated = Some(leader);
+        sim.auto_compaction_turn(now).await;
+        if sim.auto_running(leader) {
+            break leader;
+        }
+        sim.isolated = None;
+    };
+    assert!(clock >= 10, "the first Compact must wait one period");
+    let proposed = sim.nodes[&first].raw.raft.raft_log.last_index();
+    sim.trace.push(format!("isolate compacting leader {first}"));
+    // The majority elects a new leader. Its own samples let it compact without waiting.
+    sim.settle(25).await;
+    let second = sim.leader().expect("the majority must elect a leader");
+    assert_ne!(second, first);
+    sim.auto_compaction_turn(now).await;
+    assert!(
+        !sim.auto_running(first),
+        "the old leader must fail its Compact: role {:?}, pending {}, waiting {}",
+        sim.nodes[&first].raw.raft.state,
+        sim.nodes[&first].pending.len(),
+        sim.nodes[&first].waiting_proposals.is_empty(),
+    );
+    assert!(
+        sim.nodes[&first].state.compact_revision <= 0,
+        "first {first} second {second} compact {} applied {} proposed {proposed} others {:?}",
+        sim.nodes[&first].state.compact_revision,
+        sim.nodes[&first].state.applied,
+        sim.nodes
+            .values()
+            .map(|n| (n.state.compact_revision, n.state.applied))
+            .collect::<Vec<_>>(),
+    );
+    // The new leader may need one turn to see the Compact result of a failed attempt.
+    for _ in 0..3 {
+        if sim.auto_running(second) {
+            break;
+        }
+        clock += 1;
+        now = start + step * clock;
+        sim.auto_compaction_turn(now).await;
+    }
+    assert!(sim.auto_running(second), "the new leader must compact");
+    // Apply the Compact on the majority, then move leadership again while rows remain.
+    for _ in 0..200 {
+        sim.deliver(false).await;
+        if sim.nodes[&second].state.compaction_pending
+            && sim.nodes[&second].state.compact_revision > 0
+        {
+            break;
+        }
+    }
+    let boundary = sim.nodes[&second].state.compact_revision;
+    assert!(boundary > 0, "the new leader must apply its Compact");
+    assert!(
+        sim.nodes[&second].state.compaction_pending,
+        "physical removal must still run"
+    );
+    sim.isolated = Some(second);
+    sim.trace
+        .push(format!("isolate leader {second} during physical removal"));
+    // Heal the first leader so the remaining pair forms a quorum.
+    sim.settle(30).await;
+    let third = sim
+        .leader()
+        .expect("the remaining pair must elect a leader");
+    assert_ne!(third, second);
+    sim.isolated = None;
+    sim.trace.push("heal".into());
+    for _ in 0..40 {
+        clock += 1;
+        now = start + step * clock;
+        sim.auto_compaction_turn(now).await;
+        sim.settle(1).await;
+    }
+    sim.settle(25).await;
+    let applied: BTreeSet<u64> = sim.nodes.values().map(|n| n.state.applied).collect();
+    assert_eq!(
+        applied.len(),
+        1,
+        "members must apply the same log: {applied:?}"
+    );
+    let compacted: BTreeSet<i64> = sim
+        .nodes
+        .values()
+        .map(|n| n.state.compact_revision)
+        .collect();
+    assert_eq!(
+        compacted.len(),
+        1,
+        "members disagree on the boundary: {compacted:?}"
+    );
+    let boundary = *compacted.first().unwrap();
+    assert!(boundary > 0);
+    let reference = sim.rows(1).await;
+    for id in 1..=3 {
+        let node = &sim.nodes[&id];
+        assert!(
+            !node.state.compaction_pending,
+            "member {id} did not finish removal"
+        );
+        assert!(boundary <= node.state.revision);
+        let state = node.worker.state();
+        assert_eq!(
+            state.logical_usage(),
+            crate::state::maintenance::count_logical_usage(state.db().as_ref())
+                .await
+                .unwrap()
+        );
+        // Watch journal rows below the boundary are gone.
+        let mut journal = state
+            .db()
+            .scan_prefix(crate::watch::EVENTS, ..)
+            .await
+            .unwrap();
+        while let Some(row) = journal.next().await.unwrap() {
+            assert!(
+                row.key.as_ref() >= crate::watch::key(boundary).as_slice(),
+                "member {id} kept a compacted journal row"
+            );
+        }
+        assert_eq!(sim.rows(id).await, reference, "member {id} rows differ");
+        sim.assert_acknowledged(id).await;
     }
 }

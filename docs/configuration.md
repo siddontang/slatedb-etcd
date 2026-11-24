@@ -86,6 +86,9 @@ For example, use `--watch-progress-notify-interval=200ms` for the upstream clien
 | `--snapshot-every` | 10000 | Applied entries between checkpoint opportunities; zero disables it. |
 | `--snapshot-min-bytes` | 67108864 | Log bytes needed before auto truncation; zero disables it. |
 | `--quota-backend-bytes` | 0 | Zero selects 2 GiB. A negative value disables the quota. |
+| `--quota-warning-fraction` | 0.8 | Quota share that raises the early warning; zero disables it. |
+| `--auto-compaction-mode` | periodic | `periodic` keeps a duration; `revision` keeps a count. |
+| `--auto-compaction-retention` | 0 | History to keep. Zero disables automatic compaction. |
 | `--log-cache-bytes` | 8388608 | Cache budget for log entries. |
 | `--log-pending-bytes` | 33554432 | Pending entry budget, including unapplied entries. |
 | `--log-read-bytes` | 16777216 | Budget for asynchronous log read results. |
@@ -115,6 +118,23 @@ The quota can be exceeded by one operation and does not reserve free disk space.
 Native backups and `Maintenance.Snapshot` have a 64 MiB limit. Peer snapshots copy SlateDB
 checkpoint objects and have no size limit; see [object storage Raft snapshots](object-snapshots.md).
 See [log pool accounting](architecture.md#bounded-log-pools) for admission and recovery rules.
+
+## Automatic compaction
+
+The two `--auto-compaction-*` flags use the names, values, and schedule of etcd v3.6.
+Periodic mode reads an integer retention as hours, or a Go duration such as `30m` or `1.5h`.
+It samples the revision ten times per retention period, capped at one sample per six minutes.
+The first Compact waits one period. Later ones run once per period, or hourly for longer periods.
+Each uses the revision sampled about one period earlier.
+Revision mode reads a revision count. Every five minutes it compacts to the current revision
+minus that count. Like etcd, it reads a duration as its nanosecond count.
+A negative retention is an error. etcd accepts a negative duration but cannot use it.
+
+Only the leader proposes. Each Compact goes through Raft with a fixed revision, like a client
+Compact without Physical. Followers keep sampling, so a new leader compacts on its own schedule.
+A Compact that loses leadership fails and retries later. A revision that is already compacted
+counts as done. A restart drops the samples, so the member waits one full period again.
+Compaction runs as an internal request, so Auth does not apply to it.
 
 ## S3 objects
 

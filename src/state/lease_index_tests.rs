@@ -84,7 +84,7 @@ async fn check(state: &StateMachine, leases: &[i64]) {
     }
     assert_eq!(
         state.logical_bytes,
-        maintenance::count_logical_size(state.db().as_ref())
+        maintenance::count_logical_usage(state.db().as_ref())
             .await
             .unwrap()
     );
@@ -384,7 +384,24 @@ async fn the_logical_size_is_counted_when_the_counter_is_missing_or_stale() {
     let size = state.logical_bytes;
     let stored = state.db().get(LOGICAL_SIZE).await.unwrap().unwrap();
     let counter = crate::proto::state::LogicalSize::decode(stored).unwrap();
-    assert_eq!((counter.applied, counter.bytes), (state.applied, size));
+    assert_eq!(
+        (counter.applied, counter.bytes),
+        (state.applied, size.total())
+    );
+    assert_eq!(
+        (
+            counter.current,
+            counter.history,
+            counter.journal,
+            counter.other
+        ),
+        (
+            Some(size.current),
+            Some(size.history),
+            Some(size.journal),
+            Some(size.other)
+        )
+    );
     let applied = state.applied;
 
     // An older binary has no counter row.
@@ -415,7 +432,12 @@ async fn the_logical_size_is_counted_when_the_counter_is_missing_or_stale() {
     let mut batch = slatedb::WriteBatch::new();
     batch.put(
         LOGICAL_SIZE,
-        crate::proto::state::LogicalSize { applied, bytes: 1 }.encode_to_vec(),
+        crate::proto::state::LogicalSize {
+            applied,
+            bytes: 1,
+            ..Default::default()
+        }
+        .encode_to_vec(),
     );
     batch.put(APPLIED, (applied + 1).to_be_bytes());
     state
@@ -444,6 +466,7 @@ async fn the_logical_size_is_counted_when_the_counter_is_missing_or_stale() {
         crate::proto::state::LogicalSize {
             applied: data.applied,
             bytes: 1,
+            ..Default::default()
         }
         .encode_to_vec(),
     ));
@@ -457,7 +480,7 @@ async fn the_logical_size_is_counted_when_the_counter_is_missing_or_stale() {
     let installed = target.logical_bytes;
     assert_eq!(
         installed,
-        maintenance::count_logical_size(target.db().as_ref())
+        maintenance::count_logical_usage(target.db().as_ref())
             .await
             .unwrap()
     );
@@ -467,5 +490,51 @@ async fn the_logical_size_is_counted_when_the_counter_is_missing_or_stale() {
     let target = StateMachine::open(other.path()).await.unwrap();
     assert_eq!(target.logical_bytes, installed);
     target.close().await.unwrap();
+    state.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_counter_without_the_usage_split_is_counted_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    for n in 0..10 {
+        etcd(&mut state, &put(format!("key-{n}").as_bytes(), b"value", 0)).await;
+    }
+    etcd(&mut state, &put(b"key-1", b"other value", 0)).await;
+    let size = state.logical_bytes;
+    assert!(size.current > 0 && size.history > 0 && size.other > 0);
+    // A binary that stored only the total writes its row with the apply marker. The total is
+    // right and the index matches, but the split is missing, so the open counts the rows.
+    let applied = state.applied + 1;
+    let options = slatedb::config::WriteOptions { seqnum: applied };
+    let mut batch = slatedb::WriteBatch::new();
+    batch.put(
+        LOGICAL_SIZE,
+        crate::proto::state::LogicalSize {
+            applied,
+            bytes: size.total(),
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    );
+    batch.put(APPLIED, applied.to_be_bytes());
+    state
+        .db()
+        .write_with_options(batch, &options)
+        .await
+        .unwrap();
+    state.db().flush().await.unwrap();
+    state.close().await.unwrap();
+    drop(state);
+    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    assert_eq!(state.applied, applied);
+    assert_eq!(state.logical_bytes, size);
+    // The next batch stores the split again.
+    etcd(&mut state, &put(b"new", b"value", 0)).await;
+    let stored = state.db().get(LOGICAL_SIZE).await.unwrap().unwrap();
+    let counter = crate::proto::state::LogicalSize::decode(stored).unwrap();
+    assert_eq!(counter.applied, state.applied);
+    assert_eq!(counter.current, Some(state.logical_bytes.current));
+    assert_eq!(counter.history, Some(state.logical_bytes.history));
     state.close().await.unwrap();
 }

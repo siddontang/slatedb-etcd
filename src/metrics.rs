@@ -75,7 +75,10 @@ pub struct Sample {
     pub(crate) applied: u64,
     pub(crate) pending: usize,
     pub(crate) quota: i64,
-    pub(crate) used: u64,
+    /// Logical bytes by row kind. The total is the quota usage.
+    pub(crate) usage: crate::batch::Usage,
+    /// The quota usage that raises the early warning. `None` disables the warning.
+    pub(crate) warning_bytes: Option<u64>,
     pub(crate) revision: i64,
     pub(crate) compact: i64,
     pub(crate) auth_revision: u64,

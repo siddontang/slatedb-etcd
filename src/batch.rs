@@ -74,9 +74,9 @@ impl WriteBatch {
         key: Bytes,
         value: Bytes,
         old_len: Option<usize>,
-        size: &mut u64,
+        size: &mut Usage,
     ) -> Result<()> {
-        *size = row_size_after(*size, key.len(), old_len, Some(value.len()))?;
+        size.replace_row(&key, old_len, Some(value.len()))?;
         self.insert(key, Some(value), Original::Known(old_len));
         Ok(())
     }
@@ -113,8 +113,8 @@ impl WriteBatch {
         &self,
         db: &impl StateRead,
         index: &KeyIndex,
-        size: u64,
-    ) -> Result<u64> {
+        size: Usage,
+    ) -> Result<Usage> {
         self.logical_size_after(db, index, None, size).await
     }
 
@@ -124,8 +124,8 @@ impl WriteBatch {
         db: &impl StateRead,
         index: &KeyIndex,
         previous: Option<&Self>,
-        mut size: u64,
-    ) -> Result<u64> {
+        mut size: Usage,
+    ) -> Result<Usage> {
         for (key, change) in &self.changes {
             if !key.starts_with(b"etcd/") {
                 continue;
@@ -140,12 +140,7 @@ impl WriteBatch {
                     None => db.get(key).await?.map(|v| v.len()),
                 },
             };
-            size = row_size_after(
-                size,
-                key.len(),
-                old_len,
-                change.value.as_ref().map(Bytes::len),
-            )?;
+            size.replace_row(key, old_len, change.value.as_ref().map(Bytes::len))?;
         }
         Ok(size)
     }
@@ -195,17 +190,83 @@ impl WriteBatch {
     }
 }
 
-pub(crate) fn row_size_after(
-    size: u64,
-    key_len: usize,
-    old: Option<usize>,
-    new: Option<usize>,
-) -> Result<u64> {
-    let bytes = |len| (key_len + len) as u64;
-    size.checked_sub(old.map_or(0, bytes))
-        .context("logical size counter underflow")?
-        .checked_add(new.map_or(0, bytes))
-        .context("logical size counter overflow")
+/// Logical bytes of `etcd/` rows by kind. The quota limits the total.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// Current rows of live keys.
+    pub current: u64,
+    /// History versions and their hash digests. Compaction removes them.
+    pub history: u64,
+    /// Watch journal rows. Compaction removes them.
+    pub journal: u64,
+    /// Metadata rows: auth, members, leases, alarms, revision and compaction records.
+    pub other: u64,
+}
+
+impl Usage {
+    pub fn total(&self) -> u64 {
+        self.current + self.history + self.journal + self.other
+    }
+
+    fn kind(&mut self, key: &[u8]) -> &mut u64 {
+        if key.starts_with(crate::mvcc::CURRENT) {
+            &mut self.current
+        } else if key.starts_with(crate::mvcc::HISTORY) || key.starts_with(crate::maintenance::HASH)
+        {
+            &mut self.history
+        } else if key.starts_with(crate::watch::EVENTS) {
+            &mut self.journal
+        } else {
+            &mut self.other
+        }
+    }
+
+    /// Encode the counters for the shared-mode logical size row.
+    pub(crate) fn to_be_bytes(self) -> [u8; 32] {
+        let mut bytes = [0; 32];
+        for (chunk, value) in
+            bytes
+                .chunks_exact_mut(8)
+                .zip([self.current, self.history, self.journal, self.other])
+        {
+            chunk.copy_from_slice(&value.to_be_bytes());
+        }
+        bytes
+    }
+
+    /// Decode a shared-mode logical size row. Other lengths return `None`.
+    pub(crate) fn from_be_bytes(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; 32] = bytes.try_into().ok()?;
+        let value = |n: usize| u64::from_be_bytes(bytes[n * 8..n * 8 + 8].try_into().unwrap());
+        Some(Self {
+            current: value(0),
+            history: value(1),
+            journal: value(2),
+            other: value(3),
+        })
+    }
+
+    /// Count one stored row. Callers pass only `etcd/` keys.
+    pub(crate) fn add_row(&mut self, key: &[u8], len: usize) -> Result<()> {
+        self.replace_row(key, None, Some(len))
+    }
+
+    /// Replace the old row length with the new one. `None` means that no row exists.
+    pub(crate) fn replace_row(
+        &mut self,
+        key: &[u8],
+        old: Option<usize>,
+        new: Option<usize>,
+    ) -> Result<()> {
+        let bytes = |len| (key.len() + len) as u64;
+        let slot = self.kind(key);
+        *slot = slot
+            .checked_sub(old.map_or(0, bytes))
+            .context("logical size counter underflow")?
+            .checked_add(new.map_or(0, bytes))
+            .context("logical size counter overflow")?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

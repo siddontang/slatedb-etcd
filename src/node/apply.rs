@@ -18,7 +18,7 @@ pub(super) struct AppliedState {
     pub members: std::sync::Arc<crate::cluster::Store>,
     pub read: std::sync::Arc<crate::state::ReadView>,
     pub write_batches: u64,
-    pub logical_size: u64,
+    pub usage: crate::batch::Usage,
     /// Watch events that this state publishes after the node installs it.
     pub watch: Option<std::sync::Arc<crate::watch::Batch>>,
     pub compaction_pending: bool,
@@ -44,7 +44,7 @@ impl AppliedState {
             members: state.members.clone(),
             read: state.read_view()?,
             write_batches: state.write_batches,
-            logical_size: state.logical_size(),
+            usage: state.logical_usage(),
             watch: None,
             compaction_pending: state.compaction_pending(),
             compaction_plan: state.compaction_plan.generation(),
@@ -1493,14 +1493,14 @@ mod tests {
             assert_eq!(grouped.alarms, separate.alarms);
             assert_eq!(grouped.logical_size(), separate.logical_size());
             assert_eq!(
-                grouped.logical_size(),
-                crate::state::maintenance::count_logical_size(grouped.db().as_ref())
+                grouped.logical_usage(),
+                crate::state::maintenance::count_logical_usage(grouped.db().as_ref())
                     .await
                     .unwrap()
             );
             assert_eq!(
-                separate.logical_size(),
-                crate::state::maintenance::count_logical_size(separate.db().as_ref())
+                separate.logical_usage(),
+                crate::state::maintenance::count_logical_usage(separate.db().as_ref())
                     .await
                     .unwrap()
             );
@@ -1922,8 +1922,8 @@ mod tests {
             assert_eq!(grouped.alarms, separate.alarms, "{context}");
             assert_eq!(index_rows(&grouped), index_rows(&separate), "{context}");
             assert_eq!(
-                grouped.logical_size(),
-                crate::state::maintenance::count_logical_size(grouped.db().as_ref())
+                grouped.logical_usage(),
+                crate::state::maintenance::count_logical_usage(grouped.db().as_ref())
                     .await
                     .unwrap(),
                 "{context}"

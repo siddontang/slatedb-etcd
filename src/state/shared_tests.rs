@@ -178,7 +178,7 @@ async fn shared_apply_matches_replicated_apply_from_the_overlay() {
     );
     assert_eq!(
         state.logical_bytes,
-        maintenance::count_logical_size(state.applied_state())
+        maintenance::count_logical_usage(state.applied_state())
             .await
             .unwrap()
     );
@@ -562,8 +562,8 @@ async fn a_shared_backup_restores_into_a_replicated_cluster() {
     assert_eq!(rows(&restored, b"").await, rows(&expected, b"").await);
     assert_eq!(restored.logical_size(), expected.logical_size());
     assert_eq!(
-        restored.logical_size(),
-        maintenance::count_logical_size(restored.applied_state())
+        restored.logical_usage(),
+        maintenance::count_logical_usage(restored.applied_state())
             .await
             .unwrap()
     );
@@ -612,8 +612,8 @@ async fn readers_drop_a_logical_size_row() {
         None
     );
     assert_eq!(
-        restored.logical_size(),
-        maintenance::count_logical_size(restored.applied_state())
+        restored.logical_usage(),
+        maintenance::count_logical_usage(restored.applied_state())
             .await
             .unwrap()
     );
