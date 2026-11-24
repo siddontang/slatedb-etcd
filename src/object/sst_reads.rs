@@ -15,10 +15,16 @@
 //! SST path evicts it before and after the operation, and bumps a generation. A read that opened the
 //! file during that window does not cache its descriptor, because the generation moved. A later
 //! read opens the path again and sees what the inner store would see.
+//!
+//! Cached descriptors count against the open file limit, which the server shares with sockets,
+//! Raft log files, and SlateDB writes. The cache holds at most a quarter of the soft limit. If an
+//! open still fails because no descriptor is free, the cache closes its descriptors, halves its
+//! cap, and opens the file again.
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::fs::{FileExt, MetadataExt};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
@@ -27,9 +33,12 @@ use slatedb::object_store::{
     Attributes, Error, GetOptions, GetResult, GetResultPayload, ObjectMeta, Result,
 };
 
-/// Open SSTs kept per store. A sorted run has a few dozen SSTs at most; past the cap, an arbitrary
-/// descriptor is closed and reopened on its next read.
+/// Most open SSTs kept per store. A sorted run has a few dozen SSTs at most; past the cap, an
+/// arbitrary descriptor is closed and reopened on its next read. [`max_open`] lowers the cap
+/// under a low open file limit.
 const MAX_OPEN: usize = 1024;
+/// The cap never drops below this after descriptors run out.
+const MIN_OPEN: usize = 16;
 /// Longest range read on the calling task. Compaction read-ahead and whole-object reads copy more
 /// and go to the blocking pool.
 const MAX_INLINE: u64 = 256 * 1024;
@@ -60,9 +69,23 @@ struct Files {
     open: HashMap<Path, Arc<Open>>,
 }
 
-#[derive(Default)]
 pub(crate) struct SstReads {
     files: RwLock<Files>,
+    max_open: AtomicUsize,
+}
+
+impl Default for SstReads {
+    fn default() -> Self {
+        Self::with_max_open(max_open(crate::fdlimit::soft()))
+    }
+}
+
+/// The cache cap for a soft open file limit: a quarter of it, at most [`MAX_OPEN`].
+fn max_open(soft_limit: Option<u64>) -> usize {
+    match soft_limit {
+        Some(limit) => (limit / 4).clamp(1, MAX_OPEN as u64) as usize,
+        None => MAX_OPEN,
+    }
 }
 
 impl std::fmt::Debug for SstReads {
@@ -72,6 +95,13 @@ impl std::fmt::Debug for SstReads {
 }
 
 impl SstReads {
+    fn with_max_open(max_open: usize) -> Self {
+        Self {
+            files: RwLock::default(),
+            max_open: AtomicUsize::new(max_open),
+        }
+    }
+
     /// Forget `location`. Call before and after any change to that path.
     pub(crate) fn evict(&self, location: &Path) {
         if !is_sst(location) {
@@ -92,18 +122,64 @@ impl SstReads {
         if files.generation != generation {
             return;
         }
-        if files.open.len() >= MAX_OPEN && !files.open.contains_key(location) {
+        let max_open = self.max_open.load(Ordering::Relaxed);
+        while files.open.len() >= max_open && !files.open.contains_key(location) {
             let victim = files.open.keys().next().cloned();
-            if let Some(victim) = victim {
-                files.open.remove(&victim);
-            }
+            match victim {
+                Some(victim) => files.open.remove(&victim),
+                None => break,
+            };
         }
         files.open.insert(location.clone(), open);
+    }
+
+    /// Open `path`. If no descriptor is free, close the cached ones, halve the cap, and try once
+    /// more. Reads in flight keep their descriptors until they finish.
+    fn open(
+        &self,
+        path: &std::path::Path,
+        open: impl Fn(&std::path::Path) -> std::io::Result<File>,
+    ) -> std::io::Result<File> {
+        match open(path) {
+            Err(error) if crate::fdlimit::exhausted(&error) => {
+                let closed = self.shed();
+                tracing::warn!(
+                    %error,
+                    closed,
+                    max_open = self.max_open.load(Ordering::Relaxed),
+                    "No free file descriptor for an SST read; closed cached SST descriptors"
+                );
+                open(path)
+            }
+            result => result,
+        }
+    }
+
+    /// Close every cached descriptor and halve the cap. Returns how many closed.
+    fn shed(&self) -> usize {
+        let mut files = self.files.write().unwrap_or_else(|e| e.into_inner());
+        let closed = files.open.len();
+        files.open.clear();
+        let _ = self
+            .max_open
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |max| {
+                Some((max / 2).max(MIN_OPEN).min(max))
+            });
+        closed
     }
 
     #[cfg(test)]
     pub(crate) fn is_open(&self, location: &Path) -> bool {
         self.lookup(location).0.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_count(&self) -> usize {
+        self.files
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .open
+            .len()
     }
 
     #[cfg(test)]
@@ -155,7 +231,9 @@ impl SstReads {
         let reads = self.clone();
         let location = location.clone();
         tokio::task::spawn_blocking(move || {
-            let file = File::open(&path).map_err(|e| open_error(e, &location))?;
+            let file = reads
+                .open(&path, |path| File::open(path))
+                .map_err(|e| open_error(e, &location))?;
             let metadata = file.metadata().map_err(|e| read_error(e, &location))?;
             let meta = convert_metadata(&metadata, location.clone());
             let range = range(&options, &meta)?;
@@ -295,5 +373,79 @@ fn join_error(source: tokio::task::JoinError) -> Error {
     Error::Generic {
         store: "PacedStore",
         source: source.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_open_is_a_quarter_of_the_limit() {
+        assert_eq!(max_open(Some(1024)), 256);
+        assert_eq!(max_open(Some(256)), 64);
+        assert_eq!(max_open(Some(2)), 1);
+        assert_eq!(max_open(Some(65536)), MAX_OPEN);
+        assert_eq!(max_open(Some(u64::MAX)), MAX_OPEN);
+        assert_eq!(max_open(None), MAX_OPEN);
+    }
+
+    /// The cache stays under its cap. When no descriptor is free, an open closes the cached
+    /// descriptors, halves the cap, and tries again instead of failing the read.
+    #[test]
+    fn sst_reads_shed_descriptors_when_none_are_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let reads = SstReads::with_max_open(64);
+        let meta = |path: &Path| ObjectMeta {
+            location: path.clone(),
+            last_modified: Default::default(),
+            size: 1,
+            e_tag: None,
+            version: None,
+        };
+        for i in 0..100 {
+            let file_path = dir.path().join(format!("{i}.sst"));
+            std::fs::write(&file_path, b"x").unwrap();
+            let path = Path::from(format!("{i}.sst"));
+            let file = File::open(&file_path).unwrap();
+            reads.insert_for_test(&path, file, meta(&path), reads.generation());
+        }
+        assert_eq!(reads.open_count(), 64);
+
+        // The first open fails with EMFILE, the retry succeeds.
+        let file_path = dir.path().join("0.sst");
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let file = reads.open(&file_path, |path| {
+            if !failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::from_raw_os_error(libc::EMFILE));
+            }
+            File::open(path)
+        });
+        assert!(file.is_ok());
+        assert_eq!(reads.open_count(), 0);
+        assert_eq!(reads.max_open.load(Ordering::Relaxed), 32);
+
+        // Other errors pass through and keep the cache.
+        let path = Path::from("a.sst");
+        reads.insert_for_test(
+            &path,
+            File::open(&file_path).unwrap(),
+            meta(&path),
+            reads.generation(),
+        );
+        let missing = reads.open(&dir.path().join("missing.sst"), |p| File::open(p));
+        assert_eq!(missing.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(reads.open_count(), 1);
+
+        // Repeated exhaustion stops at the floor, and a second EMFILE reaches the caller.
+        for _ in 0..10 {
+            let err = reads
+                .open(&file_path, |_| {
+                    Err(std::io::Error::from_raw_os_error(libc::EMFILE))
+                })
+                .unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::EMFILE));
+        }
+        assert_eq!(reads.max_open.load(Ordering::Relaxed), 16);
     }
 }
