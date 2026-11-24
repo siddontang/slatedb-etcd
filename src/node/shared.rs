@@ -735,7 +735,7 @@ const DEFRAGMENT_WAIT: Duration = Duration::from_secs(20);
 
 impl Defragment {
     /// Flush, compact every SST into one sorted run, and wait until this member applied the
-    /// announcement of a checkpoint whose layout holds none of the compacted input SSTs. An
+    /// announcement of a checkpoint at or beyond the completed compaction manifest. An
     /// older checkpoint that applies late does not count. Members then adopt the compacted one.
     ///
     /// A leader change before that returns a retryable error, also when it closes the writer
@@ -765,8 +765,9 @@ impl Defragment {
             return Err(failed(&self.leadership, error.into()));
         }
         self.pause_at(DefragmentStep::Compact).await;
-        let inputs = match crate::state::maintenance::compact_all(&self.admin).await {
-            Ok(inputs) => inputs,
+        let compacted_manifest_id = match crate::state::maintenance::compact_all(&self.admin).await
+        {
+            Ok(id) => id,
             Err(error) => return Err(failed(&self.leadership, error)),
         };
         self.pause_at(DefragmentStep::Publish).await;
@@ -785,7 +786,9 @@ impl Defragment {
         loop {
             let applied = *self.announced.borrow_and_update();
             if let Some(checkpoint) = applied {
-                match compacted(&self.admin, checkpoint, &inputs).await {
+                match checkpoint_covers_compaction(&self.admin, checkpoint, compacted_manifest_id)
+                    .await
+                {
                     Ok(true) => return Ok(()),
                     Ok(false) => {}
                     Err(error) => return Err(failed(&self.leadership, error)),
@@ -812,28 +815,18 @@ impl Defragment {
     }
 }
 
-/// Return true when the layout of `checkpoint` holds none of the SST views in `inputs`.
-async fn compacted(
+/// Manifest versions increase across both compactions and checkpoint publications.
+/// An older checkpoint may also omit the inputs if it predates an earlier compaction.
+async fn checkpoint_covers_compaction(
     admin: &slatedb::admin::Admin,
     checkpoint: uuid::Uuid,
-    inputs: &HashSet<String>,
+    compacted_manifest_id: u64,
 ) -> Result<bool> {
-    let Some(listed) = admin
+    Ok(admin
         .list_checkpoints(None)
         .await?
-        .into_iter()
-        .find(|listed| listed.id == checkpoint)
-    else {
-        return Ok(false);
-    };
-    let manifest = admin
-        .read_manifest(Some(listed.manifest_id))
-        .await?
-        .context("missing checkpoint manifest")?;
-    let kept = manifest
-        .all_sst_views()
-        .any(|view| inputs.contains(&view.id.to_string()));
-    Ok(!kept)
+        .iter()
+        .any(|listed| listed.id == checkpoint && listed.manifest_id >= compacted_manifest_id))
 }
 
 /// The applied state that a publisher checks before it announces a checkpoint again.
@@ -3026,6 +3019,15 @@ mod tests {
     /// input SSTs. It returns only after the compacted checkpoint applies.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_defragment_ignores_an_older_checkpoint_that_applies_late() {
+        check_delayed_checkpoint(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_defragment_ignores_a_checkpoint_from_before_a_prior_compaction() {
+        check_delayed_checkpoint(true).await;
+    }
+
+    async fn check_delayed_checkpoint(compact_before_defragment: bool) {
         let (mut state, handles, events, mut announcements, mut writer) = defragment_setup().await;
         // Hold the announcement of the aged flush: no reply, no apply.
         let (old, reply) = tokio::time::timeout(Duration::from_secs(10), async {
@@ -3037,6 +3039,13 @@ mod tests {
         })
         .await
         .unwrap();
+        if compact_before_defragment {
+            // Rewrite the SSTs without advancing the applied announcement. The delayed
+            // checkpoint now shares no input SSTs with the upcoming Defragment.
+            crate::state::maintenance::compact_all(&handles.admin)
+                .await
+                .unwrap();
+        }
         let reached = Arc::new(tokio::sync::Notify::new());
         let resume = Arc::new(tokio::sync::Notify::new());
         let running = tokio::spawn(
