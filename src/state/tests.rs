@@ -1225,6 +1225,29 @@ async fn a_term_row_is_valid_only_at_its_index() {
     state.close().await.unwrap();
 }
 
+/// A Raft snapshot at the applied index must agree with a known stored term.
+#[tokio::test]
+async fn a_snapshot_at_the_applied_index_checks_a_known_term() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    state.entry_term = 6;
+    state.apply(1, None).await.unwrap();
+    let mut state = reopen(state, dir.path()).await;
+    assert_eq!((state.applied, state.applied_term), (1, 6));
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = 1;
+    snapshot.mut_metadata().term = 7;
+    let error = state.install_snapshot(&snapshot).await.unwrap_err();
+    assert!(error.to_string().contains("snapshot term"), "{error}");
+    snapshot.mut_metadata().term = 6;
+    state.install_snapshot(&snapshot).await.unwrap();
+    assert_eq!(
+        (state.applied_term, stored_term(&state).await),
+        (6, Some(6))
+    );
+    state.close().await.unwrap();
+}
+
 /// Check native snapshot bytes with the rules of the previous format 4 reader.
 fn check_format_4(data: &SnapshotData) {
     assert!(crate::readable_snapshot(data.version));

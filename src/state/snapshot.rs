@@ -46,9 +46,12 @@ impl StateMachine {
 
     pub async fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<()> {
         let index = snapshot.get_metadata().index;
+        let term = snapshot.get_metadata().term;
+        if index == self.applied {
+            self.reconcile_term(term)?;
+        }
         if let Some(descriptor) = transfer::Descriptor::decode(snapshot.get_data())? {
             // Box the copy and database open. They are large futures on the apply stack.
-            let term = snapshot.get_metadata().term;
             return Box::pin(self.install_object(descriptor, index, term)).await;
         }
         if index <= self.applied {
@@ -114,6 +117,29 @@ impl StateMachine {
         ensure!(
             self.compact_revision <= self.revision,
             "compaction exceeds current revision"
+        );
+        Ok(())
+    }
+
+    /// Check the applied term against the term of a Raft snapshot at the applied index.
+    ///
+    /// A checkpoint from an older binary has no valid term row, so its install sets the term
+    /// only in memory. Startup passes the durable Raft snapshot again, and this fills the term.
+    /// The row is not written here: a SlateDB write needs a sequence above `applied`. The
+    /// durable snapshot stays until the log truncates at a later checkpoint, and the batch of
+    /// any later entry stores the term.
+    fn reconcile_term(&mut self, term: u64) -> Result<()> {
+        if term == 0 {
+            return Ok(());
+        }
+        if self.applied_term == 0 {
+            self.applied_term = term;
+            self.entry_term = term;
+        }
+        ensure!(
+            self.applied_term == term,
+            "applied term {} differs from snapshot term {term}",
+            self.applied_term
         );
         Ok(())
     }

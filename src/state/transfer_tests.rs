@@ -145,6 +145,23 @@ async fn an_object_snapshot_supplies_an_unknown_checkpoint_term() {
     let mut follower = open(follower_dir.path(), 2).await;
     follower.install_snapshot(&snapshot).await.unwrap();
     assert_eq!((follower.applied, follower.applied_term), (2, 9));
+    // A restart before the next entry finds no valid term row. Startup passes the durable
+    // Raft snapshot again, and it restores the term.
+    follower.close().await.unwrap();
+    drop(follower);
+    let mut follower = open(follower_dir.path(), 2).await;
+    assert_eq!((follower.applied, follower.applied_term), (2, 0));
+    follower.install_snapshot(&snapshot).await.unwrap();
+    assert_eq!((follower.applied, follower.applied_term), (2, 9));
+    // A snapshot at an older index does not change the term. A conflicting term fails.
+    let mut older = Snapshot::default();
+    older.mut_metadata().index = 1;
+    older.mut_metadata().term = 5;
+    follower.install_snapshot(&older).await.unwrap();
+    snapshot.mut_metadata().term = 8;
+    let error = follower.install_snapshot(&snapshot).await.unwrap_err();
+    assert!(error.to_string().contains("snapshot term"), "{error}");
+    assert_eq!((follower.applied, follower.applied_term), (2, 9));
     put(&mut follower, 3, "key", "next").await;
     let row = follower
         .db
