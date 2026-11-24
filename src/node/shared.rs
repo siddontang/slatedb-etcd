@@ -959,4 +959,97 @@ mod tests {
         Node::align_log(&mut storage, &state).unwrap();
         state.close().await.unwrap();
     }
+
+    /// One key changes 16 times. A Watch with prev_kv catches up from the base with a short pin
+    /// and slow object reads. It receives every revision once, each with its previous value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slow_prev_kv_catch_up_makes_progress() {
+        use crate::object::faults::{FaultStore, DELAY_SST_GET};
+        use crate::proto::etcdserverpb::{
+            kv_client::KvClient, watch_client::WatchClient, watch_request, PutRequest,
+            WatchCreateRequest, WatchRequest,
+        };
+        let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::server::ServerConfig::single_node(dir.path());
+        config.state_mode = crate::state::StateMode::Shared;
+        config.object_store = crate::object::Config::Test(faults.clone(), "root".into());
+        config.view_max_age = Duration::from_millis(100);
+        config.view_pin_max = Duration::from_millis(24);
+        // A tiny cache, so history reads go to the store.
+        config.state_cache = crate::state::StateCache {
+            block_bytes: 1,
+            meta_bytes: 1,
+            row_bytes: 0,
+        };
+        let server = crate::server::Server::start(config).await.unwrap();
+        server.wait_ready(Duration::from_secs(15)).await.unwrap();
+        let channel = tonic::transport::Endpoint::from_shared(server.client_url())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut kv = KvClient::new(channel.clone());
+        let mut revisions = vec![];
+        for n in 0..16 {
+            let reply = kv
+                .put(PutRequest {
+                    key: b"key".to_vec(),
+                    value: format!("v{n}").into_bytes(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            revisions.push(reply.into_inner().header.unwrap().revision);
+        }
+        let applied = status(&server).await["applied_index"].as_u64().unwrap();
+        eventually("a base that covers the writes", async || {
+            status(&server).await["shared_state"]["base_applied_index"]
+                .as_u64()
+                .unwrap()
+                >= applied
+        })
+        .await;
+        faults.set_delay(Duration::from_millis(4));
+        faults.set(DELAY_SST_GET);
+        let (send, receive) = mpsc::channel(1);
+        send.send(WatchRequest {
+            request_union: Some(watch_request::RequestUnion::CreateRequest(
+                WatchCreateRequest {
+                    key: b"key".to_vec(),
+                    start_revision: revisions[0],
+                    prev_kv: true,
+                    ..Default::default()
+                },
+            )),
+        })
+        .await
+        .unwrap();
+        let mut stream = WatchClient::new(channel)
+            .watch(tokio_stream::wrappers::ReceiverStream::new(receive))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut events = vec![];
+        while events.len() < revisions.len() {
+            let message = tokio::time::timeout(Duration::from_secs(20), stream.message())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            events.extend(message.events);
+        }
+        let seen: Vec<_> = events
+            .iter()
+            .map(|event| event.kv.as_ref().unwrap().mod_revision)
+            .collect();
+        assert_eq!(seen, revisions);
+        for (n, event) in events.iter().enumerate().skip(1) {
+            let previous = event.prev_kv.as_ref().expect("prev_kv");
+            assert_eq!(previous.value, format!("v{}", n - 1).into_bytes());
+        }
+        faults.set(0);
+        drop(send);
+        server.shutdown().await.unwrap();
+    }
 }

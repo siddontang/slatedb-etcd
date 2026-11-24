@@ -18,6 +18,8 @@ pub(crate) struct FaultStore {
     pub release: Semaphore,
     /// Wakes stalled puts after a mode change.
     resumed: tokio::sync::Notify,
+    /// The delay of `DELAY_SST_GET`, in milliseconds.
+    delay_ms: std::sync::atomic::AtomicU64,
 }
 
 pub(crate) const FAIL_PUT: u8 = 1;
@@ -29,7 +31,7 @@ pub(crate) const FAIL_SST_GET: u8 = 5;
 pub(crate) const STALL_PUT: u8 = 6;
 /// Hold every put of the shared database, but not the claims beside it.
 pub(crate) const STALL_STATE_PUT: u8 = 8;
-/// Delay every SST read by 120 ms, like a slow object store.
+/// Delay every SST read, by 120 ms unless `set_delay` changes it, like a slow object store.
 pub(crate) const DELAY_SST_GET: u8 = 9;
 /// Report the next SST read as missing, like an SST that GC deleted.
 pub(crate) const LOSE_SST_ONCE: u8 = 7;
@@ -42,12 +44,18 @@ impl FaultStore {
             entered: Semaphore::new(0),
             release: Semaphore::new(0),
             resumed: tokio::sync::Notify::new(),
+            delay_ms: std::sync::atomic::AtomicU64::new(120),
         }
     }
 
     pub fn set(&self, mode: u8) {
         self.mode.store(mode, Ordering::SeqCst);
         self.resumed.notify_waiters();
+    }
+
+    pub fn set_delay(&self, delay: std::time::Duration) {
+        self.delay_ms
+            .store(delay.as_millis() as u64, Ordering::SeqCst);
     }
 
     async fn stall(&self, path: &Path) {
@@ -131,7 +139,8 @@ impl ObjectStore for FaultStore {
             });
         }
         if mode == DELAY_SST_GET && path.as_ref().ends_with(".sst") {
-            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            let delay = self.delay_ms.load(Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
         }
         if mode == FAIL_GET || (mode == FAIL_SST_GET && path.as_ref().ends_with(".sst")) {
             self.entered.add_permits(1);

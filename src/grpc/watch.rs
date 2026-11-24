@@ -246,7 +246,8 @@ impl Stream {
             // Read every response of the batch on the view first.
             let mut ids = vec![];
             let mut prepared = vec![];
-            let mut expired = None;
+            let mut bytes = 0;
+            let mut stopped = None;
             'rows: for (revision, journal) in journals {
                 self.candidates(journal, &mut ids);
                 let mut sent = vec![];
@@ -258,12 +259,22 @@ impl Stream {
                             prepare(&state, &reads, &credentials, watcher, *revision, journal)
                                 .await;
                         match response {
-                            Ok(response) => {
-                                prepared.extend(response.map(|response| (*id, response)));
+                            Ok(Some(response)) => {
+                                // A full batch stops before this response, and the watcher resumes
+                                // at this revision on a new view. The first response always fits,
+                                // so the watchers make progress.
+                                let size = response.response.encoded_len();
+                                if !prepared.is_empty() && bytes + size > PREPARED_BYTES {
+                                    stopped = Some((*revision, sent));
+                                    break 'rows;
+                                }
+                                bytes += size;
+                                prepared.push((*id, response));
                                 sent.push(*id);
                             }
+                            Ok(None) => sent.push(*id),
                             Err(status) if crate::state::view::expired(status.message()) => {
-                                expired = Some((*revision, sent));
+                                stopped = Some((*revision, sent));
                                 break 'rows;
                             }
                             Err(status) => return Err(status),
@@ -273,11 +284,12 @@ impl Stream {
             }
             // Release the view before any send. A slow client cannot hold the pin.
             drop((reads, state));
+            record_batch(bytes, prepared.len());
             for (id, response) in prepared {
                 let watcher = self.watchers.get_mut(&id).expect("prepared watcher");
                 send_prepared(&self.tx, &self.meters, watcher, response).await?;
             }
-            if let Some((revision, sent)) = expired {
+            if let Some((revision, sent)) = stopped {
                 // Each watcher that this batch covers resumes from its own next revision on a
                 // new view, through storage catch-up.
                 let next = self.position + 1;
@@ -376,19 +388,25 @@ impl Stream {
                 pending.push((id, start));
             }
         }
-        for id in compacted {
-            self.remove(id);
-            send(
-                &self.tx,
-                WatchResponse {
+        if !compacted.is_empty() {
+            // Build the cancellations, release the view, then send. The next page takes a new
+            // view for the other watchers.
+            let mut responses = vec![];
+            for id in compacted {
+                self.remove(id);
+                responses.push(WatchResponse {
                     header: state.header(view.revision),
                     watch_id: id,
                     canceled: true,
                     compact_revision: view.compact_revision,
                     ..Default::default()
-                },
-            )
-            .await?;
+                });
+            }
+            drop((state, view));
+            for response in responses {
+                send(&self.tx, response).await?;
+            }
+            return Ok(true);
         }
         let Some(from) = pending.iter().map(|&(_, start)| start).min() else {
             return Ok(false);
@@ -410,10 +428,18 @@ impl Stream {
                 )));
             }
         };
+        // The scan used part of the pin. The responses read prev_kv history on a fresh view
+        // with its own deadline, so a page that read its journals always delivers some of them.
+        // Journal and history rows at these revisions do not change. The fresh view's compact
+        // revision decides whether an event keeps its prev_kv, as etcd does.
+        drop((reads, view, state));
+        let state = self.current(through.is_none())?;
+        let reads = state.view.read_state();
         // Read every response of the page on the view first.
         let mut ids = vec![];
         let mut prepared = vec![];
-        let mut expired = None;
+        let mut bytes = 0;
+        let mut stopped = None;
         'rows: for (revision, journal) in &rows {
             self.candidates(journal, &mut ids);
             let mut sent = vec![];
@@ -426,12 +452,22 @@ impl Stream {
                     let response =
                         prepare(&state, &reads, &credentials, watcher, *revision, journal).await;
                     match response {
-                        Ok(response) => {
-                            prepared.extend(response.map(|response| (*id, response)));
+                        Ok(Some(response)) => {
+                            // A full batch stops before this response, and the watcher resumes
+                            // at this revision on a new view. The first response always fits,
+                            // so the watchers make progress.
+                            let size = response.response.encoded_len();
+                            if !prepared.is_empty() && bytes + size > PREPARED_BYTES {
+                                stopped = Some((*revision, sent));
+                                break 'rows;
+                            }
+                            bytes += size;
+                            prepared.push((*id, response));
                             sent.push(*id);
                         }
+                        Ok(None) => sent.push(*id),
                         Err(status) if crate::state::view::expired(status.message()) => {
-                            expired = Some((*revision, sent));
+                            stopped = Some((*revision, sent));
                             break 'rows;
                         }
                         Err(status) => return Err(status),
@@ -440,12 +476,13 @@ impl Stream {
             }
         }
         // Release the view before any send. A slow client cannot hold the pin.
-        drop((reads, rows, view, state));
+        drop((reads, rows, state));
+        record_batch(bytes, prepared.len());
         for (id, response) in prepared {
             let watcher = self.watchers.get_mut(&id).expect("prepared watcher");
             send_prepared(&self.tx, &self.meters, watcher, response).await?;
         }
-        if let Some((revision, sent)) = expired {
+        if let Some((revision, sent)) = stopped {
             // Watchers that received this revision resume after it. The others resume at it.
             for (id, _) in &pending {
                 let watcher = self.watchers.get_mut(id).expect("pending watcher");
@@ -477,23 +514,31 @@ impl Stream {
         let state = self.current(true)?;
         self.check_all(&state)?;
         let header = state.header(self.position);
+        // Release the state before any send. A slow client cannot hold the view.
+        drop(state);
         let next = self.position + 1;
-        for watcher in self.watchers.values_mut() {
-            if watcher.request.progress_notify
-                && watcher.start.unwrap_or(next) == next
-                && watcher.progress.elapsed() >= self.progress_interval
-            {
-                send(
-                    &self.tx,
-                    WatchResponse {
-                        header,
-                        watch_id: watcher.request.watch_id,
-                        ..Default::default()
-                    },
-                )
-                .await?;
-                watcher.progress = tokio::time::Instant::now();
-            }
+        let due: Vec<_> = self
+            .watchers
+            .iter()
+            .filter(|(_, watcher)| {
+                watcher.request.progress_notify
+                    && watcher.start.unwrap_or(next) == next
+                    && watcher.progress.elapsed() >= self.progress_interval
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in due {
+            let watcher = self.watchers.get_mut(&id).expect("due watcher");
+            send(
+                &self.tx,
+                WatchResponse {
+                    header,
+                    watch_id: watcher.request.watch_id,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            watcher.progress = tokio::time::Instant::now();
         }
         Ok(())
     }
@@ -527,10 +572,14 @@ impl Stream {
             request.watch_id = self.next_id;
             self.next_id += 1;
         }
+        let header = state.header(self.position);
+        let auth = state.view.auth.clone();
+        // Release the state before the send. The Auth store does not pin the view.
+        drop(state);
         send(
             &self.tx,
             WatchResponse {
-                header: state.header(self.position),
+                header,
                 watch_id: if reason.is_empty() {
                     request.watch_id
                 } else {
@@ -549,7 +598,7 @@ impl Stream {
         if request.start_revision <= 0 {
             request.start_revision = self.position + 1;
         }
-        permit(&state.view.auth, &self.credentials(), &request)?;
+        permit(&auth, &self.credentials(), &request)?;
         let watcher = Watcher {
             _active: self
                 .meters
@@ -570,11 +619,11 @@ impl Stream {
 
     async fn cancel(&mut self, id: i64) -> Result<(), Status> {
         if self.remove(id).is_some() {
-            let state = self.current(false)?;
+            let header = self.current(false)?.header(self.position);
             send(
                 &self.tx,
                 WatchResponse {
-                    header: state.header(self.position),
+                    header,
                     watch_id: id,
                     canceled: true,
                     ..Default::default()
@@ -589,12 +638,12 @@ impl Stream {
     async fn progress(&mut self) -> Result<(), Status> {
         let goal = self.current(false)?.view.revision;
         self.catch_up_all(Some(goal)).await?;
-        let state = self.current(false)?;
+        let header = self.current(false)?.header(goal);
         if !self.watchers.is_empty() && self.watchers.values().all(|w| self.start(w) <= goal + 1) {
             send(
                 &self.tx,
                 WatchResponse {
-                    header: state.header(goal),
+                    header,
                     watch_id: -1,
                     ..Default::default()
                 },
@@ -613,6 +662,26 @@ fn permit(
 ) -> Result<(), Status> {
     auth.range(credentials, &request.key, &request.range_end, false)
         .map_err(|e| e.status())
+}
+
+/// The bytes of the responses that one page or batch holds before it sends them. A full batch
+/// sends what it has and resumes each watcher on a new view.
+#[cfg(not(test))]
+const PREPARED_BYTES: usize = 4 << 20;
+#[cfg(test)]
+pub(crate) const PREPARED_BYTES: usize = 256 << 10;
+
+/// The largest prepared batch with more than one response, for tests. One response that is
+/// larger than the budget is sent alone.
+#[cfg(test)]
+pub(crate) static LARGEST_BATCH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn record_batch(_bytes: usize, _responses: usize) {
+    #[cfg(test)]
+    if _responses > 1 {
+        LARGEST_BATCH.fetch_max(_bytes, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// One response that a page or a batch read on its view. The send runs after the view is gone.
@@ -1053,6 +1122,47 @@ mod tests {
         f.stream.batch(&batch).await.unwrap();
         let revisions: Vec<_> = f.events().into_iter().map(|(_, r, _)| r).collect();
         assert_eq!(revisions, [2, 3, 4, 5, 6]);
+        f.close().await;
+    }
+
+    /// Eight following and eight historical watchers receive large values. Each revision has
+    /// more response bytes than the budget, so the feed and catch-up stop inside a revision.
+    #[tokio::test]
+    async fn prepared_batches_stay_in_the_byte_budget_and_deliver_each_revision_once() {
+        let mut f = Fixture::new().await;
+        for id in 1..=8 {
+            f.watch(request(id, "k", 0)).await;
+        }
+        let value = "x".repeat(40 << 10);
+        let mut revisions = vec![];
+        for _ in 0..6 {
+            let batch = f.put("k", &value).await;
+            assert!(batch.journals().is_some());
+            revisions.push(batch.revision);
+            f.stream.batch(&batch).await.unwrap();
+            // The feed stops inside the revision. The other watchers read storage.
+            assert!(f.stream.unsynced());
+            f.stream.catch_up_all(None).await.unwrap();
+            assert!(!f.stream.unsynced());
+        }
+        let mut events = f.events();
+        // A historical watcher catches up when the stream creates it.
+        for id in 9..=16 {
+            f.stream
+                .create(request(id, "k", revisions[0]))
+                .await
+                .unwrap();
+        }
+        events.extend(f.events());
+        let largest = LARGEST_BATCH.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(largest <= PREPARED_BYTES, "{largest} bytes in one batch");
+        let mut seen: HashMap<i64, Vec<i64>> = HashMap::new();
+        for (id, revision, _) in events {
+            seen.entry(id).or_default().push(revision);
+        }
+        for id in 1..=16 {
+            assert_eq!(seen.get(&id), Some(&revisions), "watcher {id}");
+        }
         f.close().await;
     }
 
