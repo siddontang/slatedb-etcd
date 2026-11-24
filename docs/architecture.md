@@ -389,9 +389,11 @@ Watch with `prev_kv` reads one history row for each such event. Delete events ke
 Like etcd, Watch omits `prev_kv` and logs a warning when that history version is missing.
 Storage read errors still fail the Watch request.
 
-On 64-bit hosts, each hash table slot uses 57 bytes. The table keeps 44 to 88 percent of its
-slots full. A key therefore costs 65 to 130 bytes plus its own heap allocation.
-One million 16-byte keys use about 150 MB. Table growth briefly holds the old and new slots.
+Each key has one heap allocation: a 48-byte header with the metadata, then the key bytes.
+The hash set stores one 8-byte pointer per key. The ordered key map adds an 8-byte presence slot.
+The hash set keeps 44 to 88 percent of its slots full, and tree nodes are half full or more.
+A key therefore costs about 30 to 55 bytes plus its allocation.
+One million 16-byte keys use about 115 MB with jemalloc. Table growth briefly holds both tables.
 
 The apply worker groups consecutive etcd KV entries within its 32-entry, 512 KiB job target.
 One large entry can exceed the byte target. The pending log limit still bounds that entry.
