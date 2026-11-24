@@ -140,6 +140,8 @@ impl Simulation {
                 require_peer_tls: false,
                 state_mode: Default::default(),
                 view_max_age: std::time::Duration::from_secs(10),
+                view_pin_max: std::time::Duration::from_secs(300),
+                overlay_max_bytes: 1 << 30,
                 object_store: crate::object::Config::Test(store, "state".into()),
                 strict_reconfiguration: false,
                 join: false,
@@ -1116,11 +1118,11 @@ impl Simulation {
             let state = node.worker.state();
             assert_eq!(
                 state.logical_size(),
-                crate::state::maintenance::count_logical_size(state.db.as_ref())
+                crate::state::maintenance::count_logical_size(state.db().as_ref())
                     .await
                     .unwrap()
             );
-            assert!(state.key_index.matches(&state.db).await.unwrap());
+            assert!(state.key_index.matches(state.db()).await.unwrap());
             assert!(node.state.auth.range(&writer, b"admin", b"", true).is_err());
             assert!(node.state.auth.range(&token, b"admin", b"", true).is_err());
             let value = node
@@ -1387,11 +1389,11 @@ impl Simulation {
             }
             assert_eq!(
                 state.logical_size(),
-                crate::state::maintenance::count_logical_size(state.db.as_ref())
+                crate::state::maintenance::count_logical_size(state.db().as_ref())
                     .await
                     .unwrap()
             );
-            assert!(state.key_index.matches(&state.db).await.unwrap());
+            assert!(state.key_index.matches(state.db()).await.unwrap());
         }
         self.trace.push("batched put history recovered".into());
     }
@@ -1718,14 +1720,14 @@ impl Simulation {
         let mut expected_events = None;
         for node in sim.nodes.values() {
             let state = node.worker.state();
-            let mut rows = state.db.scan_prefix(b"etcd/", ..).await.unwrap();
+            let mut rows = state.db().scan_prefix(b"etcd/", ..).await.unwrap();
             let mut size = 0;
             while let Some(row) = rows.next().await.unwrap() {
                 size += (row.key.len() + row.value.len()) as u64;
             }
             assert_eq!(state.logical_size(), size, "seed {seed}");
             assert!(
-                state.key_index.matches(&state.db).await.unwrap(),
+                state.key_index.matches(state.db()).await.unwrap(),
                 "seed {seed}"
             );
             assert!(node.state.leases[&77].generation > generation);

@@ -5,7 +5,7 @@ pub(crate) struct ReadView {
     metrics: Arc<crate::metrics::StateMeters>,
     state: StateView,
     /// Keep the database open while the view reads it. A snapshot install replaces it.
-    _database: Arc<Db>,
+    _database: Option<Arc<Db>>,
     rows: Arc<super::rows::RowCache>,
     pub revision: i64,
     pub compact_revision: i64,
@@ -13,6 +13,9 @@ pub(crate) struct ReadView {
     pub leases: Arc<std::collections::BTreeMap<i64, crate::lease::LeaseRecord>>,
     /// Current keys at the snapshot's sequence number, for Range counts.
     keys: key_index::KeyPin,
+    /// Shared mode: the longest time that one read may pin the base. Each read starts its own
+    /// deadline, so an old view stays usable for new reads.
+    pin_max: Option<std::time::Duration>,
 }
 
 impl StateMachine {
@@ -20,21 +23,30 @@ impl StateMachine {
         Ok(Arc::new(ReadView {
             metrics: self.metrics.clone(),
             state: self.pinned_state()?,
-            _database: self.db.clone(),
+            _database: self.database.clone(),
             rows: self.rows.clone(),
             revision: self.revision,
             compact_revision: self.compact_revision,
             auth: self.auth.clone(),
             leases: self.leases.clone(),
             keys: self.key_index.pin(self.applied),
+            pin_max: self.shared.as_ref().map(|shared| shared.pin_max),
         }))
     }
 }
 
 impl ReadView {
     /// The pinned state. Watch catch-up reads it beside the view's revisions.
+    #[cfg(test)]
     pub(crate) fn state(&self) -> &StateView {
         &self.state
+    }
+
+    /// The state for one read. In shared mode the read must end within the pin limit, which
+    /// starts now.
+    pub(crate) fn read_state(&self) -> StateView {
+        self.state
+            .until(self.pin_max.map(|limit| std::time::Instant::now() + limit))
     }
 
     pub async fn read(
@@ -54,6 +66,7 @@ impl ReadView {
         credentials: Option<&crate::auth::Credentials>,
         budget: Option<usize>,
     ) -> Result<Option<Outcome>> {
+        let state = self.read_state();
         if let Some(credentials) = credentials {
             if let Err(error) = self.auth.kv(credentials, request) {
                 return Ok(Some(Outcome { result: Err(error) }));
@@ -66,7 +79,7 @@ impl ReadView {
         .then(std::time::Instant::now);
         let result = match budget {
             Some(budget) => match mvcc::read_snapshot_within(
-                self.state(),
+                &state,
                 &self.rows,
                 self.revision,
                 self.compact_revision,
@@ -82,7 +95,7 @@ impl ReadView {
             },
             None => {
                 mvcc::read_snapshot(
-                    self.state(),
+                    &state,
                     &self.rows,
                     self.revision,
                     self.compact_revision,
@@ -102,6 +115,19 @@ impl ReadView {
             histogram.observe(start.elapsed().as_secs_f64());
         }
         if let Err(error) = &result {
+            // A deleted checkpoint object or an expired pin fails only this read. The client
+            // retries on a new view.
+            if self.pin_max.is_some()
+                && (super::shared::missing_object(&anyhow::anyhow!("{}", error.message))
+                    || super::view::expired(&error.message))
+            {
+                return Ok(Some(Outcome {
+                    result: Err(mvcc::KvError::new(
+                        tonic::Code::Unavailable,
+                        "etcdserver: a checkpoint object is missing; retry",
+                    )),
+                }));
+            }
             ensure!(
                 error.code != tonic::Code::Internal as i32,
                 "{}",
@@ -412,7 +438,7 @@ mod tests {
         }
         drop((first, second, third));
         apply(&mut state, put(b"z")).await;
-        assert!(state.key_index.matches(&state.db).await.unwrap());
+        assert!(state.key_index.matches(state.db()).await.unwrap());
         state.close().await.unwrap();
     }
 
@@ -658,7 +684,7 @@ mod tests {
                         // Without a SlateDB WAL, unflushed rows return through Raft replay. Flush
                         // so the reopened state holds every applied row.
                         views.clear();
-                        state.db.flush().await.unwrap();
+                        state.db().flush().await.unwrap();
                         state.close().await.unwrap();
                         drop(state);
                         state = StateMachine::open(dir.path()).await.unwrap();
@@ -696,8 +722,8 @@ mod tests {
                 .unwrap()
                 .result
                 .unwrap();
-            assert!(state.key_index.matches(&state.db).await.unwrap());
-            assert!(mirror.key_index.matches(&mirror.db).await.unwrap());
+            assert!(state.key_index.matches(state.db()).await.unwrap());
+            assert!(mirror.key_index.matches(mirror.db()).await.unwrap());
             state.close().await.unwrap();
             mirror.close().await.unwrap();
         }

@@ -96,6 +96,11 @@ pub enum Event {
     },
     /// The shared-mode publisher created this checkpoint. The leader announces it.
     ViewCheckpoint(uuid::Uuid),
+    /// A member reports the checkpoints that it pins. The leader keeps them.
+    ViewAck {
+        member: u64,
+        checkpoints: std::collections::HashSet<uuid::Uuid>,
+    },
 }
 
 /// Flush SlateDB for log truncation about once per L0 SST instead of once per entry interval.
@@ -123,6 +128,11 @@ pub struct NodeOptions {
     pub state_mode: crate::state::StateMode,
     /// Shared mode: the age of the oldest unflushed write that starts a flush and a checkpoint.
     pub view_max_age: Duration,
+    /// Shared mode: the longest time that a read view may pin its base checkpoint.
+    pub view_pin_max: Duration,
+    /// Shared mode: the leader rejects client proposals above this overlay size. Apply waits
+    /// above twice this size.
+    pub overlay_max_bytes: u64,
 }
 
 impl NodeOptions {
@@ -286,12 +296,12 @@ impl Node {
         );
         if options.state_mode == crate::state::StateMode::Shared {
             ensure!(
-                options.peers.len() == 1 && !options.join,
-                "shared state mode supports one voter until phase 2"
+                !options.view_max_age.is_zero() && !options.view_pin_max.is_zero(),
+                "the view age limits must be positive"
             );
             ensure!(
-                !options.view_max_age.is_zero(),
-                "the view age limit must be positive"
+                options.overlay_max_bytes > 0,
+                "the overlay limit must be positive"
             );
         }
         std::fs::create_dir_all(&options.dir)?;
@@ -306,6 +316,13 @@ impl Node {
                 options.peers.keys().copied().collect()
             },
         )?;
+        let shared = crate::state::shared::Options {
+            quota: options.effective_quota().max(0) as u64,
+            voters: options.peers.keys().copied().collect(),
+            join: options.join,
+            empty_log: storage.last_index()? == 0,
+            pin_max: options.view_pin_max,
+        };
         let mut state = options
             .object_store
             .open(
@@ -314,8 +331,7 @@ impl Node {
                 options.id,
                 options.state_cache,
                 options.state_mode,
-                options.effective_quota().max(0) as u64,
-                &options.peers.keys().copied().collect::<Vec<_>>(),
+                &shared,
             )
             .await?;
         // Mark the directory before the first format 4 row, not on open. See `RowMarker`.
@@ -335,6 +351,8 @@ impl Node {
             if !state.is_shared() {
                 state.quota = options.effective_quota().max(0) as u64;
             }
+            // A shared base can be ahead of the log, or on another term at its index.
+            Self::align_log(&mut storage, &state)?;
             // Flushed state proves this prefix was committed, even if its commit marker was lost.
             if state.applied > storage.commit_index() {
                 storage.persist_commit(state.applied)?;
@@ -451,15 +469,17 @@ impl Node {
             state.admin.clone(),
             state.metrics.registry.clone(),
         )?);
-        let writer = state
-            .writer_parts()
-            .map(|parts| shared::Writer::new(parts, options.view_max_age));
+        let handles = state.shared_handles();
+        let writer = handles
+            .as_ref()
+            .map(|handles| shared::Writer::new(handles, options.view_max_age));
         let mut compaction = compaction::Flush::new(&state);
-        if let Some(writer) = &writer {
-            compaction.share(writer.progress());
+        if let Some(handles) = handles {
+            compaction.share(handles.based);
         }
         let compact_plan = compaction::PlanReady::new(&state, manual_apply);
-        let worker = Worker::start(state, events.clone(), manual_apply);
+        let log_reader = state.is_shared().then(|| storage.reader());
+        let worker = Worker::start(state, events.clone(), manual_apply, log_reader);
         let log_worker = log::Worker::start(storage, manual_apply)?;
         let next_checkpoint = options.next_checkpoint(raw.store().snapshot_index());
         let mut node = Self {
@@ -549,6 +569,11 @@ impl Node {
         Ok(node)
     }
 
+    /// The shared-mode objects that the snapshot receive path opens.
+    pub(crate) fn shared_source(&self) -> Option<std::sync::Arc<crate::state::shared::Source>> {
+        self.writer.as_ref().map(|writer| writer.source.clone())
+    }
+
     pub async fn run(self, events: mpsc::Receiver<Event>) -> Result<()> {
         self.run_until(events, std::future::pending()).await
     }
@@ -599,16 +624,23 @@ impl Node {
                 _ = tokio::time::sleep_until(
                     self.compact_ready_at.unwrap_or_else(Instant::now).into()
                 ), if self.compact_ready_at.is_some() => { self.compact_ready_at = None; }
-                _ = ticks.tick() => { self.raw.tick(); self.retry_reads(); self.expire_leases()?; self.publish_member()?; }
+                _ = ticks.tick() => {
+                    self.raw.tick();
+                    self.retry_reads();
+                    self.expire_leases()?;
+                    self.publish_member()?;
+                    self.tick_shared();
+                }
                 persisted = self.log_worker.next() => { self.complete_log(persisted?)?; }
                 _ = self.compact_plan.changed() => {}
                 target = self.compaction.next(), if self.compaction.active() => {
                     self.finish_compaction_flush(target?)?;
                 }
                 completed = self.worker.next() => { self.complete_apply(completed?)?; }
-                error = shared::failed(&mut self.writer),
-                    if self.writer.as_ref().is_some_and(shared::Writer::running) => {
-                    return Err(error);
+                event = shared::next(&mut self.writer), if self.writer.is_some() => {
+                    if let shared::WriterEvent::Failed(error) = event {
+                        return Err(error);
+                    }
                 }
                 read = self.read_executor.next(), if self.read_executor.len() > 0 => {
                     self.complete_read(read?)?;
@@ -961,7 +993,7 @@ impl Node {
             Event::Checkpoint(response) => {
                 if self.writer.is_some() {
                     let _ = response.send(Err(
-                        self.error("shared state mode has no manual checkpoint until phase 2")
+                        self.error("shared state mode has no manual checkpoint until phase 4")
                     ));
                 } else if self.checkpoint_waiters.len() >= apply::MAX_QUERIES {
                     let _ = response.send(Err(self.error("too many checkpoint requests")));
@@ -973,6 +1005,10 @@ impl Node {
             }
             Event::SnapshotBuilt(built) => self.checkpoint_built(built)?,
             Event::ViewCheckpoint(checkpoint) => self.announce_view(checkpoint)?,
+            Event::ViewAck {
+                member,
+                checkpoints,
+            } => self.view_ack(member, checkpoints),
             Event::SnapshotDelay(delay_ms, response) => {
                 self.snapshot_delay_ms = delay_ms.min(5000);
                 let _ = response.send(Ok(self.status()?));
@@ -1056,7 +1092,7 @@ impl Node {
             response.error(self.error("not leader"));
             return Ok(());
         }
-        if self.pending.len() >= 1024 {
+        if self.pending.len() >= 1024 || self.overlay_full() {
             response.error(self.error("too many pending requests"));
             return Ok(());
         }
@@ -1237,7 +1273,7 @@ impl Node {
             return Ok(());
         }
         let store = self.raw.store();
-        let advances = self.state.applied > store.snapshot_index();
+        let advances = self.checkpointable(self.state.applied) > store.snapshot_index();
         // An image can replace a record without an image at the same index.
         let attaches = image && store.snapshot_index() > 0 && !store.has_image();
         if !advances && !attaches {

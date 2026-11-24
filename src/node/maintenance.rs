@@ -9,7 +9,16 @@ impl Node {
         credentials: crate::auth::Credentials,
         response: Response,
     ) -> Result<()> {
+        let shared = self.writer.is_some();
         let checked = self.state.auth.admin(&credentials).and_then(|()| {
+            // A new leader opens the writer and fences the old one. Phase 3 adds the checks that
+            // make that safe, so phase 2 keeps the bootstrap leader.
+            if shared {
+                return Err(KvError::new(
+                    Code::FailedPrecondition,
+                    "shared state mode has no leader transfer until phase 3",
+                ));
+            }
             let member = self
                 .state
                 .members

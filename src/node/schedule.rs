@@ -50,10 +50,9 @@ impl Node {
     /// The checkpoint to start once `applied` entries have been applied, if one is due.
     /// `Some(true)` builds a complete image; `Some(false)` only flushes state and truncates.
     fn checkpoint_due(&self, applied: u64) -> Option<bool> {
-        // Shared mode keeps its whole log until phase 2 adds checkpoint snapshots.
-        if self.writer.is_some() {
-            return None;
-        }
+        // Shared mode records its base `F`. The log stays above the base, so the record needs
+        // no flush, and any member can send it.
+        let applied = self.checkpointable(applied);
         let store = self.raw.store();
         let snapshot_index = store.snapshot_index();
         // A peer snapshot or a manual checkpoint needs a complete image.
@@ -75,6 +74,14 @@ impl Node {
             && self.checkpoint_waiters.is_empty()
             && !self.sending_snapshot();
         (image_due || truncate_due).then_some(image_due)
+    }
+
+    /// The index that a checkpoint can cover: `applied`, or the base `F` in shared mode.
+    pub(super) fn checkpointable(&self, applied: u64) -> u64 {
+        match self.state.view {
+            Some((base, _, _)) if self.writer.is_some() => base,
+            _ => applied,
+        }
     }
 
     /// Submit committed entries in `(applied, committed]`, up to one apply batch.
@@ -105,6 +112,7 @@ impl Node {
             };
             let committed = self.committed_ready;
             if last >= committed
+                || self.apply_paused()
                 || self.raw.store().snapshot_pending()
                 || last < self.raw.store().snapshot_index()
                 || self.prepared_puts.is_some()
@@ -136,6 +144,10 @@ impl Node {
                 snapshot_index,
             );
         }
+        // A switch frees overlay memory, so it goes before other work.
+        if self.prepared_puts.is_none() && self.take_switch() {
+            return self.submit_apply(Job::SwitchBase, self.state.applied);
+        }
         // Raft delivers committed entries only after local persistence. The commit marker in the
         // log is volatile, so apply need not wait for the log thread to write it.
         let committed = self.committed_ready;
@@ -164,14 +176,15 @@ impl Node {
                 return self.submit_apply(job, self.state.applied);
             }
         }
-        if self.state.applied < committed {
+        let paused = self.apply_paused();
+        if self.state.applied < committed && !paused {
             if self.prepare_local_puts()? {
                 return Ok(());
             }
             self.submit_entries(self.state.applied, committed)?;
             return self.pipeline_apply();
         }
-        if self.prepare_quorum_puts()? {
+        if !paused && self.prepare_quorum_puts()? {
             return Ok(());
         }
         if let Some(job) = self.next_query_job() {

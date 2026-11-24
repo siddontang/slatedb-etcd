@@ -8,6 +8,8 @@ fn options(dir: &std::path::Path) -> NodeOptions {
         require_peer_tls: false,
         state_mode: Default::default(),
         view_max_age: std::time::Duration::from_secs(10),
+        view_pin_max: std::time::Duration::from_secs(300),
+        overlay_max_bytes: 1 << 30,
         object_store: crate::object::Config::Local,
         strict_reconfiguration: false,
         join: false,

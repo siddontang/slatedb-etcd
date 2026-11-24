@@ -12,6 +12,7 @@ async fn server() -> (
     let (events, received) = mpsc::channel(256);
     let router = crate::api::router(ApiState {
         location: None,
+        shared: None,
         events,
         cluster_id: "stream-test".into(),
     });

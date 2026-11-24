@@ -9,8 +9,10 @@ use std::sync::{Arc, Mutex};
 
 use slatedb::config::{CheckpointOptions, CheckpointScope, WriteOptions};
 
+use std::collections::HashSet;
+
 use crate::state::overlay::Queue;
-use crate::state::shared::{view_checkpoints, view_name, Source, WriterParts};
+use crate::state::shared::{view_checkpoints, view_name, Handles, Source};
 
 /// The newest checkpoints that the publisher keeps. It also keeps every newer checkpoint than
 /// the oldest one that a live base pins.
@@ -60,6 +62,12 @@ impl Progress {
         }
     }
 
+    /// Start again after a writer open at `written`.
+    fn reset(&self, written: u64) {
+        self.written.send_replace(written);
+        *self.inner.lock().unwrap() = Inner::default();
+    }
+
     fn request(&self, through: u64) {
         let mut inner = self.inner.lock().unwrap();
         let through = inner
@@ -71,6 +79,7 @@ impl Progress {
     }
 
     /// Wait until the shared `Db` holds every batch through `seq`.
+    #[cfg(test)]
     pub async fn wait_written(&self, seq: u64) -> Result<()> {
         let mut written = self.written.subscribe();
         written.wait_for(|written| *written >= seq).await?;
@@ -102,66 +111,106 @@ impl Progress {
     }
 }
 
-/// The leader writer of shared state mode.
+/// Reports of pinned checkpoints by member. Each one protects its checkpoints from retention
+/// for `REPORT_LIFETIME`.
+type Reports = Arc<Mutex<HashMap<u64, (Instant, HashSet<uuid::Uuid>)>>>;
+
+/// A member's report protects its checkpoints for this time after it arrives.
+const REPORT_LIFETIME: Duration = Duration::from_secs(10 * 60);
+
+/// The shared-mode tasks of one member. Only the leader runs the writer.
 pub(super) struct Writer {
-    db: Arc<slatedb::Db>,
     admin: Arc<slatedb::admin::Admin>,
     queue: Arc<Queue>,
-    source: Arc<Source>,
+    pub(super) source: Arc<Source>,
     progress: Arc<Progress>,
     max_age: Duration,
+    /// Set while this member leads. Sending `true` closes the writer.
+    stop: Option<tokio::sync::watch::Sender<bool>>,
     tasks: tokio::task::JoinSet<Result<()>>,
+    reports: Reports,
     /// `ViewCheckpoint` entries that this node proposed.
     pub announced: u64,
+    /// The `F` of the newest base that opened. A change starts a switch job.
+    opened: tokio::sync::watch::Receiver<u64>,
+    opened_slot: Arc<crate::state::shared::Opened>,
+    /// A switch job is due.
+    pub switch_due: bool,
+    /// Apply waits while the overlay is over the hard limit.
+    pub paused: bool,
+    /// A paused member polls the checkpoint list. Only one poll runs at a time.
+    polling: Arc<std::sync::atomic::AtomicBool>,
+    ticks: u64,
 }
 
 impl Writer {
-    pub fn new(parts: WriterParts, max_age: Duration) -> Self {
+    pub fn new(handles: &Handles, max_age: Duration) -> Self {
         Self {
-            progress: Arc::new(Progress::new(parts.written)),
-            db: parts.db,
-            admin: parts.admin,
-            queue: parts.queue,
-            source: parts.source,
+            progress: Arc::new(Progress::new(0)),
+            admin: handles.admin.clone(),
+            queue: handles.queue.clone(),
+            source: handles.source.clone(),
             max_age,
+            stop: None,
             tasks: tokio::task::JoinSet::new(),
+            reports: Reports::default(),
             announced: 0,
+            opened: handles.opened.subscribe(),
+            opened_slot: handles.opened.clone(),
+            switch_due: false,
+            paused: false,
+            polling: Arc::default(),
+            ticks: 0,
         }
     }
 
     pub fn running(&self) -> bool {
-        !self.tasks.is_empty()
+        self.stop.is_some()
     }
 
-    /// Start the tasks on the leader. Stop them on any other member.
+    /// Open the writer on the leader. Close it on any other member.
+    ///
+    /// The open fences an older writer. Phase 3 adds the term check after the open, the clock
+    /// check, and the reopen after a fence. Phase 2 rejects leader transfer instead.
     pub fn sync(&mut self, leader: bool, events: &mpsc::Sender<Event>) {
         if !leader {
-            // Dropping the set aborts the tasks. The `Db` stays open for the next term.
-            self.tasks = tokio::task::JoinSet::new();
+            if let Some(stop) = self.stop.take() {
+                stop.send_replace(true);
+            }
             return;
         }
         if self.running() {
             return;
         }
-        self.tasks.spawn(materialize(
-            self.db.clone(),
-            self.queue.clone(),
-            self.progress.clone(),
-        ));
-        self.tasks.spawn(publish(
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        self.stop = Some(stop);
+        self.tasks.spawn(lead(
             Publisher {
-                db: self.db.clone(),
+                db: None,
                 admin: self.admin.clone(),
                 source: self.source.clone(),
                 progress: self.progress.clone(),
                 max_age: self.max_age,
+                reports: self.reports.clone(),
             },
+            self.queue.clone(),
             events.clone(),
+            stopped,
         ));
     }
 
     pub async fn stop(&mut self) {
-        self.tasks.shutdown().await;
+        if let Some(stop) = self.stop.take() {
+            stop.send_replace(true);
+        }
+        // A clean stop closes the writer. A stuck close must not hold the shutdown.
+        let closing = async { while self.tasks.join_next().await.is_some() {} };
+        if tokio::time::timeout(Duration::from_secs(5), closing)
+            .await
+            .is_err()
+        {
+            self.tasks.shutdown().await;
+        }
     }
 
     /// Publish a checkpoint that holds the applied state through `index`.
@@ -174,8 +223,12 @@ impl Writer {
         index.min(self.queue.pushed())
     }
 
-    pub fn progress(&self) -> Arc<Progress> {
-        self.progress.clone()
+    /// Record the checkpoints that `member` pins. The publisher keeps them.
+    pub fn report(&self, member: u64, checkpoints: HashSet<uuid::Uuid>) {
+        self.reports
+            .lock()
+            .unwrap()
+            .insert(member, (Instant::now(), checkpoints));
     }
 
     pub fn status(&self) -> Value {
@@ -184,21 +237,97 @@ impl Writer {
             "queued_batches": self.queue.len(),
             "announced": self.announced,
             "running": self.running(),
+            "paused": self.paused,
+            "reports": self.reports.lock().unwrap().len(),
         })
     }
 }
 
-/// Wait until a writer task fails. A member without running tasks waits forever.
-pub(super) async fn failed(writer: &mut Option<Writer>) -> anyhow::Error {
+/// The checkpoints that recent reports pin.
+fn reported(reports: &Reports) -> HashSet<uuid::Uuid> {
+    let mut reports = reports.lock().unwrap();
+    reports.retain(|_, (at, _)| at.elapsed() < REPORT_LIFETIME);
+    reports
+        .values()
+        .flat_map(|(_, ids)| ids.iter().copied())
+        .collect()
+}
+
+/// An event of the shared-mode tasks.
+pub(super) enum WriterEvent {
+    /// A writer task failed. The node stops.
+    Failed(anyhow::Error),
+    /// A newer base opened. A switch job is due.
+    Opened,
+}
+
+/// Wait for the next writer event. A member without shared state waits forever. A stop that
+/// the member requested is not a failure.
+pub(super) async fn next(writer: &mut Option<Writer>) -> WriterEvent {
     let Some(writer) = writer else {
         return std::future::pending().await;
     };
-    match writer.tasks.join_next().await {
-        Some(Ok(Ok(()))) => anyhow::anyhow!("a shared state writer task stopped"),
-        Some(Ok(Err(error))) => error.context("shared state writer failed"),
-        Some(Err(error)) => anyhow::Error::from(error).context("shared state writer stopped"),
-        None => std::future::pending().await,
+    let leading = writer.stop.is_some();
+    let failed = async {
+        loop {
+            match writer.tasks.join_next().await {
+                Some(Ok(Ok(()))) if !leading => continue,
+                // A newer writer can fence the old one before it sees the stop.
+                Some(Ok(Err(error))) if !leading => {
+                    tracing::warn!(%error, "the stopped shared writer failed");
+                    continue;
+                }
+                Some(Ok(Ok(()))) => return anyhow::anyhow!("a shared state writer task stopped"),
+                Some(Ok(Err(error))) => return error.context("shared state writer failed"),
+                Some(Err(error)) if error.is_cancelled() => continue,
+                Some(Err(error)) => {
+                    return anyhow::Error::from(error).context("shared state writer stopped")
+                }
+                None => return std::future::pending().await,
+            }
+        }
+    };
+    tokio::select! {
+        error = failed => WriterEvent::Failed(error),
+        changed = writer.opened.changed() => {
+            if changed.is_err() {
+                return std::future::pending().await;
+            }
+            writer.switch_due = true;
+            WriterEvent::Opened
+        }
     }
+}
+
+/// Open the writer, then materialize and publish until the member steps down.
+async fn lead(
+    mut publisher: Publisher,
+    queue: Arc<Queue>,
+    events: mpsc::Sender<Event>,
+    mut stopped: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let db = tokio::select! {
+        db = publisher.source.open_writer() => Arc::new(db?),
+        _ = stopped.wait_for(|stop| *stop) => return Ok(()),
+    };
+    // The open starts at `last_l0_seq`. Unflushed writes of an older writer are lost, and the
+    // overlay holds them.
+    publisher.progress.reset(db.manifest().last_l0_seq());
+    publisher.db = Some(db.clone());
+    let result = tokio::select! {
+        result = materialize(db.clone(), queue, publisher.progress.clone()) => result,
+        result = publish(publisher, events) => result,
+        _ = stopped.wait_for(|stop| *stop) => Ok(()),
+    };
+    let closed = db
+        .close_with_options(slatedb::config::CloseOptions { flush_type: None })
+        .await;
+    result?;
+    // A writer that a newer leader fenced cannot close cleanly. Phase 3 reopens it.
+    if let Err(error) = closed {
+        tracing::warn!(%error, "cannot close the shared writer");
+    }
+    Ok(())
 }
 
 /// Copy overlay batches into the shared `Db` in order, each with its own sequence.
@@ -225,11 +354,12 @@ pub(super) async fn materialize(
 }
 
 struct Publisher {
-    db: Arc<slatedb::Db>,
+    db: Option<Arc<slatedb::Db>>,
     admin: Arc<slatedb::admin::Admin>,
     source: Arc<Source>,
     progress: Arc<Progress>,
     max_age: Duration,
+    reports: Reports,
 }
 
 /// Flush the shared `Db` when its oldest write reaches the age limit or on request. Create one
@@ -243,7 +373,9 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
         source,
         progress,
         max_age,
+        reports,
     } = publisher;
+    let db = db.context("the publisher needs the writer")?;
     let mut published = view_checkpoints(&admin)
         .await?
         .last()
@@ -291,6 +423,12 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
         }
         tracing::debug!(checkpoint = %checkpoint.id, applied = base.applied, "publish view");
         drop(base);
+        // The marker comes before the first announcement. The checkpoint already exists, so a
+        // restart after the marker still finds a base.
+        if !bootstrapped {
+            source.mark_bootstrapped(checkpoint.id).await?;
+            bootstrapped = true;
+        }
         if events
             .send(Event::ViewCheckpoint(checkpoint.id))
             .await
@@ -298,15 +436,59 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
         {
             return Ok(());
         }
-        if !bootstrapped {
-            source.mark_bootstrapped(checkpoint.id).await?;
-            bootstrapped = true;
-        }
-        crate::state::shared::retain(&admin, &source, KEEP_CHECKPOINTS).await?;
+        crate::state::shared::retain(&admin, &source, &reported(&reports), KEEP_CHECKPOINTS)
+            .await?;
     }
 }
 
+/// Ticks between two `ViewAck` reports.
+const REPORT_TICKS: u64 = 50;
+/// Ticks between two checkpoint polls of a paused member.
+const POLL_TICKS: u64 = 10;
+
 impl Node {
+    /// Align the Raft log with the base that the state opened at restart.
+    ///
+    /// If the log holds `F` with the checkpoint term, apply replays the entries above it: a local
+    /// rebuild. Otherwise the member adopts the checkpoint as its snapshot record.
+    pub(super) fn align_log(storage: &mut RaftStorage, state: &StateMachine) -> Result<()> {
+        let index = state.applied;
+        if !state.is_shared() || index == 0 {
+            return Ok(());
+        }
+        if index == storage.snapshot_index() {
+            // Known terms at the same index must agree.
+            let term = storage.recovery_snapshot().get_metadata().term;
+            ensure!(
+                term == 0 || state.applied_term == 0 || term == state.applied_term,
+                "base term {} differs from snapshot term {term} at {index}",
+                state.applied_term
+            );
+            return Ok(());
+        }
+        ensure!(
+            index > storage.snapshot_index(),
+            "the base checkpoint is below the Raft snapshot"
+        );
+        let term = state.applied_term;
+        ensure!(term != 0, "the base checkpoint has no applied term");
+        if index <= storage.last_index()? && storage.term(index).ok() == Some(term) {
+            return Ok(());
+        }
+        let mut snapshot = raft::eraftpb::Snapshot::default();
+        snapshot.mut_metadata().index = index;
+        snapshot.mut_metadata().term = term;
+        snapshot.mut_metadata().set_conf_state(state.members.conf());
+        let shared = state.shared.as_ref().context("shared state has no base")?;
+        let checkpoint = shared
+            .base
+            .checkpoint
+            .context("the base has no checkpoint")?;
+        snapshot.data = crate::state::transfer::ViewDescriptor::new(checkpoint).encode()?;
+        tracing::info!(index, term, "adopt the base checkpoint");
+        storage.adopt(&snapshot)
+    }
+
     /// Start or stop the writer tasks after a role change.
     pub(super) fn sync_writer(&mut self) {
         let leader = self.raw.raft.state == StateRole::Leader;
@@ -333,6 +515,155 @@ impl Node {
             writer.announced += 1;
         }
         Ok(())
+    }
+
+    /// The checkpoints that this member pins: live bases, received snapshots, and the
+    /// checkpoint of its Raft snapshot record.
+    fn pinned_checkpoints(&self) -> HashSet<uuid::Uuid> {
+        let Some(writer) = &self.writer else {
+            return HashSet::new();
+        };
+        let mut pinned = writer.source.pinned();
+        let record = self.raw.store().recovery_snapshot().get_data();
+        if let Ok(Some(descriptor)) = crate::state::transfer::ViewDescriptor::decode(record) {
+            if let Ok(id) = descriptor.checkpoint() {
+                pinned.insert(id);
+            }
+        }
+        pinned
+    }
+
+    /// Record a `ViewAck` from `member`. Only the leader keeps reports.
+    pub(super) fn view_ack(&mut self, member: u64, checkpoints: HashSet<uuid::Uuid>) {
+        if let Some(writer) = &self.writer {
+            writer.report(member, checkpoints);
+        }
+    }
+
+    /// Run the periodic shared-mode work: `ViewAck` reports and the paused checkpoint poll.
+    pub(super) fn tick_shared(&mut self) {
+        let Some(writer) = &mut self.writer else {
+            return;
+        };
+        writer.ticks += 1;
+        let ticks = writer.ticks;
+        if ticks % POLL_TICKS == 0 && writer.paused {
+            self.poll_checkpoints();
+        }
+        if ticks % REPORT_TICKS != 0 {
+            return;
+        }
+        let pinned = self.pinned_checkpoints();
+        let leader = self.raw.raft.leader_id;
+        if leader == self.options.id {
+            if let Some(writer) = &self.writer {
+                writer.report(leader, pinned);
+            }
+            return;
+        }
+        if leader == 0 || self.manual_transport {
+            return;
+        }
+        let Some(address) = self
+            .state
+            .members
+            .members
+            .get(&leader)
+            .and_then(|member| member.peer_ur_ls.first())
+        else {
+            return;
+        };
+        let url = format!("{}/raft/view-ack", crate::cluster::url(address));
+        let body = json!({"member": self.options.id, "checkpoints": pinned});
+        let client = self.options.transport.http.clone();
+        let cluster = self.options.cluster_id.clone();
+        tokio::spawn(async move {
+            let sent = client
+                .post(url)
+                .header("x-cluster-id", cluster)
+                .timeout(Duration::from_secs(2))
+                .json(&body)
+                .send()
+                .await;
+            if let Err(error) = sent {
+                tracing::debug!(%error, "cannot send a view report");
+            }
+        });
+    }
+
+    /// While apply waits, open the newest checkpoint above the base out of band. A switch job
+    /// then releases the segments that it covers, including the open one.
+    fn poll_checkpoints(&mut self) {
+        let Some(writer) = &self.writer else {
+            return;
+        };
+        if writer
+            .polling
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let polling = writer.polling.clone();
+        let admin = writer.admin.clone();
+        let source = writer.source.clone();
+        let opened = writer.opened_slot.clone();
+        let base = self.state.view.map_or(0, |(base, _, _)| base);
+        tokio::spawn(async move {
+            let result = async {
+                let Some((seq, checkpoint)) = view_checkpoints(&admin).await?.pop() else {
+                    return anyhow::Ok(());
+                };
+                if seq > base {
+                    opened.offer(source.open_base(checkpoint.id).await?);
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(%error, "cannot poll view checkpoints");
+            }
+            polling.store(false, std::sync::atomic::Ordering::Release);
+        });
+    }
+
+    /// Return true when the overlay is over the soft limit. The leader then rejects client
+    /// proposals. `ViewCheckpoint` entries are exempt.
+    pub(super) fn overlay_full(&self) -> bool {
+        self.state
+            .view
+            .is_some_and(|(_, _, bytes)| bytes > self.options.overlay_max_bytes)
+    }
+
+    /// Return true while apply waits for a base switch. Apply waits above twice the soft limit
+    /// and resumes below the soft limit. Raft still persists and acknowledges entries.
+    pub(super) fn apply_paused(&mut self) -> bool {
+        let Some((_, _, bytes)) = self.state.view else {
+            return false;
+        };
+        let limit = self.options.overlay_max_bytes;
+        let Some(writer) = &mut self.writer else {
+            return false;
+        };
+        if bytes > limit.saturating_mul(2) {
+            if !writer.paused {
+                tracing::warn!(
+                    bytes,
+                    limit,
+                    "pause apply until a base switch frees the overlay"
+                );
+            }
+            writer.paused = true;
+        } else if bytes < limit {
+            writer.paused = false;
+        }
+        writer.paused
+    }
+
+    /// Take a due switch job.
+    pub(super) fn take_switch(&mut self) -> bool {
+        self.writer
+            .as_mut()
+            .is_some_and(|writer| std::mem::take(&mut writer.switch_due))
     }
 }
 
@@ -423,5 +754,302 @@ mod tests {
         progress.wrote(3);
         assert!(progress.take_flush(long));
         assert!(!progress.take_flush(long));
+    }
+
+    /// Read `/status` from the client listener.
+    async fn status(server: &crate::server::Server) -> Value {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(server.client_addr())
+            .await
+            .unwrap();
+        let request = "GET /status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        let body = response.split_once("\r\n\r\n").unwrap().1;
+        let body = &body[body.find('{').unwrap()..=body.rfind('}').unwrap()];
+        serde_json::from_str(body).unwrap()
+    }
+
+    async fn eventually(what: &str, mut check: impl std::ops::AsyncFnMut() -> bool) {
+        for _ in 0..600 {
+            if check().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// Stall S3 on one voter until apply pauses, then recover S3 and send no new request. The
+    /// leader still publishes a checkpoint at or below its applied index, and the paused member
+    /// switches to it out of band. With `early`, the stall starts before the first announcement,
+    /// so the switch must release the open segment.
+    async fn stall_and_recover(early: bool) {
+        use crate::object::faults::{FaultStore, STALL_PUT};
+        use crate::proto::etcdserverpb::{kv_client::KvClient, PutRequest};
+        let limit = 64 * 1024;
+        let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::server::ServerConfig::single_node(dir.path());
+        config.state_mode = crate::state::StateMode::Shared;
+        config.object_store = crate::object::Config::Test(faults.clone(), "root".into());
+        config.view_max_age = Duration::from_millis(100);
+        config.overlay_max_bytes = limit;
+        let server = crate::server::Server::start(config).await.unwrap();
+        if early {
+            faults.set(STALL_PUT);
+        }
+        server.wait_ready(Duration::from_secs(15)).await.unwrap();
+        let shared = |status: &Value, field: &str| status["shared_state"][field].clone();
+        if !early {
+            eventually("the first announcement", async || {
+                shared(&status(&server).await, "applied_view_checkpoints") == 1
+            })
+            .await;
+            faults.set(STALL_PUT);
+        }
+        let channel = tonic::transport::Endpoint::from_shared(server.client_url())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        // Each write alone applies above twice the soft limit, so the pause does not depend on
+        // how many writes the admission check lets in. No checkpoint can appear.
+        let puts = (0..8_u8).map(|n| {
+            let mut kv = KvClient::new(channel.clone());
+            async move {
+                kv.put(PutRequest {
+                    key: vec![b'k', n],
+                    value: vec![n; 96 * 1024],
+                    ..Default::default()
+                })
+                .await
+            }
+        });
+        let written = futures::future::join_all(puts).await;
+        assert!(written.iter().any(Result::is_ok));
+        eventually("the apply pause", async || {
+            status(&server).await["shared_state"]["writer"]["paused"] == true
+        })
+        .await;
+        let paused = status(&server).await;
+        assert!(shared(&paused, "overlay_bytes").as_u64().unwrap() > 2 * limit);
+        // S3 recovers. No client sends a request.
+        faults.set(0);
+        eventually("the resumed apply", async || {
+            let status = status(&server).await;
+            status["shared_state"]["writer"]["paused"] == false
+                && shared(&status, "overlay_bytes").as_u64().unwrap() < limit
+                && status["applied_index"] == status["commit_index"]
+        })
+        .await;
+        let mut kv = KvClient::new(channel);
+        let reply = kv
+            .range(crate::proto::etcdserverpb::RangeRequest {
+                key: vec![b'k'],
+                range_end: vec![b'l'],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        // The admitted writes are readable. The admission check rejected the others.
+        assert!(!reply.kvs.is_empty());
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stalled_store_pauses_apply_until_an_out_of_band_switch() {
+        stall_and_recover(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stall_before_the_first_announcement_releases_the_open_segment() {
+        stall_and_recover(true).await;
+    }
+
+    /// Status answers while the first leader cannot create the shared manifest, and after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn status_answers_before_the_writer_creates_the_manifest() {
+        use crate::object::faults::{FaultStore, STALL_STATE_PUT};
+        use crate::proto::etcdserverpb::{
+            kv_client::KvClient, maintenance_client::MaintenanceClient, PutRequest, StatusRequest,
+        };
+        let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+        // The claims succeed. The writer cannot create the shared manifest.
+        faults.set(STALL_STATE_PUT);
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::server::ServerConfig::single_node(dir.path());
+        config.state_mode = crate::state::StateMode::Shared;
+        config.object_store = crate::object::Config::Test(faults.clone(), "root".into());
+        let server = crate::server::Server::start(config).await.unwrap();
+        server.wait_ready(Duration::from_secs(15)).await.unwrap();
+        let channel = tonic::transport::Endpoint::from_shared(server.client_url())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut maintenance = MaintenanceClient::new(channel.clone());
+        for _ in 0..3 {
+            // No SST exists yet, so the size is the logical size of the overlay.
+            let reply = maintenance
+                .status(StatusRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(reply.db_size, reply.db_size_in_use);
+        }
+        faults.set(0);
+        let mut kv = KvClient::new(channel);
+        kv.put(PutRequest {
+            key: b"key".to_vec(),
+            value: b"value".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        eventually("the first checkpoint", async || {
+            status(&server).await["shared_state"]["applied_view_checkpoints"]
+                .as_u64()
+                .unwrap()
+                > 0
+        })
+        .await;
+        maintenance.status(StatusRequest {}).await.unwrap();
+        server.shutdown().await.unwrap();
+    }
+
+    /// A restart whose base and snapshot record share an index must agree on its term.
+    #[tokio::test]
+    async fn a_restart_refuses_a_base_with_another_term_at_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = RaftStorage::open(dir.path(), 1, "test", vec![1]).unwrap();
+        let mut snapshot = raft::eraftpb::Snapshot::default();
+        snapshot.mut_metadata().index = 1;
+        snapshot.mut_metadata().term = 3;
+        snapshot.data = crate::state::transfer::ViewDescriptor::new(uuid::Uuid::new_v4())
+            .encode()
+            .unwrap();
+        storage.adopt(&snapshot).unwrap();
+        let options = crate::state::shared::Options {
+            quota: 0,
+            voters: vec![1],
+            join: false,
+            empty_log: false,
+            pin_max: Duration::from_secs(300),
+        };
+        let mut state = StateMachine::open_shared(
+            Arc::new(InMemory::new()),
+            "root",
+            "test",
+            crate::state::StateCache::default(),
+            &options,
+            crate::state::transfer::Backend::Local,
+        )
+        .await
+        .unwrap();
+        state.entry_term = 2;
+        state.apply(1, None).await.unwrap();
+        let error = Node::align_log(&mut storage, &state).unwrap_err();
+        assert!(error.to_string().contains("differs"), "{error}");
+        state.entry_term = 3;
+        state.applied_term = 3;
+        Node::align_log(&mut storage, &state).unwrap();
+        state.close().await.unwrap();
+    }
+
+    /// One key changes 16 times. A Watch with prev_kv catches up from the base with a short pin
+    /// and slow object reads. It receives every revision once, each with its previous value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slow_prev_kv_catch_up_makes_progress() {
+        use crate::object::faults::{FaultStore, DELAY_SST_GET};
+        use crate::proto::etcdserverpb::{
+            kv_client::KvClient, watch_client::WatchClient, watch_request, PutRequest,
+            WatchCreateRequest, WatchRequest,
+        };
+        let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::server::ServerConfig::single_node(dir.path());
+        config.state_mode = crate::state::StateMode::Shared;
+        config.object_store = crate::object::Config::Test(faults.clone(), "root".into());
+        config.view_max_age = Duration::from_millis(100);
+        config.view_pin_max = Duration::from_millis(24);
+        // A tiny cache, so history reads go to the store.
+        config.state_cache = crate::state::StateCache {
+            block_bytes: 1,
+            meta_bytes: 1,
+            row_bytes: 0,
+        };
+        let server = crate::server::Server::start(config).await.unwrap();
+        server.wait_ready(Duration::from_secs(15)).await.unwrap();
+        let channel = tonic::transport::Endpoint::from_shared(server.client_url())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut kv = KvClient::new(channel.clone());
+        let mut revisions = vec![];
+        for n in 0..16 {
+            let reply = kv
+                .put(PutRequest {
+                    key: b"key".to_vec(),
+                    value: format!("v{n}").into_bytes(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            revisions.push(reply.into_inner().header.unwrap().revision);
+        }
+        let applied = status(&server).await["applied_index"].as_u64().unwrap();
+        eventually("a base that covers the writes", async || {
+            status(&server).await["shared_state"]["base_applied_index"]
+                .as_u64()
+                .unwrap()
+                >= applied
+        })
+        .await;
+        faults.set_delay(Duration::from_millis(4));
+        faults.set(DELAY_SST_GET);
+        let (send, receive) = mpsc::channel(1);
+        send.send(WatchRequest {
+            request_union: Some(watch_request::RequestUnion::CreateRequest(
+                WatchCreateRequest {
+                    key: b"key".to_vec(),
+                    start_revision: revisions[0],
+                    prev_kv: true,
+                    ..Default::default()
+                },
+            )),
+        })
+        .await
+        .unwrap();
+        let mut stream = WatchClient::new(channel)
+            .watch(tokio_stream::wrappers::ReceiverStream::new(receive))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut events = vec![];
+        while events.len() < revisions.len() {
+            let message = tokio::time::timeout(Duration::from_secs(20), stream.message())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            events.extend(message.events);
+        }
+        let seen: Vec<_> = events
+            .iter()
+            .map(|event| event.kv.as_ref().unwrap().mod_revision)
+            .collect();
+        assert_eq!(seen, revisions);
+        for (n, event) in events.iter().enumerate().skip(1) {
+            let previous = event.prev_kv.as_ref().expect("prev_kv");
+            assert_eq!(previous.value, format!("v{}", n - 1).into_bytes());
+        }
+        faults.set(0);
+        drop(send);
+        server.shutdown().await.unwrap();
     }
 }

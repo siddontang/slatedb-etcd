@@ -7,11 +7,11 @@ use crate::proto::etcdserverpb::*;
 async fn check(state: &StateMachine) {
     assert_eq!(
         state.logical_size(),
-        maintenance::count_logical_size(state.db.as_ref())
+        maintenance::count_logical_size(state.db().as_ref())
             .await
             .unwrap()
     );
-    assert!(state.key_index.matches(&state.db).await.unwrap());
+    assert!(state.key_index.matches(state.db()).await.unwrap());
 }
 
 fn put(key: &[u8], value: &[u8], lease: i64) -> RequestOp {
@@ -267,7 +267,7 @@ async fn quota_matches_scan_across_state_changes_and_recovery() {
     check(&target).await;
     assert_eq!(target.logical_bytes, state.logical_bytes);
     target.close().await.unwrap();
-    state.db.flush().await.unwrap();
+    state.db().flush().await.unwrap();
     let expected = state.logical_bytes;
     state.close().await.unwrap();
     drop(state);
@@ -323,7 +323,7 @@ async fn warm_reads_use_the_state_cache_and_observe_new_versions() {
         .unwrap()
         .result
         .unwrap();
-    state.db.flush().await.unwrap();
+    state.db().flush().await.unwrap();
     let request = RequestOp {
         request: Some(Op::RequestRange(RangeRequest {
             key: b"cached".to_vec(),
@@ -345,7 +345,7 @@ async fn warm_reads_use_the_state_cache_and_observe_new_versions() {
         .unwrap()
         .result
         .unwrap();
-    state.db.flush().await.unwrap();
+    state.db().flush().await.unwrap();
     let Some(Resp::ResponseRange(response)) = state
         .read_etcd(&request)
         .await
@@ -406,7 +406,7 @@ async fn scans_keep_new_sst_metadata_after_blocks_fill_the_cache() {
                 .collect();
             state.apply_puts(&puts).await.unwrap();
         }
-        state.db.flush().await.unwrap();
+        state.db().flush().await.unwrap();
         if set == b'a' {
             // Count every row twice. Set a's blocks now fill the block budget.
             for _ in 0..2 {
