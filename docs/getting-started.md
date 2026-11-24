@@ -41,7 +41,7 @@ See the [compatibility matrix](../COMPATIBILITY.md) and
 ## Build
 
 ```sh
-git clone https://github.com/siddontang/slatedb-etcd.git
+git clone https://github.com/slatedb/slatedb-etcd.git
 cd slatedb-etcd
 scripts/cargo.sh build --locked --release
 ```

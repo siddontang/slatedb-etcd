@@ -10,7 +10,7 @@ The Rust API can change before a stable release.
 ```toml
 [dependencies]
 anyhow = "1"
-slatedb-etcd = { git = "https://github.com/siddontang/slatedb-etcd", rev = "<reviewed-commit>" }
+slatedb-etcd = { git = "https://github.com/slatedb/slatedb-etcd", rev = "<reviewed-commit>" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

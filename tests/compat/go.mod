@@ -1,4 +1,4 @@
-module github.com/siddontang/slatedb-etcd/compat
+module github.com/slatedb/slatedb-etcd/compat
 
 go 1.24.0
 

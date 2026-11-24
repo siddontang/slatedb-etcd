@@ -213,4 +213,4 @@ The three server processes used 395 µs per Put. Most CPU time fell outside the 
 Native stacks included memory allocation, socket writes, and thread scheduling.
 The [write cost comparison][write-cost-pr] records the paired capacity measurements.
 
-[write-cost-pr]: https://github.com/siddontang/slatedb-etcd/pull/18
+[write-cost-pr]: https://github.com/slatedb/slatedb-etcd/pull/18

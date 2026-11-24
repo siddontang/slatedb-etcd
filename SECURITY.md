@@ -7,7 +7,7 @@ maintenance schedule. Do not use it as a Kubernetes backend or assume complete e
 
 Use GitHub's private vulnerability reporting when it is enabled for this repository:
 
-[Report a vulnerability](https://github.com/siddontang/slatedb-etcd/security/advisories/new)
+[Report a vulnerability](https://github.com/slatedb/slatedb-etcd/security/advisories/new)
 
 If that option is unavailable, open an issue that only requests a private contact channel.
 Do not include credentials, private keys, customer data, or exploit details in a public issue.
