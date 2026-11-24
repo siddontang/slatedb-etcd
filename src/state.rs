@@ -280,7 +280,7 @@ fn stored_usage(
     Ok(Some(size))
 }
 
-/// Encode the replicated-mode logical size row for `size` after `applied`.
+/// Encode the logical size row for `size` after `applied`.
 fn logical_size_row(applied: u64, size: crate::batch::Usage) -> Vec<u8> {
     use prost::Message;
     crate::proto::state::LogicalSize {
@@ -418,14 +418,10 @@ impl StateMachine {
             Some(data) => serde_json::from_slice(&data)?,
             None => crate::cluster::Store::default(),
         };
-        // Shared mode stores the counters in each batch, so a base needs no full scan.
-        let logical_bytes = match (&shared, reads.get(shared::LOGICAL_BYTES).await?) {
-            (Some(_), Some(bytes)) => {
-                crate::batch::Usage::from_be_bytes(&bytes).context("invalid logical size")?
-            }
-            (Some(_), None) => maintenance::count_logical_usage(&reads).await?,
-            (None, _) => load_logical_size(&reads, applied).await?,
-        };
+        // Both modes store the counter row with the apply marker, so a base needs no full scan.
+        // A shared base from an older binary has only the total in `shared::LOGICAL_BYTES`, and
+        // its apply marker is past any counter row, so the open counts the split again.
+        let logical_bytes = load_logical_size(&reads, applied).await?;
         Ok(Self {
             members: Arc::new(members),
             admin,
@@ -551,12 +547,12 @@ impl StateMachine {
                 self.rows.invalidate(key, index);
             }
         }
-        // The counters are outside `etcd/`, so they do not count themselves.
+        // The counters are outside `etcd/`, so they do not count themselves. Shared mode also
+        // keeps the eight-byte total, which older readers of the shared base load.
         if self.is_shared() {
-            batch.put(shared::LOGICAL_BYTES, size.to_be_bytes());
-        } else {
-            batch.put(LOGICAL_SIZE, logical_size_row(index, size));
+            batch.put(shared::LOGICAL_BYTES, size.total().to_be_bytes());
         }
+        batch.put(LOGICAL_SIZE, logical_size_row(index, size));
         let batch = Arc::new(batch);
         match &mut self.shared {
             None => {

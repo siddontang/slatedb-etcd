@@ -221,31 +221,6 @@ impl Usage {
         }
     }
 
-    /// Encode the counters for the shared-mode logical size row.
-    pub(crate) fn to_be_bytes(self) -> [u8; 32] {
-        let mut bytes = [0; 32];
-        for (chunk, value) in
-            bytes
-                .chunks_exact_mut(8)
-                .zip([self.current, self.history, self.journal, self.other])
-        {
-            chunk.copy_from_slice(&value.to_be_bytes());
-        }
-        bytes
-    }
-
-    /// Decode a shared-mode logical size row. Other lengths return `None`.
-    pub(crate) fn from_be_bytes(bytes: &[u8]) -> Option<Self> {
-        let bytes: &[u8; 32] = bytes.try_into().ok()?;
-        let value = |n: usize| u64::from_be_bytes(bytes[n * 8..n * 8 + 8].try_into().unwrap());
-        Some(Self {
-            current: value(0),
-            history: value(1),
-            journal: value(2),
-            other: value(3),
-        })
-    }
-
     /// Count one stored row. Callers pass only `etcd/` keys.
     pub(crate) fn add_row(&mut self, key: &[u8], len: usize) -> Result<()> {
         self.replace_row(key, None, Some(len))

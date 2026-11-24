@@ -343,8 +343,10 @@ differ in whether the Raft log changes.
 1. Build the derived state from `reader(C)`. This is a reader variant of
    `StateMachine::open_at` (`state.rs:253-269`). It makes a new `RowCache`, invalidates the Watch
    capture, and clears the compaction plan.
-2. Load the quota counters from `meta/logical-bytes`. Shared mode writes this row in each batch,
-   so install does not scan every `etcd/` row (`state/maintenance.rs:448`).
+2. Load the quota counters from `meta/logical-size`, which each batch writes with the apply
+   marker, so install does not scan every `etcd/` row. The batch also writes the eight-byte total
+   to `meta/logical-bytes` for older readers. A base from an older binary has no counter row that
+   matches its apply marker, so install counts the rows once (`state/maintenance.rs`).
 
 **Local rebuild, `F(C) <= applied`.** Rebase and restart use this form. The Raft log does not
 change.
