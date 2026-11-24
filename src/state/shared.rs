@@ -202,8 +202,53 @@ pub(crate) struct Source {
     /// `<prefix>/<sha256(cluster)>`, or empty for a store that holds one cluster.
     root: String,
     pub cache: Arc<dyn slatedb::db_cache::DbCache>,
-    /// The bases that this member opened. A base with a live reference pins its checkpoint.
-    pins: Mutex<Vec<(uuid::Uuid, Weak<Base>)>>,
+    /// Opens and deletions of checkpoints. One lock orders them. See `Pins`.
+    pins: Mutex<Pins>,
+}
+
+/// The checkpoints that this member uses, and the ones that retention deletes.
+///
+/// An open reserves its checkpoint before any storage I/O, and retention marks its candidates
+/// before it deletes them. Both steps take the same lock. So an open in flight protects its
+/// checkpoint, and an open that starts after the selection fails instead of publishing a base
+/// whose checkpoint is going away.
+#[derive(Default)]
+struct Pins {
+    /// Bases that opened. A base with a live reference pins its checkpoint.
+    bases: Vec<(uuid::Uuid, Weak<Base>)>,
+    /// Opens in flight, by checkpoint.
+    opening: std::collections::HashMap<uuid::Uuid, usize>,
+    /// Checkpoints that retention selected and deletes.
+    retiring: HashSet<uuid::Uuid>,
+}
+
+impl Pins {
+    fn pinned(&mut self) -> HashSet<uuid::Uuid> {
+        self.bases.retain(|(_, base)| base.strong_count() > 0);
+        self.bases
+            .iter()
+            .map(|(id, _)| *id)
+            .chain(self.opening.keys().copied())
+            .collect()
+    }
+}
+
+/// An open in flight. Dropping it ends the reservation.
+pub(crate) struct Opening<'a> {
+    source: &'a Source,
+    id: uuid::Uuid,
+}
+
+impl Drop for Opening<'_> {
+    fn drop(&mut self) {
+        let mut pins = self.source.pins.lock().unwrap();
+        if let Some(count) = pins.opening.get_mut(&self.id) {
+            *count -= 1;
+            if *count == 0 {
+                pins.opening.remove(&self.id);
+            }
+        }
+    }
 }
 
 impl Source {
@@ -212,20 +257,52 @@ impl Source {
         join(&self.root, STATE)
     }
 
+    /// Reserve checkpoint `id` for an open. Fail when retention is deleting it.
+    pub(crate) fn reserve_open(&self, id: uuid::Uuid) -> Result<Opening<'_>> {
+        let mut pins = self.pins.lock().unwrap();
+        ensure!(
+            !pins.retiring.contains(&id),
+            "view checkpoint {id} is being deleted"
+        );
+        *pins.opening.entry(id).or_default() += 1;
+        Ok(Opening { source: self, id })
+    }
+
     pub async fn open_base(&self, id: uuid::Uuid) -> Result<Arc<Base>> {
+        let opening = self.reserve_open(id)?;
         let base = Base::open(self.store.clone(), &self.state(), id, self.cache.clone()).await?;
         let base = Arc::new(base);
-        let mut pins = self.pins.lock().unwrap();
-        pins.retain(|(_, base)| base.strong_count() > 0);
-        pins.push((id, Arc::downgrade(&base)));
+        // The reservation ends only after the base is pinned.
+        self.pins
+            .lock()
+            .unwrap()
+            .bases
+            .push((id, Arc::downgrade(&base)));
+        drop(opening);
         Ok(base)
     }
 
-    /// The checkpoints that a live base of this member uses: a view, the apply state, or a task.
+    /// The checkpoints that this member uses: live bases and opens in flight.
+    #[cfg(test)]
     pub fn pinned(&self) -> HashSet<uuid::Uuid> {
+        self.pins.lock().unwrap().pinned()
+    }
+
+    /// Select the checkpoints to delete and mark them, under the lock that opens take. A later
+    /// open of a marked checkpoint fails. Call `end_retire` after the deletions.
+    pub(crate) fn begin_retire(&self, views: &[(u64, uuid::Uuid)], keep: usize) -> Vec<uuid::Uuid> {
         let mut pins = self.pins.lock().unwrap();
-        pins.retain(|(_, base)| base.strong_count() > 0);
-        pins.iter().map(|(id, _)| *id).collect()
+        let pinned = pins.pinned();
+        let candidates = retired(views, &pinned, keep);
+        pins.retiring.extend(candidates.iter().copied());
+        candidates
+    }
+
+    pub(crate) fn end_retire(&self, ids: &[uuid::Uuid]) {
+        let mut pins = self.pins.lock().unwrap();
+        for id in ids {
+            pins.retiring.remove(id);
+        }
     }
 
     /// Return true after the first checkpoint was published.
@@ -321,10 +398,16 @@ pub(crate) async fn retain(
         .into_iter()
         .map(|(seq, checkpoint)| (seq, checkpoint.id))
         .collect();
-    for id in retired(&views, &source.pinned(), keep) {
-        admin.delete_checkpoint(id).await?;
+    let candidates = source.begin_retire(&views, keep);
+    let mut result = Ok(());
+    for id in &candidates {
+        if let Err(error) = admin.delete_checkpoint(*id).await {
+            result = Err(error.into());
+            break;
+        }
     }
-    Ok(())
+    source.end_retire(&candidates);
+    result
 }
 
 /// Open the newest `view-` checkpoint that holds the membership. The publisher deletes a

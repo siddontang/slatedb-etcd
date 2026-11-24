@@ -589,3 +589,68 @@ async fn readers_drop_a_logical_size_row() {
     restored.close().await.unwrap();
     source.close().await.unwrap();
 }
+
+/// Five checkpoints with no live base, and their `(seq, id)` list.
+async fn five_checkpoints(state: &mut StateMachine) -> Vec<(u64, uuid::Uuid)> {
+    let mut written = 0;
+    for n in 0..5 {
+        state
+            .apply_etcd(state.applied + 1, &put(&format!("k{n}"), "v"))
+            .await
+            .unwrap();
+        drop(checkpoint(state, &mut written).await);
+    }
+    shared::view_checkpoints(&state.admin)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(seq, checkpoint)| (seq, checkpoint.id))
+        .collect()
+}
+
+/// An open that starts after retention selected its checkpoint fails. The member never holds a
+/// live base whose checkpoint retention deletes.
+#[tokio::test]
+async fn an_open_after_the_retention_choice_fails() {
+    let mut state = open_shared(Arc::new(InMemory::new())).await;
+    let views = five_checkpoints(&mut state).await;
+    let source = state.shared.as_ref().unwrap().source.clone();
+    let oldest = views[0].1;
+    let candidates = source.begin_retire(&views, 2);
+    assert_eq!(candidates, [views[0].1, views[1].1, views[2].1]);
+    // The open runs between the choice and the deletion.
+    let error = source.open_base(oldest).await.err().unwrap();
+    assert!(error.to_string().contains("being deleted"), "{error}");
+    assert!(!source.pinned().contains(&oldest));
+    for id in &candidates {
+        state.admin.delete_checkpoint(*id).await.unwrap();
+    }
+    source.end_retire(&candidates);
+    assert_eq!(
+        shared::view_checkpoints(&state.admin).await.unwrap().len(),
+        2
+    );
+    state.close().await.unwrap();
+}
+
+/// An open in flight before retention collects the pins keeps its checkpoint.
+#[tokio::test]
+async fn an_open_in_flight_keeps_its_checkpoint() {
+    let mut state = open_shared(Arc::new(InMemory::new())).await;
+    let views = five_checkpoints(&mut state).await;
+    let source = state.shared.as_ref().unwrap().source.clone();
+    // The open reserved its checkpoint and waits for storage.
+    let opening = source.reserve_open(views[0].1).unwrap();
+    shared::retain(&state.admin, &source, 2).await.unwrap();
+    assert_eq!(
+        shared::view_checkpoints(&state.admin).await.unwrap().len(),
+        5
+    );
+    drop(opening);
+    shared::retain(&state.admin, &source, 2).await.unwrap();
+    assert_eq!(
+        shared::view_checkpoints(&state.admin).await.unwrap().len(),
+        2
+    );
+    state.close().await.unwrap();
+}
