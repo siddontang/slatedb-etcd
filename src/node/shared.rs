@@ -27,8 +27,6 @@ pub(super) struct Progress {
     /// The sequence of the newest batch in the shared `Db`.
     written: tokio::sync::watch::Sender<u64>,
     wake: tokio::sync::Notify,
-    /// The newest checkpoint that the publisher created. Defragment waits for one.
-    published: tokio::sync::watch::Sender<Option<uuid::Uuid>>,
 }
 
 #[derive(Default)]
@@ -47,7 +45,6 @@ impl Progress {
             inner: Mutex::default(),
             written: tokio::sync::watch::channel(written).0,
             wake: tokio::sync::Notify::new(),
-            published: tokio::sync::watch::channel(None).0,
         }
     }
 
@@ -717,19 +714,32 @@ pub(super) struct Defragment {
     announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
     leadership: tokio::sync::watch::Receiver<(bool, u64)>,
     term: u64,
-    /// A test pause after the compaction: (reached, resume).
-    pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    /// A test pause before a step: (step, reached, resume).
+    pause: Option<(
+        DefragmentStep,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+    )>,
+}
+
+/// The steps of a Defragment where a test can pause it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum DefragmentStep {
+    Flush,
+    Compact,
+    Publish,
 }
 
 /// The longest time that a Defragment waits for its compacted checkpoint.
 const DEFRAGMENT_WAIT: Duration = Duration::from_secs(20);
 
 impl Defragment {
-    /// Flush, compact every SST into one sorted run, and wait until a checkpoint with that
-    /// layout is published and this member applied its announcement. Members then adopt it.
+    /// Flush, compact every SST into one sorted run, and wait until this member applied the
+    /// announcement of a checkpoint whose layout holds none of the compacted input SSTs. An
+    /// older checkpoint that applies late does not count. Members then adopt the compacted one.
     ///
-    /// A leader change before that returns a retryable error. The new leader can then run the
-    /// Defragment again: its compaction is short, and it publishes the compacted checkpoint.
+    /// A leader change before that returns a retryable error, also when it closes the writer
+    /// during the flush or the compaction. The new leader can then run the Defragment again.
     pub(super) async fn run(mut self) -> std::result::Result<(), KvError> {
         let lost = || {
             KvError::new(
@@ -737,26 +747,32 @@ impl Defragment {
                 "etcdserver: the leader changed during Defragment; retry",
             )
         };
-        self.db
-            .flush()
-            .await
-            .map_err(|error| KvError::storage(anyhow::Error::from(error)))?;
-        crate::state::maintenance::compact_all(&self.admin)
-            .await
-            .map_err(KvError::storage)?;
-        if let Some((reached, resume)) = self.pause.take() {
-            reached.notify_one();
-            resume.notified().await;
-        }
         let term = self.term;
         let leads = |leadership: &tokio::sync::watch::Receiver<(bool, u64)>| {
             *leadership.borrow() == (true, term)
         };
+        // A step down closes the writer, so a storage error then means a lost lead.
+        let failed = |leadership: &tokio::sync::watch::Receiver<(bool, u64)>,
+                      error: anyhow::Error| {
+            if leads(leadership) {
+                KvError::storage(error)
+            } else {
+                lost()
+            }
+        };
+        self.pause_at(DefragmentStep::Flush).await;
+        if let Err(error) = self.db.flush().await {
+            return Err(failed(&self.leadership, error.into()));
+        }
+        self.pause_at(DefragmentStep::Compact).await;
+        let inputs = match crate::state::maintenance::compact_all(&self.admin).await {
+            Ok(inputs) => inputs,
+            Err(error) => return Err(failed(&self.leadership, error)),
+        };
+        self.pause_at(DefragmentStep::Publish).await;
         if !leads(&self.leadership) {
             return Err(lost());
         }
-        let mut published = self.progress.published.subscribe();
-        published.mark_unchanged();
         // The next checkpoint, also at the same index, reads the compacted layout.
         self.progress.republish();
         let deadline = tokio::time::Instant::now() + DEFRAGMENT_WAIT;
@@ -766,25 +782,14 @@ impl Defragment {
                 "etcdserver: Defragment did not publish its checkpoint in time; retry",
             )
         };
-        let checkpoint = loop {
-            tokio::select! {
-                changed = published.changed() => {
-                    changed.map_err(|_| lost())?;
-                    if let Some(id) = *published.borrow_and_update() {
-                        break id;
-                    }
-                }
-                changed = self.leadership.changed() => {
-                    if changed.is_err() || !leads(&self.leadership) {
-                        return Err(lost());
-                    }
-                }
-                _ = tokio::time::sleep_until(deadline) => return Err(timeout()),
-            }
-        };
         loop {
-            if *self.announced.borrow_and_update() == Some(checkpoint) {
-                return Ok(());
+            let applied = *self.announced.borrow_and_update();
+            if let Some(checkpoint) = applied {
+                match compacted(&self.admin, checkpoint, &inputs).await {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(error) => return Err(failed(&self.leadership, error)),
+                }
             }
             tokio::select! {
                 changed = self.announced.changed() => changed.map_err(|_| lost())?,
@@ -797,6 +802,38 @@ impl Defragment {
             }
         }
     }
+
+    async fn pause_at(&mut self, step: DefragmentStep) {
+        if self.pause.as_ref().is_some_and(|(at, ..)| *at == step) {
+            let (_, reached, resume) = self.pause.take().unwrap();
+            reached.notify_one();
+            resume.notified().await;
+        }
+    }
+}
+
+/// Return true when the layout of `checkpoint` holds none of the SST views in `inputs`.
+async fn compacted(
+    admin: &slatedb::admin::Admin,
+    checkpoint: uuid::Uuid,
+    inputs: &HashSet<String>,
+) -> Result<bool> {
+    let Some(listed) = admin
+        .list_checkpoints(None)
+        .await?
+        .into_iter()
+        .find(|listed| listed.id == checkpoint)
+    else {
+        return Ok(false);
+    };
+    let manifest = admin
+        .read_manifest(Some(listed.manifest_id))
+        .await?
+        .context("missing checkpoint manifest")?;
+    let kept = manifest
+        .all_sst_views()
+        .any(|view| inputs.contains(&view.id.to_string()));
+    Ok(!kept)
 }
 
 /// The applied state that a publisher checks before it announces a checkpoint again.
@@ -1027,7 +1064,6 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
             return Ok(());
         };
         retry.sent(checkpoint.id, accepted);
-        progress.published.send_replace(Some(checkpoint.id));
         let views = view_checkpoints(&admin).await?.len();
         if let Some(gauge) = &retained {
             gauge.set(views as i64);
@@ -2882,7 +2918,7 @@ mod tests {
             announced: handles.announced.clone(),
             leadership: writer.leadership.subscribe(),
             term: 3,
-            pause: Some((reached.clone(), resume.clone())),
+            pause: Some((DefragmentStep::Publish, reached.clone(), resume.clone())),
         };
         let running = tokio::spawn(defragment.run());
         reached.notified().await;
@@ -2932,6 +2968,151 @@ mod tests {
         writer.sync(false, 4, &events);
         writer.stop().await;
         state.close().await.unwrap();
+    }
+
+    /// A leader writer at term 3 with five more writes after the adopted first checkpoint.
+    async fn defragment_setup() -> (
+        StateMachine,
+        Handles,
+        mpsc::Sender<Event>,
+        Announcements,
+        Writer,
+    ) {
+        let (mut state, handles, events, mut announcements, first) = stranded_checkpoint().await;
+        adopt_announced(&mut state, first).await;
+        let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+        writer.sync(true, 3, &events);
+        writer.progress.wait_written(1).await.unwrap();
+        for n in 0..5 {
+            let put = crate::proto::etcdserverpb::RequestOp {
+                request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
+                    crate::proto::etcdserverpb::PutRequest {
+                        key: format!("key-{n}").into_bytes(),
+                        value: b"value".to_vec(),
+                        ..Default::default()
+                    },
+                )),
+            };
+            let index = state.applied + 1;
+            state.apply_etcd(index, &put).await.unwrap();
+        }
+        let _ = &mut announcements;
+        (state, handles, events, announcements, writer)
+    }
+
+    fn defragment(
+        handles: &Handles,
+        writer: &Writer,
+        term: u64,
+        pause: Option<(
+            DefragmentStep,
+            Arc<tokio::sync::Notify>,
+            Arc<tokio::sync::Notify>,
+        )>,
+    ) -> Defragment {
+        Defragment {
+            db: writer.open.lock().unwrap().clone().unwrap(),
+            admin: handles.admin.clone(),
+            progress: writer.progress.clone(),
+            announced: handles.announced.clone(),
+            leadership: writer.leadership.subscribe(),
+            term,
+            pause,
+        }
+    }
+
+    /// The announcement of a checkpoint from before the Defragment waits in Raft. It applies
+    /// after the compaction. Defragment does not count it, because its layout still holds the
+    /// input SSTs. It returns only after the compacted checkpoint applies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_defragment_ignores_an_older_checkpoint_that_applies_late() {
+        let (mut state, handles, events, mut announcements, mut writer) = defragment_setup().await;
+        // Hold the announcement of the aged flush: no reply, no apply.
+        let (old, reply) = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(Event::ViewCheckpoint(id, reply)) = announcements.0.recv().await {
+                    return (id, reply.unwrap());
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let running = tokio::spawn(
+            defragment(
+                &handles,
+                &writer,
+                3,
+                Some((DefragmentStep::Publish, reached.clone(), resume.clone())),
+            )
+            .run(),
+        );
+        reached.notified().await;
+        resume.notify_one();
+        let _ = reply.send(true);
+        adopt_announced(&mut state, old).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !running.is_finished(),
+            "Defragment counted the older checkpoint"
+        );
+        let compacted = announcements.next(Duration::from_secs(10), true).await;
+        assert_ne!(compacted, old);
+        adopt_announced(&mut state, compacted).await;
+        running.await.unwrap().unwrap();
+        let checkpoint = handles
+            .admin
+            .list_checkpoints(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|checkpoint| checkpoint.id == compacted)
+            .unwrap();
+        let manifest = handles
+            .admin
+            .read_manifest(Some(checkpoint.manifest_id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(manifest.l0().is_empty());
+        assert_eq!(manifest.compacted().len(), 1);
+        writer.sync(false, 3, &events);
+        writer.stop().await;
+        state.close().await.unwrap();
+    }
+
+    /// A step down during the flush or the compaction closes the writer. The storage error
+    /// then becomes the retryable Unavailable error, not an internal error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_step_down_during_defragment_storage_work_is_retryable() {
+        for step in [DefragmentStep::Flush, DefragmentStep::Compact] {
+            let (state, handles, events, mut announcements, mut writer) = defragment_setup().await;
+            // The aged flush leaves an L0 SST for the compaction.
+            announcements.next(Duration::from_secs(10), true).await;
+            let reached = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            let running = tokio::spawn(
+                defragment(
+                    &handles,
+                    &writer,
+                    3,
+                    Some((step, reached.clone(), resume.clone())),
+                )
+                .run(),
+            );
+            reached.notified().await;
+            writer.sync(false, 3, &events);
+            writer.stop().await;
+            resume.notify_one();
+            let error = running.await.unwrap().unwrap_err();
+            assert_eq!(
+                error.code,
+                tonic::Code::Unavailable as i32,
+                "{step:?}: {error:?}"
+            );
+            state.close().await.unwrap();
+        }
     }
 
     /// An adopt across membership changes leaves Raft with the checkpoint's ConfState, also

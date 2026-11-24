@@ -163,7 +163,7 @@ impl StateMachine {
         let _active = crate::metrics::Active::new(&self.metrics.defrag_active);
         self.metrics.flush_db(self.db()).await?;
         self.durable_applied = self.applied;
-        compact_all(&self.admin).await
+        compact_all(&self.admin).await.map(drop)
     }
 
     pub(super) async fn hash_kv(&self, revision: i64) -> std::result::Result<Value, KvError> {
@@ -428,8 +428,12 @@ pub(crate) async fn count_logical_size(db: &impl StateRead) -> Result<u64> {
 
 /// Compact every L0 SST and sorted run into one sorted run, and wait up to 8 s for the end.
 /// The compactor of the database writer runs the job. Defragment uses this in both state modes.
-pub(crate) async fn compact_all(admin: &slatedb::admin::Admin) -> Result<()> {
+/// Return the IDs of the input SST views. A layout without them is compacted.
+pub(crate) async fn compact_all(
+    admin: &slatedb::admin::Admin,
+) -> Result<std::collections::HashSet<String>> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut inputs = std::collections::HashSet::new();
     loop {
         let manifest = admin
             .read_manifest(None)
@@ -447,12 +451,13 @@ pub(crate) async fn compact_all(admin: &slatedb::admin::Admin) -> Result<()> {
                 .map(|r| SourceId::SortedRun(r.id)),
         );
         if sources.is_empty() {
-            return Ok(());
+            return Ok(inputs);
         }
         let destination = manifest.compacted().iter().map(|r| r.id).min().unwrap_or(0);
         // SlateDB can reuse the destination run ID, so the input SST views identify the input.
         let input: std::collections::HashSet<_> =
             manifest.all_sst_views().map(|view| view.id).collect();
+        inputs.extend(input.iter().map(|id| id.to_string()));
         let job = admin
             .submit_compaction(CompactionSpec::new(sources, destination))
             .await?;
@@ -476,7 +481,7 @@ pub(crate) async fn compact_all(admin: &slatedb::admin::Admin) -> Result<()> {
                                 .all_sst_views()
                                 .any(|view| input.contains(&view.id))
                         {
-                            return Ok(());
+                            return Ok(inputs);
                         }
                         ensure!(
                             tokio::time::Instant::now() < deadline,
