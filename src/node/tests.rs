@@ -10,6 +10,7 @@ fn options(dir: &std::path::Path) -> NodeOptions {
         view_max_age: std::time::Duration::from_secs(10),
         view_pin_max: std::time::Duration::from_secs(300),
         overlay_max_bytes: 1 << 30,
+        max_clock_skew: std::time::Duration::from_secs(5),
         object_store: crate::object::Config::Local,
         strict_reconfiguration: false,
         join: false,

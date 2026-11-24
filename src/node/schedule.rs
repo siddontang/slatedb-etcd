@@ -148,6 +148,9 @@ impl Node {
         if self.prepared_puts.is_none() && self.take_switch() {
             return self.submit_apply(Job::SwitchBase, self.state.applied);
         }
+        if let Some((index, term)) = self.adoptable() {
+            return self.submit_apply(Job::AdoptBase { term }, index);
+        }
         // Raft delivers committed entries only after local persistence. The commit marker in the
         // log is volatile, so apply need not wait for the log thread to write it.
         let committed = self.committed_ready;

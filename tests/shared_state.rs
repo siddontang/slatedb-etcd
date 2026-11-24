@@ -442,9 +442,7 @@ async fn local_hash(server: &Server, revision: i64) -> Option<u32> {
 /// same results and hashes. In shared mode the learner joins from a format 6 snapshot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn three_voters_and_a_learner_share_one_state() {
-    use slatedb_etcd::proto::etcdserverpb::{
-        cluster_client::ClusterClient, MemberAddRequest, MoveLeaderRequest,
-    };
+    use slatedb_etcd::proto::etcdserverpb::{cluster_client::ClusterClient, MemberAddRequest};
     let mut outputs = vec![];
     let mut hashes = vec![];
     for mode in [StateMode::Replicated, StateMode::Shared] {
@@ -519,13 +517,6 @@ async fn three_voters_and_a_learner_share_one_state() {
             })
             .await;
             assert!(status(lead).await["snapshot_index"].as_u64().unwrap() > 0);
-            // Phase 2 keeps the bootstrap leader.
-            let current = leader(lead).await;
-            let target = (1..=3).find(|id| *id != current).unwrap();
-            let moved = MaintenanceClient::new(channel(lead).await)
-                .move_leader(MoveLeaderRequest { target_id: target })
-                .await;
-            assert!(moved.is_err());
         }
         hashes.push(values[0]);
         learner.shutdown().await.unwrap();
@@ -726,4 +717,141 @@ async fn slow_watchers_get_every_revision_once() {
     }
     drop(senders);
     server.shutdown().await.unwrap();
+}
+
+/// Start three shared voters that flush only on request, so their overlays keep every write.
+async fn quiet_cluster(dir: &std::path::Path) -> (Vec<ServerConfig>, Vec<Option<Server>>) {
+    let peers = addresses(3).await;
+    let configs: Vec<_> = (1..=3)
+        .map(|id| {
+            let mut config = member_config(dir, StateMode::Shared, id, &peers);
+            config.view_max_age = Duration::from_secs(60);
+            config.overlay_max_bytes = 8 << 20;
+            config
+        })
+        .collect();
+    let mut servers = vec![];
+    for config in &configs {
+        servers.push(Some(Server::start(config.clone()).await.unwrap()));
+    }
+    for server in servers.iter().flatten() {
+        server.wait_ready(Duration::from_secs(15)).await.unwrap();
+    }
+    (configs, servers)
+}
+
+/// Every live member reaches the same hash at the leader's revision.
+async fn converge(servers: &[Option<Server>]) {
+    let live: Vec<_> = servers.iter().flatten().collect();
+    let mut revision = 0;
+    for server in &live {
+        if let Ok(reply) = KvClient::new(channel(server).await).range(all()).await {
+            revision = reply.into_inner().header.unwrap().revision;
+            break;
+        }
+    }
+    let mut hashes = vec![];
+    for server in live {
+        let mut hash = None;
+        eventually("a member hash", async || {
+            hash = local_hash(server, revision).await;
+            hash.is_some()
+        })
+        .await;
+        hashes.push(hash.unwrap());
+    }
+    assert!(hashes.iter().all(|hash| *hash == hashes[0]), "{hashes:?}");
+}
+
+/// A leader transfer first publishes a checkpoint of the applied state. The new leader opens the
+/// writer, fences the old one, and serves writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn move_leader_publishes_first_and_the_new_leader_writes() {
+    use slatedb_etcd::proto::etcdserverpb::MoveLeaderRequest;
+    let dir = tempfile::tempdir().unwrap();
+    let (_, servers) = quiet_cluster(dir.path()).await;
+    let lead = leader(servers[0].as_ref().unwrap()).await;
+    let old = servers[lead as usize - 1].as_ref().unwrap();
+    let mut kv = KvClient::new(channel(old).await);
+    for n in 0..20 {
+        kv.put(put(&format!("k{n}"), "before")).await.unwrap();
+    }
+    let applied = status(old).await["applied_index"].as_u64().unwrap();
+    let target = (1..=3).find(|id| *id != lead).unwrap();
+    MaintenanceClient::new(channel(old).await)
+        .move_leader(MoveLeaderRequest { target_id: target })
+        .await
+        .unwrap();
+    // The old leader published a checkpoint that covers its applied writes before the transfer.
+    let base = status(old).await["shared_state"]["base_applied_index"]
+        .as_u64()
+        .unwrap();
+    assert!(base >= applied - 1, "base {base} applied {applied}");
+    let new = servers[target as usize - 1].as_ref().unwrap();
+    assert_eq!(leader(new).await, target);
+    let mut kv = KvClient::new(channel(new).await);
+    eventually("a write on the new leader", async || {
+        kv.put(put("after", "moved")).await.is_ok()
+    })
+    .await;
+    // The new leader opened the writer, which fenced the old one, and materialized the write.
+    eventually("the new writer", async || {
+        status(new).await["shared_state"]["writer"]["written"]
+            .as_u64()
+            .unwrap()
+            > applied
+    })
+    .await;
+    converge(&servers).await;
+    for server in servers.into_iter().flatten() {
+        server.shutdown().await.unwrap();
+    }
+}
+
+/// The leader stops with a nearly full overlay and no checkpoint of its writes. A new leader
+/// opens the writer, materializes its own overlay, and serves the first write. The test prints
+/// the time from the stop to that write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn failover_with_a_full_overlay_serves_the_next_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (configs, mut servers) = quiet_cluster(dir.path()).await;
+    let lead = leader(servers[0].as_ref().unwrap()).await as usize - 1;
+    let mut kv = KvClient::new(channel(servers[lead].as_ref().unwrap()).await);
+    // Each value is in a current row and a history row: about 6 MiB against an 8 MiB limit.
+    for n in 0..24 {
+        kv.put(put(&format!("big{n}"), &"x".repeat(128 * 1024)))
+            .await
+            .unwrap();
+    }
+    let follower = servers[(lead + 1) % 3].as_ref().unwrap();
+    eventually("the follower overlay", async || {
+        status(follower).await["shared_state"]["overlay_bytes"]
+            .as_u64()
+            .unwrap()
+            > 5 << 20
+    })
+    .await;
+    let stopped = std::time::Instant::now();
+    servers[lead].take().unwrap().shutdown().await.unwrap();
+    let mut elapsed = None;
+    for _ in 0..600 {
+        for server in servers.iter().flatten() {
+            let mut kv = KvClient::new(channel(server).await);
+            if kv.put(put("first", "after failover")).await.is_ok() {
+                elapsed = Some(stopped.elapsed());
+            }
+        }
+        if elapsed.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let elapsed = elapsed.expect("no write after the failover");
+    eprintln!("failover to the first write with a full overlay: {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
+    servers[lead] = Some(Server::start(configs[lead].clone()).await.unwrap());
+    converge(&servers).await;
+    for server in servers.into_iter().flatten() {
+        server.shutdown().await.unwrap();
+    }
 }

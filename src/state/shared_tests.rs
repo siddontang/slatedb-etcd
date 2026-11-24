@@ -836,3 +836,86 @@ async fn the_deadline_bounds_a_slow_base_read() {
     faults.set(0);
     state.close().await.unwrap();
 }
+
+async fn announce(state: &mut StateMachine, base: &view::Base) {
+    let id = base.checkpoint.unwrap().to_string();
+    let index = state.applied + 1;
+    state.apply_view_checkpoint(index, &id).await.unwrap();
+}
+
+/// A deposed leader's `ViewCheckpoint` commits after a newer one. The base does not go back.
+#[tokio::test]
+async fn a_late_older_announcement_keeps_the_base() {
+    let mut state = open_shared(Arc::new(InMemory::new())).await;
+    let writer = writer(&state).await;
+    let mut written = 0;
+    state.apply_etcd(1, &put("a", "1")).await.unwrap();
+    let older = checkpoint(&state, &writer, &mut written).await;
+    state.apply_etcd(2, &put("b", "2")).await.unwrap();
+    let newer = checkpoint(&state, &writer, &mut written).await;
+    let opened = state.shared_handles().unwrap().opened;
+    announce(&mut state, &newer).await;
+    for _ in 0..100 {
+        state.switch_base();
+        if state.shared.as_ref().unwrap().base.applied == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(state.shared.as_ref().unwrap().base.applied, 2);
+    announce(&mut state, &older).await;
+    for _ in 0..100 {
+        if opened.newest() == Some(1) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(opened.newest(), Some(1));
+    state.switch_base();
+    assert_eq!(state.shared.as_ref().unwrap().base.applied, 2);
+    state.close().await.unwrap();
+}
+
+/// A member behind a checkpoint adopts it in process when its log commits the checkpoint index.
+#[tokio::test]
+async fn a_member_behind_a_checkpoint_adopts_it() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut ahead = open_shared(store.clone()).await;
+    let mut behind = open_shared(store).await;
+    for state in [&mut ahead, &mut behind] {
+        state.entry_term = 4;
+    }
+    for n in 1..=6 {
+        ahead
+            .apply_etcd(n, &put(&format!("k{n}"), "v"))
+            .await
+            .unwrap();
+    }
+    for n in 1..=2 {
+        behind
+            .apply_etcd(n, &put(&format!("k{n}"), "v"))
+            .await
+            .unwrap();
+    }
+    let writer = writer(&ahead).await;
+    let mut written = 0;
+    let base = checkpoint(&ahead, &writer, &mut written).await;
+    let opened = behind.shared_handles().unwrap().opened;
+    opened.offer(base);
+    // A switch cannot use a base above the applied index.
+    behind.switch_base();
+    assert_eq!(behind.applied, 2);
+    behind.adopt_opened(4).await.unwrap();
+    assert_eq!(behind.applied, 6);
+    assert_eq!(behind.revision, ahead.revision);
+    assert_eq!(rows(&behind, b"etcd/").await, rows(&ahead, b"etcd/").await);
+    // A base with another term at its index fails.
+    let mut wrong = open_shared(Arc::new(InMemory::new())).await;
+    wrong.apply_etcd(1, &put("x", "y")).await.unwrap();
+    let base = checkpoint(&ahead, &writer, &mut written).await;
+    wrong.shared_handles().unwrap().opened.offer(base);
+    assert!(wrong.adopt_opened(5).await.is_err());
+    for state in [ahead, behind, wrong] {
+        state.close().await.unwrap();
+    }
+}

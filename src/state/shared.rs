@@ -516,8 +516,23 @@ async fn newest_base(admin: &slatedb::admin::Admin, source: &Source) -> Result<O
 
 /// Return true when `error` comes from an object that the store no longer has, such as an SST
 /// that GC deleted under an old base. Other storage errors still stop the member.
+///
+/// A SlateDB error keeps its kind and its object store source, so the check uses them. Apply
+/// reports some storage errors as text through `KvError`, so the check also matches that text.
 pub(crate) fn missing_object(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
+        if let Some(error) = cause.downcast_ref::<slatedb::Error>() {
+            let mut source = std::error::Error::source(error);
+            while let Some(inner) = source {
+                if matches!(
+                    inner.downcast_ref::<slatedb::object_store::Error>(),
+                    Some(slatedb::object_store::Error::NotFound { .. })
+                ) {
+                    return error.kind() == slatedb::ErrorKind::Data;
+                }
+                source = inner.source();
+            }
+        }
         let text = cause.to_string();
         text.contains("Data error") && text.contains("not found")
     })
@@ -567,6 +582,15 @@ impl Opened {
 
     pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
         self.ready.subscribe()
+    }
+
+    /// The `F` of the opened base that waits in the slot.
+    pub(crate) fn newest(&self) -> Option<u64> {
+        self.slot.lock().unwrap().as_ref().map(|base| base.applied)
+    }
+
+    fn take(&self) -> Option<Arc<Base>> {
+        self.slot.lock().unwrap().take()
     }
 }
 
@@ -867,6 +891,18 @@ impl StateMachine {
             "rebase on a new checkpoint"
         );
         self.adopt_base(base, 0).await
+    }
+
+    /// Adopt the opened base above the applied index. A paused member uses this when its log
+    /// commits the base index, so the Raft log needs no change. `term` is the log term there.
+    pub(crate) async fn adopt_opened(&mut self, term: u64) -> Result<()> {
+        let shared = self
+            .shared
+            .as_ref()
+            .context("adopt needs shared state mode")?;
+        let base = shared.opened.take().context("no opened base")?;
+        ensure!(base.applied > self.applied, "the opened base is not ahead");
+        self.adopt_base(base, term).await
     }
 
     /// Install a format 6 snapshot: the checkpoint that Raft sent. The receive handler opened it.

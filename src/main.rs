@@ -154,6 +154,10 @@ struct Args {
     /// above twice this size.
     #[arg(long, default_value_t = slatedb_etcd::server::DEFAULT_OVERLAY_MAX_BYTES)]
     overlay_max_bytes: u64,
+    /// Shared mode: a new leader does not start its writer while its clock is behind the shared
+    /// writer clock by more than this.
+    #[arg(long, default_value = "5s", value_parser = humantime::parse_duration)]
+    max_clock_skew: std::time::Duration,
     /// Log entry cache budget in bytes.
     #[arg(long, default_value_t = 8 * 1024 * 1024)]
     log_cache_bytes: usize,
@@ -262,6 +266,7 @@ async fn run(args: Args) -> Result<()> {
         view_max_age: args.view_max_age,
         view_pin_max: args.view_pin_max,
         overlay_max_bytes: args.overlay_max_bytes,
+        max_clock_skew: args.max_clock_skew,
     };
     let mut server = Server::start(config).await?;
     tracing::info!(node = args.id, listen = %server.client_addr(), "Node started");

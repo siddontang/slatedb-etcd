@@ -141,11 +141,25 @@ pub(super) struct Writer {
     /// A paused member polls the checkpoint list. Only one poll runs at a time.
     polling: Arc<std::sync::atomic::AtomicBool>,
     ticks: u64,
+    /// The role and term of this member. The writer task checks them after its open.
+    leadership: tokio::sync::watch::Sender<(bool, u64)>,
+    /// The term of the running writer task.
+    term: u64,
+    pub(super) clock: Clock,
+    /// A leader transfer waits for a checkpoint that covers this batch sequence.
+    pub(super) transfer: Option<(u64, u64)>,
+    /// Writer opens after a fence while this member still led.
+    reopens: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Writer {
-    pub fn new(handles: &Handles, max_age: Duration) -> Self {
+    pub fn new(handles: &Handles, max_age: Duration, clock: Clock) -> Self {
         Self {
+            leadership: tokio::sync::watch::channel((false, 0)).0,
+            term: 0,
+            clock,
+            transfer: None,
+            reopens: Arc::default(),
             progress: Arc::new(Progress::new(0)),
             admin: handles.admin.clone(),
             queue: handles.queue.clone(),
@@ -168,20 +182,21 @@ impl Writer {
         self.stop.is_some()
     }
 
-    /// Open the writer on the leader. Close it on any other member.
+    /// Open the writer on the leader of `term`. Close it on any other member.
     ///
-    /// The open fences an older writer. Phase 3 adds the term check after the open, the clock
-    /// check, and the reopen after a fence. Phase 2 rejects leader transfer instead.
-    pub fn sync(&mut self, leader: bool, events: &mpsc::Sender<Event>) {
-        if !leader {
+    /// The open fences an older writer. A task of an older term stops before the new one starts.
+    pub fn sync(&mut self, leader: bool, term: u64, events: &mpsc::Sender<Event>) {
+        self.leadership.send_replace((leader, term));
+        if !leader || self.term != term {
             if let Some(stop) = self.stop.take() {
                 stop.send_replace(true);
             }
+            self.transfer = None;
+        }
+        if !leader || self.running() {
             return;
         }
-        if self.running() {
-            return;
-        }
+        self.term = term;
         let (stop, stopped) = tokio::sync::watch::channel(false);
         self.stop = Some(stop);
         self.tasks.spawn(lead(
@@ -193,9 +208,15 @@ impl Writer {
                 max_age: self.max_age,
                 reports: self.reports.clone(),
             },
-            self.queue.clone(),
-            events.clone(),
-            stopped,
+            Leading {
+                queue: self.queue.clone(),
+                events: events.clone(),
+                stopped,
+                term,
+                leadership: self.leadership.subscribe(),
+                clock: self.clock.clone(),
+                reopens: self.reopens.clone(),
+            },
         ));
     }
 
@@ -238,6 +259,9 @@ impl Writer {
             "announced": self.announced,
             "running": self.running(),
             "paused": self.paused,
+            "clock_skew_ms": self.clock.skew.load(std::sync::atomic::Ordering::Relaxed),
+            "clock_alarm": self.clock.alarm.load(std::sync::atomic::Ordering::Relaxed),
+            "reopens": self.reopens.load(std::sync::atomic::Ordering::Relaxed),
             "reports": self.reports.lock().unwrap().len(),
         })
     }
@@ -299,35 +323,166 @@ pub(super) async fn next(writer: &mut Option<Writer>) -> WriterEvent {
     }
 }
 
-/// Open the writer, then materialize and publish until the member steps down.
-async fn lead(
-    mut publisher: Publisher,
+/// The clock check of a new writer. SlateDB starts a writer's clock at the manifest's
+/// `last_l0_clock_tick`, and a lagging clock makes each write wait and then fail.
+#[derive(Clone)]
+pub(super) struct Clock {
+    /// Milliseconds since the Unix epoch. Tests skew it.
+    pub now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
+    pub max_skew: Duration,
+    /// The last measured skew: `last_l0_clock_tick` minus the local time, at least zero.
+    pub skew: Arc<std::sync::atomic::AtomicI64>,
+    /// Set while the skew is over the limit and the writer does not start.
+    pub alarm: Arc<std::sync::atomic::AtomicBool>,
+    pub gauge: Option<prometheus::IntGauge>,
+}
+
+impl Clock {
+    pub fn system(max_skew: Duration, gauge: Option<prometheus::IntGauge>) -> Self {
+        Self {
+            now_ms: Arc::new(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_millis() as i64)
+            }),
+            max_skew,
+            skew: Arc::default(),
+            alarm: Arc::default(),
+            gauge,
+        }
+    }
+
+    /// Wait until the local clock passes `tick`. Return false, and raise the alarm, when the
+    /// local clock is behind by more than the limit.
+    pub async fn pass(&self, tick: i64) -> bool {
+        use std::sync::atomic::Ordering;
+        // A new database has the minimum tick, so the subtraction saturates.
+        let skew = tick.saturating_sub((self.now_ms)()).max(0);
+        self.skew.store(skew, Ordering::Relaxed);
+        if let Some(gauge) = &self.gauge {
+            gauge.set(skew);
+        }
+        if skew > self.max_skew.as_millis() as i64 {
+            if !self.alarm.swap(true, Ordering::Relaxed) {
+                tracing::error!(
+                    skew_ms = skew,
+                    "the local clock is behind the shared writer"
+                );
+            }
+            return false;
+        }
+        self.alarm.store(false, Ordering::Relaxed);
+        loop {
+            let behind = tick.saturating_sub((self.now_ms)());
+            if behind < 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis((behind as u64 + 1).min(100))).await;
+        }
+    }
+}
+
+/// The inputs of one leader term's writer task.
+struct Leading {
     queue: Arc<Queue>,
     events: mpsc::Sender<Event>,
-    mut stopped: tokio::sync::watch::Receiver<bool>,
-) -> Result<()> {
-    let db = tokio::select! {
-        db = publisher.source.open_writer() => Arc::new(db?),
-        _ = stopped.wait_for(|stop| *stop) => return Ok(()),
-    };
-    // The open starts at `last_l0_seq`. Unflushed writes of an older writer are lost, and the
-    // overlay holds them.
-    publisher.progress.reset(db.manifest().last_l0_seq());
-    publisher.db = Some(db.clone());
-    let result = tokio::select! {
-        result = materialize(db.clone(), queue, publisher.progress.clone()) => result,
-        result = publish(publisher, events) => result,
-        _ = stopped.wait_for(|stop| *stop) => Ok(()),
-    };
-    let closed = db
-        .close_with_options(slatedb::config::CloseOptions { flush_type: None })
-        .await;
-    result?;
-    // A writer that a newer leader fenced cannot close cleanly. Phase 3 reopens it.
-    if let Err(error) = closed {
-        tracing::warn!(%error, "cannot close the shared writer");
+    stopped: tokio::sync::watch::Receiver<bool>,
+    term: u64,
+    leadership: tokio::sync::watch::Receiver<(bool, u64)>,
+    clock: Clock,
+    reopens: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Wait until the member asks the writer task to stop. The result holds no borrow, so the task
+/// stays `Send` across later waits.
+async fn stop_requested(stopped: &mut tokio::sync::watch::Receiver<bool>) {
+    let _ = stopped.wait_for(|stop| *stop).await;
+}
+
+/// Return true when `error` comes from a writer that a newer writer fenced.
+pub(super) fn fenced(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<slatedb::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced)
+            )
+        })
+    })
+}
+
+/// Open the writer, then materialize and publish until the member steps down.
+///
+/// 1. The open increments the writer epoch, which fences an older writer.
+/// 2. After the open, the member must still lead the same term. Otherwise it closes the writer.
+/// 3. The local clock must pass the manifest's `last_l0_clock_tick`. Over the skew limit the
+///    writer does not start, and the task tries again later.
+/// 4. The materializer and the publisher start. A fence while this member still leads is not
+///    a storage failure: the task opens the writer again. Every other error stops the member.
+async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
+    let Leading {
+        queue,
+        events,
+        mut stopped,
+        term,
+        leadership,
+        clock,
+        reopens,
+    } = leading;
+    let current = || *leadership.borrow() == (true, term);
+    loop {
+        let db = tokio::select! {
+            db = publisher.source.open_writer() => Arc::new(db?),
+            _ = stop_requested(&mut stopped) => return Ok(()),
+        };
+        let close = |db: Arc<slatedb::Db>| async move {
+            // A writer that a newer writer fenced cannot close cleanly. GC closes with it.
+            if let Err(error) = db
+                .close_with_options(slatedb::config::CloseOptions { flush_type: None })
+                .await
+            {
+                tracing::warn!(%error, "cannot close the shared writer");
+            }
+        };
+        // Apply and replies continued during the open. A later election ends this term.
+        if !current() {
+            close(db).await;
+            return Ok(());
+        }
+        let passed = tokio::select! {
+            passed = clock.pass(db.manifest().last_l0_clock_tick()) => passed,
+            _ = stop_requested(&mut stopped) => {
+                close(db).await;
+                return Ok(());
+            }
+        };
+        if !passed {
+            close(db).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
+                _ = stop_requested(&mut stopped) => return Ok(()),
+            }
+        }
+        // The open starts at `last_l0_seq`. Unflushed writes of an older writer are lost, and
+        // the overlay holds them.
+        let mut publisher = publisher.clone();
+        publisher.progress.reset(db.manifest().last_l0_seq());
+        publisher.db = Some(db.clone());
+        let result = tokio::select! {
+            result = materialize(db.clone(), queue.clone(), publisher.progress.clone()) => result,
+            result = publish(publisher, events.clone()) => result,
+            _ = stop_requested(&mut stopped) => Ok(()),
+        };
+        close(db).await;
+        match result {
+            // Two quick elections can open writers in reverse term order.
+            Err(error) if fenced(&error) && current() && !*stopped.borrow() => {
+                tracing::warn!(term, "the shared writer was fenced; open it again");
+                reopens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            result => return result,
+        }
     }
-    Ok(())
 }
 
 /// Copy overlay batches into the shared `Db` in order, each with its own sequence.
@@ -353,6 +508,7 @@ pub(super) async fn materialize(
     }
 }
 
+#[derive(Clone)]
 struct Publisher {
     db: Option<Arc<slatedb::Db>>,
     admin: Arc<slatedb::admin::Admin>,
@@ -492,8 +648,9 @@ impl Node {
     /// Start or stop the writer tasks after a role change.
     pub(super) fn sync_writer(&mut self) {
         let leader = self.raw.raft.state == StateRole::Leader;
+        let term = self.raw.raft.term;
         if let Some(writer) = &mut self.writer {
-            writer.sync(leader, &self.events);
+            writer.sync(leader, term, &self.events);
         }
     }
 
@@ -657,6 +814,20 @@ impl Node {
             writer.paused = false;
         }
         writer.paused
+    }
+
+    /// Return the index and log term of an opened base that a paused member can adopt: the
+    /// base is above the applied index, and the delivered commit covers it.
+    pub(super) fn adoptable(&self) -> Option<(u64, u64)> {
+        let writer = self.writer.as_ref()?;
+        if !writer.paused || self.prepared_puts.is_some() || self.held_puts.is_some() {
+            return None;
+        }
+        let index = writer.opened_slot.newest()?;
+        if index <= self.state.applied || index > self.committed_ready {
+            return None;
+        }
+        Some((index, self.raw.raft.raft_log.term(index).ok()?))
     }
 
     /// Take a due switch job.
@@ -1051,5 +1222,102 @@ mod tests {
         faults.set(0);
         drop(send);
         server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_writer_waits_for_its_clock_and_refuses_a_large_skew() {
+        use std::sync::atomic::Ordering;
+        let clock = Clock::system(Duration::from_secs(5), None);
+        // The manifest clock is 300 ms ahead. The writer waits until the local clock passes it.
+        let started = Instant::now();
+        assert!(clock.pass((clock.now_ms)() + 300).await);
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        assert!(!clock.alarm.load(Ordering::Relaxed));
+        // A clock 10 s behind does not start the writer, and it raises the alarm.
+        let started = Instant::now();
+        assert!(!clock.pass((clock.now_ms)() + 10_000).await);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(clock.alarm.load(Ordering::Relaxed));
+        assert!(clock.skew.load(Ordering::Relaxed) >= 9_000);
+        // A later check within the limit clears the alarm.
+        assert!(clock.pass((clock.now_ms)() - 1).await);
+        assert!(!clock.alarm.load(Ordering::Relaxed));
+    }
+
+    /// The open of an older term finishes after the current leader's open and fences it. The
+    /// current leader opens its writer again, and its overlay batches still reach a checkpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_fenced_leader_opens_its_writer_again() {
+        let options = crate::state::shared::Options {
+            quota: 0,
+            voters: vec![1],
+            join: false,
+            empty_log: false,
+            pin_max: Duration::from_secs(300),
+        };
+        let mut state = StateMachine::open_shared(
+            Arc::new(InMemory::new()),
+            "root",
+            "test",
+            crate::state::StateCache::default(),
+            &options,
+            crate::state::transfer::Backend::Local,
+        )
+        .await
+        .unwrap();
+        state.members = Arc::new(crate::cluster::Store::initial(
+            &[(1, "127.0.0.1:1".to_owned())].into(),
+        ));
+        state.apply(1, None).await.unwrap();
+        let handles = state.shared_handles().unwrap();
+        let (events, mut announced) = mpsc::channel(64);
+        let clock = Clock::system(Duration::from_secs(5), None);
+        let mut writer = Writer::new(&handles, Duration::from_millis(50), clock);
+        writer.sync(true, 2, &events);
+        writer.progress.wait_written(1).await.unwrap();
+        // The leader of term 1 opens late. Its open fences the writer of term 2. The current
+        // leader can open again before this open ends, which fails the late open instead.
+        let old = handles.source.open_writer().await.ok();
+        let put = |key: &str| crate::proto::etcdserverpb::RequestOp {
+            request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
+                crate::proto::etcdserverpb::PutRequest {
+                    key: key.as_bytes().to_vec(),
+                    value: b"value".to_vec(),
+                    ..Default::default()
+                },
+            )),
+        };
+        state.apply_etcd(2, &put("after-fence")).await.unwrap();
+        // A checkpoint above the fence appears. The writer task did not stop the member.
+        let covered = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(event) = announced.recv().await {
+                if let Event::ViewCheckpoint(id) = event {
+                    let base = handles.source.open_base(id).await.unwrap();
+                    if base.applied >= 2 {
+                        return base;
+                    }
+                }
+            }
+            panic!("the writer stopped");
+        })
+        .await
+        .unwrap();
+        let value = covered.get(b"etcd/current/after-fence").await.unwrap();
+        assert!(value.is_some());
+        assert!(writer.tasks.try_join_next().is_none());
+        // The current leader saw the fence and opened its writer again.
+        assert!(writer.reopens.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+        // The writer of term 1 is fenced now. Its next flush cannot commit a manifest.
+        if let Some(old) = old {
+            let flushed = async {
+                old.put(b"orphan", b"value").await?;
+                old.flush().await
+            };
+            let error = flushed.await.unwrap_err();
+            assert!(fenced(&anyhow::Error::from(error)));
+        }
+        writer.sync(false, 2, &events);
+        writer.stop().await;
+        state.close().await.unwrap();
     }
 }

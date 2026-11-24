@@ -133,6 +133,9 @@ pub struct NodeOptions {
     /// Shared mode: the leader rejects client proposals above this overlay size. Apply waits
     /// above twice this size.
     pub overlay_max_bytes: u64,
+    /// Shared mode: a new writer does not start while the local clock is behind the manifest
+    /// clock by more than this.
+    pub max_clock_skew: Duration,
 }
 
 impl NodeOptions {
@@ -470,9 +473,18 @@ impl Node {
             state.metrics.registry.clone(),
         )?);
         let handles = state.shared_handles();
-        let writer = handles
-            .as_ref()
-            .map(|handles| shared::Writer::new(handles, options.view_max_age));
+        let writer = match &handles {
+            Some(handles) => {
+                let gauge = prometheus::IntGauge::new(
+                    "slatedb_etcd_shared_clock_skew_milliseconds",
+                    "Milliseconds that the local clock is behind the shared writer clock.",
+                )?;
+                state.metrics.registry.register(Box::new(gauge.clone()))?;
+                let clock = shared::Clock::system(options.max_clock_skew, Some(gauge));
+                Some(shared::Writer::new(handles, options.view_max_age, clock))
+            }
+            None => None,
+        };
         let mut compaction = compaction::Flush::new(&state);
         if let Some(handles) = handles {
             compaction.share(handles.based);

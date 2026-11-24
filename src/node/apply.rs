@@ -148,6 +148,10 @@ pub(super) enum Job {
     Snapshot(Snapshot),
     /// Shared mode: switch to a base that finished opening, and publish the new view.
     SwitchBase,
+    /// Shared mode: adopt the opened base above the applied index. `term` is the log term at it.
+    AdoptBase {
+        term: u64,
+    },
     Query(Query),
     /// Flush the applied prefix. Build a full image only when `image` is set.
     Checkpoint {
@@ -303,7 +307,11 @@ impl Executor {
         }
         let changes_state = matches!(
             work.job,
-            Job::Entries(_) | Job::Snapshot(_) | Job::PublishPuts(_) | Job::SwitchBase
+            Job::Entries(_)
+                | Job::Snapshot(_)
+                | Job::PublishPuts(_)
+                | Job::SwitchBase
+                | Job::AdoptBase { .. }
         );
         let copy_state = changes_state || matches!(work.job, Job::Query(Query::Maintenance(..)));
         let previous_revision = self.state.revision;
@@ -333,6 +341,10 @@ impl Executor {
             }
             // The switch ran above. The new view goes out with the completion.
             Job::SwitchBase => Output::Entries(Vec::new()),
+            Job::AdoptBase { term } => {
+                self.state.adopt_opened(term).await?;
+                Output::Entries(Vec::new())
+            }
             Job::Snapshot(snapshot) => {
                 self.state.install_snapshot(&snapshot).await?;
                 // An object snapshot replaces the database. The node rebinds its handles.

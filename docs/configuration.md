@@ -141,6 +141,7 @@ checkpoint of it, its base, under an in-memory overlay of the newer applied batc
 | `--view-max-age` | `10s` | Age of the oldest unflushed write that starts a flush and checkpoint. |
 | `--view-pin-max` | `5m` | Age after which a read view fails with a retryable error. |
 | `--overlay-max-bytes` | 1073741824 | Leader admission limit of the overlay. Apply waits at 2x. |
+| `--max-clock-skew` | `5s` | A new writer does not start with its clock this far behind. |
 
 Rules and limits:
 
@@ -150,13 +151,20 @@ Rules and limits:
 - On S3, `mode.json` under the cluster prefix fixes the mode before any state write. A shared start
   also refuses a prefix that holds a replicated member namespace.
 - A directory keeps its mode. A member refuses to start in a different mode.
-- The leader opens the writer when it takes the lead. Phase 2 rejects MoveLeader, because phase 3
-  adds the fencing checks of a leader change.
+- The leader opens the writer when it takes the lead. The open fences the old writer. The leader
+  then checks that it still leads the same term, and waits until its clock passes the manifest
+  clock. A fence while it still leads opens the writer again.
+- Over `--max-clock-skew`, the writer does not start. The member logs an error, sets
+  `clock_alarm` in `/status`, exports `slatedb_etcd_shared_clock_skew_milliseconds`, and tries
+  again each second.
+- MoveLeader first publishes a checkpoint of the applied state, then transfers the lead.
 - Each member truncates its log through the index of its base checkpoint. Its Raft snapshot names
   that checkpoint. A member that receives the snapshot opens the checkpoint and adopts it.
 - A restart opens the newest checkpoint. It adopts the checkpoint when the log ends below it.
 - A missing checkpoint object fails a read with a retryable error. In apply it rebuilds the
   state from the newest checkpoint and replays the local log.
+- A member that waits on its overlay limit adopts a newer checkpoint in process when its log
+  commits the checkpoint index.
 - Manual checkpoints, Defragment, and snapshot restore are unavailable.
 - `object::Config::SharedDirectory` lets members of one host share a local directory in tests.
   A member-local store serves one voter.
