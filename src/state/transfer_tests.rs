@@ -79,8 +79,14 @@ async fn a_follower_installs_copied_checkpoint_objects() {
     let mut snapshot = Snapshot::default();
     snapshot.mut_metadata().index = 50;
     snapshot.data = data;
+    // A known checkpoint term must equal the snapshot term. The check runs before the switch.
+    let root = follower.location.root();
+    snapshot.mut_metadata().term = 8;
+    let error = follower.install_snapshot(&snapshot).await.unwrap_err();
+    assert!(error.to_string().contains("snapshot term"), "{error}");
+    assert_eq!((follower.applied, follower.location.root()), (1, root));
+    snapshot.mut_metadata().term = 7;
     follower.install_snapshot(&snapshot).await.unwrap();
-    // The copied checkpoint holds the term row of its last entry.
     assert_eq!((follower.applied, follower.applied_term), (50, 7));
     assert_eq!(follower.location.root(), "state-1");
     assert_eq!(
@@ -117,6 +123,36 @@ async fn a_follower_installs_copied_checkpoint_objects() {
         exists(&leader, &format!("state/{}", descriptor.ssts[0])).await,
         "the copy must not move leader objects"
     );
+    follower.close().await.unwrap();
+    leader.close().await.unwrap();
+}
+
+/// A checkpoint whose term row is stale, after an older binary advanced `meta/applied`, has an
+/// unknown term. The install takes the term from the snapshot.
+#[tokio::test]
+async fn an_object_snapshot_supplies_an_unknown_checkpoint_term() {
+    let leader_dir = tempfile::tempdir().unwrap();
+    let follower_dir = tempfile::tempdir().unwrap();
+    let mut leader = open(leader_dir.path(), 1).await;
+    leader.entry_term = 7;
+    put(&mut leader, 1, "key", "value").await;
+    let mut batch = crate::WriteBatch::new();
+    batch.put(crate::state::APPLIED, 2_u64.to_be_bytes());
+    leader.write_batch(batch, 2).await.unwrap();
+    leader.applied = 2;
+    let mut snapshot = image(&leader).await;
+    snapshot.mut_metadata().term = 9;
+    let mut follower = open(follower_dir.path(), 2).await;
+    follower.install_snapshot(&snapshot).await.unwrap();
+    assert_eq!((follower.applied, follower.applied_term), (2, 9));
+    put(&mut follower, 3, "key", "next").await;
+    let row = follower
+        .db
+        .get(crate::state::APPLIED_TERM)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.as_ref(), crate::state::applied_term_row(3, 9));
     follower.close().await.unwrap();
     leader.close().await.unwrap();
 }

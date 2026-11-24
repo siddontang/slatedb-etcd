@@ -63,13 +63,11 @@ impl StateMachine {
                 *value = serde_json::to_vec(&alarms)?;
             }
         }
-        // The restored log starts at index 1 in term 1.
+        // The restored log starts at (1, 1). Install stores that term from the snapshot.
         data.rows
             .retain(|(key, _)| key != APPLIED && key != APPLIED_TERM && key != crate::cluster::KEY);
         data.rows
             .push((APPLIED.to_vec(), 1_u64.to_be_bytes().to_vec()));
-        data.rows
-            .push((APPLIED_TERM.to_vec(), 1_u64.to_be_bytes().to_vec()));
         data.rows
             .push((crate::cluster::KEY.to_vec(), serde_json::to_vec(members)?));
         data.applied = 1;

@@ -108,6 +108,8 @@ opened, without writes, stays readable by older binaries.
 They fail explicitly and do not misread the rows. A downgrade is not supported.
 To upgrade a cluster, upgrade the followers first. Then transfer leadership and upgrade the old
 leader. A follower on an older binary cannot install a snapshot from an upgraded leader.
+An older member that installed a checkpoint with `meta/applied-term` exports that row in its
+backups. Restore such a backup with the newer binary. Older restores reject the row.
 Use `--restore-snapshot` for native backups; `etcdutl` cannot restore them.
 Use the [native export tool](docs/operations.md#backups-and-restoration) to save a backup.
 `etcdctl snapshot save` can reject the native image because it requires bbolt page alignment.

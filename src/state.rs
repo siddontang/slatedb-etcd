@@ -45,7 +45,10 @@ pub(crate) mod maintenance;
 mod quota_tests;
 
 const APPLIED: &[u8] = b"meta/applied";
-/// The Raft term of the entry at `meta/applied`. Every state batch writes both rows.
+/// The apply position with its Raft term: `(index, term)`, two big-endian `u64` values.
+/// Every state batch writes it with `meta/applied`. Binaries before this row advance
+/// `meta/applied` alone, so the term is valid only while its index equals `meta/applied`.
+/// Logical images and native backups omit the row. See `read_applied_term`.
 pub(crate) const APPLIED_TERM: &[u8] = b"meta/applied-term";
 const DATA: &[u8] = b"data/";
 
@@ -278,7 +281,7 @@ impl StateMachine {
                 db.snapshot()?.seq() == applied,
                 "SlateDB sequence and apply marker differ"
             );
-            let applied_term = read_applied_term(db.as_ref()).await?;
+            let applied_term = read_applied_term(db.as_ref(), applied).await?;
             let revision = read_revision(db.as_ref()).await?;
             let compact_revision = read_compact_revision(db.as_ref()).await?;
             ensure!(
@@ -430,17 +433,27 @@ impl StateMachine {
 /// Store the apply position: the index and the Raft term of the last entry of a batch.
 fn mark_applied(batch: &mut WriteBatch, index: u64, term: u64) {
     batch.put(APPLIED, index.to_be_bytes());
-    batch.put(APPLIED_TERM, term.to_be_bytes());
+    batch.put(APPLIED_TERM, applied_term_row(index, term));
 }
 
-/// Read the term of the applied entry. A database without the row reports zero.
-async fn read_applied_term(db: &impl StateRead) -> Result<u64> {
-    Ok(match db.get(APPLIED_TERM).await? {
-        Some(bytes) => {
-            u64::from_be_bytes(bytes.as_ref().try_into().context("invalid applied term")?)
-        }
-        None => 0,
-    })
+/// Encode the `meta/applied-term` row.
+pub(crate) fn applied_term_row(index: u64, term: u64) -> [u8; 16] {
+    let mut row = [0; 16];
+    row[..8].copy_from_slice(&index.to_be_bytes());
+    row[8..].copy_from_slice(&term.to_be_bytes());
+    row
+}
+
+/// Read the term of the entry at `applied`. Zero means that the term is unknown: the row is
+/// missing, or an older binary advanced `meta/applied` after the row was written.
+async fn read_applied_term(db: &impl StateRead, applied: u64) -> Result<u64> {
+    let Some(row) = db.get(APPLIED_TERM).await? else {
+        return Ok(0);
+    };
+    let row: [u8; 16] = row.as_ref().try_into().context("invalid applied term")?;
+    let index = u64::from_be_bytes(row[..8].try_into()?);
+    let term = u64::from_be_bytes(row[8..].try_into()?);
+    Ok(if index == applied { term } else { 0 })
 }
 
 async fn read_revision(db: &impl StateRead) -> Result<i64> {
@@ -463,6 +476,10 @@ async fn read_compact_revision(db: &impl StateRead) -> Result<i64> {
 }
 
 /// Return true when a native snapshot or backup can hold `key`.
+///
+/// This binary never writes `meta/applied-term` to an image or backup. An older binary that
+/// installed a copied checkpoint of this binary exports the row, so readers accept it. Install
+/// replaces it, and restore drops it.
 fn snapshot_key(key: &[u8]) -> bool {
     key.starts_with(DATA) || key.starts_with(b"etcd/") || key == APPLIED || key == APPLIED_TERM
 }

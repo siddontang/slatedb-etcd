@@ -51,6 +51,10 @@ Use a new cluster ID. Restore replaces membership and invalidates old tokens.
 Remove `--restore-snapshot` from later restart commands.
 Check keys, permissions, member addresses, and health before resuming the workload.
 
+Upgrade every member before a member on a newer binary sends a checkpoint. A member on an older
+binary that installs a checkpoint with `meta/applied-term` exports that row in its backups.
+The older restore rejects the row. Restore such a backup with the newer binary, which drops it.
+
 Do not copy a live `objects/` directory as a complete backup.
 Unflushed state can still depend on Raft logs. Native export preserves one applied state boundary.
 Full backup construction uses memory and has a 64 MiB transfer limit.
@@ -93,4 +97,6 @@ The Raft identity and native snapshot header require this format.
 Use fresh data directories and object prefixes for this version.
 Old directories and old native backups are not upgrade inputs. There is no format migration.
 Mixed binary versions and rolling upgrades are unsupported.
+Binaries that write `meta/applied-term` keep native snapshot and backup format 4. Upgrade the
+followers first, as for format 5, so that no older member installs a checkpoint with the row.
 The etcd client protocol remains separate from this internal storage format.

@@ -839,10 +839,20 @@ mod tests {
         state.close().await.unwrap();
     }
 
-    /// Return the stored applied term. The in-memory value must match it.
+    /// Return the stored applied term. The row must hold the applied index, and the in-memory
+    /// term must match it.
     async fn stored_term(state: &StateMachine) -> u64 {
-        let row = state.db.get(crate::state::APPLIED_TERM).await.unwrap();
-        let term = u64::from_be_bytes(row.unwrap().as_ref().try_into().unwrap());
+        let row = state
+            .db
+            .get(crate::state::APPLIED_TERM)
+            .await
+            .unwrap()
+            .unwrap();
+        let term = u64::from_be_bytes(row[8..].try_into().unwrap());
+        assert_eq!(
+            row.as_ref(),
+            crate::state::applied_term_row(state.applied, term)
+        );
         assert_eq!(term, state.applied_term);
         term
     }

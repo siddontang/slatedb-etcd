@@ -73,7 +73,7 @@ SlateDB uses these logical keys:
 | Prefix or key | Content |
 | --- | --- |
 | `meta/applied` | Last applied Raft index |
-| `meta/applied-term` | Raft term of the entry at `meta/applied`. Older databases have no row |
+| `meta/applied-term` | `(index, term)` of the last applied entry, two big-endian `u64` values |
 | `data/` | Diagnostic JSON keyspace |
 | `etcd/current/` | Current values and key metadata |
 | `etcd/history/` | Historical versions and tombstones |
@@ -88,6 +88,11 @@ SlateDB uses these logical keys:
 | `etcd/compact-pending` | Physical compaction progress |
 
 The full snapshot preserves these keys together. A checkpoint has one pinned apply boundary.
+The `meta/applied-term` term is valid only when its index equals `meta/applied`. Older binaries
+advance `meta/applied` alone, so a different index or a missing row means an unknown term. The
+next state batch stores the term again. A copied checkpoint with a known term must match the
+Raft snapshot term. Logical images and native backups omit the row; install takes the term from
+the Raft snapshot metadata, and restore starts at index 1 in term 1.
 
 ## Durability and ordering contract
 

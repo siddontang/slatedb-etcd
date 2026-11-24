@@ -319,10 +319,10 @@ mod tests {
         assert!(old.kvs.is_empty());
         // The prepared batch stores the term of its entries beside the apply marker.
         use crate::state::StateRead;
-        let term = node.state.state().get(crate::state::APPLIED_TERM).await;
+        let row = node.state.state().get(crate::state::APPLIED_TERM).await;
         assert_eq!(
-            term.unwrap().unwrap().as_ref(),
-            node.raw.raft.term.to_be_bytes()
+            row.unwrap().unwrap().as_ref(),
+            crate::state::applied_term_row(index, node.raw.raft.term)
         );
     }
     #[tokio::test]
