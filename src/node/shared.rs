@@ -1725,12 +1725,12 @@ mod tests {
                 .unwrap();
             revisions.push(reply.into_inner().header.unwrap().revision);
         }
-        let applied = status(&server).await["applied_index"].as_u64().unwrap();
+        // The base covers every write when the overlay holds no batch. The applied index can be
+        // higher: a later `ViewCheckpoint` entry changes no state, so no base reaches it.
         eventually("a base that covers the writes", async || {
-            status(&server).await["shared_state"]["base_applied_index"]
-                .as_u64()
-                .unwrap()
-                >= applied
+            let status = status(&server).await;
+            status["shared_state"]["overlay_bytes"].as_u64() == Some(0)
+                && status["shared_state"]["base_applied_index"].as_u64() > Some(0)
         })
         .await;
         faults.set_delay(Duration::from_millis(4));

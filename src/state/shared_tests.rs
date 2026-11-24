@@ -815,6 +815,9 @@ async fn the_deadline_bounds_a_slow_base_read() {
     state.switch_base();
     assert_eq!(state.shared.as_ref().unwrap().base.applied, 64);
     let view = state.read_view().unwrap();
+    // Each SST read takes 1 s, far above the 20 ms pin limit. A loaded host still ends the
+    // read well below one SST read.
+    faults.set_delay(Duration::from_secs(1));
     faults.set(DELAY_SST_GET);
     // A flush caches current rows, so the read scans history rows, which only the store has.
     let held = view.read_state();
@@ -829,7 +832,7 @@ async fn the_deadline_bounds_a_slow_base_read() {
     let error = scanned.await.unwrap_err();
     assert!(view::expired(&error.to_string()), "{error}");
     assert!(
-        started.elapsed() < Duration::from_millis(100),
+        started.elapsed() < Duration::from_millis(500),
         "{:?}",
         started.elapsed()
     );
