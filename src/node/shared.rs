@@ -426,6 +426,18 @@ async fn stop_requested(stopped: &mut tokio::sync::watch::Receiver<bool>) {
     let _ = stopped.wait_for(|stop| *stop).await;
 }
 
+/// Return true when `error` is a lost manifest race: another writer wrote the manifest version
+/// that this open tried to write. SlateDB reports it as a data error, so the check uses its
+/// message.
+pub(super) fn open_conflict(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<slatedb::Error>().is_some_and(|error| {
+            error.kind() == slatedb::ErrorKind::Data
+                && error.to_string().contains("version already exists")
+        })
+    })
+}
+
 /// Return true when `error` comes from a writer that a newer writer fenced.
 pub(super) fn fenced(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
@@ -465,8 +477,12 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         let db = match opened {
             Ok(db) => Arc::new(db),
             // A newer open fenced this one while the member still leads the same term.
-            Err(error) if fenced(&error) && current() && !*stopped.borrow() => {
-                tracing::warn!(term, "the shared writer open was fenced; open it again");
+            // Two opens can also race for the same manifest version. The open that loses must
+            // read the new manifest and try again.
+            Err(error)
+                if (fenced(&error) || open_conflict(&error)) && current() && !*stopped.borrow() =>
+            {
+                tracing::warn!(term, %error, "the shared writer open was fenced; open it again");
                 reopens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 continue;
             }
@@ -2002,6 +2018,80 @@ mod tests {
         assert!(second.tasks.try_join_next().is_none());
         second.sync(false, 3, &events);
         second.stop().await;
+        state.close().await.unwrap();
+    }
+
+    /// The announcement of a checkpoint applies, and the member cannot read the checkpoint.
+    /// After the store recovers, the member opens it and switches its base. No client write
+    /// and no new Raft entry is needed, and a physical compaction waiter ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_base_open_is_retried_on_an_idle_member() {
+        use crate::object::faults::{FaultStore, FAIL_GET};
+        let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+        let options = crate::state::shared::Options {
+            quota: 0,
+            voters: vec![1],
+            join: false,
+            empty_log: false,
+            pin_max: Duration::from_secs(300),
+        };
+        // A tiny cache, so the open reads the store.
+        let cache = crate::state::StateCache {
+            block_bytes: 1,
+            meta_bytes: 1,
+            row_bytes: 0,
+        };
+        let mut state = StateMachine::open_shared(
+            faults.clone(),
+            "root",
+            "test",
+            cache,
+            &options,
+            crate::state::transfer::Backend::Local,
+        )
+        .await
+        .unwrap();
+        state.members = Arc::new(crate::cluster::Store::initial(
+            &[(1, "127.0.0.1:1".to_owned())].into(),
+        ));
+        state.apply(1, None).await.unwrap();
+        let handles = state.shared_handles().unwrap();
+        let (events, received) = mpsc::channel(64);
+        let mut announcements = Announcements(received);
+        let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+        writer.sync(true, 2, &events);
+        let id = announcements.next(Duration::from_secs(20), true).await;
+        writer.sync(false, 2, &events);
+        writer.stop().await;
+        let mut based = handles.based.clone();
+        let waiter = tokio::spawn(async move { based.wait_for(|base| *base >= 1).await.is_ok() });
+        // The announcement applies while every read fails.
+        faults.set(FAIL_GET);
+        state
+            .apply_view_checkpoint(2, &id.to_string())
+            .await
+            .unwrap();
+        let applied = state.applied;
+        faults.entered.acquire().await.unwrap().forget();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(handles.opened.newest(), None);
+        assert_eq!(*handles.based.borrow(), 0);
+        // The store recovers. Only the retry of the open runs.
+        faults.set(0);
+        let mut ready = handles.opened.subscribe();
+        tokio::time::timeout(
+            RETRY_MAX + Duration::from_secs(2),
+            ready.wait_for(|ready| *ready >= 1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        state.switch_base();
+        assert!(tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap());
+        assert_eq!(state.applied, applied);
         state.close().await.unwrap();
     }
 

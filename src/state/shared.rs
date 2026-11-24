@@ -658,9 +658,55 @@ pub(crate) struct Shared {
     announced: Arc<tokio::sync::watch::Sender<Option<uuid::Uuid>>>,
     /// Background opens of announced checkpoints. DST waits for them to keep schedules exact.
     opening: Vec<tokio::task::JoinHandle<()>>,
+    /// A failed open tries again until the base opens or a newer announcement replaces it.
+    /// DST turns this off, because a retry would run at a time that the schedule does not fix.
+    retry_opens: bool,
     /// The `F` of the current base. Physical Compact replies wait for a covering base.
     based: Arc<tokio::sync::watch::Sender<u64>>,
     pub(crate) pin_max: Duration,
+}
+
+/// The first wait before a failed checkpoint open tries again.
+const OPEN_RETRY_MIN: Duration = Duration::from_millis(100);
+/// The longest wait between two open attempts.
+const OPEN_RETRY_MAX: Duration = Duration::from_secs(2);
+
+/// Open the announced checkpoint `id` and offer its base for a switch.
+///
+/// The announcement is already applied, so the writer does not announce the checkpoint again,
+/// and a member that is not paused does not poll. Thus a failed open tries again with a
+/// backoff from `OPEN_RETRY_MIN` to `OPEN_RETRY_MAX`, also on an idle member. It stops when
+/// the base opens, when a newer announcement replaces it, or when the state closes. A transient
+/// error never leaves the member on an old base.
+async fn open_announced(
+    source: Arc<Source>,
+    opened: Arc<Opened>,
+    mut announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
+    id: uuid::Uuid,
+    retry: bool,
+) {
+    let mut backoff = OPEN_RETRY_MIN;
+    loop {
+        match source.open_base(id).await {
+            Ok(base) => return opened.offer(base),
+            Err(error) => tracing::warn!(%error, %id, "cannot open a view checkpoint"),
+        }
+        if !retry {
+            return;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            changed = announced.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+        if *announced.borrow() != Some(id) {
+            return;
+        }
+        backoff = (backoff * 2).min(OPEN_RETRY_MAX);
+    }
 }
 
 impl Shared {
@@ -674,6 +720,7 @@ impl Shared {
             announcements: 0,
             announced: Arc::new(tokio::sync::watch::channel(None).0),
             opening: vec![],
+            retry_opens: true,
             pin_max,
         }
     }
@@ -704,14 +751,18 @@ impl Shared {
         self.overlay.close_segment();
         let source = self.source.clone();
         let opened = self.opened.clone();
+        let announced = self.announced.subscribe();
         self.opening.retain(|task| !task.is_finished());
-        self.opening.push(tokio::spawn(async move {
-            match source.open_base(id).await {
-                Ok(base) => opened.offer(base),
-                // The member keeps its base and waits for the next checkpoint.
-                Err(error) => tracing::warn!(%error, %id, "cannot open a view checkpoint"),
+        let retry = self.retry_opens;
+        if retry {
+            // The newer checkpoint replaces the opens and retries of the older ones.
+            for task in self.opening.drain(..) {
+                task.abort();
             }
-        }));
+        }
+        self.opening.push(tokio::spawn(open_announced(
+            source, opened, announced, id, retry,
+        )));
     }
 
     /// Offer a base that opened elsewhere, such as in a test.
@@ -864,6 +915,14 @@ impl StateMachine {
         self.applied = index;
         self.applied_term = self.entry_term;
         Ok(())
+    }
+
+    /// Set whether a failed open of an announced checkpoint tries again. A manual apply, such
+    /// as DST, turns this off to keep its schedule exact.
+    pub(crate) fn set_open_retries(&mut self, retry: bool) {
+        if let Some(shared) = &mut self.shared {
+            shared.retry_opens = retry;
+        }
     }
 
     /// Wait for the background opens of announced checkpoints. Return true if one ran.

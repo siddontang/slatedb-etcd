@@ -442,6 +442,7 @@ impl Node {
             }
         };
         let manual_apply = transport_override.is_some();
+        state.set_open_retries(!manual_apply);
         let mut traffic = BTreeMap::<u64, std::sync::Arc<crate::metrics::PeerTraffic>>::new();
         let mut transports = tokio::task::JoinSet::new();
         let mut peer_addresses = BTreeMap::new();

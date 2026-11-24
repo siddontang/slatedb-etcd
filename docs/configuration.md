@@ -170,6 +170,10 @@ Rules and limits:
   failed check of the checkpoint list is also tried again. After Raft takes a proposal, the
   writer checks again after 2 s. A writer does not announce a checkpoint again when the leader
   applied its announcement, or when its index is at or below the leader's base.
+- A member that cannot open an announced checkpoint tries again after a backoff from 100 ms to
+  2 s, also when it is idle. It stops when the base opens or a newer announcement replaces it.
+- Two writer opens can race for the same manifest version. A leader that loses the race opens
+  the writer again, as after a fence.
 - Each member truncates its log through the index of its base checkpoint. Its Raft snapshot names
   that checkpoint. A member that receives the snapshot opens the checkpoint and adopts it.
 - A restart opens the newest checkpoint. It adopts the checkpoint when the log ends below it.
