@@ -250,6 +250,8 @@ pub(crate) struct Source {
     /// Bases of received snapshots, with their receive time. Install takes the base. Raft can
     /// also drop a snapshot, so a receipt expires after `RECEIPT_LIFETIME`.
     received: Mutex<std::collections::HashMap<uuid::Uuid, (std::time::Instant, Arc<Base>)>>,
+    /// The SSTs of the last opened base. A new base warms the cache only for other SSTs.
+    warmed: Mutex<HashSet<slatedb::manifest::SsTableId>>,
 }
 
 /// The checkpoints that this member uses, and the ones that retention deletes.
@@ -325,6 +327,11 @@ impl Source {
             .bases
             .push((id, Arc::downgrade(&base)));
         drop(opening);
+        // Warm the cache before the caller switches to the base, so reads find the new SSTs in
+        // it. Opens of the same checkpoint on one member warm only once.
+        let known = self.warmed.lock().unwrap().clone();
+        let ssts = base.warm(&known).await;
+        *self.warmed.lock().unwrap() = ssts;
         Ok(base)
     }
 
@@ -599,6 +606,7 @@ pub(crate) fn offline_source(
         cache: cache.build(),
         pins: Mutex::default(),
         received: Mutex::default(),
+        warmed: Mutex::default(),
     }))
 }
 
@@ -1273,6 +1281,7 @@ impl StateMachine {
             cache: cache.build(),
             pins: Mutex::default(),
             received: Mutex::default(),
+            warmed: Mutex::default(),
         });
         ensure!(
             state_root == source.state(),

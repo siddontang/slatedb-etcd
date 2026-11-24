@@ -181,19 +181,24 @@ const COMPACTION_FETCH_BYTES: usize = 512 * 1024;
 /// subcompactions this held about 185 MiB in put-v4096 on a server with 4 CPU threads.
 const SUBCOMPACTIONS: usize = 2;
 
-/// Cache SST indexes, filters, and current-row data blocks after a memtable flush.
+/// The SST entries that a memtable flush caches: indexes, filters, and current-row data blocks.
 ///
 /// SlateDB inserts every data block of a flushed L0 SST by default. Each flush then filled the
 /// block cache with history and Watch journal rows that latest reads do not touch. Puts use the
 /// in-memory key index. Range reads at the latest revision read `etcd/current/` rows, so a flush
-/// still caches those blocks. Other blocks are cached when a read loads them.
-fn block_cache_policy() -> slatedb::BlockCachePolicy {
+/// still caches those blocks. Other blocks are cached when a read loads them. A shared-mode base
+/// loads the same entries for the L0 SSTs that the member did not flush. See `view::Base::warm`.
+pub(crate) fn flush_targets() -> [slatedb::CacheTarget; 3] {
     use slatedb::CacheTarget;
-    slatedb::BlockCachePolicy::default().with_flush_targets(&[
+    [
         CacheTarget::data(crate::mvcc::CURRENT..CURRENT_END),
         CacheTarget::Index,
         CacheTarget::Filters,
-    ])
+    ]
+}
+
+fn block_cache_policy() -> slatedb::BlockCachePolicy {
+    slatedb::BlockCachePolicy::default().with_flush_targets(&flush_targets())
 }
 
 /// SlateDB settings for the state machine.

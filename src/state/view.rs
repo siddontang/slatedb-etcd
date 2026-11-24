@@ -8,12 +8,14 @@
 //! A shared-mode view is `(base, segments, seq)`: a read-only SlateDB checkpoint plus the overlay
 //! batches at or below `seq`. See `docs/shared-state.md`.
 
+use std::collections::HashSet;
 use std::ops::{Bound, Range};
 use std::sync::Arc;
 
 use bytes::Bytes;
 use slatedb::config::{DbReaderOptions, ScanOptions};
-use slatedb::{Db, DbIterator, DbReader, DbReaderMode, DbSnapshot};
+use slatedb::manifest::SsTableId;
+use slatedb::{CacheTarget, Db, DbCacheManagerOps, DbIterator, DbReader, DbReaderMode, DbSnapshot};
 
 use super::overlay::{End, Segment};
 use super::{Row, StateRead, StateScan};
@@ -77,6 +79,40 @@ impl Base {
             Some(reader) => reader.get(key).await,
             None => Ok(None),
         }
+    }
+
+    /// Load cache entries for the SSTs of the base that are not in `known`. Return all SSTs of
+    /// the base.
+    ///
+    /// A replicated member caches the entries of `flush_targets` when it flushes an L0 SST, and
+    /// SlateDB caches the index and filters of compaction output. A shared-mode member writes no
+    /// SST, so without this step each first read of a new block is an object store GET. On a
+    /// local MinIO, these cold reads cut point read throughput by more than half and raised the
+    /// p99 latency ten times. This step loads the same entries as replicated mode. A failure only
+    /// leaves the cache cold. See `docs/shared-state.md`.
+    pub(crate) async fn warm(&self, known: &HashSet<SsTableId>) -> HashSet<SsTableId> {
+        let Some(reader) = &self.reader else {
+            return HashSet::new();
+        };
+        let manifest = reader.manifest();
+        let flushed = super::flush_targets();
+        let compacted = [CacheTarget::Index, CacheTarget::Filters];
+        let mut ssts = HashSet::new();
+        let mut cold = vec![];
+        let l0 = manifest.l0().iter().map(|view| (view.sst.id, true));
+        let runs = manifest.compacted().iter().flat_map(|run| run.sst_views());
+        for (id, flush) in l0.chain(runs.map(|view| (view.sst.id, false))) {
+            if ssts.insert(id) && !known.contains(&id) {
+                cold.push((id, flush));
+            }
+        }
+        for (id, flush) in cold {
+            let targets = if flush { &flushed[..] } else { &compacted[..] };
+            if let Err(error) = reader.warm_sst(id, targets).await {
+                tracing::warn!(%error, sst = %id.value(), "cannot warm the cache for a base SST");
+            }
+        }
+        ssts
     }
 }
 
@@ -496,5 +532,55 @@ mod tests {
         assert_eq!(view.get(b"k/1").await.unwrap(), Some("v".into()));
         assert_eq!(view.get(b"k/2").await.unwrap(), None);
         assert_eq!(rows(&view, b"k/").await, vec![row("k/1", "v")]);
+    }
+
+    /// A warm base serves current rows of its L0 SSTs from the cache. Other rows still need GETs.
+    #[tokio::test]
+    async fn a_warm_base_reads_current_rows_without_sst_gets() {
+        use crate::object::faults::{FaultStore, FAIL_SST_GET};
+        let faults = Arc::new(FaultStore::new(Arc::new(
+            slatedb::object_store::memory::InMemory::new(),
+        )));
+        let store: Arc<dyn slatedb::object_store::ObjectStore> = faults.clone();
+        let db = Db::builder("state", store.clone())
+            .with_settings(super::super::slatedb_settings())
+            .build()
+            .await
+            .unwrap();
+        // Many rows, so the current rows, history rows, and apply marker are in separate blocks.
+        let mut rows = crate::WriteBatch::new();
+        for i in 0..300 {
+            rows.put(format!("etcd/current/{i:04}"), vec![b'c'; 200]);
+            rows.put(format!("etcd/history/{i:04}"), vec![b'h'; 200]);
+        }
+        rows.put(super::super::APPLIED, 3_u64.to_be_bytes());
+        db.write_with_options(rows.to_storage(), &WriteOptions { seqnum: 3 })
+            .await
+            .unwrap();
+        db.flush().await.unwrap();
+        let id = db
+            .create_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
+            .await
+            .unwrap()
+            .id;
+        let open = || async {
+            let cache = crate::state::StateCache::default().build();
+            Base::open(store.clone(), "state", id, cache).await.unwrap()
+        };
+        let (warm, cold) = (open().await, open().await);
+        let ssts = warm.warm(&HashSet::new()).await;
+        assert_eq!(ssts.len(), 1);
+        // Known SSTs are not read again.
+        assert_eq!(warm.warm(&ssts).await, ssts);
+
+        faults.set(FAIL_SST_GET);
+        for i in [0, 150, 299] {
+            let key = format!("etcd/current/{i:04}");
+            assert_eq!(warm.get(key.as_bytes()).await.unwrap().unwrap().len(), 200);
+            assert!(cold.get(key.as_bytes()).await.is_err());
+        }
+        assert!(warm.get(b"etcd/history/0150").await.is_err());
+        faults.set(0);
+        db.close().await.unwrap();
     }
 }
