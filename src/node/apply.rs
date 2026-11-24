@@ -604,9 +604,14 @@ impl Worker {
     pub fn state(&self) -> &StateMachine {
         &self.manual.as_ref().unwrap().0.state
     }
+
+    #[cfg(test)]
+    pub fn state_mut(&mut self) -> &mut StateMachine {
+        &mut self.manual.as_mut().unwrap().0.state
+    }
 }
 
-async fn apply_entries(
+pub(super) async fn apply_entries(
     state: &mut StateMachine,
     entries: Vec<Entry>,
     header: Header,

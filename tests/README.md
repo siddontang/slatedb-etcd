@@ -73,6 +73,13 @@ Repeat a failing seed with the same command. Each run also writes a partial `see
 The test drives real storage with a simulated transport and Raft clock.
 It checks lease generations, Watch journals, auth revocation, and physical compaction after
 recovery. It does not simulate lease expiry time.
+
+`--shared-seeds`, default `1,2,3`, runs the shared state schedules. Three members share one
+in-memory object store, and the simulation drives the leader writer one step at a time. The
+schedules stop members between writer steps, open late writers, fail SST writes, partition a
+member, and run retention and GC. After every step each member's view must equal a replicated
+reference at the same index. The simulated writer compacts only on request, so GC deletes the
+same SSTs on every replay. Each run writes `shared-seed-N.json`.
 The scheduler controls disk execution, completion delivery, and apply jobs.
 A 1 KiB cache forces asynchronous reads. Each schedule checks all four log pool limits.
 It injects read and write failure, restart, and late read completion after a term change.

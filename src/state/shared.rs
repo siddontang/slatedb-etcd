@@ -374,9 +374,13 @@ impl Source {
 
     /// Open the writable shared database. Opening it fences an older writer.
     pub async fn open_writer(&self) -> Result<Db> {
+        self.open_writer_with(slatedb_settings()).await
+    }
+
+    pub async fn open_writer_with(&self, settings: Settings) -> Result<Db> {
         Ok(Db::builder(self.state(), self.store.clone())
             .with_db_cache(self.cache.clone(), 0)
-            .with_settings(slatedb_settings())
+            .with_settings(settings)
             .with_block_cache_policy(block_cache_policy())
             .build()
             .await?)
@@ -649,6 +653,8 @@ pub(crate) struct Shared {
     pub(crate) source: Arc<Source>,
     /// `ViewCheckpoint` entries that this member applied.
     pub(crate) announcements: u64,
+    /// Background opens of announced checkpoints. DST waits for them to keep schedules exact.
+    opening: Vec<tokio::task::JoinHandle<()>>,
     /// The `F` of the current base. Physical Compact replies wait for a covering base.
     based: Arc<tokio::sync::watch::Sender<u64>>,
     pub(crate) pin_max: Duration,
@@ -663,6 +669,7 @@ impl Shared {
             opened: Arc::default(),
             source,
             announcements: 0,
+            opening: vec![],
             pin_max,
         }
     }
@@ -692,13 +699,14 @@ impl Shared {
         self.overlay.close_segment();
         let source = self.source.clone();
         let opened = self.opened.clone();
-        tokio::spawn(async move {
+        self.opening.retain(|task| !task.is_finished());
+        self.opening.push(tokio::spawn(async move {
             match source.open_base(id).await {
                 Ok(base) => opened.offer(base),
                 // The member keeps its base and waits for the next checkpoint.
                 Err(error) => tracing::warn!(%error, %id, "cannot open a view checkpoint"),
             }
-        });
+        }));
     }
 
     /// Offer a base that opened elsewhere, such as in a test.
@@ -848,6 +856,20 @@ impl StateMachine {
         self.applied = index;
         self.applied_term = self.entry_term;
         Ok(())
+    }
+
+    /// Wait for the background opens of announced checkpoints. Return true if one ran.
+    #[cfg(test)]
+    pub(crate) async fn settle_opens(&mut self) -> bool {
+        let Some(shared) = &mut self.shared else {
+            return false;
+        };
+        let opening = std::mem::take(&mut shared.opening);
+        let any = !opening.is_empty();
+        for task in opening {
+            let _ = task.await;
+        }
+        any
     }
 
     /// Use a base that finished opening. Apply calls this before each job.

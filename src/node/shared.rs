@@ -124,7 +124,7 @@ const REPORT_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
 /// The shared-mode tasks of one member. Only the leader runs the writer.
 pub(super) struct Writer {
-    admin: Arc<slatedb::admin::Admin>,
+    pub(super) admin: Arc<slatedb::admin::Admin>,
     queue: Arc<Queue>,
     pub(super) source: Arc<Source>,
     progress: Arc<Progress>,
@@ -924,6 +924,225 @@ impl Node {
         self.writer
             .as_mut()
             .is_some_and(|writer| std::mem::take(&mut writer.switch_due))
+    }
+}
+
+/// A writer that DST drives one step at a time. Each step follows the rules of `lead` and
+/// `publish`, so a schedule can stop, fence, or crash a writer between any two steps.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct DstWriter {
+    pub db: Option<Arc<slatedb::Db>>,
+    pub term: u64,
+    pub written: u64,
+    pub epoch: u64,
+    published: u64,
+    bootstrapped: bool,
+    /// A checkpoint that the next announce step proposes.
+    pub pending: Option<uuid::Uuid>,
+}
+
+/// Compact every L0 SST and sorted run into one run when the L0 has `limit` SSTs or more, and
+/// wait until the compaction ends.
+#[cfg(test)]
+async fn dst_compact(admin: &slatedb::admin::Admin, limit: usize) -> Result<()> {
+    use slatedb::compactor::{CompactionSpec, CompactionStatus, SourceId};
+    let manifest = admin
+        .read_manifest(None)
+        .await?
+        .context("missing manifest")?;
+    if manifest.l0().len() < limit {
+        return Ok(());
+    }
+    let mut sources: Vec<_> = manifest
+        .l0()
+        .iter()
+        .map(|view| SourceId::SstView(view.id))
+        .collect();
+    sources.extend(
+        manifest
+            .compacted()
+            .iter()
+            .map(|run| SourceId::SortedRun(run.id)),
+    );
+    let destination = manifest
+        .compacted()
+        .iter()
+        .map(|run| run.id)
+        .min()
+        .unwrap_or(0);
+    let job = admin
+        .submit_compaction(CompactionSpec::new(sources, destination))
+        .await?;
+    for _ in 0..400 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        match admin.read_compaction(job.id(), None).await? {
+            Some(job) if matches!(job.status(), CompactionStatus::Completed) => {
+                // The compactor commits the manifest after the job. Wait for the new L0.
+                let manifest = admin
+                    .read_manifest(None)
+                    .await?
+                    .context("missing manifest")?;
+                if manifest.l0().len() < limit {
+                    return Ok(());
+                }
+            }
+            Some(job) if matches!(job.status(), CompactionStatus::Failed) => {
+                anyhow::bail!("a DST compaction failed")
+            }
+            _ => {}
+        }
+    }
+    anyhow::bail!("a DST compaction timed out")
+}
+
+#[cfg(test)]
+impl DstWriter {
+    pub async fn close(&mut self) {
+        if let Some(db) = self.db.take() {
+            let _ = db
+                .close_with_options(slatedb::config::CloseOptions { flush_type: None })
+                .await;
+        }
+    }
+}
+
+#[cfg(test)]
+impl Node {
+    /// Open the writer on the leader. With `deposed`, a member that does not lead opens it, as
+    /// a slow open of an older term does. Return false when the open did not start a writer.
+    pub(super) async fn dst_open(&mut self, dst: &mut DstWriter, deposed: bool) -> Result<bool> {
+        let leader = self.raw.raft.state == StateRole::Leader;
+        if leader == deposed {
+            return Ok(false);
+        }
+        let term = self.raw.raft.term;
+        let writer = self.writer.as_ref().context("shared state mode")?;
+        dst.close().await;
+        // The compactor runs only on request, so GC removes the same SSTs on every replay.
+        let mut settings = crate::state::slatedb_settings();
+        if let Some(compactor) = settings.compactor_options.as_mut() {
+            compactor
+                .scheduler_options
+                .insert("min_compaction_sources".into(), "1000000".into());
+        }
+        let db = Arc::new(writer.source.open_writer_with(settings).await?);
+        // The lead must be unchanged after the open, and the clock must pass the manifest.
+        if (!deposed && self.raw.raft.term != term)
+            || !writer.clock.pass(db.manifest().last_l0_clock_tick()).await
+        {
+            let _ = db
+                .close_with_options(slatedb::config::CloseOptions { flush_type: None })
+                .await;
+            return Ok(false);
+        }
+        dst.written = db.manifest().last_l0_seq();
+        dst.epoch = db.manifest().writer_epoch();
+        dst.term = term;
+        dst.published = view_checkpoints(&writer.admin)
+            .await?
+            .last()
+            .map_or(0, |(seq, _)| *seq);
+        dst.bootstrapped = writer.source.bootstrapped().await?;
+        dst.pending = None;
+        dst.db = Some(db);
+        Ok(true)
+    }
+
+    /// Write the overlay batches above the written sequence, each with its own sequence.
+    pub(super) async fn dst_materialize(&mut self, dst: &mut DstWriter) -> Result<usize> {
+        let (Some(db), Some(writer)) = (&dst.db, &self.writer) else {
+            return Ok(0);
+        };
+        let mut count = 0;
+        for (seq, batch) in writer.queue.after(dst.written, usize::MAX) {
+            db.write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
+                .await?;
+            dst.written = seq;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Flush, then create one checkpoint for an advance of `last_l0_seq`. The bootstrap marker
+    /// comes before the first announcement.
+    pub(super) async fn dst_checkpoint(
+        &mut self,
+        dst: &mut DstWriter,
+    ) -> Result<Option<uuid::Uuid>> {
+        let (Some(db), Some(writer)) = (&dst.db, &self.writer) else {
+            return Ok(None);
+        };
+        db.flush().await?;
+        // Compact the L0 SSTs on request before SlateDB would stop writes for them.
+        dst_compact(&writer.admin, 4).await?;
+        let last = db.manifest().last_l0_seq();
+        if last <= dst.published {
+            return Ok(None);
+        }
+        let options = CheckpointOptions {
+            name: Some(view_name(last)),
+            ..Default::default()
+        };
+        let id = db
+            .create_checkpoint(CheckpointScope::Durable, &options)
+            .await?
+            .id;
+        dst.published = last;
+        let base = writer.source.open_base(id).await?;
+        if base.get(crate::cluster::KEY).await?.is_none() {
+            writer.admin.delete_checkpoint(id).await?;
+            return Ok(None);
+        }
+        if !dst.bootstrapped {
+            writer.source.mark_bootstrapped(id).await?;
+            dst.bootstrapped = true;
+        }
+        dst.pending = Some(id);
+        Ok(Some(id))
+    }
+
+    /// Propose the pending checkpoint. Only the leader proposes.
+    pub(super) fn dst_announce(&mut self, dst: &mut DstWriter) -> Result<()> {
+        match dst.pending.take() {
+            Some(id) => self.announce_view(id),
+            None => Ok(()),
+        }
+    }
+
+    /// Delete old checkpoints that no member reported, with the epoch check of this writer.
+    pub(super) async fn dst_retain(
+        &mut self,
+        dst: &mut DstWriter,
+        reported: &HashSet<uuid::Uuid>,
+    ) -> Result<()> {
+        let (Some(_), Some(writer)) = (&dst.db, &self.writer) else {
+            return Ok(());
+        };
+        crate::state::shared::retain(
+            &writer.admin,
+            &writer.source,
+            reported,
+            KEEP_CHECKPOINTS,
+            Some(dst.epoch),
+        )
+        .await
+    }
+
+    /// Return true when a newer writer holds the shared database.
+    pub(super) async fn dst_fenced(&self, dst: &DstWriter) -> bool {
+        let Some(writer) = &self.writer else {
+            return false;
+        };
+        match writer.admin.read_manifest(None).await {
+            Ok(Some(manifest)) => manifest.writer_epoch() != dst.epoch,
+            _ => false,
+        }
+    }
+
+    /// The checkpoints that this member pins, as its `ViewAck` reports them.
+    pub(super) fn dst_pins(&self) -> HashSet<uuid::Uuid> {
+        self.pinned_checkpoints()
     }
 }
 
