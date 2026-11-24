@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use slatedb::config::{CheckpointOptions, CheckpointScope, DbReaderOptions, ScanOptions};
 use slatedb::{DbReader, DbReaderMode};
 use std::io::{BufReader, Read};
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 /// The bytes of one Snapshot response message.
@@ -18,7 +19,6 @@ const CHUNK_BYTES: usize = 64 * 1024;
 const CHUNKS_AHEAD: usize = 16;
 /// A checkpoint of a failed process expires after this time. A running backup refreshes it.
 const CHECKPOINT_LIFETIME: Duration = Duration::from_secs(10 * 60);
-const REFRESH_EVERY: Duration = Duration::from_secs(60);
 const CHECKPOINT_NAME: &str = "native-backup";
 /// `etcdctl snapshot save` accepts a file of a multiple of this size plus the digest.
 const ALIGN: u64 = 512;
@@ -53,6 +53,11 @@ impl StateMachine {
     /// Call it between apply jobs. Only the checkpoint start runs here. Writes that apply later
     /// do not reach the checkpoint, so the image holds one applied state boundary.
     pub(crate) async fn backup(&self) -> Result<Stream> {
+        self.backup_with_lifetime(CHECKPOINT_LIFETIME).await
+    }
+
+    /// Like `backup`, with a checkpoint that expires after `lifetime` unless refreshed.
+    pub(super) async fn backup_with_lifetime(&self, lifetime: Duration) -> Result<Stream> {
         if self.is_shared() {
             return self.view_backup().await;
         }
@@ -67,7 +72,7 @@ impl StateMachine {
             .begin_checkpoint(
                 CheckpointScope::All,
                 &CheckpointOptions {
-                    lifetime: Some(CHECKPOINT_LIFETIME),
+                    lifetime: Some(lifetime),
                     name: Some(CHECKPOINT_NAME.to_owned()),
                     ..Default::default()
                 },
@@ -86,7 +91,12 @@ impl StateMachine {
         tokio::spawn(async move {
             let result = async {
                 let checkpoint = handle.wait().await?.id;
-                let result = source.stream(checkpoint, &tx).await;
+                // A client that stops reading blocks the stream, so refresh the checkpoint
+                // apart from it until the stream ends.
+                let result = tokio::select! {
+                    result = source.stream(checkpoint, &tx) => result,
+                    error = keep(&source.admin, checkpoint, lifetime) => Err(error),
+                };
                 // Like etcd, the backend snapshot duration counts completed streams only.
                 if result.is_ok() {
                     timer.observe_duration();
@@ -166,29 +176,18 @@ impl Source {
             .with_db_cache_disabled()
             .build()
             .await?;
-        let result = self.copy(&reader, checkpoint, tx).await;
+        let result = self.copy(&reader, tx).await;
         let _ = reader.close().await;
         result
     }
 
-    async fn copy(
-        &self,
-        reader: &DbReader,
-        checkpoint: uuid::Uuid,
-        tx: &mpsc::Sender<Result<Chunk>>,
-    ) -> Result<()> {
-        let mut lease = Lease {
-            admin: &self.admin,
-            checkpoint,
-            refreshed: tokio::time::Instant::now(),
-        };
+    async fn copy(&self, reader: &DbReader, tx: &mpsc::Sender<Result<Chunk>>) -> Result<()> {
         let header = (crate::SNAPSHOT_FORMAT, self.applied);
         // The row count precedes the rows. Count them first; the checkpoint does not change.
         let mut rows = 0_u64;
         let mut size = encoded_size(&header)? + encoded_size(&0_u64)?;
         let mut scan = rows_of(reader).await?;
         while let Some(row) = scan.next().await? {
-            lease.keep().await?;
             ensure!(!tx.is_closed(), "the snapshot client went away");
             if !omitted(&row.key) {
                 rows += 1;
@@ -211,7 +210,6 @@ impl Source {
         let mut scan = rows_of(reader).await?;
         let mut written = 0_u64;
         while let Some(row) = scan.next().await? {
-            lease.keep().await?;
             if !omitted(&row.key) {
                 written += 1;
                 image.write(&(row.key, row.value)).await?;
@@ -244,22 +242,17 @@ fn encoded_size(value: &impl serde::Serialize) -> Result<u64> {
     Ok(crate::codec::write(&mut std::io::sink(), value)? as u64)
 }
 
-/// Keep the backup checkpoint alive while the stream runs.
-struct Lease<'a> {
-    admin: &'a slatedb::admin::Admin,
+/// Refresh the backup checkpoint every tenth of its lifetime. Return only on an error.
+async fn keep(
+    admin: &slatedb::admin::Admin,
     checkpoint: uuid::Uuid,
-    refreshed: tokio::time::Instant,
-}
-
-impl Lease<'_> {
-    async fn keep(&mut self) -> Result<()> {
-        if self.refreshed.elapsed() >= REFRESH_EVERY {
-            self.admin
-                .refresh_checkpoint(self.checkpoint, Some(CHECKPOINT_LIFETIME))
-                .await?;
-            self.refreshed = tokio::time::Instant::now();
+    lifetime: Duration,
+) -> anyhow::Error {
+    loop {
+        tokio::time::sleep(lifetime / 10).await;
+        if let Err(error) = admin.refresh_checkpoint(checkpoint, Some(lifetime)).await {
+            return error.into();
         }
-        Ok(())
     }
 }
 
@@ -362,7 +355,8 @@ impl ImageFile {
     }
 
     /// Read the rest of the file. Check its digest, then that the rows filled the payload.
-    fn finish(mut self, rows: Result<()>) -> Result<()> {
+    /// Return the digest.
+    fn finish(mut self, rows: Result<()>) -> Result<[u8; DIGEST as usize]> {
         let trailing = std::io::copy(&mut self.payload, &mut std::io::sink())?;
         let mut checksum = [0; DIGEST as usize];
         self.payload.inner.into_inner().read_exact(&mut checksum)?;
@@ -372,7 +366,7 @@ impl ImageFile {
         );
         rows?;
         ensure!(trailing == 0, "trailing native snapshot data");
-        Ok(())
+        Ok(checksum)
     }
 }
 
@@ -394,8 +388,16 @@ fn replaced(key: &[u8]) -> bool {
     key == APPLIED || derived_key(key) || key == crate::cluster::KEY
 }
 
-/// Check every row in one pass. Return the number of copied rows.
-fn check(path: &Path) -> Result<u64> {
+/// A native image file that passed `check`.
+pub(super) struct Checked {
+    path: PathBuf,
+    /// The number of rows that a restore copies.
+    copied: u64,
+    digest: [u8; DIGEST as usize],
+}
+
+/// Check every row in one pass.
+pub(super) fn check(path: &Path) -> Result<Checked> {
     let mut image = ImageFile::open(path)?;
     let mut copied = 0;
     let rows = (|| {
@@ -417,8 +419,12 @@ fn check(path: &Path) -> Result<u64> {
         }
         Ok(())
     })();
-    image.finish(rows)?;
-    Ok(copied)
+    let digest = image.finish(rows)?;
+    Ok(Checked {
+        path: path.to_owned(),
+        copied,
+        digest,
+    })
 }
 
 /// The value that a restored cluster stores for `key`.
@@ -460,8 +466,22 @@ impl StateMachine {
     ) -> Result<()> {
         check_restore_target(dir, id, members)?;
         let started = std::time::Instant::now();
-        let copied = check(backup)?;
-        tracing::info!(rows = copied, elapsed = ?started.elapsed(), "checked the snapshot to restore");
+        let checked = check(backup)?;
+        tracing::info!(rows = checked.copied, elapsed = ?started.elapsed(), "checked the snapshot to restore");
+        Self::restore_checked(&checked, dir, id, cluster_id, members, objects, cache).await
+    }
+
+    /// Write the rows of a checked image. See `restore_backup`.
+    pub(super) async fn restore_checked(
+        checked: &Checked,
+        dir: &Path,
+        id: u64,
+        cluster_id: &str,
+        members: &crate::cluster::Store,
+        objects: &crate::object::Config,
+        cache: StateCache,
+    ) -> Result<()> {
+        let started = std::time::Instant::now();
         std::fs::create_dir_all(dir)?;
         let marker = dir.join(RESTORE_MARKER);
         std::fs::File::create(&marker)?.sync_all()?;
@@ -494,7 +514,7 @@ impl StateMachine {
         state.row_marker = Some(storage.row_marker());
         let member = *members.members.keys().next().unwrap();
         let result = async {
-            let mut image = ImageFile::open(backup)?;
+            let mut image = ImageFile::open(&checked.path)?;
             let mut written = 0;
             let rows = async {
                 image.header()?;
@@ -528,9 +548,12 @@ impl StateMachine {
                 Ok(())
             }
             .await;
-            // The file can change after the check. Check its digest again before the marker.
-            image.finish(rows)?;
-            ensure!(written == copied, "snapshot changed during restore");
+            // The file can change after the check. Its digest must match the checked one before
+            // the marker goes away.
+            ensure!(
+                image.finish(rows)? == checked.digest,
+                "snapshot changed during restore"
+            );
             let index = written + 1;
             let mut batch = WriteBatch::new();
             batch.put(crate::cluster::KEY, serde_json::to_vec(members)?);

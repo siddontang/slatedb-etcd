@@ -14,7 +14,7 @@ async fn check(state: &StateMachine) {
     assert!(state.key_index.matches(state.db()).await.unwrap());
 }
 
-fn put(key: &[u8], value: &[u8], lease: i64) -> RequestOp {
+pub(super) fn put(key: &[u8], value: &[u8], lease: i64) -> RequestOp {
     RequestOp {
         request: Some(Op::RequestPut(PutRequest {
             key: key.to_vec(),

@@ -110,8 +110,10 @@ The member pins its applied state in a SlateDB checkpoint and streams the image 
 Writes continue while the stream runs and do not reach the image.
 The server holds a few 64 KiB messages, not the image, so backups have no size limit.
 The server reads the checkpoint twice: first to count the rows, then to send them.
-The checkpoint lives 10 minutes; a running stream renews it every minute and deletes it at the end.
+The checkpoint lives 10 minutes. While the stream runs, even with a client that stops reading,
+the member renews it every minute, and it deletes it at the end.
 Restore checks the file in one pass and writes the rows in 4 MiB batches in a second pass.
+The second pass must read a file with the checked digest.
 It also holds only a few rows in memory. The restored Raft index is the copied row count plus one.
 An interrupted restore leaves a `restore-incomplete` file, and startup rejects that directory.
 Remove the directory and restore again.

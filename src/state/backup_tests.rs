@@ -41,7 +41,8 @@ async fn rows(state: &StateMachine) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut rows = vec![];
     let mut scan = state.db().scan_prefix(b"", ..).await.unwrap();
     while let Some(row) = scan.next().await.unwrap() {
-        if row.key.as_ref() != crate::cluster::KEY && row.key.as_ref() != APPLIED_TERM {
+        // The image leaves out the derived meta rows, and writes the membership row last.
+        if row.key.as_ref() != crate::cluster::KEY && !derived_key(&row.key) {
             rows.push((row.key.to_vec(), row.value.to_vec()));
         }
     }
@@ -94,13 +95,26 @@ async fn a_backup_streams_its_applied_boundary_while_writes_continue() {
     for index in 1..=300 {
         put(&mut state, index, &format!("key-{index}"), &value).await;
     }
+    // etcd keys give the source a logical size.
+    for index in 301..=320 {
+        let key = format!("etcd-{index}");
+        let request = super::quota_tests::put(key.as_bytes(), value.as_bytes(), 0);
+        state
+            .apply_etcd(index, &request)
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+    }
+    assert!(state.logical_bytes > 0);
     let boundary = state.applied;
+    let size = state.logical_bytes;
     let expected = rows(&state).await;
     let stream = state.backup().await.unwrap();
     assert_eq!(stream.header.unwrap().revision, state.revision);
     // Later writes overwrite and add rows while the image streams.
-    for index in 301..=400 {
-        put(&mut state, index, &format!("key-{}", index - 300), "new").await;
+    for index in 321..=420 {
+        put(&mut state, index, &format!("key-{}", index - 320), "new").await;
     }
     let data = collect(stream).await;
     assert_eq!(
@@ -146,6 +160,10 @@ async fn a_backup_streams_its_applied_boundary_while_writes_continue() {
         Some(value.as_str())
     );
     assert_eq!(restored.members.members.len(), 1);
+    // The restored size is the source size at the boundary plus the new membership row, which
+    // the source keeps only in memory.
+    let members = crate::cluster::KEY.len() + serde_json::to_vec(&members()).unwrap().len();
+    assert_eq!(restored.logical_bytes, size + members as u64);
     restored.close().await.unwrap();
     state.close().await.unwrap();
 }
@@ -211,5 +229,86 @@ async fn a_restore_reads_legacy_images_and_rejects_unordered_rows() {
     let error = restore(&path, &target).await.unwrap_err();
     assert!(error.to_string().contains("unordered"), "{error:#}");
     assert!(!target.exists());
+    state.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_restore_rejects_an_image_replaced_after_its_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = |value: &[u8]| {
+        let mut bytes = crate::codec::encode(&SnapshotData {
+            version: crate::SNAPSHOT_FORMAT,
+            applied: 2,
+            rows: vec![
+                (b"etcd/a".to_vec(), b"1".to_vec()),
+                (b"etcd/b".to_vec(), value.to_vec()),
+            ],
+        })
+        .unwrap();
+        bytes.extend_from_slice(&Sha256::digest(&bytes));
+        bytes
+    };
+    let path = dir.path().join("native.snapshot");
+    std::fs::write(&path, image(b"checked")).unwrap();
+    let checked = super::backup::check(&path).unwrap();
+    // Between the passes, a valid image with as many rows replaces the checked file.
+    std::fs::write(&path, image(b"replaced")).unwrap();
+    let target = dir.path().join("restored");
+    let error = StateMachine::restore_checked(
+        &checked,
+        &target,
+        1,
+        "backup-test",
+        &members(),
+        &crate::object::Config::Local,
+        StateCache::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("snapshot changed during restore"),
+        "{error:#}"
+    );
+    // Startup rejects the directory of the failed restore.
+    assert!(target.join(RESTORE_MARKER).exists());
+}
+
+#[tokio::test]
+async fn a_paused_client_keeps_the_backup_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open(&dir.path().join("state")).await.unwrap();
+    let value = "v".repeat(16 * 1024);
+    for index in 1..=200 {
+        put(&mut state, index, &format!("key-{index}"), &value).await;
+    }
+    let lifetime = Duration::from_secs(2);
+    let mut stream = state.backup_with_lifetime(lifetime).await.unwrap();
+    let first = stream.chunks.recv().await.unwrap().unwrap();
+    // The client stops reading while the image is larger than the chunks buffered ahead.
+    tokio::time::sleep(lifetime * 3).await;
+    let checkpoints = state
+        .admin
+        .list_checkpoints(Some("native-backup"))
+        .await
+        .unwrap();
+    let expires = checkpoints
+        .first()
+        .and_then(|checkpoint| checkpoint.expire_time)
+        .expect("the backup checkpoint is gone");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    assert!(
+        expires.timestamp_millis() > now.as_millis() as i64,
+        "the backup checkpoint expired"
+    );
+    // The client resumes and gets the whole image.
+    let mut data = first.blob;
+    data.extend_from_slice(&collect(stream).await);
+    let (payload, checksum) = data.split_at(data.len() - 32);
+    assert_eq!(Sha256::digest(payload).as_slice(), checksum);
+    released(&state).await;
     state.close().await.unwrap();
 }
