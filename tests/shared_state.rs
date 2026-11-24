@@ -248,7 +248,9 @@ async fn one_write_makes_one_checkpoint_and_one_announcement() {
         views(&server).await.0 >= 1
     })
     .await;
-    assert!(dir.path().join("objects/shared/bootstrap.json").exists());
+    // The bootstrap marker follows the first checkpoint, so wait for it as well.
+    let marker = dir.path().join("objects/shared/bootstrap.json");
+    eventually("the bootstrap marker", async || marker.exists()).await;
     // Startup also applies the member's client URLs. Let those publications settle.
     tokio::time::sleep(age * 5).await;
     let (idle, announced, _) = views(&server).await;
