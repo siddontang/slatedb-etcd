@@ -14,26 +14,38 @@ See [remote storage](docs/remote-storage.md) for ownership, recovery, and deploy
 
 ## Why evaluate SlateDB etcd?
 
-- **Move key-value data to object storage.** Upstream etcd keeps each member's database in a local
-  bbolt file. With SlateDB, each member can store its immutable table files in its own S3 prefix.
-  This lets operators size object storage separately from the local disk needed for the Raft log.
-  A quorum commits writes to durable logs without waiting for an S3 upload.
-  See [remote storage](docs/remote-storage.md).
-- **Reduce leader traffic during follower recovery.** When a follower needs a snapshot, the leader
-  sends a checkpoint description. With the same S3 bucket, endpoint, region, and cross-prefix read
-  access, S3 copies the table files directly. The bulk data bypasses the leader, and retries reuse
-  files the follower already copied. The HTTP fallback reads the files through the leader.
-  See [snapshot transfer](docs/object-snapshots.md#transfer).
-- **Run a member inside a Rust application.** A Rust service can start a member on its own Tokio
-  runtime, wait for quorum readiness, and manage shutdown. This removes a separate server process
-  while clients can still use the supported etcd v3 APIs. See [Rust embedding](docs/embedding.md)
-  and [API compatibility](COMPATIBILITY.md).
+Operators can move key-value data to S3 and recover write capacity without defragmenting a member.
 
-**Sizing and recovery limits.** Writes still pass through one Raft leader. The default logical
-quota is 2 GiB even with S3, and the in-memory index grows with the number of live keys.
-A follower can recover from a surviving cluster. Recovery after total cluster loss needs a separate
-backup. Native backup and restore currently limit the image to 64 MiB.
+| Operator task | etcd | SlateDB etcd |
+| --- | --- | --- |
+| Size storage | Keep a bbolt database on each member's disk | Keep state on local disk or in S3 |
+| Free quota after NOSPACE | Compact history and defragment the database | Delete and compact |
+| Catch up a follower from a snapshot | Stream the database from the leader | Copy files within S3 |
+| Embed a member | Use the Go embed package | Use the Rust API on your Tokio runtime |
+
+The [Rust embedding API](docs/embedding.md) lets an application manage its own member while it
+serves existing etcd v3 clients.
+
+With S3, operators can size the data store separately from each member's local Raft log.
+A normal write commits to a quorum of durable logs without waiting for an S3 upload.
+During follower recovery, a server-side copy keeps bulk data off the leader's network.
+It requires a common bucket, endpoint, region, and read access across member prefixes.
+The HTTP fallback transfers the files through the leader.
+See [remote storage](docs/remote-storage.md) and
+[snapshot transfer](docs/object-snapshots.md#transfer).
+
+After a NOSPACE alarm, etcd counts unused pages in the database file toward its quota.
+Defragmentation shrinks that file and blocks reads and writes on the member while it runs.
+SlateDB etcd counts logical bytes. Delete unneeded keys and compact old revisions until usage falls
+below quota, then disarm the alarm to resume writes. Physical space reclamation can happen later.
+See [etcd maintenance][etcd-maintenance] and [SlateDB etcd administration](docs/administration.md).
+
+Both services use one Raft write leader and default to a 2 GiB backend quota.
+Use `--quota-backend-bytes` to change the quota. When sizing SlateDB etcd, allow memory for an index
+that grows with the live key count. Native backup and restore limit the image to 64 MiB.
 See [snapshot limits](docs/object-snapshots.md#limits).
+
+[etcd-maintenance]: https://etcd.io/docs/v3.6/op-guide/maintenance/
 
 ## Start here
 
