@@ -299,8 +299,8 @@ cluster with no leader therefore keep their checkpoints.
 1. Apply `ViewCheckpoint(C)`. Close the segment. Start `DbReader::open(Checkpoint(C))` in the
    background. Apply continues.
 2. When the reader is open, read `F(C)`. If `F(C)` is not above the current base, close the
-   reader and stop (invariant 6). Opens can finish out of order. Then load the cache entries of
-   the SSTs that the previous base did not have. See [Base cache warm](#base-cache-warm).
+   reader and stop (invariant 6). Opens can finish out of order. Then warm the cache for at
+   most 500 ms. See [Base cache warm](#base-cache-warm).
 3. Publish later views as `(reader(C), segments above F(C))`. Report `C` in `ViewAck`.
 4. When no view uses the old reader, close it and release the segments at or below `F(C)`.
 5. Write a Raft snapshot record for `C` and allow log truncation through `F(C)` (invariant 5).
@@ -314,11 +314,18 @@ A replicated member caches SST indexes, filters, and `etcd/current/` blocks when
 SST. SlateDB also caches the index and filters of compaction output. A shared-mode member writes
 no SST, so every first read of a block in a new base was an S3 GET.
 
-The open of a new base therefore loads the same entries before the switch, with
-`DbReader::warm_sst`. L0 SSTs get indexes, filters, and `etcd/current/` blocks. Sorted run SSTs
-get indexes and filters. SSTs of the previous base are skipped. A failed load only leaves the
-cache cold. The cost is one GET per contiguous range of current-row blocks in each new L0 SST, on
-each member.
+A member therefore loads the same entries with `DbReader::warm_sst` when it adopts an announced
+base, before the switch. L0 SSTs get indexes, filters, and `etcd/current/` blocks. Sorted run SSTs
+get indexes and filters. The cost is one GET per contiguous range of current-row blocks in each
+new L0 SST, on each member. These rules apply:
+
+- The warm stops after 500 ms, and the member then switches. A slow store cannot hold back a
+  usable base while the overlay grows.
+- An SST counts as warm only after all its entries loaded. A failed or stopped warm leaves the SST
+  for the next base.
+- The set of warm SSTs keeps only SSTs of live bases, so it does not grow with each flush.
+- A publication, a snapshot receipt, a restart, and a manual apply such as DST open a base with no
+  warm. They do not wait for SST reads.
 
 Benchmark note: three members on one host with MinIO, 100,000 preloaded keys of 256 B, 64
 clients. Before this step, followers missed 41% of their data block lookups. Linearizable random
@@ -329,7 +336,9 @@ second pass on the same cluster already ran at 24,600 ops/s. So cold blocks were
 the cost of the overlay or the base reader.
 
 Each follower now downloads about the current-row bytes of every write once. In a run of
-100,000 puts of 256 B, S3 GET bytes rose from 4 MiB to 71 MiB, and the GET count did not change.
+100,000 puts of 256 B (put-c256), S3 GET response bytes rose from 2.5 MiB to 45.3 MiB during the
+load, and from 1.9 MiB to 25.9 MiB while it settled: a 15 s pause and a checkpoint on each
+member. The total rose from 4.4 MiB to 71.2 MiB. The GET count did not change.
 After a Defragment or another compaction, both modes read cold compaction output. In the same
 setup, one read pass then ran at about 9,500 ops/s in both modes.
 

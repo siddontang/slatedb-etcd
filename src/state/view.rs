@@ -38,6 +38,8 @@ pub(crate) struct Base {
     pub checkpoint: Option<uuid::Uuid>,
     /// `F`: the index of the last state change in the checkpoint.
     pub applied: u64,
+    /// The SSTs of the checkpoint. The flag is true for an L0 SST.
+    ssts: Vec<(SsTableId, bool)>,
 }
 
 impl Base {
@@ -46,6 +48,7 @@ impl Base {
             reader: None,
             checkpoint: None,
             applied: 0,
+            ssts: vec![],
         }
     }
 
@@ -67,10 +70,17 @@ impl Base {
             .build()
             .await?;
         let applied = super::decode_applied(reader.get(super::APPLIED).await?)?;
+        let manifest = reader.manifest();
+        let l0 = manifest.l0().iter().map(|view| (view.sst.id, true));
+        let runs = manifest.compacted().iter().flat_map(|run| run.sst_views());
+        let mut ssts: Vec<_> = l0.chain(runs.map(|view| (view.sst.id, false))).collect();
+        let mut seen = HashSet::new();
+        ssts.retain(|(id, _)| seen.insert(*id));
         Ok(Self {
             reader: Some(reader),
             checkpoint: Some(id),
             applied,
+            ssts,
         })
     }
 
@@ -81,38 +91,29 @@ impl Base {
         }
     }
 
-    /// Load cache entries for the SSTs of the base that are not in `known`. Return all SSTs of
-    /// the base.
+    /// The SSTs of the checkpoint. The flag is true for an L0 SST.
+    pub(crate) fn ssts(&self) -> &[(SsTableId, bool)] {
+        &self.ssts
+    }
+
+    /// Load the cache entries of SST `id` that the member would cache if it wrote the SST.
     ///
     /// A replicated member caches the entries of `flush_targets` when it flushes an L0 SST, and
     /// SlateDB caches the index and filters of compaction output. A shared-mode member writes no
     /// SST, so without this step each first read of a new block is an object store GET. On a
     /// local MinIO, these cold reads cut point read throughput by more than half and raised the
-    /// p99 latency ten times. This step loads the same entries as replicated mode. A failure only
-    /// leaves the cache cold. See `docs/shared-state.md`.
-    pub(crate) async fn warm(&self, known: &HashSet<SsTableId>) -> HashSet<SsTableId> {
+    /// p99 latency ten times. See `Source::warm` and `docs/shared-state.md`.
+    pub(crate) async fn warm_sst(&self, id: SsTableId, l0: bool) -> Result<(), slatedb::Error> {
         let Some(reader) = &self.reader else {
-            return HashSet::new();
+            return Ok(());
         };
-        let manifest = reader.manifest();
-        let flushed = super::flush_targets();
-        let compacted = [CacheTarget::Index, CacheTarget::Filters];
-        let mut ssts = HashSet::new();
-        let mut cold = vec![];
-        let l0 = manifest.l0().iter().map(|view| (view.sst.id, true));
-        let runs = manifest.compacted().iter().flat_map(|run| run.sst_views());
-        for (id, flush) in l0.chain(runs.map(|view| (view.sst.id, false))) {
-            if ssts.insert(id) && !known.contains(&id) {
-                cold.push((id, flush));
-            }
+        if l0 {
+            reader.warm_sst(id, &super::flush_targets()).await
+        } else {
+            reader
+                .warm_sst(id, &[CacheTarget::Index, CacheTarget::Filters])
+                .await
         }
-        for (id, flush) in cold {
-            let targets = if flush { &flushed[..] } else { &compacted[..] };
-            if let Err(error) = reader.warm_sst(id, targets).await {
-                tracing::warn!(%error, sst = %id.value(), "cannot warm the cache for a base SST");
-            }
-        }
-        ssts
     }
 }
 
@@ -568,10 +569,10 @@ mod tests {
             Base::open(store.clone(), "state", id, cache).await.unwrap()
         };
         let (warm, cold) = (open().await, open().await);
-        let ssts = warm.warm(&HashSet::new()).await;
-        assert_eq!(ssts.len(), 1);
-        // Known SSTs are not read again.
-        assert_eq!(warm.warm(&ssts).await, ssts);
+        assert_eq!(warm.ssts().len(), 1);
+        let (id, l0) = warm.ssts()[0];
+        assert!(l0);
+        warm.warm_sst(id, l0).await.unwrap();
 
         faults.set(FAIL_SST_GET);
         for i in [0, 150, 299] {
