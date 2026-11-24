@@ -3,8 +3,14 @@
 
 use super::*;
 
-const MAX_WAITING: usize = 256;
-const MAX_WAITING_BYTES: usize = 4 * 1024 * 1024;
+/// Client writes that may wait for capacity. Each client has at most one write in flight per
+/// stream, so the queue must hold every client that a busy server serves: a transient apply or
+/// log stall should delay writes, as in etcd, not fail them. This matches the read admission
+/// bound in `grpc::admission`. The waiting writes are not proposed and hold no Raft memory.
+const MAX_WAITING: usize = 8192;
+/// Encoded bytes of the waiting writes. Twice the queued log bytes, so a stall at the log bound
+/// can hold a full log queue of writes behind it.
+const MAX_WAITING_BYTES: usize = 2 * log::MAX_BYTES;
 const WAIT_LIMIT: Duration = Duration::from_secs(5);
 /// etcd returns ErrTooManyRequests when apply falls too far behind. A deferred
 /// proposal that expires was never proposed, so its outcome is known.
@@ -419,6 +425,47 @@ mod tests {
         )
         .unwrap();
         rx
+    }
+
+    /// A transient backlog with 1000 clients delays every put and fails none. The queue
+    /// held 256 writes before, so the 257th client got "state apply backlog is full".
+    #[tokio::test]
+    async fn a_transient_backlog_delays_a_thousand_clients_without_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = super::super::tests::leader_node(dir.path()).await;
+        let last = node.raw.raft.raft_log.last_index();
+        let previous_bytes = node.log_bytes;
+        node.log_bytes = log::MAX_BYTES;
+        let mut waiting: Vec<_> = (0..1000u32)
+            .map(|n| waiting_put(&mut node, n.to_be_bytes().repeat(64)))
+            .collect();
+        assert_eq!(node.waiting_proposals.requests.len(), 1000);
+        for reply in &mut waiting {
+            assert!(matches!(
+                reply.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+        }
+        assert_eq!(node.raw.raft.raft_log.last_index(), last);
+        node.log_bytes = previous_bytes;
+        for _ in 0..1000 {
+            if node.waiting_proposals.is_empty() {
+                break;
+            }
+            node.drive_ready().await.unwrap();
+        }
+        assert!(node.waiting_proposals.is_empty());
+        node.flush_puts();
+        node.drive_ready().await.unwrap();
+        // Every waiting put reached the log, and none failed.
+        assert_eq!(node.raw.raft.raft_log.last_index(), last + 1000);
+        assert_eq!(node.waiting_proposals.bytes, 0);
+        for reply in &mut waiting {
+            assert!(matches!(
+                reply.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+        }
     }
 
     #[tokio::test]
