@@ -33,6 +33,7 @@ def main():
             if not path.is_file():
                 parser.error(f"Missing history: {path}")
         if paths:
+            print(f"Checking {workload} histories in {args.histories}", flush=True)
             subprocess.run(lein + ["run", workload, *map(str, paths)],
                            cwd=ROOT / "tests/jepsen", check=True)
 
