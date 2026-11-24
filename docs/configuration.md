@@ -158,7 +158,15 @@ Rules and limits:
 - Over `--max-clock-skew`, the writer does not start. The member logs an error, sets
   `clock_alarm` in `/status`, exports `slatedb_etcd_shared_clock_skew_milliseconds`, and tries
   again each second.
-- MoveLeader first publishes a checkpoint of the applied state, then transfers the lead.
+- MoveLeader first requests a checkpoint of the applied state. It transfers the lead when the
+  applied base covers the applied index of the request, or 3 s after the newest pending
+  MoveLeader request even if the base still trails that index. The new leader then materializes
+  the overlay above the base. The request fails after 10 s if the target does not lead.
+- A new writer, and each explicit publication request, announces the newest checkpoint again
+  when no applied announcement or base covers it. A writer that stopped after a checkpoint and
+  before its announcement committed leaves such a checkpoint. A writer does not announce a
+  checkpoint again when the leader applied its announcement, or when its index is at or below
+  the leader's base. It also sends each checkpoint at most once.
 - Each member truncates its log through the index of its base checkpoint. Its Raft snapshot names
   that checkpoint. A member that receives the snapshot opens the checkpoint and adopts it.
 - A restart opens the newest checkpoint. It adopts the checkpoint when the log ends below it.

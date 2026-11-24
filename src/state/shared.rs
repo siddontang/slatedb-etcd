@@ -653,6 +653,9 @@ pub(crate) struct Shared {
     pub(crate) source: Arc<Source>,
     /// `ViewCheckpoint` entries that this member applied.
     pub(crate) announcements: u64,
+    /// The checkpoint of the newest applied `ViewCheckpoint` entry. A new writer does not
+    /// announce it again.
+    announced: Arc<tokio::sync::watch::Sender<Option<uuid::Uuid>>>,
     /// Background opens of announced checkpoints. DST waits for them to keep schedules exact.
     opening: Vec<tokio::task::JoinHandle<()>>,
     /// The `F` of the current base. Physical Compact replies wait for a covering base.
@@ -669,6 +672,7 @@ impl Shared {
             opened: Arc::default(),
             source,
             announcements: 0,
+            announced: Arc::new(tokio::sync::watch::channel(None).0),
             opening: vec![],
             pin_max,
         }
@@ -696,6 +700,7 @@ impl Shared {
     /// Close the open segment and open checkpoint `id` in the background.
     pub(crate) fn announce(&mut self, id: uuid::Uuid) {
         self.announcements += 1;
+        self.announced.send_replace(Some(id));
         self.overlay.close_segment();
         let source = self.source.clone();
         let opened = self.opened.clone();
@@ -751,6 +756,8 @@ pub(crate) struct Handles {
     pub source: Arc<Source>,
     /// The `F` of the current base.
     pub based: tokio::sync::watch::Receiver<u64>,
+    /// The checkpoint of the newest applied `ViewCheckpoint` entry.
+    pub announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
     pub opened: Arc<Opened>,
 }
 
@@ -831,6 +838,7 @@ impl StateMachine {
             queue: shared.overlay.queue(),
             source: shared.source.clone(),
             based: shared.based.subscribe(),
+            announced: shared.announced.subscribe(),
             opened: shared.opened.clone(),
         })
     }

@@ -91,8 +91,9 @@ impl Progress {
         Some(self.inner.lock().unwrap().dirty_since? + max_age)
     }
 
-    /// Return true when a flush is due, and clear the causes that it covers.
-    fn take_flush(&self, max_age: Duration) -> bool {
+    /// Return whether a flush is due, and whether a request is one of its causes. Clear the
+    /// causes that it covers.
+    fn take_flush(&self, max_age: Duration) -> (bool, bool) {
         let written = self.written();
         let mut inner = self.inner.lock().unwrap();
         let requested = inner
@@ -107,7 +108,7 @@ impl Progress {
         if requested || aged {
             inner.dirty_since = None;
         }
-        requested || aged
+        (requested || aged, requested)
     }
 }
 
@@ -136,6 +137,8 @@ pub(super) struct Writer {
     reports: Reports,
     /// `ViewCheckpoint` entries that this node proposed.
     pub announced: u64,
+    /// The applied base and announcement. The publisher announces a stranded checkpoint.
+    applied: Applied,
     /// The `F` of the newest base that opened. A change starts a switch job.
     opened: tokio::sync::watch::Receiver<u64>,
     opened_slot: Arc<crate::state::shared::Opened>,
@@ -178,6 +181,10 @@ impl Writer {
             tasks: tokio::task::JoinSet::new(),
             reports: Reports::default(),
             announced: 0,
+            applied: Applied {
+                based: handles.based.clone(),
+                announced: handles.announced.clone(),
+            },
             opened: handles.opened.subscribe(),
             opened_slot: handles.opened.clone(),
             switch_due: false,
@@ -218,6 +225,7 @@ impl Writer {
                 reports: self.reports.clone(),
                 retention: self.retention,
                 retained: self.retained.clone(),
+                applied: self.applied.clone(),
             },
             Leading {
                 queue: self.queue.clone(),
@@ -546,6 +554,52 @@ struct Publisher {
     retention: crate::state::ViewRetention,
     /// The number of `view-` checkpoints after the last publication.
     retained: Option<prometheus::IntGauge>,
+    applied: Applied,
+}
+
+/// The applied state that a publisher checks before it announces a checkpoint again.
+#[derive(Clone)]
+struct Applied {
+    /// The `F` of the current base.
+    based: tokio::sync::watch::Receiver<u64>,
+    /// The checkpoint of the newest applied `ViewCheckpoint` entry.
+    announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
+}
+
+/// Find a stranded checkpoint: the newest view checkpoint, when no applied announcement covers
+/// it. A writer that stops after a checkpoint and before its announcement commits leaves one.
+/// With no more writes, no newer checkpoint replaces it, and members wait for its base.
+///
+/// A checkpoint is not stranded when it is the newest announced one, when an announced one is
+/// at the same or a newer sequence, or when its `F` is at or below the current base. Thus an
+/// adopted checkpoint never causes a new announcement, and announcements cannot loop. A
+/// checkpoint without membership is not valid and is not stranded.
+async fn stranded(
+    admin: &slatedb::admin::Admin,
+    source: &Source,
+    applied: &Applied,
+) -> Result<Option<uuid::Uuid>> {
+    let views = view_checkpoints(admin).await?;
+    let Some((seq, checkpoint)) = views.last() else {
+        return Ok(None);
+    };
+    let announced = *applied.announced.borrow();
+    if let Some(announced) = announced {
+        if views
+            .iter()
+            .any(|(other, view)| view.id == announced && other >= seq)
+        {
+            return Ok(None);
+        }
+    }
+    let base = source.open_base(checkpoint.id).await?;
+    if base.applied <= *applied.based.borrow() {
+        return Ok(None);
+    }
+    if base.get(crate::cluster::KEY).await?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(checkpoint.id))
 }
 
 /// Flush the shared `Db` when its oldest write reaches the age limit or on request. Create one
@@ -562,6 +616,7 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
         reports,
         retention,
         retained,
+        applied,
     } = publisher;
     let db = db.context("the publisher needs the writer")?;
     let led = Instant::now();
@@ -574,6 +629,22 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
     if !bootstrapped {
         // The first leader publishes the first checkpoint at once. It holds `etcd/members`.
         progress.request(1);
+    }
+    // The newest checkpoint that this publisher sent. It does not send one twice.
+    let mut sent = None;
+    // A writer that stopped before its announcement committed can leave a stranded
+    // checkpoint. A new writer announces it, so the members do not wait for more writes.
+    if !reannounce(
+        &admin,
+        &source,
+        &applied,
+        &mut sent,
+        &mut bootstrapped,
+        &events,
+    )
+    .await?
+    {
+        return Ok(());
     }
     let mut status = db.subscribe();
     loop {
@@ -588,12 +659,27 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
                 changed = status.changed() => changed?,
             },
         }
-        if progress.take_flush(max_age) {
+        let (flush, requested) = progress.take_flush(max_age);
+        if flush {
             db.flush().await?;
         }
         // SlateDB also flushes a full memtable by itself. Each advance gets one checkpoint.
         let last = db.manifest().last_l0_seq();
         if last <= published {
+            // A request with no new checkpoint can wait for a stranded one.
+            if requested
+                && !reannounce(
+                    &admin,
+                    &source,
+                    &applied,
+                    &mut sent,
+                    &mut bootstrapped,
+                    &events,
+                )
+                .await?
+            {
+                return Ok(());
+            }
             continue;
         }
         let options = CheckpointOptions {
@@ -626,6 +712,7 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
         {
             return Ok(());
         }
+        sent = Some(checkpoint.id);
         let views = view_checkpoints(&admin).await?.len();
         if let Some(gauge) = &retained {
             gauge.set(views as i64);
@@ -637,6 +724,37 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
                 .await?;
         }
     }
+}
+
+/// Announce a stranded checkpoint that this publisher did not send yet. Return false when the
+/// node no longer takes events.
+async fn reannounce(
+    admin: &slatedb::admin::Admin,
+    source: &Source,
+    applied: &Applied,
+    sent: &mut Option<uuid::Uuid>,
+    bootstrapped: &mut bool,
+    events: &mpsc::Sender<Event>,
+) -> Result<bool> {
+    // The next request or writer checks again. A failed check does not stop the writer.
+    let id = match stranded(admin, source, applied).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return Ok(true),
+        Err(error) => {
+            tracing::warn!(%error, "cannot check for a stranded view checkpoint");
+            return Ok(true);
+        }
+    };
+    if *sent == Some(id) {
+        return Ok(true);
+    }
+    tracing::info!(checkpoint = %id, "announce a stranded view checkpoint");
+    if !*bootstrapped {
+        source.mark_bootstrapped(id).await?;
+        *bootstrapped = true;
+    }
+    *sent = Some(id);
+    Ok(events.send(Event::ViewCheckpoint(id)).await.is_ok())
 }
 
 /// Bring Raft's voters and learners to `target` with single membership changes.
@@ -1044,7 +1162,12 @@ impl Node {
             .last()
             .map_or(0, |(seq, _)| *seq);
         dst.bootstrapped = writer.source.bootstrapped().await?;
-        dst.pending = None;
+        // A new writer announces a stranded checkpoint, as `publish` does.
+        dst.pending = stranded(&writer.admin, &writer.source, &writer.applied).await?;
+        if let (Some(id), false) = (dst.pending, dst.bootstrapped) {
+            writer.source.mark_bootstrapped(id).await?;
+            dst.bootstrapped = true;
+        }
         dst.db = Some(db);
         Ok(true)
     }
@@ -1217,22 +1340,25 @@ mod tests {
         let long = Duration::from_secs(60);
         // An idle writer has no deadline and no flush.
         assert_eq!(progress.deadline(long), None);
-        assert!(!progress.take_flush(Duration::ZERO));
+        assert_eq!(progress.take_flush(Duration::ZERO), (false, false));
         progress.wrote(1);
         let deadline = progress.deadline(long).unwrap();
         progress.wrote(2);
         // A later write keeps the deadline of the oldest unflushed write.
         assert_eq!(progress.deadline(long), Some(deadline));
-        assert!(!progress.take_flush(long));
-        assert!(progress.take_flush(Duration::ZERO));
-        assert!(!progress.take_flush(Duration::ZERO));
+        assert_eq!(progress.take_flush(long), (false, false));
+        assert_eq!(progress.take_flush(Duration::ZERO), (true, false));
+        assert_eq!(progress.take_flush(Duration::ZERO), (false, false));
         assert_eq!(progress.deadline(long), None);
         // A request waits until the materializer writes its sequence.
         progress.request(3);
-        assert!(!progress.take_flush(long));
+        assert_eq!(progress.take_flush(long), (false, false));
         progress.wrote(3);
-        assert!(progress.take_flush(long));
-        assert!(!progress.take_flush(long));
+        assert_eq!(progress.take_flush(long), (true, true));
+        assert_eq!(progress.take_flush(long), (false, false));
+        // A request that the written sequence already covers is due at once.
+        progress.request(2);
+        assert_eq!(progress.take_flush(long), (true, true));
     }
 
     /// Read `/status` from the client listener.
@@ -1626,6 +1752,101 @@ mod tests {
         }
         writer.sync(false, 2, &events);
         writer.stop().await;
+        state.close().await.unwrap();
+    }
+
+    /// A writer creates the first checkpoint and stops before its announcement reaches Raft.
+    /// With no more writes, the next writer announces it. The base
+    /// advances and a physical compaction waiter ends. The adopted checkpoint causes no further
+    /// announcement, also from a later writer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_new_writer_announces_a_stranded_checkpoint() {
+        let options = crate::state::shared::Options {
+            quota: 0,
+            voters: vec![1],
+            join: false,
+            empty_log: false,
+            pin_max: Duration::from_secs(300),
+        };
+        let mut state = StateMachine::open_shared(
+            Arc::new(InMemory::new()),
+            "root",
+            "test",
+            crate::state::StateCache::default(),
+            &options,
+            crate::state::transfer::Backend::Local,
+        )
+        .await
+        .unwrap();
+        state.members = Arc::new(crate::cluster::Store::initial(
+            &[(1, "127.0.0.1:1".to_owned())].into(),
+        ));
+        state.apply(1, None).await.unwrap();
+        let handles = state.shared_handles().unwrap();
+        let (events, mut received) = mpsc::channel(64);
+        let max_age = Duration::from_millis(50);
+        let clock = Clock::system(Duration::from_secs(5), None);
+        async fn announcement(received: &mut mpsc::Receiver<Event>, wait: Duration) -> uuid::Uuid {
+            tokio::time::timeout(wait, async {
+                loop {
+                    if let Some(Event::ViewCheckpoint(id)) = received.recv().await {
+                        return id;
+                    }
+                }
+            })
+            .await
+            .expect("an announcement")
+        }
+        // The first writer publishes a checkpoint at index 1. Its announcement is lost.
+        let mut first = Writer::new(&handles, max_age, clock.clone());
+        first.sync(true, 2, &events);
+        let lost = announcement(&mut received, Duration::from_secs(20)).await;
+        first.sync(false, 2, &events);
+        first.stop().await;
+        // A physical compaction waits for a base that covers index 1.
+        let mut based = handles.based.clone();
+        assert_eq!(*based.borrow(), 0);
+        let waiter = tokio::spawn(async move { based.wait_for(|base| *base >= 1).await.is_ok() });
+        // The next writer has nothing to write. Its open, or at the latest the request through
+        // index 1, announces the stranded checkpoint.
+        let mut second = Writer::new(&handles, max_age, clock.clone());
+        second.sync(true, 3, &events);
+        second.progress.wait_written(1).await.unwrap();
+        second.request_publication(1);
+        assert_eq!(
+            announcement(&mut received, Duration::from_secs(2)).await,
+            lost
+        );
+        state
+            .apply_view_checkpoint(2, &lost.to_string())
+            .await
+            .unwrap();
+        state.settle_opens().await;
+        state.switch_base();
+        assert!(tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap());
+        // Requests over several flush ages do not announce the adopted checkpoint again.
+        for _ in 0..4 {
+            second.request_publication(1);
+            tokio::time::sleep(max_age).await;
+        }
+        assert!(received.try_recv().is_err());
+        second.sync(false, 3, &events);
+        second.stop().await;
+        // A later writer does not announce it either.
+        let mut third = Writer::new(&handles, max_age, clock);
+        third.sync(true, 4, &events);
+        third.progress.wait_written(1).await.unwrap();
+        for _ in 0..4 {
+            third.request_publication(1);
+            tokio::time::sleep(max_age).await;
+        }
+        assert!(received.try_recv().is_err());
+        assert!(third.tasks.try_join_next().is_none());
+        third.sync(false, 4, &events);
+        third.stop().await;
         state.close().await.unwrap();
     }
 
