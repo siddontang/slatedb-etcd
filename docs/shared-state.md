@@ -99,18 +99,26 @@ The design depends on these rules. Later sections refer to them by number.
   the claim. Each member's local binding repeats the mode and root. A member with a different
   mode or root refuses to start.
 - `shared` requires S3. All members must use the same bucket, endpoint, region, and prefix.
-- Every member needs read and write access to `shared/state/`, because any voter can become the
+- Every voter needs read and write access to `shared/state/`, because any voter can become the
   leader. Per-member write isolation is lost. See [Costs](#costs-and-trade-offs).
+- Scope each voter's credentials to its own cluster prefix. A learner can use read-only
+  credentials. Promotion checks write access before the learner can lead.
+- A credential that can delete objects can delete the data of every member. Keep recovery
+  copies under separate credentials.
+- A member refuses to open an existing cluster in a different mode.
 - `replicated` stays the default and keeps the current `member-<id>/state-N` layout.
 
 ## Bootstrap
 
 1. The first leader creates `shared/state` when it opens the writer.
-2. Before a checkpoint exists, every member uses an empty base. Its overlay starts at index 1,
+2. The first entry that every member applies writes `etcd/members` from the bootstrap
+   configuration. All members start from the same configuration, so they write the same row.
+   Today each member writes it at its own next batch (`node.rs:328-336`).
+3. Before a checkpoint exists, every member uses an empty base. Its overlay starts at index 1,
    and its log holds every entry.
-3. The first leader flushes and publishes the first checkpoint at once. It then writes
+4. The first leader flushes and publishes the first checkpoint at once. It then writes
    `shared/bootstrap.json`.
-4. After `bootstrap.json` exists, a member never starts from an empty base. If it finds no
+5. After `bootstrap.json` exists, a member never starts from an empty base. If it finds no
    checkpoint, it stops with an error. This prevents a replay onto empty state.
 
 ## Overlay
@@ -127,13 +135,27 @@ not store commands.
 - A segment is released when its whole range is at or below `F` of the oldest checkpoint that a
   live view uses (invariant 4). A group that spans `F` stays until a later base covers it.
 
-**Memory limit.** `--overlay-max-bytes`, default 1 GiB, is checked only when the leader admits a
-new proposal. Over the limit, the leader rejects new client proposals with the existing
-retryable admission error. `ViewCheckpoint` proposals are exempt. Apply of committed entries
-never waits for overlay memory. A wait there could block the very entry that frees the memory.
+**Memory limit.** The overlay is one part of a member memory budget. On the leader the budget
+also counts the `Db` memtable and the materializer backlog. `--overlay-max-bytes`, default
+1 GiB, is checked only when the leader admits a new proposal. Over the limit, the leader
+rejects new client proposals with the existing retryable admission error. `ViewCheckpoint`
+proposals are exempt. Apply of committed entries does not wait for this limit. A wait there could
+block the very entry that frees the memory. Only the hard limit below pauses apply.
 
-A follower over the limit does not block. It **rebases**: it opens the newest checkpoint and
-makes it the base, as in [Rebase](#rebase).
+A member over the limit, leader or follower, frees memory in this order:
+
+1. Switch to the newest checkpoint if it is above the base. This releases the covered segments.
+2. Cancel the oldest reads and Watch scans that pin an old base, with a retryable error.
+   Watch streams resume from their last delivered revision on a new view.
+3. If the overlay is still over the hard limit, `2 × --overlay-max-bytes`, pause apply. The
+   committed entries stay in the durable log, and Raft continues to persist and acknowledge
+   new entries. Reads that wait for apply time out with the existing retryable error.
+4. While paused, poll the checkpoint list. When a checkpoint above `applied` appears and the
+   local commit index reaches it, [rebase](#rebase) onto it and resume.
+
+Step 3 bounds memory during an S3 stall even when the member already has the newest base.
+Step 4 ends the pause without the paused entries, so it cannot deadlock on an unapplied
+`ViewCheckpoint`.
 
 ## Views and reads
 
@@ -177,6 +199,12 @@ memtable insert.
 background open of `reader(checkpoint)`. It changes no etcd state and does not advance the KV
 revision. The checkpoint covers only entries below this entry, so the member has applied them.
 
+In shared mode an entry that changes no state writes **no batch**. This covers empty entries and
+`ViewCheckpoint`. Today such entries still write `meta/applied`. Here that write would make the
+memtable dirty, and the age flush would then publish a checkpoint for it. Each announcement
+would cause the next one on an idle cluster. `applied` still advances in memory, and `F` stays
+the index of the last state change.
+
 ## Determinism
 
 Today two inputs to apply differ by member. Each member keeps its own state, so the difference
@@ -212,7 +240,8 @@ The publisher makes one checkpoint for each flush. The flush rate therefore sets
 rate.
 
 1. Flush when the oldest unflushed batch is older than `--view-max-age` (default 10 s). SlateDB
-   also flushes on its own when a memtable reaches `l0_sst_size_bytes` (64 MiB).
+   also flushes on its own when a memtable reaches `l0_sst_size_bytes` (64 MiB). While a
+   checkpoint is being published, later flushes join the next publication.
 2. When `last_l0_seq` advances, call `create_checkpoint(Durable)` with the name
    `view-<checkpoint-id>`. `Durable` does not force another flush.
 3. When the call returns, read `F` from the checkpoint's own `meta/applied`. Do not use the
@@ -221,6 +250,10 @@ rate.
 4. Propose `ViewCheckpoint { checkpoint }`.
 5. Also publish after each configuration change, so a checkpoint holds each new membership.
    This replaces the forced checkpoint after a membership change (`node/schedule.rs:65-66`).
+
+The publisher acts only on progress that a state change made. No-op entries write no batch,
+so they never start a flush or a checkpoint. A test writes once and then waits several age
+intervals. It must see exactly one checkpoint and one announcement.
 
 An idle cluster makes no new checkpoints. Light writes make one each `--view-max-age`. Heavy
 writes make one for each 64 MiB memtable, a flush that also happens today. A checkpoint costs
@@ -232,16 +265,21 @@ It also makes smaller L0 SSTs and more compaction.
 Each batch also writes `meta/applied-term`, the term of its last entry. A checkpoint is
 therefore self-describing. Its `meta/applied`, `meta/applied-term`, and `etcd/members` give the
 index, term, and ConfState that a Raft snapshot record needs. Take the ConfState from
-`etcd/members` in the checkpoint, not from the member's current configuration.
+`etcd/members` in the checkpoint, not from the member's current configuration. The publisher
+refuses to announce a checkpoint without `etcd/members`, and install rejects one.
 
 ## Checkpoint retention
 
 Checkpoints have **no lifetime**. Only explicit deletion removes them. An idle cluster and a
 cluster with no leader therefore keep their checkpoints.
 
-- Each member reports its base checkpoint ID to the leader on the peer stream (`ViewAck`).
-- The publisher keeps the two newest checkpoints and every base that a member reported in the
-  last 10 minutes. It deletes the rest.
+- Each member reports every checkpoint that a live view still pins to the leader on the peer
+  stream (`ViewAck`). A long read or Watch scan on an old view therefore keeps its checkpoint.
+- A view can pin a checkpoint for at most `--view-pin-max` (default 5 minutes). After that the
+  read fails with a retryable error, and a Watch stream resumes from its last delivered revision
+  on a new view.
+- The publisher keeps the two newest checkpoints and every checkpoint that a member reported in
+  the last 10 minutes. It deletes the rest.
 - A member that has not reported for 10 minutes loses this protection. It can then hit a missing
   SST and [rebase](#rebase).
 - Before each deletion, the publisher reads the manifest and checks that it still holds the
@@ -272,8 +310,8 @@ mode a missing SST rebases the member instead. Every other storage error still s
 
 1. Stop apply and fail pending local reads with a retryable error.
 2. Open the newest `view-` checkpoint `C`.
-3. Install `C` as in [Install](#install).
-4. Resume apply above `F(C)`.
+3. [Install](#install) `C`: a local rebuild if `F(C) <= applied`, otherwise an adopt.
+4. Resume apply above the new `applied`.
 
 A rebase rescans the live data. It is the cost of losing a base, not of a leader change.
 
@@ -292,19 +330,38 @@ A rebase rescans the live data. It is the cost of losing a base, not of a leader
 
 ## Install
 
-Install sets a member's base to checkpoint `C` and drops its overlay. Raft snapshot receipt,
-rebase, and restart use it.
+Install sets a member's base to checkpoint `C` and drops its overlay. It has two forms. They
+differ in whether the Raft log changes.
+
+**Common steps:**
 
 1. Build the derived state from `reader(C)`. This is a reader variant of
    `StateMachine::open_at` (`state.rs:253-269`). It makes a new `RowCache`, invalidates the Watch
    capture, and clears the compaction plan.
 2. Load the quota counter from `meta/logical-bytes`. Shared mode writes this row in each batch,
    so install does not scan every `etcd/` row (`state/maintenance.rs:448`).
-3. Set `applied = F(C)`. If the local commit index is below `F(C)`, or the local term at `F(C)`
-   differs from the checkpoint term, write a Raft snapshot record from the checkpoint, set the
-   commit index to `F(C)`, and drop the local log through `F(C)`. Raft resolves any later
-   conflicts as for a received snapshot. `F(C)` is committed, because only committed entries
-   reach the shared `Db`.
+
+**Local rebuild, `F(C) <= applied`.** Rebase and restart use this form. The Raft log does not
+change.
+
+- Set the state to `F(C)` and replay the local log from `F(C) + 1` to the old `applied`.
+- Hold reads and Watch behind a barrier until the replay reaches the old `applied`. The barrier
+  keeps a client from seeing state older than a result it already has.
+- Watch capture drops the replayed events at or below the last published revision, so no stream
+  gets an event twice.
+
+**Adopt ahead of the log, `F(C) > applied`.** A received Raft snapshot, a paused member, and a
+restart with a short log use this form. It follows the Raft snapshot restore rules:
+
+- If the local log holds an entry at `F(C)` with the checkpoint term, keep the entries after it.
+  Otherwise discard the whole log. An entry above a mismatched `F(C)` can come from a deposed
+  term and has lost its prefix.
+- Persist the snapshot record, its ConfState, the commit index `F(C)`, and the log change in one
+  synced raft-engine batch. A crash leaves either the old log or the new boundary.
+- `F(C)` is committed, because only committed entries reach the shared `Db`.
+
+A test crashes the member right after the adopt batch and then forces an election. The member
+must not vote with, or replicate, a discarded entry.
 
 `KeyIndex::load` reads current rows with their values (`state/key_index.rs:82-90`). Install
 time therefore grows with the live data size. It does not grow with history or SST count.
@@ -323,8 +380,8 @@ time therefore grows with the live data size. It does not grow with history or S
 5. Start the materializer and the publisher.
 
 Client writes do not wait for steps 2–4. Proposals commit to the log and apply to the overlay at
-once. The overlay limit applies only to new proposals, so a slow S3 open delays rejection, not
-apply. The visible failover time stays one election.
+once. A slow S3 open grows the overlay until the memory limits apply. The failover test in
+[Tests](#tests) must confirm that the first write succeeds after one election.
 
 **What the old leader can still do after the fence:**
 
@@ -369,7 +426,8 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
 
 1. Read the base from the local Raft snapshot record. If that checkpoint was deleted, take the
    newest `view-` checkpoint. If none exists and `bootstrap.json` exists, stop with an error.
-2. [Install](#install) the base.
+2. [Install](#install) the base. If the local log ends below `F` or its term at `F` differs,
+   this is an adopt. Otherwise it is a local rebuild with nothing to replay yet.
 3. Replay committed log entries above `F` into the overlay. This is the current replay path with
    the overlay as its target.
 
@@ -390,7 +448,7 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
 | --- | --- |
 | Leader crashes with unflushed batches | The new leader materializes them from its overlay |
 | Old leader is partitioned | It cannot commit L0 changes. Its uploads are orphans |
-| S3 is slow or down | New proposals fail when the leader overlay is full. Apply continues |
+| S3 is slow or down | New proposals fail at the soft limit. Apply pauses at the hard limit |
 | A member stops reporting its base | Its base can be deleted. It rebases on a missing SST |
 | A checkpoint open fails | The member keeps its base and tries the next checkpoint |
 | No writes for a long time | Checkpoints have no lifetime, so all bases stay valid |
@@ -411,7 +469,7 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
 - **Snapshot install:** no data copy. It reads the live rows to rebuild the key index.
 - **Fault domain:** members no longer hold independent copies. A writer bug or an object loss
   affects all members. HashKV can still detect divergent apply, but not storage corruption.
-- **Isolation:** every member can write the shared prefix.
+- **Isolation:** every voter can write the shared prefix.
 - **Clocks:** leader changes depend on bounded clock skew between hosts.
 - **Two code paths:** local mode keeps the replicated design. Both need tests.
 
@@ -444,6 +502,15 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
   materializer and publisher step, two writers in reverse term order, and crashes before and
   after each checkpoint. Delete checkpoints under a lagging member. Finish base opens out of
   order. Fill the overlay on the leader and on a follower.
+- **Feedback loop:** write once, then wait several `--view-max-age` intervals. Exactly one
+  checkpoint and one announcement must appear.
+- **Pinned reads:** hold a range read and a Watch catch-up open across several base switches and
+  GC runs. The read must succeed or fail with a retryable error. The Watch must resume with no
+  gap and no duplicate.
+- **S3 stall:** stall S3 under write load with one old view pinned. Measure peak memory, check
+  the pause, and check recovery after S3 returns.
+- **Adopt and crash:** adopt a checkpoint above a conflicting log suffix, crash, and force an
+  election. Also restart three voters after the first checkpoint with no membership change.
 - **Idle and leaderless runs:** stop writes, or stop all voters, for longer than every retention
   window. Then restart members and add a learner.
 - **Clocks:** skew host clocks in DST. Check the writer wait, the skew limit, and GC.
@@ -452,17 +519,26 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
 - **Integration:** three members on RustFS or MinIO. Run the linearizability checks during kill,
   partition, and leader-transfer schedules.
 - **Benchmarks:** compare replicated and shared mode on `lai7-8c32`. Measure S3 bytes, S3 PUTs,
-  follower and leader RSS, failover time, snapshot install time, and read p99.
+  follower and leader peak RSS, snapshot install time, and read p99.
+- **Failover:** measure the time to the first successful write after an election with a nearly
+  full overlay. Do not claim one-election failover before this passes.
+- **View age:** compare 10 s and 30 s under light writes and bursts. Choose the release default
+  from follower peak memory, retained log bytes, S3 requests, compaction bytes, and write p99.
+- **Recovery:** restore a cluster after loss of the shared prefix at the target data size. The
+  native backup limit is 64 MiB today, so production use needs a larger backup path.
 
-## Open questions
+## Decisions
 
-1. Is about 2× the unflushed data on the leader acceptable? The alternative is a rescan on each
-   leader change.
-2. Default `--view-max-age` of 10 s. It sets follower memory and log retention against
-   compaction work.
-3. Is shared mode for new clusters only acceptable in the first release? The converter comes in
-   Phase 4.
-4. Is it acceptable that every member can write the shared prefix?
+Sig-Codex recommended these answers. They are open until the owner accepts them.
+
+1. **Leader memory:** accept about 2× the unflushed data for the prototype. Slow uploads, queued
+   writes, and long reads can retain more, so enforce a total memory budget and measure peak RSS.
+2. **View age:** start with a 10 s maximum age for dirty data, with no timer work when idle.
+   Choose the release default from the 10 s and 30 s comparison in [Tests](#tests).
+3. **Scope:** shared mode for new clusters only in the first release. Replicated mode stays the
+   default.
+4. **Write access:** all voters of one trusted cluster share write access, with the credential
+   rules in [Storage layout and mode](#storage-layout-and-mode).
 
 ## Appendix: SlateDB 0.18.1 facts
 
