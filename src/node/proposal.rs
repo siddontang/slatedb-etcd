@@ -85,6 +85,11 @@ impl Group {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    /// Bytes the group charges against the pending log quota.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
 }
 
 impl Node {
@@ -468,24 +473,62 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn large_puts_wait_before_raft_would_drop_them() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut node = super::super::tests::leader_node(dir.path()).await;
-        // 300 x 64 KiB is more than Raft's former 16 MiB uncommitted limit. The second
-        // voter never acknowledges, so nothing commits and every reply must stay open.
+    /// A second voter is unavailable, and each 64 KiB put reaches the local disk before the
+    /// next one. 600 puts are more than Raft's 32 MiB uncommitted limit. Each put must wait
+    /// for a quorum: none fails, and all complete in order when the voter returns.
+    async fn large_puts_wait_for_a_quorum(node: &mut Node) {
         let mut replies = Vec::new();
-        for _ in 0..300 {
-            replies.push(waiting_put(&mut node, vec![7; 64 * 1024]));
-            node.flush_puts();
+        for _ in 0..600 {
+            replies.push(waiting_put(node, vec![7; 64 * 1024]));
+            node.drive_ready().await.unwrap();
+            node.drain_log().await.unwrap();
+            assert!(node.raw.raft.raft_log.unstable_entries().is_empty());
+            assert_eq!(node.log_bytes, 0);
         }
-        for mut reply in replies {
+        for reply in &mut replies {
             match reply.try_recv() {
                 Err(oneshot::error::TryRecvError::Empty) => {}
-                other => panic!("a put was answered before it committed: {other:?}"),
+                other => panic!("a put was answered before a quorum: {other:?}"),
             }
         }
-        assert!(!node.waiting_proposals.requests.is_empty());
+        assert!(!node.waiting_proposals.is_empty());
+        assert!(node.raw.raft.uncommitted_size() <= log::MAX_BYTES + apply::BATCH_BYTES as usize);
+        // The voter returns. Every held put is proposed, committed, and answered.
+        for _ in 0..100 {
+            if node.waiting_proposals.is_empty() && node.pending.is_empty() {
+                break;
+            }
+            commit_all(node).await;
+        }
+        assert!(node.waiting_proposals.is_empty());
+        let mut last = 0;
+        for reply in replies {
+            let revision = revision(reply.await.unwrap());
+            assert!(revision > last);
+            last = revision;
+        }
+    }
+
+    #[tokio::test]
+    async fn large_puts_wait_for_a_quorum_after_the_local_log_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = super::super::tests::leader_node(dir.path()).await;
+        large_puts_wait_for_a_quorum(&mut node).await;
+        // The pending log quota holds unapplied entries, so it stops writers first here.
+        assert!(node.backlog_rejects[4] > 0);
+    }
+
+    #[tokio::test]
+    async fn large_puts_wait_for_a_quorum_with_a_large_pending_log_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = super::super::tests::leader_node_with(dir.path(), |options| {
+            options.log_memory.pending_bytes = 256 * 1024 * 1024;
+        })
+        .await;
+        large_puts_wait_for_a_quorum(&mut node).await;
+        // Only Raft's uncommitted bytes stop writers before Raft would drop them.
+        assert!(node.backlog_rejects[3] > 0);
+        assert_eq!(node.backlog_rejects[4], 0);
     }
 
     #[tokio::test]

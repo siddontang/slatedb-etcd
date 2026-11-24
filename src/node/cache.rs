@@ -293,6 +293,18 @@ impl Cache {
         }
     }
 
+    /// Return true when unapplied entries, with unstable entries not staged yet and
+    /// `proposal_bytes`, use half or more of the pending quota. Writers wait then, so the
+    /// quota does not fail a write that is held until a quorum or apply returns.
+    pub fn pending_half_full(&self, unstable: &[Entry], proposal_bytes: usize) -> bool {
+        let unstaged: usize = unstable
+            .iter()
+            .filter(|entry| entry.index > self.last)
+            .map(charge)
+            .sum();
+        self.pending_bytes + unstaged + proposal_bytes >= self.limits.pending_bytes / 2
+    }
+
     pub fn admits(&self, unstable: &[Entry], incoming: &[Entry], proposal_bytes: usize) -> bool {
         if incoming
             .iter()

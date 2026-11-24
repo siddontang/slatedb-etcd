@@ -569,9 +569,19 @@ async fn dropping_the_node_cancels_an_active_worker() {
 }
 
 pub(super) async fn leader_node(dir: &std::path::Path) -> Node {
+    leader_node_with(dir, |_| {}).await
+}
+
+/// Like `leader_node`, but `configure` can change the node options first.
+pub(super) async fn leader_node_with(
+    dir: &std::path::Path,
+    configure: impl FnOnce(&mut NodeOptions),
+) -> Node {
     seed_log(dir, 1);
+    let mut config = options(dir);
+    configure(&mut config);
     let (events, _) = mpsc::channel(256);
-    let mut node = Node::open_with_transport(options(dir), events, Some(BTreeMap::new()))
+    let mut node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
         .await
         .unwrap();
     node.raw.campaign().unwrap();
