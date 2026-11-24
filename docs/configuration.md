@@ -141,6 +141,8 @@ checkpoint of it, its base, under an in-memory overlay of the newer applied batc
 | `--view-max-age` | `10s` | Age of the oldest unflushed write that starts a flush and checkpoint. |
 | `--view-pin-max` | `5m` | Age after which a read view fails with a retryable error. |
 | `--overlay-max-bytes` | 1073741824 | Leader admission limit of the overlay. Apply waits at 2x. |
+| `--max-clock-skew` | `5s` | A new writer does not start with its clock this far behind. |
+| `--view-retention` | `off` | `off` keeps all view checkpoints. `fenced` deletes unpinned ones. |
 
 Rules and limits:
 
@@ -150,14 +152,56 @@ Rules and limits:
 - On S3, `mode.json` under the cluster prefix fixes the mode before any state write. A shared start
   also refuses a prefix that holds a replicated member namespace.
 - A directory keeps its mode. A member refuses to start in a different mode.
-- The leader opens the writer when it takes the lead. Phase 2 rejects MoveLeader, because phase 3
-  adds the fencing checks of a leader change.
+- The leader opens the writer when it takes the lead. The open fences the old writer. The leader
+  then checks that it still leads the same term, and waits until its clock passes the manifest
+  clock. A fence while it still leads opens the writer again.
+- Over `--max-clock-skew`, the writer does not start. The member logs an error, sets
+  `clock_alarm` in `/status`, exports `slatedb_etcd_shared_clock_skew_milliseconds`, and tries
+  again each second.
+- MoveLeader first requests a checkpoint of the applied state. It transfers the lead when the
+  applied base covers the applied index of the request, or 3 s after the newest pending
+  MoveLeader request even if the base still trails that index. The new leader then materializes
+  the overlay above the base. The request fails after 10 s if the target does not lead.
+- A new writer, and each explicit publication request, announces the newest checkpoint again
+  when no applied announcement or base covers it. A writer that stopped after a checkpoint and
+  before its announcement committed leaves such a checkpoint.
+- Raft can drop an announcement proposal, for example during a leader transfer. The writer then
+  announces the checkpoint again after a backoff from 100 ms to 2 s, also on an idle cluster. A
+  failed check of the checkpoint list is also tried again. After Raft takes a proposal, the
+  writer checks again after 2 s. A writer does not announce a checkpoint again when the leader
+  applied its announcement, or when its index is at or below the leader's base.
+- A member opens announced checkpoints one at a time. A started open runs to its end, so the
+  base advances under a steady stream of announcements. Only the newest announced checkpoint
+  waits for the next open. A failed open tries again after a backoff from 100 ms to 2 s, also
+  when the member is idle, unless a newer checkpoint waits.
+- Two writer opens can race for the same manifest version. A leader that loses the race opens
+  the writer again, as after a fence.
 - Each member truncates its log through the index of its base checkpoint. Its Raft snapshot names
   that checkpoint. A member that receives the snapshot opens the checkpoint and adopts it.
 - A restart opens the newest checkpoint. It adopts the checkpoint when the log ends below it.
 - A missing checkpoint object fails a read with a retryable error. In apply it rebuilds the
   state from the newest checkpoint and replays the local log.
+- A member that waits on its overlay limit adopts a newer checkpoint in process when its log
+  commits the checkpoint index.
 - Manual checkpoints, Defragment, and snapshot restore are unavailable.
+
+### View checkpoint retention
+
+Automatic deletion of `view-` checkpoints is off by default. SlateDB 0.18.1 deletes a
+checkpoint without a writer epoch check. A deposed leader can pass its own epoch check, and a new
+leader can take the writer before the deletion. The deletion can then remove a checkpoint that a
+member of the new leader pins.
+
+- Each kept checkpoint pins its SSTs, so object storage grows with the number of checkpoints.
+  `slatedb_etcd_shared_view_checkpoints` reports their number after each publication.
+- `--view-retention fenced` deletes old checkpoints that no member reported in the last 10
+  minutes. It checks the writer epoch before each deletion, and a new leader waits 10 seconds
+  for member reports first. The race above remains.
+- Manual cleanup is safe with the whole cluster stopped. Keep the newest checkpoint and the
+  checkpoint of each member's Raft snapshot record, then delete older `view-` checkpoints with
+  the SlateDB admin API. Start the members again after the deletion.
+- Checkpoint expiry is future work. It needs recovery after an offline period longer than the
+  lifetime, and follower reads across missed renewals.
 - `object::Config::SharedDirectory` lets members of one host share a local directory in tests.
   A member-local store serves one voter.
 

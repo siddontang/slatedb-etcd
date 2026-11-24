@@ -91,8 +91,9 @@ impl Progress {
         Some(self.inner.lock().unwrap().dirty_since? + max_age)
     }
 
-    /// Return true when a flush is due, and clear the causes that it covers.
-    fn take_flush(&self, max_age: Duration) -> bool {
+    /// Return whether a flush is due, and whether a request is one of its causes. Clear the
+    /// causes that it covers.
+    fn take_flush(&self, max_age: Duration) -> (bool, bool) {
         let written = self.written();
         let mut inner = self.inner.lock().unwrap();
         let requested = inner
@@ -107,7 +108,7 @@ impl Progress {
         if requested || aged {
             inner.dirty_since = None;
         }
-        requested || aged
+        (requested || aged, requested)
     }
 }
 
@@ -115,22 +116,29 @@ impl Progress {
 /// for `REPORT_LIFETIME`.
 type Reports = Arc<Mutex<HashMap<u64, (Instant, HashSet<uuid::Uuid>)>>>;
 
+/// A new leader deletes no checkpoint for this time. Each member reports twice in it, so the
+/// leader knows the pins of the members before it deletes.
+const RETENTION_GRACE: Duration = Duration::from_secs(2 * REPORT_TICKS * 100 / 1000);
+
 /// A member's report protects its checkpoints for this time after it arrives.
 const REPORT_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
 /// The shared-mode tasks of one member. Only the leader runs the writer.
 pub(super) struct Writer {
-    admin: Arc<slatedb::admin::Admin>,
+    pub(super) admin: Arc<slatedb::admin::Admin>,
     queue: Arc<Queue>,
     pub(super) source: Arc<Source>,
     progress: Arc<Progress>,
     max_age: Duration,
     /// Set while this member leads. Sending `true` closes the writer.
     stop: Option<tokio::sync::watch::Sender<bool>>,
-    tasks: tokio::task::JoinSet<Result<()>>,
+    /// Writer tasks with the term that started each one.
+    tasks: tokio::task::JoinSet<(u64, Result<()>)>,
     reports: Reports,
     /// `ViewCheckpoint` entries that this node proposed.
     pub announced: u64,
+    /// The applied base and announcement. The publisher announces a stranded checkpoint.
+    applied: Applied,
     /// The `F` of the newest base that opened. A change starts a switch job.
     opened: tokio::sync::watch::Receiver<u64>,
     opened_slot: Arc<crate::state::shared::Opened>,
@@ -141,11 +149,29 @@ pub(super) struct Writer {
     /// A paused member polls the checkpoint list. Only one poll runs at a time.
     polling: Arc<std::sync::atomic::AtomicBool>,
     ticks: u64,
+    /// The role and term of this member. The writer task checks them after its open.
+    leadership: tokio::sync::watch::Sender<(bool, u64)>,
+    /// The term of the running writer task.
+    term: u64,
+    pub(super) clock: Clock,
+    /// A leader transfer waits for a checkpoint that covers this batch sequence.
+    pub(super) transfer: Option<(u64, u64)>,
+    /// Writer opens after a fence while this member still led.
+    reopens: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) retention: crate::state::ViewRetention,
+    pub(super) retained: Option<prometheus::IntGauge>,
 }
 
 impl Writer {
-    pub fn new(handles: &Handles, max_age: Duration) -> Self {
+    pub fn new(handles: &Handles, max_age: Duration, clock: Clock) -> Self {
         Self {
+            leadership: tokio::sync::watch::channel((false, 0)).0,
+            term: 0,
+            clock,
+            transfer: None,
+            reopens: Arc::default(),
+            retention: crate::state::ViewRetention::Off,
+            retained: None,
             progress: Arc::new(Progress::new(0)),
             admin: handles.admin.clone(),
             queue: handles.queue.clone(),
@@ -155,6 +181,12 @@ impl Writer {
             tasks: tokio::task::JoinSet::new(),
             reports: Reports::default(),
             announced: 0,
+            applied: Applied {
+                based: handles.based.clone(),
+                announced: handles.announced.clone(),
+                #[cfg(test)]
+                failures: Arc::default(),
+            },
             opened: handles.opened.subscribe(),
             opened_slot: handles.opened.clone(),
             switch_due: false,
@@ -168,23 +200,24 @@ impl Writer {
         self.stop.is_some()
     }
 
-    /// Open the writer on the leader. Close it on any other member.
+    /// Open the writer on the leader of `term`. Close it on any other member.
     ///
-    /// The open fences an older writer. Phase 3 adds the term check after the open, the clock
-    /// check, and the reopen after a fence. Phase 2 rejects leader transfer instead.
-    pub fn sync(&mut self, leader: bool, events: &mpsc::Sender<Event>) {
-        if !leader {
+    /// The open fences an older writer. A task of an older term stops before the new one starts.
+    pub fn sync(&mut self, leader: bool, term: u64, events: &mpsc::Sender<Event>) {
+        self.leadership.send_replace((leader, term));
+        if !leader || self.term != term {
             if let Some(stop) = self.stop.take() {
                 stop.send_replace(true);
             }
+            self.transfer = None;
+        }
+        if !leader || self.running() {
             return;
         }
-        if self.running() {
-            return;
-        }
+        self.term = term;
         let (stop, stopped) = tokio::sync::watch::channel(false);
         self.stop = Some(stop);
-        self.tasks.spawn(lead(
+        let task = lead(
             Publisher {
                 db: None,
                 admin: self.admin.clone(),
@@ -192,11 +225,21 @@ impl Writer {
                 progress: self.progress.clone(),
                 max_age: self.max_age,
                 reports: self.reports.clone(),
+                retention: self.retention,
+                retained: self.retained.clone(),
+                applied: self.applied.clone(),
             },
-            self.queue.clone(),
-            events.clone(),
-            stopped,
-        ));
+            Leading {
+                queue: self.queue.clone(),
+                events: events.clone(),
+                stopped,
+                term,
+                leadership: self.leadership.subscribe(),
+                clock: self.clock.clone(),
+                reopens: self.reopens.clone(),
+            },
+        );
+        self.tasks.spawn(async move { (term, task.await) });
     }
 
     pub async fn stop(&mut self) {
@@ -238,6 +281,9 @@ impl Writer {
             "announced": self.announced,
             "running": self.running(),
             "paused": self.paused,
+            "clock_skew_ms": self.clock.skew.load(std::sync::atomic::Ordering::Relaxed),
+            "clock_alarm": self.clock.alarm.load(std::sync::atomic::Ordering::Relaxed),
+            "reopens": self.reopens.load(std::sync::atomic::Ordering::Relaxed),
             "reports": self.reports.lock().unwrap().len(),
         })
     }
@@ -268,17 +314,22 @@ pub(super) async fn next(writer: &mut Option<Writer>) -> WriterEvent {
         return std::future::pending().await;
     };
     let leading = writer.stop.is_some();
+    let current = writer.term;
     let failed = async {
         loop {
             match writer.tasks.join_next().await {
-                Some(Ok(Ok(()))) if !leading => continue,
-                // A newer writer can fence the old one before it sees the stop.
-                Some(Ok(Err(error))) if !leading => {
-                    tracing::warn!(%error, "the stopped shared writer failed");
+                // A task of an older term, or of a term that this member left, is obsolete. A
+                // newer writer can fence it before it sees its stop.
+                Some(Ok((term, result))) if !leading || term != current => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, term, "a stopped shared writer failed");
+                    }
                     continue;
                 }
-                Some(Ok(Ok(()))) => return anyhow::anyhow!("a shared state writer task stopped"),
-                Some(Ok(Err(error))) => return error.context("shared state writer failed"),
+                Some(Ok((_, Ok(())))) => {
+                    return anyhow::anyhow!("a shared state writer task stopped")
+                }
+                Some(Ok((_, Err(error)))) => return error.context("shared state writer failed"),
                 Some(Err(error)) if error.is_cancelled() => continue,
                 Some(Err(error)) => {
                     return anyhow::Error::from(error).context("shared state writer stopped")
@@ -299,35 +350,192 @@ pub(super) async fn next(writer: &mut Option<Writer>) -> WriterEvent {
     }
 }
 
-/// Open the writer, then materialize and publish until the member steps down.
-async fn lead(
-    mut publisher: Publisher,
+/// The clock check of a new writer. SlateDB starts a writer's clock at the manifest's
+/// `last_l0_clock_tick`, and a lagging clock makes each write wait and then fail.
+#[derive(Clone)]
+pub(super) struct Clock {
+    /// Milliseconds since the Unix epoch. Tests skew it.
+    pub now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
+    pub max_skew: Duration,
+    /// The last measured skew: `last_l0_clock_tick` minus the local time, at least zero.
+    pub skew: Arc<std::sync::atomic::AtomicI64>,
+    /// Set while the skew is over the limit and the writer does not start.
+    pub alarm: Arc<std::sync::atomic::AtomicBool>,
+    pub gauge: Option<prometheus::IntGauge>,
+}
+
+impl Clock {
+    pub fn system(max_skew: Duration, gauge: Option<prometheus::IntGauge>) -> Self {
+        Self {
+            now_ms: Arc::new(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_millis() as i64)
+            }),
+            max_skew,
+            skew: Arc::default(),
+            alarm: Arc::default(),
+            gauge,
+        }
+    }
+
+    /// Wait until the local clock passes `tick`. Return false, and raise the alarm, when the
+    /// local clock is behind by more than the limit.
+    pub async fn pass(&self, tick: i64) -> bool {
+        use std::sync::atomic::Ordering;
+        // A new database has the minimum tick, so the subtraction saturates.
+        let skew = tick.saturating_sub((self.now_ms)()).max(0);
+        self.skew.store(skew, Ordering::Relaxed);
+        if let Some(gauge) = &self.gauge {
+            gauge.set(skew);
+        }
+        if skew > self.max_skew.as_millis() as i64 {
+            if !self.alarm.swap(true, Ordering::Relaxed) {
+                tracing::error!(
+                    skew_ms = skew,
+                    "the local clock is behind the shared writer"
+                );
+            }
+            return false;
+        }
+        self.alarm.store(false, Ordering::Relaxed);
+        loop {
+            let behind = tick.saturating_sub((self.now_ms)());
+            if behind < 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis((behind as u64 + 1).min(100))).await;
+        }
+    }
+}
+
+/// The inputs of one leader term's writer task.
+struct Leading {
     queue: Arc<Queue>,
     events: mpsc::Sender<Event>,
-    mut stopped: tokio::sync::watch::Receiver<bool>,
-) -> Result<()> {
-    let db = tokio::select! {
-        db = publisher.source.open_writer() => Arc::new(db?),
-        _ = stopped.wait_for(|stop| *stop) => return Ok(()),
-    };
-    // The open starts at `last_l0_seq`. Unflushed writes of an older writer are lost, and the
-    // overlay holds them.
-    publisher.progress.reset(db.manifest().last_l0_seq());
-    publisher.db = Some(db.clone());
-    let result = tokio::select! {
-        result = materialize(db.clone(), queue, publisher.progress.clone()) => result,
-        result = publish(publisher, events) => result,
-        _ = stopped.wait_for(|stop| *stop) => Ok(()),
-    };
-    let closed = db
-        .close_with_options(slatedb::config::CloseOptions { flush_type: None })
-        .await;
-    result?;
-    // A writer that a newer leader fenced cannot close cleanly. Phase 3 reopens it.
-    if let Err(error) = closed {
-        tracing::warn!(%error, "cannot close the shared writer");
+    stopped: tokio::sync::watch::Receiver<bool>,
+    term: u64,
+    leadership: tokio::sync::watch::Receiver<(bool, u64)>,
+    clock: Clock,
+    reopens: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Wait until the member asks the writer task to stop. The result holds no borrow, so the task
+/// stays `Send` across later waits.
+async fn stop_requested(stopped: &mut tokio::sync::watch::Receiver<bool>) {
+    let _ = stopped.wait_for(|stop| *stop).await;
+}
+
+/// Return true when `error` is a lost manifest race: another writer wrote the manifest version
+/// that this open tried to write. SlateDB reports it as a data error, so the check uses its
+/// message.
+pub(super) fn open_conflict(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<slatedb::Error>().is_some_and(|error| {
+            error.kind() == slatedb::ErrorKind::Data
+                && error.to_string().contains("version already exists")
+        })
+    })
+}
+
+/// Return true when `error` comes from a writer that a newer writer fenced.
+pub(super) fn fenced(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<slatedb::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced)
+            )
+        })
+    })
+}
+
+/// Open the writer, then materialize and publish until the member steps down.
+///
+/// 1. The open increments the writer epoch, which fences an older writer.
+/// 2. After the open, the member must still lead the same term. Otherwise it closes the writer.
+/// 3. The local clock must pass the manifest's `last_l0_clock_tick`. Over the skew limit the
+///    writer does not start, and the task tries again later.
+/// 4. The materializer and the publisher start. A fence while this member still leads is not
+///    a storage failure: the task opens the writer again. Every other error stops the member.
+async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
+    let Leading {
+        queue,
+        events,
+        mut stopped,
+        term,
+        leadership,
+        clock,
+        reopens,
+    } = leading;
+    let current = || *leadership.borrow() == (true, term);
+    loop {
+        let opened = tokio::select! {
+            opened = publisher.source.open_writer() => opened,
+            _ = stop_requested(&mut stopped) => return Ok(()),
+        };
+        let db = match opened {
+            Ok(db) => Arc::new(db),
+            // A newer open fenced this one while the member still leads the same term.
+            // Two opens can also race for the same manifest version. The open that loses must
+            // read the new manifest and try again.
+            Err(error)
+                if (fenced(&error) || open_conflict(&error)) && current() && !*stopped.borrow() =>
+            {
+                tracing::warn!(term, %error, "the shared writer open was fenced; open it again");
+                reopens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let close = |db: Arc<slatedb::Db>| async move {
+            // A writer that a newer writer fenced cannot close cleanly. GC closes with it.
+            if let Err(error) = db
+                .close_with_options(slatedb::config::CloseOptions { flush_type: None })
+                .await
+            {
+                tracing::warn!(%error, "cannot close the shared writer");
+            }
+        };
+        // Apply and replies continued during the open. A later election ends this term.
+        if !current() {
+            close(db).await;
+            return Ok(());
+        }
+        let passed = tokio::select! {
+            passed = clock.pass(db.manifest().last_l0_clock_tick()) => passed,
+            _ = stop_requested(&mut stopped) => {
+                close(db).await;
+                return Ok(());
+            }
+        };
+        if !passed {
+            close(db).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
+                _ = stop_requested(&mut stopped) => return Ok(()),
+            }
+        }
+        // The open starts at `last_l0_seq`. Unflushed writes of an older writer are lost, and
+        // the overlay holds them.
+        let mut publisher = publisher.clone();
+        publisher.progress.reset(db.manifest().last_l0_seq());
+        publisher.db = Some(db.clone());
+        let result = tokio::select! {
+            result = materialize(db.clone(), queue.clone(), publisher.progress.clone()) => result,
+            result = publish(publisher, events.clone()) => result,
+            _ = stop_requested(&mut stopped) => Ok(()),
+        };
+        close(db).await;
+        match result {
+            // Two quick elections can open writers in reverse term order.
+            Err(error) if fenced(&error) && current() && !*stopped.borrow() => {
+                tracing::warn!(term, "the shared writer was fenced; open it again");
+                reopens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            result => return result,
+        }
     }
-    Ok(())
 }
 
 /// Copy overlay batches into the shared `Db` in order, each with its own sequence.
@@ -353,6 +561,7 @@ pub(super) async fn materialize(
     }
 }
 
+#[derive(Clone)]
 struct Publisher {
     db: Option<Arc<slatedb::Db>>,
     admin: Arc<slatedb::admin::Admin>,
@@ -360,6 +569,135 @@ struct Publisher {
     progress: Arc<Progress>,
     max_age: Duration,
     reports: Reports,
+    retention: crate::state::ViewRetention,
+    /// The number of `view-` checkpoints after the last publication.
+    retained: Option<prometheus::IntGauge>,
+    applied: Applied,
+}
+
+/// The applied state that a publisher checks before it announces a checkpoint again.
+#[derive(Clone)]
+struct Applied {
+    /// The `F` of the current base.
+    based: tokio::sync::watch::Receiver<u64>,
+    /// The checkpoint of the newest applied `ViewCheckpoint` entry.
+    announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
+    /// Checks that fail before they read storage, for tests.
+    #[cfg(test)]
+    failures: Arc<std::sync::atomic::AtomicU32>,
+}
+
+/// The first wait before the publisher checks an announcement again.
+const RETRY_MIN: Duration = Duration::from_millis(100);
+/// The longest wait between two checks.
+const RETRY_MAX: Duration = Duration::from_secs(2);
+
+/// The check of announcements that the publisher sent. An announcement can be lost: the node
+/// can drop its proposal, for example during a leader transfer, or a writer can stop before it
+/// commits. A sent checkpoint counts only after applied state shows it. Until then, the
+/// publisher checks again with a backoff from `RETRY_MIN` to `RETRY_MAX`, also on an idle
+/// cluster.
+struct Retry {
+    /// The checkpoint that the publisher announced last.
+    awaiting: Option<uuid::Uuid>,
+    /// The time of the next check, if one is due.
+    at: Option<Instant>,
+    backoff: Duration,
+}
+
+impl Retry {
+    /// A writer checks for a stranded checkpoint at its open.
+    fn new() -> Self {
+        Self {
+            awaiting: None,
+            at: Some(Instant::now()),
+            backoff: RETRY_MIN,
+        }
+    }
+
+    /// Check at once, for an explicit request.
+    fn now(&mut self) {
+        self.at = Some(Instant::now());
+    }
+
+    fn due(&self) -> bool {
+        self.at.is_some_and(|at| at <= Instant::now())
+    }
+
+    /// Check again after the backoff, and double it.
+    fn again(&mut self) {
+        self.at = Some(Instant::now() + self.backoff);
+        self.backoff = (self.backoff * 2).min(RETRY_MAX);
+    }
+
+    /// The publisher sent checkpoint `id`. Raft took the proposal if `accepted`. An entry in
+    /// the leader's log commits in its term, so the next check waits `RETRY_MAX`. A dropped
+    /// proposal is sent again after the backoff, which grows while the same checkpoint waits.
+    fn sent(&mut self, id: uuid::Uuid, accepted: bool) {
+        if accepted {
+            self.at = Some(Instant::now() + RETRY_MAX);
+        } else {
+            if self.awaiting != Some(id) {
+                self.backoff = RETRY_MIN;
+            }
+            self.again();
+        }
+        self.awaiting = Some(id);
+    }
+
+    fn done(&mut self) {
+        self.awaiting = None;
+        self.at = None;
+        self.backoff = RETRY_MIN;
+    }
+}
+
+/// Find a stranded checkpoint: the newest view checkpoint, when no applied announcement covers
+/// it. A writer that stops after a checkpoint and before its announcement commits leaves one.
+/// With no more writes, no newer checkpoint replaces it, and members wait for its base.
+///
+/// A checkpoint is not stranded when it is the newest announced one, when an announced one is
+/// at the same or a newer sequence, or when its `F` is at or below the current base. Thus an
+/// adopted checkpoint never causes a new announcement, and announcements cannot loop. A
+/// checkpoint without membership is not valid and is not stranded.
+async fn stranded(
+    admin: &slatedb::admin::Admin,
+    source: &Source,
+    applied: &Applied,
+) -> Result<Option<uuid::Uuid>> {
+    #[cfg(test)]
+    if applied
+        .failures
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |left| left.checked_sub(1),
+        )
+        .is_ok()
+    {
+        anyhow::bail!("an injected storage error");
+    }
+    let views = view_checkpoints(admin).await?;
+    let Some((seq, checkpoint)) = views.last() else {
+        return Ok(None);
+    };
+    let announced = *applied.announced.borrow();
+    if let Some(announced) = announced {
+        if views
+            .iter()
+            .any(|(other, view)| view.id == announced && other >= seq)
+        {
+            return Ok(None);
+        }
+    }
+    let base = source.open_base(checkpoint.id).await?;
+    if base.applied <= *applied.based.borrow() {
+        return Ok(None);
+    }
+    if base.get(crate::cluster::KEY).await?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(checkpoint.id))
 }
 
 /// Flush the shared `Db` when its oldest write reaches the age limit or on request. Create one
@@ -374,8 +712,13 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
         progress,
         max_age,
         reports,
+        retention,
+        retained,
+        applied,
     } = publisher;
     let db = db.context("the publisher needs the writer")?;
+    let led = Instant::now();
+    let epoch = db.manifest().writer_epoch();
     let mut published = view_checkpoints(&admin)
         .await?
         .last()
@@ -385,9 +728,16 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
         // The first leader publishes the first checkpoint at once. It holds `etcd/members`.
         progress.request(1);
     }
+    // A writer that stopped before its announcement committed can leave a stranded
+    // checkpoint. A new writer announces it, so the members do not wait for more writes.
+    let mut retry = Retry::new();
     let mut status = db.subscribe();
     loop {
-        match progress.deadline(max_age) {
+        let deadline = [progress.deadline(max_age), retry.at]
+            .into_iter()
+            .flatten()
+            .min();
+        match deadline {
             Some(deadline) => tokio::select! {
                 _ = progress.wake.notified() => {}
                 _ = tokio::time::sleep_until(deadline.into()) => {}
@@ -398,12 +748,30 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
                 changed = status.changed() => changed?,
             },
         }
-        if progress.take_flush(max_age) {
+        let (flush, requested) = progress.take_flush(max_age);
+        if flush {
             db.flush().await?;
         }
         // SlateDB also flushes a full memtable by itself. Each advance gets one checkpoint.
         let last = db.manifest().last_l0_seq();
         if last <= published {
+            // A request with no new checkpoint can wait for a stranded one.
+            if requested {
+                retry.now();
+            }
+            if retry.due()
+                && !reannounce(
+                    &admin,
+                    &source,
+                    &applied,
+                    &mut retry,
+                    &mut bootstrapped,
+                    &events,
+                )
+                .await?
+            {
+                return Ok(());
+            }
             continue;
         }
         let options = CheckpointOptions {
@@ -429,16 +797,111 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
             source.mark_bootstrapped(checkpoint.id).await?;
             bootstrapped = true;
         }
-        if events
-            .send(Event::ViewCheckpoint(checkpoint.id))
-            .await
-            .is_err()
-        {
+        let Some(accepted) = announce(&events, checkpoint.id).await else {
             return Ok(());
+        };
+        retry.sent(checkpoint.id, accepted);
+        let views = view_checkpoints(&admin).await?.len();
+        if let Some(gauge) = &retained {
+            gauge.set(views as i64);
         }
-        crate::state::shared::retain(&admin, &source, &reported(&reports), KEEP_CHECKPOINTS)
-            .await?;
+        // A new leader has no reports yet. It waits until each member has reported twice.
+        if retention == crate::state::ViewRetention::Fenced && led.elapsed() >= RETENTION_GRACE {
+            let reported = reported(&reports);
+            crate::state::shared::retain(&admin, &source, &reported, KEEP_CHECKPOINTS, Some(epoch))
+                .await?;
+        }
     }
+}
+
+/// Check the last announcement, and announce a stranded checkpoint. Return false when the node
+/// no longer takes events.
+///
+/// A failed check keeps the retry due. A sent announcement stays due until applied state
+/// shows it, or until its base covers it.
+async fn reannounce(
+    admin: &slatedb::admin::Admin,
+    source: &Source,
+    applied: &Applied,
+    retry: &mut Retry,
+    bootstrapped: &mut bool,
+    events: &mpsc::Sender<Event>,
+) -> Result<bool> {
+    // The usual case reads no storage: the sent announcement applied.
+    if retry.awaiting.is_some() && *applied.announced.borrow() == retry.awaiting {
+        retry.done();
+        return Ok(true);
+    }
+    let id = match stranded(admin, source, applied).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            retry.done();
+            return Ok(true);
+        }
+        Err(error) => {
+            tracing::warn!(%error, "cannot check for a stranded view checkpoint; retry");
+            retry.again();
+            return Ok(true);
+        }
+    };
+    tracing::info!(checkpoint = %id, "announce a stranded view checkpoint");
+    if !*bootstrapped {
+        source.mark_bootstrapped(id).await?;
+        *bootstrapped = true;
+    }
+    let Some(accepted) = announce(events, id).await else {
+        return Ok(false);
+    };
+    retry.sent(id, accepted);
+    Ok(true)
+}
+
+/// Send checkpoint `id` to the node for its announcement. Return whether Raft took the
+/// proposal, or `None` when the node no longer takes events.
+async fn announce(events: &mpsc::Sender<Event>, id: uuid::Uuid) -> Option<bool> {
+    let (reply, accepted) = tokio::sync::oneshot::channel();
+    events
+        .send(Event::ViewCheckpoint(id, Some(reply)))
+        .await
+        .ok()?;
+    Some(accepted.await.unwrap_or(false))
+}
+
+/// Bring Raft's voters and learners to `target` with single membership changes.
+///
+/// An in-process adopt skips the log entries up to the checkpoint, and those entries can hold
+/// membership changes. Raft changes its configuration only through `apply_conf_change`, so this
+/// applies the difference: new voters and promotions, new learners, then removals.
+pub(super) fn reconcile_conf(
+    raw: &mut RawNode<log::Cache>,
+    target: &raft::eraftpb::ConfState,
+) -> Result<()> {
+    use raft::eraftpb::{ConfChange, ConfChangeType};
+    let current = raw.raft.prs().conf().to_conf_state();
+    let mut changes = vec![];
+    for &id in &target.voters {
+        if !current.voters.contains(&id) {
+            changes.push((id, ConfChangeType::AddNode));
+        }
+    }
+    for &id in &target.learners {
+        if !current.learners.contains(&id) && !current.voters.contains(&id) {
+            changes.push((id, ConfChangeType::AddLearnerNode));
+        }
+    }
+    for &id in current.voters.iter().chain(&current.learners) {
+        if !target.voters.contains(&id) && !target.learners.contains(&id) {
+            changes.push((id, ConfChangeType::RemoveNode));
+        }
+    }
+    for (node_id, change_type) in changes {
+        raw.apply_conf_change(&ConfChange {
+            node_id,
+            change_type: change_type as i32,
+            ..Default::default()
+        })?;
+    }
+    Ok(())
 }
 
 /// Ticks between two `ViewAck` reports.
@@ -492,29 +955,38 @@ impl Node {
     /// Start or stop the writer tasks after a role change.
     pub(super) fn sync_writer(&mut self) {
         let leader = self.raw.raft.state == StateRole::Leader;
+        let term = self.raw.raft.term;
         if let Some(writer) = &mut self.writer {
-            writer.sync(leader, &self.events);
+            writer.sync(leader, term, &self.events);
         }
     }
 
-    /// Propose a checkpoint that the publisher created. Only the leader announces.
-    pub(super) fn announce_view(&mut self, checkpoint: uuid::Uuid) -> Result<()> {
+    /// Propose a checkpoint that the publisher created. Only the leader announces. Return true
+    /// when Raft took the proposal.
+    pub(super) fn announce_view(&mut self, checkpoint: uuid::Uuid) -> Result<bool> {
         let Some(writer) = &mut self.writer else {
-            return Ok(());
+            return Ok(false);
         };
         if self.raw.raft.state != StateRole::Leader {
-            return Ok(());
+            return Ok(false);
         }
         let data = RaftCommand::ViewCheckpoint {
             id: uuid::Uuid::new_v4().to_string(),
             checkpoint: checkpoint.to_string(),
         }
         .encode()?;
-        // The entry frees memory, so it bypasses the client admission limits.
-        if self.raw.propose(vec![], data).is_ok() {
-            writer.announced += 1;
+        // The entry frees memory, so it bypasses the client admission limits. Raft can drop the
+        // proposal, for example during a leader transfer. The publisher then announces again.
+        match self.raw.propose(vec![], data) {
+            Ok(()) => {
+                writer.announced += 1;
+                Ok(true)
+            }
+            Err(error) => {
+                tracing::info!(%error, %checkpoint, "a view checkpoint proposal was dropped");
+                Ok(false)
+            }
         }
-        Ok(())
     }
 
     /// The checkpoints that this member pins: live bases, received snapshots, and the
@@ -659,11 +1131,259 @@ impl Node {
         writer.paused
     }
 
+    /// Return the index and log term of an opened base that a paused member can adopt: the
+    /// base is above the applied index, and the delivered commit covers it.
+    ///
+    /// The node takes the base from the slot and verifies that one. A newer open cannot replace
+    /// it before the job runs. A base that fails the check goes back to the slot.
+    pub(super) fn adoptable(&self) -> Option<(Arc<crate::state::view::Base>, u64)> {
+        let writer = self.writer.as_ref()?;
+        if !writer.paused || self.prepared_puts.is_some() || self.held_puts.is_some() {
+            return None;
+        }
+        let base = writer.opened_slot.take()?;
+        let index = base.applied;
+        let term = (index > self.state.applied && index <= self.committed_ready)
+            .then(|| self.raw.raft.raft_log.term(index).ok())
+            .flatten();
+        match term {
+            Some(term) => Some((base, term)),
+            None => {
+                writer.opened_slot.offer(base);
+                None
+            }
+        }
+    }
+
     /// Take a due switch job.
     pub(super) fn take_switch(&mut self) -> bool {
         self.writer
             .as_mut()
             .is_some_and(|writer| std::mem::take(&mut writer.switch_due))
+    }
+}
+
+/// A writer that DST drives one step at a time. Each step follows the rules of `lead` and
+/// `publish`, so a schedule can stop, fence, or crash a writer between any two steps.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct DstWriter {
+    pub db: Option<Arc<slatedb::Db>>,
+    pub term: u64,
+    pub written: u64,
+    pub epoch: u64,
+    published: u64,
+    bootstrapped: bool,
+    /// A checkpoint that the next announce step proposes.
+    pub pending: Option<uuid::Uuid>,
+}
+
+/// Compact every L0 SST and sorted run into one run when the L0 has `limit` SSTs or more, and
+/// wait until the compaction ends.
+#[cfg(test)]
+async fn dst_compact(admin: &slatedb::admin::Admin, limit: usize) -> Result<()> {
+    use slatedb::compactor::{CompactionSpec, CompactionStatus, SourceId};
+    let manifest = admin
+        .read_manifest(None)
+        .await?
+        .context("missing manifest")?;
+    if manifest.l0().len() < limit {
+        return Ok(());
+    }
+    let mut sources: Vec<_> = manifest
+        .l0()
+        .iter()
+        .map(|view| SourceId::SstView(view.id))
+        .collect();
+    sources.extend(
+        manifest
+            .compacted()
+            .iter()
+            .map(|run| SourceId::SortedRun(run.id)),
+    );
+    let destination = manifest
+        .compacted()
+        .iter()
+        .map(|run| run.id)
+        .min()
+        .unwrap_or(0);
+    let job = admin
+        .submit_compaction(CompactionSpec::new(sources, destination))
+        .await?;
+    for _ in 0..400 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        match admin.read_compaction(job.id(), None).await? {
+            Some(job) if matches!(job.status(), CompactionStatus::Completed) => {
+                // The compactor commits the manifest after the job. Wait for the new L0.
+                let manifest = admin
+                    .read_manifest(None)
+                    .await?
+                    .context("missing manifest")?;
+                if manifest.l0().len() < limit {
+                    return Ok(());
+                }
+            }
+            Some(job) if matches!(job.status(), CompactionStatus::Failed) => {
+                anyhow::bail!("a DST compaction failed")
+            }
+            _ => {}
+        }
+    }
+    anyhow::bail!("a DST compaction timed out")
+}
+
+#[cfg(test)]
+impl DstWriter {
+    pub async fn close(&mut self) {
+        if let Some(db) = self.db.take() {
+            let _ = db
+                .close_with_options(slatedb::config::CloseOptions { flush_type: None })
+                .await;
+        }
+    }
+}
+
+#[cfg(test)]
+impl Node {
+    /// Open the writer on the leader. With `deposed`, a member that does not lead opens it, as
+    /// a slow open of an older term does. Return false when the open did not start a writer.
+    pub(super) async fn dst_open(&mut self, dst: &mut DstWriter, deposed: bool) -> Result<bool> {
+        let leader = self.raw.raft.state == StateRole::Leader;
+        if leader == deposed {
+            return Ok(false);
+        }
+        let term = self.raw.raft.term;
+        let writer = self.writer.as_ref().context("shared state mode")?;
+        dst.close().await;
+        // The compactor runs only on request, so GC removes the same SSTs on every replay.
+        let mut settings = crate::state::slatedb_settings();
+        if let Some(compactor) = settings.compactor_options.as_mut() {
+            compactor
+                .scheduler_options
+                .insert("min_compaction_sources".into(), "1000000".into());
+        }
+        let db = Arc::new(writer.source.open_writer_with(settings).await?);
+        // The lead must be unchanged after the open, and the clock must pass the manifest.
+        if (!deposed && self.raw.raft.term != term)
+            || !writer.clock.pass(db.manifest().last_l0_clock_tick()).await
+        {
+            let _ = db
+                .close_with_options(slatedb::config::CloseOptions { flush_type: None })
+                .await;
+            return Ok(false);
+        }
+        dst.written = db.manifest().last_l0_seq();
+        dst.epoch = db.manifest().writer_epoch();
+        dst.term = term;
+        dst.published = view_checkpoints(&writer.admin)
+            .await?
+            .last()
+            .map_or(0, |(seq, _)| *seq);
+        dst.bootstrapped = writer.source.bootstrapped().await?;
+        // A new writer announces a stranded checkpoint, as `publish` does.
+        dst.pending = stranded(&writer.admin, &writer.source, &writer.applied).await?;
+        if let (Some(id), false) = (dst.pending, dst.bootstrapped) {
+            writer.source.mark_bootstrapped(id).await?;
+            dst.bootstrapped = true;
+        }
+        dst.db = Some(db);
+        Ok(true)
+    }
+
+    /// Write the overlay batches above the written sequence, each with its own sequence.
+    pub(super) async fn dst_materialize(&mut self, dst: &mut DstWriter) -> Result<usize> {
+        let (Some(db), Some(writer)) = (&dst.db, &self.writer) else {
+            return Ok(0);
+        };
+        let mut count = 0;
+        for (seq, batch) in writer.queue.after(dst.written, usize::MAX) {
+            db.write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
+                .await?;
+            dst.written = seq;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Flush, then create one checkpoint for an advance of `last_l0_seq`. The bootstrap marker
+    /// comes before the first announcement.
+    pub(super) async fn dst_checkpoint(
+        &mut self,
+        dst: &mut DstWriter,
+    ) -> Result<Option<uuid::Uuid>> {
+        let (Some(db), Some(writer)) = (&dst.db, &self.writer) else {
+            return Ok(None);
+        };
+        db.flush().await?;
+        // Compact the L0 SSTs on request before SlateDB would stop writes for them.
+        dst_compact(&writer.admin, 4).await?;
+        let last = db.manifest().last_l0_seq();
+        if last <= dst.published {
+            return Ok(None);
+        }
+        let options = CheckpointOptions {
+            name: Some(view_name(last)),
+            ..Default::default()
+        };
+        let id = db
+            .create_checkpoint(CheckpointScope::Durable, &options)
+            .await?
+            .id;
+        dst.published = last;
+        let base = writer.source.open_base(id).await?;
+        if base.get(crate::cluster::KEY).await?.is_none() {
+            writer.admin.delete_checkpoint(id).await?;
+            return Ok(None);
+        }
+        if !dst.bootstrapped {
+            writer.source.mark_bootstrapped(id).await?;
+            dst.bootstrapped = true;
+        }
+        dst.pending = Some(id);
+        Ok(Some(id))
+    }
+
+    /// Propose the pending checkpoint. Only the leader proposes.
+    pub(super) fn dst_announce(&mut self, dst: &mut DstWriter) -> Result<()> {
+        match dst.pending.take() {
+            Some(id) => self.announce_view(id).map(drop),
+            None => Ok(()),
+        }
+    }
+
+    /// Delete old checkpoints that no member reported, with the epoch check of this writer.
+    pub(super) async fn dst_retain(
+        &mut self,
+        dst: &mut DstWriter,
+        reported: &HashSet<uuid::Uuid>,
+    ) -> Result<()> {
+        let (Some(_), Some(writer)) = (&dst.db, &self.writer) else {
+            return Ok(());
+        };
+        crate::state::shared::retain(
+            &writer.admin,
+            &writer.source,
+            reported,
+            KEEP_CHECKPOINTS,
+            Some(dst.epoch),
+        )
+        .await
+    }
+
+    /// Return true when a newer writer holds the shared database.
+    pub(super) async fn dst_fenced(&self, dst: &DstWriter) -> bool {
+        let Some(writer) = &self.writer else {
+            return false;
+        };
+        match writer.admin.read_manifest(None).await {
+            Ok(Some(manifest)) => manifest.writer_epoch() != dst.epoch,
+            _ => false,
+        }
+    }
+
+    /// The checkpoints that this member pins, as its `ViewAck` reports them.
+    pub(super) fn dst_pins(&self) -> HashSet<uuid::Uuid> {
+        self.pinned_checkpoints()
     }
 }
 
@@ -738,22 +1458,25 @@ mod tests {
         let long = Duration::from_secs(60);
         // An idle writer has no deadline and no flush.
         assert_eq!(progress.deadline(long), None);
-        assert!(!progress.take_flush(Duration::ZERO));
+        assert_eq!(progress.take_flush(Duration::ZERO), (false, false));
         progress.wrote(1);
         let deadline = progress.deadline(long).unwrap();
         progress.wrote(2);
         // A later write keeps the deadline of the oldest unflushed write.
         assert_eq!(progress.deadline(long), Some(deadline));
-        assert!(!progress.take_flush(long));
-        assert!(progress.take_flush(Duration::ZERO));
-        assert!(!progress.take_flush(Duration::ZERO));
+        assert_eq!(progress.take_flush(long), (false, false));
+        assert_eq!(progress.take_flush(Duration::ZERO), (true, false));
+        assert_eq!(progress.take_flush(Duration::ZERO), (false, false));
         assert_eq!(progress.deadline(long), None);
         // A request waits until the materializer writes its sequence.
         progress.request(3);
-        assert!(!progress.take_flush(long));
+        assert_eq!(progress.take_flush(long), (false, false));
         progress.wrote(3);
-        assert!(progress.take_flush(long));
-        assert!(!progress.take_flush(long));
+        assert_eq!(progress.take_flush(long), (true, true));
+        assert_eq!(progress.take_flush(long), (false, false));
+        // A request that the written sequence already covers is due at once.
+        progress.request(2);
+        assert_eq!(progress.take_flush(long), (true, true));
     }
 
     /// Read `/status` from the client listener.
@@ -1051,5 +1774,502 @@ mod tests {
         faults.set(0);
         drop(send);
         server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_writer_waits_for_its_clock_and_refuses_a_large_skew() {
+        use std::sync::atomic::Ordering;
+        let clock = Clock::system(Duration::from_secs(5), None);
+        // The manifest clock is 300 ms ahead. The writer waits until the local clock passes it.
+        let started = Instant::now();
+        assert!(clock.pass((clock.now_ms)() + 300).await);
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        assert!(!clock.alarm.load(Ordering::Relaxed));
+        // A clock 10 s behind does not start the writer, and it raises the alarm.
+        let started = Instant::now();
+        assert!(!clock.pass((clock.now_ms)() + 10_000).await);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(clock.alarm.load(Ordering::Relaxed));
+        assert!(clock.skew.load(Ordering::Relaxed) >= 9_000);
+        // A later check within the limit clears the alarm.
+        assert!(clock.pass((clock.now_ms)() - 1).await);
+        assert!(!clock.alarm.load(Ordering::Relaxed));
+    }
+
+    /// The open of an older term finishes after the current leader's open and fences it. The
+    /// current leader opens its writer again, and its overlay batches still reach a checkpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_fenced_leader_opens_its_writer_again() {
+        let options = crate::state::shared::Options {
+            quota: 0,
+            voters: vec![1],
+            join: false,
+            empty_log: false,
+            pin_max: Duration::from_secs(300),
+        };
+        let mut state = StateMachine::open_shared(
+            Arc::new(InMemory::new()),
+            "root",
+            "test",
+            crate::state::StateCache::default(),
+            &options,
+            crate::state::transfer::Backend::Local,
+        )
+        .await
+        .unwrap();
+        state.members = Arc::new(crate::cluster::Store::initial(
+            &[(1, "127.0.0.1:1".to_owned())].into(),
+        ));
+        state.apply(1, None).await.unwrap();
+        let handles = state.shared_handles().unwrap();
+        let (events, mut announced) = mpsc::channel(64);
+        let clock = Clock::system(Duration::from_secs(5), None);
+        let mut writer = Writer::new(&handles, Duration::from_millis(50), clock);
+        writer.sync(true, 2, &events);
+        writer.progress.wait_written(1).await.unwrap();
+        // The leader of term 1 opens late. Its open fences the writer of term 2. The current
+        // leader can open again before this open ends, which fails the late open instead.
+        let old = handles.source.open_writer().await.ok();
+        let put = |key: &str| crate::proto::etcdserverpb::RequestOp {
+            request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
+                crate::proto::etcdserverpb::PutRequest {
+                    key: key.as_bytes().to_vec(),
+                    value: b"value".to_vec(),
+                    ..Default::default()
+                },
+            )),
+        };
+        state.apply_etcd(2, &put("after-fence")).await.unwrap();
+        // A checkpoint above the fence appears. The writer task did not stop the member.
+        let covered = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(event) = announced.recv().await {
+                if let Event::ViewCheckpoint(id, reply) = event {
+                    if let Some(reply) = reply {
+                        let _ = reply.send(true);
+                    }
+                    let base = handles.source.open_base(id).await.unwrap();
+                    if base.applied >= 2 {
+                        return base;
+                    }
+                }
+            }
+            panic!("the writer stopped");
+        })
+        .await
+        .unwrap();
+        let value = covered.get(b"etcd/current/after-fence").await.unwrap();
+        assert!(value.is_some());
+        assert!(writer.tasks.try_join_next().is_none());
+        // The current leader saw the fence and opened its writer again.
+        assert!(writer.reopens.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+        // The writer of term 1 is fenced now. Its next flush cannot commit a manifest.
+        if let Some(old) = old {
+            let flushed = async {
+                old.put(b"orphan", b"value").await?;
+                old.flush().await
+            };
+            let error = flushed.await.unwrap_err();
+            assert!(fenced(&anyhow::Error::from(error)));
+        }
+        writer.sync(false, 2, &events);
+        writer.stop().await;
+        state.close().await.unwrap();
+    }
+
+    /// The announcement events of a publisher. The test answers for the node.
+    struct Announcements(mpsc::Receiver<Event>);
+
+    impl Announcements {
+        /// Wait for the next announcement and reply whether Raft took it.
+        async fn next(&mut self, wait: Duration, accepted: bool) -> uuid::Uuid {
+            tokio::time::timeout(wait, async {
+                loop {
+                    if let Some(Event::ViewCheckpoint(id, reply)) = self.0.recv().await {
+                        if let Some(reply) = reply {
+                            let _ = reply.send(accepted);
+                        }
+                        return id;
+                    }
+                }
+            })
+            .await
+            .expect("an announcement")
+        }
+
+        /// Wait `wait` and fail on any announcement in it.
+        async fn none(&mut self, wait: Duration) {
+            let next = tokio::time::timeout(wait, self.0.recv()).await;
+            assert!(
+                !matches!(next, Ok(Some(Event::ViewCheckpoint(..)))),
+                "an unexpected announcement"
+            );
+        }
+    }
+
+    /// Open a one-voter shared state. A first writer publishes a checkpoint at index 1, and its
+    /// announcement never reaches Raft. Return the state, its handles, the event sender, the
+    /// announcements, and the stranded checkpoint.
+    async fn stranded_checkpoint() -> (
+        StateMachine,
+        Handles,
+        mpsc::Sender<Event>,
+        Announcements,
+        uuid::Uuid,
+    ) {
+        let options = crate::state::shared::Options {
+            quota: 0,
+            voters: vec![1],
+            join: false,
+            empty_log: false,
+            pin_max: Duration::from_secs(300),
+        };
+        let mut state = StateMachine::open_shared(
+            Arc::new(InMemory::new()),
+            "root",
+            "test",
+            crate::state::StateCache::default(),
+            &options,
+            crate::state::transfer::Backend::Local,
+        )
+        .await
+        .unwrap();
+        state.members = Arc::new(crate::cluster::Store::initial(
+            &[(1, "127.0.0.1:1".to_owned())].into(),
+        ));
+        state.apply(1, None).await.unwrap();
+        let handles = state.shared_handles().unwrap();
+        let (events, received) = mpsc::channel(64);
+        let mut announcements = Announcements(received);
+        let mut first = Writer::new(&handles, STRANDED_AGE, clock());
+        first.sync(true, 2, &events);
+        let lost = announcements.next(Duration::from_secs(20), true).await;
+        first.sync(false, 2, &events);
+        first.stop().await;
+        (state, handles, events, announcements, lost)
+    }
+
+    const STRANDED_AGE: Duration = Duration::from_millis(50);
+
+    fn clock() -> Clock {
+        Clock::system(Duration::from_secs(5), None)
+    }
+
+    /// The next writer has no writes. It announces the stranded checkpoint, and Raft drops the
+    /// proposal, as during a leader transfer. On the idle cluster the publisher announces it
+    /// again within the backoff limit. The base advances and a physical compaction waiter ends.
+    /// The adopted checkpoint causes no further announcement, also from a later writer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_new_writer_announces_a_stranded_checkpoint() {
+        let (mut state, handles, events, mut announcements, lost) = stranded_checkpoint().await;
+        // A physical compaction waits for a base that covers index 1.
+        let mut based = handles.based.clone();
+        assert_eq!(*based.borrow(), 0);
+        let waiter = tokio::spawn(async move { based.wait_for(|base| *base >= 1).await.is_ok() });
+        let mut second = Writer::new(&handles, STRANDED_AGE, clock());
+        second.sync(true, 3, &events);
+        assert_eq!(
+            announcements.next(Duration::from_secs(2), false).await,
+            lost
+        );
+        // No write and no request follows. The retry timer sends it again.
+        let limit = RETRY_MAX + Duration::from_millis(500);
+        assert_eq!(announcements.next(limit, true).await, lost);
+        state
+            .apply_view_checkpoint(2, &lost.to_string())
+            .await
+            .unwrap();
+        state.settle_opens().await;
+        state.switch_base();
+        assert!(tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap());
+        // Requests and retries over several flush ages do not announce it again.
+        for _ in 0..4 {
+            second.request_publication(1);
+            announcements.none(STRANDED_AGE).await;
+        }
+        announcements.none(limit).await;
+        second.sync(false, 3, &events);
+        second.stop().await;
+        // A later writer does not announce it either.
+        let mut third = Writer::new(&handles, STRANDED_AGE, clock());
+        third.sync(true, 4, &events);
+        third.progress.wait_written(1).await.unwrap();
+        third.request_publication(1);
+        announcements.none(limit).await;
+        assert!(third.tasks.try_join_next().is_none());
+        third.sync(false, 4, &events);
+        third.stop().await;
+        state.close().await.unwrap();
+    }
+
+    /// A storage error in the stranded check does not drop it. The publisher checks again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_stranded_check_is_retried() {
+        let (state, handles, events, mut announcements, lost) = stranded_checkpoint().await;
+        let mut second = Writer::new(&handles, STRANDED_AGE, clock());
+        let failures = second.applied.failures.clone();
+        failures.store(3, std::sync::atomic::Ordering::Relaxed);
+        second.sync(true, 3, &events);
+        let limit = RETRY_MAX + Duration::from_secs(1);
+        assert_eq!(announcements.next(limit, true).await, lost);
+        assert_eq!(failures.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(second.tasks.try_join_next().is_none());
+        second.sync(false, 3, &events);
+        second.stop().await;
+        state.close().await.unwrap();
+    }
+
+    /// The announcement of a checkpoint applies, and the member cannot read the checkpoint.
+    /// After the store recovers, the member opens it and switches its base. No client write
+    /// and no new Raft entry is needed, and a physical compaction waiter ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_base_open_is_retried_on_an_idle_member() {
+        use crate::object::faults::{FaultStore, FAIL_GET};
+        let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+        let options = crate::state::shared::Options {
+            quota: 0,
+            voters: vec![1],
+            join: false,
+            empty_log: false,
+            pin_max: Duration::from_secs(300),
+        };
+        // A tiny cache, so the open reads the store.
+        let cache = crate::state::StateCache {
+            block_bytes: 1,
+            meta_bytes: 1,
+            row_bytes: 0,
+        };
+        let mut state = StateMachine::open_shared(
+            faults.clone(),
+            "root",
+            "test",
+            cache,
+            &options,
+            crate::state::transfer::Backend::Local,
+        )
+        .await
+        .unwrap();
+        state.members = Arc::new(crate::cluster::Store::initial(
+            &[(1, "127.0.0.1:1".to_owned())].into(),
+        ));
+        state.apply(1, None).await.unwrap();
+        let handles = state.shared_handles().unwrap();
+        let (events, received) = mpsc::channel(64);
+        let mut announcements = Announcements(received);
+        let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+        writer.sync(true, 2, &events);
+        let id = announcements.next(Duration::from_secs(20), true).await;
+        writer.sync(false, 2, &events);
+        writer.stop().await;
+        let mut based = handles.based.clone();
+        let waiter = tokio::spawn(async move { based.wait_for(|base| *base >= 1).await.is_ok() });
+        // The announcement applies while every read fails.
+        faults.set(FAIL_GET);
+        state
+            .apply_view_checkpoint(2, &id.to_string())
+            .await
+            .unwrap();
+        let applied = state.applied;
+        faults.entered.acquire().await.unwrap().forget();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(handles.opened.newest(), None);
+        assert_eq!(*handles.based.borrow(), 0);
+        // The store recovers. Only the retry of the open runs.
+        faults.set(0);
+        let mut ready = handles.opened.subscribe();
+        tokio::time::timeout(
+            RETRY_MAX + Duration::from_secs(2),
+            ready.wait_for(|ready| *ready >= 1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        state.switch_base();
+        assert!(tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap());
+        assert_eq!(state.applied, applied);
+        state.close().await.unwrap();
+    }
+
+    /// Announcements arrive faster than one open takes. A started open finishes, so the base
+    /// advances while announcements still arrive, and it reaches the newest checkpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_base_advances_under_a_stream_of_announcements() {
+        use crate::object::faults::{FaultStore, DELAY_SST_GET};
+        let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+        let options = crate::state::shared::Options {
+            quota: 0,
+            voters: vec![1],
+            join: false,
+            empty_log: false,
+            pin_max: Duration::from_secs(300),
+        };
+        // A tiny cache, so each open reads the store.
+        let cache = crate::state::StateCache {
+            block_bytes: 1,
+            meta_bytes: 1,
+            row_bytes: 0,
+        };
+        let mut state = StateMachine::open_shared(
+            faults.clone(),
+            "root",
+            "test",
+            cache,
+            &options,
+            crate::state::transfer::Backend::Local,
+        )
+        .await
+        .unwrap();
+        state.members = Arc::new(crate::cluster::Store::initial(
+            &[(1, "127.0.0.1:1".to_owned())].into(),
+        ));
+        state.apply(1, None).await.unwrap();
+        let handles = state.shared_handles().unwrap();
+        let (events, received) = mpsc::channel(64);
+        let mut announcements = Announcements(received);
+        let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+        writer.sync(true, 2, &events);
+        // Sixteen checkpoints, each after one more write. Raft takes none of them yet.
+        let mut checkpoints = vec![announcements.next(Duration::from_secs(20), true).await];
+        for n in 0..15 {
+            let put = crate::proto::etcdserverpb::RequestOp {
+                request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
+                    crate::proto::etcdserverpb::PutRequest {
+                        key: format!("key-{n}").into_bytes(),
+                        value: b"value".to_vec(),
+                        ..Default::default()
+                    },
+                )),
+            };
+            let index = state.applied + 1;
+            state.apply_etcd(index, &put).await.unwrap();
+            loop {
+                let id = announcements.next(Duration::from_secs(20), true).await;
+                let base = handles.source.open_base(id).await.unwrap();
+                if base.applied == index {
+                    checkpoints.push(id);
+                    break;
+                }
+            }
+        }
+        writer.sync(false, 2, &events);
+        writer.stop().await;
+        let newest = state.applied;
+        // Each object read takes 70 ms. The announcements come 40 ms apart.
+        faults.set_delay(Duration::from_millis(70));
+        faults.set(DELAY_SST_GET);
+        let mut advanced = 0;
+        for id in &checkpoints {
+            let index = state.applied + 1;
+            state
+                .apply_view_checkpoint(index, &id.to_string())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            state.switch_base();
+            advanced = advanced.max(*handles.based.borrow());
+        }
+        assert!(
+            advanced >= 1,
+            "the base did not advance during the announcements"
+        );
+        let mut ready = handles.opened.subscribe();
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            ready.wait_for(|ready| *ready >= newest),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        state.switch_base();
+        assert_eq!(*handles.based.borrow(), newest);
+        faults.set(0);
+        state.close().await.unwrap();
+    }
+
+    /// An adopt across membership changes leaves Raft with the checkpoint's ConfState, also
+    /// after an election.
+    #[tokio::test]
+    async fn an_adopt_takes_the_checkpoint_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = super::super::tests::leader_node(dir.path()).await;
+        // The skipped entries added learner 4, promoted it, added learner 5, and removed 3.
+        let target = raft::eraftpb::ConfState::from((vec![1, 2, 4], vec![5]));
+        reconcile_conf(&mut node.raw, &target).unwrap();
+        let conf = |node: &Node| {
+            let mut conf = node.raw.raft.prs().conf().to_conf_state();
+            conf.voters.sort_unstable();
+            conf.learners.sort_unstable();
+            conf
+        };
+        assert_eq!(conf(&node), target);
+        // A new election asks the new voters, not the removed one or the learner.
+        let term = node.raw.raft.term;
+        node.raw.raft.become_follower(term + 1, raft::INVALID_ID);
+        node.raw.raft.msgs.clear();
+        node.raw.campaign().unwrap();
+        assert_eq!(conf(&node), target);
+        let mut asked: Vec<_> = node
+            .raw
+            .raft
+            .msgs
+            .iter()
+            .map(|message| message.to)
+            .collect();
+        asked.sort_unstable();
+        asked.dedup();
+        assert_eq!(asked, [2, 4]);
+        // A second reconcile changes nothing.
+        reconcile_conf(&mut node.raw, &target).unwrap();
+        assert_eq!(conf(&node), target);
+    }
+
+    /// A member steps down and leads again before it collects the old task. The old term's
+    /// normal end is not a failure of the new term.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_old_term_task_end_is_not_a_failure() {
+        let options = crate::state::shared::Options {
+            quota: 0,
+            voters: vec![1],
+            join: false,
+            empty_log: false,
+            pin_max: Duration::from_secs(300),
+        };
+        let mut state = StateMachine::open_shared(
+            Arc::new(InMemory::new()),
+            "root",
+            "test",
+            crate::state::StateCache::default(),
+            &options,
+            crate::state::transfer::Backend::Local,
+        )
+        .await
+        .unwrap();
+        let handles = state.shared_handles().unwrap();
+        let (events, _announced) = mpsc::channel(64);
+        let clock = Clock::system(Duration::from_secs(5), None);
+        let mut writer = Some(Writer::new(&handles, Duration::from_millis(50), clock));
+        let leader = writer.as_mut().unwrap();
+        leader.sync(true, 2, &events);
+        leader.sync(false, 2, &events);
+        leader.sync(true, 3, &events);
+        let failure = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if let WriterEvent::Failed(error) = next(&mut writer).await {
+                    return error;
+                }
+            }
+        })
+        .await;
+        assert!(failure.is_err(), "{failure:?}");
+        let mut leader = writer.unwrap();
+        leader.sync(false, 3, &events);
+        leader.stop().await;
+        state.apply(1, None).await.unwrap();
+        state.close().await.unwrap();
     }
 }

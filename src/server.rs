@@ -71,6 +71,11 @@ pub struct ServerConfig {
     /// Shared mode: the leader rejects client proposals above this overlay size, and apply
     /// waits above twice this size.
     pub overlay_max_bytes: u64,
+    /// Shared mode: a new leader does not start its writer while its clock is behind the
+    /// shared writer clock by more than this.
+    pub max_clock_skew: Duration,
+    /// Shared mode: whether the leader deletes old view checkpoints. Off by default.
+    pub view_retention: crate::state::ViewRetention,
 }
 
 impl ServerConfig {
@@ -105,6 +110,8 @@ impl ServerConfig {
             view_max_age: DEFAULT_VIEW_MAX_AGE,
             view_pin_max: DEFAULT_VIEW_PIN_MAX,
             overlay_max_bytes: DEFAULT_OVERLAY_MAX_BYTES,
+            max_clock_skew: Duration::from_secs(5),
+            view_retention: crate::state::ViewRetention::Off,
         }
     }
 }
@@ -304,6 +311,8 @@ impl Server {
                 view_max_age: config.view_max_age,
                 view_pin_max: config.view_pin_max,
                 overlay_max_bytes: config.overlay_max_bytes,
+                max_clock_skew: config.max_clock_skew,
+                view_retention: config.view_retention,
                 transport,
             },
             events.clone(),

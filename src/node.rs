@@ -94,8 +94,9 @@ pub enum Event {
         snapshot: bool,
         success: bool,
     },
-    /// The shared-mode publisher created this checkpoint. The leader announces it.
-    ViewCheckpoint(uuid::Uuid),
+    /// The shared-mode publisher created this checkpoint. The leader announces it. The reply
+    /// tells whether Raft took the proposal.
+    ViewCheckpoint(uuid::Uuid, Option<tokio::sync::oneshot::Sender<bool>>),
     /// A member reports the checkpoints that it pins. The leader keeps them.
     ViewAck {
         member: u64,
@@ -133,6 +134,11 @@ pub struct NodeOptions {
     /// Shared mode: the leader rejects client proposals above this overlay size. Apply waits
     /// above twice this size.
     pub overlay_max_bytes: u64,
+    /// Shared mode: a new writer does not start while the local clock is behind the manifest
+    /// clock by more than this.
+    pub max_clock_skew: Duration,
+    /// Shared mode: whether the leader deletes old view checkpoints.
+    pub view_retention: crate::state::ViewRetention,
 }
 
 impl NodeOptions {
@@ -436,6 +442,7 @@ impl Node {
             }
         };
         let manual_apply = transport_override.is_some();
+        state.set_open_retries(!manual_apply);
         let mut traffic = BTreeMap::<u64, std::sync::Arc<crate::metrics::PeerTraffic>>::new();
         let mut transports = tokio::task::JoinSet::new();
         let mut peer_addresses = BTreeMap::new();
@@ -470,9 +477,29 @@ impl Node {
             state.metrics.registry.clone(),
         )?);
         let handles = state.shared_handles();
-        let writer = handles
-            .as_ref()
-            .map(|handles| shared::Writer::new(handles, options.view_max_age));
+        let writer = match &handles {
+            Some(handles) => {
+                let gauge = prometheus::IntGauge::new(
+                    "slatedb_etcd_shared_clock_skew_milliseconds",
+                    "Milliseconds that the local clock is behind the shared writer clock.",
+                )?;
+                state.metrics.registry.register(Box::new(gauge.clone()))?;
+                let clock = shared::Clock::system(options.max_clock_skew, Some(gauge));
+                let retained = prometheus::IntGauge::new(
+                    "slatedb_etcd_shared_view_checkpoints",
+                    "View checkpoints of the shared state. Each one pins its SSTs.",
+                )?;
+                state
+                    .metrics
+                    .registry
+                    .register(Box::new(retained.clone()))?;
+                let mut writer = shared::Writer::new(handles, options.view_max_age, clock);
+                writer.retention = options.view_retention;
+                writer.retained = Some(retained);
+                Some(writer)
+            }
+            None => None,
+        };
         let mut compaction = compaction::Flush::new(&state);
         if let Some(handles) = handles {
             compaction.share(handles.based);
@@ -1004,7 +1031,12 @@ impl Node {
                 }
             }
             Event::SnapshotBuilt(built) => self.checkpoint_built(built)?,
-            Event::ViewCheckpoint(checkpoint) => self.announce_view(checkpoint)?,
+            Event::ViewCheckpoint(checkpoint, reply) => {
+                let accepted = self.announce_view(checkpoint)?;
+                if let Some(reply) = reply {
+                    let _ = reply.send(accepted);
+                }
+            }
             Event::ViewAck {
                 member,
                 checkpoints,
