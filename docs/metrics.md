@@ -48,6 +48,9 @@ Use the inventory to check dashboards before deployment. An absent series repres
 
 Monitoring can use the same queries as etcd for these signals.
 
+One family has no etcd counterpart. `etcd_debugging_mvcc_range_too_large_total` counts reads
+that failed because their rows exceed `--max-response-bytes`.
+
 ```promql
 etcd_server_has_leader == 0
 etcd_server_proposals_committed_total - etcd_server_proposals_applied_total

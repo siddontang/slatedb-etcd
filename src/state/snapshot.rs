@@ -138,6 +138,7 @@ impl StateMachine {
         crate::failpoint::hit("snapshot-after-install-write");
         next.metrics = self.metrics.clone();
         next.quota = self.quota;
+        next.max_response_bytes = self.max_response_bytes;
         next.write_batches = self.write_batches;
         next.row_marker = self.row_marker.take();
         next.watch_capture = self.watch_capture.take();

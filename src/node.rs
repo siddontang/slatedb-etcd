@@ -110,6 +110,8 @@ pub struct NodeOptions {
     pub log_memory: LogMemory,
     pub state_cache: crate::state::StateCache,
     pub quota_bytes: i64,
+    /// Encoded bytes of rows one client read may return.
+    pub max_response_bytes: usize,
     pub strict_reconfiguration: bool,
     pub join: bool,
     pub client_peers: BTreeMap<u64, String>,
@@ -310,6 +312,7 @@ impl Node {
         let location = state.location.clone();
         let recovered = async {
             state.quota = options.effective_quota().max(0) as u64;
+            state.max_response_bytes = options.max_response_bytes;
             // Flushed state proves this prefix was committed, even if its commit marker was lost.
             if state.applied > storage.commit_index() {
                 storage.persist_commit(state.applied)?;

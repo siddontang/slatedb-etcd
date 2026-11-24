@@ -155,6 +155,11 @@ struct Args {
     /// Logical quota in bytes. Zero selects 2 GiB. A negative value disables the quota.
     #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
     quota_backend_bytes: i64,
+    /// Encoded bytes of rows one Range or read-only Txn response may return. Larger reads fail
+    /// with ResourceExhausted before the member holds the whole result. At most 2 GiB - 1 MiB.
+    #[arg(long, default_value_t = slatedb_etcd::state::DEFAULT_MAX_RESPONSE_BYTES as u64,
+          value_parser = clap::value_parser!(u64).range(1..=i32::MAX as u64 - 1024 * 1024))]
+    max_response_bytes: u64,
     /// Token mode: simple, or jwt with RS256 public-key and private-key paths.
     #[arg(long, default_value = "simple")]
     auth_token: String,
@@ -240,6 +245,7 @@ async fn run(args: Args) -> Result<()> {
             row_bytes: args.state_row_cache_bytes,
         },
         quota_bytes: args.quota_backend_bytes,
+        max_response_bytes: args.max_response_bytes as usize,
         auth_token: args.auth_token,
         strict_reconfiguration: args.strict_reconfig_check,
         join: args.join,

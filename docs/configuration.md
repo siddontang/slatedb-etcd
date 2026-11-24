@@ -86,12 +86,19 @@ For example, use `--watch-progress-notify-interval=200ms` for the upstream clien
 | `--snapshot-every` | 10000 | Applied entries between checkpoint opportunities; zero disables it. |
 | `--snapshot-min-bytes` | 67108864 | Log bytes needed before auto truncation; zero disables it. |
 | `--quota-backend-bytes` | 0 | Zero selects 2 GiB. A negative value disables the quota. |
+| `--max-response-bytes` | 67108864 | Encoded row bytes of one Range or read-only Txn response. |
 | `--log-cache-bytes` | 8388608 | Cache budget for log entries. |
 | `--log-pending-bytes` | 33554432 | Pending entry budget, including unapplied entries. |
 | `--log-read-bytes` | 16777216 | Budget for asynchronous log read results. |
 | `--log-term-bytes` | 1048576 | Budget for compressed term metadata. |
 | `--state-block-cache-bytes` | 67108864 | Weight budget for cached SST data blocks. |
 | `--state-meta-cache-bytes` | 67108864 | Budget for cached SST indexes, filters, and stats. |
+
+A read whose kept rows exceed `--max-response-bytes` fails with `ResourceExhausted` and
+`etcdserver: range response is too large`. A limit, `count_only`, or `keys_only` shrinks the
+kept rows. The KV gRPC send limit is this value plus 1 MiB, and never below 64 MiB.
+Write transactions ignore the cap, so every member applies them the same way.
+The maximum is 2 GiB minus 1 MiB.
 
 The read budget must hold one maximum entry. An encoded entry cannot exceed 8 MiB.
 The two state cache budgets add up to 128 MiB by default. Each must be positive.

@@ -142,6 +142,7 @@ impl Simulation {
                 strict_reconfiguration: false,
                 join: false,
                 quota_bytes: 0,
+                max_response_bytes: crate::state::DEFAULT_MAX_RESPONSE_BYTES,
                 id,
                 cluster_id: "dst".into(),
                 dir: self.root.path().join(id.to_string()),

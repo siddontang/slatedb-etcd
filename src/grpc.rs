@@ -39,6 +39,18 @@ pub struct Service {
     local_reads: std::sync::Arc<tokio::sync::Semaphore>,
     member: u64,
     tokens: crate::auth::TokenIssuer,
+    /// Largest KV response this member sends or accepts from a forwarded leader reply.
+    kv_message_bytes: usize,
+}
+
+/// Room for headers and message framing around the rows that `--max-response-bytes` counts.
+const RESPONSE_FRAMING_BYTES: usize = 1024 * 1024;
+
+/// The KV gRPC message limit for a response row cap. It never drops below the earlier 64 MiB.
+fn kv_message_bytes(max_response_bytes: usize) -> usize {
+    max_response_bytes
+        .saturating_add(RESPONSE_FRAMING_BYTES)
+        .max(64 * 1024 * 1024)
 }
 
 pub fn service(
@@ -66,7 +78,16 @@ pub(crate) fn service_with_watch_interval(
     transport: crate::tls::Transport,
     interval: Duration,
 ) -> anyhow::Result<axum::Router> {
-    Ok(Servers::new(member, events, peers, tokens, transport, interval)?.router())
+    Ok(Servers::new(
+        member,
+        events,
+        peers,
+        tokens,
+        transport,
+        interval,
+        crate::state::DEFAULT_MAX_RESPONSE_BYTES,
+    )?
+    .router())
 }
 
 /// The tonic servers for one member, configured once and shared by every listener.
@@ -89,8 +110,10 @@ impl Servers {
         tokens: crate::auth::TokenIssuer,
         transport: crate::tls::Transport,
         interval: Duration,
+        max_response_bytes: usize,
     ) -> anyhow::Result<Self> {
-        let service = Service::new(member, events, peers, tokens, transport, interval)?;
+        let mut service = Service::new(member, events, peers, tokens, transport, interval)?;
+        service.kv_message_bytes = kv_message_bytes(max_response_bytes);
         Ok(Self {
             cluster: cluster_server::ClusterServer::new(service.clone()),
             health: tonic_health::pb::health_server::HealthServer::new(service.clone()),
@@ -99,7 +122,7 @@ impl Servers {
             auth: auth_server::AuthServer::new(service.clone()),
             kv: KvServer::new(service.clone())
                 .max_decoding_message_size(1536 * 1024)
-                .max_encoding_message_size(64 * 1024 * 1024),
+                .max_encoding_message_size(service.kv_message_bytes),
             lease: lease_server::LeaseServer::new(service.clone()),
             watch: watch_server::WatchServer::new(service)
                 .max_encoding_message_size(64 * 1024 * 1024),
@@ -141,6 +164,7 @@ impl Service {
             local_reads: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_LOCAL_READS)),
             member,
             tokens,
+            kv_message_bytes: kv_message_bytes(crate::state::DEFAULT_MAX_RESPONSE_BYTES),
         })
     }
 

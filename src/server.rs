@@ -50,6 +50,9 @@ pub struct ServerConfig {
     pub state_cache: crate::state::StateCache,
     /// Zero selects the default 2 GiB quota. A negative value disables the quota.
     pub quota_bytes: i64,
+    /// Encoded bytes of rows one Range or read-only Txn response may return.
+    /// Larger reads fail with `ResourceExhausted` instead of building the whole result.
+    pub max_response_bytes: usize,
     pub auth_token: String,
     pub strict_reconfiguration: bool,
     pub join: bool,
@@ -80,6 +83,7 @@ impl ServerConfig {
             log_memory: LogMemory::default(),
             state_cache: crate::state::StateCache::default(),
             quota_bytes: 0,
+            max_response_bytes: crate::state::DEFAULT_MAX_RESPONSE_BYTES,
             auth_token: "simple".into(),
             strict_reconfiguration: true,
             join: false,
@@ -258,6 +262,7 @@ impl Server {
             tokens,
             transport.clone(),
             config.watch_progress_notify_interval,
+            config.max_response_bytes,
         )?;
         let node = Node::open(
             NodeOptions {
@@ -271,6 +276,7 @@ impl Server {
                 log_memory: config.log_memory,
                 state_cache: config.state_cache,
                 quota_bytes: config.quota_bytes,
+                max_response_bytes: config.max_response_bytes,
                 strict_reconfiguration: config.strict_reconfiguration,
                 join: config.join,
                 object_store: config.object_store.clone(),

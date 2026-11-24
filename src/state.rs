@@ -41,8 +41,12 @@ mod key_index_tests;
 pub(crate) mod maintenance;
 #[cfg(test)]
 mod quota_tests;
+#[cfg(test)]
+mod range_tests;
 
 const APPLIED: &[u8] = b"meta/applied";
+/// The default `--max-response-bytes`, the KV gRPC send limit before it was configurable.
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const DATA: &[u8] = b"data/";
 
 #[derive(Deserialize, Serialize)]
@@ -59,6 +63,8 @@ pub struct StateMachine {
     pub members: Arc<crate::cluster::Store>,
     pub(crate) admin: Arc<slatedb::admin::Admin>,
     pub quota: u64,
+    /// Encoded bytes of rows one client read may return. Apply never reads it.
+    pub max_response_bytes: usize,
     logical_bytes: u64,
     pub(crate) current: current::CurrentRows,
     pub(crate) key_index: key_index::KeyIndex,
@@ -293,6 +299,7 @@ impl StateMachine {
                 admin: Arc::new(admin),
                 metrics: Arc::new(crate::metrics::StateMeters::new()?),
                 quota: 0,
+                max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
                 current: current::CurrentRows::default(),
                 key_index: key_index::KeyIndex::load(&db).await?,
                 rows,

@@ -10,6 +10,7 @@ fn options(dir: &std::path::Path) -> NodeOptions {
         strict_reconfiguration: false,
         join: false,
         quota_bytes: 0,
+        max_response_bytes: crate::state::DEFAULT_MAX_RESPONSE_BYTES,
         id: 1,
         cluster_id: "worker-test".into(),
         dir: dir.to_owned(),
@@ -220,13 +221,15 @@ async fn waiting_scans_do_not_block_current_point_reads() {
         .await
         .unwrap();
     let mut replies = vec![];
-    for revision in [1, 1, 0] {
+    // Two descending Ranges need the exclusive slot. The point read passes the second one.
+    for wide in [true, true, false] {
         let (tx, rx) = oneshot::channel();
         node.enqueue_query(Query::Read(
             RequestOp {
                 request: Some(Op::RequestRange(RangeRequest {
                     key: b"key".to_vec(),
-                    revision,
+                    range_end: if wide { b"kez".to_vec() } else { vec![] },
+                    sort_order: if wide { 2 } else { 0 },
                     serializable: true,
                     ..Default::default()
                 })),

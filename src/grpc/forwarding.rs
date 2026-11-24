@@ -86,7 +86,7 @@ impl Service {
         credentials: &crate::auth::Credentials,
     ) -> Result<ResponseOp, Status> {
         let channel = self.peer_channel(leader).await?;
-        let mut client = KvClient::new(channel).max_decoding_message_size(64 * 1024 * 1024);
+        let mut client = KvClient::new(channel).max_decoding_message_size(self.kv_message_bytes);
         let response = self.forwarded(
             leader,
             async {

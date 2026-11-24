@@ -733,6 +733,7 @@ mod tests {
                 require_peer_tls: false,
                 object_store: crate::object::Config::Local,
                 quota_bytes: 0,
+                max_response_bytes: crate::state::DEFAULT_MAX_RESPONSE_BYTES,
                 strict_reconfiguration: false,
                 join: false,
                 id: 1,

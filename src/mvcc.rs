@@ -15,9 +15,11 @@ use crate::proto::mvccpb::KeyValue;
 use crate::proto::state::Version;
 
 mod put;
+mod range;
 #[cfg(test)]
 pub(crate) use put::DIRECT_TXNS;
 pub(crate) use put::{batchable_txn, prepare_put, prepare_txn_puts, CurrentView};
+pub(crate) use range::{Budget, TOO_LARGE};
 
 pub(crate) const CURRENT: &[u8] = b"etcd/current/";
 pub(crate) const HISTORY: &[u8] = b"etcd/history/";
@@ -322,20 +324,6 @@ impl ReadDb<'_> {
             _ => self.scan_base()?.scan_with_options(range, &options).await,
         }
     }
-
-    async fn scan_prefix(&self, prefix: Vec<u8>) -> Result<slatedb::DbIterator, slatedb::Error> {
-        match self {
-            Self::Pinned(db, _) => {
-                db.scan_prefix_with_options(prefix, .., &scan_options())
-                    .await
-            }
-            _ => {
-                self.scan_base()?
-                    .scan_prefix_with_options(prefix, .., &scan_options())
-                    .await
-            }
-        }
-    }
 }
 
 struct View<'a> {
@@ -350,8 +338,8 @@ struct View<'a> {
     leases: &'a BTreeMap<i64, crate::lease::LeaseRecord>,
     /// Metadata of the live applied rows. Pinned read views have no index.
     index: Option<&'a crate::state::key_index::KeyIndex>,
-    /// Bytes of rows a streaming Range may materialize. `None` means unbounded.
-    row_budget: Option<usize>,
+    /// Byte budgets of a client read. Apply-side views are unbounded.
+    budget: range::Budget,
     /// Current keys at the pinned snapshot. Live views count rows by scanning.
     keys: Option<&'a crate::state::key_index::KeyPin>,
 }
@@ -428,35 +416,6 @@ impl View<'_> {
             }
         }
         Ok(rows)
-    }
-
-    async fn historical(&self, key: &[u8], end: &[u8], revision: i64) -> KvResult<Rows> {
-        let prefix = if end.is_empty() {
-            history_prefix(key)
-        } else {
-            HISTORY.to_vec()
-        };
-        let mut versions = BTreeMap::<Vec<u8>, Version>::new();
-        let mut scan = self
-            .db
-            .scan_prefix(prefix)
-            .await
-            .map_err(KvError::storage)?;
-        while let Some(row) = scan.next().await.map_err(KvError::storage)? {
-            let v = Version::decode(row.value).map_err(KvError::storage)?;
-            if v.revision <= revision
-                && contains(&v.key, key, end)
-                && versions
-                    .get(&v.key)
-                    .is_none_or(|old| old.revision < v.revision)
-            {
-                versions.insert(v.key.clone(), v);
-            }
-        }
-        Ok(versions
-            .into_iter()
-            .filter_map(|(k, v)| v.value.map(|v| (k, v)))
-            .collect())
     }
 
     async fn compare(&self, cmp: &Compare) -> KvResult<bool> {
@@ -573,121 +532,6 @@ impl View<'_> {
         self.revision + i64::from(!self.changes.is_empty())
     }
 
-    async fn ordered_range(&self, r: &RangeRequest) -> KvResult<RangeResponse> {
-        let mut response = RangeResponse {
-            header: header(self.current_revision()),
-            ..Default::default()
-        };
-        let bounds = current_bounds(&r.key, &r.range_end);
-        if bounds.is_empty() {
-            return Ok(response);
-        }
-        // The key order of a pinned view holds the count, so the scan stops after `limit + 1`
-        // rows. Debug builds scan the whole interval and check the count against the rows.
-        let total = self.keys.map(|keys| keys.count(&r.key, &r.range_end));
-        let full_scan = total.is_none() || cfg!(debug_assertions);
-        if let Some(total) = total.filter(|_| r.count_only && !full_scan) {
-            response.count = total;
-            return Ok(response);
-        }
-        let mut budget = self.row_budget;
-        let mut scan = self.db.scan(bounds).await.map_err(KvError::storage)?;
-        while let Some(row) = scan.next().await.map_err(KvError::storage)? {
-            response.count += 1;
-            if r.count_only {
-                continue;
-            }
-            if r.limit > 0 && response.count > r.limit {
-                response.more = true;
-                if !full_scan {
-                    break;
-                }
-                continue;
-            }
-            let mut kv = KeyValue::decode(row.value).map_err(KvError::storage)?;
-            if r.keys_only {
-                kv.value.clear();
-            }
-            if let Some(budget) = &mut budget {
-                *budget = budget.checked_sub(row_bytes(&kv)).ok_or_else(over_budget)?;
-            }
-            response.kvs.push(kv);
-        }
-        if let Some(total) = total {
-            if full_scan {
-                debug_assert_eq!(
-                    total, response.count,
-                    "key order count differs from the rows"
-                );
-            }
-            response.count = total;
-        }
-        Ok(response)
-    }
-
-    async fn range(&self, r: &RangeRequest) -> KvResult<RangeResponse> {
-        if self.changes.is_empty() && streams_range(r) {
-            return self.ordered_range(r).await;
-        }
-        let rows: Vec<_> = if r.revision > 0 {
-            self.historical(&r.key, &r.range_end, r.revision)
-                .await?
-                .into_values()
-                .collect()
-        } else if r.range_end.is_empty() {
-            self.point(&r.key, true).await?.into_iter().collect()
-        } else {
-            self.latest(&r.key, &r.range_end, true)
-                .await?
-                .into_values()
-                .collect()
-        };
-        let count = rows.len() as i64;
-        let mut kvs: Vec<_> = if r.count_only {
-            vec![]
-        } else {
-            rows.into_iter()
-                .filter(|kv| {
-                    (r.min_mod_revision == 0 || kv.mod_revision >= r.min_mod_revision)
-                        && (r.max_mod_revision == 0 || kv.mod_revision <= r.max_mod_revision)
-                        && (r.min_create_revision == 0
-                            || kv.create_revision >= r.min_create_revision)
-                        && (r.max_create_revision == 0
-                            || kv.create_revision <= r.max_create_revision)
-                })
-                .collect()
-        };
-        kvs.sort_by(|a, b| {
-            let order = match r.sort_target {
-                1 => a.version.cmp(&b.version),
-                2 => a.create_revision.cmp(&b.create_revision),
-                3 => a.mod_revision.cmp(&b.mod_revision),
-                4 => a.value.cmp(&b.value),
-                _ => a.key.cmp(&b.key),
-            };
-            if r.sort_order == 2 {
-                order.reverse()
-            } else {
-                order
-            }
-        });
-        let more = r.limit > 0 && kvs.len() as i64 > r.limit;
-        if more {
-            kvs.truncate(r.limit as usize);
-        }
-        if r.keys_only {
-            for kv in &mut kvs {
-                kv.value.clear();
-            }
-        }
-        Ok(RangeResponse {
-            header: header(self.current_revision()),
-            kvs,
-            more,
-            count,
-        })
-    }
-
     fn execute<'a, 'r: 'a>(&'a mut self, plan: Plan<'r>, nested: bool) -> KvFuture<'a, ResponseOp> {
         Box::pin(async move {
             let op = match plan {
@@ -786,59 +630,35 @@ pub async fn read(
         request,
         leases,
         None,
-        None,
+        Budget::default(),
     )
     .await
 }
 
-pub(crate) async fn read_snapshot(
-    db: &slatedb::DbSnapshot,
-    rows: &crate::state::rows::RowCache,
-    revision: i64,
-    compact_revision: i64,
-    request: &RequestOp,
-    leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
-    keys: &crate::state::key_index::KeyPin,
-) -> KvResult<ResponseOp> {
-    read_from(
-        ReadDb::Pinned(db, rows),
-        revision,
-        compact_revision,
-        request,
-        leases,
-        Some(keys),
-        None,
-    )
-    .await
-}
-
-/// Return true when a current Range streams rows in key order from one scan.
-/// Such a Range holds at most `limit` rows. Other Ranges collect the interval before they sort or filter it.
+/// Return true when a Range streams rows in key order from one scan: a current interval or any
+/// historical read, with or without revision filters. Such a Range holds at most `limit` rows.
+/// Other sort orders keep the best `limit` rows, or every row without a limit.
 pub(crate) fn streams_range(r: &RangeRequest) -> bool {
-    !r.range_end.is_empty()
-        && r.revision <= 0
+    (!r.range_end.is_empty() || r.revision > 0)
         && r.sort_target == 0
         && matches!(r.sort_order, 0 | 1)
-        && r.min_mod_revision == 0
-        && r.max_mod_revision == 0
-        && r.min_create_revision == 0
-        && r.max_create_revision == 0
 }
 
 const OVER_BUDGET: &str = "range rows exceed the shared read budget";
 
-fn over_budget() -> KvError {
+pub(super) fn over_budget() -> KvError {
     KvError::new(Code::ResourceExhausted, OVER_BUDGET)
 }
 
 /// Approximate heap and inline bytes of one materialized row.
-fn row_bytes(kv: &KeyValue) -> usize {
+pub(super) fn row_bytes(kv: &KeyValue) -> usize {
     std::mem::size_of::<KeyValue>() + kv.key.len() + kv.value.len()
 }
 
-/// Read a streaming Range from a pinned snapshot within `budget` bytes of rows.
-/// `None` means the rows exceed the budget. The caller can repeat the read on the same snapshot
-/// without a budget and get the same result.
+/// Read from a pinned snapshot within `budget`.
+/// `None` means the rows exceed `budget.rows`. The caller can repeat the read on the same
+/// snapshot without a row budget and get the same result. A response over `budget.response`
+/// fails with `TOO_LARGE`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_snapshot_within(
     db: &slatedb::DbSnapshot,
@@ -848,7 +668,7 @@ pub(crate) async fn read_snapshot_within(
     request: &RequestOp,
     leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
     keys: &crate::state::key_index::KeyPin,
-    budget: usize,
+    budget: Budget,
 ) -> Option<KvResult<ResponseOp>> {
     let result = read_from(
         ReadDb::Pinned(db, rows),
@@ -857,7 +677,7 @@ pub(crate) async fn read_snapshot_within(
         request,
         leases,
         Some(keys),
-        Some(budget),
+        budget,
     )
     .await;
     match result {
@@ -878,7 +698,7 @@ async fn read_from<'a>(
     request: &RequestOp,
     leases: &'a BTreeMap<i64, crate::lease::LeaseRecord>,
     keys: Option<&'a crate::state::key_index::KeyPin>,
-    row_budget: Option<usize>,
+    budget: Budget,
 ) -> KvResult<ResponseOp> {
     validate(request)?;
     if !read_only(request, false) {
@@ -894,7 +714,7 @@ async fn read_from<'a>(
         prev_revisions: vec![],
         leases,
         index: None,
-        row_budget,
+        budget,
         keys,
     };
     if let Some(Op::RequestRange(range)) = &request.request {
@@ -983,7 +803,7 @@ async fn prepare_view(
         prev_revisions: vec![],
         leases,
         index,
-        row_budget: None,
+        budget: Default::default(),
         keys: None,
     };
     let plan = view.plan(request, false).await?;
@@ -1108,7 +928,7 @@ pub(crate) async fn revoke_keys(
         prev_revisions: vec![],
         leases,
         index: None,
-        row_budget: None,
+        budget: Default::default(),
         keys: None,
     };
     for key in lease_keys(db, id).await? {
