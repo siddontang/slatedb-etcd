@@ -31,6 +31,9 @@ pub enum Config {
     SharedDirectory(std::path::PathBuf),
     #[cfg(test)]
     Test(Arc<dyn ObjectStore>, String),
+    /// The S3 layout on another store, for tests.
+    #[cfg(test)]
+    TestS3(Arc<dyn ObjectStore>, S3),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +242,8 @@ impl Config {
                 s3.validate()?;
                 Some(s3)
             }
+            #[cfg(test)]
+            Self::TestS3(_, s3) => Some(s3.clone()),
             _ => None,
         };
         let binding = bind(dir, cluster, member, s3, mode)?;
@@ -260,7 +265,7 @@ impl Config {
                 }
             };
         };
-        let store = s3.store()?;
+        let store = self.s3_store(s3)?;
         let prefix = s3.member_prefix(cluster, member);
         let backend = crate::state::transfer::Backend::S3 {
             bucket: s3.bucket.clone(),
@@ -283,6 +288,80 @@ impl Config {
                 StateMachine::open_shared(store, &root, cluster, cache, &shared, backend).await
             }
         }
+    }
+}
+
+impl Config {
+    /// The object store of an S3 configuration.
+    pub(crate) fn s3_store(&self, s3: &S3) -> Result<Arc<dyn ObjectStore>> {
+        #[cfg(test)]
+        if let Self::TestS3(store, _) = self {
+            return Ok(store.clone());
+        }
+        s3.store()
+    }
+}
+
+/// Read the object store binding of a data directory.
+fn read_binding(dir: &Path) -> Result<Binding> {
+    let path = dir.join("object-store.json");
+    ensure!(
+        path.exists(),
+        "the data directory has no object store binding"
+    );
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+
+/// Write the binding of a data directory atomically.
+fn write_binding(dir: &Path, binding: &Binding) -> Result<()> {
+    let temporary = dir.join("object-store.json.pending");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(&serde_json::to_vec(binding)?)?;
+    file.sync_all()?;
+    std::fs::rename(temporary, dir.join("object-store.json"))?;
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// The S3 settings of a replicated member directory of `cluster`, or of a member that a
+/// conversion already changed to shared mode.
+pub(crate) fn converted_s3(dir: &Path, cluster: &str, member: u64) -> Result<(S3, StateMode)> {
+    let binding = read_binding(dir)?;
+    ensure!(
+        binding.version == 1 && binding.cluster == cluster && binding.member == member,
+        "the data directory belongs to another cluster or member"
+    );
+    let s3 = binding
+        .s3
+        .context("only a member with S3 state can be converted")?;
+    Ok((s3, binding.mode))
+}
+
+/// Change the binding of a stopped replicated member to shared mode.
+///
+/// The member writes its shared binding claim first, then its local binding, and then deletes
+/// its replicated owner claim. Each step can run again after a crash. A shared member refuses to
+/// start while any member namespace still has a replicated owner claim, so the cluster starts
+/// only after every member is converted.
+pub(crate) async fn convert_binding(
+    dir: &Path,
+    store: &dyn ObjectStore,
+    cluster: &str,
+    member: u64,
+) -> Result<()> {
+    let mut binding = read_binding(dir)?;
+    let s3 = binding.s3.clone().context("the member has no S3 state")?;
+    let prefix = s3.member_prefix(cluster, member);
+    binding.mode = StateMode::Shared;
+    claim(store, &prefix, BINDING, &binding).await?;
+    write_binding(dir, &binding)?;
+    match store.delete(&format!("{prefix}/{OWNER}").into()).await {
+        Ok(()) | Err(slatedb::object_store::Error::NotFound { .. }) => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -493,6 +572,7 @@ mod tests {
                     join: false,
                     empty_log: true,
                     pin_max: Duration::from_secs(300),
+                    restore: None,
                 };
                 claim_shared(store, &root, &prefix, "cluster", &binding, &options)
                     .await
@@ -594,6 +674,7 @@ mod tests {
             join: true,
             empty_log: true,
             pin_max: Duration::from_secs(300),
+            restore: None,
         };
         let root = config.cluster_prefix("cluster");
         let prefix = config.member_prefix("cluster", 4);
@@ -639,6 +720,82 @@ mod tests {
             let mut config = s3();
             config.prefix = prefix.into();
             assert!(config.validate().is_err());
+        }
+    }
+
+    /// The object keys that shared members touch at startup. The S3 policy in the shared state
+    /// guide grants exactly these. Every member reads `mode.json`, the shared claims, the shared
+    /// state, and the owner claims of all members. A voter writes its own binding and the shared
+    /// keys. A joining learner writes only its own binding.
+    #[tokio::test]
+    async fn shared_members_touch_the_keys_of_the_guide_policy() {
+        use crate::object::faults::FaultStore;
+        let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+        let config = Config::TestS3(faults.clone(), s3());
+        let root = format!("{}/", s3().cluster_prefix("cluster"));
+        let dirs = tempfile::tempdir().unwrap();
+        let open = |member: u64, join: bool| {
+            let config = config.clone();
+            let dir = dirs.path().join(member.to_string());
+            async move {
+                let options = crate::state::shared::Options {
+                    quota: 0,
+                    voters: vec![1, 2],
+                    join,
+                    empty_log: true,
+                    pin_max: Duration::from_secs(300),
+                    restore: None,
+                };
+                config
+                    .open(
+                        &dir,
+                        "cluster",
+                        member,
+                        crate::state::StateCache::default(),
+                        StateMode::Shared,
+                        &options,
+                    )
+                    .await
+                    .unwrap()
+                    .close()
+                    .await
+                    .unwrap();
+            }
+        };
+        let keys = |set: &std::sync::Mutex<std::collections::BTreeSet<String>>| {
+            let keys: Vec<String> = std::mem::take(&mut *set.lock().unwrap())
+                .into_iter()
+                .map(|key| key.strip_prefix(&root).expect("a cluster key").to_owned())
+                .collect();
+            keys
+        };
+        open(1, false).await;
+        let written = keys(&faults.written);
+        assert!(
+            written.iter().all(|key| key == "mode.json"
+                || key == "member-1/binding.json"
+                || key.starts_with("shared/")),
+            "{written:?}"
+        );
+        keys(&faults.read);
+        for (member, join) in [(2, false), (3, true)] {
+            open(member, join).await;
+            let written = keys(&faults.written);
+            let own = format!("member-{member}/");
+            assert!(
+                written
+                    .iter()
+                    .all(|key| key.starts_with(&own) || (!join && key.starts_with("shared/"))),
+                "member {member} wrote {written:?}"
+            );
+            let read = keys(&faults.read);
+            assert!(
+                read.iter().all(|key| key == "mode.json"
+                    || key.starts_with("shared/")
+                    || key.starts_with(&own)
+                    || (key.starts_with("member-") && key.ends_with("/owner.json"))),
+                "member {member} read {read:?}"
+            );
         }
     }
 }

@@ -77,6 +77,7 @@ Create one `ServerConfig` for each member. Set these fields before `Server::star
 | `log_memory`, `quota_bytes` | Set separate log budgets and the logical data quota. |
 | `snapshot_every` | Set the automatic checkpoint interval. Zero disables it. |
 | `snapshot_min_bytes` | Set the log bytes an automatic checkpoint waits for. Zero disables it. |
+| `log_file_bytes` | Set the size of one Raft log file. Truncation frees whole files. |
 | `auth_token` | Select the same simple or JWT token configuration as the CLI. |
 | `join`, `restore_snapshot` | Select member join or native restore. They cannot both be enabled. |
 | `state_mode`, `view_max_age` | Select shared mode for a new one-voter cluster and its flush age. |

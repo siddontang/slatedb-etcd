@@ -12,6 +12,7 @@ fn options(dir: &std::path::Path) -> NodeOptions {
         overlay_max_bytes: 1 << 30,
         max_clock_skew: std::time::Duration::from_secs(5),
         view_retention: Default::default(),
+        restore: None,
         object_store: crate::object::Config::Local,
         strict_reconfiguration: false,
         join: false,
@@ -22,6 +23,7 @@ fn options(dir: &std::path::Path) -> NodeOptions {
         peers: (1..=3).map(|id| (id, format!("127.0.0.1:{id}"))).collect(),
         snapshot_every: 0,
         snapshot_min_bytes: 0,
+        log_file_bytes: 256 * 1024,
         log_memory: LogMemory::default(),
         state_cache: Default::default(),
     }
@@ -568,9 +570,19 @@ async fn dropping_the_node_cancels_an_active_worker() {
 }
 
 pub(super) async fn leader_node(dir: &std::path::Path) -> Node {
+    leader_node_with(dir, |_| {}).await
+}
+
+/// Like `leader_node`, but `configure` can change the node options first.
+pub(super) async fn leader_node_with(
+    dir: &std::path::Path,
+    configure: impl FnOnce(&mut NodeOptions),
+) -> Node {
     seed_log(dir, 1);
+    let mut config = options(dir);
+    configure(&mut config);
     let (events, _) = mpsc::channel(256);
-    let mut node = Node::open_with_transport(options(dir), events, Some(BTreeMap::new()))
+    let mut node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
         .await
         .unwrap();
     node.raw.campaign().unwrap();

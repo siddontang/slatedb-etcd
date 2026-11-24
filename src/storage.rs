@@ -54,6 +54,14 @@ pub struct LogStats {
 /// The identity marker of data directories whose state rows can omit Put values outside the
 /// current and history rows. Binaries without it reject such a directory.
 const ROW_MARKER: &str = "history-values";
+/// Default size of one Raft log file, as etcd's 64 MiB WAL segment.
+///
+/// Each file rotation syncs the old file, the new file header, and the directory. With 256 KiB
+/// files, 4 KiB-value puts rotated about every 130 writes, and rotation caused half of the
+/// device flushes. Truncation deletes only whole files, so up to one file of old entries stays.
+pub const DEFAULT_LOG_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// Smallest Raft log file size. A file must hold its header and at least one write batch.
+pub const MIN_LOG_FILE_BYTES: u64 = 64 * 1024;
 
 /// The identity record of the data directory and whether it carries [`ROW_MARKER`].
 ///
@@ -166,11 +174,55 @@ impl RaftStorage {
         }
     }
 
-    pub fn open(dir: &Path, node_id: u64, cluster_id: &str, voters: Vec<u64>) -> Result<Self> {
+    /// The member ID, the cluster ID, and the initial voters in the identity of an existing
+    /// log. Offline tools open a log without the startup flags. The open fails while the member
+    /// runs.
+    pub fn stored_identity(dir: &Path) -> Result<(u64, String, Vec<u64>)> {
         let config = Config {
             dir: dir.to_string_lossy().into_owned(),
-            target_file_size: ReadableSize::kb(256),
-            purge_threshold: ReadableSize::kb(512),
+            enable_log_recycle: false,
+            ..Config::default()
+        };
+        let engine = Engine::open(config)?;
+        let stored = engine
+            .get(GROUP, IDENTITY)
+            .context("the log has no identity")?;
+        let fields: Vec<serde_json::Value> = serde_json::from_slice(&stored)?;
+        let field = |n: usize| fields.get(n).cloned().context("invalid log identity");
+        Ok((
+            serde_json::from_value(field(1)?)?,
+            serde_json::from_value(field(2)?)?,
+            serde_json::from_value(field(3)?)?,
+        ))
+    }
+
+    /// Open an existing log with its stored identity.
+    pub fn open_existing(dir: &Path) -> Result<Self> {
+        let (member, cluster, voters) = Self::stored_identity(dir)?;
+        Self::open(dir, member, &cluster, voters)
+    }
+
+    pub fn open(dir: &Path, node_id: u64, cluster_id: &str, voters: Vec<u64>) -> Result<Self> {
+        Self::open_with_file_bytes(dir, node_id, cluster_id, voters, DEFAULT_LOG_FILE_BYTES)
+    }
+
+    /// Open the log with `file_bytes` per log file. Existing files of any size stay readable.
+    pub fn open_with_file_bytes(
+        dir: &Path,
+        node_id: u64,
+        cluster_id: &str,
+        voters: Vec<u64>,
+        file_bytes: u64,
+    ) -> Result<Self> {
+        ensure!(
+            file_bytes >= MIN_LOG_FILE_BYTES,
+            "log file size must be at least {MIN_LOG_FILE_BYTES} bytes"
+        );
+        let config = Config {
+            dir: dir.to_string_lossy().into_owned(),
+            target_file_size: ReadableSize(file_bytes),
+            // raft-engine requires a purge threshold of at least one file.
+            purge_threshold: ReadableSize(file_bytes),
             batch_compression_threshold: ReadableSize(0),
             enable_log_recycle: false,
             ..Config::default()
@@ -355,14 +407,29 @@ impl RaftStorage {
     /// One synced batch stores the record, its ConfState, the commit `max(commit, index)`, and
     /// the log change. A crash leaves the old log or the new boundary.
     pub fn adopt(&mut self, snapshot: &Snapshot) -> Result<()> {
+        self.adopt_at(snapshot, false)
+    }
+
+    /// Adopt `snapshot`, or replace the record at its own index when the terms match. The offline
+    /// converter uses this, because a member's record can already be at the checkpoint index.
+    pub fn replace_record(&mut self, snapshot: &Snapshot) -> Result<()> {
+        self.adopt_at(snapshot, true)
+    }
+
+    fn adopt_at(&mut self, snapshot: &Snapshot, replace: bool) -> Result<()> {
         let index = snapshot.get_metadata().index;
         let term = snapshot.get_metadata().term;
-        ensure!(index > self.snapshot_index(), "stale adopted snapshot");
+        let same =
+            replace && index == self.snapshot_index() && term == self.snapshot.get_metadata().term;
+        ensure!(
+            same || index > self.snapshot_index(),
+            "stale adopted snapshot"
+        );
         ensure!(
             !snapshot.data.is_empty(),
             "adopted snapshot has no descriptor"
         );
-        let keep = index <= self.last_index()? && self.term(index).ok() == Some(term);
+        let keep = same || (index <= self.last_index()? && self.term(index).ok() == Some(term));
         ensure!(
             keep || index > self.hard_state.commit,
             "committed log term at {index} differs from checkpoint term {term}"

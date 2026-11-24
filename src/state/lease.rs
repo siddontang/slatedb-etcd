@@ -61,6 +61,7 @@ impl StateMachine {
         let (result, mut batch, revision, change, deletes) =
             match crate::lease::prepare_with_counts(
                 self.applied_state(),
+                Some(&self.key_index),
                 self.revision,
                 self.compact_revision,
                 index,

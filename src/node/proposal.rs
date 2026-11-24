@@ -3,9 +3,14 @@
 
 use super::*;
 
-const MAX_WAITING: usize = 256;
-const MAX_WAITING_BYTES: usize = 4 * 1024 * 1024;
-const WAIT_LIMIT: Duration = Duration::from_secs(5);
+/// Client writes that may wait for capacity. Each client has at most one write in flight per
+/// stream, so the queue must hold every client that a busy server serves: a transient apply or
+/// log stall should delay writes, as in etcd, not fail them. This matches the read admission
+/// bound in `grpc::admission`. The waiting writes are not proposed and hold no Raft memory.
+const MAX_WAITING: usize = 8192;
+/// Encoded bytes of the waiting writes. Twice the queued log bytes, so a stall at the log bound
+/// can hold a full log queue of writes behind it.
+const MAX_WAITING_BYTES: usize = 2 * log::MAX_BYTES;
 /// etcd returns ErrTooManyRequests when apply falls too far behind. A deferred
 /// proposal that expires was never proposed, so its outcome is known.
 pub(super) const TOO_MANY_REQUESTS: &str = "too many requests";
@@ -79,6 +84,11 @@ impl Group {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    /// Bytes the group charges against the pending log quota.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
 }
 
 impl Node {
@@ -131,7 +141,7 @@ impl Node {
             data,
             response,
             term: self.raw.raft.term,
-            expires: Instant::now() + WAIT_LIMIT,
+            expires: Instant::now() + self.request_timeout,
         });
     }
 
@@ -419,6 +429,201 @@ mod tests {
         )
         .unwrap();
         rx
+    }
+
+    /// A transient backlog with 1000 clients delays every put and fails none. The queue
+    /// held 256 writes before, so the 257th client got "state apply backlog is full".
+    #[tokio::test]
+    async fn a_transient_backlog_delays_a_thousand_clients_without_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = super::super::tests::leader_node(dir.path()).await;
+        let last = node.raw.raft.raft_log.last_index();
+        let previous_bytes = node.log_bytes;
+        node.log_bytes = log::MAX_BYTES;
+        let mut waiting: Vec<_> = (0..1000u32)
+            .map(|n| waiting_put(&mut node, n.to_be_bytes().repeat(64)))
+            .collect();
+        assert_eq!(node.waiting_proposals.requests.len(), 1000);
+        for reply in &mut waiting {
+            assert!(matches!(
+                reply.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+        }
+        assert_eq!(node.raw.raft.raft_log.last_index(), last);
+        node.log_bytes = previous_bytes;
+        for _ in 0..1000 {
+            if node.waiting_proposals.is_empty() {
+                break;
+            }
+            node.drive_ready().await.unwrap();
+        }
+        assert!(node.waiting_proposals.is_empty());
+        node.flush_puts();
+        node.drive_ready().await.unwrap();
+        // Every waiting put reached the log, and none failed.
+        assert_eq!(node.raw.raft.raft_log.last_index(), last + 1000);
+        assert_eq!(node.waiting_proposals.bytes, 0);
+        for reply in &mut waiting {
+            assert!(matches!(
+                reply.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    /// Send one 64 KiB put, then persist it and everything Raft has ready.
+    async fn put_and_drain(
+        node: &mut Node,
+        replies: &mut Vec<oneshot::Receiver<Result<KvReply, ApiError>>>,
+    ) {
+        replies.push(waiting_put(node, vec![7; 64 * 1024]));
+        node.drive_ready().await.unwrap();
+        node.drain_log().await.unwrap();
+        assert!(node.raw.raft.raft_log.unstable_entries().is_empty());
+        assert!(node.log_queue.is_empty());
+        assert_eq!(node.log_bytes, 0);
+        // Each put is in Raft or waits for capacity, and none has a reply.
+        assert_eq!(
+            node.pending.len() + node.waiting_proposals.len(),
+            replies.len()
+        );
+        for reply in replies.iter_mut() {
+            match reply.try_recv() {
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                other => panic!("a put was answered before a quorum: {other:?}"),
+            }
+        }
+    }
+
+    /// Commit until every put is proposed and applied, then check all replies in order.
+    async fn commit_puts(
+        node: &mut Node,
+        replies: Vec<oneshot::Receiver<Result<KvReply, ApiError>>>,
+    ) {
+        for _ in 0..100 {
+            if node.waiting_proposals.is_empty() && node.pending.is_empty() {
+                break;
+            }
+            commit_all(node).await;
+        }
+        assert!(node.waiting_proposals.is_empty());
+        let mut last = 0;
+        for reply in replies {
+            let revision = revision(reply.await.unwrap());
+            assert!(revision > last);
+            last = revision;
+        }
+    }
+
+    /// A second voter is unavailable, and each 64 KiB put reaches the local disk before the
+    /// next one. 600 puts are more than Raft's 32 MiB uncommitted limit. Each put must wait
+    /// for a quorum: none fails, and all complete in order when the voter returns.
+    async fn large_puts_wait_for_a_quorum(node: &mut Node) {
+        // The checks below are by step. A busy test host must not reach the 5 s deadlines.
+        node.request_timeout = Duration::from_secs(3600);
+        let mut replies = Vec::new();
+        for _ in 0..600 {
+            put_and_drain(node, &mut replies).await;
+        }
+        assert!(!node.waiting_proposals.is_empty());
+        assert!(node.raw.raft.uncommitted_size() <= log::MAX_BYTES + apply::BATCH_BYTES as usize);
+        // The voter returns. Every held put is proposed, committed, and answered.
+        commit_puts(node, replies).await;
+    }
+
+    #[tokio::test]
+    async fn large_puts_wait_for_a_quorum_after_the_local_log_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = super::super::tests::leader_node(dir.path()).await;
+        large_puts_wait_for_a_quorum(&mut node).await;
+        // The pending log quota holds unapplied entries, so it stops writers first here.
+        assert!(node.backlog_rejects[4] > 0);
+    }
+
+    #[tokio::test]
+    async fn large_puts_wait_for_a_quorum_with_a_large_pending_log_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = super::super::tests::leader_node_with(dir.path(), |options| {
+            options.log_memory.pending_bytes = 256 * 1024 * 1024;
+        })
+        .await;
+        large_puts_wait_for_a_quorum(&mut node).await;
+        // Only Raft's uncommitted bytes stop writers before Raft would drop them.
+        assert!(node.backlog_rejects[3] > 0);
+        assert_eq!(node.backlog_rejects[4], 0);
+    }
+
+    async fn member_change(
+        node: &mut Node,
+        request: crate::cluster::Command,
+    ) -> oneshot::Receiver<Result<Value, ApiError>> {
+        let (tx, rx) = oneshot::channel();
+        node.handle(Event::Cluster(request, tx), &mut vec![])
+            .await
+            .unwrap();
+        rx
+    }
+
+    /// Three voters, and voter 3 is down. Puts fill a write byte hold and wait, and the local
+    /// log queue is empty. Voters 1 and 2 must still remove voter 3. A second change waits.
+    async fn removal_skips_the_write_byte_holds(node: &mut Node, cause: usize) {
+        node.request_timeout = Duration::from_secs(3600);
+        let mut replies = Vec::new();
+        while node.waiting_proposals.is_empty() {
+            assert!(replies.len() < 600, "puts did not reach a byte hold");
+            put_and_drain(node, &mut replies).await;
+        }
+        assert!(node.backlogged());
+        assert!(node.backlog_rejects[cause] > 0);
+        assert_eq!(node.backlog_rejects[..3], [0, 0, 0]);
+        let applied = node.state.applied;
+        let mut removed = member_change(node, crate::cluster::Command::Remove(3)).await;
+        // Raft has the change at once. It does not wait behind the puts.
+        assert!(matches!(
+            removed.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(node.raw.raft.pending_conf_index > applied);
+        let learner = crate::cluster::Command::Add(crate::proto::etcdserverpb::Member {
+            id: 4,
+            peer_ur_ls: vec!["http://127.0.0.1:4".into()],
+            is_learner: true,
+            ..Default::default()
+        });
+        let refused = member_change(node, learner).await.await.unwrap().unwrap();
+        assert!(refused
+            .to_string()
+            .contains("reconfiguration is in progress"));
+        // Voter 2 acknowledges. The removal commits with voters 1 and 2.
+        let removed = loop {
+            commit_all(node).await;
+            match removed.try_recv() {
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                reply => break reply.unwrap().unwrap(),
+            }
+        };
+        assert!(!removed.to_string().contains("Err"), "{removed}");
+        assert!(!node.state.members.members.contains_key(&3));
+        assert!(!node.raw.raft.prs().conf().voters().contains(3));
+        commit_puts(node, replies).await;
+    }
+
+    #[tokio::test]
+    async fn member_removal_skips_the_pending_log_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = super::super::tests::leader_node(dir.path()).await;
+        removal_skips_the_write_byte_holds(&mut node, 4).await;
+    }
+
+    #[tokio::test]
+    async fn member_removal_skips_the_uncommitted_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = super::super::tests::leader_node_with(dir.path(), |options| {
+            options.log_memory.pending_bytes = 256 * 1024 * 1024;
+        })
+        .await;
+        removal_skips_the_write_byte_holds(&mut node, 3).await;
     }
 
     #[tokio::test]

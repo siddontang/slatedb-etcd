@@ -94,8 +94,8 @@ impl StateMachine {
         drop(rows);
         for (key, value) in data.rows {
             ensure!(snapshot_key(&key), "invalid snapshot key");
-            // Shared mode derives the logical size row again from the installed rows.
-            if key != shared::LOGICAL_BYTES {
+            // This batch derives the size and term rows again from the installed rows.
+            if !derived_key(&key) {
                 batch.put(key, value);
             }
         }

@@ -11,6 +11,7 @@ use slatedb::config::{CheckpointOptions, CheckpointScope, WriteOptions};
 
 use std::collections::HashSet;
 
+use crate::mvcc::{KvError, Outcome};
 use crate::state::overlay::Queue;
 use crate::state::shared::{view_checkpoints, view_name, Handles, Source};
 
@@ -34,6 +35,8 @@ struct Inner {
     dirty_since: Option<Instant>,
     /// Publish a checkpoint after the materializer writes this sequence.
     publish_through: Option<u64>,
+    /// Publish a new checkpoint even at an unchanged sequence. Defragment sets this.
+    republish: bool,
 }
 
 impl Progress {
@@ -62,10 +65,23 @@ impl Progress {
         }
     }
 
-    /// Start again after a writer open at `written`.
+    /// Start again after a writer open at `written`. A publication request stays: a manual
+    /// checkpoint can ask for it before the new writer opens.
     fn reset(&self, written: u64) {
         self.written.send_replace(written);
-        *self.inner.lock().unwrap() = Inner::default();
+        let mut inner = self.inner.lock().unwrap();
+        inner.dirty_since = None;
+        inner.republish = false;
+    }
+
+    /// Publish a new checkpoint at the current sequence, for a changed layout.
+    fn republish(&self) {
+        self.inner.lock().unwrap().republish = true;
+        self.wake.notify_one();
+    }
+
+    fn take_republish(&self) -> bool {
+        std::mem::take(&mut self.inner.lock().unwrap().republish)
     }
 
     fn request(&self, through: u64) {
@@ -160,6 +176,59 @@ pub(super) struct Writer {
     reopens: Arc<std::sync::atomic::AtomicU64>,
     pub(super) retention: crate::state::ViewRetention,
     pub(super) retained: Option<prometheus::IntGauge>,
+    /// The writer `Db` while this member leads.
+    open: OpenWriter,
+    pub(super) gauges: Option<Gauges>,
+    /// The highest manual checkpoint index that requested a publication after apply.
+    checkpoint_requested: u64,
+    /// A follower's manual checkpoint index that waits for apply on this leader.
+    remote_checkpoint: u64,
+}
+
+/// The shared-mode gauges of one member. The node sets them on each tick.
+pub(super) struct Gauges {
+    base: prometheus::IntGauge,
+    overlay: prometheus::IntGauge,
+    paused: prometheus::IntGauge,
+    leading: prometheus::IntGauge,
+    reopens: prometheus::IntGauge,
+    clock_alarm: prometheus::IntGauge,
+}
+
+impl Gauges {
+    pub(super) fn register(registry: &prometheus::Registry) -> Result<Self> {
+        let gauge = |name: &str, help: &str| -> Result<prometheus::IntGauge> {
+            let gauge = prometheus::IntGauge::new(name, help)?;
+            registry.register(Box::new(gauge.clone()))?;
+            Ok(gauge)
+        };
+        Ok(Self {
+            base: gauge(
+                "slatedb_etcd_shared_base_applied_index",
+                "Raft index of the view checkpoint that this member reads as its base.",
+            )?,
+            overlay: gauge(
+                "slatedb_etcd_shared_overlay_bytes",
+                "Bytes of applied batches in the overlay above the base.",
+            )?,
+            paused: gauge(
+                "slatedb_etcd_shared_apply_paused",
+                "1 while apply waits for a base switch above twice the overlay limit.",
+            )?,
+            leading: gauge(
+                "slatedb_etcd_shared_writer_running",
+                "1 while the shared writer database of this member is open.",
+            )?,
+            clock_alarm: gauge(
+                "slatedb_etcd_shared_writer_clock_alarm",
+                "1 while the writer does not start because the local clock is too far behind.",
+            )?,
+            reopens: gauge(
+                "slatedb_etcd_shared_writer_reopens",
+                "Writer opens after a fence or a lost manifest race while this member led.",
+            )?,
+        })
+    }
 }
 
 impl Writer {
@@ -172,6 +241,10 @@ impl Writer {
             reopens: Arc::default(),
             retention: crate::state::ViewRetention::Off,
             retained: None,
+            open: OpenWriter::default(),
+            gauges: None,
+            checkpoint_requested: 0,
+            remote_checkpoint: 0,
             progress: Arc::new(Progress::new(0)),
             admin: handles.admin.clone(),
             queue: handles.queue.clone(),
@@ -184,6 +257,7 @@ impl Writer {
             applied: Applied {
                 based: handles.based.clone(),
                 announced: handles.announced.clone(),
+                base_id: handles.base_id.clone(),
                 #[cfg(test)]
                 failures: Arc::default(),
             },
@@ -237,6 +311,7 @@ impl Writer {
                 leadership: self.leadership.subscribe(),
                 clock: self.clock.clone(),
                 reopens: self.reopens.clone(),
+                open: self.open.clone(),
             },
         );
         self.tasks.spawn(async move { (term, task.await) });
@@ -254,6 +329,17 @@ impl Writer {
         {
             self.tasks.shutdown().await;
         }
+    }
+
+    /// Request the publication for a manual checkpoint through `index` once apply reaches it.
+    /// Return true when this call requested it. Each index is requested once.
+    pub fn request_checkpoint(&mut self, index: u64, applied: u64) -> bool {
+        if index > applied || index <= self.checkpoint_requested {
+            return false;
+        }
+        self.checkpoint_requested = index;
+        self.request_publication(index);
+        true
     }
 
     /// Publish a checkpoint that holds the applied state through `index`.
@@ -418,7 +504,11 @@ struct Leading {
     leadership: tokio::sync::watch::Receiver<(bool, u64)>,
     clock: Clock,
     reopens: Arc<std::sync::atomic::AtomicU64>,
+    open: OpenWriter,
 }
+
+/// The writer `Db` while the writer task runs. Defragment flushes and compacts it.
+type OpenWriter = Arc<Mutex<Option<Arc<slatedb::Db>>>>;
 
 /// Wait until the member asks the writer task to stop. The result holds no borrow, so the task
 /// stays `Send` across later waits.
@@ -467,9 +557,19 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         leadership,
         clock,
         reopens,
+        open,
     } = leading;
     let current = || *leadership.borrow() == (true, term);
     loop {
+        // An ordinary start bootstraps an empty state only after it claims the one bootstrap
+        // operation. A pending snapshot restore holds the claim, so the leader waits for it.
+        if let Some(wait) = bootstrap_wait(&publisher.source).await {
+            tracing::warn!(reason = %wait, "the shared writer waits for the bootstrap");
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
+                _ = stop_requested(&mut stopped) => return Ok(()),
+            }
+        }
         let opened = tokio::select! {
             opened = publisher.source.open_writer() => opened,
             _ = stop_requested(&mut stopped) => return Ok(()),
@@ -521,11 +621,19 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         let mut publisher = publisher.clone();
         publisher.progress.reset(db.manifest().last_l0_seq());
         publisher.db = Some(db.clone());
+        *open.lock().unwrap() = Some(db.clone());
         let result = tokio::select! {
             result = materialize(db.clone(), queue.clone(), publisher.progress.clone()) => result,
             result = publish(publisher, events.clone()) => result,
             _ = stop_requested(&mut stopped) => Ok(()),
         };
+        // A later task can own the slot already. Clear only this task's writer.
+        {
+            let mut slot = open.lock().unwrap();
+            if slot.as_ref().is_some_and(|open| Arc::ptr_eq(open, &db)) {
+                *slot = None;
+            }
+        }
         close(db).await;
         match result {
             // Two quick elections can open writers in reverse term order.
@@ -535,6 +643,28 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
             }
             result => return result,
         }
+    }
+}
+
+/// Return why the writer cannot open yet: a pending snapshot restore, or an unreadable claim.
+async fn bootstrap_wait(source: &Source) -> Option<String> {
+    let checked = async {
+        if source.bootstrapped().await? {
+            return anyhow::Ok(None);
+        }
+        let op = crate::state::shared::BootstrapOp::Empty;
+        Ok(
+            match crate::state::shared::claim_bootstrap(source, &op).await? {
+                crate::state::shared::BootstrapOp::Empty => None,
+                crate::state::shared::BootstrapOp::Restore { snapshot } => {
+                    Some(format!("the restore of snapshot {snapshot} is pending"))
+                }
+            },
+        )
+    };
+    match checked.await {
+        Ok(wait) => wait,
+        Err(error) => Some(error.to_string()),
     }
 }
 
@@ -575,6 +705,130 @@ struct Publisher {
     applied: Applied,
 }
 
+/// One Defragment on the leader writer.
+pub(super) struct Defragment {
+    db: Arc<slatedb::Db>,
+    admin: Arc<slatedb::admin::Admin>,
+    progress: Arc<Progress>,
+    /// The newest applied announcement on this member.
+    announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
+    leadership: tokio::sync::watch::Receiver<(bool, u64)>,
+    term: u64,
+    /// A test pause before a step: (step, reached, resume).
+    pause: Option<(
+        DefragmentStep,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+    )>,
+}
+
+/// The steps of a Defragment where a test can pause it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum DefragmentStep {
+    Flush,
+    Compact,
+    Publish,
+}
+
+/// The longest time that a Defragment waits for its compacted checkpoint.
+const DEFRAGMENT_WAIT: Duration = Duration::from_secs(20);
+
+impl Defragment {
+    /// Flush, compact every SST into one sorted run, and wait until this member applied the
+    /// announcement of a checkpoint at or beyond the completed compaction manifest. An
+    /// older checkpoint that applies late does not count. Members then adopt the compacted one.
+    ///
+    /// A leader change before that returns a retryable error, also when it closes the writer
+    /// during the flush or the compaction. The new leader can then run the Defragment again.
+    pub(super) async fn run(mut self) -> std::result::Result<(), KvError> {
+        let lost = || {
+            KvError::new(
+                tonic::Code::Unavailable,
+                "etcdserver: the leader changed during Defragment; retry",
+            )
+        };
+        let term = self.term;
+        let leads = |leadership: &tokio::sync::watch::Receiver<(bool, u64)>| {
+            *leadership.borrow() == (true, term)
+        };
+        // A step down closes the writer, so a storage error then means a lost lead.
+        let failed = |leadership: &tokio::sync::watch::Receiver<(bool, u64)>,
+                      error: anyhow::Error| {
+            if leads(leadership) {
+                KvError::storage(error)
+            } else {
+                lost()
+            }
+        };
+        self.pause_at(DefragmentStep::Flush).await;
+        if let Err(error) = self.db.flush().await {
+            return Err(failed(&self.leadership, error.into()));
+        }
+        self.pause_at(DefragmentStep::Compact).await;
+        let compacted_manifest_id = match crate::state::maintenance::compact_all(&self.admin).await
+        {
+            Ok(id) => id,
+            Err(error) => return Err(failed(&self.leadership, error)),
+        };
+        self.pause_at(DefragmentStep::Publish).await;
+        if !leads(&self.leadership) {
+            return Err(lost());
+        }
+        // The next checkpoint, also at the same index, reads the compacted layout.
+        self.progress.republish();
+        let deadline = tokio::time::Instant::now() + DEFRAGMENT_WAIT;
+        let timeout = || {
+            KvError::new(
+                tonic::Code::Unavailable,
+                "etcdserver: Defragment did not publish its checkpoint in time; retry",
+            )
+        };
+        loop {
+            let applied = *self.announced.borrow_and_update();
+            if let Some(checkpoint) = applied {
+                match checkpoint_covers_compaction(&self.admin, checkpoint, compacted_manifest_id)
+                    .await
+                {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(error) => return Err(failed(&self.leadership, error)),
+                }
+            }
+            tokio::select! {
+                changed = self.announced.changed() => changed.map_err(|_| lost())?,
+                changed = self.leadership.changed() => {
+                    if changed.is_err() || !leads(&self.leadership) {
+                        return Err(lost());
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => return Err(timeout()),
+            }
+        }
+    }
+
+    async fn pause_at(&mut self, step: DefragmentStep) {
+        if self.pause.as_ref().is_some_and(|(at, ..)| *at == step) {
+            let (_, reached, resume) = self.pause.take().unwrap();
+            reached.notify_one();
+            resume.notified().await;
+        }
+    }
+}
+
+/// Manifest versions increase across both compactions and checkpoint publications.
+/// An older checkpoint may also omit the inputs if it predates an earlier compaction.
+async fn checkpoint_covers_compaction(
+    admin: &slatedb::admin::Admin,
+    checkpoint: uuid::Uuid,
+    compacted_manifest_id: u64,
+) -> Result<bool> {
+    Ok(admin
+        .list_checkpoints(None)
+        .await?
+        .iter()
+        .any(|listed| listed.id == checkpoint && listed.manifest_id >= compacted_manifest_id))
+}
+
 /// The applied state that a publisher checks before it announces a checkpoint again.
 #[derive(Clone)]
 struct Applied {
@@ -582,6 +836,8 @@ struct Applied {
     based: tokio::sync::watch::Receiver<u64>,
     /// The checkpoint of the newest applied `ViewCheckpoint` entry.
     announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
+    /// The checkpoint of the current base.
+    base_id: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
     /// Checks that fail before they read storage, for tests.
     #[cfg(test)]
     failures: Arc<std::sync::atomic::AtomicU32>,
@@ -656,8 +912,9 @@ impl Retry {
 /// it. A writer that stops after a checkpoint and before its announcement commits leaves one.
 /// With no more writes, no newer checkpoint replaces it, and members wait for its base.
 ///
-/// A checkpoint is not stranded when it is the newest announced one, when an announced one is
-/// at the same or a newer sequence, or when its `F` is at or below the current base. Thus an
+/// The newest checkpoint is the last in (index, manifest) order. It is not stranded when it is
+/// the newest announced checkpoint or the current base, or when its `F` is below the base.
+/// After a Defragment a newer checkpoint at the base index is stranded until it applies. Thus an
 /// adopted checkpoint never causes a new announcement, and announcements cannot loop. A
 /// checkpoint without membership is not valid and is not stranded.
 async fn stranded(
@@ -677,21 +934,19 @@ async fn stranded(
     {
         anyhow::bail!("an injected storage error");
     }
+    // The newest checkpoint in (index, manifest) order. A Defragment adds a newer one at the
+    // same index, so the identity counts, not only the index.
     let views = view_checkpoints(admin).await?;
-    let Some((seq, checkpoint)) = views.last() else {
+    let Some((_, checkpoint)) = views.last() else {
         return Ok(None);
     };
-    let announced = *applied.announced.borrow();
-    if let Some(announced) = announced {
-        if views
-            .iter()
-            .any(|(other, view)| view.id == announced && other >= seq)
-        {
-            return Ok(None);
-        }
+    if *applied.announced.borrow() == Some(checkpoint.id)
+        || *applied.base_id.borrow() == Some(checkpoint.id)
+    {
+        return Ok(None);
     }
     let base = source.open_base(checkpoint.id).await?;
-    if base.applied <= *applied.based.borrow() {
+    if base.applied < *applied.based.borrow() {
         return Ok(None);
     }
     if base.get(crate::cluster::KEY).await?.is_none() {
@@ -754,7 +1009,8 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
         }
         // SlateDB also flushes a full memtable by itself. Each advance gets one checkpoint.
         let last = db.manifest().last_l0_seq();
-        if last <= published {
+        let republish = progress.take_republish();
+        if last <= published && !republish {
             // A request with no new checkpoint can wait for a stranded one.
             if requested {
                 retry.now();
@@ -827,9 +1083,17 @@ async fn reannounce(
     bootstrapped: &mut bool,
     events: &mpsc::Sender<Event>,
 ) -> Result<bool> {
-    // The usual case reads no storage: the sent announcement applied.
-    if retry.awaiting.is_some() && *applied.announced.borrow() == retry.awaiting {
-        retry.done();
+    // A sent announcement counts when applied state shows it. Until then this publisher sends
+    // its own checkpoint again. The usual case reads no storage.
+    if let Some(id) = retry.awaiting {
+        if *applied.announced.borrow() == Some(id) {
+            retry.done();
+            return Ok(true);
+        }
+        let Some(accepted) = announce(events, id).await else {
+            return Ok(false);
+        };
+        retry.sent(id, accepted);
         return Ok(true);
     }
     let id = match stranded(admin, source, applied).await {
@@ -906,6 +1170,8 @@ pub(super) fn reconcile_conf(
 
 /// Ticks between two `ViewAck` reports.
 const REPORT_TICKS: u64 = 50;
+/// Ticks between two publication requests of a follower's waiting manual checkpoint.
+const RETRY_TICKS: u64 = 5;
 /// Ticks between two checkpoint polls of a paused member.
 const POLL_TICKS: u64 = 10;
 
@@ -961,6 +1227,58 @@ impl Node {
         }
     }
 
+    /// Defragment the shared database. Only the leader has the writer and its compactor, so a
+    /// follower returns "not leader" and the gRPC layer forwards the request. The leader flushes
+    /// the writer, compacts every SST into one sorted run, and requests a checkpoint, so the
+    /// next base reads the compacted run.
+    pub(super) fn defragment_shared(
+        &mut self,
+        credentials: crate::auth::Credentials,
+        response: Response,
+    ) -> Result<()> {
+        if let Err(error) = self.state.auth.admin(&credentials) {
+            let _ = response.send(Ok(serde_json::to_value(Outcome::<Value> {
+                result: Err(error),
+            })?));
+            return Ok(());
+        }
+        if self.raw.raft.state != StateRole::Leader {
+            let _ = response.send(Err(self.error("not leader")));
+            return Ok(());
+        }
+        let writer = self.writer.as_ref().context("shared mode has no writer")?;
+        let Some(db) = writer.open.lock().unwrap().clone() else {
+            let _ = response.send(Err(self.error("the shared writer is not open yet")));
+            return Ok(());
+        };
+        let defragment = Defragment {
+            db,
+            admin: writer.admin.clone(),
+            progress: writer.progress.clone(),
+            announced: writer.applied.announced.clone(),
+            leadership: writer.leadership.subscribe(),
+            term: self.raw.raft.term,
+            pause: None,
+        };
+        let mut header = ResponseHeader {
+            revision: self.state.revision,
+            ..Default::default()
+        };
+        self.fill_header(Some(&mut header));
+        tokio::spawn(async move {
+            let outcome = match defragment.run().await {
+                Ok(()) => Outcome {
+                    result: Ok(json!({ "header": header })),
+                },
+                Err(error) => Outcome { result: Err(error) },
+            };
+            if let Ok(value) = serde_json::to_value(outcome) {
+                let _ = response.send(Ok(value));
+            }
+        });
+        Ok(())
+    }
+
     /// Propose a checkpoint that the publisher created. Only the leader announces. Return true
     /// when Raft took the proposal.
     pub(super) fn announce_view(&mut self, checkpoint: uuid::Uuid) -> Result<bool> {
@@ -1006,9 +1324,18 @@ impl Node {
     }
 
     /// Record a `ViewAck` from `member`. Only the leader keeps reports.
-    pub(super) fn view_ack(&mut self, member: u64, checkpoints: HashSet<uuid::Uuid>) {
-        if let Some(writer) = &self.writer {
+    pub(super) fn view_ack(
+        &mut self,
+        member: u64,
+        checkpoints: HashSet<uuid::Uuid>,
+        publish: Option<u64>,
+    ) {
+        if let Some(writer) = &mut self.writer {
             writer.report(member, checkpoints);
+            // A follower's manual checkpoint. The publication is due once apply reaches it.
+            if let Some(index) = publish {
+                writer.remote_checkpoint = writer.remote_checkpoint.max(index);
+            }
         }
     }
 
@@ -1019,12 +1346,55 @@ impl Node {
         };
         writer.ticks += 1;
         let ticks = writer.ticks;
+        if let (Some(gauges), Some((base, _, bytes))) = (&writer.gauges, self.state.view) {
+            gauges.base.set(base as i64);
+            gauges.overlay.set(bytes as i64);
+            gauges.paused.set(writer.paused.into());
+            gauges
+                .leading
+                .set(writer.open.lock().unwrap().is_some().into());
+            gauges.clock_alarm.set(
+                writer
+                    .clock
+                    .alarm
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .into(),
+            );
+            gauges
+                .reopens
+                .set(writer.reopens.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        }
+        let leader = self.raw.raft.state == StateRole::Leader;
+        if leader && writer.remote_checkpoint > 0 {
+            let index = writer.remote_checkpoint;
+            writer.request_checkpoint(index, self.state.applied);
+            if index <= writer.checkpoint_requested {
+                writer.remote_checkpoint = 0;
+            }
+        }
         if ticks % POLL_TICKS == 0 && writer.paused {
             self.poll_checkpoints();
+        }
+        // A follower repeats the request of a waiting manual checkpoint.
+        if !leader && ticks % RETRY_TICKS == 0 {
+            if let Some(index) = self
+                .checkpoint_waiters
+                .iter()
+                .map(|(index, _)| *index)
+                .max()
+            {
+                self.send_view_ack(Some(index));
+            }
         }
         if ticks % REPORT_TICKS != 0 {
             return;
         }
+        self.send_view_ack(None);
+    }
+
+    /// Report the pinned checkpoints to the leader. `publish` asks the leader to publish through
+    /// an index for a manual checkpoint on this member.
+    pub(super) fn send_view_ack(&mut self, publish: Option<u64>) {
         let pinned = self.pinned_checkpoints();
         let leader = self.raw.raft.leader_id;
         if leader == self.options.id {
@@ -1046,7 +1416,7 @@ impl Node {
             return;
         };
         let url = format!("{}/raft/view-ack", crate::cluster::url(address));
-        let body = json!({"member": self.options.id, "checkpoints": pinned});
+        let body = json!({"member": self.options.id, "checkpoints": pinned, "publish": publish});
         let client = self.options.transport.http.clone();
         let cluster = self.options.cluster_id.clone();
         tokio::spawn(async move {
@@ -1392,6 +1762,7 @@ mod tests {
     use super::*;
     use crate::state::overlay::Overlay;
     use slatedb::object_store::memory::InMemory;
+    use slatedb::object_store::ObjectStore;
 
     fn batch(seq: u64, rows: &[(&str, &str)]) -> Arc<crate::WriteBatch> {
         let mut batch = crate::WriteBatch::new();
@@ -1662,6 +2033,7 @@ mod tests {
             join: false,
             empty_log: false,
             pin_max: Duration::from_secs(300),
+            restore: None,
         };
         let mut state = StateMachine::open_shared(
             Arc::new(InMemory::new()),
@@ -1725,12 +2097,12 @@ mod tests {
                 .unwrap();
             revisions.push(reply.into_inner().header.unwrap().revision);
         }
-        let applied = status(&server).await["applied_index"].as_u64().unwrap();
+        // The base covers every write when the overlay holds no batch. The applied index can be
+        // higher: a later `ViewCheckpoint` entry changes no state, so no base reaches it.
         eventually("a base that covers the writes", async || {
-            status(&server).await["shared_state"]["base_applied_index"]
-                .as_u64()
-                .unwrap()
-                >= applied
+            let status = status(&server).await;
+            status["shared_state"]["overlay_bytes"].as_u64() == Some(0)
+                && status["shared_state"]["base_applied_index"].as_u64() > Some(0)
         })
         .await;
         faults.set_delay(Duration::from_millis(4));
@@ -1806,6 +2178,7 @@ mod tests {
             join: false,
             empty_log: false,
             pin_max: Duration::from_secs(300),
+            restore: None,
         };
         let mut state = StateMachine::open_shared(
             Arc::new(InMemory::new()),
@@ -1922,6 +2295,7 @@ mod tests {
             join: false,
             empty_log: false,
             pin_max: Duration::from_secs(300),
+            restore: None,
         };
         let mut state = StateMachine::open_shared(
             Arc::new(InMemory::new()),
@@ -2034,6 +2408,7 @@ mod tests {
             join: false,
             empty_log: false,
             pin_max: Duration::from_secs(300),
+            restore: None,
         };
         // A tiny cache, so the open reads the store.
         let cache = crate::state::StateCache {
@@ -2107,6 +2482,7 @@ mod tests {
             join: false,
             empty_log: false,
             pin_max: Duration::from_secs(300),
+            restore: None,
         };
         // A tiny cache, so each open reads the store.
         let cache = crate::state::StateCache {
@@ -2191,6 +2567,563 @@ mod tests {
         state.close().await.unwrap();
     }
 
+    /// A manual checkpoint arrives after its entry commits and before the entry applies. The
+    /// publication request waits for apply, so it covers the batch of that entry.
+    #[tokio::test]
+    async fn a_manual_checkpoint_requests_its_publication_after_apply() {
+        let (mut state, handles, _events, _announcements, _) = stranded_checkpoint().await;
+        let mut writer = Writer::new(&handles, Duration::from_secs(60), clock());
+        let index = state.applied + 1;
+        // Committed at `index`, applied below it: no request yet.
+        assert!(!writer.request_checkpoint(index, index - 1));
+        let put = crate::proto::etcdserverpb::RequestOp {
+            request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
+                crate::proto::etcdserverpb::PutRequest {
+                    key: b"key".to_vec(),
+                    value: b"value".to_vec(),
+                    ..Default::default()
+                },
+            )),
+        };
+        state.apply_etcd(index, &put).await.unwrap();
+        assert!(writer.request_checkpoint(index, index));
+        assert_eq!(
+            writer.progress.inner.lock().unwrap().publish_through,
+            Some(index)
+        );
+        assert!(!writer.request_checkpoint(index, index));
+        state.close().await.unwrap();
+    }
+
+    /// Apply announcement `id` at the next index and switch to its base.
+    async fn adopt_announced(state: &mut StateMachine, id: uuid::Uuid) {
+        let index = state.applied + 1;
+        state
+            .apply_view_checkpoint(index, &id.to_string())
+            .await
+            .unwrap();
+        state.settle_opens().await;
+        state.switch_base();
+        assert_eq!(state.base_checkpoint(), Some(id));
+    }
+
+    /// A Defragment publishes a newer checkpoint at the base index, and the leader changes
+    /// before its announcement applies. The next writer announces it, because the identity of
+    /// the newest checkpoint differs from the base, and the members adopt it with no write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_new_writer_announces_a_same_index_checkpoint() {
+        let (mut state, handles, events, mut announcements, first) = stranded_checkpoint().await;
+        adopt_announced(&mut state, first).await;
+        let mut second = Writer::new(&handles, STRANDED_AGE, clock());
+        second.sync(true, 3, &events);
+        second.progress.wait_written(1).await.unwrap();
+        announcements.none(Duration::from_millis(300)).await;
+        // The Defragment republish. Its announcement does not apply before the change.
+        second.progress.republish();
+        let compacted = announcements.next(Duration::from_secs(5), true).await;
+        assert_ne!(compacted, first);
+        let base = handles.source.open_base(compacted).await.unwrap();
+        assert_eq!(base.applied, state.shared.as_ref().unwrap().base.applied);
+        drop(base);
+        second.sync(false, 3, &events);
+        second.stop().await;
+        let mut third = Writer::new(&handles, STRANDED_AGE, clock());
+        third.sync(true, 4, &events);
+        assert_eq!(
+            announcements.next(Duration::from_secs(2), true).await,
+            compacted
+        );
+        adopt_announced(&mut state, compacted).await;
+        announcements
+            .none(RETRY_MAX + Duration::from_millis(500))
+            .await;
+        third.sync(false, 4, &events);
+        third.stop().await;
+        state.close().await.unwrap();
+    }
+
+    /// A manual checkpoint requests its publication after apply and before the newly elected
+    /// writer opens. The open keeps the request, so the writer publishes and announces the
+    /// covering checkpoint at once, not after the flush age.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_checkpoint_request_survives_the_writer_open() {
+        let (mut state, handles, events, mut announcements, first) = stranded_checkpoint().await;
+        adopt_announced(&mut state, first).await;
+        let put = crate::proto::etcdserverpb::RequestOp {
+            request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
+                crate::proto::etcdserverpb::PutRequest {
+                    key: b"key".to_vec(),
+                    value: b"value".to_vec(),
+                    ..Default::default()
+                },
+            )),
+        };
+        let index = state.applied + 1;
+        state.apply_etcd(index, &put).await.unwrap();
+        let mut writer = Writer::new(&handles, Duration::from_secs(90), clock());
+        assert!(writer.request_checkpoint(index, index));
+        writer.sync(true, 3, &events);
+        let id = announcements.next(Duration::from_secs(2), true).await;
+        assert_eq!(handles.source.open_base(id).await.unwrap().applied, index);
+        writer.sync(false, 3, &events);
+        writer.stop().await;
+        state.close().await.unwrap();
+    }
+
+    /// A one-voter shared state on `store`, opened without a restore, with its handles.
+    async fn ordinary(store: Arc<dyn ObjectStore>) -> (StateMachine, Handles) {
+        let options = crate::state::shared::Options {
+            quota: 0,
+            voters: vec![1],
+            join: false,
+            empty_log: true,
+            pin_max: Duration::from_secs(300),
+            restore: None,
+        };
+        let mut state = StateMachine::open_shared(
+            store,
+            "root",
+            "test",
+            crate::state::StateCache::default(),
+            &options,
+            crate::state::transfer::Backend::Local,
+        )
+        .await
+        .unwrap();
+        state.members = Arc::new(crate::cluster::Store::initial(
+            &[(1, "127.0.0.1:1".to_owned())].into(),
+        ));
+        let handles = state.shared_handles().unwrap();
+        (state, handles)
+    }
+
+    fn snapshot(id: &str) -> crate::state::shared::Restore {
+        let members = crate::cluster::Store::initial(&[(1, "127.0.0.1:1".to_owned())].into());
+        crate::state::shared::Restore::new(
+            vec![
+                (crate::state::APPLIED.to_vec(), 1_u64.to_be_bytes().to_vec()),
+                (
+                    crate::cluster::KEY.to_vec(),
+                    serde_json::to_vec(&members).unwrap(),
+                ),
+                (b"etcd/restored".to_vec(), id.as_bytes().to_vec()),
+            ],
+            id.to_owned(),
+        )
+    }
+
+    /// A restore claims the bootstrap and stops before its marker. An ordinary member then
+    /// opens without the restore flag. It does not select an empty base: it waits. The restore
+    /// completes, and the ordinary member opens on the restored checkpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_ordinary_start_waits_for_a_pending_restore() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let source = crate::state::shared::offline_source(
+            store.clone(),
+            "root",
+            crate::state::StateCache::default(),
+        )
+        .unwrap();
+        let restore = snapshot("a");
+        crate::state::shared::seed_rows_for_test(&source, &restore)
+            .await
+            .unwrap();
+        let opening = tokio::spawn(ordinary(store.clone()));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!opening.is_finished());
+        let admin = slatedb::admin::Admin::builder(source.state().as_str(), store).build();
+        crate::state::shared::seed(&source, &admin, &restore)
+            .await
+            .unwrap();
+        let (state, _handles) = opening.await.unwrap();
+        let base = state.shared.as_ref().unwrap().base.clone();
+        assert_eq!(base.applied, 1);
+        assert_eq!(
+            base.get(b"etcd/restored").await.unwrap().as_deref(),
+            Some(b"a".as_slice())
+        );
+        drop(base);
+        state.close().await.unwrap();
+    }
+
+    /// An ordinary leader bootstraps first. A later restore into that cluster fails, and tells
+    /// the operator that a restore needs a new cluster prefix.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restore_after_an_ordinary_bootstrap_fails() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (mut state, handles) = ordinary(store.clone()).await;
+        state.apply(1, None).await.unwrap();
+        let (events, received) = mpsc::channel(64);
+        let mut announcements = Announcements(received);
+        let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+        writer.sync(true, 2, &events);
+        announcements.next(Duration::from_secs(20), true).await;
+        assert!(handles.source.bootstrapped().await.unwrap());
+        let admin =
+            slatedb::admin::Admin::builder(handles.source.state().as_str(), store.clone()).build();
+        let error = crate::state::shared::seed(&handles.source, &admin, &snapshot("a"))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("new cluster prefix"),
+            "{error:#}"
+        );
+        writer.sync(false, 2, &events);
+        writer.stop().await;
+        state.close().await.unwrap();
+    }
+
+    /// A restore stops after its rows, or after its checkpoint, before its marker. An ordinary
+    /// server start never serves the empty base while the restore claim is pending. After the
+    /// rows it fails after its wait. After the checkpoint it completes the marker with the
+    /// snapshot checksum and starts. A retry of the same snapshot then succeeds, and an ordinary
+    /// start follows the restore.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_ordinary_start_resolves_a_stopped_restore() {
+        for checkpointed in [false, true] {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let source = crate::state::shared::offline_source(
+                store.clone(),
+                "root",
+                crate::state::StateCache::default(),
+            )
+            .unwrap();
+            let admin =
+                slatedb::admin::Admin::builder(source.state().as_str(), store.clone()).build();
+            let restore = snapshot("a");
+            if checkpointed {
+                crate::state::shared::seed_checkpoint_for_test(&source, &restore)
+                    .await
+                    .unwrap();
+            } else {
+                crate::state::shared::seed_rows_for_test(&source, &restore)
+                    .await
+                    .unwrap();
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = crate::server::ServerConfig::single_node(dir.path());
+            config.state_mode = crate::state::StateMode::Shared;
+            config.object_store = crate::object::Config::Test(store.clone(), "root".into());
+            let started = tokio::time::timeout(
+                Duration::from_secs(30),
+                crate::server::Server::start(config.clone()),
+            )
+            .await
+            .unwrap();
+            if checkpointed {
+                let server = started.unwrap();
+                server.wait_ready(Duration::from_secs(15)).await.unwrap();
+                server.shutdown().await.unwrap();
+                assert_eq!(
+                    source.restored_snapshot().await.unwrap().as_deref(),
+                    Some("a")
+                );
+            } else {
+                let error = started.err().unwrap();
+                assert!(format!("{error:#}").contains("pending"), "{error:#}");
+                assert!(!source.bootstrapped().await.unwrap());
+            }
+            // The same snapshot restores with success at either boundary.
+            crate::state::shared::seed(&source, &admin, &restore)
+                .await
+                .unwrap();
+            assert_eq!(
+                source.restored_snapshot().await.unwrap().as_deref(),
+                Some("a")
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = crate::server::ServerConfig::single_node(dir.path());
+            config.state_mode = crate::state::StateMode::Shared;
+            config.object_store = crate::object::Config::Test(store.clone(), "root".into());
+            let server = crate::server::Server::start(config).await.unwrap();
+            server.wait_ready(Duration::from_secs(15)).await.unwrap();
+            server.shutdown().await.unwrap();
+        }
+    }
+
+    /// A MoveLeader requests its publication while the new writer is still opening, after
+    /// apply passed the last published index. The open keeps the request, so the writer
+    /// publishes through the requested index at once, well before the 3 s transfer fallback.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_transfer_request_during_the_writer_open_is_published() {
+        let (mut state, handles, events, mut announcements, first) = stranded_checkpoint().await;
+        adopt_announced(&mut state, first).await;
+        for n in 0..5 {
+            let put = crate::proto::etcdserverpb::RequestOp {
+                request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
+                    crate::proto::etcdserverpb::PutRequest {
+                        key: format!("key-{n}").into_bytes(),
+                        value: b"value".to_vec(),
+                        ..Default::default()
+                    },
+                )),
+            };
+            let index = state.applied + 1;
+            state.apply_etcd(index, &put).await.unwrap();
+        }
+        let applied = state.applied;
+        let mut writer = Writer::new(&handles, Duration::from_secs(90), clock());
+        writer.sync(true, 3, &events);
+        // MoveLeader calls this with the applied index. The writer has not opened yet.
+        writer.request_publication(applied);
+        let started = Instant::now();
+        let id = announcements.next(Duration::from_secs(2), true).await;
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(handles.source.open_base(id).await.unwrap().applied, applied);
+        writer.sync(false, 3, &events);
+        writer.stop().await;
+        state.close().await.unwrap();
+    }
+
+    /// The leader changes after the Defragment compaction and before the republish. The call
+    /// returns a retryable error. A retry on the new leader publishes the compacted checkpoint,
+    /// returns after its announcement applies, and the base then has one run and no L0 SST.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_defragment_that_loses_the_lead_returns_a_retryable_error() {
+        let (mut state, handles, events, mut announcements, first) = stranded_checkpoint().await;
+        adopt_announced(&mut state, first).await;
+        let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+        writer.sync(true, 3, &events);
+        writer.progress.wait_written(1).await.unwrap();
+        for n in 0..5 {
+            let put = crate::proto::etcdserverpb::RequestOp {
+                request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
+                    crate::proto::etcdserverpb::PutRequest {
+                        key: format!("key-{n}").into_bytes(),
+                        value: b"value".to_vec(),
+                        ..Default::default()
+                    },
+                )),
+            };
+            let index = state.applied + 1;
+            state.apply_etcd(index, &put).await.unwrap();
+        }
+        // The aged flush publishes a checkpoint with an L0 SST. The members adopt it.
+        let id = announcements.next(Duration::from_secs(10), true).await;
+        adopt_announced(&mut state, id).await;
+        let db = writer.open.lock().unwrap().clone().unwrap();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let defragment = Defragment {
+            db,
+            admin: handles.admin.clone(),
+            progress: writer.progress.clone(),
+            announced: handles.announced.clone(),
+            leadership: writer.leadership.subscribe(),
+            term: 3,
+            pause: Some((DefragmentStep::Publish, reached.clone(), resume.clone())),
+        };
+        let running = tokio::spawn(defragment.run());
+        reached.notified().await;
+        writer.sync(false, 3, &events);
+        writer.stop().await;
+        resume.notify_one();
+        let error = running.await.unwrap().unwrap_err();
+        assert_eq!(error.code, tonic::Code::Unavailable as i32, "{error:?}");
+        // The retry on the next leader.
+        let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+        writer.sync(true, 4, &events);
+        let db = loop {
+            if let Some(db) = writer.open.lock().unwrap().clone() {
+                break db;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let defragment = Defragment {
+            db,
+            admin: handles.admin.clone(),
+            progress: writer.progress.clone(),
+            announced: handles.announced.clone(),
+            leadership: writer.leadership.subscribe(),
+            term: 4,
+            pause: None,
+        };
+        let running = tokio::spawn(defragment.run());
+        let compacted = announcements.next(Duration::from_secs(20), true).await;
+        adopt_announced(&mut state, compacted).await;
+        running.await.unwrap().unwrap();
+        let checkpoint = handles
+            .admin
+            .list_checkpoints(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|checkpoint| Some(checkpoint.id) == state.base_checkpoint())
+            .unwrap();
+        let manifest = handles
+            .admin
+            .read_manifest(Some(checkpoint.manifest_id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(manifest.l0().is_empty());
+        assert_eq!(manifest.compacted().len(), 1);
+        writer.sync(false, 4, &events);
+        writer.stop().await;
+        state.close().await.unwrap();
+    }
+
+    /// A leader writer at term 3 with five more writes after the adopted first checkpoint.
+    async fn defragment_setup() -> (
+        StateMachine,
+        Handles,
+        mpsc::Sender<Event>,
+        Announcements,
+        Writer,
+    ) {
+        let (mut state, handles, events, mut announcements, first) = stranded_checkpoint().await;
+        adopt_announced(&mut state, first).await;
+        let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+        writer.sync(true, 3, &events);
+        writer.progress.wait_written(1).await.unwrap();
+        for n in 0..5 {
+            let put = crate::proto::etcdserverpb::RequestOp {
+                request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
+                    crate::proto::etcdserverpb::PutRequest {
+                        key: format!("key-{n}").into_bytes(),
+                        value: b"value".to_vec(),
+                        ..Default::default()
+                    },
+                )),
+            };
+            let index = state.applied + 1;
+            state.apply_etcd(index, &put).await.unwrap();
+        }
+        let _ = &mut announcements;
+        (state, handles, events, announcements, writer)
+    }
+
+    fn defragment(
+        handles: &Handles,
+        writer: &Writer,
+        term: u64,
+        pause: Option<(
+            DefragmentStep,
+            Arc<tokio::sync::Notify>,
+            Arc<tokio::sync::Notify>,
+        )>,
+    ) -> Defragment {
+        Defragment {
+            db: writer.open.lock().unwrap().clone().unwrap(),
+            admin: handles.admin.clone(),
+            progress: writer.progress.clone(),
+            announced: handles.announced.clone(),
+            leadership: writer.leadership.subscribe(),
+            term,
+            pause,
+        }
+    }
+
+    /// The announcement of a checkpoint from before the Defragment waits in Raft. It applies
+    /// after the compaction. Defragment does not count it, because its layout still holds the
+    /// input SSTs. It returns only after the compacted checkpoint applies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_defragment_ignores_an_older_checkpoint_that_applies_late() {
+        check_delayed_checkpoint(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_defragment_ignores_a_checkpoint_from_before_a_prior_compaction() {
+        check_delayed_checkpoint(true).await;
+    }
+
+    async fn check_delayed_checkpoint(compact_before_defragment: bool) {
+        let (mut state, handles, events, mut announcements, mut writer) = defragment_setup().await;
+        // Hold the announcement of the aged flush: no reply, no apply.
+        let (old, reply) = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(Event::ViewCheckpoint(id, reply)) = announcements.0.recv().await {
+                    return (id, reply.unwrap());
+                }
+            }
+        })
+        .await
+        .unwrap();
+        if compact_before_defragment {
+            // Rewrite the SSTs without advancing the applied announcement. The delayed
+            // checkpoint now shares no input SSTs with the upcoming Defragment.
+            crate::state::maintenance::compact_all(&handles.admin)
+                .await
+                .unwrap();
+        }
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let running = tokio::spawn(
+            defragment(
+                &handles,
+                &writer,
+                3,
+                Some((DefragmentStep::Publish, reached.clone(), resume.clone())),
+            )
+            .run(),
+        );
+        reached.notified().await;
+        resume.notify_one();
+        let _ = reply.send(true);
+        adopt_announced(&mut state, old).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !running.is_finished(),
+            "Defragment counted the older checkpoint"
+        );
+        let compacted = announcements.next(Duration::from_secs(10), true).await;
+        assert_ne!(compacted, old);
+        adopt_announced(&mut state, compacted).await;
+        running.await.unwrap().unwrap();
+        let checkpoint = handles
+            .admin
+            .list_checkpoints(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|checkpoint| checkpoint.id == compacted)
+            .unwrap();
+        let manifest = handles
+            .admin
+            .read_manifest(Some(checkpoint.manifest_id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(manifest.l0().is_empty());
+        assert_eq!(manifest.compacted().len(), 1);
+        writer.sync(false, 3, &events);
+        writer.stop().await;
+        state.close().await.unwrap();
+    }
+
+    /// A step down during the flush or the compaction closes the writer. The storage error
+    /// then becomes the retryable Unavailable error, not an internal error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_step_down_during_defragment_storage_work_is_retryable() {
+        for step in [DefragmentStep::Flush, DefragmentStep::Compact] {
+            let (state, handles, events, mut announcements, mut writer) = defragment_setup().await;
+            // The aged flush leaves an L0 SST for the compaction.
+            announcements.next(Duration::from_secs(10), true).await;
+            let reached = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            let running = tokio::spawn(
+                defragment(
+                    &handles,
+                    &writer,
+                    3,
+                    Some((step, reached.clone(), resume.clone())),
+                )
+                .run(),
+            );
+            reached.notified().await;
+            writer.sync(false, 3, &events);
+            writer.stop().await;
+            resume.notify_one();
+            let error = running.await.unwrap().unwrap_err();
+            assert_eq!(
+                error.code,
+                tonic::Code::Unavailable as i32,
+                "{step:?}: {error:?}"
+            );
+            state.close().await.unwrap();
+        }
+    }
+
     /// An adopt across membership changes leaves Raft with the checkpoint's ConfState, also
     /// after an election.
     #[tokio::test]
@@ -2238,6 +3171,7 @@ mod tests {
             join: false,
             empty_log: false,
             pin_max: Duration::from_secs(300),
+            restore: None,
         };
         let mut state = StateMachine::open_shared(
             Arc::new(InMemory::new()),

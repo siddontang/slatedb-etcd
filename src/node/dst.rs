@@ -206,6 +206,7 @@ impl Simulation {
                 overlay_max_bytes: 1 << 30,
                 max_clock_skew: std::time::Duration::from_secs(5),
                 view_retention: Default::default(),
+                restore: None,
                 object_store: crate::object::Config::Test(
                     store,
                     if shared { "root" } else { "state" }.into(),
@@ -220,6 +221,7 @@ impl Simulation {
                 // Shared members truncate often, so a lagging member needs a format 6 snapshot.
                 snapshot_every: if shared { 8 } else { 0 },
                 snapshot_min_bytes: 0,
+                log_file_bytes: 256 * 1024,
                 log_memory: LogMemory {
                     cache_bytes: 1024,
                     ..LogMemory::default()

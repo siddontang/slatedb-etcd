@@ -19,3 +19,10 @@ message Journal {
   // the full KeyValue.
   bool values_in_history = 3;
 }
+
+// The logical size of all `etcd/` rows after the apply index `applied`. The row is valid only
+// when `applied` equals the apply marker. Older binaries do not update it.
+message LogicalSize {
+  uint64 applied = 1;
+  uint64 bytes = 2;
+}

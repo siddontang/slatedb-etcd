@@ -295,8 +295,8 @@ async fn streamed_snapshot_matches_the_complete_state_encoding() {
     let mut rows = vec![];
     let mut scan = state.db().scan_prefix(b"", ..).await.unwrap();
     while let Some(row) = scan.next().await.unwrap() {
-        // The image omits the term row. Install takes the term from the Raft snapshot.
-        if row.key.as_ref() != crate::cluster::KEY && row.key.as_ref() != APPLIED_TERM {
+        // The image omits the derived rows. Install takes the term from the Raft snapshot.
+        if row.key.as_ref() != crate::cluster::KEY && !derived_key(&row.key) {
             rows.push((row.key.to_vec(), row.value.to_vec()));
         }
     }
@@ -541,7 +541,7 @@ async fn lease_revoke_deletes_more_keys_than_the_user_transaction_limit() {
         .unwrap();
     assert_eq!(page.responses.len(), 1);
     assert_eq!(page.responses[0].events.len(), 130);
-    assert!(crate::mvcc::lease_keys(state.db().as_ref(), 9)
+    assert!(crate::mvcc::scan_lease_keys(state.db().as_ref(), 9)
         .await
         .unwrap()
         .is_empty());
