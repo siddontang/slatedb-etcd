@@ -423,16 +423,18 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
         }
         tracing::debug!(checkpoint = %checkpoint.id, applied = base.applied, "publish view");
         drop(base);
+        // The marker comes before the first announcement. The checkpoint already exists, so a
+        // restart after the marker still finds a base.
+        if !bootstrapped {
+            source.mark_bootstrapped(checkpoint.id).await?;
+            bootstrapped = true;
+        }
         if events
             .send(Event::ViewCheckpoint(checkpoint.id))
             .await
             .is_err()
         {
             return Ok(());
-        }
-        if !bootstrapped {
-            source.mark_bootstrapped(checkpoint.id).await?;
-            bootstrapped = true;
         }
         crate::state::shared::retain(&admin, &source, &reported(&reports), KEEP_CHECKPOINTS)
             .await?;

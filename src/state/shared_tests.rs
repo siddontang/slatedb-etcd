@@ -777,3 +777,62 @@ async fn a_skipped_snapshot_releases_its_receipt() {
     assert!(!source.pinned().contains(&id));
     state.close().await.unwrap();
 }
+
+/// A slow base read ends at the read's deadline with a retryable error.
+#[tokio::test]
+async fn the_deadline_bounds_a_slow_base_read() {
+    use crate::object::faults::{FaultStore, DELAY_SST_GET};
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let store: Arc<dyn ObjectStore> = faults.clone();
+    let mut state = StateMachine::open_shared(
+        store,
+        "cluster",
+        "test",
+        // A tiny cache, so the read goes to the store.
+        StateCache {
+            block_bytes: 1,
+            meta_bytes: 1,
+            row_bytes: 0,
+        },
+        &shared::Options {
+            pin_max: Duration::from_millis(20),
+            ..options()
+        },
+        transfer::Backend::Local,
+    )
+    .await
+    .unwrap();
+    for n in 0..64 {
+        state
+            .apply_etcd(n + 1, &put(&format!("k{n}"), &"v".repeat(1024)))
+            .await
+            .unwrap();
+    }
+    let writer = writer(&state).await;
+    let mut written = 0;
+    let base = checkpoint(&state, &writer, &mut written).await;
+    state.shared.as_ref().unwrap().offer(base);
+    state.switch_base();
+    assert_eq!(state.shared.as_ref().unwrap().base.applied, 64);
+    let view = state.read_view().unwrap();
+    faults.set(DELAY_SST_GET);
+    // A flush caches current rows, so the read scans history rows, which only the store has.
+    let held = view.read_state();
+    let started = std::time::Instant::now();
+    let scanned = async {
+        let mut scan = held
+            .scan_under(b"etcd/history/", &ScanOptions::default())
+            .await?;
+        while scan.next().await?.is_some() {}
+        Ok::<_, slatedb::Error>(())
+    };
+    let error = scanned.await.unwrap_err();
+    assert!(view::expired(&error.to_string()), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "{:?}",
+        started.elapsed()
+    );
+    faults.set(0);
+    state.close().await.unwrap();
+}

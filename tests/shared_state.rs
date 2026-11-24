@@ -659,3 +659,71 @@ async fn reads_after_an_idle_pin_limit_succeed() {
     drop(send);
     server.shutdown().await.unwrap();
 }
+
+/// Three Watch streams with prev_kv read slowly while the pin limit is short. Each stream gets
+/// every revision once, with no gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_watchers_get_every_revision_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path(), StateMode::Shared, Duration::from_millis(200));
+    config.view_pin_max = Duration::from_millis(30);
+    let (server, channel) = start(config).await;
+    let mut streams = vec![];
+    let mut senders = vec![];
+    for _ in 0..3 {
+        // Each stream has its own connection. One connection would share its flow-control
+        // window, and a stream that nobody reads would block the others.
+        let (send, receive) = tokio::sync::mpsc::channel(1);
+        send.send(WatchRequest {
+            request_union: Some(watch_request::RequestUnion::CreateRequest(
+                WatchCreateRequest {
+                    key: b"w/".to_vec(),
+                    range_end: b"w0".to_vec(),
+                    prev_kv: true,
+                    ..Default::default()
+                },
+            )),
+        })
+        .await
+        .unwrap();
+        let mut stream = WatchClient::new(crate::channel(&server).await)
+            .watch(tokio_stream::wrappers::ReceiverStream::new(receive))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(stream.message().await.unwrap().unwrap().created);
+        streams.push(stream);
+        senders.push(send);
+    }
+    let mut kv = KvClient::new(channel);
+    let value = "v".repeat(64 * 1024);
+    let mut revisions = vec![];
+    for n in 0..48 {
+        let reply = kv.put(put(&format!("w/{}", n % 6), &value)).await.unwrap();
+        revisions.push(reply.into_inner().header.unwrap().revision);
+    }
+    let readers = streams.into_iter().map(|mut stream| {
+        let count = revisions.len();
+        async move {
+            let mut seen = vec![];
+            while seen.len() < count {
+                // A slow consumer: the server blocks on its sends.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let message = tokio::time::timeout(Duration::from_secs(10), stream.message())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                for event in message.events {
+                    seen.push(event.kv.unwrap().mod_revision);
+                }
+            }
+            seen
+        }
+    });
+    for seen in futures::future::join_all(readers).await {
+        assert_eq!(seen, revisions);
+    }
+    drop(senders);
+    server.shutdown().await.unwrap();
+}

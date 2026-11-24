@@ -352,7 +352,18 @@ pub(crate) async fn scan(
         .scan_range(key(from)..key(through + 1), &Default::default())
         .await
         .map_err(KvError::storage)?;
-    while let Some(row) = scan.next().await.map_err(KvError::storage)? {
+    loop {
+        let row = match scan.next().await {
+            Ok(Some(row)) => row,
+            Ok(None) => break,
+            // A page that held its view too long keeps the revisions that it read, so a retry
+            // on a new view makes progress.
+            Err(error) if !rows.is_empty() && crate::state::view::expired(&error.to_string()) => {
+                let covered = rows.last().map(|(revision, _)| *revision).unwrap();
+                return Ok((rows, covered));
+            }
+            Err(error) => return Err(KvError::storage(error)),
+        };
         let revision = i64::from_be_bytes(
             row.key[EVENTS.len()..]
                 .try_into()

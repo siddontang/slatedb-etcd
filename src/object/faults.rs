@@ -29,6 +29,8 @@ pub(crate) const FAIL_SST_GET: u8 = 5;
 pub(crate) const STALL_PUT: u8 = 6;
 /// Hold every put of the shared database, but not the claims beside it.
 pub(crate) const STALL_STATE_PUT: u8 = 8;
+/// Delay every SST read by 120 ms, like a slow object store.
+pub(crate) const DELAY_SST_GET: u8 = 9;
 /// Report the next SST read as missing, like an SST that GC deleted.
 pub(crate) const LOSE_SST_ONCE: u8 = 7;
 
@@ -127,6 +129,9 @@ impl ObjectStore for FaultStore {
                 path: path.to_string(),
                 source: std::io::Error::new(std::io::ErrorKind::NotFound, "injected loss").into(),
             });
+        }
+        if mode == DELAY_SST_GET && path.as_ref().ends_with(".sst") {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
         }
         if mode == FAIL_GET || (mode == FAIL_SST_GET && path.as_ref().ends_with(".sst")) {
             self.entered.add_permits(1);
