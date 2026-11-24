@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Compare replicated and shared state mode on three local members with one local MinIO.
+"""Compare replicated and shared state mode on three local members with one local RustFS.
 
-Each case starts a new cluster in a new bucket. The script records the etcd benchmark result,
-the S3 requests and bytes from MinIO, and the peak RSS of each member. The `ops` scenario
+The RustFS server is the pinned release of scripts/rustfs_fixture.py. Members reach it through
+scripts/s3-counter, a proxy that counts the S3 requests and bytes of each bucket.
+
+Each case starts a new RustFS data directory and a new cluster. The script records the etcd
+benchmark result, the S3 requests and bytes, and the peak RSS of each member. The `ops` scenario
 measures the time from a leader kill to the first successful write, and the time that a new
-learner needs to reach the leader's index. The `policy` check runs members with the S3
-policies of docs/shared-state-guide.md and checks that MinIO denies keys outside them.
+learner needs to reach the leader's index. The `policy` check runs members with the S3 policies
+of docs/shared-state-guide.md and checks that RustFS denies keys outside them.
 
 The caller holds the machine-wide benchmark lock. See scripts/run-shared-bench.sh.
 """
@@ -21,7 +24,11 @@ import signal
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ElementTree
+
+import rustfs_fixture
 
 GiB = 1024**3
 ROOT_USER, ROOT_PASSWORD = "benchroot", "benchroot-secret"
@@ -55,48 +62,98 @@ def run(cmd, env=None, check=True, timeout=600, **kw):
     return r
 
 
-class Minio:
-    def __init__(self, tools, work, port=9100):
-        self.tools, self.work, self.port = tools, work, port
-        self.url = f"http://127.0.0.1:{port}"
-        self.env = dict(os.environ, MC_CONFIG_DIR=str(work / "mc"))
+class S3:
+    """A RustFS server behind the counting proxy. Each case restarts RustFS on empty data."""
 
-    def start(self):
-        data = self.work / "minio-data"
+    def __init__(self, work, go, port=9100):
+        self.work, self.port = work, port
+        self.url = f"http://127.0.0.1:{port}"
+        self.direct = f"http://127.0.0.1:{port + 1}"
+        tools = work / "tools"
+        tools.mkdir(parents=True, exist_ok=True)
+        self.binary = rustfs_fixture.install(tools)
+        self.version = rustfs_fixture.VERSION
+        self.sha256 = rustfs_fixture.sha256(self.binary)
+        source = Path(__file__).resolve().parent / "s3-counter" / "main.go"
+        self.counter = tools / "s3-counter"
+        run([go, "build", "-o", str(self.counter), str(source)],
+            env=dict(os.environ, CGO_ENABLED="0"))
+        self.server = None
+        self.proxy = subprocess.Popen(
+            ["taskset", "-c", CLIENT_CPUS, str(self.counter), "-listen", f"127.0.0.1:{port}",
+             "-target", self.direct],
+            stdout=open(work / "s3-counter.log", "ab"), stderr=subprocess.STDOUT)
+
+    def fresh(self, bucket):
+        """Restart RustFS on an empty data directory, and create `bucket`."""
+        self.stop_server()
+        data = self.work / "rustfs-data"
         shutil.rmtree(data, ignore_errors=True)
         data.mkdir(parents=True)
-        env = dict(os.environ, MINIO_ROOT_USER=ROOT_USER, MINIO_ROOT_PASSWORD=ROOT_PASSWORD,
-                   MINIO_PROMETHEUS_AUTH_TYPE="public", MINIO_BROWSER="off")
-        log = open(self.work / "minio.log", "ab")
-        self.proc = subprocess.Popen(
-            ["taskset", "-c", CLIENT_CPUS, str(self.tools / "minio"), "server", str(data),
-             "--address", f"127.0.0.1:{self.port}", "--quiet"],
-            stdout=log, stderr=subprocess.STDOUT, env=env)
-        for _ in range(100):
-            if self.mc("alias", "set", "local", self.url, ROOT_USER, ROOT_PASSWORD,
-                       check=False).returncode == 0 and \
-                    self.mc("ls", "local", check=False).returncode == 0:
-                return self
-            time.sleep(0.2)
-        raise RuntimeError("MinIO did not start")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("RUSTFS_")}
+        env.update(RUSTFS_ACCESS_KEY=ROOT_USER, RUSTFS_SECRET_KEY=ROOT_PASSWORD,
+                   RUSTFS_CONSOLE_ENABLE="false")
+        self.server = subprocess.Popen(
+            ["taskset", "-c", CLIENT_CPUS, str(self.binary), "server", "--address",
+             f"127.0.0.1:{self.port + 1}", str(data)],
+            stdout=open(self.work / "rustfs.log", "ab"), stderr=subprocess.STDOUT, env=env,
+            cwd=self.work)
+        rustfs_fixture.wait_for_bucket(self.server, self.direct, bucket, ROOT_USER,
+                                       ROOT_PASSWORD)
+
+    def stop_server(self):
+        if self.server is not None:
+            self.server.send_signal(signal.SIGTERM)
+            try:
+                self.server.wait(30)
+            except subprocess.TimeoutExpired:
+                self.server.kill()
+                self.server.wait()
+            self.server = None
 
     def stop(self):
-        self.proc.send_signal(signal.SIGTERM)
-        self.proc.wait(30)
+        self.stop_server()
+        self.proxy.terminate()
+        self.proxy.wait(10)
 
-    def mc(self, *args, check=True):
-        return run([str(self.tools / "mc"), *args], env=self.env, check=check)
+    def counts(self):
+        """The counts since the proxy started."""
+        return json.loads(urllib.request.urlopen(f"{self.url}/__counts", timeout=10).read())
 
-    def trace(self, path):
-        """Start `mc admin trace`. MinIO metrics are cached, so the trace counts each call."""
-        return subprocess.Popen([str(self.tools / "mc"), "admin", "trace", "--json", "local"],
-                                stdout=open(path, "w"), stderr=subprocess.DEVNULL,
-                                env=self.env)
+    def request(self, method, path, access=ROOT_USER, secret=ROOT_PASSWORD, query=None,
+                body=b""):
+        """A signed request to RustFS, not counted. Return (status, body)."""
+        try:
+            with rustfs_fixture.signed_request(self.direct, method, path, access, secret,
+                                               query=query, body=body) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as error:
+            with error:
+                return error.code, error.read()
+
+    def admin(self, operation, query, body):
+        status, reply = self.request("PUT", f"/rustfs/admin/v3/{operation}", query=query,
+                                     body=body)
+        if status != 200:
+            raise RuntimeError(f"{operation} failed with {status}: {reply[:300]!r}")
 
     def usage(self, bucket):
-        r = self.mc("du", "--json", f"local/{bucket}")
-        line = json.loads(r.stdout.strip().splitlines()[-1])
-        return {"bytes": line.get("size", 0), "objects": line.get("objects", 0)}
+        """The bytes and objects in `bucket`, from ListObjectsV2."""
+        size = objects = 0
+        query = {"list-type": "2"}
+        while True:
+            status, body = self.request("GET", f"/{bucket}", query=query)
+            if status != 200:
+                raise RuntimeError(f"ListObjectsV2 failed with {status}: {body[:300]!r}")
+            root = ElementTree.fromstring(body)
+            ns = root.tag.split("}")[0] + "}" if root.tag.startswith("{") else ""
+            for item in root.iter(f"{ns}Contents"):
+                size += int(item.find(f"{ns}Size").text)
+                objects += 1
+            token = root.find(f"{ns}NextContinuationToken")
+            if root.findtext(f"{ns}IsTruncated") != "true" or token is None:
+                return {"bytes": size, "objects": objects}
+            query = {"list-type": "2", "continuation-token": token.text}
 
 
 class Cluster:
@@ -118,7 +175,7 @@ class Cluster:
         cmd = [str(self.args.binary), "--id", str(i), "--dir", str(self.work / f"m{i}"),
                "--listen", f"127.0.0.1:{port}", "--peer-listen", f"127.0.0.1:{port + 1}",
                "--cluster-id", CLUSTER, "--quota-backend-bytes", str(8 * GiB),
-               "--s3-bucket", self.bucket, "--s3-endpoint", self.args.minio_url,
+               "--s3-bucket", self.bucket, "--s3-endpoint", self.args.s3_url,
                "--s3-allow-http", "--s3-prefix", "bench"]
         for j in self.ports:
             cmd += ["--peer", f"{j}=127.0.0.1:{self.ports[j] + 1}",
@@ -230,39 +287,21 @@ def bench(args, eps, tool_args):
     return out
 
 
-def traced(path, bucket):
-    """S3 calls and bytes for `bucket` in a trace: {api: [calls, bytes in, bytes out]}."""
-    out = {}
-    for line in Path(path).read_text().splitlines():
-        try:
-            call = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if f"/{bucket}" not in call.get("path", "") and \
-                call.get("callStats", {}).get("bucket") != bucket:
-            continue
-        api = call.get("api") or call.get("funcName", "unknown")
-        stats = call.get("callStats", {})
-        entry = out.setdefault(api.removeprefix("s3."), [0, 0, 0])
-        entry[0] += 1
-        entry[1] += stats.get("rx", 0)
-        entry[2] += stats.get("tx", 0)
-    return out
-
-
 class Trace:
-    """Count the S3 calls of one bucket between start and stop."""
+    """Count the S3 calls of one bucket between start and stop: {api: [calls, bytes in, bytes
+    out]}. Bytes in are request bodies, and bytes out are response bodies. Stop waits 1 s for
+    calls in flight. A trace that starts at the stop of another one misses no call."""
 
-    def __init__(self, minio, work, bucket):
-        self.path, self.bucket = work / "trace.jsonl", bucket
-        self.proc = minio.trace(self.path)
-        time.sleep(1)
+    def __init__(self, s3, bucket):
+        self.s3, self.bucket = s3, bucket
+        self.start = self.s3.counts().get(bucket, {})
 
     def stop(self):
         time.sleep(1)
-        self.proc.terminate()
-        self.proc.wait(10)
-        return traced(self.path, self.bucket)
+        end = self.s3.counts().get(self.bucket, {})
+        zero = [0, 0, 0]
+        return {api: [a - b for a, b in zip(value, self.start.get(api, zero))]
+                for api, value in end.items() if value != self.start.get(api)}
 
 
 def checkpoint_all(cluster):
@@ -278,18 +317,17 @@ def checkpoint_all(cluster):
             raise RuntimeError(f"checkpoint on member {i} failed: {error}") from error
 
 
-def fresh(minio, args, name):
+def fresh(s3, args, name):
     bucket = re.sub(r"[^a-z0-9-]", "-", name.lower())[:60]
-    minio.mc("rb", "--force", f"local/{bucket}", check=False)
-    minio.mc("mb", f"local/{bucket}")
+    s3.fresh(bucket)
     work = args.work / name
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
     return bucket, work
 
 
-def run_case(minio, args, mode, case, repeat):
-    bucket, work = fresh(minio, args, f"{case}-{mode}-{repeat}")
+def run_case(s3, args, mode, case, repeat):
+    bucket, work = fresh(s3, args, f"{case}-{mode}-{repeat}")
     cluster = Cluster(args, mode, bucket, work).start()
     try:
         leader = cluster.leader()
@@ -300,27 +338,26 @@ def run_case(minio, args, mode, case, repeat):
                    "--key-size", K, "--val-size", V])
             time.sleep(args.quiet)
         cluster.samples = {}
-        trace = Trace(minio, work, bucket)
+        trace = Trace(s3, bucket)
         eps = cluster.endpoint(leader) if case.startswith("put") else cluster.eps()
         result = bench(args, eps, CASES[case])
         result["s3_load"] = trace.stop()
         # Then make the state durable in both modes, and measure the stored bytes.
-        trace = Trace(minio, work, bucket)
+        trace = Trace(s3, bucket)
         time.sleep(args.quiet)
         checkpoint_all(cluster)
         result["s3_settle"] = trace.stop()
-        result["s3_usage"] = minio.usage(bucket)
+        result["s3_usage"] = s3.usage(bucket)
         result["rss"] = {("leader" if i == leader else f"follower-{i}"): rss
                          for i, rss in cluster.samples.items()}
     finally:
         cluster.stop()
-    minio.mc("rb", "--force", f"local/{bucket}", check=False)
     return result
 
 
-def run_ops(minio, args, mode, repeat):
+def run_ops(s3, args, mode, repeat):
     """Learner install and failover after a preload."""
-    bucket, work = fresh(minio, args, f"ops-{mode}-{repeat}")
+    bucket, work = fresh(s3, args, f"ops-{mode}-{repeat}")
     cluster = Cluster(args, mode, bucket, work).start()
     out = {}
     try:
@@ -338,8 +375,8 @@ def run_ops(minio, args, mode, repeat):
         cluster.ports[learner] = port
         (work / f"m{learner}").mkdir()
         checkpoint_all(cluster)
-        out["s3_usage_before_learner"] = minio.usage(bucket)
-        trace = Trace(minio, work, bucket)
+        out["s3_usage_before_learner"] = s3.usage(bucket)
+        trace = Trace(s3, bucket)
         started = time.time()
         cluster.start_member(learner, join=True)
         while True:
@@ -375,7 +412,6 @@ def run_ops(minio, args, mode, repeat):
         out["failover_first_write_s"] = time.time() - killed
     finally:
         cluster.stop()
-    minio.mc("rb", "--force", f"local/{bucket}", check=False)
     return out
 
 
@@ -407,22 +443,25 @@ def policy(bucket, prefix, role, member):
     return {"Version": "2012-10-17", "Statement": statements}
 
 
-def user(minio, work, bucket, prefix, role, member):
+def user(s3, bucket, prefix, role, member):
+    """Create a RustFS user with the guide's policy for `role`. RustFS 1.0.6 takes the admin
+    request bodies as plain JSON."""
     name = f"{role}-{member}"
     secret = f"{name}-secret-key"
-    path = work / f"{name}.json"
-    path.write_text(json.dumps(policy(bucket, prefix, role, member)))
-    minio.mc("admin", "policy", "create", "local", name, str(path))
-    minio.mc("admin", "user", "add", "local", name, secret)
-    minio.mc("admin", "policy", "attach", "local", name, "--user", name)
+    s3.admin("add-canned-policy", {"name": name},
+             json.dumps(policy(bucket, prefix, role, member)).encode())
+    s3.admin("add-user", {"accessKey": name},
+             json.dumps({"secretKey": secret, "status": "enabled"}).encode())
+    s3.admin("set-user-or-group-policy",
+             {"policyName": name, "userOrGroup": name, "isGroup": "false"}, b"")
     return name, secret
 
 
-def run_policy(minio, args):
+def run_policy(s3, args):
     """Run three voters and a learner with the guide's policies."""
-    bucket, work = fresh(minio, args, "policy-check")
+    bucket, work = fresh(s3, args, "policy-check")
     prefix = cluster_prefix()
-    credentials = {i: user(minio, work, bucket, prefix, "voter", i) for i in (1, 2, 3)}
+    credentials = {i: user(s3, bucket, prefix, "voter", i) for i in (1, 2, 3)}
     cluster = Cluster(args, "shared", bucket, work, credentials=credentials).start()
     out = {"voters_ready": True}
     try:
@@ -430,7 +469,7 @@ def run_policy(minio, args):
         port = 26040
         learner = cluster.add_learner(port)
         cluster.ports[learner] = port
-        cluster.credentials[learner] = user(minio, work, bucket, prefix, "learner", learner)
+        cluster.credentials[learner] = user(s3, bucket, prefix, "learner", learner)
         (work / f"m{learner}").mkdir()
         cluster.start_member(learner, join=True)
         deadline = time.time() + 120
@@ -443,10 +482,8 @@ def run_policy(minio, args):
                 break
             time.sleep(0.5)
         out["learner_reads"] = value == "checked"
-        # Each probe has one expected outcome: the guide's policy allows it, or MinIO denies it
+        # Each probe has one expected outcome: the guide's policy allows it, or RustFS denies it
         # with AccessDenied. Any other result fails the check.
-        probe = work / "probe"
-        probe.write_text("x")
         voter = credentials[1]
         probes = [
             ("learner_reads_shared", cluster.credentials[learner], "read",
@@ -463,43 +500,19 @@ def run_policy(minio, args):
         ]
         results, passed = {}, True
         for name, (user_name, secret), action, key, expected in probes:
-            minio.mc("alias", "set", name, minio.url, user_name, secret)
-            target = f"{name}/{bucket}/{prefix}/{key}"
-            # `--debug` prints the S3 response, so the check reads the exact error code.
-            if action == "read":
-                r = minio.mc("--debug", "cat", target, check=False)
-            else:
-                r = minio.mc("--debug", "cp", str(probe), target, check=False)
-            text = r.stdout + r.stderr
-            # mc also probes the bucket, and MinIO denies that. Only the errors of the probed
-            # object count.
-            codes = sorted({
-                re.search(r"<Code>(\w+)</Code>", error).group(1)
-                for error in re.findall(r"<Error>.*?</Error>", text, re.S)
-                if f"<Key>{prefix}/{key}</Key>" in error
-            })
-            # A HEAD response has no body, so a denied stat shows only its 403 status. The same
-            # credentials pass the allowed probes, so a 403 there is a policy denial.
-            statuses, request = [], None
-            for line in text.splitlines():
-                m = re.search(r"\b(GET|HEAD|PUT|POST) (/\S+) HTTP/1\.1", line)
-                if m:
-                    request = (m.group(1), m.group(2))
-                m = re.search(r"HTTP/1\.1 (\d{3})", line)
-                if m and request and request[1].split("?")[0].endswith(f"/{prefix}/{key}"):
-                    statuses.append((request[0], int(m.group(1))))
-                    request = None
-            if not codes and ("HEAD", 403) in statuses:
-                codes = ["AccessDenied"]
-            if r.returncode == 0 and not codes:
+            method, body = ("GET", b"") if action == "read" else ("PUT", b"x")
+            status, reply = s3.request(method, f"/{bucket}/{prefix}/{key}", user_name, secret,
+                                       body=body)
+            code = re.search(rb"<Code>(\w+)</Code>", reply)
+            code = code.group(1).decode() if code else None
+            if status == 200:
                 outcome = "allowed"
-            elif r.returncode != 0 and codes == ["AccessDenied"]:
+            elif status == 403 and code == "AccessDenied":
                 outcome = "denied"
             else:
                 outcome = "error"
             results[name] = {"action": action, "key": key, "expected": expected,
-                             "outcome": outcome, "object_errors": codes,
-                             "object_statuses": statuses}
+                             "outcome": outcome, "status": status, "code": code}
             passed &= outcome == expected
         out["probes"] = results
         out["passed"] = passed and out["learner_reads"]
@@ -511,7 +524,7 @@ def run_policy(minio, args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--binary", type=Path, required=True)
-    ap.add_argument("--tools", type=Path, required=True, help="directory with minio and mc")
+    ap.add_argument("--go", default="go", help="Go toolchain that builds scripts/s3-counter")
     ap.add_argument("--benchmark", type=Path, required=True, help="etcd benchmark tool")
     ap.add_argument("--etcdctl", type=Path, required=True)
     ap.add_argument("--work", type=Path, required=True)
@@ -525,8 +538,8 @@ def main():
     ap.add_argument("--policy", action="store_true")
     args = ap.parse_args()
     args.work.mkdir(parents=True, exist_ok=True)
-    minio = Minio(args.tools, args.work).start()
-    args.minio_url = minio.url
+    s3 = S3(args.work, args.go)
+    args.s3_url = s3.url
     try:
         with open(args.out, "a") as out:
             def record(entry):
@@ -535,8 +548,10 @@ def main():
                 out.flush()
                 print(json.dumps({k: v for k, v in entry.items() if k != "tail"})[:600],
                       flush=True)
+            record({"kind": "s3", "name": "RustFS", "version": s3.version,
+                    "binary_sha256": s3.sha256})
             if args.policy:
-                checked = run_policy(minio, args)
+                checked = run_policy(s3, args)
                 record({"kind": "policy", **checked})
                 if not checked["passed"]:
                     raise SystemExit("the policy check failed")
@@ -545,7 +560,7 @@ def main():
                     for mode in args.modes:
                         entry = {"kind": "case", "case": case, "mode": mode, "repeat": repeat}
                         try:
-                            entry.update(run_case(minio, args, mode, case, repeat))
+                            entry.update(run_case(s3, args, mode, case, repeat))
                         except Exception as error:  # noqa: BLE001
                             # An invalid case keeps no measurement.
                             entry["error"] = str(error)
@@ -553,9 +568,9 @@ def main():
                 if args.ops:
                     for mode in args.modes:
                         record({"kind": "ops", "mode": mode, "repeat": repeat,
-                                **run_ops(minio, args, mode, repeat)})
+                                **run_ops(s3, args, mode, repeat)})
     finally:
-        minio.stop()
+        s3.stop()
 
 
 if __name__ == "__main__":
