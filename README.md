@@ -20,7 +20,7 @@ Operators can move key-value data to S3 and recover write capacity without defra
 | --- | --- | --- |
 | Size storage | Keep a bbolt database on each member's disk | Keep state on local disk or in S3 |
 | Free quota after NOSPACE | Compact history and defragment the database | Delete and compact |
-| Catch up a follower from a snapshot | Stream the database from the leader | Copy files within S3 |
+| Recover a follower | Stream a snapshot from the leader | Copy bulk data within S3 off the leader |
 | Embed a member | Use the Go embed package | Use the Rust API on your Tokio runtime |
 
 The [Rust embedding API](docs/embedding.md) lets an application manage its own member while it
@@ -43,6 +43,7 @@ See [etcd maintenance][etcd-maintenance] and [SlateDB etcd administration](docs/
 Both services use one Raft write leader and default to a 2 GiB backend quota.
 Use `--quota-backend-bytes` to change the quota. When sizing SlateDB etcd, allow memory for an index
 that grows with the live key count. Native backup and restore limit the image to 64 MiB.
+If your backup image exceeds 64 MiB, you need another recovery plan for the loss of all members.
 See [snapshot limits](docs/object-snapshots.md#limits).
 
 [etcd-maintenance]: https://etcd.io/docs/v3.6/op-guide/maintenance/
