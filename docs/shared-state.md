@@ -150,12 +150,16 @@ A member over the limit, leader or follower, frees memory in this order:
 3. If the overlay is still over the hard limit, `2 × --overlay-max-bytes`, pause apply. The
    committed entries stay in the durable log, and Raft continues to persist and acknowledge
    new entries. Reads that wait for apply time out with the existing retryable error.
-4. While paused, poll the checkpoint list. When a checkpoint above `applied` appears and the
-   local commit index reaches it, [rebase](#rebase) onto it and resume.
+4. While paused, poll the checkpoint list. Switch out of band to any checkpoint newer than the
+   base, including one at or below `applied`, and release the segments it covers. Resume apply
+   when the overlay is below `--overlay-max-bytes`. If a checkpoint above `applied` appears,
+   [rebase](#rebase) onto it.
 
 Step 3 bounds memory during an S3 stall even when the member already has the newest base.
-Step 4 ends the pause without the paused entries, so it cannot deadlock on an unapplied
-`ViewCheckpoint`.
+Step 4 does not need the paused `ViewCheckpoint` entries. A paused leader still materializes its
+applied batches, so it publishes a checkpoint at or below its own `applied` and then switches to
+it. A test stalls S3 on a single voter, recovers S3, and sends no new requests. The voter must
+resume.
 
 ## Views and reads
 
@@ -353,15 +357,20 @@ change.
 **Adopt ahead of the log, `F(C) > applied`.** A received Raft snapshot, a paused member, and a
 restart with a short log use this form. It follows the Raft snapshot restore rules:
 
-- If the local log holds an entry at `F(C)` with the checkpoint term, keep the entries after it.
-  Otherwise discard the whole log. An entry above a mismatched `F(C)` can come from a deposed
-  term and has lost its prefix.
-- Persist the snapshot record, its ConfState, the commit index `F(C)`, and the log change in one
-  synced raft-engine batch. A crash leaves either the old log or the new boundary.
+- If the local log holds an entry at `F(C)` with the checkpoint term, keep the entries after it
+  and keep the local commit index when it is higher. Then replay through that commit index.
+- If the term at `F(C)` differs and `F(C)` is above the local commit index, discard the whole log.
+  An entry above a mismatched `F(C)` can come from a deposed term and has lost its prefix.
+- If the term differs and `F(C)` is at or below the local commit index, two committed prefixes
+  disagree. Stop recovery with an error.
+- Persist the snapshot record, its ConfState, the new commit index `max(commit, F(C))`, and the
+  log change in one synced raft-engine batch. A crash leaves either the old log or the new
+  boundary.
 - `F(C)` is committed, because only committed entries reach the shared `Db`.
 
 A test crashes the member right after the adopt batch and then forces an election. The member
-must not vote with, or replicate, a discarded entry.
+must not vote with, or replicate, a discarded entry. A second test adopts checkpoint 100 with
+`applied = 90` and commit 110, crashes, and checks that 101–110 are still committed on restart.
 
 `KeyIndex::load` reads current rows with their values (`state/key_index.rs:82-90`). Install
 time therefore grows with the live data size. It does not grow with history or SST count.
