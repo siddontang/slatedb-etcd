@@ -779,10 +779,10 @@ async fn a_skipped_snapshot_releases_its_receipt() {
     state.close().await.unwrap();
 }
 
-/// A slow base read ends at the read's deadline with a retryable error.
-#[tokio::test]
-async fn the_deadline_bounds_a_slow_base_read() {
-    use crate::object::faults::{FaultStore, DELAY_SST_GET};
+/// A shared state whose base holds 64 rows of 1 KiB, behind a store that can delay SST reads.
+/// Reads hold their view for at most 20 ms.
+async fn slow_base() -> (StateMachine, Arc<crate::object::faults::FaultStore>) {
+    use crate::object::faults::FaultStore;
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     let store: Arc<dyn ObjectStore> = faults.clone();
     let mut state = StateMachine::open_shared(
@@ -815,11 +815,30 @@ async fn the_deadline_bounds_a_slow_base_read() {
     state.shared.as_ref().unwrap().offer(base);
     state.switch_base();
     assert_eq!(state.shared.as_ref().unwrap().base.applied, 64);
+    (state, faults)
+}
+
+/// Assert that a read failed at its deadline with a retryable error, long before a slow
+/// object read would end.
+fn assert_expired(result: Result<(), slatedb::Error>, started: std::time::Instant) {
+    let error = result.unwrap_err();
+    assert!(view::expired(&error.to_string()), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// A slow base read ends at the read's deadline with a retryable error.
+#[tokio::test]
+async fn the_deadline_bounds_a_slow_base_read() {
+    let (state, faults) = slow_base().await;
     let view = state.read_view().unwrap();
     // Each SST read takes 1 s, far above the 20 ms pin limit. A loaded host still ends the
     // read well below one SST read.
     faults.set_delay(Duration::from_secs(1));
-    faults.set(DELAY_SST_GET);
+    faults.set(crate::object::faults::DELAY_SST_GET);
     // A flush caches current rows, so the read scans history rows, which only the store has.
     let held = view.read_state();
     let started = std::time::Instant::now();
@@ -830,14 +849,124 @@ async fn the_deadline_bounds_a_slow_base_read() {
         while scan.next().await?.is_some() {}
         Ok::<_, slatedb::Error>(())
     };
-    let error = scanned.await.unwrap_err();
-    assert!(view::expired(&error.to_string()), "{error}");
-    assert!(
-        started.elapsed() < Duration::from_millis(500),
-        "{:?}",
-        started.elapsed()
+    assert_expired(scanned.await, started);
+    faults.set(0);
+    state.close().await.unwrap();
+}
+
+/// A slow base read during a seek ends at the read's deadline with a retryable error.
+#[tokio::test]
+async fn the_deadline_bounds_a_slow_base_seek() {
+    let (state, faults) = slow_base().await;
+    let view = state.read_view().unwrap();
+    let held = view.read_state();
+    let mut scan = held
+        .scan_under(b"etcd/history/", &ScanOptions::default())
+        .await
+        .unwrap();
+    faults.set_delay(Duration::from_secs(1));
+    faults.set(crate::object::faults::DELAY_SST_GET);
+    let started = std::time::Instant::now();
+    assert_expired(
+        scan.seek(&crate::mvcc::history_key(b"k9", 0)).await,
+        started,
     );
     faults.set(0);
+    state.close().await.unwrap();
+}
+
+/// Range the single key `key` at `revision` through a pinned view and the live state, and
+/// return the value.
+async fn value_at(state: &StateMachine, key: &str, revision: i64) -> Option<String> {
+    let request = RequestOp {
+        request: Some(Op::RequestRange(RangeRequest {
+            key: key.as_bytes().to_vec(),
+            revision,
+            ..Default::default()
+        })),
+    };
+    let pinned = state
+        .read_view()
+        .unwrap()
+        .read(&request, None)
+        .await
+        .unwrap();
+    let live = state.read_etcd(&request).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&pinned).unwrap(),
+        serde_json::to_value(&live).unwrap()
+    );
+    let Ok(ResponseOp {
+        response: Some(response_op::Response::ResponseRange(reply)),
+    }) = live.result
+    else {
+        panic!("unexpected response {:?}", live.result);
+    };
+    reply
+        .kvs
+        .first()
+        .map(|kv| String::from_utf8(kv.value.clone()).unwrap())
+}
+
+/// A historical point read returns the newest version at its revision, from the overlay alone
+/// and from history split between a checkpoint and the overlay.
+#[tokio::test]
+async fn historical_point_reads_return_the_version_at_the_revision() {
+    let mut state = open_shared(Arc::new(InMemory::new())).await;
+    let writer = writer(&state).await;
+    let mut written = 0;
+    // Revisions 2, 3, and 4, all in the overlay.
+    for value in ["old", "middle", "new"] {
+        state
+            .apply_etcd(state.applied + 1, &put("a", value))
+            .await
+            .unwrap();
+    }
+    let expected = [
+        (1, None),
+        (2, Some("old")),
+        (3, Some("middle")),
+        (4, Some("new")),
+    ];
+    for (revision, value) in expected {
+        assert_eq!(
+            value_at(&state, "a", revision).await.as_deref(),
+            value,
+            "overlay, revision {revision}"
+        );
+    }
+    // Revisions 5 and 6 of `b` go into a checkpoint, and 7 and 8 stay in the overlay.
+    for value in ["b1", "b2"] {
+        state
+            .apply_etcd(state.applied + 1, &put("b", value))
+            .await
+            .unwrap();
+    }
+    let base = checkpoint(&state, &writer, &mut written).await;
+    state.shared.as_ref().unwrap().offer(base);
+    state.switch_base();
+    assert_eq!(state.shared.as_ref().unwrap().base.applied, 5);
+    for value in ["b3", "b4"] {
+        state
+            .apply_etcd(state.applied + 1, &put("b", value))
+            .await
+            .unwrap();
+    }
+    let expected = [
+        (4, None),
+        (5, Some("b1")),
+        (6, Some("b2")),
+        (7, Some("b3")),
+        (8, Some("b4")),
+    ];
+    for (revision, value) in expected {
+        assert_eq!(
+            value_at(&state, "b", revision).await.as_deref(),
+            value,
+            "checkpoint and overlay, revision {revision}"
+        );
+    }
+    assert_eq!(value_at(&state, "a", 3).await.as_deref(), Some("middle"));
     state.close().await.unwrap();
 }
 
