@@ -12,6 +12,42 @@ Each replica owns an independent local or S3 object namespace and manifest.
 etcd replacement. S3 storage and remote mutual TLS are available for controlled validation.
 See [remote storage](docs/remote-storage.md) for ownership, recovery, and deployment limits.
 
+## Why evaluate SlateDB etcd?
+
+Operators can move key-value data to S3 and recover write capacity without defragmenting a member.
+
+| Operator task | etcd | SlateDB etcd |
+| --- | --- | --- |
+| Size storage | Keep a bbolt database on each member's disk | Keep state on local disk or in S3 |
+| Free quota after NOSPACE | Compact history and defragment the database | Delete and compact |
+| Recover a follower | Stream a snapshot from the leader | Copy bulk data within S3 off the leader |
+| Embed a member | Use the Go embed package | Use the Rust API on your Tokio runtime |
+
+The [Rust embedding API](docs/embedding.md) lets an application manage its own member while it
+serves existing etcd v3 clients.
+
+With S3, operators can size the data store separately from each member's local Raft log.
+A normal write commits to a quorum of durable logs without waiting for an S3 upload.
+During follower recovery, a server-side copy keeps bulk data off the leader's network.
+It requires a common bucket, endpoint, region, and read access across member prefixes.
+The HTTP fallback transfers the files through the leader.
+See [remote storage](docs/remote-storage.md) and
+[snapshot transfer](docs/object-snapshots.md#transfer).
+
+After a NOSPACE alarm, etcd counts unused pages in the database file toward its quota.
+Defragmentation shrinks that file and blocks reads and writes on the member while it runs.
+SlateDB etcd counts logical bytes. Delete unneeded keys and compact old revisions until usage falls
+below quota, then disarm the alarm to resume writes. Physical space reclamation can happen later.
+See [etcd maintenance][etcd-maintenance] and [SlateDB etcd administration](docs/administration.md).
+
+Both services use one Raft write leader and default to a 2 GiB backend quota.
+Use `--quota-backend-bytes` to change the quota. When sizing SlateDB etcd, allow memory for an index
+that grows with the live key count. Native backup and restore limit the image to 64 MiB.
+If your backup image exceeds 64 MiB, you need another recovery plan for the loss of all members.
+See [snapshot limits](docs/object-snapshots.md#limits).
+
+[etcd-maintenance]: https://etcd.io/docs/v3.6/op-guide/maintenance/
+
 ## Start here
 
 See the [quick start](docs/getting-started.md) for prerequisites, a single node, and a three-node
