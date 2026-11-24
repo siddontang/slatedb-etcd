@@ -45,6 +45,8 @@ pub use source::{Row, StateRead, StateScan};
 use view::StateView;
 #[cfg(test)]
 mod key_index_tests;
+#[cfg(test)]
+mod lease_index_tests;
 pub(crate) mod maintenance;
 #[cfg(test)]
 mod quota_tests;
@@ -57,6 +59,8 @@ const APPLIED: &[u8] = b"meta/applied";
 /// `meta/applied` alone, so the term is valid only while its index equals `meta/applied`.
 /// Logical images and native backups omit the row. See `read_applied_term`.
 pub(crate) const APPLIED_TERM: &[u8] = b"meta/applied-term";
+/// The logical size counter. Each state batch updates it with the apply marker.
+const LOGICAL_SIZE: &[u8] = b"meta/logical-size";
 const DATA: &[u8] = b"data/";
 
 #[derive(Deserialize, Serialize)]
@@ -218,6 +222,33 @@ pub(crate) fn slatedb_settings() -> Settings {
     settings
 }
 
+/// Read the stored logical size, or count it when the counter does not match the apply marker.
+///
+/// Directories from older binaries have no counter. An older binary that writes to a directory
+/// moves the apply marker past the counter, so the next open counts again.
+async fn load_logical_size(db: &impl StateRead, applied: u64) -> Result<u64> {
+    use prost::Message;
+    let stored = match db.get(LOGICAL_SIZE).await? {
+        Some(row) => {
+            let counter =
+                crate::proto::state::LogicalSize::decode(row).context("invalid size counter")?;
+            (counter.applied == applied).then_some(counter.bytes)
+        }
+        None => None,
+    };
+    let Some(bytes) = stored else {
+        return maintenance::count_logical_size(db).await;
+    };
+    if cfg!(debug_assertions) {
+        let counted = maintenance::count_logical_size(db).await?;
+        ensure!(
+            counted == bytes,
+            "stored logical size {bytes} differs from the counted size {counted}"
+        );
+    }
+    Ok(bytes)
+}
+
 /// The first key after every `etcd/current/` key.
 const CURRENT_END: &[u8] = b"etcd/current0";
 
@@ -347,7 +378,8 @@ impl StateMachine {
             (Some(_), Some(bytes)) => {
                 u64::from_be_bytes(bytes.as_ref().try_into().context("invalid logical size")?)
             }
-            _ => maintenance::count_logical_size(&reads).await?,
+            (Some(_), None) => maintenance::count_logical_size(&reads).await?,
+            (None, _) => load_logical_size(&reads, applied).await?,
         };
         Ok(Self {
             members: Arc::new(members),
@@ -474,8 +506,19 @@ impl StateMachine {
                 self.rows.invalidate(key, index);
             }
         }
+        // The counters are outside `etcd/`, so they do not count themselves.
         if self.is_shared() {
             batch.put(shared::LOGICAL_BYTES, size.to_be_bytes());
+        } else {
+            use prost::Message;
+            batch.put(
+                LOGICAL_SIZE,
+                crate::proto::state::LogicalSize {
+                    applied: index,
+                    bytes: size,
+                }
+                .encode_to_vec(),
+            );
         }
         let batch = Arc::new(batch);
         match &mut self.shared {
@@ -582,10 +625,10 @@ fn snapshot_key(key: &[u8]) -> bool {
     key.starts_with(DATA) || key.starts_with(b"etcd/") || key == APPLIED || derived_key(key)
 }
 
-/// Return true for a meta row that each state derives again: the applied term and the shared-mode
-/// logical size. Format 4 images and backups omit these rows, so the previous reader accepts them.
+/// Return true for a meta row that each state derives again: the applied term and the logical
+/// size counters. Format 4 images and backups omit these rows, so the previous reader accepts them.
 fn derived_key(key: &[u8]) -> bool {
-    key == APPLIED_TERM || key == shared::LOGICAL_BYTES
+    key == APPLIED_TERM || key == shared::LOGICAL_BYTES || key == LOGICAL_SIZE
 }
 
 fn data_key(key: &str) -> Vec<u8> {
