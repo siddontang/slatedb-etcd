@@ -661,6 +661,8 @@ pub(crate) struct Shared {
     /// A failed open tries again until the base opens or a newer announcement replaces it.
     /// DST turns this off, because a retry would run at a time that the schedule does not fix.
     retry_opens: bool,
+    /// The checkpoint that waits for the opener task.
+    pending: Arc<Mutex<Pending>>,
     /// The `F` of the current base. Physical Compact replies wait for a covering base.
     based: Arc<tokio::sync::watch::Sender<u64>>,
     pub(crate) pin_max: Duration,
@@ -671,41 +673,76 @@ const OPEN_RETRY_MIN: Duration = Duration::from_millis(100);
 /// The longest wait between two open attempts.
 const OPEN_RETRY_MAX: Duration = Duration::from_secs(2);
 
-/// Open the announced checkpoint `id` and offer its base for a switch.
+/// The announced checkpoint that waits for an open, and whether an opener task runs.
+#[derive(Default)]
+struct Pending {
+    /// Only the newest waiting checkpoint. A newer announcement replaces an older one.
+    id: Option<uuid::Uuid>,
+    running: bool,
+}
+
+/// Open announced checkpoints one at a time and offer each base for a switch.
+///
+/// A started open runs to its end, so a steady stream of announcements still advances the
+/// base. After each open the task takes the newest waiting checkpoint, if any.
 ///
 /// The announcement is already applied, so the writer does not announce the checkpoint again,
 /// and a member that is not paused does not poll. Thus a failed open tries again with a
-/// backoff from `OPEN_RETRY_MIN` to `OPEN_RETRY_MAX`, also on an idle member. It stops when
-/// the base opens, when a newer announcement replaces it, or when the state closes. A transient
-/// error never leaves the member on an old base.
+/// backoff from `OPEN_RETRY_MIN` to `OPEN_RETRY_MAX`, also on an idle member. A newer waiting
+/// checkpoint replaces the failed one before the next attempt. The task stops when nothing
+/// waits, or when the state closes. A transient error never leaves the member on an old base.
 async fn open_announced(
     source: Arc<Source>,
     opened: Arc<Opened>,
+    pending: Arc<Mutex<Pending>>,
     mut announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
-    id: uuid::Uuid,
-    retry: bool,
 ) {
-    let mut backoff = OPEN_RETRY_MIN;
-    loop {
-        match source.open_base(id).await {
-            Ok(base) => return opened.offer(base),
-            Err(error) => tracing::warn!(%error, %id, "cannot open a view checkpoint"),
-        }
-        if !retry {
-            return;
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(backoff) => {}
-            changed = announced.changed() => {
-                if changed.is_err() {
-                    return;
+    let next = || {
+        let mut pending = pending.lock().unwrap();
+        let id = pending.id.take();
+        pending.running = id.is_some();
+        id
+    };
+    let waiting = || pending.lock().unwrap().id.is_some();
+    let mut current = next();
+    while let Some(id) = current {
+        let mut backoff = OPEN_RETRY_MIN;
+        loop {
+            match source.open_base(id).await {
+                Ok(base) => {
+                    opened.offer(base);
+                    break;
+                }
+                Err(error) => tracing::warn!(%error, %id, "cannot open a view checkpoint"),
+            }
+            if waiting() {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                changed = announced.changed() => {
+                    if changed.is_err() {
+                        pending.lock().unwrap().running = false;
+                        return;
+                    }
                 }
             }
+            if waiting() {
+                break;
+            }
+            backoff = (backoff * 2).min(OPEN_RETRY_MAX);
         }
-        if *announced.borrow() != Some(id) {
-            return;
-        }
-        backoff = (backoff * 2).min(OPEN_RETRY_MAX);
+        current = next();
+    }
+}
+
+/// Open checkpoint `id` once and offer its base. A manual apply, such as DST, uses this, so
+/// each announcement opens its own checkpoint at a fixed point of the schedule.
+async fn open_once(source: Arc<Source>, opened: Arc<Opened>, id: uuid::Uuid) {
+    match source.open_base(id).await {
+        Ok(base) => opened.offer(base),
+        // The member keeps its base and waits for the next checkpoint.
+        Err(error) => tracing::warn!(%error, %id, "cannot open a view checkpoint"),
     }
 }
 
@@ -721,6 +758,7 @@ impl Shared {
             announced: Arc::new(tokio::sync::watch::channel(None).0),
             opening: vec![],
             retry_opens: true,
+            pending: Arc::default(),
             pin_max,
         }
     }
@@ -751,17 +789,25 @@ impl Shared {
         self.overlay.close_segment();
         let source = self.source.clone();
         let opened = self.opened.clone();
-        let announced = self.announced.subscribe();
         self.opening.retain(|task| !task.is_finished());
-        let retry = self.retry_opens;
-        if retry {
-            // The newer checkpoint replaces the opens and retries of the older ones.
-            for task in self.opening.drain(..) {
-                task.abort();
-            }
+        if !self.retry_opens {
+            self.opening
+                .push(tokio::spawn(open_once(source, opened, id)));
+            return;
         }
+        // The checkpoint waits for the opener. It replaces an older waiting one, but not the
+        // open that runs.
+        let mut pending = self.pending.lock().unwrap();
+        pending.id = Some(id);
+        if pending.running {
+            return;
+        }
+        pending.running = true;
+        drop(pending);
+        let announced = self.announced.subscribe();
+        let pending = self.pending.clone();
         self.opening.push(tokio::spawn(open_announced(
-            source, opened, announced, id, retry,
+            source, opened, pending, announced,
         )));
     }
 

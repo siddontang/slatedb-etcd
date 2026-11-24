@@ -2095,6 +2095,102 @@ mod tests {
         state.close().await.unwrap();
     }
 
+    /// Announcements arrive faster than one open takes. A started open finishes, so the base
+    /// advances while announcements still arrive, and it reaches the newest checkpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_base_advances_under_a_stream_of_announcements() {
+        use crate::object::faults::{FaultStore, DELAY_SST_GET};
+        let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+        let options = crate::state::shared::Options {
+            quota: 0,
+            voters: vec![1],
+            join: false,
+            empty_log: false,
+            pin_max: Duration::from_secs(300),
+        };
+        // A tiny cache, so each open reads the store.
+        let cache = crate::state::StateCache {
+            block_bytes: 1,
+            meta_bytes: 1,
+            row_bytes: 0,
+        };
+        let mut state = StateMachine::open_shared(
+            faults.clone(),
+            "root",
+            "test",
+            cache,
+            &options,
+            crate::state::transfer::Backend::Local,
+        )
+        .await
+        .unwrap();
+        state.members = Arc::new(crate::cluster::Store::initial(
+            &[(1, "127.0.0.1:1".to_owned())].into(),
+        ));
+        state.apply(1, None).await.unwrap();
+        let handles = state.shared_handles().unwrap();
+        let (events, received) = mpsc::channel(64);
+        let mut announcements = Announcements(received);
+        let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+        writer.sync(true, 2, &events);
+        // Sixteen checkpoints, each after one more write. Raft takes none of them yet.
+        let mut checkpoints = vec![announcements.next(Duration::from_secs(20), true).await];
+        for n in 0..15 {
+            let put = crate::proto::etcdserverpb::RequestOp {
+                request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
+                    crate::proto::etcdserverpb::PutRequest {
+                        key: format!("key-{n}").into_bytes(),
+                        value: b"value".to_vec(),
+                        ..Default::default()
+                    },
+                )),
+            };
+            let index = state.applied + 1;
+            state.apply_etcd(index, &put).await.unwrap();
+            loop {
+                let id = announcements.next(Duration::from_secs(20), true).await;
+                let base = handles.source.open_base(id).await.unwrap();
+                if base.applied == index {
+                    checkpoints.push(id);
+                    break;
+                }
+            }
+        }
+        writer.sync(false, 2, &events);
+        writer.stop().await;
+        let newest = state.applied;
+        // Each object read takes 70 ms. The announcements come 40 ms apart.
+        faults.set_delay(Duration::from_millis(70));
+        faults.set(DELAY_SST_GET);
+        let mut advanced = 0;
+        for id in &checkpoints {
+            let index = state.applied + 1;
+            state
+                .apply_view_checkpoint(index, &id.to_string())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            state.switch_base();
+            advanced = advanced.max(*handles.based.borrow());
+        }
+        assert!(
+            advanced >= 1,
+            "the base did not advance during the announcements"
+        );
+        let mut ready = handles.opened.subscribe();
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            ready.wait_for(|ready| *ready >= newest),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        state.switch_base();
+        assert_eq!(*handles.based.borrow(), newest);
+        faults.set(0);
+        state.close().await.unwrap();
+    }
+
     /// An adopt across membership changes leaves Raft with the checkpoint's ConfState, also
     /// after an election.
     #[tokio::test]
