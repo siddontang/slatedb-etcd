@@ -7,8 +7,13 @@
 //! Each hash table slot uses 57 bytes on 64-bit hosts: a boxed key, five integer fields, and a
 //! control byte. Slots are 44 to 88 percent full, so a key costs 65 to 130 bytes plus its key
 //! allocation.
+//!
+//! The index also groups the keys of each lease, like etcd's lessor item sets. Lease revocation,
+//! `LeaseTimeToLive` with keys, and Auth lease checks then read only the keys of one lease. A
+//! leased key adds one 17-byte set slot that shares the key allocation, so it costs 19 to 39 bytes
+//! more. Each lease with keys adds a 57-byte map slot and its set.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -70,6 +75,8 @@ impl KeyMeta {
 #[derive(Default)]
 pub(crate) struct KeyIndex {
     keys: HashMap<Arc<[u8]>, KeyMeta>,
+    /// The current keys of each lease. Entries share the key allocations of `keys`.
+    leases: HashMap<i64, HashSet<Arc<[u8]>>>,
     /// Key creations and deletions of the batch being published.
     changes: Vec<(Arc<[u8]>, bool)>,
     order: Arc<KeyOrder>,
@@ -113,20 +120,65 @@ impl KeyIndex {
             Some(value) => {
                 let meta = KeyMeta::decode(value)?;
                 if let Some(old) = self.keys.get_mut(key) {
-                    *old = meta;
+                    let old_lease = std::mem::replace(old, meta).lease;
+                    if old_lease != meta.lease {
+                        let shared = self.keys.get_key_value(key).unwrap().0.clone();
+                        self.unlink(old_lease, &shared);
+                        self.link(meta.lease, shared);
+                    }
                 } else {
                     let key: Arc<[u8]> = key.into();
+                    self.link(meta.lease, key.clone());
                     self.keys.insert(key.clone(), meta);
                     self.changes.push((key, true));
                 }
             }
             None => {
-                if let Some((key, _)) = self.keys.remove_entry(key) {
+                if let Some((key, meta)) = self.keys.remove_entry(key) {
+                    self.unlink(meta.lease, &key);
                     self.changes.push((key, false));
                 }
             }
         }
         Ok(())
+    }
+
+    fn link(&mut self, lease: i64, key: Arc<[u8]>) {
+        if lease != 0 {
+            self.leases.entry(lease).or_default().insert(key);
+        }
+    }
+
+    fn unlink(&mut self, lease: i64, key: &[u8]) {
+        if lease == 0 {
+            return;
+        }
+        if let Some(keys) = self.leases.get_mut(&lease) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.leases.remove(&lease);
+            }
+        }
+    }
+
+    /// Visit the current keys attached to a lease in no particular order.
+    pub(crate) fn lease_keys_unordered(&self, lease: i64) -> impl Iterator<Item = &[u8]> {
+        self.leases
+            .get(&lease)
+            .filter(|_| lease != 0)
+            .into_iter()
+            .flatten()
+            .map(AsRef::as_ref)
+    }
+
+    /// Return the current keys attached to a lease in key order.
+    pub(crate) fn lease_keys(&self, lease: i64) -> Vec<Vec<u8>> {
+        let mut keys: Vec<Vec<u8>> = match self.leases.get(&lease) {
+            Some(keys) if lease != 0 => keys.iter().map(|key| key.to_vec()).collect(),
+            _ => return vec![],
+        };
+        keys.sort_unstable();
+        keys
     }
 
     /// Make the creations and deletions published since the last commit visible to read views
@@ -158,7 +210,10 @@ impl KeyIndex {
             .collect();
         let mut current: Vec<&[u8]> = self.keys.keys().map(AsRef::as_ref).collect();
         current.sort_unstable();
-        Ok(fresh.keys == self.keys && visible == current && self.changes.is_empty())
+        Ok(fresh.keys == self.keys
+            && fresh.leases == self.leases
+            && visible == current
+            && self.changes.is_empty())
     }
 }
 

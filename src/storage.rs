@@ -54,6 +54,14 @@ pub struct LogStats {
 /// The identity marker of data directories whose state rows can omit Put values outside the
 /// current and history rows. Binaries without it reject such a directory.
 const ROW_MARKER: &str = "history-values";
+/// Default size of one Raft log file, as etcd's 64 MiB WAL segment.
+///
+/// Each file rotation syncs the old file, the new file header, and the directory. With 256 KiB
+/// files, 4 KiB-value puts rotated about every 130 writes, and rotation caused half of the
+/// device flushes. Truncation deletes only whole files, so up to one file of old entries stays.
+pub const DEFAULT_LOG_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// Smallest Raft log file size. A file must hold its header and at least one write batch.
+pub const MIN_LOG_FILE_BYTES: u64 = 64 * 1024;
 
 /// The identity record of the data directory and whether it carries [`ROW_MARKER`].
 ///
@@ -167,10 +175,26 @@ impl RaftStorage {
     }
 
     pub fn open(dir: &Path, node_id: u64, cluster_id: &str, voters: Vec<u64>) -> Result<Self> {
+        Self::open_with_file_bytes(dir, node_id, cluster_id, voters, DEFAULT_LOG_FILE_BYTES)
+    }
+
+    /// Open the log with `file_bytes` per log file. Existing files of any size stay readable.
+    pub fn open_with_file_bytes(
+        dir: &Path,
+        node_id: u64,
+        cluster_id: &str,
+        voters: Vec<u64>,
+        file_bytes: u64,
+    ) -> Result<Self> {
+        ensure!(
+            file_bytes >= MIN_LOG_FILE_BYTES,
+            "log file size must be at least {MIN_LOG_FILE_BYTES} bytes"
+        );
         let config = Config {
             dir: dir.to_string_lossy().into_owned(),
-            target_file_size: ReadableSize::kb(256),
-            purge_threshold: ReadableSize::kb(512),
+            target_file_size: ReadableSize(file_bytes),
+            // raft-engine requires a purge threshold of at least one file.
+            purge_threshold: ReadableSize(file_bytes),
             batch_compression_threshold: ReadableSize(0),
             enable_log_recycle: false,
             ..Config::default()
