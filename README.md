@@ -12,6 +12,29 @@ Each replica owns an independent local or S3 object namespace and manifest.
 etcd replacement. S3 storage and remote mutual TLS are available for controlled validation.
 See [remote storage](docs/remote-storage.md) for ownership, recovery, and deployment limits.
 
+## Why evaluate SlateDB etcd?
+
+- **Move key-value data to object storage.** Upstream etcd keeps each member's database in a local
+  bbolt file. With SlateDB, each member can store its immutable table files in its own S3 prefix.
+  This lets operators size object storage separately from the local disk needed for the Raft log.
+  A quorum commits writes to durable logs without waiting for an S3 upload.
+  See [remote storage](docs/remote-storage.md).
+- **Reduce leader traffic during follower recovery.** When a follower needs a snapshot, the leader
+  sends a checkpoint description. With the same S3 bucket, endpoint, region, and cross-prefix read
+  access, S3 copies the table files directly. The bulk data bypasses the leader, and retries reuse
+  files the follower already copied. The HTTP fallback reads the files through the leader.
+  See [snapshot transfer](docs/object-snapshots.md#transfer).
+- **Run a member inside a Rust application.** A Rust service can start a member on its own Tokio
+  runtime, wait for quorum readiness, and manage shutdown. This removes a separate server process
+  while clients can still use the supported etcd v3 APIs. See [Rust embedding](docs/embedding.md)
+  and [API compatibility](COMPATIBILITY.md).
+
+**Sizing and recovery limits.** Writes still pass through one Raft leader. The default logical
+quota is 2 GiB even with S3, and the in-memory index grows with the number of live keys.
+A follower can recover from a surviving cluster. Recovery after total cluster loss needs a separate
+backup. Native backup and restore currently limit the image to 64 MiB.
+See [snapshot limits](docs/object-snapshots.md#limits).
+
 ## Start here
 
 See the [quick start](docs/getting-started.md) for prerequisites, a single node, and a three-node
