@@ -101,6 +101,8 @@ pub enum Event {
     ViewAck {
         member: u64,
         checkpoints: std::collections::HashSet<uuid::Uuid>,
+        /// A manual checkpoint on the member asks for a publication through this index.
+        publish: Option<u64>,
     },
 }
 
@@ -141,6 +143,8 @@ pub struct NodeOptions {
     pub max_clock_skew: Duration,
     /// Shared mode: whether the leader deletes old view checkpoints.
     pub view_retention: crate::state::ViewRetention,
+    /// Shared mode: the rows of a native snapshot that seed a new cluster.
+    pub restore: Option<crate::state::shared::Restore>,
 }
 
 impl NodeOptions {
@@ -338,6 +342,7 @@ impl Node {
             join: options.join,
             empty_log: storage.last_index()? == 0,
             pin_max: options.view_pin_max,
+            restore: options.restore.clone(),
         };
         let mut state = options
             .object_store
@@ -509,6 +514,7 @@ impl Node {
                 let mut writer = shared::Writer::new(handles, options.view_max_age, clock);
                 writer.retention = options.view_retention;
                 writer.retained = Some(retained);
+                writer.gauges = Some(shared::Gauges::register(&state.metrics.registry)?);
                 Some(writer)
             }
             None => None,
@@ -800,6 +806,9 @@ impl Node {
                     M::MoveLeader(target) => {
                         self.move_leader(target, credentials.unwrap_or_default(), response)?
                     }
+                    M::Defragment if self.writer.is_some() => {
+                        self.defragment_shared(credentials.unwrap_or_default(), response)?
+                    }
                     M::Alarm(_) | M::Downgrade(_) => self.propose(
                         RaftCommand::Maintenance {
                             id: uuid::Uuid::new_v4().to_string(),
@@ -1032,15 +1041,20 @@ impl Node {
                 let _ = response.send(Ok(self.status()?));
             }
             Event::Checkpoint(response) => {
-                if self.writer.is_some() {
-                    let _ = response.send(Err(
-                        self.error("shared state mode has no manual checkpoint until phase 4")
-                    ));
-                } else if self.checkpoint_waiters.len() >= apply::MAX_QUERIES {
+                if self.checkpoint_waiters.len() >= apply::MAX_QUERIES {
                     let _ = response.send(Err(self.error("too many checkpoint requests")));
                 } else {
-                    self.checkpoint_waiters
-                        .push((self.raw.raft.raft_log.committed, response));
+                    let committed = self.raw.raft.raft_log.committed;
+                    // Shared mode: the leader publishes a checkpoint through the commit index. A
+                    // follower asks the leader for that publication.
+                    if let Some(writer) = &self.writer {
+                        if self.raw.raft.state == StateRole::Leader {
+                            writer.request_publication(committed);
+                        } else {
+                            self.send_view_ack(Some(committed));
+                        }
+                    }
+                    self.checkpoint_waiters.push((committed, response));
                     self.schedule_apply()?;
                 }
             }
@@ -1054,7 +1068,8 @@ impl Node {
             Event::ViewAck {
                 member,
                 checkpoints,
-            } => self.view_ack(member, checkpoints),
+                publish,
+            } => self.view_ack(member, checkpoints, publish),
             Event::SnapshotDelay(delay_ms, response) => {
                 self.snapshot_delay_ms = delay_ms.min(5000);
                 let _ = response.send(Ok(self.status()?));
@@ -1389,16 +1404,37 @@ impl Node {
 
     fn finish_checkpoint_waiters(&mut self) -> Result<()> {
         let mut waiting = vec![];
+        let leader = self.raw.raft.state == StateRole::Leader;
+        let applied = self.state.applied;
         for (index, response) in std::mem::take(&mut self.checkpoint_waiters) {
             if response.is_closed() {
                 continue;
             }
-            // A manual checkpoint completes only with a complete image.
+            // Shared mode: the first request can arrive before apply reaches its commit index.
+            // The covering publication is due once apply reaches it.
+            if let Some(writer) = &mut self.writer {
+                if leader {
+                    writer.request_checkpoint(index, applied);
+                }
+            }
+            // A manual checkpoint completes only with a complete image. In shared mode the
+            // image is a view checkpoint, so the member's base must hold the state at `index`.
             let store = self.raw.store();
-            if index <= store.snapshot_index()
-                && index <= self.state.applied
-                && (index == 0 || store.has_image())
-            {
+            let done = match &self.writer {
+                Some(writer) => {
+                    index <= self.state.applied
+                        && self
+                            .state
+                            .view
+                            .is_some_and(|(base, _, _)| base >= writer.covering(index))
+                }
+                None => {
+                    index <= store.snapshot_index()
+                        && index <= self.state.applied
+                        && (index == 0 || store.has_image())
+                }
+            };
+            if done {
                 let _ = response.send(Ok(self.status()?));
             } else {
                 waiting.push((index, response));
@@ -1479,8 +1515,17 @@ impl Node {
         }
         status["quorum_reply_index"] = self.quorum_reply_index.into();
         if let (Some(writer), Some((base, applied, bytes))) = (&self.writer, self.state.view) {
+            let record = crate::state::transfer::ViewDescriptor::decode(
+                self.raw.store().recovery_snapshot().get_data(),
+            )
+            .ok()
+            .flatten()
+            .and_then(|view| view.checkpoint().ok());
             status["shared_state"] = json!({
                 "base_applied_index": base,
+                "base_checkpoint": self.state.base_checkpoint,
+                "record_index": self.raw.store().snapshot_index(),
+                "record_checkpoint": record,
                 "applied_view_checkpoints": applied,
                 "overlay_bytes": bytes,
                 "writer": writer.status(),

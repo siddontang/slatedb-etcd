@@ -14,6 +14,7 @@ fn options() -> shared::Options {
         join: false,
         empty_log: false,
         pin_max: Duration::from_secs(300),
+        restore: None,
     }
 }
 
@@ -977,4 +978,173 @@ async fn a_fenced_writer_deletes_no_checkpoint() {
         .collect();
     assert_eq!(left, [views[0].1, views[3].1, views[4].1]);
     state.close().await.unwrap();
+}
+
+fn restore(id: &str) -> shared::Restore {
+    let members = crate::cluster::Store::initial(&[(1, "127.0.0.1:1".to_owned())].into());
+    shared::Restore::new(
+        vec![
+            (APPLIED.to_vec(), 1_u64.to_be_bytes().to_vec()),
+            (
+                crate::cluster::KEY.to_vec(),
+                serde_json::to_vec(&members).unwrap(),
+            ),
+            (b"etcd/restored".to_vec(), id.as_bytes().to_vec()),
+        ],
+        id.to_owned(),
+    )
+}
+
+fn restore_source(store: Arc<dyn ObjectStore>) -> (Arc<shared::Source>, slatedb::admin::Admin) {
+    let source = shared::offline_source(store.clone(), "cluster", StateCache::default()).unwrap();
+    let admin = slatedb::admin::Admin::builder(source.state().as_str(), store).build();
+    (source, admin)
+}
+
+/// The bootstrap claim names the snapshot. The same snapshot restores again with success. Another
+/// snapshot fails, and so does a shared state that an older ordinary start created.
+#[tokio::test]
+async fn a_restore_claim_names_its_snapshot() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (source, admin) = restore_source(store.clone());
+    shared::seed(&source, &admin, &restore("a")).await.unwrap();
+    shared::seed(&source, &admin, &restore("a")).await.unwrap();
+    let error = shared::seed(&source, &admin, &restore("b"))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("new cluster prefix"),
+        "{error:#}"
+    );
+    let (id, _) = shared::view_checkpoints(&admin)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(id, 1);
+    // A normal first leader created this shared state. It has no restore claim.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (source, admin) = restore_source(store);
+    let db = source.open_writer().await.unwrap();
+    db.put(b"etcd/other", b"value").await.unwrap();
+    db.flush().await.unwrap();
+    db.close().await.unwrap();
+    let error = shared::seed(&source, &admin, &restore("a"))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("new cluster prefix"),
+        "{error:#}"
+    );
+}
+
+/// A restore stopped after its rows reached the shared database and before its checkpoint and
+/// marker. The next restore of the same snapshot completes the checkpoint and the marker.
+#[tokio::test]
+async fn a_restore_completes_after_a_failure_before_its_marker() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (source, admin) = restore_source(store);
+    let partial = restore("a");
+    shared::seed_rows_for_test(&source, &partial).await.unwrap();
+    assert!(!source.bootstrapped().await.unwrap());
+    assert!(admin.read_manifest(None).await.unwrap().is_some());
+    shared::seed(&source, &admin, &partial).await.unwrap();
+    assert!(source.bootstrapped().await.unwrap());
+    let (seq, checkpoint) = shared::view_checkpoints(&admin)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(seq, 1);
+    let base = source.open_base(checkpoint.id).await.unwrap();
+    assert_eq!(base.applied, 1);
+    assert_eq!(
+        base.get(b"etcd/restored").await.unwrap().as_deref(),
+        Some(b"a".as_slice())
+    );
+    // Another snapshot cannot take over the state of this one.
+    let error = shared::seed(&source, &admin, &restore("b"))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("new cluster prefix"),
+        "{error:#}"
+    );
+}
+
+/// Defragment from sorted runs only. SlateDB can reuse the destination run ID, so the check
+/// compares SST views: a checkpoint after `compact_all` has one run and none of the input views.
+#[tokio::test]
+async fn defragment_replaces_every_input_sorted_run() {
+    use slatedb::compactor::{CompactionSpec, CompactionStatus, SourceId};
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut settings = slatedb_settings();
+    if let Some(compactor) = settings.compactor_options.as_mut() {
+        compactor
+            .scheduler_options
+            .insert("min_compaction_sources".into(), "1000000".into());
+    }
+    let db = slatedb::Db::builder("db", store.clone())
+        .with_settings(settings)
+        .build()
+        .await
+        .unwrap();
+    let admin = slatedb::admin::Admin::builder("db", store).build();
+    // Two sorted runs and no L0 SST.
+    for (n, destination) in [(0_u32, 0_u32), (1, 1)] {
+        db.put(format!("k{n}").as_bytes(), b"v").await.unwrap();
+        db.flush().await.unwrap();
+        let manifest = admin.read_manifest(None).await.unwrap().unwrap();
+        let sources = manifest
+            .l0()
+            .iter()
+            .map(|view| SourceId::SstView(view.id))
+            .collect();
+        let job = admin
+            .submit_compaction(CompactionSpec::new(sources, destination))
+            .await
+            .unwrap();
+        for _ in 0..500 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let done = matches!(
+                admin
+                    .read_compaction(job.id(), None)
+                    .await
+                    .unwrap()
+                    .map(|j| j.status()),
+                Some(CompactionStatus::Completed)
+            );
+            if done
+                && admin
+                    .read_manifest(None)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .l0()
+                    .is_empty()
+            {
+                break;
+            }
+        }
+    }
+    let manifest = admin.read_manifest(None).await.unwrap().unwrap();
+    assert!(manifest.l0().is_empty());
+    assert_eq!(manifest.compacted().len(), 2);
+    let input: std::collections::HashSet<_> =
+        manifest.all_sst_views().map(|view| view.id).collect();
+    maintenance::compact_all(&admin).await.unwrap();
+    let checkpoint = db
+        .create_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
+        .await
+        .unwrap();
+    let manifest = admin
+        .read_manifest(Some(checkpoint.manifest_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(manifest.compacted().len(), 1);
+    assert!(!manifest
+        .all_sst_views()
+        .any(|view| input.contains(&view.id)));
+    db.close().await.unwrap();
 }

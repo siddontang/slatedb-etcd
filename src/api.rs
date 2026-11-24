@@ -146,6 +146,9 @@ async fn raft_message(State(state): State<ApiState>, headers: HeaderMap, body: B
 struct ViewAck {
     member: u64,
     checkpoints: std::collections::HashSet<uuid::Uuid>,
+    /// A manual checkpoint on the member asks the leader to publish through this index.
+    #[serde(default)]
+    publish: Option<u64>,
 }
 
 /// Receive the checkpoints that a shared-mode member pins. The leader keeps them for a time.
@@ -164,6 +167,7 @@ async fn view_ack(
     let event = Event::ViewAck {
         member: report.member,
         checkpoints: report.checkpoints,
+        publish: report.publish,
     };
     match state.events.try_send(event) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),

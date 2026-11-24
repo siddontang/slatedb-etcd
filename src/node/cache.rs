@@ -749,6 +749,7 @@ mod tests {
                 overlay_max_bytes: 1 << 30,
                 max_clock_skew: std::time::Duration::from_secs(5),
                 view_retention: Default::default(),
+                restore: None,
                 object_store: crate::object::Config::Local,
                 quota_bytes: 0,
                 strict_reconfiguration: false,
