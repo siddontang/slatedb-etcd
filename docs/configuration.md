@@ -85,6 +85,7 @@ For example, use `--watch-progress-notify-interval=200ms` for the upstream clien
 | --- | ---: | --- |
 | `--snapshot-every` | 10000 | Applied entries between checkpoint opportunities; zero disables it. |
 | `--snapshot-min-bytes` | 67108864 | Log bytes needed before auto truncation; zero disables it. |
+| `--log-file-bytes` | 67108864 | Log file size, at least 65536. Truncation frees whole files. |
 | `--quota-backend-bytes` | 0 | Zero selects 2 GiB. A negative value disables the quota. |
 | `--log-cache-bytes` | 8388608 | Cache budget for log entries. |
 | `--log-pending-bytes` | 33554432 | Pending entry budget, including unapplied entries. |

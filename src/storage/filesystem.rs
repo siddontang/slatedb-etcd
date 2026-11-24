@@ -100,6 +100,7 @@ impl FileSystem for LogFileSystem {
     fn new_writer(&self, handle: Arc<Self::Handle>) -> io::Result<Self::Writer> {
         Ok(LogWriter {
             inner: DefaultFileSystem.new_writer(Arc::clone(&handle.inner))?,
+            file: Arc::clone(&handle.inner),
             metrics: self.0.clone(),
         })
     }
@@ -107,8 +108,12 @@ impl FileSystem for LogFileSystem {
 
 pub(super) struct LogWriter {
     inner: <DefaultFileSystem as FileSystem>::Writer,
+    file: Arc<<DefaultFileSystem as FileSystem>::Handle>,
     metrics: crate::metrics::Wal,
 }
+
+/// Zero bytes for one write of log file preallocation.
+static ZEROS: [u8; 64 * 1024] = [0; 64 * 1024];
 
 impl Write for LogWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
@@ -137,8 +142,24 @@ impl WriteExt for LogWriter {
         self.inner.truncate(offset)
     }
 
+    /// Write zeros over the range instead of `fallocate`.
+    ///
+    /// `fallocate` makes unwritten extents. On ext4, each later `fdatasync` must then commit
+    /// the journal to mark the written blocks, and that costs a second device flush. Written
+    /// zeros make the blocks plain data, so a log sync flushes the device once. Recovery reads
+    /// zeros after the last record in both cases.
     fn allocate(&mut self, offset: usize, size: usize) -> io::Result<()> {
-        self.inner.allocate(offset, size)
+        let end = offset + size;
+        let mut at = offset;
+        while at < end {
+            let len = (end - at).min(ZEROS.len());
+            let written = self.file.write(at, &ZEROS[..len])?;
+            if written == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            at += written;
+        }
+        Ok(())
     }
 }
 
@@ -167,5 +188,28 @@ mod tests {
         reader.read_to_end(&mut data).unwrap();
         assert_eq!(data, b"durable log");
         fs.delete(renamed).unwrap();
+    }
+
+    #[test]
+    fn allocation_writes_zeros_after_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("log");
+        let fs = LogFileSystem(crate::metrics::Wal::new().unwrap());
+        let handle = Arc::new(fs.create(&path).unwrap());
+        let mut writer = fs.new_writer(Arc::clone(&handle)).unwrap();
+        writer.write_all(b"record").unwrap();
+        let size = ZEROS.len() * 2 + 7;
+        writer.allocate(6, size).unwrap();
+        writer.write_all(b"next").unwrap();
+        handle.sync().unwrap();
+        assert_eq!(handle.file_size().unwrap(), 6 + size);
+        drop(writer);
+        let mut data = Vec::new();
+        fs.new_reader(handle)
+            .unwrap()
+            .read_to_end(&mut data)
+            .unwrap();
+        assert_eq!(&data[..10], b"recordnext");
+        assert!(data[10..].iter().all(|&byte| byte == 0));
     }
 }
