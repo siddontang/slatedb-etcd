@@ -2,11 +2,11 @@ use std::collections::BTreeMap;
 
 use crate::WriteBatch;
 use serde::{Deserialize, Serialize};
-use slatedb::Db;
 use tonic::Code;
 
 use crate::mvcc::{self, KvError};
 use crate::proto::etcdserverpb::*;
+use crate::state::{StateRead, StateScan};
 
 const PREFIX: &[u8] = b"etcd/leases/";
 
@@ -52,9 +52,9 @@ fn key(id: i64) -> Vec<u8> {
     [PREFIX, &id.to_be_bytes()].concat()
 }
 
-pub async fn load(db: &Db) -> anyhow::Result<BTreeMap<i64, LeaseRecord>> {
+pub async fn load(db: &impl StateRead) -> anyhow::Result<BTreeMap<i64, LeaseRecord>> {
     let mut leases = BTreeMap::new();
-    let mut scan = db.scan_prefix(PREFIX, ..).await?;
+    let mut scan = db.scan_under(PREFIX, &Default::default()).await?;
     while let Some(row) = scan.next().await? {
         let id = i64::from_be_bytes(row.key[PREFIX.len()..].try_into()?);
         leases.insert(id, crate::codec::decode(&row.value)?);
@@ -66,7 +66,7 @@ pub type LeaseChange = Option<(i64, Option<LeaseRecord>)>;
 pub type PreparedLease = (LeaseReply, WriteBatch, i64, LeaseChange);
 
 pub async fn prepare(
-    db: &Db,
+    db: &impl StateRead,
     revision: i64,
     compact_revision: i64,
     index: u64,
@@ -79,7 +79,7 @@ pub async fn prepare(
 }
 
 pub(crate) async fn prepare_with_counts(
-    db: &Db,
+    db: &impl StateRead,
     revision: i64,
     compact_revision: i64,
     index: u64,

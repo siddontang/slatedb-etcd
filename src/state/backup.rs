@@ -44,10 +44,7 @@ impl StateMachine {
         );
         let mut seen = std::collections::BTreeSet::new();
         for (key, value) in &mut data.rows {
-            ensure!(
-                key.starts_with(DATA) || key.starts_with(b"etcd/") || key == APPLIED,
-                "invalid snapshot key"
-            );
+            ensure!(snapshot_key(key), "invalid snapshot key");
             ensure!(seen.insert(key.clone()), "duplicate snapshot key");
             if key == crate::auth::KEY {
                 let mut auth: crate::auth::Store = serde_json::from_slice(value)?;
@@ -66,10 +63,13 @@ impl StateMachine {
                 *value = serde_json::to_vec(&alarms)?;
             }
         }
+        // The restored log starts at index 1 in term 1.
         data.rows
-            .retain(|(key, _)| key != APPLIED && key != crate::cluster::KEY);
+            .retain(|(key, _)| key != APPLIED && key != APPLIED_TERM && key != crate::cluster::KEY);
         data.rows
             .push((APPLIED.to_vec(), 1_u64.to_be_bytes().to_vec()));
+        data.rows
+            .push((APPLIED_TERM.to_vec(), 1_u64.to_be_bytes().to_vec()));
         data.rows
             .push((crate::cluster::KEY.to_vec(), serde_json::to_vec(members)?));
         data.applied = 1;

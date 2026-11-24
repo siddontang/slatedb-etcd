@@ -34,8 +34,10 @@ pub(crate) mod rows;
 #[cfg(test)]
 mod rows_tests;
 mod snapshot;
+mod source;
 pub(crate) mod transfer;
 pub(crate) use read::ReadView;
+pub use source::{Row, StateRead, StateScan};
 #[cfg(test)]
 mod key_index_tests;
 pub(crate) mod maintenance;
@@ -43,6 +45,8 @@ pub(crate) mod maintenance;
 mod quota_tests;
 
 const APPLIED: &[u8] = b"meta/applied";
+/// The Raft term of the entry at `meta/applied`. Every state batch writes both rows.
+pub(crate) const APPLIED_TERM: &[u8] = b"meta/applied-term";
 const DATA: &[u8] = b"data/";
 
 #[derive(Deserialize, Serialize)]
@@ -67,6 +71,12 @@ pub struct StateMachine {
     pub(crate) write_batches: u64,
     pub alarms: Vec<crate::proto::etcdserverpb::AlarmMember>,
     pub applied: u64,
+    /// The Raft term of the entry at `applied`. Zero means that the term is unknown: the database
+    /// is empty or predates `meta/applied-term`.
+    pub applied_term: u64,
+    /// The Raft term of the entry that the next state batch marks as applied. The apply worker
+    /// sets it before each entry or group, and snapshot install sets it from the snapshot.
+    pub(crate) entry_term: u64,
     pub durable_applied: u64,
     pub revision: i64,
     pub compact_revision: i64,
@@ -268,14 +278,15 @@ impl StateMachine {
                 db.snapshot()?.seq() == applied,
                 "SlateDB sequence and apply marker differ"
             );
-            let revision = read_revision(&db).await?;
-            let compact_revision = read_compact_revision(&db).await?;
+            let applied_term = read_applied_term(db.as_ref()).await?;
+            let revision = read_revision(db.as_ref()).await?;
+            let compact_revision = read_compact_revision(db.as_ref()).await?;
             ensure!(
                 compact_revision <= revision,
                 "compaction exceeds current revision"
             );
-            let compaction = compaction::load(&db).await?;
-            let leases = crate::lease::load(&db).await?;
+            let compaction = compaction::load(db.as_ref()).await?;
+            let leases = crate::lease::load(db.as_ref()).await?;
             let auth = match db.get(crate::auth::KEY).await? {
                 Some(data) => serde_json::from_slice(&data)?,
                 None => crate::auth::Store::default(),
@@ -294,14 +305,16 @@ impl StateMachine {
                 metrics: Arc::new(crate::metrics::StateMeters::new()?),
                 quota: 0,
                 current: current::CurrentRows::default(),
-                key_index: key_index::KeyIndex::load(&db).await?,
+                key_index: key_index::KeyIndex::load(db.as_ref()).await?,
                 rows,
-                logical_bytes: maintenance::count_logical_size(&db).await?,
+                logical_bytes: maintenance::count_logical_size(db.as_ref()).await?,
                 write_batches: 0,
                 alarms,
                 auth: Arc::new(auth),
                 db: Arc::clone(&db),
                 applied,
+                applied_term,
+                entry_term: applied_term,
                 durable_applied: applied,
                 revision,
                 compact_revision,
@@ -325,12 +338,23 @@ impl StateMachine {
         Ok(state)
     }
 
+    /// The applied state that apply and the apply owner read. Writes go to `db`.
+    pub(crate) fn applied_state(&self) -> &impl StateRead {
+        self.db.as_ref()
+    }
+
+    /// Mark `index` applied in `batch`, with the term of its entry from `entry_term`.
+    fn mark_applied(&self, batch: &mut WriteBatch, index: u64) {
+        mark_applied(batch, index, self.entry_term);
+    }
+
     async fn write_batch(&mut self, batch: WriteBatch, index: u64) -> Result<()> {
         let size = batch
-            .logical_size(&self.db, &self.key_index, self.logical_bytes)
+            .logical_size(self.applied_state(), &self.key_index, self.logical_bytes)
             .await?;
         let size = self.store_batch(batch, index, size).await?;
         self.logical_bytes = size;
+        self.applied_term = self.entry_term;
         Ok(())
     }
 
@@ -340,7 +364,11 @@ impl StateMachine {
         let mut size = size;
         if members_saved && !batch.contains(crate::cluster::KEY) {
             let value = serde_json::to_vec(self.members.as_ref())?;
-            let old = self.db.get(crate::cluster::KEY).await?.map(|v| v.len());
+            let old = self
+                .applied_state()
+                .get(crate::cluster::KEY)
+                .await?
+                .map(|v| v.len());
             size = crate::batch::row_size_after(
                 size,
                 crate::cluster::KEY.len(),
@@ -399,14 +427,30 @@ impl StateMachine {
     }
 }
 
-async fn read_revision(db: &Db) -> Result<i64> {
+/// Store the apply position: the index and the Raft term of the last entry of a batch.
+fn mark_applied(batch: &mut WriteBatch, index: u64, term: u64) {
+    batch.put(APPLIED, index.to_be_bytes());
+    batch.put(APPLIED_TERM, term.to_be_bytes());
+}
+
+/// Read the term of the applied entry. A database without the row reports zero.
+async fn read_applied_term(db: &impl StateRead) -> Result<u64> {
+    Ok(match db.get(APPLIED_TERM).await? {
+        Some(bytes) => {
+            u64::from_be_bytes(bytes.as_ref().try_into().context("invalid applied term")?)
+        }
+        None => 0,
+    })
+}
+
+async fn read_revision(db: &impl StateRead) -> Result<i64> {
     Ok(match db.get(mvcc::REVISION).await? {
         Some(bytes) => i64::from_be_bytes(bytes.as_ref().try_into().context("invalid revision")?),
         None => 1,
     })
 }
 
-async fn read_compact_revision(db: &Db) -> Result<i64> {
+async fn read_compact_revision(db: &impl StateRead) -> Result<i64> {
     Ok(match db.get(mvcc::COMPACT_REVISION).await? {
         Some(bytes) => i64::from_be_bytes(
             bytes
@@ -416,6 +460,11 @@ async fn read_compact_revision(db: &Db) -> Result<i64> {
         ),
         None => -1,
     })
+}
+
+/// Return true when a native snapshot or backup can hold `key`.
+fn snapshot_key(key: &[u8]) -> bool {
+    key.starts_with(DATA) || key.starts_with(b"etcd/") || key == APPLIED || key == APPLIED_TERM
 }
 
 fn data_key(key: &str) -> Vec<u8> {

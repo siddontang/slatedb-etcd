@@ -3,7 +3,7 @@ use super::*;
 /// Pin data and authorization metadata at one applied position.
 pub(crate) struct ReadView {
     metrics: Arc<crate::metrics::StateMeters>,
-    pub snapshot: Arc<slatedb::DbSnapshot>,
+    snapshot: Arc<slatedb::DbSnapshot>,
     /// Keep the database open while the view reads it. A snapshot install replaces it.
     _database: Arc<Db>,
     rows: Arc<super::rows::RowCache>,
@@ -37,6 +37,11 @@ impl StateMachine {
 }
 
 impl ReadView {
+    /// The pinned state. Watch catch-up reads it beside the view's revisions.
+    pub(crate) fn state(&self) -> &impl StateRead {
+        self.snapshot.as_ref()
+    }
+
     pub async fn read(
         &self,
         request: &RequestOp,
@@ -66,7 +71,7 @@ impl ReadView {
         .then(std::time::Instant::now);
         let result = match budget {
             Some(budget) => match mvcc::read_snapshot_within(
-                &self.snapshot,
+                self.state(),
                 &self.rows,
                 self.revision,
                 self.compact_revision,
@@ -82,7 +87,7 @@ impl ReadView {
             },
             None => {
                 mvcc::read_snapshot(
-                    &self.snapshot,
+                    self.state(),
                     &self.rows,
                     self.revision,
                     self.compact_revision,

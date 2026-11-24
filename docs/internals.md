@@ -24,7 +24,8 @@ The leader returns a computed result after quorum commit. Followers apply the sa
 An ordinary Put can use the bounded preparation path in the [Raft design](architecture.md).
 Consecutive ordinary puts can share one SlateDB write.
 Each request retains its own etcd revision, Watch events, quota result, and response.
-The batch stores its final `meta/applied` marker with all mutations.
+The batch stores its final `meta/applied` marker and `meta/applied-term` with all mutations.
+The term is the Raft term of the last entry in the batch.
 The SlateDB sequence is that final Raft index. Even an empty Raft entry advances the apply marker.
 This index is not an etcd revision.
 

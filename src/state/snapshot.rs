@@ -26,7 +26,7 @@ impl StateMachine {
             let count_offset = data.len();
             crate::codec::write(&mut data, &0_u64)?;
             let mut count = 0_u64;
-            let mut iterator = snapshot.scan_prefix(b"", ..).await?;
+            let mut iterator = snapshot.scan_under(b"", &Default::default()).await?;
             while let Some(row) = iterator.next().await? {
                 if row.key.as_ref() != crate::cluster::KEY {
                     crate::codec::write(&mut data, &(row.key, row.value))?;
@@ -67,19 +67,23 @@ impl StateMachine {
             "invalid snapshot metadata"
         );
         let mut batch = WriteBatch::new();
-        let mut iterator = self.db.scan_prefix(b"", ..).await?;
-        while let Some(row) = iterator.next().await? {
+        let mut rows = self
+            .applied_state()
+            .scan_under(b"", &Default::default())
+            .await?;
+        while let Some(row) = rows.next().await? {
             batch.delete(row.key);
         }
+        drop(rows);
         for (key, value) in data.rows {
-            ensure!(
-                key.starts_with(DATA) || key.starts_with(b"etcd/") || key == APPLIED,
-                "invalid snapshot key"
-            );
+            ensure!(snapshot_key(&key), "invalid snapshot key");
             batch.put(key, value);
         }
         crate::failpoint::hit("snapshot-before-install");
-        batch.put(APPLIED, index.to_be_bytes());
+        // The snapshot metadata holds the term of the entry at `index`. Older images and
+        // backups have no term row, so the metadata replaces any stored value.
+        self.entry_term = snapshot.get_metadata().term;
+        self.mark_applied(&mut batch, index);
         self.write_batch(batch, index).await?;
         crate::failpoint::hit("snapshot-after-install-write");
         // The durable Raft snapshot lets a restart repeat this atomic replacement.
@@ -87,20 +91,20 @@ impl StateMachine {
         crate::failpoint::hit("snapshot-after-install-flush");
         self.applied = index;
         self.durable_applied = index;
-        self.revision = read_revision(&self.db).await?;
-        self.compact_revision = read_compact_revision(&self.db).await?;
-        self.compaction = compaction::load(&self.db).await?;
+        self.revision = read_revision(self.applied_state()).await?;
+        self.compact_revision = read_compact_revision(self.applied_state()).await?;
+        self.compaction = compaction::load(self.applied_state()).await?;
         self.plan_compaction();
-        self.leases = Arc::new(crate::lease::load(&self.db).await?);
-        self.alarms = match self.db.get(crate::maintenance::ALARMS).await? {
+        self.leases = Arc::new(crate::lease::load(self.applied_state()).await?);
+        self.alarms = match self.applied_state().get(crate::maintenance::ALARMS).await? {
             Some(data) => serde_json::from_slice(&data)?,
             None => vec![],
         };
-        self.members = Arc::new(match self.db.get(crate::cluster::KEY).await? {
+        self.members = Arc::new(match self.applied_state().get(crate::cluster::KEY).await? {
             Some(data) => serde_json::from_slice(&data)?,
             None => crate::cluster::Store::default(),
         });
-        self.auth = Arc::new(match self.db.get(crate::auth::KEY).await? {
+        self.auth = Arc::new(match self.applied_state().get(crate::auth::KEY).await? {
             Some(data) => serde_json::from_slice(&data)?,
             None => crate::auth::Store::default(),
         });

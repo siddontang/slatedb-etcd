@@ -7,7 +7,9 @@ use crate::proto::etcdserverpb::*;
 async fn check(state: &StateMachine) {
     assert_eq!(
         state.logical_size(),
-        maintenance::count_logical_size(&state.db).await.unwrap()
+        maintenance::count_logical_size(state.db.as_ref())
+            .await
+            .unwrap()
     );
     assert!(state.key_index.matches(&state.db).await.unwrap());
 }

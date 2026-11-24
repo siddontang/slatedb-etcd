@@ -227,13 +227,13 @@ pub(super) fn record_changes(
 }
 
 /// The applied current state that an ordinary Put reads on the apply worker.
-pub(crate) struct CurrentView<'a> {
-    pub db: &'a Db,
+pub(crate) struct CurrentView<'a, R> {
+    pub db: &'a R,
     pub rows: &'a crate::state::current::CurrentRows,
     pub index: &'a crate::state::key_index::KeyIndex,
 }
 
-impl CurrentView<'_> {
+impl<R: StateRead> CurrentView<'_, R> {
     async fn value(&self, key: &[u8]) -> KvResult<Option<bytes::Bytes>> {
         match self.rows.get(key) {
             Some(value) => Ok(Some(value)),
@@ -293,7 +293,7 @@ pub(super) fn prev_event(old: Option<&Old>, revision: i64) -> KvResult<(Option<K
 /// The key index supplies the old revision metadata and row length. The old value is read only
 /// when the request returns it as prev_kv.
 pub(crate) async fn prepare_put(
-    view: &CurrentView<'_>,
+    view: &CurrentView<'_, impl StateRead>,
     revision: i64,
     request: &RequestOp,
     batch: &mut WriteBatch,
@@ -355,7 +355,7 @@ thread_local! {
 /// `None` means that the chosen branch is empty. The caller then uses the general evaluator.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_txn_puts(
-    view: &CurrentView<'_>,
+    view: &CurrentView<'_, impl StateRead>,
     revision: i64,
     compact_revision: i64,
     request: &RequestOp,
@@ -430,7 +430,7 @@ pub(crate) async fn prepare_txn_puts(
 
 /// Evaluate transaction compares on the applied state plus the earlier group writes.
 async fn compares(
-    current: &CurrentView<'_>,
+    current: &CurrentView<'_, impl StateRead>,
     previous: &WriteBatch,
     revision: i64,
     compact_revision: i64,
@@ -473,7 +473,7 @@ async fn compares(
 /// `values_in_history`, so its history row at `next` must be the final version of the key.
 #[allow(clippy::too_many_arguments)]
 async fn put_rows(
-    view: &CurrentView<'_>,
+    view: &CurrentView<'_, impl StateRead>,
     next: i64,
     sub: usize,
     values_in_history: bool,
@@ -564,7 +564,7 @@ async fn put_rows(
 /// Count the revision row. It has a fixed width after its first write, so only revision one
 /// changes the logical size. The group writes the final value.
 async fn put_revision_row(
-    view: &CurrentView<'_>,
+    view: &CurrentView<'_, impl StateRead>,
     revision: i64,
     batch: &mut WriteBatch,
     size: &mut u64,
@@ -608,7 +608,7 @@ mod tests {
             })),
         };
         let view = CurrentView {
-            db: &state.db,
+            db: state.db.as_ref(),
             rows: &state.current,
             index: &state.key_index,
         };

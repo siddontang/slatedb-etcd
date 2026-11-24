@@ -14,9 +14,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result};
 use prost::Message;
-use slatedb::Db;
 
 use crate::mvcc::CURRENT;
+use crate::state::{StateRead, StateScan};
 
 /// The revision metadata of one current key.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -79,9 +79,9 @@ pub(crate) struct KeyIndex {
 
 impl KeyIndex {
     /// Scan all current rows once.
-    pub(crate) async fn load(db: &Db) -> Result<Self> {
+    pub(crate) async fn load(db: &impl StateRead) -> Result<Self> {
         let mut index = Self::default();
-        let mut scan = db.scan_prefix(CURRENT, ..).await?;
+        let mut scan = db.scan_under(CURRENT, &Default::default()).await?;
         while let Some(row) = scan.next().await? {
             index.publish(&row.key, Some(&row.value))?;
         }
@@ -146,7 +146,7 @@ impl KeyIndex {
 
     /// Compare the index with a full current-row scan.
     #[cfg(test)]
-    pub(crate) async fn matches(&self, db: &Db) -> Result<bool> {
+    pub(crate) async fn matches(&self, db: &slatedb::Db) -> Result<bool> {
         let fresh = Self::load(db).await?;
         let latest = self.pin(u64::MAX);
         let ordered = self.order.keys.read().unwrap();
@@ -289,6 +289,11 @@ pub(crate) struct KeyPin {
 }
 
 impl KeyPin {
+    /// The SlateDB sequence number of the pinned view.
+    pub(crate) fn seq(&self) -> u64 {
+        self.seq
+    }
+
     /// Count the current keys in `[begin, end)` at the pinned sequence. `end == [0]` means no
     /// upper bound. The interval follows `mvcc::current_bounds`.
     pub(crate) fn count(&self, begin: &[u8], end: &[u8]) -> i64 {

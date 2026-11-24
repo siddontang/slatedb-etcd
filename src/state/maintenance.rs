@@ -39,7 +39,10 @@ impl StateMachine {
             Command::HashAll => {
                 let _timer = self.metrics.hash.start_timer();
                 let mut hash = 0;
-                let mut rows = self.db.scan_prefix(b"etcd/", ..).await?;
+                let mut rows = self
+                    .applied_state()
+                    .scan_under(b"etcd/", &Default::default())
+                    .await?;
                 while let Some(row) = rows.next().await? {
                     hash = crc32c::crc32c_append(hash, &row.key);
                     hash = crc32c::crc32c_append(hash, &row.value);
@@ -121,7 +124,7 @@ impl StateMachine {
             )),
         });
         batch.put(ALARMS, serde_json::to_vec(&alarms)?);
-        batch.put(APPLIED, index.to_be_bytes());
+        self.mark_applied(&mut batch, index);
         self.write_batch(batch, index).await?;
         self.applied = index;
         self.alarms = alarms;
@@ -129,7 +132,7 @@ impl StateMachine {
     }
 
     pub(super) async fn hash_cache(&self) -> Result<Vec<Value>> {
-        match self.db.get(b"etcd/hash-cache").await? {
+        match self.applied_state().get(b"etcd/hash-cache").await? {
             Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
             None => Ok(vec![]),
         }
@@ -233,7 +236,7 @@ impl StateMachine {
         let mut latest = std::collections::HashMap::new();
         let mut survivors = std::collections::HashMap::new();
         if compact >= 0 {
-            let mut scan = hash_rows(&self.db, revision).await?;
+            let mut scan = hash_rows(self.applied_state(), revision).await?;
             while let Some(row) = scan.next().await.map_err(KvError::storage)? {
                 let user_key = hash_record_key(&row.value).map_err(KvError::storage)?;
                 if pending && hash_main(&row.key)? <= compact {
@@ -271,7 +274,7 @@ impl StateMachine {
         let mut hash = crc32c::crc32c(b"key");
         // etcd includes obsolete records when the retention set is empty.
         let mut empty_hash = Some(hash).filter(|_| self.compact_revision >= 0);
-        let mut rows = hash_rows(&self.db, revision).await?;
+        let mut rows = hash_rows(self.applied_state(), revision).await?;
         while let Some(row) = rows.next().await.map_err(KvError::storage)? {
             let key = &row.key[HASH.len()..];
             let main = i64::from_be_bytes(key[..8].try_into().map_err(KvError::storage)?);
@@ -435,18 +438,22 @@ fn hash_main(key: &[u8]) -> std::result::Result<i64, KvError> {
         .ok_or_else(|| KvError::storage("invalid hash key"))
 }
 
-async fn hash_rows(db: &Db, revision: i64) -> std::result::Result<slatedb::DbIterator, KvError> {
-    db.scan_with_options(
-        HASH.to_vec()..=hash_key(revision, i64::MAX, true),
-        &mvcc::maintenance_scan(),
-    )
-    .await
-    .map_err(KvError::storage)
+/// Scan the hash records through `revision`.
+async fn hash_rows<R: StateRead>(
+    db: &R,
+    revision: i64,
+) -> std::result::Result<R::Scan<'_>, KvError> {
+    // The first key after the last record of `revision` ends the range.
+    let mut end = hash_key(revision, i64::MAX, true);
+    end.push(0);
+    db.scan_range(HASH.to_vec()..end, &mvcc::maintenance_scan())
+        .await
+        .map_err(KvError::storage)
 }
 
 // Rebuild derived accounting when opening stored state.
-pub(crate) async fn count_logical_size(db: &Db) -> Result<u64> {
-    let mut scan = db.scan_prefix(b"etcd/", ..).await?;
+pub(crate) async fn count_logical_size(db: &impl StateRead) -> Result<u64> {
+    let mut scan = db.scan_under(b"etcd/", &Default::default()).await?;
     let mut size = 0_u64;
     while let Some(row) = scan.next().await? {
         size = size

@@ -90,7 +90,7 @@ impl Progress {
     }
 }
 
-pub(crate) async fn load(db: &Db) -> Result<Option<Progress>> {
+pub(crate) async fn load(db: &impl StateRead) -> Result<Option<Progress>> {
     Ok(match db.get(PENDING).await? {
         Some(bytes) => Some(serde_json::from_slice(&bytes).context("invalid compaction progress")?),
         None => None,
@@ -208,7 +208,7 @@ impl Planner {
             // Publish also after a failure or panic, so the leader proposes the step and reads
             // it inline.
             let _ready = Ready(ready, generation);
-            read_step(&db, input).await
+            read_step(db.as_ref(), input).await
         });
         self.plan = Some(Plan {
             input: progress.clone(),
@@ -249,7 +249,7 @@ impl Drop for Ready {
     }
 }
 
-async fn read_step(db: &Db, mut progress: Progress) -> Result<Step> {
+async fn read_step(db: &impl StateRead, mut progress: Progress) -> Result<Step> {
     let mut batch = WriteBatch::new();
     let finished = Reader { db }.work(&mut progress, &mut batch).await?;
     Ok(Step {
@@ -260,8 +260,8 @@ async fn read_step(db: &Db, mut progress: Progress) -> Result<Step> {
 }
 
 /// Read-only compaction work. It reads storage and records deletes in the step batch.
-struct Reader<'a> {
-    db: &'a Db,
+struct Reader<'a, R> {
+    db: &'a R,
 }
 
 impl StateMachine {
@@ -322,7 +322,7 @@ impl StateMachine {
             batch.put(PENDING, serde_json::to_vec(&progress)?);
         }
         crate::failpoint::hit("compact-before-apply");
-        batch.put(APPLIED, index.to_be_bytes());
+        self.mark_applied(&mut batch, index);
         self.write_batch(batch, index).await?;
         self.applied = index;
         if result.is_ok() || retry {
@@ -351,7 +351,7 @@ impl StateMachine {
         if let Some(current) = self.compaction.clone() {
             let step = match self.compaction_plan.take(&current).await {
                 Some(step) => step,
-                None => read_step(&self.db, current).await?,
+                None => read_step(self.applied_state(), current).await?,
             };
             batch = step.batch;
             finished = step.finished;
@@ -363,7 +363,7 @@ impl StateMachine {
             progress = Some(step.progress);
         }
         crate::failpoint::hit("compact-step-before-apply");
-        batch.put(APPLIED, index.to_be_bytes());
+        self.mark_applied(&mut batch, index);
         self.write_batch(batch, index).await?;
         self.applied = index;
         self.compaction = progress.filter(|state| !state.targets.is_empty());
@@ -378,7 +378,7 @@ impl StateMachine {
     }
 }
 
-impl Reader<'_> {
+impl<R: StateRead> Reader<'_, R> {
     /// Return true when at least one physical target is complete.
     async fn work(&self, state: &mut Progress, batch: &mut WriteBatch) -> Result<bool> {
         let mut budget = STEP_COST;
@@ -464,7 +464,7 @@ impl Reader<'_> {
         let end = revision_bound(HASH, target.revision);
         let mut scan = self
             .db
-            .scan_with_options(Self::start(state, HASH)..end, &scan_options())
+            .scan_range(Self::start(state, HASH)..end, &scan_options())
             .await?;
         while let Some(row) = scan.next().await? {
             if *budget == 0 {
@@ -499,7 +499,7 @@ impl Reader<'_> {
         let end = revision_bound(HASH, target.previous);
         let mut scan = self
             .db
-            .scan_with_options(Self::start(state, HASH)..end, &scan_options())
+            .scan_range(Self::start(state, HASH)..end, &scan_options())
             .await?;
         while let Some(row) = scan.next().await? {
             if *budget == 0 {
@@ -524,7 +524,7 @@ impl Reader<'_> {
         let start = Self::start(state, crate::watch::EVENTS);
         let mut scan = self
             .db
-            .scan_with_options(start..crate::watch::key(target.revision), &scan_options())
+            .scan_range(start..crate::watch::key(target.revision), &scan_options())
             .await?;
         while let Some(row) = scan.next().await? {
             if *budget == 0 {
@@ -548,7 +548,7 @@ impl Reader<'_> {
         *end.last_mut().unwrap() += 1;
         let mut scan = self
             .db
-            .scan_with_options(Self::start(state, mvcc::HISTORY)..end, &scan_options())
+            .scan_range(Self::start(state, mvcc::HISTORY)..end, &scan_options())
             .await?;
         let mut group: Vec<HistoryRow> = vec![];
         let mut prefix: Option<Bytes> = None;
@@ -640,7 +640,7 @@ impl Reader<'_> {
         let mut prefix = HASH.to_vec();
         prefix.extend_from_slice(&version.revision.to_be_bytes());
         prefix.push(b'_');
-        let mut scan = self.db.scan_prefix(&prefix, ..).await?;
+        let mut scan = self.db.scan_under(&prefix, &Default::default()).await?;
         while let Some(row) = scan.next().await? {
             if (row.key.len() == HASH.len() + 18) == version.tombstone && matches(&row.value)? {
                 batch.delete_known(row.key, row.value.len());

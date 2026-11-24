@@ -73,6 +73,7 @@ SlateDB uses these logical keys:
 | Prefix or key | Content |
 | --- | --- |
 | `meta/applied` | Last applied Raft index |
+| `meta/applied-term` | Raft term of the entry at `meta/applied`. Older databases have no row |
 | `data/` | Diagnostic JSON keyspace |
 | `etcd/current/` | Current values and key metadata |
 | `etcd/history/` | Historical versions and tombstones |

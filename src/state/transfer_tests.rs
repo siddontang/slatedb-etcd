@@ -5,7 +5,7 @@ use slatedb::object_store::path::Path;
 use slatedb::object_store::ObjectStoreExt;
 
 use super::*;
-use crate::state::StateMachine;
+use crate::state::{StateMachine, StateRead};
 use crate::{Command, Operation};
 
 async fn put(state: &mut StateMachine, index: u64, key: &str, value: &str) {
@@ -54,6 +54,7 @@ async fn a_follower_installs_copied_checkpoint_objects() {
     let leader_dir = tempfile::tempdir().unwrap();
     let follower_dir = tempfile::tempdir().unwrap();
     let mut leader = open(leader_dir.path(), 1).await;
+    leader.entry_term = 7;
     for index in 1..=50 {
         put(
             &mut leader,
@@ -79,7 +80,8 @@ async fn a_follower_installs_copied_checkpoint_objects() {
     snapshot.mut_metadata().index = 50;
     snapshot.data = data;
     follower.install_snapshot(&snapshot).await.unwrap();
-    assert_eq!(follower.applied, 50);
+    // The copied checkpoint holds the term row of its last entry.
+    assert_eq!((follower.applied, follower.applied_term), (50, 7));
     assert_eq!(follower.location.root(), "state-1");
     assert_eq!(
         follower.local_value("key-1").await.unwrap().as_deref(),
@@ -353,7 +355,7 @@ async fn a_read_view_keeps_the_replaced_database_open() {
     // The retire task waits for the view. The pinned snapshot stays readable.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert!(view
-        .snapshot
+        .state()
         .get(crate::state::APPLIED)
         .await
         .unwrap()

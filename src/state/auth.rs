@@ -14,7 +14,7 @@ impl StateMachine {
         if result.is_ok() {
             batch.put(crate::auth::KEY, serde_json::to_vec(&next)?);
         }
-        batch.put(APPLIED, index.to_be_bytes());
+        self.mark_applied(&mut batch, index);
         self.write_batch(batch, index).await?;
         self.applied = index;
         if result.is_ok() {
@@ -55,8 +55,8 @@ impl StateMachine {
                 };
                 if self.auth.enabled {
                     let mut scan = self
-                        .db
-                        .scan_prefix(b"etcd/current/", ..)
+                        .applied_state()
+                        .scan_under(mvcc::CURRENT, &Default::default())
                         .await
                         .map_err(mvcc::KvError::storage)?;
                     use prost::Message;
@@ -99,8 +99,8 @@ impl StateMachine {
         if self.auth.enabled && !leases.is_empty() {
             use prost::Message;
             let mut scan = self
-                .db
-                .scan_prefix(b"etcd/current/", ..)
+                .applied_state()
+                .scan_under(mvcc::CURRENT, &Default::default())
                 .await
                 .map_err(mvcc::KvError::storage)?;
             while let Some(row) = scan.next().await.map_err(mvcc::KvError::storage)? {
