@@ -61,6 +61,8 @@ pub enum Event {
     Auth(crate::auth::Command, Response),
     AuthLookup(String, Response),
     Maintenance(crate::maintenance::Command, Response),
+    /// Stream a native backup of the applied state. See `state::backup`.
+    Snapshot(oneshot::Sender<Result<crate::state::backup::Stream, crate::mvcc::KvError>>),
     Cluster(crate::cluster::Command, Response),
     SubscribeForwarding(oneshot::Sender<ForwardView>),
     Propose(Request, Response),
@@ -310,6 +312,13 @@ impl Node {
                 "the overlay limit must be positive"
             );
         }
+        ensure!(
+            !options
+                .dir
+                .join(crate::state::backup::RESTORE_MARKER)
+                .exists(),
+            "the data directory holds an interrupted snapshot restore; remove it and restore again"
+        );
         std::fs::create_dir_all(&options.dir)?;
         // Open Raft first. Its exclusive file lock also protects this node's SlateDB directory.
         let mut storage = RaftStorage::open(
@@ -821,6 +830,9 @@ impl Node {
             }
             Event::AuthLookup(name, response) => {
                 self.enqueue_query(Query::AuthLookup(name, response))
+            }
+            Event::Snapshot(response) => {
+                self.enqueue_query(Query::Snapshot(credentials.unwrap_or_default(), response))
             }
             Event::Propose(request, response) => {
                 self.propose(

@@ -17,7 +17,9 @@ use crate::proto::etcdserverpb::{CompactionRequest, CompactionResponse, RequestO
 use crate::{Command, Operation, Reply};
 
 mod auth;
-mod backup;
+pub(crate) mod backup;
+#[cfg(test)]
+mod backup_tests;
 mod checkpoint;
 mod cluster;
 pub(crate) mod compaction;

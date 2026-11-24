@@ -301,9 +301,17 @@ async fn snapshot_import_requires_the_current_format() {
         1,
         "http://127.0.0.1:2380".into(),
     )]));
-    let error =
-        StateMachine::restore_backup(&path, &dir.path().join("restore"), 1, "test", &members)
-            .unwrap_err();
+    let error = StateMachine::restore_backup(
+        &path,
+        &dir.path().join("restore"),
+        1,
+        "test",
+        &members,
+        &crate::object::Config::Local,
+        StateCache::default(),
+    )
+    .await
+    .unwrap_err();
     assert!(error.to_string().contains("unsupported snapshot version"));
     state.close().await.unwrap();
 }

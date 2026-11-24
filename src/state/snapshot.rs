@@ -1,6 +1,7 @@
 use super::*;
 
 impl StateMachine {
+    /// Build a legacy row image in memory. Tests install it to check the legacy format.
     pub async fn snapshot_data(&mut self) -> Result<Vec<u8>> {
         let data = self.snapshot_job()?.await?;
         // Only a replicated export flushes the database. A shared view scan makes nothing durable.

@@ -1429,10 +1429,7 @@ async fn queued_ready_jobs_share_sync_and_keep_the_final_log_suffix() {
 
 #[tokio::test]
 async fn maintenance_flushes_update_durable_apply_metadata() {
-    for command in [
-        crate::maintenance::Command::Snapshot,
-        crate::maintenance::Command::Defragment,
-    ] {
+    for command in [crate::maintenance::Command::Defragment] {
         let dir = tempfile::tempdir().unwrap();
         seed_log(dir.path(), 1);
         let (events, _) = mpsc::channel(256);
@@ -2104,4 +2101,17 @@ async fn a_snapshot_that_raft_skips_releases_its_staging_reservation() {
         Some(true)
     );
     state.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_interrupted_restore_blocks_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(crate::state::backup::RESTORE_MARKER), b"").unwrap();
+    let (events, _) = mpsc::channel(256);
+    let error = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("interrupted snapshot restore"));
+    assert!(!dir.path().join("raft").exists());
 }

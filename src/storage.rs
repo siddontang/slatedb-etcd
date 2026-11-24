@@ -494,6 +494,36 @@ impl RaftStorage {
         Ok(())
     }
 
+    /// Record a restored state at `index` in a new directory, with a snapshot without an image.
+    ///
+    /// The caller must first flush the restored SlateDB state with its apply marker at `index`.
+    /// That state covers the log before `index`, as after `publish_checkpoint` without an image.
+    pub(crate) fn restore(&mut self, index: u64, conf: ConfState) -> Result<()> {
+        ensure!(
+            self.snapshot_index() == 0
+                && self.hard_state == HardState::default()
+                && self.engine.last_index(GROUP).is_none(),
+            "restore requires a new Raft directory"
+        );
+        let mut snapshot = Snapshot::default();
+        snapshot.mut_metadata().index = index;
+        snapshot.mut_metadata().term = 1;
+        snapshot.mut_metadata().set_conf_state(conf);
+        let hard_state = HardState {
+            term: 1,
+            commit: index,
+            ..Default::default()
+        };
+        let mut batch = LogBatch::default();
+        checkpoint::publish_metadata(&snapshot, &mut batch)?;
+        batch.put_value::<ProstCodec, _>(GROUP, HARD_STATE.to_vec(), &hard_state)?;
+        self.engine.write(&mut batch, true)?;
+        self.sync_writes += 1;
+        self.hard_state = hard_state;
+        self.snapshot = snapshot;
+        Ok(())
+    }
+
     /// The identity marker that the state machine sets before it writes format 4 rows.
     pub fn row_marker(&self) -> Arc<RowMarker> {
         Arc::clone(&self.rows)

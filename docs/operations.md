@@ -38,12 +38,14 @@ tmp/bin/slatedb-snapshot --endpoints=http://127.0.0.1:7001 --output /path/native
 
 Use `--cacert`, `--cert`, and `--key` for TLS.
 For password authentication, set `--user` and the `SLATEDB_SNAPSHOT_PASSWORD` environment variable.
-The exporter verifies SHA-256, limits size, and publishes a mode 0600 file without overwriting one.
+The exporter verifies SHA-256 and publishes a mode 0600 file without overwriting one.
+`--max-bytes` rejects a larger snapshot. The default, 0, accepts any size.
+`etcdctl snapshot save` also accepts the native file. It checks the length, not the digest.
 The server returns its native state image and a trailing SHA-256 digest.
 Protect backup files: they contain values, user password hashes, tokens, and lease metadata.
 The native image is not a bbolt database. `etcdutl snapshot restore` cannot restore it.
-`etcdctl snapshot save` can reject its file length because it expects a bbolt page boundary.
-Use the native exporter above, or stream the Snapshot RPC with the official client.
+Older servers did not pad the image, so `etcdctl snapshot save` could reject their file length.
+Use the native exporter above, `etcdctl snapshot save`, or the Snapshot RPC of the official client.
 
 Follow the [native restore steps](administration.md#maintenance-and-storage) for a new cluster.
 Every restored member uses the same backup, a new empty directory, and the same new peer map.
@@ -57,7 +59,7 @@ The older restore rejects the row. Restore such a backup with the newer binary, 
 
 Do not copy a live `objects/` directory as a complete backup.
 Unflushed state can still depend on Raft logs. Native export preserves one applied state boundary.
-Full backup construction uses memory and has a 64 MiB transfer limit.
+Backups stream from a pinned checkpoint with bounded memory and have no size limit.
 
 ## Disk use and quota
 

@@ -547,17 +547,19 @@ async fn a_shared_backup_restores_into_a_replicated_cluster() {
     super::tests::check_format_4(&data);
     let shared_backup = super::tests::backup_bytes(shared_image);
     super::tests::check_format_4_backup(&shared_backup);
+    // A Snapshot RPC in shared mode sends the same image of the pinned view.
+    assert_eq!(super::tests::streamed_backup(&state).await, shared_backup);
     let reference_backup = super::tests::backup_bytes(reference.snapshot_data().await.unwrap());
 
     let restored = {
         let path = dir.path().join("from-shared");
         std::fs::create_dir(&path).unwrap();
-        super::tests::restore(&path, shared_backup).await.0
+        super::tests::restore(&path, shared_backup).await
     };
     let expected = {
         let path = dir.path().join("from-replicated");
         std::fs::create_dir(&path).unwrap();
-        super::tests::restore(&path, reference_backup).await.0
+        super::tests::restore(&path, reference_backup).await
     };
     assert_eq!(rows(&restored, b"").await, rows(&expected, b"").await);
     assert_eq!(restored.logical_size(), expected.logical_size());
@@ -602,7 +604,7 @@ async fn readers_drop_a_logical_size_row() {
     let image = crate::codec::encode(&data).unwrap();
     let path = dir.path().join("restore");
     std::fs::create_dir(&path).unwrap();
-    let (restored, _) = super::tests::restore(&path, super::tests::backup_bytes(image)).await;
+    let restored = super::tests::restore(&path, super::tests::backup_bytes(image)).await;
     assert_eq!(
         restored
             .applied_state()

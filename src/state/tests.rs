@@ -1283,8 +1283,9 @@ pub(super) fn backup_bytes(mut image: Vec<u8>) -> Vec<u8> {
     image
 }
 
-/// Restore `backup` and install its Raft snapshot. Return the restored state.
-pub(super) async fn restore(dir: &std::path::Path, backup: Vec<u8>) -> (StateMachine, Snapshot) {
+/// Restore `backup`, open the restored state, and install the Raft snapshot like startup.
+/// The Raft snapshot records the restored index with term 1 and holds no image.
+pub(super) async fn restore(dir: &std::path::Path, backup: Vec<u8>) -> StateMachine {
     let path = dir.join("backup");
     std::fs::write(&path, backup).unwrap();
     let members = crate::cluster::Store::initial(&std::collections::BTreeMap::from([(
@@ -1292,19 +1293,42 @@ pub(super) async fn restore(dir: &std::path::Path, backup: Vec<u8>) -> (StateMac
         "http://127.0.0.1:2380".into(),
     )]));
     let restore = dir.join("restore");
-    StateMachine::restore_backup(&path, &restore, 1, "test", &members).unwrap();
+    StateMachine::restore_backup(
+        &path,
+        &restore,
+        1,
+        "test",
+        &members,
+        &crate::object::Config::Local,
+        StateCache::default(),
+    )
+    .await
+    .unwrap();
     let snapshot =
         crate::storage::RaftStorage::open(&restore.join("raft"), 1, "test", members.conf().voters)
             .unwrap()
             .recovery_snapshot()
             .clone();
-    let mut restored = StateMachine::open(&restore.join("state")).await.unwrap();
+    assert!(snapshot.data.is_empty());
+    assert_eq!(snapshot.get_metadata().term, 1);
+    let mut restored = StateMachine::open(&restore.join("objects")).await.unwrap();
+    assert_eq!(restored.applied, snapshot.get_metadata().index);
     restored.install_snapshot(&snapshot).await.unwrap();
-    (restored, snapshot)
+    restored
+}
+
+/// Collect a streamed native backup.
+pub(super) async fn streamed_backup(state: &StateMachine) -> Vec<u8> {
+    let mut stream = state.backup().await.unwrap();
+    let mut data = vec![];
+    while let Some(chunk) = stream.chunks.recv().await {
+        data.extend_from_slice(&chunk.unwrap().blob);
+    }
+    data
 }
 
 /// Images and backups keep the format 4 rows, so the previous binary reads them. Install takes
-/// the term from the Raft snapshot metadata, and a restored backup starts at (1, 1).
+/// the term from the Raft snapshot metadata, and a restored backup starts at term 1.
 #[tokio::test]
 async fn images_and_backups_omit_the_term_row() {
     let dir = tempfile::tempdir().unwrap();
@@ -1326,6 +1350,7 @@ async fn images_and_backups_omit_the_term_row() {
     assert_eq!(data.version, crate::SNAPSHOT_FORMAT);
     check_format_4(&data);
     check_format_4_backup(&backup_bytes(image.clone()));
+    check_format_4_backup(&streamed_backup(&source).await);
 
     let mut target = StateMachine::open(&dir.path().join("target"))
         .await
@@ -1343,9 +1368,8 @@ async fn images_and_backups_omit_the_term_row() {
     assert_eq!((target.applied, target.applied_term), (2, 6));
     target.close().await.unwrap();
 
-    let (restored, snapshot) = restore(dir.path(), backup_bytes(image)).await;
-    check_format_4(&crate::codec::decode(&snapshot.data).unwrap());
-    assert_eq!((restored.applied, restored.applied_term), (1, 1));
+    let restored = restore(dir.path(), backup_bytes(image)).await;
+    assert_eq!(restored.applied_term, 1);
     assert_eq!(stored_term(&restored).await, Some(1));
     restored.close().await.unwrap();
     source.close().await.unwrap();
@@ -1386,9 +1410,8 @@ async fn images_and_backups_from_an_older_exporter_may_hold_the_term_row() {
     );
     target.close().await.unwrap();
 
-    let (restored, snapshot) = restore(dir.path(), backup_bytes(image)).await;
-    check_format_4(&crate::codec::decode(&snapshot.data).unwrap());
-    assert_eq!((restored.applied, restored.applied_term), (1, 1));
+    let restored = restore(dir.path(), backup_bytes(image)).await;
+    assert_eq!(restored.applied_term, 1);
     assert_eq!(stored_term(&restored).await, Some(1));
     restored.close().await.unwrap();
     source.close().await.unwrap();

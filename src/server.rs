@@ -270,7 +270,10 @@ impl Server {
                 config.id,
                 &config.cluster_id,
                 &members,
-            )?;
+                &config.object_store,
+                config.state_cache,
+            )
+            .await?;
         }
         // Snapshot restore must see the original data directory before AutoTLS creates fixtures.
         if client_auto {

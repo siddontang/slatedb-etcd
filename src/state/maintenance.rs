@@ -59,18 +59,6 @@ impl StateMachine {
                 .await
                 .map_err(KvError::storage)
                 .map(|()| json!({"header": mvcc::header(self.revision)})),
-            Command::Snapshot => {
-                let _timer = self.metrics.snapshot.start_timer();
-                let bytes = self.snapshot_data().await?;
-                if bytes.len() + 32 > 64 * 1024 * 1024 {
-                    Err(KvError::new(
-                        Code::ResourceExhausted,
-                        "native snapshot exceeds 64 MiB",
-                    ))
-                } else {
-                    Ok(json!({"header": mvcc::header(self.revision), "blob": bytes}))
-                }
-            }
             _ => Err(KvError::new(
                 Code::InvalidArgument,
                 "invalid local maintenance operation",

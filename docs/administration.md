@@ -92,8 +92,9 @@ The deprecated Hash RPC hashes native records. Its result cannot be compared wit
 hash.
 
 Snapshot streams the native state image with a trailing SHA-256 digest.
-Use the [native export tool](operations.md#backups-and-restoration) to save it.
-`etcdctl snapshot save` expects bbolt page alignment and can reject this native image.
+Save it with `etcdctl snapshot save` or the
+[native export tool](operations.md#backups-and-restoration).
+The server pads the membership row with JSON spaces, so the file length passes the etcdctl check.
 It includes auth, membership, alarms, leases, and MVCC metadata.
 Earlier Raft recovery snapshots used this format. Current ones use checkpoint descriptors.
 It is not an etcd bbolt backup and cannot be restored with `etcdutl`.
@@ -105,8 +106,17 @@ The restore path verifies the checksum, replaces membership, and invalidates old
 It retains KV revisions, compaction, leases, users, roles, and alarm types.
 Remove `--restore-snapshot` when restarting the restored cluster. Existing directories are never
 replaced. A damaged checksum stops restoration before any data directory is created.
-The server builds the complete snapshot in memory. Native backups have a 64 MiB limit.
-Peer snapshots copy SlateDB objects and have no such limit.
+The member pins its applied state in a SlateDB checkpoint and streams the image from it.
+Writes continue while the stream runs and do not reach the image.
+The server holds a few 64 KiB messages, not the image, so backups have no size limit.
+The server reads the checkpoint twice: first to count the rows, then to send them.
+The checkpoint lives 10 minutes; a running stream renews it every minute and deletes it at the end.
+Restore checks the file in one pass and writes the rows in 4 MiB batches in a second pass.
+It also holds only a few rows in memory. The restored Raft index is the copied row count plus one.
+An interrupted restore leaves a `restore-incomplete` file, and startup rejects that directory.
+Remove the directory and restore again.
+In [shared state mode](shared-state.md) the member still builds the image of its pinned view
+in memory, up to 64 MiB, and sends it in the same messages.
 
 Downgrade authenticates the administrator and returns Unimplemented.
 The SlateDB format cannot run an older etcd binary. No rolling binary downgrade is claimed.
