@@ -8,6 +8,7 @@ pub mod api;
 pub mod auth;
 pub mod cluster;
 mod failpoint;
+pub mod fdlimit;
 pub mod grpc;
 pub mod lease;
 pub mod maintenance;

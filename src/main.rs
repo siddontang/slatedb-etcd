@@ -194,11 +194,30 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    // Raise the limit before any thread starts, so every thread sees it.
+    let nofile = slatedb_etcd::fdlimit::raise();
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(args.runtime_workers.unwrap_or_else(default_workers).get())
         .enable_all()
         .build()?
-        .block_on(run(args))
+        .block_on(run(args, nofile))
+}
+
+fn log_nofile(nofile: std::io::Result<slatedb_etcd::fdlimit::Limit>) {
+    match nofile {
+        Ok(limit) if limit.soft < slatedb_etcd::fdlimit::LOW => tracing::warn!(
+            soft = limit.soft,
+            hard = limit.hard,
+            "Open file limit is low; raise the hard RLIMIT_NOFILE to avoid EMFILE under load"
+        ),
+        Ok(limit) => tracing::info!(
+            before = limit.before,
+            soft = limit.soft,
+            hard = limit.hard,
+            "Open file limit"
+        ),
+        Err(error) => tracing::warn!(%error, "Cannot read or raise the open file limit"),
+    }
 }
 
 /// Linux derives this from `sched_getaffinity` and the cgroup CPU quota. Two remains the fallback.
@@ -206,13 +225,14 @@ fn default_workers() -> std::num::NonZeroUsize {
     std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::new(2).unwrap())
 }
 
-async fn run(args: Args) -> Result<()> {
+async fn run(args: Args, nofile: std::io::Result<slatedb_etcd::fdlimit::Limit>) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_writer(std::io::stderr)
         .init();
+    log_nofile(nofile);
     let config = ServerConfig {
         id: args.id,
         cluster_id: args.cluster_id,
