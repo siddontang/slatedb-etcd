@@ -65,8 +65,9 @@ def eventually(check, description, timeout=30):
 
 
 class Cluster:
-    def __init__(self, binary, root, snapshot_every):
+    def __init__(self, binary, root, snapshot_every, extra=()):
         self.binary, self.root, self.snapshot_every = binary, root, snapshot_every
+        self.extra = list(extra)
         sockets = [socket.socket() for _ in range(3)]
         for sock in sockets:
             sock.bind(("127.0.0.1", 0))
@@ -82,6 +83,7 @@ class Cluster:
         command = [str(self.binary), "--id", str(node), "--listen",
                    f"127.0.0.1:{self.ports[node]}", "--dir", str(self.root / f"node-{node}"),
                    "--cluster-id", self.cluster_id, "--snapshot-every", str(self.snapshot_every)]
+        command.extend(self.extra)
         for peer, port in self.ports.items():
             command.extend(["--peer", f"{peer}=127.0.0.1:{port}"])
         env = dict(os.environ, RUST_LOG="slatedb_etcd=info,slatedb=warn", RUST_BACKTRACE="1")
@@ -356,7 +358,9 @@ def main():
     assert args.requests > 0 and all(c > 0 for c in args.concurrency)
     root = Path(tempfile.mkdtemp(prefix="slatedb-raft-poc-"))
     print(f"Run directory: {root}", flush=True)
-    cluster = Cluster(args.binary.resolve(), root, args.snapshot_every)
+    # In tests, small log files let the log truncation check reclaim whole files.
+    extra = ["--log-file-bytes", str(256 * 1024)] if args.mode == "test" else []
+    cluster = Cluster(args.binary.resolve(), root, args.snapshot_every, extra)
     report = {"mode": args.mode, "host": platform.platform(), "machine": platform.machine(),
               "created_at": datetime.now(timezone.utc).isoformat(), "logical_cpus": os.cpu_count(),
               "binary_sha256": hashlib.sha256(cluster.binary.read_bytes()).hexdigest(),

@@ -18,6 +18,7 @@ fn options(dir: &std::path::Path) -> NodeOptions {
         peers: (1..=3).map(|id| (id, format!("127.0.0.1:{id}"))).collect(),
         snapshot_every: 0,
         snapshot_min_bytes: 0,
+        log_file_bytes: 256 * 1024,
         log_memory: LogMemory::default(),
         state_cache: Default::default(),
     }

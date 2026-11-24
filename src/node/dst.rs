@@ -150,6 +150,7 @@ impl Simulation {
                 peers: (1..=3).map(|n| (n, format!("127.0.0.1:{n}"))).collect(),
                 snapshot_every: 0,
                 snapshot_min_bytes: 0,
+                log_file_bytes: 256 * 1024,
                 log_memory: LogMemory {
                     cache_bytes: 1024,
                     ..LogMemory::default()

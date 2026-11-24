@@ -110,6 +110,8 @@ pub struct NodeOptions {
     /// Automatic log truncation also waits for this many appended log bytes. Each truncation
     /// flushes SlateDB with synced writes, so small flushes cost more than the log they free.
     pub snapshot_min_bytes: u64,
+    /// Size of one Raft log file. Truncation frees disk space one whole file at a time.
+    pub log_file_bytes: u64,
     pub log_memory: LogMemory,
     pub state_cache: crate::state::StateCache,
     pub quota_bytes: i64,
@@ -296,7 +298,7 @@ impl Node {
         }
         std::fs::create_dir_all(&options.dir)?;
         // Open Raft first. Its exclusive file lock also protects this node's SlateDB directory.
-        let mut storage = RaftStorage::open(
+        let mut storage = RaftStorage::open_with_file_bytes(
             &options.dir.join("raft"),
             options.id,
             &options.cluster_id,
@@ -305,6 +307,7 @@ impl Node {
             } else {
                 options.peers.keys().copied().collect()
             },
+            options.log_file_bytes,
         )?;
         let mut state = options
             .object_store
