@@ -50,6 +50,9 @@ struct Stream {
     /// Watchers that store their start revision.
     pinned: BTreeSet<i64>,
     next_id: i64,
+    /// Runs once after the next journal scan, before the responses take a new view.
+    #[cfg(test)]
+    after_scan: Option<Box<dyn FnOnce() + Send>>,
 }
 
 fn unavailable() -> Status {
@@ -92,6 +95,8 @@ impl Stream {
             ranges: BTreeSet::new(),
             pinned: BTreeSet::new(),
             next_id: 0,
+            #[cfg(test)]
+            after_scan: None,
         }
     }
 
@@ -433,7 +438,20 @@ impl Stream {
         // Journal and history rows at these revisions do not change. The fresh view's compact
         // revision decides whether an event keeps its prev_kv, as etcd does.
         drop((reads, view, state));
+        #[cfg(test)]
+        if let Some(hook) = self.after_scan.take() {
+            hook();
+        }
         let state = self.current(through.is_none())?;
+        // A compaction between the scan and this view can remove the history of a pending
+        // watcher. The next page then cancels that watcher with the compact revision, as etcd
+        // does, and serves the others. No history read runs below the compact revision.
+        if pending
+            .iter()
+            .any(|&(_, start)| start < state.view.compact_revision)
+        {
+            return Ok(true);
+        }
         let reads = state.view.read_state();
         // Read every response of the page on the view first.
         let mut ids = vec![];
@@ -872,7 +890,7 @@ mod tests {
     struct Fixture {
         _dir: tempfile::TempDir,
         state: StateMachine,
-        feed: watch::Sender<FeedState>,
+        feed: Arc<watch::Sender<FeedState>>,
         output: mpsc::Receiver<Result<WatchResponse, Status>>,
         stream: Stream,
     }
@@ -894,6 +912,7 @@ mod tests {
             let mut state = StateMachine::open(dir.path()).await.unwrap();
             state.watch_capture = Some(Default::default());
             let (feed, changes) = watch::channel(feed_state(&state));
+            let feed = Arc::new(feed);
             let (tx, output) = mpsc::channel(1024);
             let stream = Stream::new(
                 tx,
@@ -1276,6 +1295,62 @@ mod tests {
         assert!(responses[1].canceled);
         assert_eq!(responses[1].compact_revision, 3);
         assert!(f.stream.watchers.is_empty());
+        f.close().await;
+    }
+
+    /// A physical compaction lands between the journal scan and the history reads. The
+    /// historical watcher is cancelled with the compact revision. The stream stays open, and a
+    /// current watcher on it receives its next event.
+    #[tokio::test]
+    async fn a_compaction_after_the_scan_cancels_only_the_compacted_watcher() {
+        let mut f = Fixture::new().await;
+        f.watch(request(2, "other", 0)).await;
+        let mut revisions = vec![];
+        for n in 0..3 {
+            let batch = f.put("k", &n.to_string()).await;
+            revisions.push(batch.revision);
+            f.stream.batch(&batch).await.unwrap();
+        }
+        // The feed keeps the view before the compaction until the scan ends.
+        let index = f.state.applied + 1;
+        f.state
+            .apply_compaction(
+                index,
+                &CompactionRequest {
+                    revision: revisions[2],
+                    physical: true,
+                },
+            )
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        while f.state.compaction_pending() {
+            let index = f.state.applied + 1;
+            f.state.apply_compaction_step(index).await.unwrap();
+        }
+        let compacted = feed_state(&f.state);
+        let feed = f.feed.clone();
+        f.stream.after_scan = Some(Box::new(move || {
+            feed.send_replace(compacted);
+        }));
+        f.stream
+            .create(request(1, "k", revisions[0]))
+            .await
+            .unwrap();
+        assert!(f.stream.after_scan.is_none(), "the scan ran");
+        let responses = f.responses();
+        assert_eq!(responses.len(), 2);
+        assert!(responses[0].created);
+        assert!(responses[1].canceled);
+        assert_eq!(
+            (responses[1].watch_id, responses[1].compact_revision),
+            (1, revisions[2])
+        );
+        assert_eq!(f.stream.watchers.keys().copied().collect::<Vec<_>>(), [2]);
+        let next = f.put("other", "1").await;
+        f.stream.batch(&next).await.unwrap();
+        assert_eq!(f.events(), [(2, next.revision, 0)]);
         f.close().await;
     }
 
