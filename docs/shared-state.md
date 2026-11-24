@@ -159,7 +159,8 @@ Step 3 bounds memory during an S3 stall even when the member already has the new
 Step 4 does not need the paused `ViewCheckpoint` entries. A paused leader still materializes its
 applied batches, so it publishes a checkpoint at or below its own `applied` and then switches to
 it. A test stalls S3 on a single voter, recovers S3, and sends no new requests. The voter must
-resume.
+resume. A second run stalls S3 before the first announcement applies, so the out-of-band switch
+must release the open segment.
 
 ## Views and reads
 
