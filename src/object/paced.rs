@@ -726,11 +726,20 @@ mod tests {
             s.spawn(|| {
                 let _w = lane.acquire(Writer::Flush);
                 flushed.store(1, Ordering::SeqCst);
-                while release.load(Ordering::SeqCst) == 0 {
+                // A failed assertion of the main thread never sets `release`. The scope then
+                // waits for this thread, so it stops after a bounded time.
+                let started = std::time::Instant::now();
+                while release.load(Ordering::SeqCst) == 0 && started.elapsed().as_secs() < 30 {
                     std::thread::sleep(Duration::from_millis(5));
                 }
             });
-            std::thread::sleep(Duration::from_millis(50));
+            // Wait until the flush waits. A fixed sleep fails on a loaded host: the compaction
+            // then takes the freed window first.
+            let started = std::time::Instant::now();
+            while lane.state.lock().unwrap().flush_waiting == 0 {
+                assert!(started.elapsed().as_secs() < 30, "the flush never waited");
+                std::thread::sleep(Duration::from_millis(1));
+            }
             assert_eq!(
                 flushed.load(Ordering::SeqCst),
                 0,
