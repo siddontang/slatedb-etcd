@@ -408,8 +408,15 @@ impl Source {
     }
 
     /// Record that a checkpoint exists. A member never starts from an empty base after this.
+    /// Write the bootstrap marker. A pending restore claim gives its snapshot checksum to the
+    /// marker, so a repair after a stopped restore keeps the identity of that restore.
     pub async fn mark_bootstrapped(&self, checkpoint: uuid::Uuid) -> Result<()> {
-        self.mark_bootstrapped_with(checkpoint, None).await
+        let restore = match bootstrap_op(self).await? {
+            Some(BootstrapOp::Restore { snapshot }) => Some(snapshot),
+            _ => None,
+        };
+        self.mark_bootstrapped_with(checkpoint, restore.as_deref())
+            .await
     }
 
     /// The checksum of the snapshot that the bootstrap marker records, if a restore wrote it.
@@ -443,7 +450,16 @@ impl Source {
             )
             .await
         {
-            Ok(_) | Err(slatedb::object_store::Error::AlreadyExists { .. }) => Ok(()),
+            Ok(_) => Ok(()),
+            // Another member wrote the marker first. It must name the same bootstrap.
+            Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
+                let existing = self.restored_snapshot().await?;
+                ensure!(
+                    existing.as_deref() == restore,
+                    "the bootstrap marker records another bootstrap"
+                );
+                Ok(())
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -817,6 +833,47 @@ pub(crate) async fn claim_bootstrap(source: &Source, op: &BootstrapOp) -> Result
         .context("the bootstrap claim disappeared")
 }
 
+/// Resolve the bootstrap operation before an ordinary start selects its base and admits clients.
+///
+/// A bootstrapped cluster needs nothing. Otherwise the start claims an empty bootstrap. A pending
+/// restore claim holds the start: once the restore created its checkpoint, the start completes
+/// the marker with the snapshot checksum. Before that the start waits, and then fails, so it
+/// never serves an empty base while a restore claim exists.
+async fn resolve_bootstrap(source: &Source, admin: &slatedb::admin::Admin) -> Result<()> {
+    let deadline = std::time::Instant::now() + RESTORE_WAIT;
+    loop {
+        if source.bootstrapped().await? {
+            return Ok(());
+        }
+        let BootstrapOp::Restore { snapshot } =
+            claim_bootstrap(source, &BootstrapOp::Empty).await?
+        else {
+            return Ok(());
+        };
+        if let Some(base) = newest_base(admin, source).await? {
+            let checkpoint = base
+                .checkpoint
+                .context("the restored base has no checkpoint")?;
+            return source
+                .mark_bootstrapped_with(checkpoint, Some(&snapshot))
+                .await;
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "the restore of snapshot {snapshot} into this cluster is pending; start a member \
+             with the same --restore-snapshot, or use a new cluster prefix"
+        );
+        tracing::info!(%snapshot, "wait for the pending snapshot restore");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// The longest time that an ordinary start waits for a pending restore.
+#[cfg(not(test))]
+const RESTORE_WAIT: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const RESTORE_WAIT: Duration = Duration::from_secs(3);
+
 /// The message for a restore into a cluster that this snapshot did not create.
 const FRESH_PREFIX: &str = "a snapshot restore needs a new cluster prefix and empty member \
     directories; this shared state is not a restore of this snapshot (see \
@@ -878,15 +935,31 @@ pub(crate) async fn seed_rows_for_test(source: &Source, restore: &Restore) -> Re
     let op = BootstrapOp::Restore {
         snapshot: restore.id.clone(),
     };
-    claim_bootstrap(source, &op).await?;
+    ensure!(claim_bootstrap(source, &op).await? == op, FRESH_PREFIX);
     let db = source.open_writer().await?;
     let mut batch = slatedb::WriteBatch::new();
     for (key, value) in restore.rows.iter() {
         batch.put(key, value);
     }
+    batch.put(APPLIED_TERM, applied_term_row(1, 1));
     db.write_with_options(batch, &slatedb::config::WriteOptions { seqnum: 1 })
         .await?;
     db.flush().await?;
+    db.close().await?;
+    Ok(())
+}
+
+/// Claim the restore, write its rows, and create its checkpoint, then stop before the marker.
+#[cfg(test)]
+pub(crate) async fn seed_checkpoint_for_test(source: &Source, restore: &Restore) -> Result<()> {
+    seed_rows_for_test(source, restore).await?;
+    let db = source.open_writer().await?;
+    let options = slatedb::config::CheckpointOptions {
+        name: Some(view_name(1)),
+        ..Default::default()
+    };
+    db.create_checkpoint(slatedb::config::CheckpointScope::Durable, &options)
+        .await?;
     db.close().await?;
     Ok(())
 }
@@ -936,6 +1009,10 @@ async fn write_seed(
         .mark_bootstrapped_with(checkpoint, Some(&restore.id))
         .await?;
     db.close().await?;
+    ensure!(
+        source.restored_snapshot().await?.as_deref() == Some(restore.id.as_str()),
+        FRESH_PREFIX
+    );
     Ok(())
 }
 
@@ -1203,8 +1280,11 @@ impl StateMachine {
         );
         let rows = Arc::new(rows::RowCache::new(cache.row_bytes));
         let admin = Arc::new(slatedb::admin::Admin::builder(state_root.as_str(), store).build());
-        if let Some(restore) = &options.restore {
-            seed(&source, &admin, restore).await?;
+        match &options.restore {
+            Some(restore) => seed(&source, &admin, restore).await?,
+            // A joining member finds a bootstrapped cluster. Its Raft log decides its base.
+            None if !options.join => resolve_bootstrap(&source, &admin).await?,
+            None => {}
         }
         // A joining member with no log waits for Raft: entries from index 1 or a snapshot.
         let base = match newest_base(&admin, &source).await? {

@@ -1071,3 +1071,80 @@ async fn a_restore_completes_after_a_failure_before_its_marker() {
         "{error:#}"
     );
 }
+
+/// Defragment from sorted runs only. SlateDB can reuse the destination run ID, so the check
+/// compares SST views: a checkpoint after `compact_all` has one run and none of the input views.
+#[tokio::test]
+async fn defragment_replaces_every_input_sorted_run() {
+    use slatedb::compactor::{CompactionSpec, CompactionStatus, SourceId};
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut settings = slatedb_settings();
+    if let Some(compactor) = settings.compactor_options.as_mut() {
+        compactor
+            .scheduler_options
+            .insert("min_compaction_sources".into(), "1000000".into());
+    }
+    let db = slatedb::Db::builder("db", store.clone())
+        .with_settings(settings)
+        .build()
+        .await
+        .unwrap();
+    let admin = slatedb::admin::Admin::builder("db", store).build();
+    // Two sorted runs and no L0 SST.
+    for (n, destination) in [(0_u32, 0_u32), (1, 1)] {
+        db.put(format!("k{n}").as_bytes(), b"v").await.unwrap();
+        db.flush().await.unwrap();
+        let manifest = admin.read_manifest(None).await.unwrap().unwrap();
+        let sources = manifest
+            .l0()
+            .iter()
+            .map(|view| SourceId::SstView(view.id))
+            .collect();
+        let job = admin
+            .submit_compaction(CompactionSpec::new(sources, destination))
+            .await
+            .unwrap();
+        for _ in 0..500 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let done = matches!(
+                admin
+                    .read_compaction(job.id(), None)
+                    .await
+                    .unwrap()
+                    .map(|j| j.status()),
+                Some(CompactionStatus::Completed)
+            );
+            if done
+                && admin
+                    .read_manifest(None)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .l0()
+                    .is_empty()
+            {
+                break;
+            }
+        }
+    }
+    let manifest = admin.read_manifest(None).await.unwrap().unwrap();
+    assert!(manifest.l0().is_empty());
+    assert_eq!(manifest.compacted().len(), 2);
+    let input: std::collections::HashSet<_> =
+        manifest.all_sst_views().map(|view| view.id).collect();
+    maintenance::compact_all(&admin).await.unwrap();
+    let checkpoint = db
+        .create_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
+        .await
+        .unwrap();
+    let manifest = admin
+        .read_manifest(Some(checkpoint.manifest_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(manifest.compacted().len(), 1);
+    assert!(!manifest
+        .all_sst_views()
+        .any(|view| input.contains(&view.id)));
+    db.close().await.unwrap();
+}

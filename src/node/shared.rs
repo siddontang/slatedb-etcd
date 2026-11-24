@@ -2591,37 +2591,37 @@ mod tests {
         )
     }
 
-    /// A restore claims the bootstrap and stops before its marker. An ordinary leader then
-    /// starts without the restore flag. It does not bootstrap an empty state: it waits. The
-    /// restore completes, and the leader announces the restored checkpoint.
+    /// A restore claims the bootstrap and stops before its marker. An ordinary member then
+    /// opens without the restore flag. It does not select an empty base: it waits. The restore
+    /// completes, and the ordinary member opens on the restored checkpoint.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_ordinary_start_waits_for_a_pending_restore() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (state, handles) = ordinary(store.clone()).await;
+        let source = crate::state::shared::offline_source(
+            store.clone(),
+            "root",
+            crate::state::StateCache::default(),
+        )
+        .unwrap();
         let restore = snapshot("a");
-        crate::state::shared::seed_rows_for_test(&handles.source, &restore)
+        crate::state::shared::seed_rows_for_test(&source, &restore)
             .await
             .unwrap();
-        let (events, received) = mpsc::channel(64);
-        let mut announcements = Announcements(received);
-        let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
-        writer.sync(true, 2, &events);
-        announcements.none(Duration::from_secs(1)).await;
-        assert!(!handles.source.bootstrapped().await.unwrap());
-        let admin =
-            slatedb::admin::Admin::builder(handles.source.state().as_str(), store.clone()).build();
-        crate::state::shared::seed(&handles.source, &admin, &restore)
+        let opening = tokio::spawn(ordinary(store.clone()));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!opening.is_finished());
+        let admin = slatedb::admin::Admin::builder(source.state().as_str(), store).build();
+        crate::state::shared::seed(&source, &admin, &restore)
             .await
             .unwrap();
-        let id = announcements.next(Duration::from_secs(10), true).await;
-        let base = handles.source.open_base(id).await.unwrap();
+        let (state, _handles) = opening.await.unwrap();
+        let base = state.shared.as_ref().unwrap().base.clone();
+        assert_eq!(base.applied, 1);
         assert_eq!(
             base.get(b"etcd/restored").await.unwrap().as_deref(),
             Some(b"a".as_slice())
         );
         drop(base);
-        writer.sync(false, 2, &events);
-        writer.stop().await;
         state.close().await.unwrap();
     }
 
@@ -2648,6 +2648,108 @@ mod tests {
             "{error:#}"
         );
         writer.sync(false, 2, &events);
+        writer.stop().await;
+        state.close().await.unwrap();
+    }
+
+    /// A restore stops after its rows, or after its checkpoint, before its marker. An ordinary
+    /// server start never serves the empty base while the restore claim is pending. After the
+    /// rows it fails after its wait. After the checkpoint it completes the marker with the
+    /// snapshot checksum and starts. A retry of the same snapshot then succeeds, and an ordinary
+    /// start follows the restore.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_ordinary_start_resolves_a_stopped_restore() {
+        for checkpointed in [false, true] {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let source = crate::state::shared::offline_source(
+                store.clone(),
+                "root",
+                crate::state::StateCache::default(),
+            )
+            .unwrap();
+            let admin =
+                slatedb::admin::Admin::builder(source.state().as_str(), store.clone()).build();
+            let restore = snapshot("a");
+            if checkpointed {
+                crate::state::shared::seed_checkpoint_for_test(&source, &restore)
+                    .await
+                    .unwrap();
+            } else {
+                crate::state::shared::seed_rows_for_test(&source, &restore)
+                    .await
+                    .unwrap();
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = crate::server::ServerConfig::single_node(dir.path());
+            config.state_mode = crate::state::StateMode::Shared;
+            config.object_store = crate::object::Config::Test(store.clone(), "root".into());
+            let started = tokio::time::timeout(
+                Duration::from_secs(30),
+                crate::server::Server::start(config.clone()),
+            )
+            .await
+            .unwrap();
+            if checkpointed {
+                let server = started.unwrap();
+                server.wait_ready(Duration::from_secs(15)).await.unwrap();
+                server.shutdown().await.unwrap();
+                assert_eq!(
+                    source.restored_snapshot().await.unwrap().as_deref(),
+                    Some("a")
+                );
+            } else {
+                let error = started.err().unwrap();
+                assert!(format!("{error:#}").contains("pending"), "{error:#}");
+                assert!(!source.bootstrapped().await.unwrap());
+            }
+            // The same snapshot restores with success at either boundary.
+            crate::state::shared::seed(&source, &admin, &restore)
+                .await
+                .unwrap();
+            assert_eq!(
+                source.restored_snapshot().await.unwrap().as_deref(),
+                Some("a")
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = crate::server::ServerConfig::single_node(dir.path());
+            config.state_mode = crate::state::StateMode::Shared;
+            config.object_store = crate::object::Config::Test(store.clone(), "root".into());
+            let server = crate::server::Server::start(config).await.unwrap();
+            server.wait_ready(Duration::from_secs(15)).await.unwrap();
+            server.shutdown().await.unwrap();
+        }
+    }
+
+    /// A MoveLeader requests its publication while the new writer is still opening, after
+    /// apply passed the last published index. The open keeps the request, so the writer
+    /// publishes through the requested index at once, well before the 3 s transfer fallback.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_transfer_request_during_the_writer_open_is_published() {
+        let (mut state, handles, events, mut announcements, first) = stranded_checkpoint().await;
+        adopt_announced(&mut state, first).await;
+        for n in 0..5 {
+            let put = crate::proto::etcdserverpb::RequestOp {
+                request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
+                    crate::proto::etcdserverpb::PutRequest {
+                        key: format!("key-{n}").into_bytes(),
+                        value: b"value".to_vec(),
+                        ..Default::default()
+                    },
+                )),
+            };
+            let index = state.applied + 1;
+            state.apply_etcd(index, &put).await.unwrap();
+        }
+        let applied = state.applied;
+        let mut writer = Writer::new(&handles, Duration::from_secs(90), clock());
+        writer.sync(true, 3, &events);
+        // MoveLeader calls this with the applied index. The writer has not opened yet.
+        writer.request_publication(applied);
+        let started = Instant::now();
+        let id = announcements.next(Duration::from_secs(2), true).await;
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(handles.source.open_base(id).await.unwrap().applied, applied);
+        writer.sync(false, 3, &events);
         writer.stop().await;
         state.close().await.unwrap();
     }

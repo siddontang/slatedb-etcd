@@ -161,8 +161,10 @@ member with `--restore-snapshot <file>` and `--state-mode shared`.
    writes the bootstrap marker with the checksum.
 3. Another member with the same snapshot finds the claim and completes or skips the same steps.
    This also completes a restore that failed between its first write and the marker.
-4. A member without the restore flag waits while a restore is pending. Then it adopts the
-   restored checkpoint. An ordinary first leader claims the operation as an empty bootstrap.
+4. A member without the restore flag resolves the bootstrap before it selects its base and
+   admits clients. While a restore is pending it waits, up to 60 s, and then fails. If the
+   restore already created its checkpoint, the member completes the marker with the snapshot
+   checksum and opens on that checkpoint. Otherwise an ordinary start claims an empty bootstrap.
 5. A restore into a cluster that an ordinary start or another snapshot created fails. Use a new
    cluster prefix.
 
