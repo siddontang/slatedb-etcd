@@ -174,9 +174,10 @@ impl RaftStorage {
         }
     }
 
-    /// The initial voters in the identity of an existing log. The offline converter opens a
-    /// log without the startup flags. The open fails while the member runs.
-    pub fn stored_voters(dir: &Path) -> Result<Vec<u64>> {
+    /// The member ID, the cluster ID, and the initial voters in the identity of an existing
+    /// log. Offline tools open a log without the startup flags. The open fails while the member
+    /// runs.
+    pub fn stored_identity(dir: &Path) -> Result<(u64, String, Vec<u64>)> {
         let config = Config {
             dir: dir.to_string_lossy().into_owned(),
             enable_log_recycle: false,
@@ -187,8 +188,18 @@ impl RaftStorage {
             .get(GROUP, IDENTITY)
             .context("the log has no identity")?;
         let fields: Vec<serde_json::Value> = serde_json::from_slice(&stored)?;
-        let voters = fields.get(3).cloned().context("invalid log identity")?;
-        Ok(serde_json::from_value(voters)?)
+        let field = |n: usize| fields.get(n).cloned().context("invalid log identity");
+        Ok((
+            serde_json::from_value(field(1)?)?,
+            serde_json::from_value(field(2)?)?,
+            serde_json::from_value(field(3)?)?,
+        ))
+    }
+
+    /// Open an existing log with its stored identity.
+    pub fn open_existing(dir: &Path) -> Result<Self> {
+        let (member, cluster, voters) = Self::stored_identity(dir)?;
+        Self::open(dir, member, &cluster, voters)
     }
 
     pub fn open(dir: &Path, node_id: u64, cluster_id: &str, voters: Vec<u64>) -> Result<Self> {

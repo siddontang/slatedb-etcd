@@ -936,9 +936,10 @@ async fn http(server: &Server, method: &str, path: &str) -> String {
     response.lines().next().unwrap().to_owned()
 }
 
-/// Defragment on a follower runs on the leader writer: the shared database then has one sorted
-/// run and no L0 SST, and every member keeps its data. A manual checkpoint on each member
-/// returns after its base covers the commit index.
+/// A manual checkpoint on each member returns after its base covers the writes. Defragment on
+/// a follower then runs on the idle leader writer. The shared database gets one sorted run and
+/// no L0 SST. Without another write, the leader publishes a new checkpoint at the same index,
+/// and every member's base reads the compacted layout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn defragment_and_manual_checkpoints_in_shared_mode() {
     use slatedb_etcd::proto::etcdserverpb::DefragmentRequest;
@@ -948,6 +949,18 @@ async fn defragment_and_manual_checkpoints_in_shared_mode() {
     let mut kv = KvClient::new(channel(servers[lead as usize - 1].as_ref().unwrap()).await);
     for n in 0..20 {
         kv.put(put(&format!("k{n}"), "value")).await.unwrap();
+    }
+    let written = status(servers[lead as usize - 1].as_ref().unwrap()).await["shared_state"]
+        ["writer"]["written"]
+        .as_u64()
+        .unwrap();
+    for server in servers.iter().flatten() {
+        let reply = http(server, "POST", "/checkpoint").await;
+        assert!(reply.contains("200"), "{reply}");
+        let base = status(server).await["shared_state"]["base_applied_index"]
+            .as_u64()
+            .unwrap();
+        assert!(base >= written, "base {base} written {written}");
     }
     let follower = (1..=3).find(|id| *id != lead).unwrap();
     let follower = servers[follower as usize - 1].as_ref().unwrap();
@@ -961,26 +974,36 @@ async fn defragment_and_manual_checkpoints_in_shared_mode() {
         )
         .unwrap(),
     );
-    let manifest = slatedb::admin::Admin::builder("shared/state", store)
-        .build()
-        .read_manifest(None)
-        .await
-        .unwrap()
-        .unwrap();
+    let admin = slatedb::admin::Admin::builder("shared/state", store).build();
+    let manifest = admin.read_manifest(None).await.unwrap().unwrap();
     assert!(manifest.l0().is_empty());
     assert_eq!(manifest.compacted().len(), 1);
-    // A manual checkpoint waits until the member's base holds every write.
-    let written = status(servers[lead as usize - 1].as_ref().unwrap()).await["shared_state"]
-        ["writer"]["written"]
-        .as_u64()
-        .unwrap();
+    // Each base reaches a checkpoint with the compacted layout.
     for server in servers.iter().flatten() {
-        let reply = http(server, "POST", "/checkpoint").await;
-        assert!(reply.contains("200"), "{reply}");
-        let base = status(server).await["shared_state"]["base_applied_index"]
-            .as_u64()
-            .unwrap();
-        assert!(base >= written, "base {base} written {written}");
+        eventually("a compacted base", async || {
+            let Some(base) = status(server).await["shared_state"]["base_checkpoint"]
+                .as_str()
+                .map(str::to_owned)
+            else {
+                return false;
+            };
+            let Some(checkpoint) = admin
+                .list_checkpoints(None)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|checkpoint| checkpoint.id.to_string() == base)
+            else {
+                return false;
+            };
+            let manifest = admin
+                .read_manifest(Some(checkpoint.manifest_id))
+                .await
+                .unwrap()
+                .unwrap();
+            manifest.l0().is_empty() && manifest.compacted().len() == 1
+        })
+        .await;
     }
     for server in servers.iter().flatten() {
         let local = KvClient::new(channel(server).await)

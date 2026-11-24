@@ -29,6 +29,8 @@ new clusters. A stopped replicated S3 cluster can be converted offline. See
     mode.json                  the cluster mode, written before any state
     shared/owner.json          the cluster claim: mode, quota, and the initial voters
     shared/bootstrap.json      written once after the first checkpoint
+    shared/restore.json        the snapshot of a --restore-snapshot start
+    shared/conversion.json     the plan of an offline conversion
     shared/state/              the one SlateDB: manifest/, compacted/, checkpoints
     member-<id>/binding.json   the member identity and mode. It holds no state.
 ```
@@ -41,22 +43,31 @@ All members use the same bucket, endpoint, region, and prefix.
 These rules follow the accepted design decision: all voters of one trusted cluster share write
 access.
 
-- Give each voter read and write access to `shared/state/` and to its own
-  `member-<id>/binding.json`. Any voter can become the leader and the writer.
+- Give each voter read and write access to `shared/`. Any voter can become the leader and the
+  writer.
+- At startup each member reads `mode.json`, the shared claims, and the owner claim of every
+  member namespace. A replicated owner claim stops the start.
+- Each member, also a learner, writes its own `member-<id>/binding.json` at its first start.
+- A learner only reads `shared/`. Give it the voter statements before you promote it.
 - Scope each credential to the cluster prefix `<prefix>/<sha256(cluster-id)>/`. Do not give a
   member access to the prefixes of other clusters.
-- A learner only reads the shared state. A read-only credential is enough until its promotion.
-  Give it write access before you promote it.
 - A credential that can delete objects can delete the state of every member. Keep backups and
   recovery copies under a separate credential and a separate prefix.
 
-An example S3 policy for one voter has these statements:
+An S3 policy has these statements. `<cluster>` is the cluster prefix. A unit test,
+`shared_members_touch_the_keys_of_the_guide_policy`, checks the keys that members use.
 
-| Action | Resource |
-| --- | --- |
-| `s3:ListBucket` | the bucket, with the condition `s3:prefix` = `<cluster prefix>/*` |
-| `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` | `<cluster prefix>/shared/*` |
-| `s3:GetObject`, `s3:PutObject` | `<cluster prefix>/mode.json`, `<cluster prefix>/member-<id>/*` |
+| Role | Action | Resource |
+| --- | --- | --- |
+| All | `s3:ListBucket` | the bucket, with the condition `s3:prefix` = `<cluster>/*` |
+| All | `s3:GetObject` | `<cluster>/mode.json`, `<cluster>/member-*/owner.json` |
+| All | `s3:GetObject`, `s3:PutObject` | `<cluster>/member-<id>/*` |
+| Voter | `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` | `<cluster>/shared/*` |
+| Voter | `s3:PutObject` | `<cluster>/mode.json`, for the first start |
+| Learner | `s3:GetObject` | `<cluster>/shared/*` |
+
+The offline converter also needs `s3:GetObject` and `s3:DeleteObject` on
+`<cluster>/member-*/*`, because it reads the replicated states and retires owner claims.
 
 ## Checkpoints and retention
 
@@ -77,10 +88,19 @@ cannot accept this race.
 Manual cleanup with `off`:
 
 1. Stop all members.
-2. List the `view-` checkpoints of `shared/state` with the SlateDB admin API.
-3. Keep the newest checkpoint. Also keep the checkpoint that each member's Raft snapshot record
-   names. `GET /status` shows it before the stop.
-4. Delete the older `view-` checkpoints. Run the SlateDB garbage collector to delete the SSTs
+2. On each member host, read the checkpoint of the member's Raft snapshot record:
+
+   ```sh
+   slatedb-etcd shared-status --dir <data dir>
+   ```
+
+   The command prints the record index, its term, and its `checkpoint` ID. It reads the stopped
+   member, so the record cannot change after the read. `GET /status` shows the same fields as
+   `record_checkpoint` and `base_checkpoint` while the member runs, but they can change before
+   the stop.
+3. List the `view-` checkpoints of `shared/state` with the SlateDB admin API. Keep the newest
+   one and each checkpoint from step 2.
+4. Delete the other `view-` checkpoints. Run the SlateDB garbage collector to delete the SSTs
    that no checkpoint pins.
 5. Start the members.
 
@@ -120,18 +140,29 @@ Keep host clocks synchronized with NTP.
 | `--restore-snapshot` | Seeds a new shared cluster at index 1 |
 | MoveLeader | Requests a checkpoint first, then transfers the lead within 3 s |
 
-Defragment flushes the writer, compacts every SST into one sorted run, and requests a new
-checkpoint. The next base reads the compacted run. Old checkpoints keep their SSTs until
-retention or a manual cleanup deletes them.
+Defragment flushes the writer and compacts every SST into one sorted run. The leader then
+publishes a new checkpoint, also at an unchanged index, and announces it. Each member switches
+its base to the newer checkpoint at the same index, so it reads the compacted run without a
+further write. Old checkpoints keep their SSTs until retention or a manual cleanup deletes them.
 
-On the leader, a manual checkpoint requests a publication through the commit index. A follower
-waits for the next publication of the leader, at most `--view-max-age` after the last write.
+A manual checkpoint keeps its commit index. When apply reaches that index, the leader requests a
+publication that covers it. A follower waits for that publication, or for the next one after
+`--view-max-age`.
 
 To restore a native snapshot, start each member of the new cluster with
-`--restore-snapshot <file>`, `--state-mode shared`, and an empty data directory. One member
-writes the rows into the shared database at index 1, publishes the first checkpoint, and writes
-the bootstrap marker. The other members find the marker and skip the restore. A member that does
-not use the flag also works: it adopts the first checkpoint. The native backup limit is 64 MiB.
+`--restore-snapshot <file>`, `--state-mode shared`, and an empty data directory.
+
+1. A member claims `shared/restore.json` with the snapshot checksum before its first write.
+2. It writes the rows into the shared database at index 1, publishes the first checkpoint, and
+   writes the bootstrap marker.
+3. Another member with the same snapshot finds the claim and completes or skips the same steps.
+   This also completes a restore that failed between its first write and the marker.
+4. A member with another snapshot fails. A shared state without a restore claim also fails: a
+   normal start or an unknown write created it.
+
+To start a failed restore again, stop all members and delete `shared/` under the cluster prefix.
+A member that does not use the flag also works: it adopts the first checkpoint. The native
+backup limit is 64 MiB.
 
 ## Convert a replicated cluster
 
@@ -148,17 +179,28 @@ S3. It needs the same S3 credentials as the members.
 
 4. Start all members with `--state-mode shared` and their earlier flags.
 
-The first run reads the flushed index of each member from S3 and takes the highest one. Different
-indexes log a warning. It copies that member's SSTs and manifest into `shared/state`, changes the
-mode claim, writes the cluster claim with the voters of the copied membership, publishes the
-first checkpoint, and writes the bootstrap marker. Each run then adopts the checkpoint in the
-member's Raft log and changes the member's binding. A member keeps its log entries above the
-checkpoint and replays them at start.
+The first run is the preflight. It reads the flushed index of each replicated member namespace
+from a detached checkpoint and takes the highest one. Different indexes log a warning. It checks
+the index, the term at the index, the membership, and the end of the copied manifest before it
+changes any claim, so a failed preflight leaves the replicated cluster usable. A state without a
+term takes it from the local Raft log. If that log does not hold the index, run the conversion
+on the source member first.
 
-The conversion refuses a running member, a member of another cluster, and a member without S3
-state. A shared member refuses to start while any member namespace has a replicated owner claim,
-so the cluster starts only after every member is converted. The replicated state objects under
-`member-<id>/state*` stay in place. Delete them after you check the converted cluster.
+The run then writes the plan, `shared/conversion.json`, with a create-only put. A concurrent or
+later run uses that plan and deletes only its own detached checkpoints. Until the bootstrap
+marker exists, each run completes the seed: it copies the planned SSTs and manifest into
+`shared/state`, changes the mode claim, writes the cluster claim with the bootstrap voters of the
+Raft logs, publishes the first checkpoint, retires the owner claims of members that the copied
+membership does not hold, and writes the marker. No step deletes a view checkpoint.
+
+Each run then installs the checkpoint as the member's Raft snapshot record and changes the
+member's binding. A member keeps its log entries above the checkpoint and replays them at start.
+
+The conversion refuses a running member, a member of another cluster, a member without S3
+state, and a member outside the copied membership. A shared member refuses to start while an
+active member namespace has a replicated owner claim, so the cluster starts only after every
+active member is converted. The replicated state objects under `member-<id>/state*` stay in
+place. Delete them after you check the converted cluster.
 
 ## Failure modes
 

@@ -14,7 +14,7 @@ impl StateMachine {
         members: &crate::cluster::Store,
     ) -> Result<()> {
         check_restore_target(dir, id, members)?;
-        let data = restored_data(backup, members)?;
+        let (data, _) = restored_data(backup, members)?;
         let mut snapshot = Snapshot::default();
         snapshot.mut_metadata().index = 1;
         snapshot.mut_metadata().term = 1;
@@ -48,7 +48,8 @@ impl StateMachine {
         members: &crate::cluster::Store,
     ) -> Result<shared::Restore> {
         check_restore_target(dir, id, members)?;
-        Ok(shared::Restore::new(restored_data(backup, members)?.rows))
+        let (data, checksum) = restored_data(backup, members)?;
+        Ok(shared::Restore::new(data.rows, checksum))
     }
 }
 
@@ -67,7 +68,8 @@ fn check_restore_target(dir: &Path, id: u64, members: &crate::cluster::Store) ->
 
 /// Read and check a native snapshot, and rewrite it for a new cluster with `members`. The rows
 /// are at index 1, with new auth tokens and the alarms on a member of the new cluster.
-fn restored_data(backup: &Path, members: &crate::cluster::Store) -> Result<SnapshotData> {
+/// Also return the snapshot checksum in hexadecimal. It identifies the snapshot.
+fn restored_data(backup: &Path, members: &crate::cluster::Store) -> Result<(SnapshotData, String)> {
     let mut bytes = vec![];
     std::fs::File::open(backup)?
         .take(MAX_BACKUP_BYTES as u64 + 1)
@@ -119,5 +121,6 @@ fn restored_data(backup: &Path, members: &crate::cluster::Store) -> Result<Snaps
         .push((crate::cluster::KEY.to_vec(), serde_json::to_vec(members)?));
     data.applied = 1;
     data.version = crate::SNAPSHOT_FORMAT;
-    Ok(data)
+    let checksum = checksum.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok((data, checksum))
 }

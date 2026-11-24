@@ -222,7 +222,22 @@ struct ConvertArgs {
     quota_backend_bytes: i64,
 }
 
+/// Print the Raft snapshot record of a stopped member and the view checkpoint that it names.
+#[derive(Parser)]
+#[command(name = "slatedb-etcd shared-status")]
+struct StatusArgs {
+    /// Data directory of the stopped member.
+    #[arg(long)]
+    dir: PathBuf,
+}
+
 fn main() -> Result<()> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("shared-status")) {
+        let args = StatusArgs::parse_from(std::env::args_os().skip(1));
+        let record = slatedb_etcd::convert::member_record(&args.dir)?;
+        println!("{}", serde_json::to_string_pretty(&record)?);
+        return Ok(());
+    }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("convert-to-shared")) {
         let args = ConvertArgs::parse_from(std::env::args_os().skip(1));
         return tokio::runtime::Builder::new_multi_thread()
@@ -259,14 +274,16 @@ async fn convert(args: ConvertArgs) -> Result<()> {
             .run()
             .await?;
     println!(
-        "member {} converted: base index {}, term {}{}",
+        "member {} converted: base index {}, term {}, source member {}{}",
         args.id,
         converted.index,
         converted.term,
-        converted
-            .source
-            .map(|source| format!(", seeded from member {source}"))
-            .unwrap_or_default()
+        converted.source,
+        if converted.planned {
+            ", planned here"
+        } else {
+            ""
+        }
     );
     Ok(())
 }

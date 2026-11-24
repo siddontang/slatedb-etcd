@@ -20,6 +20,9 @@ pub(crate) struct FaultStore {
     resumed: tokio::sync::Notify,
     /// The delay of `DELAY_SST_GET`, in milliseconds.
     delay_ms: std::sync::atomic::AtomicU64,
+    /// The paths of puts and copy targets, and of reads, for access tests.
+    pub written: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    pub read: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 pub(crate) const FAIL_PUT: u8 = 1;
@@ -45,6 +48,8 @@ impl FaultStore {
             release: Semaphore::new(0),
             resumed: tokio::sync::Notify::new(),
             delay_ms: std::sync::atomic::AtomicU64::new(120),
+            written: Default::default(),
+            read: Default::default(),
         }
     }
 
@@ -91,6 +96,7 @@ impl ObjectStore for FaultStore {
         payload: PutPayload,
         options: PutOptions,
     ) -> Result<PutResult> {
+        self.written.lock().unwrap().insert(path.to_string());
         self.stall(path).await;
         if path.as_ref().ends_with(".sst") {
             match self.mode.load(Ordering::SeqCst) {
@@ -129,6 +135,7 @@ impl ObjectStore for FaultStore {
     }
 
     async fn get_opts(&self, path: &Path, options: GetOptions) -> Result<GetResult> {
+        self.read.lock().unwrap().insert(path.to_string());
         let mode = self.mode.load(Ordering::SeqCst);
         if mode == LOSE_SST_ONCE && path.as_ref().ends_with(".sst") {
             self.mode.store(0, Ordering::SeqCst);
@@ -165,6 +172,8 @@ impl ObjectStore for FaultStore {
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+        self.written.lock().unwrap().insert(to.to_string());
+        self.read.lock().unwrap().insert(from.to_string());
         self.inner.copy_opts(from, to, options).await
     }
 }

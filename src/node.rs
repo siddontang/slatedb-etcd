@@ -1360,9 +1360,18 @@ impl Node {
 
     fn finish_checkpoint_waiters(&mut self) -> Result<()> {
         let mut waiting = vec![];
+        let leader = self.raw.raft.state == StateRole::Leader;
+        let applied = self.state.applied;
         for (index, response) in std::mem::take(&mut self.checkpoint_waiters) {
             if response.is_closed() {
                 continue;
+            }
+            // Shared mode: the first request can arrive before apply reaches its commit index.
+            // The covering publication is due once apply reaches it.
+            if let Some(writer) = &mut self.writer {
+                if leader {
+                    writer.request_checkpoint(index, applied);
+                }
             }
             // A manual checkpoint completes only with a complete image. In shared mode the
             // image is a view checkpoint, so the member's base must hold the state at `index`.
@@ -1462,8 +1471,17 @@ impl Node {
         }
         status["quorum_reply_index"] = self.quorum_reply_index.into();
         if let (Some(writer), Some((base, applied, bytes))) = (&self.writer, self.state.view) {
+            let record = crate::state::transfer::ViewDescriptor::decode(
+                self.raw.store().recovery_snapshot().get_data(),
+            )
+            .ok()
+            .flatten()
+            .and_then(|view| view.checkpoint().ok());
             status["shared_state"] = json!({
                 "base_applied_index": base,
+                "base_checkpoint": self.state.base_checkpoint,
+                "record_index": self.raw.store().snapshot_index(),
+                "record_checkpoint": record,
                 "applied_view_checkpoints": applied,
                 "overlay_bytes": bytes,
                 "writer": writer.status(),

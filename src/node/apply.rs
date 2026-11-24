@@ -27,6 +27,8 @@ pub(super) struct AppliedState {
     pub physical_revision: i64,
     /// Shared mode: the base index, the applied `ViewCheckpoint` entries, and the overlay bytes.
     pub view: Option<(u64, u64, u64)>,
+    /// Shared mode: the checkpoint of the base.
+    pub base_checkpoint: Option<uuid::Uuid>,
 }
 
 impl std::ops::Deref for AppliedState {
@@ -50,6 +52,7 @@ impl AppliedState {
             compaction_plan: state.compaction_plan.generation(),
             physical_revision: state.physical_revision(),
             view: state.view_status(),
+            base_checkpoint: state.base_checkpoint(),
         })
     }
 }

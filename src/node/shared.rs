@@ -35,6 +35,8 @@ struct Inner {
     dirty_since: Option<Instant>,
     /// Publish a checkpoint after the materializer writes this sequence.
     publish_through: Option<u64>,
+    /// Publish a new checkpoint even at an unchanged sequence. Defragment sets this.
+    republish: bool,
 }
 
 impl Progress {
@@ -67,6 +69,16 @@ impl Progress {
     fn reset(&self, written: u64) {
         self.written.send_replace(written);
         *self.inner.lock().unwrap() = Inner::default();
+    }
+
+    /// Publish a new checkpoint at the current sequence, for a changed layout.
+    fn republish(&self) {
+        self.inner.lock().unwrap().republish = true;
+        self.wake.notify_one();
+    }
+
+    fn take_republish(&self) -> bool {
+        std::mem::take(&mut self.inner.lock().unwrap().republish)
     }
 
     fn request(&self, through: u64) {
@@ -164,6 +176,8 @@ pub(super) struct Writer {
     /// The writer `Db` while this member leads.
     open: OpenWriter,
     pub(super) gauges: Option<Gauges>,
+    /// The highest manual checkpoint index that requested a publication after apply.
+    checkpoint_requested: u64,
 }
 
 /// The shared-mode gauges of one member. The node sets them on each tick.
@@ -173,6 +187,7 @@ pub(super) struct Gauges {
     paused: prometheus::IntGauge,
     leading: prometheus::IntGauge,
     reopens: prometheus::IntGauge,
+    clock_alarm: prometheus::IntGauge,
 }
 
 impl Gauges {
@@ -197,7 +212,11 @@ impl Gauges {
             )?,
             leading: gauge(
                 "slatedb_etcd_shared_writer_running",
-                "1 while this member runs the shared writer.",
+                "1 while the shared writer database of this member is open.",
+            )?,
+            clock_alarm: gauge(
+                "slatedb_etcd_shared_writer_clock_alarm",
+                "1 while the writer does not start because the local clock is too far behind.",
             )?,
             reopens: gauge(
                 "slatedb_etcd_shared_writer_reopens",
@@ -219,6 +238,7 @@ impl Writer {
             retained: None,
             open: OpenWriter::default(),
             gauges: None,
+            checkpoint_requested: 0,
             progress: Arc::new(Progress::new(0)),
             admin: handles.admin.clone(),
             queue: handles.queue.clone(),
@@ -302,6 +322,17 @@ impl Writer {
         {
             self.tasks.shutdown().await;
         }
+    }
+
+    /// Request the publication for a manual checkpoint through `index` once apply reaches it.
+    /// Return true when this call requested it. Each index is requested once.
+    pub fn request_checkpoint(&mut self, index: u64, applied: u64) -> bool {
+        if index > applied || index <= self.checkpoint_requested {
+            return false;
+        }
+        self.checkpoint_requested = index;
+        self.request_publication(index);
+        true
     }
 
     /// Publish a checkpoint that holds the applied state through `index`.
@@ -580,7 +611,13 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
             result = publish(publisher, events.clone()) => result,
             _ = stop_requested(&mut stopped) => Ok(()),
         };
-        open.lock().unwrap().take();
+        // A later task can own the slot already. Clear only this task's writer.
+        {
+            let mut slot = open.lock().unwrap();
+            if slot.as_ref().is_some_and(|open| Arc::ptr_eq(open, &db)) {
+                *slot = None;
+            }
+        }
         close(db).await;
         match result {
             // Two quick elections can open writers in reverse term order.
@@ -809,7 +846,8 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
         }
         // SlateDB also flushes a full memtable by itself. Each advance gets one checkpoint.
         let last = db.manifest().last_l0_seq();
-        if last <= published {
+        let republish = progress.take_republish();
+        if last <= published && !republish {
             // A request with no new checkpoint can wait for a stranded one.
             if requested {
                 retry.now();
@@ -882,9 +920,17 @@ async fn reannounce(
     bootstrapped: &mut bool,
     events: &mpsc::Sender<Event>,
 ) -> Result<bool> {
-    // The usual case reads no storage: the sent announcement applied.
-    if retry.awaiting.is_some() && *applied.announced.borrow() == retry.awaiting {
-        retry.done();
+    // A sent announcement counts when applied state shows it. Until then this publisher sends
+    // its own checkpoint again. The usual case reads no storage.
+    if let Some(id) = retry.awaiting {
+        if *applied.announced.borrow() == Some(id) {
+            retry.done();
+            return Ok(true);
+        }
+        let Some(accepted) = announce(events, id).await else {
+            return Ok(false);
+        };
+        retry.sent(id, accepted);
         return Ok(true);
     }
     let id = match stranded(admin, source, applied).await {
@@ -1051,7 +1097,8 @@ impl Node {
             let result = async {
                 db.flush().await?;
                 crate::state::maintenance::compact_all(&admin).await?;
-                progress.request(progress.written());
+                // The next checkpoint, also at the same index, reads the compacted layout.
+                progress.republish();
                 anyhow::Ok(())
             }
             .await;
@@ -1132,7 +1179,16 @@ impl Node {
             gauges.base.set(base as i64);
             gauges.overlay.set(bytes as i64);
             gauges.paused.set(writer.paused.into());
-            gauges.leading.set(writer.running().into());
+            gauges
+                .leading
+                .set(writer.open.lock().unwrap().is_some().into());
+            gauges.clock_alarm.set(
+                writer
+                    .clock
+                    .alarm
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .into(),
+            );
             gauges
                 .reopens
                 .set(writer.reopens.load(std::sync::atomic::Ordering::Relaxed) as i64);
@@ -2311,6 +2367,34 @@ mod tests {
         state.switch_base();
         assert_eq!(*handles.based.borrow(), newest);
         faults.set(0);
+        state.close().await.unwrap();
+    }
+
+    /// A manual checkpoint arrives after its entry commits and before the entry applies. The
+    /// publication request waits for apply, so it covers the batch of that entry.
+    #[tokio::test]
+    async fn a_manual_checkpoint_requests_its_publication_after_apply() {
+        let (mut state, handles, _events, _announcements, _) = stranded_checkpoint().await;
+        let mut writer = Writer::new(&handles, Duration::from_secs(60), clock());
+        let index = state.applied + 1;
+        // Committed at `index`, applied below it: no request yet.
+        assert!(!writer.request_checkpoint(index, index - 1));
+        let put = crate::proto::etcdserverpb::RequestOp {
+            request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
+                crate::proto::etcdserverpb::PutRequest {
+                    key: b"key".to_vec(),
+                    value: b"value".to_vec(),
+                    ..Default::default()
+                },
+            )),
+        };
+        state.apply_etcd(index, &put).await.unwrap();
+        assert!(writer.request_checkpoint(index, index));
+        assert_eq!(
+            writer.progress.inner.lock().unwrap().publish_through,
+            Some(index)
+        );
+        assert!(!writer.request_checkpoint(index, index));
         state.close().await.unwrap();
     }
 

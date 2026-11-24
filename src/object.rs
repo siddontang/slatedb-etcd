@@ -722,4 +722,80 @@ mod tests {
             assert!(config.validate().is_err());
         }
     }
+
+    /// The object keys that shared members touch at startup. The S3 policy in the shared state
+    /// guide grants exactly these. Every member reads `mode.json`, the shared claims, the shared
+    /// state, and the owner claims of all members. A voter writes its own binding and the shared
+    /// keys. A joining learner writes only its own binding.
+    #[tokio::test]
+    async fn shared_members_touch_the_keys_of_the_guide_policy() {
+        use crate::object::faults::FaultStore;
+        let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+        let config = Config::TestS3(faults.clone(), s3());
+        let root = format!("{}/", s3().cluster_prefix("cluster"));
+        let dirs = tempfile::tempdir().unwrap();
+        let open = |member: u64, join: bool| {
+            let config = config.clone();
+            let dir = dirs.path().join(member.to_string());
+            async move {
+                let options = crate::state::shared::Options {
+                    quota: 0,
+                    voters: vec![1, 2],
+                    join,
+                    empty_log: true,
+                    pin_max: Duration::from_secs(300),
+                    restore: None,
+                };
+                config
+                    .open(
+                        &dir,
+                        "cluster",
+                        member,
+                        crate::state::StateCache::default(),
+                        StateMode::Shared,
+                        &options,
+                    )
+                    .await
+                    .unwrap()
+                    .close()
+                    .await
+                    .unwrap();
+            }
+        };
+        let keys = |set: &std::sync::Mutex<std::collections::BTreeSet<String>>| {
+            let keys: Vec<String> = std::mem::take(&mut *set.lock().unwrap())
+                .into_iter()
+                .map(|key| key.strip_prefix(&root).expect("a cluster key").to_owned())
+                .collect();
+            keys
+        };
+        open(1, false).await;
+        let written = keys(&faults.written);
+        assert!(
+            written.iter().all(|key| key == "mode.json"
+                || key == "member-1/binding.json"
+                || key.starts_with("shared/")),
+            "{written:?}"
+        );
+        keys(&faults.read);
+        for (member, join) in [(2, false), (3, true)] {
+            open(member, join).await;
+            let written = keys(&faults.written);
+            let own = format!("member-{member}/");
+            assert!(
+                written
+                    .iter()
+                    .all(|key| key.starts_with(&own) || (!join && key.starts_with("shared/"))),
+                "member {member} wrote {written:?}"
+            );
+            let read = keys(&faults.read);
+            assert!(
+                read.iter().all(|key| key == "mode.json"
+                    || key.starts_with("shared/")
+                    || key.starts_with(&own)
+                    || (key.starts_with("member-") && key.ends_with("/owner.json"))),
+                "member {member} read {read:?}"
+            );
+        }
+    }
 }

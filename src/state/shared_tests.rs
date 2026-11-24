@@ -979,3 +979,86 @@ async fn a_fenced_writer_deletes_no_checkpoint() {
     assert_eq!(left, [views[0].1, views[3].1, views[4].1]);
     state.close().await.unwrap();
 }
+
+fn restore(id: &str) -> shared::Restore {
+    let members = crate::cluster::Store::initial(&[(1, "127.0.0.1:1".to_owned())].into());
+    shared::Restore::new(
+        vec![
+            (APPLIED.to_vec(), 1_u64.to_be_bytes().to_vec()),
+            (
+                crate::cluster::KEY.to_vec(),
+                serde_json::to_vec(&members).unwrap(),
+            ),
+            (b"etcd/restored".to_vec(), id.as_bytes().to_vec()),
+        ],
+        id.to_owned(),
+    )
+}
+
+fn restore_source(store: Arc<dyn ObjectStore>) -> (Arc<shared::Source>, slatedb::admin::Admin) {
+    let source = shared::offline_source(store.clone(), "cluster", StateCache::default()).unwrap();
+    let admin = slatedb::admin::Admin::builder(source.state().as_str(), store).build();
+    (source, admin)
+}
+
+/// The restore claim names the snapshot. The same snapshot restores again with success. Another
+/// snapshot fails, and so does a shared state that a normal start created.
+#[tokio::test]
+async fn a_restore_claim_names_its_snapshot() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (source, admin) = restore_source(store.clone());
+    shared::seed(&source, &admin, &restore("a")).await.unwrap();
+    shared::seed(&source, &admin, &restore("a")).await.unwrap();
+    let error = shared::seed(&source, &admin, &restore("b"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("another snapshot"), "{error:#}");
+    let (id, _) = shared::view_checkpoints(&admin)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(id, 1);
+    // A normal first leader created this shared state. It has no restore claim.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (source, admin) = restore_source(store);
+    let db = source.open_writer().await.unwrap();
+    db.put(b"etcd/other", b"value").await.unwrap();
+    db.flush().await.unwrap();
+    db.close().await.unwrap();
+    let error = shared::seed(&source, &admin, &restore("a"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("delete shared/"), "{error:#}");
+}
+
+/// A restore stopped after its rows reached the shared database and before its checkpoint and
+/// marker. The next restore of the same snapshot completes the checkpoint and the marker.
+#[tokio::test]
+async fn a_restore_completes_after_a_failure_before_its_marker() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (source, admin) = restore_source(store);
+    let partial = restore("a");
+    shared::seed_rows_for_test(&source, &partial).await.unwrap();
+    assert!(!source.bootstrapped().await.unwrap());
+    assert!(admin.read_manifest(None).await.unwrap().is_some());
+    shared::seed(&source, &admin, &partial).await.unwrap();
+    assert!(source.bootstrapped().await.unwrap());
+    let (seq, checkpoint) = shared::view_checkpoints(&admin)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(seq, 1);
+    let base = source.open_base(checkpoint.id).await.unwrap();
+    assert_eq!(base.applied, 1);
+    assert_eq!(
+        base.get(b"etcd/restored").await.unwrap().as_deref(),
+        Some(b"a".as_slice())
+    );
+    // Another snapshot cannot take over the partial state of this one.
+    let error = shared::seed(&source, &admin, &restore("b"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("another snapshot"), "{error:#}");
+}

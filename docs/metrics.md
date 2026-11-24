@@ -88,12 +88,13 @@ A member in shared state mode also exports these gauges. Replicated members omit
 | `slatedb_etcd_shared_base_applied_index` | Raft index of the checkpoint that the member reads |
 | `slatedb_etcd_shared_overlay_bytes` | Bytes of applied batches in the overlay above the base |
 | `slatedb_etcd_shared_apply_paused` | 1 while apply waits above twice `--overlay-max-bytes` |
-| `slatedb_etcd_shared_writer_running` | 1 while this member runs the shared writer |
+| `slatedb_etcd_shared_writer_running` | 1 while the writer database of this member is open |
+| `slatedb_etcd_shared_writer_clock_alarm` | 1 while the clock check keeps the writer closed |
 | `slatedb_etcd_shared_writer_reopens` | Writer opens after a fence or a lost manifest race |
 | `slatedb_etcd_shared_view_checkpoints` | `view-` checkpoints after the last publication |
 | `slatedb_etcd_shared_clock_skew_milliseconds` | Local clock lag behind the writer clock |
 
-The member sets the first five gauges on each Raft tick. The leader sets the checkpoint count
+The member sets the first six gauges on each Raft tick. The leader sets the checkpoint count
 after each publication. The clock gauge changes at each writer open.
 
 - A base index that stops while the applied index grows means that no checkpoint reaches the
