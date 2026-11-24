@@ -31,6 +31,17 @@ pub enum StateMode {
     Shared,
 }
 
+/// How the leader deletes old `view-` checkpoints.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum ViewRetention {
+    /// Keep every checkpoint. Each one pins its SSTs, so storage grows until a manual cleanup.
+    #[default]
+    Off,
+    /// Delete old checkpoints that no member pins. SlateDB deletes without an epoch check, so a
+    /// deposed leader can still race a new one between its epoch check and the deletion.
+    Fenced,
+}
+
 impl StateMode {
     pub fn is_replicated(&self) -> bool {
         *self == Self::Replicated
@@ -363,9 +374,13 @@ impl Source {
 
     /// Open the writable shared database. Opening it fences an older writer.
     pub async fn open_writer(&self) -> Result<Db> {
+        self.open_writer_with(slatedb_settings()).await
+    }
+
+    pub async fn open_writer_with(&self, settings: Settings) -> Result<Db> {
         Ok(Db::builder(self.state(), self.store.clone())
             .with_db_cache(self.cache.clone(), 0)
-            .with_settings(slatedb_settings())
+            .with_settings(settings)
             .with_block_cache_policy(block_cache_policy())
             .build()
             .await?)
@@ -459,11 +474,16 @@ pub(crate) fn retired(
 
 /// Delete the old `view-` checkpoints that no live base of this member pins and that no member
 /// reported. Other checkpoints are not ours.
+///
+/// Deletion writes the manifest without an epoch check, so a deposed writer could delete a
+/// checkpoint that the new leader's members pin. With `epoch`, retention reads the manifest
+/// before each deletion and stops when another writer holds a newer epoch.
 pub(crate) async fn retain(
     admin: &slatedb::admin::Admin,
     source: &Source,
     reported: &HashSet<uuid::Uuid>,
     keep: usize,
+    epoch: Option<u64>,
 ) -> Result<()> {
     let views: Vec<_> = view_checkpoints(admin)
         .await?
@@ -473,6 +493,20 @@ pub(crate) async fn retain(
     let candidates = source.begin_retire(&views, reported, keep);
     let mut result = Ok(());
     for id in &candidates {
+        if let Some(epoch) = epoch {
+            let current = admin.read_manifest(None).await.map_err(anyhow::Error::from);
+            match current.map(|manifest| manifest.map(|manifest| manifest.writer_epoch())) {
+                Ok(Some(current)) if current == epoch => {}
+                Ok(current) => {
+                    tracing::warn!(?current, epoch, "a newer writer holds the shared state");
+                    break;
+                }
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
         if let Err(error) = admin.delete_checkpoint(*id).await {
             result = Err(error.into());
             break;
@@ -516,8 +550,23 @@ async fn newest_base(admin: &slatedb::admin::Admin, source: &Source) -> Result<O
 
 /// Return true when `error` comes from an object that the store no longer has, such as an SST
 /// that GC deleted under an old base. Other storage errors still stop the member.
+///
+/// A SlateDB error keeps its kind and its object store source, so the check uses them. Apply
+/// reports some storage errors as text through `KvError`, so the check also matches that text.
 pub(crate) fn missing_object(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
+        if let Some(error) = cause.downcast_ref::<slatedb::Error>() {
+            let mut source = std::error::Error::source(error);
+            while let Some(inner) = source {
+                if matches!(
+                    inner.downcast_ref::<slatedb::object_store::Error>(),
+                    Some(slatedb::object_store::Error::NotFound { .. })
+                ) {
+                    return error.kind() == slatedb::ErrorKind::Data;
+                }
+                source = inner.source();
+            }
+        }
         let text = cause.to_string();
         text.contains("Data error") && text.contains("not found")
     })
@@ -568,6 +617,17 @@ impl Opened {
     pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
         self.ready.subscribe()
     }
+
+    /// The `F` of the opened base that waits in the slot.
+    #[cfg(test)]
+    pub(crate) fn newest(&self) -> Option<u64> {
+        self.slot.lock().unwrap().as_ref().map(|base| base.applied)
+    }
+
+    /// Take the opened base. The caller holds it until it adopts it or offers it back.
+    pub(crate) fn take(&self) -> Option<Arc<Base>> {
+        self.slot.lock().unwrap().take()
+    }
 }
 
 /// The shared-mode settings of one member.
@@ -593,9 +653,97 @@ pub(crate) struct Shared {
     pub(crate) source: Arc<Source>,
     /// `ViewCheckpoint` entries that this member applied.
     pub(crate) announcements: u64,
+    /// The checkpoint of the newest applied `ViewCheckpoint` entry. A new writer does not
+    /// announce it again.
+    announced: Arc<tokio::sync::watch::Sender<Option<uuid::Uuid>>>,
+    /// Background opens of announced checkpoints. DST waits for them to keep schedules exact.
+    opening: Vec<tokio::task::JoinHandle<()>>,
+    /// A failed open tries again until the base opens or a newer announcement replaces it.
+    /// DST turns this off, because a retry would run at a time that the schedule does not fix.
+    retry_opens: bool,
+    /// The checkpoint that waits for the opener task.
+    pending: Arc<Mutex<Pending>>,
     /// The `F` of the current base. Physical Compact replies wait for a covering base.
     based: Arc<tokio::sync::watch::Sender<u64>>,
     pub(crate) pin_max: Duration,
+}
+
+/// The first wait before a failed checkpoint open tries again.
+const OPEN_RETRY_MIN: Duration = Duration::from_millis(100);
+/// The longest wait between two open attempts.
+const OPEN_RETRY_MAX: Duration = Duration::from_secs(2);
+
+/// The announced checkpoint that waits for an open, and whether an opener task runs.
+#[derive(Default)]
+struct Pending {
+    /// Only the newest waiting checkpoint. A newer announcement replaces an older one.
+    id: Option<uuid::Uuid>,
+    running: bool,
+}
+
+/// Open announced checkpoints one at a time and offer each base for a switch.
+///
+/// A started open runs to its end, so a steady stream of announcements still advances the
+/// base. After each open the task takes the newest waiting checkpoint, if any.
+///
+/// The announcement is already applied, so the writer does not announce the checkpoint again,
+/// and a member that is not paused does not poll. Thus a failed open tries again with a
+/// backoff from `OPEN_RETRY_MIN` to `OPEN_RETRY_MAX`, also on an idle member. A newer waiting
+/// checkpoint replaces the failed one before the next attempt. The task stops when nothing
+/// waits, or when the state closes. A transient error never leaves the member on an old base.
+async fn open_announced(
+    source: Arc<Source>,
+    opened: Arc<Opened>,
+    pending: Arc<Mutex<Pending>>,
+    mut announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
+) {
+    let next = || {
+        let mut pending = pending.lock().unwrap();
+        let id = pending.id.take();
+        pending.running = id.is_some();
+        id
+    };
+    let waiting = || pending.lock().unwrap().id.is_some();
+    let mut current = next();
+    while let Some(id) = current {
+        let mut backoff = OPEN_RETRY_MIN;
+        loop {
+            match source.open_base(id).await {
+                Ok(base) => {
+                    opened.offer(base);
+                    break;
+                }
+                Err(error) => tracing::warn!(%error, %id, "cannot open a view checkpoint"),
+            }
+            if waiting() {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                changed = announced.changed() => {
+                    if changed.is_err() {
+                        pending.lock().unwrap().running = false;
+                        return;
+                    }
+                }
+            }
+            if waiting() {
+                break;
+            }
+            backoff = (backoff * 2).min(OPEN_RETRY_MAX);
+        }
+        current = next();
+    }
+}
+
+/// Open checkpoint `id` once and offer its base. A manual apply, such as DST, uses this, so
+/// each announcement opens its own checkpoint at a fixed point of the schedule.
+async fn open_once(source: Arc<Source>, opened: Arc<Opened>, id: uuid::Uuid) {
+    match source.open_base(id).await {
+        Ok(base) => opened.offer(base),
+        // The member keeps its base and waits for the next checkpoint.
+        Err(error) => tracing::warn!(%error, %id, "cannot open a view checkpoint"),
+    }
 }
 
 impl Shared {
@@ -607,6 +755,10 @@ impl Shared {
             opened: Arc::default(),
             source,
             announcements: 0,
+            announced: Arc::new(tokio::sync::watch::channel(None).0),
+            opening: vec![],
+            retry_opens: true,
+            pending: Arc::default(),
             pin_max,
         }
     }
@@ -633,16 +785,30 @@ impl Shared {
     /// Close the open segment and open checkpoint `id` in the background.
     pub(crate) fn announce(&mut self, id: uuid::Uuid) {
         self.announcements += 1;
+        self.announced.send_replace(Some(id));
         self.overlay.close_segment();
         let source = self.source.clone();
         let opened = self.opened.clone();
-        tokio::spawn(async move {
-            match source.open_base(id).await {
-                Ok(base) => opened.offer(base),
-                // The member keeps its base and waits for the next checkpoint.
-                Err(error) => tracing::warn!(%error, %id, "cannot open a view checkpoint"),
-            }
-        });
+        self.opening.retain(|task| !task.is_finished());
+        if !self.retry_opens {
+            self.opening
+                .push(tokio::spawn(open_once(source, opened, id)));
+            return;
+        }
+        // The checkpoint waits for the opener. It replaces an older waiting one, but not the
+        // open that runs.
+        let mut pending = self.pending.lock().unwrap();
+        pending.id = Some(id);
+        if pending.running {
+            return;
+        }
+        pending.running = true;
+        drop(pending);
+        let announced = self.announced.subscribe();
+        let pending = self.pending.clone();
+        self.opening.push(tokio::spawn(open_announced(
+            source, opened, pending, announced,
+        )));
     }
 
     /// Offer a base that opened elsewhere, such as in a test.
@@ -687,6 +853,8 @@ pub(crate) struct Handles {
     pub source: Arc<Source>,
     /// The `F` of the current base.
     pub based: tokio::sync::watch::Receiver<u64>,
+    /// The checkpoint of the newest applied `ViewCheckpoint` entry.
+    pub announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
     pub opened: Arc<Opened>,
 }
 
@@ -767,6 +935,7 @@ impl StateMachine {
             queue: shared.overlay.queue(),
             source: shared.source.clone(),
             based: shared.based.subscribe(),
+            announced: shared.announced.subscribe(),
             opened: shared.opened.clone(),
         })
     }
@@ -792,6 +961,28 @@ impl StateMachine {
         self.applied = index;
         self.applied_term = self.entry_term;
         Ok(())
+    }
+
+    /// Set whether a failed open of an announced checkpoint tries again. A manual apply, such
+    /// as DST, turns this off to keep its schedule exact.
+    pub(crate) fn set_open_retries(&mut self, retry: bool) {
+        if let Some(shared) = &mut self.shared {
+            shared.retry_opens = retry;
+        }
+    }
+
+    /// Wait for the background opens of announced checkpoints. Return true if one ran.
+    #[cfg(test)]
+    pub(crate) async fn settle_opens(&mut self) -> bool {
+        let Some(shared) = &mut self.shared else {
+            return false;
+        };
+        let opening = std::mem::take(&mut shared.opening);
+        let any = !opening.is_empty();
+        for task in opening {
+            let _ = task.await;
+        }
+        any
     }
 
     /// Use a base that finished opening. Apply calls this before each job.
@@ -867,6 +1058,13 @@ impl StateMachine {
             "rebase on a new checkpoint"
         );
         self.adopt_base(base, 0).await
+    }
+
+    /// Adopt the opened base above the applied index. A paused member uses this when its log
+    /// commits the base index, so the Raft log needs no change. `term` is the log term there.
+    pub(crate) async fn adopt_opened(&mut self, base: Arc<Base>, term: u64) -> Result<()> {
+        ensure!(base.applied > self.applied, "the opened base is not ahead");
+        self.adopt_base(base, term).await
     }
 
     /// Install a format 6 snapshot: the checkpoint that Raft sent. The receive handler opened it.

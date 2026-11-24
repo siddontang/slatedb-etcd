@@ -148,6 +148,12 @@ pub(super) enum Job {
     Snapshot(Snapshot),
     /// Shared mode: switch to a base that finished opening, and publish the new view.
     SwitchBase,
+    /// Shared mode: adopt this opened base above the applied index. The node verified its index
+    /// against the delivered commit, and `term` is the log term there. The job holds the base.
+    AdoptBase {
+        base: std::sync::Arc<crate::state::view::Base>,
+        term: u64,
+    },
     Query(Query),
     /// Flush the applied prefix. Build a full image only when `image` is set.
     Checkpoint {
@@ -190,6 +196,9 @@ pub(super) struct AppliedCommand {
 }
 
 pub(super) enum Output {
+    /// Shared mode adopted a checkpoint in process. Raft takes its ConfState, because the
+    /// skipped entries can hold membership changes.
+    Adopted(raft::eraftpb::ConfState),
     Reads(Vec<Output>),
     SharedLinear(Vec<u64>, std::sync::Arc<Outcome>),
     Linear {
@@ -303,7 +312,11 @@ impl Executor {
         }
         let changes_state = matches!(
             work.job,
-            Job::Entries(_) | Job::Snapshot(_) | Job::PublishPuts(_) | Job::SwitchBase
+            Job::Entries(_)
+                | Job::Snapshot(_)
+                | Job::PublishPuts(_)
+                | Job::SwitchBase
+                | Job::AdoptBase { .. }
         );
         let copy_state = changes_state || matches!(work.job, Job::Query(Query::Maintenance(..)));
         let previous_revision = self.state.revision;
@@ -333,6 +346,10 @@ impl Executor {
             }
             // The switch ran above. The new view goes out with the completion.
             Job::SwitchBase => Output::Entries(Vec::new()),
+            Job::AdoptBase { base, term } => {
+                self.state.adopt_opened(base, term).await?;
+                Output::Adopted(self.state.members.conf())
+            }
             Job::Snapshot(snapshot) => {
                 self.state.install_snapshot(&snapshot).await?;
                 // An object snapshot replaces the database. The node rebinds its handles.
@@ -587,9 +604,14 @@ impl Worker {
     pub fn state(&self) -> &StateMachine {
         &self.manual.as_ref().unwrap().0.state
     }
+
+    #[cfg(test)]
+    pub fn state_mut(&mut self) -> &mut StateMachine {
+        &mut self.manual.as_mut().unwrap().0.state
+    }
 }
 
-async fn apply_entries(
+pub(super) async fn apply_entries(
     state: &mut StateMachine,
     entries: Vec<Entry>,
     header: Header,

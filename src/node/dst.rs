@@ -6,6 +6,18 @@ use crate::mvcc::Outcome;
 use crate::proto::etcdserverpb::request_op::Request as Op;
 use crate::proto::etcdserverpb::response_op::Response as Resp;
 use crate::proto::etcdserverpb::{PutRequest, RangeRequest, WatchCreateRequest};
+use crate::state::{StateRead, StateScan};
+
+/// A digest of every `etcd/` row of a state.
+async fn rows_digest(state: &impl StateRead) -> std::result::Result<u32, slatedb::Error> {
+    let mut scan = state.scan_under(b"etcd/", &Default::default()).await?;
+    let mut digest = 0;
+    while let Some(row) = scan.next().await? {
+        digest = crc32c::crc32c_append(digest, &row.key);
+        digest = crc32c::crc32c_append(digest, &row.value);
+    }
+    Ok(digest)
+}
 
 struct ClientRequest {
     key: String,
@@ -52,6 +64,18 @@ struct Simulation {
     next_request: u64,
     trace: Vec<String>,
     installed_snapshots: u64,
+    /// Every value that a client proposed. A read must not return another value.
+    proposed: BTreeSet<(String, String)>,
+    /// Shared mode: the one object store of all members.
+    shared: Option<std::sync::Arc<crate::object::faults::FaultStore>>,
+    /// Shared mode: a replicated state that applies the committed entries in order.
+    reference: Option<StateMachine>,
+    /// Shared mode: the reference digest of the `etcd/` rows after each index.
+    digests: BTreeMap<u64, u32>,
+    /// Shared mode: the last applied index that the view check covered on each member.
+    checked: BTreeMap<u64, u64>,
+    /// Shared mode: member views that matched the reference.
+    view_checks: u64,
 }
 
 impl Drop for Simulation {
@@ -68,9 +92,26 @@ impl Drop for Simulation {
 
 impl Simulation {
     async fn new(seed: u64) -> Self {
+        Self::with_mode(seed, false).await
+    }
+
+    /// Start three members. Shared mode gives them one fault-injectable in-memory store.
+    async fn with_mode(seed: u64, shared: bool) -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let reference = if shared {
+            let mut reference = StateMachine::open(&root.path().join("reference"))
+                .await
+                .unwrap();
+            let peers = (1..=3).map(|n| (n, format!("127.0.0.1:{n}"))).collect();
+            reference.members = std::sync::Arc::new(crate::cluster::Store::initial(&peers));
+            reference.members_unsaved = true;
+            Some(reference)
+        } else {
+            None
+        };
         let mut sim = Self {
             seed,
-            root: tempfile::tempdir().unwrap(),
+            root,
             stores: BTreeMap::new(),
             nodes: BTreeMap::new(),
             links: BTreeMap::new(),
@@ -95,6 +136,16 @@ impl Simulation {
             next_request: 0,
             trace: vec![],
             installed_snapshots: 0,
+            proposed: BTreeSet::new(),
+            shared: shared.then(|| {
+                std::sync::Arc::new(crate::object::faults::FaultStore::new(std::sync::Arc::new(
+                    slatedb::object_store::memory::InMemory::new(),
+                )))
+            }),
+            reference,
+            digests: BTreeMap::new(),
+            checked: BTreeMap::new(),
+            view_checks: 0,
         };
         for id in 1..=3 {
             sim.start(id).await;
@@ -122,27 +173,43 @@ impl Simulation {
             senders.insert(peer, tx);
             self.links.insert((id, peer), rx);
         }
-        let store = self
-            .stores
-            .entry(id)
-            .or_insert_with(|| {
-                let path = self.root.path().join(id.to_string()).join("objects");
-                std::fs::create_dir_all(&path).unwrap();
-                std::sync::Arc::new(crate::object::faults::FaultStore::new(std::sync::Arc::new(
-                    slatedb::object_store::local::LocalFileSystem::new_with_prefix(path).unwrap(),
-                )))
-            })
-            .clone();
+        let store = match &self.shared {
+            Some(store) => store.clone(),
+            None => self
+                .stores
+                .entry(id)
+                .or_insert_with(|| {
+                    let path = self.root.path().join(id.to_string()).join("objects");
+                    std::fs::create_dir_all(&path).unwrap();
+                    std::sync::Arc::new(crate::object::faults::FaultStore::new(
+                        std::sync::Arc::new(
+                            slatedb::object_store::local::LocalFileSystem::new_with_prefix(path)
+                                .unwrap(),
+                        ),
+                    ))
+                })
+                .clone(),
+        };
+        let shared = self.shared.is_some();
         let node = Node::open_with_transport(
             NodeOptions {
                 client_peers: BTreeMap::new(),
                 transport: crate::tls::Transport::default(),
                 require_peer_tls: false,
-                state_mode: Default::default(),
+                state_mode: if shared {
+                    crate::state::StateMode::Shared
+                } else {
+                    crate::state::StateMode::Replicated
+                },
                 view_max_age: std::time::Duration::from_secs(10),
                 view_pin_max: std::time::Duration::from_secs(300),
                 overlay_max_bytes: 1 << 30,
-                object_store: crate::object::Config::Test(store, "state".into()),
+                max_clock_skew: std::time::Duration::from_secs(5),
+                view_retention: Default::default(),
+                object_store: crate::object::Config::Test(
+                    store,
+                    if shared { "root" } else { "state" }.into(),
+                ),
                 strict_reconfiguration: false,
                 join: false,
                 quota_bytes: 0,
@@ -150,7 +217,8 @@ impl Simulation {
                 cluster_id: "dst".into(),
                 dir: self.root.path().join(id.to_string()),
                 peers: (1..=3).map(|n| (n, format!("127.0.0.1:{n}"))).collect(),
-                snapshot_every: 0,
+                // Shared members truncate often, so a lagging member needs a format 6 snapshot.
+                snapshot_every: if shared { 8 } else { 0 },
                 snapshot_min_bytes: 0,
                 log_memory: LogMemory {
                     cache_bytes: 1024,
@@ -286,6 +354,14 @@ impl Simulation {
                     else {
                         panic!("expected range");
                     };
+                    for kv in &response.kvs {
+                        let key = String::from_utf8_lossy(&kv.key).into_owned();
+                        let value = String::from_utf8_lossy(&kv.value).into_owned();
+                        assert!(
+                            !key.starts_with("key-") || self.proposed.contains(&(key, value)),
+                            "a read returned a value that no client wrote"
+                        );
+                    }
                     for (key, value) in read.known {
                         assert!(
                             response
@@ -368,6 +444,58 @@ impl Simulation {
                     assert_eq!(previous, bytes, "committed index {} changed", entry.index);
                 }
             }
+        }
+        if self.shared.is_some() {
+            self.check_shared().await;
+        }
+    }
+
+    /// Shared-mode invariants after every step.
+    ///
+    /// - Background checkpoint opens finish before the next step, so a schedule stays exact.
+    /// - A replicated reference applies the committed entries in order.
+    /// - Each member's view at its applied index equals the reference at that index. A view can
+    ///   fail on a deleted object, but it never returns other data.
+    async fn check_shared(&mut self) {
+        for node in self.nodes.values_mut() {
+            if node.worker.state_mut().settle_opens().await {
+                if let Some(writer) = &mut node.writer {
+                    writer.switch_due = true;
+                }
+            }
+        }
+        let reference = self.reference.as_mut().unwrap();
+        while let Some(bytes) = self.committed_entries.get(&(reference.applied + 1)) {
+            let entry = Entry::decode(bytes.as_slice()).unwrap();
+            let header = Header {
+                cluster: 0,
+                member: 0,
+                term: entry.term,
+            };
+            apply::apply_entries(reference, vec![entry], header)
+                .await
+                .unwrap();
+            let digest = rows_digest(reference.applied_state()).await.unwrap();
+            self.digests.insert(reference.applied, digest);
+        }
+        for (&id, node) in &self.nodes {
+            let applied = node.state.applied;
+            if self.checked.get(&id) == Some(&applied) {
+                continue;
+            }
+            let Some(&expected) = self.digests.get(&applied) else {
+                continue;
+            };
+            let Ok(actual) = rows_digest(node.state.read.state()).await else {
+                continue;
+            };
+            assert_eq!(
+                actual, expected,
+                "seed {}: member {id} view at {applied} differs from the reference",
+                self.seed
+            );
+            self.checked.insert(id, applied);
+            self.view_checks += 1;
         }
     }
 
@@ -454,6 +582,7 @@ impl Simulation {
             )
             .unwrap();
         self.trace.push(format!("propose {leader} {key}"));
+        self.proposed.insert((key.clone(), value.clone()));
         self.requests.push(ClientRequest {
             key,
             value,
@@ -1884,5 +2013,370 @@ async fn truncation_without_an_image_recovers_and_serves_an_on_demand_snapshot()
     sim.settle(10).await;
     for id in 1..=3 {
         sim.assert_acknowledged(id).await;
+    }
+}
+
+/// The writer steps of a shared-mode schedule.
+#[derive(Clone, Copy, Debug)]
+enum WriterStep {
+    Open,
+    Materialize,
+    Checkpoint,
+    Announce,
+    Retain,
+}
+
+impl Simulation {
+    /// Run one writer step on member `id`. A fence closes the writer; the next open step opens
+    /// it again. Any other writer error stops the member, as architecture rule 8 requires.
+    async fn writer_step(
+        &mut self,
+        writers: &mut BTreeMap<u64, shared::DstWriter>,
+        id: u64,
+        step: WriterStep,
+    ) {
+        // Members that the leader can reach report their pins. An isolated member does not, so
+        // its base can go away, as for a member that stopped reporting.
+        let mut pins = std::collections::HashSet::new();
+        for (&member, other) in &self.nodes {
+            if Some(member) != self.isolated {
+                pins.extend(other.dst_pins());
+            }
+        }
+        let Some(node) = self.nodes.get_mut(&id) else {
+            return;
+        };
+        let writer = writers.entry(id).or_default();
+        // SlateDB finds a fence at its next manifest write or poll, at a time that the schedule
+        // does not fix. The simulated writer checks the epoch first, so a newer writer always
+        // fences it at its next step.
+        if writer.db.is_some() && !matches!(step, WriterStep::Open) && node.dst_fenced(writer).await
+        {
+            writer.close().await;
+            self.trace.push(format!("writer {id} {step:?} fenced"));
+            self.drive().await;
+            return;
+        }
+        let result = match step {
+            WriterStep::Open => node.dst_open(writer, false).await.map(drop),
+            WriterStep::Materialize => node.dst_materialize(writer).await.map(drop),
+            WriterStep::Checkpoint => node.dst_checkpoint(writer).await.map(drop),
+            WriterStep::Announce => node.dst_announce(writer),
+            WriterStep::Retain => node.dst_retain(writer, &pins).await,
+        };
+        match result {
+            Ok(()) => self.trace.push(format!("writer {id} {step:?}")),
+            Err(error) if shared::fenced(&error) => {
+                writer.close().await;
+                self.trace.push(format!("writer {id} {step:?} fenced"));
+            }
+            Err(error) => {
+                writer.close().await;
+                self.trace.push(format!("writer {id} {step:?} failed"));
+                tracing::debug!(%error, id, "writer step failed");
+                self.stop(id);
+            }
+        }
+        self.drive().await;
+    }
+
+    /// Read the keys on a member's published view, as a serializable Range does. A ReadIndex read
+    /// waits on wall-clock limits, so shared schedules use this read. It must return only
+    /// values that clients wrote.
+    async fn view_read(&mut self) {
+        let pick = self.choose(3);
+        let Some((&id, node)) = self.nodes.iter().nth(pick) else {
+            return;
+        };
+        let view = node.state.read.clone();
+        let request = RequestOp {
+            request: Some(Op::RequestRange(RangeRequest {
+                key: b"key-".to_vec(),
+                range_end: b"key.".to_vec(),
+                ..Default::default()
+            })),
+        };
+        if let Ok(Some(Resp::ResponseRange(response))) = view
+            .read(&request, None)
+            .await
+            .map(|outcome| outcome.result.ok().and_then(|reply| reply.response))
+        {
+            for kv in &response.kvs {
+                let key = String::from_utf8_lossy(&kv.key).into_owned();
+                let value = String::from_utf8_lossy(&kv.value).into_owned();
+                assert!(
+                    self.proposed.contains(&(key, value)),
+                    "seed {}: a view read returned a value that no client wrote",
+                    self.seed
+                );
+            }
+        }
+        self.trace.push(format!("view read {id}"));
+    }
+
+    /// Close every outstanding client request. The members see closed responses at their next
+    /// checks, which the schedule fixes.
+    async fn drop_clients(&mut self) {
+        self.drive().await;
+        self.requests.clear();
+        self.reads.clear();
+        self.revisions.clear();
+        self.trace.push("drop clients".into());
+        self.drive().await;
+    }
+
+    /// Run GC once on the shared database, after its minimum age.
+    async fn collect_garbage(&mut self) {
+        let Some(node) = self.nodes.values().next() else {
+            return;
+        };
+        let Some(writer) = &node.writer else {
+            return;
+        };
+        let directory = slatedb::config::GarbageCollectorDirectoryOptions {
+            interval: None,
+            min_age: std::time::Duration::from_millis(200),
+            dry_run: false,
+        };
+        let options = slatedb::config::GarbageCollectorOptions {
+            manifest_options: Some(directory),
+            compacted_options: Some(directory),
+            ..Default::default()
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let admin = writer.admin.clone();
+        let _ = admin.run_gc_once(options).await;
+        self.trace.push("gc".into());
+        self.drive().await;
+    }
+
+    /// A shared-mode schedule: one store, writer steps at random points, leader changes,
+    /// crashes between writer steps, late opens of deposed writers, partitions, object store
+    /// failures, retention with GC, and reads on old views.
+    async fn run_shared(seed: u64) -> Vec<String> {
+        let mut sim = Self::with_mode(seed, true).await;
+        let mut writers = BTreeMap::new();
+        for _ in 0..100 {
+            sim.deliver(false).await;
+        }
+        sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+        let mut stopped = None;
+        let mut held = vec![];
+        let mut collections = 0;
+        for step in 0..800 {
+            // Requests expire after 5 s of wall time, and shared steps do real object I/O. The
+            // clients give up at fixed steps, so no request lives long enough to expire on time.
+            if step % 40 == 39 {
+                sim.drop_clients().await;
+            }
+            let leader = sim.leader();
+            match sim.choose(34) {
+                0..=10 => {
+                    for _ in 0..4 {
+                        sim.deliver(true).await;
+                    }
+                }
+                11..=12 => {
+                    let id = sim.choose(3) as u64 + 1;
+                    sim.tick(id).await;
+                }
+                13..=17 => sim.propose().await,
+                18 => sim.view_read().await,
+                31..=33 => {
+                    if let Some(leader) = leader {
+                        sim.writer_step(&mut writers, leader, WriterStep::Retain)
+                            .await;
+                    }
+                }
+                19..=20 | 28..=29 => {
+                    if let Some(leader) = leader {
+                        let step = match sim.choose(5) {
+                            0 => WriterStep::Open,
+                            1 => WriterStep::Materialize,
+                            2 => WriterStep::Checkpoint,
+                            3 => WriterStep::Announce,
+                            _ => WriterStep::Retain,
+                        };
+                        let open = writers
+                            .get(&leader)
+                            .is_some_and(|writer: &shared::DstWriter| writer.db.is_some());
+                        let step = if open { step } else { WriterStep::Open };
+                        sim.writer_step(&mut writers, leader, step).await;
+                    }
+                }
+                21 => {
+                    // A crash between two writer steps, often on the leader: before or after a
+                    // checkpoint, its marker, or its announcement.
+                    if let Some(id) = stopped.take() {
+                        sim.start(id).await;
+                        sim.drive().await;
+                    } else {
+                        let id = leader.unwrap_or(sim.choose(3) as u64 + 1);
+                        if let Some(mut writer) = writers.remove(&id) {
+                            writer.close().await;
+                        }
+                        sim.stop(id);
+                        stopped = Some(id);
+                    }
+                }
+                22 => {
+                    // A deposed member's slow open fences the current writer.
+                    let pick = sim.choose(2);
+                    let deposed = (1..=3)
+                        .filter(|id| Some(*id) != leader && sim.nodes.contains_key(id))
+                        .nth(pick);
+                    if let Some(id) = deposed {
+                        let writer = writers.entry(id).or_default();
+                        let node = sim.nodes.get_mut(&id).unwrap();
+                        if node.dst_open(writer, true).await.unwrap_or(false) {
+                            sim.trace.push(format!("writer {id} late open"));
+                            // The deposed writer's own next commit fails with a fence.
+                            writer.close().await;
+                        }
+                    }
+                }
+                23 => {
+                    sim.isolated = match sim.isolated {
+                        Some(_) => None,
+                        None => Some(sim.choose(3) as u64 + 1),
+                    };
+                    sim.trace.push(format!("isolate {:?}", sim.isolated));
+                }
+                24..=26 => {
+                    // Hold a view across later switches, retention, and GC, then read it.
+                    if held.len() < 3 {
+                        let pick = sim.choose(3);
+                        if let Some(node) = sim.nodes.values().nth(pick) {
+                            held.push((node.state.applied, node.state.read.clone()));
+                        }
+                    } else {
+                        let (applied, view) = held.remove(0);
+                        if let (Ok(actual), Some(expected)) =
+                            (rows_digest(view.state()).await, sim.digests.get(&applied))
+                        {
+                            assert_eq!(actual, *expected, "seed {seed}: a held view changed");
+                        }
+                        sim.trace.push("held read".into());
+                    }
+                }
+                27 => {
+                    // The object store rejects SST writes for a while.
+                    let store = sim.shared.clone().unwrap();
+                    store.set(crate::object::faults::FAIL_PUT);
+                    for _ in 0..5 {
+                        sim.deliver(true).await;
+                        if let Some(leader) = sim.leader() {
+                            sim.writer_step(&mut writers, leader, WriterStep::Checkpoint)
+                                .await;
+                        }
+                    }
+                    store.set(0);
+                    sim.trace.push("store recovered".into());
+                }
+                _ => {
+                    if collections < 3 {
+                        collections += 1;
+                        sim.collect_garbage().await;
+                    }
+                }
+            }
+        }
+        // Recover: every member runs, the network heals, and the leader publishes.
+        if let Some(id) = stopped.take() {
+            sim.start(id).await;
+        }
+        sim.isolated = None;
+        for round in 0..60 {
+            if round % 10 == 9 {
+                sim.drop_clients().await;
+            }
+            for id in 1..=3 {
+                sim.tick(id).await;
+            }
+            if round < 40 {
+                sim.propose().await;
+                sim.view_read().await;
+            }
+            for _ in 0..30 {
+                sim.deliver(false).await;
+            }
+            if let Some(leader) = sim.leader() {
+                for step in [
+                    WriterStep::Open,
+                    WriterStep::Materialize,
+                    WriterStep::Checkpoint,
+                    WriterStep::Announce,
+                ] {
+                    let open = writers
+                        .get(&leader)
+                        .is_some_and(|writer: &shared::DstWriter| writer.db.is_some());
+                    if matches!(step, WriterStep::Open) == open {
+                        continue;
+                    }
+                    sim.writer_step(&mut writers, leader, step).await;
+                }
+            }
+        }
+        // Every member reaches the last commit with the reference state.
+        let commit = sim
+            .nodes
+            .values()
+            .map(|n| n.raw.raft.raft_log.committed)
+            .max();
+        for (&id, node) in &sim.nodes {
+            assert_eq!(
+                Some(node.state.applied),
+                commit,
+                "seed {seed}: member {id} did not catch up"
+            );
+            let actual = rows_digest(node.state.read.state()).await.unwrap();
+            assert_eq!(Some(&actual), sim.digests.get(&node.state.applied));
+        }
+        for (key, value) in sim.acknowledged.clone() {
+            let node = sim.nodes.values().next().unwrap();
+            let row = node
+                .state
+                .read
+                .state()
+                .get(format!("etcd/current/{key}").as_bytes())
+                .await
+                .unwrap();
+            assert!(
+                row.is_some(),
+                "seed {seed}: lost acknowledged {key}={value}"
+            );
+        }
+        for (_, mut writer) in writers {
+            writer.close().await;
+        }
+        sim.trace.push(format!(
+            "acknowledged {} views checked {}",
+            sim.acknowledged.len(),
+            sim.view_checks
+        ));
+        sim.trace.clone()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_store_schedules_replay_identically() {
+    let seeds = std::env::var("SLATEDB_DST_SHARED_SEEDS").unwrap_or_else(|_| "1,2,3".into());
+    for seed in seeds.split(',').map(|s| s.parse::<u64>().unwrap()) {
+        eprintln!("shared DST seed {seed}: starting");
+        let first = Simulation::run_shared(seed).await;
+        let second = Simulation::run_shared(seed).await;
+        let trace_dir =
+            std::env::var("SLATEDB_DST_TRACE_DIR").unwrap_or_else(|_| "target/dst".into());
+        std::fs::create_dir_all(&trace_dir).unwrap();
+        std::fs::write(
+            format!("{trace_dir}/shared-seed-{seed}.json"),
+            serde_json::to_vec_pretty(&first).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            first, second,
+            "shared seed {seed}: simulation schedule changed"
+        );
+        eprintln!("shared DST seed {seed}: {} events replayed", first.len());
     }
 }
