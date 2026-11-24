@@ -16,6 +16,7 @@ Use `tmp/test-results/` for local output unless you intend to update a retained 
 | `fault-tests.json` | Original three-replica experiment |
 | `latency.json`, `latency-with-snapshots.json` | Original local JSON benchmarks |
 | `before-background-snapshots.json` | An earlier failed benchmark kept for comparison |
+| `performance/shared-state.md`, `.jsonl` | Shared state mode compared with replicated mode |
 
 Read `passed`, `complete`, and `leaf_counts` where present.
 A parent Go test can pass while a child skips. Do not add overlapping profile counts together.
