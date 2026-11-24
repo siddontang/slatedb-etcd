@@ -16,6 +16,8 @@ pub(crate) struct FaultStore {
     mode: AtomicU8,
     pub entered: Semaphore,
     pub release: Semaphore,
+    /// Wakes stalled puts after a mode change.
+    resumed: tokio::sync::Notify,
 }
 
 pub(crate) const FAIL_PUT: u8 = 1;
@@ -23,6 +25,10 @@ pub(crate) const PAUSE_PUT: u8 = 2;
 pub(crate) const LOSE_PUT_REPLY: u8 = 3;
 pub(crate) const FAIL_GET: u8 = 4;
 pub(crate) const FAIL_SST_GET: u8 = 5;
+/// Hold every put until the mode changes, like a stalled object store.
+pub(crate) const STALL_PUT: u8 = 6;
+/// Report the next SST read as missing, like an SST that GC deleted.
+pub(crate) const LOSE_SST_ONCE: u8 = 7;
 
 impl FaultStore {
     pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
@@ -31,11 +37,23 @@ impl FaultStore {
             mode: AtomicU8::new(0),
             entered: Semaphore::new(0),
             release: Semaphore::new(0),
+            resumed: tokio::sync::Notify::new(),
         }
     }
 
     pub fn set(&self, mode: u8) {
         self.mode.store(mode, Ordering::SeqCst);
+        self.resumed.notify_waiters();
+    }
+
+    async fn stall(&self) {
+        loop {
+            let resumed = self.resumed.notified();
+            if self.mode.load(Ordering::SeqCst) != STALL_PUT {
+                return;
+            }
+            resumed.await;
+        }
     }
 }
 
@@ -59,6 +77,7 @@ impl ObjectStore for FaultStore {
         payload: PutPayload,
         options: PutOptions,
     ) -> Result<PutResult> {
+        self.stall().await;
         if path.as_ref().ends_with(".sst") {
             match self.mode.load(Ordering::SeqCst) {
                 FAIL_PUT => {
@@ -91,11 +110,20 @@ impl ObjectStore for FaultStore {
         path: &Path,
         options: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
+        self.stall().await;
         self.inner.put_multipart_opts(path, options).await
     }
 
     async fn get_opts(&self, path: &Path, options: GetOptions) -> Result<GetResult> {
         let mode = self.mode.load(Ordering::SeqCst);
+        if mode == LOSE_SST_ONCE && path.as_ref().ends_with(".sst") {
+            self.mode.store(0, Ordering::SeqCst);
+            self.entered.add_permits(1);
+            return Err(Error::NotFound {
+                path: path.to_string(),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "injected loss").into(),
+            });
+        }
         if mode == FAIL_GET || (mode == FAIL_SST_GET && path.as_ref().ends_with(".sst")) {
             self.entered.add_permits(1);
             return Err(error());

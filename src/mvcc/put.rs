@@ -608,7 +608,7 @@ mod tests {
             })),
         };
         let view = CurrentView {
-            db: state.db.as_ref(),
+            db: state.db().as_ref(),
             rows: &state.current,
             index: &state.key_index,
         };

@@ -5,33 +5,47 @@ use super::*;
 type CheckpointJob =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Vec<u8>>>> + Send>>;
 
+/// The index, the ConfState, and the job of one checkpoint.
+pub(crate) type CheckpointParts = (u64, raft::eraftpb::ConfState, CheckpointJob);
+
 impl StateMachine {
+    /// Start a checkpoint of the applied prefix. Shared mode takes its base instead: the record
+    /// is a format 6 descriptor at `F`, with the ConfState of the checkpoint. It needs no flush.
+    pub(crate) async fn checkpoint_parts(&self, image: bool) -> Result<CheckpointParts> {
+        if !self.is_shared() {
+            let job = self.checkpoint_job(image).await?;
+            return Ok((self.applied, self.members.conf(), job));
+        }
+        let (index, data, conf) = self
+            .base_snapshot()
+            .await?
+            .context("shared state has no checkpoint yet")?;
+        Ok((index, conf, Box::pin(async move { Ok(Some(data)) })))
+    }
+
     /// Pin the applied prefix now, then flush it outside the Raft loop.
     ///
     /// The flush makes the state and its apply marker durable through the pinned index. That
     /// state covers the local log without a copy. Only a peer that needs a snapshot requests an
     /// image. The image is a descriptor of a SlateDB checkpoint at the pinned index.
     pub(crate) async fn checkpoint_job(&self, image: bool) -> Result<CheckpointJob> {
-        ensure!(
-            !self.is_shared(),
-            "shared state mode has no local checkpoints before phase 2"
-        );
+        ensure!(!self.is_shared(), "shared state mode checkpoints its base");
         if image {
             // A peer copies the SlateDB checkpoint objects. See `transfer`.
             ensure!(
-                self.db.snapshot()?.seq() == self.applied,
+                self.db().snapshot()?.seq() == self.applied,
                 "checkpoint does not match the apply marker"
             );
             let members = serde_json::to_vec(self.members.as_ref())?;
-            let job = Box::pin(self.location.begin(&self.db, self.applied, members)).await?;
+            let job = Box::pin(self.location.begin(self.db(), self.applied, members)).await?;
             return Ok(Box::pin(async move { job.await.map(Some) }));
         }
         ensure!(
-            self.db.snapshot()?.seq() == self.applied,
+            self.db().snapshot()?.seq() == self.applied,
             "checkpoint does not match the apply marker"
         );
         let metrics = self.metrics.clone();
-        let db = self.db.clone();
+        let db = self.db().clone();
         Ok(Box::pin(async move {
             metrics.flush_db(&db).await?;
             Ok(None)

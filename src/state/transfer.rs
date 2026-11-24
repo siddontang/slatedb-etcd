@@ -40,6 +40,45 @@ pub(crate) enum Backend {
     },
 }
 
+/// The Raft snapshot format of shared state mode. It names a `view-` checkpoint of the shared
+/// database. Every member reads the same objects, so any member can send it.
+pub(crate) const VIEW_SNAPSHOT_FORMAT: u32 = 6;
+
+/// The Raft snapshot data of format 6. The snapshot metadata holds the index, term, and
+/// ConfState from the checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ViewDescriptor {
+    pub version: u32,
+    pub checkpoint: String,
+}
+
+impl ViewDescriptor {
+    pub fn new(checkpoint: uuid::Uuid) -> Self {
+        Self {
+            version: VIEW_SNAPSHOT_FORMAT,
+            checkpoint: checkpoint.to_string(),
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        Ok(crate::codec::encode(self)?)
+    }
+
+    /// Decode format 6 data. Other formats return `None`.
+    pub fn decode(data: &[u8]) -> Result<Option<Self>> {
+        if format(data) != Some(VIEW_SNAPSHOT_FORMAT) {
+            return Ok(None);
+        }
+        let descriptor: Self = crate::codec::decode(data).context("invalid view descriptor")?;
+        descriptor.checkpoint()?;
+        Ok(Some(descriptor))
+    }
+
+    pub fn checkpoint(&self) -> Result<uuid::Uuid> {
+        uuid::Uuid::parse_str(&self.checkpoint).context("invalid view checkpoint")
+    }
+}
+
 /// The Raft snapshot data of format 5.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Descriptor {
@@ -100,6 +139,9 @@ fn now_ms() -> u64 {
 pub(crate) fn sendable(data: &[u8], member: u64) -> bool {
     if data.is_empty() {
         return false;
+    }
+    if format(data) == Some(VIEW_SNAPSHOT_FORMAT) {
+        return ViewDescriptor::decode(data).is_ok();
     }
     match Descriptor::decode(data) {
         Ok(Some(descriptor)) => {

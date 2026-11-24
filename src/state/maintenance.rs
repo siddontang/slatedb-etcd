@@ -49,6 +49,11 @@ impl StateMachine {
                 }
                 Ok(json!({"header": mvcc::header(self.revision), "hash": hash}))
             }
+            // The shared database belongs to the leader writer. Phase 4 adds Defragment there.
+            Command::Defragment if self.is_shared() => Err(KvError::new(
+                Code::Unimplemented,
+                "shared state mode has no Defragment until phase 4",
+            )),
             Command::Defragment => self
                 .defragment()
                 .await
@@ -156,11 +161,8 @@ impl StateMachine {
     async fn defragment(&mut self) -> Result<()> {
         let _timer = self.metrics.defrag.start_timer();
         let _active = crate::metrics::Active::new(&self.metrics.defrag_active);
-        self.metrics.flush_db(&self.db).await?;
-        // A shared-mode flush covers only the materialized prefix.
-        if !self.is_shared() {
-            self.durable_applied = self.applied;
-        }
+        self.metrics.flush_db(self.db()).await?;
+        self.durable_applied = self.applied;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         loop {
             let manifest = self

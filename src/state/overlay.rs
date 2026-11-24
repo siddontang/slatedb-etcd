@@ -141,6 +141,12 @@ impl Queue {
         self.pushed.send_replace(seq);
     }
 
+    /// Drop every batch and start again after `base`.
+    fn reset(&self, base: u64) {
+        self.batches.lock().unwrap().clear();
+        self.pushed.send_replace(base);
+    }
+
     fn release(&self, through: u64) {
         let mut batches = self.batches.lock().unwrap();
         while batches.front().is_some_and(|(seq, _)| *seq <= through) {
@@ -200,6 +206,14 @@ impl Overlay {
             self.shared = self.segments.clone().into();
         }
         self.queue.release(through);
+    }
+
+    /// Drop all segments and batches. The new base at `base` holds their state. The queue stays
+    /// the same object, so the materializer keeps its handle.
+    pub(crate) fn reset(&mut self, base: u64) {
+        self.segments = vec![Arc::new(Segment::default())];
+        self.shared = self.segments.clone().into();
+        self.queue.reset(base);
     }
 
     pub(crate) fn segments(&self) -> Arc<[Arc<Segment>]> {

@@ -25,6 +25,10 @@ pub enum MetricsLevel {
 
 /// The default age limit of unflushed shared-mode writes.
 pub const DEFAULT_VIEW_MAX_AGE: Duration = Duration::from_secs(10);
+/// The default time that a shared-mode read view may pin its base checkpoint.
+pub const DEFAULT_VIEW_PIN_MAX: Duration = Duration::from_secs(5 * 60);
+/// The default soft limit of the shared-mode overlay.
+pub const DEFAULT_OVERLAY_MAX_BYTES: u64 = 1 << 30;
 
 /// Configuration for one member. Preserve its ID, cluster ID, and directory across restarts.
 #[derive(Clone)]
@@ -62,6 +66,11 @@ pub struct ServerConfig {
     pub state_mode: crate::state::StateMode,
     /// Shared mode: flush and publish a checkpoint when the oldest unflushed write is this old.
     pub view_max_age: Duration,
+    /// Shared mode: a read fails with a retryable error when its view is older than this.
+    pub view_pin_max: Duration,
+    /// Shared mode: the leader rejects client proposals above this overlay size, and apply
+    /// waits above twice this size.
+    pub overlay_max_bytes: u64,
 }
 
 impl ServerConfig {
@@ -94,6 +103,8 @@ impl ServerConfig {
             restore_snapshot: None,
             state_mode: crate::state::StateMode::Replicated,
             view_max_age: DEFAULT_VIEW_MAX_AGE,
+            view_pin_max: DEFAULT_VIEW_PIN_MAX,
+            overlay_max_bytes: DEFAULT_OVERLAY_MAX_BYTES,
         }
     }
 }
@@ -130,7 +141,7 @@ impl Server {
         );
         ensure!(
             config.state_mode.is_replicated() || config.restore_snapshot.is_none(),
-            "shared state mode cannot restore a snapshot until phase 2"
+            "shared state mode cannot restore a snapshot until phase 4"
         );
         ensure!(
             config.id != 0 && !config.peers.contains_key(&0),
@@ -291,6 +302,8 @@ impl Server {
                 require_peer_tls: config.allow_remote,
                 state_mode: config.state_mode,
                 view_max_age: config.view_max_age,
+                view_pin_max: config.view_pin_max,
+                overlay_max_bytes: config.overlay_max_bytes,
                 transport,
             },
             events.clone(),
@@ -300,6 +313,7 @@ impl Server {
             events: events.clone(),
             cluster_id: config.cluster_id.clone(),
             location: Some(node.location.clone()),
+            shared: node.shared_source(),
         });
         // Peer gRPC has no RPC metrics; diagnostics paths never collide with gRPC services.
         let peer_app = App::new(

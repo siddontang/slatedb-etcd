@@ -139,18 +139,27 @@ checkpoint of it, its base, under an in-memory overlay of the newer applied batc
 | --- | --- | --- |
 | `--state-mode` | `replicated` | State layout of a new cluster: `replicated` or `shared`. |
 | `--view-max-age` | `10s` | Age of the oldest unflushed write that starts a flush and checkpoint. |
+| `--view-pin-max` | `5m` | Age after which a read view fails with a retryable error. |
+| `--overlay-max-bytes` | 1073741824 | Leader admission limit of the overlay. Apply waits at 2x. |
 
-Phase 1 limits:
+Rules and limits:
 
-- Shared mode supports one voter. It rejects more peers, `--join`, MemberAdd, and Promote.
+- All members use one S3 bucket and prefix. Learners and `--join` members are supported.
 - The cluster claim `shared/owner.json` stores the mode, the quota, and the initial voters.
   Later starts use that quota. A member with other initial voters refuses to open the writer.
 - On S3, `mode.json` under the cluster prefix fixes the mode before any state write. A shared start
   also refuses a prefix that holds a replicated member namespace.
 - A directory keeps its mode. A member refuses to start in a different mode.
-- The Raft log is not truncated, and manual checkpoints and snapshot restore are unavailable.
-- A restart opens the newest `view-` checkpoint and replays the log above it.
-- The local object store works for tests. Several members need S3, which a later phase adds.
+- The leader opens the writer when it takes the lead. Phase 2 rejects MoveLeader, because phase 3
+  adds the fencing checks of a leader change.
+- Each member truncates its log through the index of its base checkpoint. Its Raft snapshot names
+  that checkpoint. A member that receives the snapshot opens the checkpoint and adopts it.
+- A restart opens the newest checkpoint. It adopts the checkpoint when the log ends below it.
+- A missing checkpoint object fails a read with a retryable error. In apply it rebuilds the
+  state from the newest checkpoint and replays the local log.
+- Manual checkpoints, Defragment, and snapshot restore are unavailable.
+- `object::Config::SharedDirectory` lets members of one host share a local directory in tests.
+  A member-local store serves one voter.
 
 ## Environment
 

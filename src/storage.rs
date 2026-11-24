@@ -133,7 +133,39 @@ fn identity_record(
     Ok(serde_json::to_vec(&fields)?)
 }
 
+/// Reads durable log entries outside the log worker. Shared-mode rebase replays them.
+#[derive(Clone)]
+pub struct LogReader {
+    engine: Arc<Engine<LogFileSystem>>,
+}
+
+impl LogReader {
+    /// Return the entries in `[low, high)`. A missing entry is an error.
+    pub fn entries(&self, low: u64, high: u64) -> Result<Vec<Entry>> {
+        let mut entries = vec![];
+        self.engine
+            .fetch_entries_to_with::<EntryCodec, ProstCodec>(
+                GROUP,
+                low,
+                high,
+                None,
+                &mut entries,
+            )?;
+        ensure!(
+            entries.len() as u64 == high - low,
+            "the log has no entries in [{low}, {high})"
+        );
+        Ok(entries)
+    }
+}
+
 impl RaftStorage {
+    pub fn reader(&self) -> LogReader {
+        LogReader {
+            engine: Arc::clone(&self.engine),
+        }
+    }
+
     pub fn open(dir: &Path, node_id: u64, cluster_id: &str, voters: Vec<u64>) -> Result<Self> {
         let config = Config {
             dir: dir.to_string_lossy().into_owned(),
@@ -308,6 +340,60 @@ impl RaftStorage {
             self.engine.sync()?;
             self.sync_writes += 1;
         }
+        Ok(())
+    }
+
+    /// Adopt a shared-state checkpoint as the snapshot record, as a Raft snapshot restore does.
+    ///
+    /// - If the log holds the snapshot index with the snapshot term, keep the later entries and
+    ///   the commit index when it is higher.
+    /// - If the term differs and the index is above the commit index, discard the whole log. An
+    ///   entry above a mismatched index can come from a deposed term.
+    /// - If the term differs at or below the commit index, two committed prefixes disagree.
+    ///   Return an error and change nothing.
+    ///
+    /// One synced batch stores the record, its ConfState, the commit `max(commit, index)`, and
+    /// the log change. A crash leaves the old log or the new boundary.
+    pub fn adopt(&mut self, snapshot: &Snapshot) -> Result<()> {
+        let index = snapshot.get_metadata().index;
+        let term = snapshot.get_metadata().term;
+        ensure!(index > self.snapshot_index(), "stale adopted snapshot");
+        ensure!(
+            !snapshot.data.is_empty(),
+            "adopted snapshot has no descriptor"
+        );
+        let keep = index <= self.last_index()? && self.term(index).ok() == Some(term);
+        ensure!(
+            keep || index > self.hard_state.commit,
+            "committed log term at {index} differs from checkpoint term {term}"
+        );
+        let mut hard_state = self.hard_state;
+        hard_state.commit = hard_state.commit.max(index);
+        let mut batch = LogBatch::default();
+        let rows = Arc::clone(&self.rows);
+        let identity = rows.lock();
+        if keep {
+            batch.add_command(GROUP, EngineCommand::Compact { index: index + 1 });
+        } else {
+            batch.add_command(GROUP, EngineCommand::Clean);
+        }
+        // A clean removes the group's keys too, so the batch stores them again.
+        batch.put(GROUP, IDENTITY.to_vec(), rows.record(&identity, false))?;
+        batch.put_value::<ProstCodec, _>(GROUP, HARD_STATE.to_vec(), &hard_state)?;
+        let file = PreparedCheckpoint::write(&self.dir, snapshot.data.clone().into())?
+            .publish(&self.dir, snapshot, 0, &mut batch)?;
+        crate::failpoint::hit("adopt-before-save");
+        self.engine.write(&mut batch, true)?;
+        drop(identity);
+        self.sync_writes += 1;
+        crate::failpoint::hit("adopt-after-save");
+        if self.checkpoint_file != Some(file) {
+            checkpoint::retire(&self.dir, self.checkpoint_file)?;
+        }
+        self.checkpoint_file = Some(file);
+        self.snapshot = snapshot.clone();
+        self.hard_state = hard_state;
+        self.purge()?;
         Ok(())
     }
 
@@ -583,6 +669,102 @@ mod checkpoint_tests {
         }
         .encode()
         .unwrap()
+    }
+
+    /// A log of `last` entries in term 1 with commit `commit`.
+    fn term_one_log(dir: &Path, last: u64, commit: u64) -> RaftStorage {
+        let mut store = RaftStorage::open(dir, 1, "test", vec![1]).unwrap();
+        let entries: Vec<Entry> = (1..=last)
+            .map(|index| Entry {
+                index,
+                term: 1,
+                ..Default::default()
+            })
+            .collect();
+        let hs = HardState {
+            term: 1,
+            vote: 1,
+            commit,
+        };
+        store.persist(&entries, Some(&hs), None).unwrap();
+        store
+    }
+
+    fn view_snapshot(index: u64, term: u64) -> Snapshot {
+        let mut snapshot = Snapshot::default();
+        snapshot.mut_metadata().index = index;
+        snapshot.mut_metadata().term = term;
+        snapshot
+            .mut_metadata()
+            .set_conf_state(ConfState::from((vec![1], vec![])));
+        snapshot.data = crate::state::transfer::ViewDescriptor::new(uuid::Uuid::new_v4())
+            .encode()
+            .unwrap();
+        snapshot
+    }
+
+    fn bounds(store: &RaftStorage) -> (u64, u64, u64) {
+        (
+            store.first_index().unwrap(),
+            store.last_index().unwrap(),
+            store.commit_index(),
+        )
+    }
+
+    /// Adopt checkpoint 100 with applied 90 and commit 110. The matching log keeps 101..=120 and
+    /// the higher commit, also after a crash right after the batch.
+    #[test]
+    fn adopt_keeps_a_matching_suffix_and_a_higher_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = term_one_log(root.path(), 120, 110);
+        let snapshot = view_snapshot(100, 1);
+        store.adopt(&snapshot).unwrap();
+        assert_eq!(bounds(&store), (101, 120, 110));
+        drop(store);
+        let store = RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
+        assert_eq!(bounds(&store), (101, 120, 110));
+        assert_eq!(store.recovery_snapshot(), &snapshot);
+        assert_eq!(store.term(100).unwrap(), 1);
+        assert_eq!(
+            store
+                .entries(101, 111, None, GetEntriesContext::empty(false))
+                .unwrap()
+                .len(),
+            10
+        );
+    }
+
+    /// A mismatched term above the commit discards the whole log. A crash after the batch keeps
+    /// no discarded entry, so the member cannot vote with one or send one.
+    #[test]
+    fn adopt_discards_a_mismatched_log_above_the_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = term_one_log(root.path(), 120, 90);
+        store.adopt(&view_snapshot(100, 2)).unwrap();
+        assert_eq!(bounds(&store), (101, 100, 100));
+        drop(store);
+        let store = RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
+        assert_eq!(bounds(&store), (101, 100, 100));
+        assert_eq!(store.term(100).unwrap(), 2);
+        assert!(store.term(101).is_err());
+        // A checkpoint ahead of an empty log is an adopt with nothing to keep.
+        let empty = tempfile::tempdir().unwrap();
+        let mut store = RaftStorage::open(empty.path(), 1, "test", vec![1]).unwrap();
+        store.adopt(&view_snapshot(7, 3)).unwrap();
+        assert_eq!(bounds(&store), (8, 7, 7));
+    }
+
+    /// Two committed prefixes that disagree stop recovery and change nothing.
+    #[test]
+    fn adopt_refuses_a_mismatched_committed_index() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = term_one_log(root.path(), 120, 110);
+        let error = store.adopt(&view_snapshot(100, 2)).unwrap_err();
+        assert!(error.to_string().contains("differs"), "{error}");
+        assert_eq!(bounds(&store), (1, 120, 110));
+        drop(store);
+        let store = RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
+        assert_eq!(bounds(&store), (1, 120, 110));
     }
 
     #[test]

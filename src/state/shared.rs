@@ -3,12 +3,12 @@
 //! This module owns the apply side: the cluster claim, the overlay, the base checkpoint, and
 //! base switches. The leader tasks that write the shared `Db` are in `node/shared`.
 //!
-//! Phase 1 limits: one voter only, and the writer opens with the state, not at a leader change.
-//! Follower bases, `ViewAck`, install, rebase, Raft snapshots of format 6, and fencing come in
-//! later phases. Shared mode does not truncate the Raft log yet.
+//! No member opens the writer here. The leader opens it in `node/shared` when it takes the lead.
+//! Phase 3 adds the fencing checks, the clock checks, and the reopen after a fence.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -129,6 +129,28 @@ pub(crate) async fn has_replicated_member(store: &dyn ObjectStore, root: &str) -
     Ok(false)
 }
 
+/// Read the quota of an existing claim. A joining member uses this, because it is not one of the
+/// initial voters.
+pub(crate) async fn claimed_quota(
+    store: &dyn ObjectStore,
+    root: &str,
+    cluster: &str,
+) -> Result<u64> {
+    let data = match store.get(&Path::from(join(root, CLAIM))).await {
+        Ok(result) => result.bytes().await?,
+        Err(slatedb::object_store::Error::NotFound { .. }) => {
+            bail!("a joining member needs an existing shared cluster")
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let existing: Claim = serde_json::from_slice(&data).context("invalid cluster claim")?;
+    ensure!(
+        existing.version == 1 && existing.cluster == cluster && existing.mode == StateMode::Shared,
+        "the shared state belongs to another cluster"
+    );
+    Ok(existing.quota)
+}
+
 /// Create or check the shared state claim under `root`. Return the cluster quota.
 ///
 /// The claim holds the initial voters. Two members that each bootstrap a separate one-voter
@@ -204,6 +226,8 @@ pub(crate) struct Source {
     pub cache: Arc<dyn slatedb::db_cache::DbCache>,
     /// Opens and deletions of checkpoints. One lock orders them. See `Pins`.
     pins: Mutex<Pins>,
+    /// Bases of received snapshots. Each one stays open until its install takes it.
+    received: Mutex<std::collections::HashMap<uuid::Uuid, Arc<Base>>>,
 }
 
 /// The checkpoints that this member uses, and the ones that retention deletes.
@@ -283,7 +307,6 @@ impl Source {
     }
 
     /// The checkpoints that this member uses: live bases and opens in flight.
-    #[cfg(test)]
     pub fn pinned(&self) -> HashSet<uuid::Uuid> {
         self.pins.lock().unwrap().pinned()
     }
@@ -303,6 +326,32 @@ impl Source {
         for id in ids {
             pins.retiring.remove(id);
         }
+    }
+
+    /// Open the checkpoint of a received snapshot before Raft accepts it. A failed open fails the
+    /// request, and the leader retries.
+    pub async fn receive(&self, id: uuid::Uuid) -> Result<()> {
+        if self.received.lock().unwrap().contains_key(&id) {
+            return Ok(());
+        }
+        let base = self.open_base(id).await?;
+        // Raft can drop an older snapshot without an install. Keep only the newest one.
+        *self.received.lock().unwrap() = std::collections::HashMap::from([(id, base)]);
+        Ok(())
+    }
+
+    fn take_received(&self, id: uuid::Uuid) -> Option<Arc<Base>> {
+        self.received.lock().unwrap().remove(&id)
+    }
+
+    /// Open the writable shared database. Opening it fences an older writer.
+    pub async fn open_writer(&self) -> Result<Db> {
+        Ok(Db::builder(self.state(), self.store.clone())
+            .with_db_cache(self.cache.clone(), 0)
+            .with_settings(slatedb_settings())
+            .with_block_cache_policy(block_cache_policy())
+            .build()
+            .await?)
     }
 
     /// Return true after the first checkpoint was published.
@@ -345,6 +394,10 @@ pub(crate) fn view_name(seq: u64) -> String {
 pub(crate) async fn view_checkpoints(
     admin: &slatedb::admin::Admin,
 ) -> Result<Vec<(u64, slatedb::Checkpoint)>> {
+    // The first leader creates the database. Before that it has no manifest.
+    if admin.read_manifest(None).await?.is_none() {
+        return Ok(vec![]);
+    }
     let mut views: Vec<_> = admin
         .list_checkpoints(None)
         .await?
@@ -365,10 +418,12 @@ pub(crate) async fn view_checkpoints(
 
 /// Return the view checkpoints to delete: every checkpoint except the newest `keep`, and only
 /// those older than the oldest checkpoint in `pinned`. A base pins memory, not objects, so a
-/// checkpoint under a live view must survive GC.
+/// checkpoint under a live view must survive GC. `reported` holds the checkpoints that other
+/// members reported in `ViewAck`; they also survive.
 pub(crate) fn retired(
     views: &[(u64, uuid::Uuid)],
     pinned: &HashSet<uuid::Uuid>,
+    reported: &HashSet<uuid::Uuid>,
     keep: usize,
 ) -> Vec<uuid::Uuid> {
     let oldest_pin = views
@@ -380,17 +435,17 @@ pub(crate) fn retired(
     let old = views.len().saturating_sub(keep);
     views[..old]
         .iter()
-        .filter(|(seq, _)| *seq < oldest_pin)
+        .filter(|(seq, id)| *seq < oldest_pin && !reported.contains(id))
         .map(|(_, id)| *id)
         .collect()
 }
 
-/// Delete the old `view-` checkpoints that no live base of this member pins.
-///
-/// Phase 1 has one member, so its own pins are all the pins. Other checkpoints are not ours.
+/// Delete the old `view-` checkpoints that no live base of this member pins and that no member
+/// reported. Other checkpoints are not ours.
 pub(crate) async fn retain(
     admin: &slatedb::admin::Admin,
     source: &Source,
+    reported: &HashSet<uuid::Uuid>,
     keep: usize,
 ) -> Result<()> {
     let views: Vec<_> = view_checkpoints(admin)
@@ -398,7 +453,7 @@ pub(crate) async fn retain(
         .into_iter()
         .map(|(seq, checkpoint)| (seq, checkpoint.id))
         .collect();
-    let candidates = source.begin_retire(&views, keep);
+    let candidates = source.begin_retire(&views, reported, keep);
     let mut result = Ok(());
     for id in &candidates {
         if let Err(error) = admin.delete_checkpoint(*id).await {
@@ -423,27 +478,75 @@ async fn newest_base(admin: &slatedb::admin::Admin, source: &Source) -> Result<O
     Ok(None)
 }
 
+/// Return true when `error` comes from an object that the store no longer has, such as an SST
+/// that GC deleted under an old base. Other storage errors still stop the member.
+pub(crate) fn missing_object(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let text = cause.to_string();
+        text.contains("Data error") && text.contains("not found")
+    })
+}
+
 /// Bases that opened in the background. Apply takes the newest one.
-#[derive(Default)]
-pub(crate) struct Opened(Mutex<Option<Arc<Base>>>);
+pub(crate) struct Opened {
+    slot: Mutex<Option<Arc<Base>>>,
+    /// The `F` of the newest offered base. The node starts a switch when it goes up.
+    ready: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for Opened {
+    fn default() -> Self {
+        Self {
+            slot: Mutex::default(),
+            ready: tokio::sync::watch::channel(0).0,
+        }
+    }
+}
 
 impl Opened {
     /// Keep `base` unless an opened base already covers more. Opens can finish out of order.
     pub(crate) fn offer(&self, base: Arc<Base>) {
-        let mut slot = self.0.lock().unwrap();
-        if slot.as_ref().is_none_or(|old| old.applied < base.applied) {
-            *slot = Some(base);
+        let applied = base.applied;
+        let mut slot = self.slot.lock().unwrap();
+        if slot.as_ref().is_some_and(|old| old.applied >= applied) {
+            return;
         }
+        *slot = Some(base);
+        drop(slot);
+        self.ready.send_if_modified(|old| {
+            let newer = *old < applied;
+            *old = (*old).max(applied);
+            newer
+        });
     }
 
     fn take_through(&self, pushed: u64) -> Option<Arc<Base>> {
-        let mut slot = self.0.lock().unwrap();
-        // A base above the overlay needs an adopt, which phase 2 adds.
+        let mut slot = self.slot.lock().unwrap();
+        // A base above the applied state needs an adopt: a snapshot install or a restart.
         if slot.as_ref().is_some_and(|base| base.applied <= pushed) {
             return slot.take();
         }
         None
     }
+
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.ready.subscribe()
+    }
+}
+
+/// The shared-mode settings of one member.
+#[derive(Clone, Debug)]
+pub(crate) struct Options {
+    /// The quota of a new cluster claim. An existing claim sets the cluster quota.
+    pub quota: u64,
+    /// The initial voters of a new cluster claim. Every bootstrap member must name the same set.
+    pub voters: Vec<u64>,
+    /// The member joins after MemberAdd. It skips the voter check of the claim.
+    pub join: bool,
+    /// The member has no Raft log yet. It may start from an empty base and wait for Raft.
+    pub empty_log: bool,
+    /// The longest time that a read view may pin its base.
+    pub pin_max: Duration,
 }
 
 /// The apply side of shared mode on one member.
@@ -454,19 +557,21 @@ pub(crate) struct Shared {
     pub(crate) source: Arc<Source>,
     /// `ViewCheckpoint` entries that this member applied.
     pub(crate) announcements: u64,
-    /// The writer's sequence when it opened. The materializer continues above it.
-    pub(crate) written: u64,
+    /// The `F` of the current base. Physical Compact replies wait for a covering base.
+    based: Arc<tokio::sync::watch::Sender<u64>>,
+    pub(crate) pin_max: Duration,
 }
 
 impl Shared {
-    fn new(base: Arc<Base>, source: Arc<Source>, written: u64) -> Self {
+    fn new(base: Arc<Base>, source: Arc<Source>, pin_max: Duration) -> Self {
         Self {
             overlay: Overlay::new(base.applied),
+            based: Arc::new(tokio::sync::watch::channel(base.applied).0),
             base,
             opened: Arc::default(),
             source,
             announcements: 0,
-            written,
+            pin_max,
         }
     }
 
@@ -510,6 +615,11 @@ impl Shared {
         self.opened.offer(base);
     }
 
+    fn set_base(&mut self, base: Arc<Base>) {
+        self.based.send_replace(base.applied);
+        self.base = base;
+    }
+
     /// Switch to the newest opened base when it covers more than the current one. Return true
     /// after a switch. The base `F` never goes down.
     pub(crate) fn switch(&mut self) -> bool {
@@ -519,36 +629,56 @@ impl Shared {
         if base.applied <= self.base.applied {
             return false;
         }
+        // A paused member switches before the next `ViewCheckpoint` entry applies, so the
+        // switch also closes the open segment. A covered open segment is then released.
+        self.overlay.close_segment();
         self.overlay.release(base.applied);
-        self.base = base;
+        self.set_base(base);
         true
+    }
+
+    /// Make `base` the whole state and drop the overlay. Install and rebase use this.
+    fn reset(&mut self, base: Arc<Base>) {
+        self.overlay.reset(base.applied);
+        self.set_base(base);
     }
 }
 
-/// The handles that the leader writer tasks use.
-pub(crate) struct WriterParts {
-    pub db: Arc<Db>,
+/// The shared-mode handles that the node uses outside apply.
+pub(crate) struct Handles {
     pub admin: Arc<slatedb::admin::Admin>,
     pub queue: Arc<super::overlay::Queue>,
     pub source: Arc<Source>,
-    /// The writer's sequence when it opened.
-    pub written: u64,
+    /// The `F` of the current base.
+    pub based: tokio::sync::watch::Receiver<u64>,
+    pub opened: Arc<Opened>,
 }
 
 impl StateMachine {
     /// Open the shared state of the cluster at `root` in `store`. See the module comment.
+    ///
+    /// No member opens the writer here. The leader opens it in `node/shared`.
     pub(crate) async fn open_shared(
         store: Arc<dyn ObjectStore>,
         root: &str,
         cluster: &str,
         cache: StateCache,
-        quota: u64,
-        voters: &[u64],
+        options: &Options,
         backend: transfer::Backend,
     ) -> Result<Self> {
         cache.validate()?;
-        // The claim comes before the writer opens. A member that loses it changes nothing.
-        let quota = claim(store.as_ref(), root, cluster, quota, voters).await?;
+        let quota = if options.join {
+            claimed_quota(store.as_ref(), root, cluster).await?
+        } else {
+            claim(
+                store.as_ref(),
+                root,
+                cluster,
+                options.quota,
+                &options.voters,
+            )
+            .await?
+        };
         let location =
             transfer::Location::open(store.clone(), &join(root, STATE), backend, cache).await?;
         let state_root = location.root();
@@ -557,54 +687,33 @@ impl StateMachine {
             root: root.to_owned(),
             cache: cache.build(),
             pins: Mutex::default(),
+            received: Mutex::default(),
         });
         ensure!(
             state_root == source.state(),
             "shared state has no generations"
         );
         let rows = Arc::new(rows::RowCache::new(cache.row_bytes));
-        let admin = slatedb::admin::Admin::builder(state_root.as_str(), store.clone()).build();
-        let db = Arc::new(
-            Db::builder(state_root.as_str(), store)
-                .with_db_cache(source.cache.clone(), 0)
-                .with_settings(slatedb_settings())
-                .with_block_cache_policy(block_cache_policy())
-                .build()
-                .await?,
-        );
-        let result = async {
-            let written = db.manifest().last_l0_seq();
-            let base = match newest_base(&admin, &source).await? {
-                Some(base) => {
-                    // A stop between the first checkpoint and its marker leaves no marker.
-                    if !source.bootstrapped().await? {
-                        source.mark_bootstrapped(base.checkpoint.unwrap()).await?;
-                    }
-                    base
+        let admin = Arc::new(slatedb::admin::Admin::builder(state_root.as_str(), store).build());
+        // A joining member with no log waits for Raft: entries from index 1 or a snapshot.
+        let base = match newest_base(&admin, &source).await? {
+            Some(_) if options.join && options.empty_log => Arc::new(Base::empty()),
+            Some(base) => {
+                // A stop between the first checkpoint and its marker leaves no marker.
+                if !source.bootstrapped().await? {
+                    source.mark_bootstrapped(base.checkpoint.unwrap()).await?;
                 }
-                None if source.bootstrapped().await? => {
-                    bail!("the shared state has no view checkpoint after its bootstrap")
-                }
-                None => Arc::new(Base::empty()),
-            };
-            ensure!(
-                base.applied <= written,
-                "the base checkpoint is ahead of the shared database"
-            );
-            let shared = Shared::new(base, source, written);
-            let reads = shared.live();
-            let mut state =
-                Self::load(db.clone(), admin, location, rows, reads, Some(shared)).await?;
-            state.quota = quota;
-            Ok(state)
-        }
-        .await;
-        if result.is_err() {
-            let _ = db
-                .close_with_options(slatedb::config::CloseOptions { flush_type: None })
-                .await;
-        }
-        let mut state = result?;
+                base
+            }
+            None if source.bootstrapped().await? && !(options.join && options.empty_log) => {
+                bail!("the shared state has no view checkpoint after its bootstrap")
+            }
+            None => Arc::new(Base::empty()),
+        };
+        let shared = Shared::new(base, source, options.pin_max);
+        let reads = shared.live();
+        let mut state = Self::load(None, admin, location, rows, reads, Some(shared)).await?;
+        state.quota = quota;
         state.plan_compaction();
         Ok(state)
     }
@@ -614,15 +723,15 @@ impl StateMachine {
         self.shared.is_some()
     }
 
-    /// The handles of the leader writer tasks, in shared mode.
-    pub(crate) fn writer_parts(&self) -> Option<WriterParts> {
+    /// The handles of the node, in shared mode.
+    pub(crate) fn shared_handles(&self) -> Option<Handles> {
         let shared = self.shared.as_ref()?;
-        Some(WriterParts {
-            db: self.db.clone(),
+        Some(Handles {
             admin: self.admin.clone(),
             queue: shared.overlay.queue(),
             source: shared.source.clone(),
-            written: shared.written,
+            based: shared.based.subscribe(),
+            opened: shared.opened.clone(),
         })
     }
 
@@ -658,7 +767,128 @@ impl StateMachine {
         }
     }
 
-    /// The base index `F` and the applied announcements, in shared mode.
+    /// Make `base` the state at its index `F` and drop the overlay. The Raft log must already
+    /// hold the matching boundary: a received snapshot, or a log that covers `F`.
+    ///
+    /// `term` is the Raft term at `F` when the caller knows it. A known checkpoint term must
+    /// match it.
+    pub(crate) async fn adopt_base(&mut self, base: Arc<Base>, term: u64) -> Result<()> {
+        let mut shared = self
+            .shared
+            .take()
+            .context("adopt needs shared state mode")?;
+        shared.reset(base);
+        let reads = shared.live();
+        let rows = Arc::new(rows::RowCache::new(self.location.cache.row_bytes));
+        let result = Self::load(
+            None,
+            self.admin.clone(),
+            self.location.clone(),
+            rows,
+            reads,
+            Some(shared),
+        )
+        .await;
+        let mut next = result?;
+        if next.applied_term != 0 && term != 0 {
+            ensure!(
+                next.applied_term == term,
+                "checkpoint term {} differs from Raft term {term}",
+                next.applied_term
+            );
+        }
+        if next.applied_term == 0 {
+            next.applied_term = term;
+            next.entry_term = term;
+        }
+        next.metrics = self.metrics.clone();
+        next.quota = self.quota;
+        next.write_batches = self.write_batches;
+        next.row_marker = self.row_marker.take();
+        // The new rows reach watchers through storage catch-up.
+        next.watch_capture = self.watch_capture.take();
+        if let Some(capture) = &mut next.watch_capture {
+            capture.invalidate();
+        }
+        *self = next;
+        self.plan_compaction();
+        Ok(())
+    }
+
+    /// Rebuild the state from the newest checkpoint after a missing object. The caller replays
+    /// the local log from the new `applied` to its old position.
+    ///
+    /// A checkpoint above the applied index needs an adopt of the Raft log. A restart does that.
+    pub(crate) async fn rebase(&mut self) -> Result<()> {
+        let shared = self
+            .shared
+            .as_ref()
+            .context("rebase needs shared state mode")?;
+        let base = newest_base(&self.admin, &shared.source)
+            .await?
+            .context("the shared state has no view checkpoint")?;
+        ensure!(
+            base.applied <= self.applied,
+            "the newest checkpoint {} is above applied index {}; restart the member to adopt it",
+            base.applied,
+            self.applied
+        );
+        tracing::warn!(
+            base = base.applied,
+            applied = self.applied,
+            "rebase on a new checkpoint"
+        );
+        self.adopt_base(base, 0).await
+    }
+
+    /// Install a format 6 snapshot: the checkpoint that Raft sent. The receive handler opened it.
+    pub(crate) async fn install_view(
+        &mut self,
+        descriptor: transfer::ViewDescriptor,
+        index: u64,
+        term: u64,
+    ) -> Result<()> {
+        let shared = self
+            .shared
+            .as_ref()
+            .context("a format 6 snapshot needs shared state mode")?;
+        if index <= self.applied {
+            return Ok(());
+        }
+        let id = descriptor.checkpoint()?;
+        let base = match shared.source.take_received(id) {
+            Some(base) => base,
+            None => shared.source.open_base(id).await?,
+        };
+        ensure!(
+            base.applied == index,
+            "checkpoint index {} differs from snapshot index {index}",
+            base.applied
+        );
+        self.adopt_base(base, term).await
+    }
+
+    /// The format 6 snapshot of the current base: its index, data, and ConfState. `None` before
+    /// the first checkpoint.
+    pub(crate) async fn base_snapshot(
+        &self,
+    ) -> Result<Option<(u64, Vec<u8>, raft::eraftpb::ConfState)>> {
+        let shared = self.shared.as_ref().context("not in shared state mode")?;
+        let Some(id) = shared.base.checkpoint else {
+            return Ok(None);
+        };
+        // The ConfState comes from the checkpoint, not from the current membership.
+        let members = shared
+            .base
+            .get(crate::cluster::KEY)
+            .await?
+            .context("the base checkpoint has no membership")?;
+        let members: crate::cluster::Store = serde_json::from_slice(&members)?;
+        let data = transfer::ViewDescriptor::new(id).encode()?;
+        Ok(Some((shared.base.applied, data, members.conf())))
+    }
+
+    /// The base index `F`, the applied announcements, and the overlay bytes, in shared mode.
     pub(crate) fn view_status(&self) -> Option<(u64, u64, u64)> {
         let shared = self.shared.as_ref()?;
         Some((

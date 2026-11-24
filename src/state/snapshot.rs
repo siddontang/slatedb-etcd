@@ -16,7 +16,7 @@ impl StateMachine {
     ) -> Result<impl std::future::Future<Output = Result<Vec<u8>>> + Send + 'static> {
         // A shared-mode view needs no flush. Its rows are in a checkpoint or in memory.
         let snapshot = self.pinned_state()?;
-        let db = (!self.is_shared()).then(|| Arc::clone(&self.db));
+        let db = self.database.clone();
         let metrics = self.metrics.clone();
         let applied = self.applied;
         let members = serde_json::to_vec(self.members.as_ref())?;
@@ -48,11 +48,14 @@ impl StateMachine {
 
     pub async fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<()> {
         let index = snapshot.get_metadata().index;
+        let term = snapshot.get_metadata().term;
+        if let Some(view) = transfer::ViewDescriptor::decode(snapshot.get_data())? {
+            return Box::pin(self.install_view(view, index, term)).await;
+        }
         ensure!(
             !self.is_shared() || index <= self.applied,
-            "shared state mode cannot install a snapshot before phase 2"
+            "shared state mode installs only format 6 snapshots"
         );
-        let term = snapshot.get_metadata().term;
         if index == self.applied {
             self.reconcile_term(term)?;
         }
@@ -102,7 +105,7 @@ impl StateMachine {
         self.write_batch(batch, index).await?;
         crate::failpoint::hit("snapshot-after-install-write");
         // The durable Raft snapshot lets a restart repeat this atomic replacement.
-        self.metrics.flush_db(&self.db).await?;
+        self.metrics.flush_db(self.db()).await?;
         crate::failpoint::hit("snapshot-after-install-flush");
         self.applied = index;
         self.durable_applied = index;
@@ -163,7 +166,7 @@ impl StateMachine {
     ) -> Result<()> {
         if index <= self.applied {
             // A bootstrap membership is stored by the first write after the install.
-            if index == self.applied && self.db.get(crate::cluster::KEY).await?.is_none() {
+            if index == self.applied && self.db().get(crate::cluster::KEY).await?.is_none() {
                 self.members = Arc::new(serde_json::from_slice(&descriptor.members)?);
                 self.members_unsaved = true;
             }
@@ -199,7 +202,7 @@ impl StateMachine {
         next.members = Arc::new(serde_json::from_slice(&descriptor.members)?);
         next.members_unsaved = true;
         let old = std::mem::replace(self, next);
-        location.retire(old.db.clone(), old_name);
+        location.retire(old.db().clone(), old_name);
         drop(old);
         crate::failpoint::hit("snapshot-after-install-flush");
         Ok(())

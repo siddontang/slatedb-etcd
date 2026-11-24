@@ -5,7 +5,7 @@ pub(crate) struct ReadView {
     metrics: Arc<crate::metrics::StateMeters>,
     state: StateView,
     /// Keep the database open while the view reads it. A snapshot install replaces it.
-    _database: Arc<Db>,
+    _database: Option<Arc<Db>>,
     rows: Arc<super::rows::RowCache>,
     pub revision: i64,
     pub compact_revision: i64,
@@ -13,6 +13,8 @@ pub(crate) struct ReadView {
     pub leases: Arc<std::collections::BTreeMap<i64, crate::lease::LeaseRecord>>,
     /// Current keys at the snapshot's sequence number, for Range counts.
     keys: key_index::KeyPin,
+    /// Shared mode: reads fail after this time, so a view does not pin its checkpoint forever.
+    expires: Option<std::time::Instant>,
 }
 
 impl StateMachine {
@@ -20,13 +22,17 @@ impl StateMachine {
         Ok(Arc::new(ReadView {
             metrics: self.metrics.clone(),
             state: self.pinned_state()?,
-            _database: self.db.clone(),
+            _database: self.database.clone(),
             rows: self.rows.clone(),
             revision: self.revision,
             compact_revision: self.compact_revision,
             auth: self.auth.clone(),
             leases: self.leases.clone(),
             keys: self.key_index.pin(self.applied),
+            expires: self
+                .shared
+                .as_ref()
+                .map(|shared| std::time::Instant::now() + shared.pin_max),
         }))
     }
 }
@@ -54,6 +60,18 @@ impl ReadView {
         credentials: Option<&crate::auth::Credentials>,
         budget: Option<usize>,
     ) -> Result<Option<Outcome>> {
+        // The caller retries on a new view. A Watch catch-up takes a new view for each page.
+        if self
+            .expires
+            .is_some_and(|expires| std::time::Instant::now() >= expires)
+        {
+            return Ok(Some(Outcome {
+                result: Err(mvcc::KvError::new(
+                    tonic::Code::Unavailable,
+                    "etcdserver: read view expired; retry",
+                )),
+            }));
+        }
         if let Some(credentials) = credentials {
             if let Err(error) = self.auth.kv(credentials, request) {
                 return Ok(Some(Outcome { result: Err(error) }));
@@ -102,6 +120,17 @@ impl ReadView {
             histogram.observe(start.elapsed().as_secs_f64());
         }
         if let Err(error) = &result {
+            // A deleted checkpoint object fails only this read. The client retries on a new view.
+            if self.expires.is_some()
+                && super::shared::missing_object(&anyhow::anyhow!("{}", error.message))
+            {
+                return Ok(Some(Outcome {
+                    result: Err(mvcc::KvError::new(
+                        tonic::Code::Unavailable,
+                        "etcdserver: a checkpoint object is missing; retry",
+                    )),
+                }));
+            }
             ensure!(
                 error.code != tonic::Code::Internal as i32,
                 "{}",
@@ -412,7 +441,7 @@ mod tests {
         }
         drop((first, second, third));
         apply(&mut state, put(b"z")).await;
-        assert!(state.key_index.matches(&state.db).await.unwrap());
+        assert!(state.key_index.matches(state.db()).await.unwrap());
         state.close().await.unwrap();
     }
 
@@ -658,7 +687,7 @@ mod tests {
                         // Without a SlateDB WAL, unflushed rows return through Raft replay. Flush
                         // so the reopened state holds every applied row.
                         views.clear();
-                        state.db.flush().await.unwrap();
+                        state.db().flush().await.unwrap();
                         state.close().await.unwrap();
                         drop(state);
                         state = StateMachine::open(dir.path()).await.unwrap();
@@ -696,8 +725,8 @@ mod tests {
                 .unwrap()
                 .result
                 .unwrap();
-            assert!(state.key_index.matches(&state.db).await.unwrap());
-            assert!(mirror.key_index.matches(&mirror.db).await.unwrap());
+            assert!(state.key_index.matches(state.db()).await.unwrap());
+            assert!(mirror.key_index.matches(mirror.db()).await.unwrap());
             state.close().await.unwrap();
             mirror.close().await.unwrap();
         }

@@ -1,7 +1,8 @@
 //! Drive physical MVCC compaction through small replicated steps.
 //!
 //! Each member flushes SlateDB after a physical target finishes. The flush runs while the apply
-//! worker accepts more entries.
+//! worker accepts more entries. In shared mode a member has no database of its own. It waits
+//! until its base checkpoint covers the target instead.
 
 use super::*;
 use std::future::Future;
@@ -15,12 +16,12 @@ const STEP_PAUSE: Duration = Duration::from_millis(2);
 type FlushJob = Pin<Box<dyn Future<Output = Result<(u64, i64)>> + Send>>;
 
 pub(super) struct Flush {
-    db: Arc<slatedb::Db>,
+    db: Option<Arc<slatedb::Db>>,
     meters: Arc<crate::metrics::StateMeters>,
     running: Option<FlushJob>,
     queued: Option<(u64, i64)>,
-    /// Shared mode: the materializer progress. A flush first waits for the batches.
-    shared: Option<Arc<super::shared::Progress>>,
+    /// Shared mode: the index `F` of the base. A durable target needs a covering base.
+    shared: Option<watch::Receiver<u64>>,
     /// The physical boundary that has reached object storage.
     pub durable: watch::Sender<i64>,
     /// Physical Compact replies. A long pass can exceed the proposal timeout, so these replies
@@ -73,7 +74,7 @@ impl Waiter {
 impl Flush {
     pub fn new(state: &StateMachine) -> Self {
         Self {
-            db: state.db.clone(),
+            db: state.database(),
             meters: state.metrics.clone(),
             running: None,
             queued: None,
@@ -84,13 +85,13 @@ impl Flush {
     }
 
     /// Use the database that a snapshot install opened. A running flush finishes on the old one.
-    pub fn rebind(&mut self, db: std::sync::Arc<slatedb::Db>) {
+    pub fn rebind(&mut self, db: Option<std::sync::Arc<slatedb::Db>>) {
         self.db = db;
     }
 
-    /// Flush only after the shared-mode materializer has written the requested batches.
-    pub fn share(&mut self, progress: Arc<super::shared::Progress>) {
-        self.shared = Some(progress);
+    /// Wait for a covering base instead of a flush. `based` follows the base index `F`.
+    pub fn share(&mut self, based: watch::Receiver<u64>) {
+        self.shared = Some(based);
     }
 
     pub fn cancel(&mut self) {
@@ -102,7 +103,8 @@ impl Flush {
         self.running.is_some()
     }
 
-    /// Flush through `index`. In shared mode `wait` is the batch sequence that holds `index`.
+    /// Flush through `index`. In shared mode `wait` is the batch sequence that holds `index`,
+    /// and the job waits for a base at or above it.
     pub fn request(&mut self, index: u64, revision: i64, wait: Option<u64>) {
         if self.active() {
             // Apply submits requests in log order. One later flush covers the queued prefix.
@@ -113,11 +115,14 @@ impl Flush {
         let meters = self.meters.clone();
         let shared = self.shared.clone().zip(wait);
         self.running = Some(Box::pin(async move {
-            if let Some((progress, seq)) = shared {
-                progress.wait_written(seq).await?;
+            if let Some((mut based, seq)) = shared {
+                based.wait_for(|base| *base >= seq).await?;
+                return Ok((index, revision));
             }
             crate::failpoint::hit("compact-before-flush");
-            meters.flush_db(&db).await?;
+            meters
+                .flush_db(db.as_ref().context("replicated state has a database")?)
+                .await?;
             crate::failpoint::hit("compact-after-flush");
             Ok((index, revision))
         }));
@@ -164,6 +169,10 @@ impl Node {
     /// Flush storage through `index` for the physical boundary `revision`.
     pub(super) fn flush_compaction(&mut self, index: u64, revision: i64) {
         let wait = self.writer.as_ref().map(|writer| writer.covering(index));
+        // The leader publishes a covering checkpoint now instead of at the age limit.
+        if let Some(writer) = &self.writer {
+            writer.request_publication(index);
+        }
         self.compaction.request(index, revision, wait);
     }
 

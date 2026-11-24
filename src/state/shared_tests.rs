@@ -7,14 +7,23 @@ use slatedb::config::{CheckpointOptions, CheckpointScope};
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
 
+fn options() -> shared::Options {
+    shared::Options {
+        quota: 0,
+        voters: vec![1],
+        join: false,
+        empty_log: false,
+        pin_max: Duration::from_secs(300),
+    }
+}
+
 async fn open_shared(store: Arc<dyn ObjectStore>) -> StateMachine {
     StateMachine::open_shared(
         store,
         "cluster",
         "test",
         StateCache::default(),
-        0,
-        &[1],
+        &options(),
         transfer::Backend::Local,
     )
     .await
@@ -158,8 +167,8 @@ async fn shared_apply_matches_replicated_apply_from_the_overlay() {
     let mut reference = StateMachine::open(dir.path()).await.unwrap();
     let mut state = open_shared(Arc::new(InMemory::new())).await;
     run(&mut state, &mut reference, false).await;
-    // The rows exist only in the overlay. Apply never wrote the shared database.
-    assert_eq!(state.db.get(APPLIED).await.unwrap(), None);
+    // The rows exist only in the overlay. A member has no database of its own.
+    assert!(state.database().is_none());
     assert!(state.write_batches > 0);
     // Each batch stores the logical size, so a later base needs no full scan.
     let stored = state.applied_state().get(shared::LOGICAL_BYTES).await;
@@ -241,20 +250,28 @@ async fn no_op_entries_write_no_batch_after_the_membership_entry() {
     state.close().await.unwrap();
 }
 
+/// Open the shared writer, as the leader task does.
+async fn writer(state: &StateMachine) -> slatedb::Db {
+    let source = state.shared.as_ref().unwrap().source.clone();
+    source.open_writer().await.unwrap()
+}
+
 /// Write the overlay batches into the shared database, flush, and open a checkpoint of it.
-async fn checkpoint(state: &StateMachine, written: &mut u64) -> Arc<view::Base> {
+async fn checkpoint(
+    state: &StateMachine,
+    writer: &slatedb::Db,
+    written: &mut u64,
+) -> Arc<view::Base> {
     let queue = state.shared.as_ref().unwrap().overlay.queue();
     for (seq, batch) in queue.after(*written, usize::MAX) {
-        state
-            .db
+        writer
             .write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
             .await
             .unwrap();
         *written = seq;
     }
-    state.db.flush().await.unwrap();
-    let id = state
-        .db
+    writer.flush().await.unwrap();
+    let id = writer
         .create_checkpoint(
             CheckpointScope::Durable,
             &CheckpointOptions {
@@ -274,13 +291,14 @@ async fn bases_switch_monotonically_and_release_covered_segments() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let mut state = open_shared(store.clone()).await;
     let mut written = 0;
+    let writer = writer(&state).await;
     for n in 0..10 {
         state
             .apply_etcd(state.applied + 1, &put(&format!("k{n}"), "one"))
             .await
             .unwrap();
     }
-    let older = checkpoint(&state, &mut written).await;
+    let older = checkpoint(&state, &writer, &mut written).await;
     assert_eq!(older.applied, 10);
     state
         .apply_view_checkpoint(state.applied + 1, &uuid::Uuid::new_v4().to_string())
@@ -292,7 +310,7 @@ async fn bases_switch_monotonically_and_release_covered_segments() {
             .await
             .unwrap();
     }
-    let newer = checkpoint(&state, &mut written).await;
+    let newer = checkpoint(&state, &writer, &mut written).await;
     assert_eq!(newer.applied, 21);
     state
         .apply_view_checkpoint(state.applied + 1, &uuid::Uuid::new_v4().to_string())
@@ -315,9 +333,12 @@ async fn bases_switch_monotonically_and_release_covered_segments() {
     state.shared.as_ref().unwrap().offer(older);
     state.switch_base();
     assert_eq!(state.shared.as_ref().unwrap().base.applied, 21);
-    // The two closed segments are covered. The open segment holds the delete.
+    // The two closed segments are covered. The switch also closed the segment with the delete,
+    // which is above the base, and opened an empty one.
     let overlay = &state.shared.as_ref().unwrap().overlay;
-    assert_eq!(overlay.segments().len(), 1);
+    let segments = overlay.segments();
+    assert_eq!(segments.len(), 2);
+    assert_eq!((segments[0].last(), segments[1].last()), (23, 0));
     assert!(overlay.bytes() < bytes);
     assert_eq!(rows(&state, b"etcd/").await, expected);
     assert_eq!(
@@ -360,8 +381,7 @@ async fn bases_switch_monotonically_and_release_covered_segments() {
         "cluster",
         "test",
         StateCache::default(),
-        0,
-        &[1],
+        &options(),
         transfer::Backend::Local,
     )
     .await
@@ -405,7 +425,8 @@ async fn a_restart_writes_a_missing_bootstrap_marker() {
     state.apply(1, None).await.unwrap();
     // The publisher stopped after its first checkpoint and before the marker.
     let mut written = 0;
-    checkpoint(&state, &mut written).await;
+    let writer = writer(&state).await;
+    checkpoint(&state, &writer, &mut written).await;
     let source = state.shared.as_ref().unwrap().source.clone();
     assert!(!source.bootstrapped().await.unwrap());
     state.close().await.unwrap();
@@ -432,39 +453,50 @@ fn retention_keeps_every_checkpoint_from_the_oldest_pinned_one() {
         .map(|(n, id)| (n as u64 * 10, *id))
         .collect();
     let none = std::collections::HashSet::new();
-    assert_eq!(shared::retired(&views, &none, 2), ids[..3]);
+    assert_eq!(shared::retired(&views, &none, &none, 2), ids[..3]);
     let pinned = [ids[1]].into_iter().collect();
-    assert_eq!(shared::retired(&views, &pinned, 2), ids[..1]);
+    assert_eq!(shared::retired(&views, &pinned, &none, 2), ids[..1]);
     // A pin on a checkpoint that the publisher keeps anyway changes nothing.
     let pinned = [ids[4]].into_iter().collect();
-    assert_eq!(shared::retired(&views, &pinned, 2), ids[..3]);
+    assert_eq!(shared::retired(&views, &pinned, &none, 2), ids[..3]);
+    // A checkpoint that another member reported survives. Older unreported ones do not.
+    let reported = [ids[1]].into_iter().collect();
+    assert_eq!(
+        shared::retired(&views, &none, &reported, 2),
+        [ids[0], ids[2]]
+    );
 }
 
 #[tokio::test]
 async fn retention_keeps_the_checkpoint_of_a_live_base() {
     let mut state = open_shared(Arc::new(InMemory::new())).await;
     let mut written = 0;
+    let writer = writer(&state).await;
     let mut bases = vec![];
     for n in 0..5 {
         state
             .apply_etcd(state.applied + 1, &put(&format!("k{n}"), "v"))
             .await
             .unwrap();
-        bases.push(checkpoint(&state, &mut written).await);
+        bases.push(checkpoint(&state, &writer, &mut written).await);
     }
     let source = state.shared.as_ref().unwrap().source.clone();
     let count = || async { shared::view_checkpoints(&state.admin).await.unwrap().len() };
     // A slow open still uses the second checkpoint. Retention keeps it and all newer ones.
     let pinned = bases.remove(1);
     drop(bases);
-    shared::retain(&state.admin, &source, 2).await.unwrap();
+    shared::retain(&state.admin, &source, &Default::default(), 2)
+        .await
+        .unwrap();
     assert_eq!(count().await, 4);
     assert_eq!(
         pinned.get(b"meta/applied").await.unwrap().unwrap().as_ref(),
         2_u64.to_be_bytes()
     );
     drop(pinned);
-    shared::retain(&state.admin, &source, 2).await.unwrap();
+    shared::retain(&state.admin, &source, &Default::default(), 2)
+        .await
+        .unwrap();
     assert_eq!(count().await, 2);
     state.close().await.unwrap();
 }
@@ -479,9 +511,8 @@ async fn a_shared_export_keeps_the_durable_index() {
         assert_eq!(state.durable_applied, 0);
         state.snapshot_data().await.unwrap();
     }
-    // The view scan flushed nothing. The shared database is still empty.
+    // The view scan flushed nothing.
     assert_eq!(shared_state.durable_applied, 0);
-    assert_eq!(shared_state.db.snapshot().unwrap().seq(), 0);
     // A replicated export flushes the database through the applied index.
     assert_eq!(replicated.durable_applied, 1);
     shared_state.close().await.unwrap();
@@ -652,5 +683,39 @@ async fn an_open_in_flight_keeps_its_checkpoint() {
         shared::view_checkpoints(&state.admin).await.unwrap().len(),
         2
     );
+    state.close().await.unwrap();
+}
+
+/// A read on a view that is older than the pin limit fails with a retryable error.
+#[tokio::test]
+async fn an_old_view_fails_reads_with_a_retryable_error() {
+    let mut state = StateMachine::open_shared(
+        Arc::new(InMemory::new()),
+        "cluster",
+        "test",
+        StateCache::default(),
+        &shared::Options {
+            pin_max: Duration::from_millis(50),
+            ..options()
+        },
+        transfer::Backend::Local,
+    )
+    .await
+    .unwrap();
+    state.apply_etcd(1, &put("key", "value")).await.unwrap();
+    let get = RequestOp {
+        request: Some(Op::RequestRange(RangeRequest {
+            key: b"key".to_vec(),
+            ..Default::default()
+        })),
+    };
+    let view = state.read_view().unwrap();
+    assert!(view.read(&get, None).await.unwrap().result.is_ok());
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let error = view.read(&get, None).await.unwrap().result.unwrap_err();
+    assert_eq!(error.code, tonic::Code::Unavailable as i32);
+    // A new view reads again.
+    let fresh = state.read_view().unwrap();
+    assert!(fresh.read(&get, None).await.unwrap().result.is_ok());
     state.close().await.unwrap();
 }

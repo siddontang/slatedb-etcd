@@ -92,7 +92,7 @@ impl Node {
             let _ = response.send(Err(self.error("not leader")));
             return Ok(());
         }
-        if self.pending.len() + self.put_proposals.clients.len() >= 1024 {
+        if self.pending.len() + self.put_proposals.clients.len() >= 1024 || self.overlay_full() {
             let _ = response.send(Err(self.error("too many pending requests")));
             return Ok(());
         }

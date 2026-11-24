@@ -342,7 +342,7 @@ async fn a_restart_replays_the_log_above_the_newest_checkpoint() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_directory_keeps_its_mode_and_shared_mode_has_one_voter() {
+async fn a_directory_keeps_its_mode_and_members_need_a_shared_store() {
     let dir = tempfile::tempdir().unwrap();
     let age = Duration::from_secs(10);
     let (server, _) = start(config(dir.path(), StateMode::Replicated, age)).await;
@@ -358,5 +358,250 @@ async fn a_directory_keeps_its_mode_and_shared_mode_has_one_voter() {
     three.peers.insert(2, "127.0.0.1:2".into());
     three.peers.insert(3, "127.0.0.1:3".into());
     let error = Server::start(three).await.err().unwrap();
-    assert!(format!("{error:#}").contains("one voter"), "{error:#}");
+    assert!(
+        format!("{error:#}").contains("shared object store"),
+        "{error:#}"
+    );
+}
+
+/// Reserve loopback addresses for `members` members.
+async fn addresses(members: u64) -> std::collections::BTreeMap<u64, String> {
+    let mut peers = std::collections::BTreeMap::new();
+    let mut reservations = vec![];
+    for id in 1..=members {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        peers.insert(id, listener.local_addr().unwrap().to_string());
+        reservations.push(listener);
+    }
+    peers
+}
+
+fn member_config(
+    dir: &std::path::Path,
+    mode: StateMode,
+    id: u64,
+    peers: &std::collections::BTreeMap<u64, String>,
+) -> ServerConfig {
+    let mut config = config(&dir.join(id.to_string()), mode, Duration::from_millis(200));
+    config.id = id;
+    config.listen = peers[&id].parse().unwrap();
+    config.peers = peers.clone();
+    config.client_peers = peers.clone();
+    // Truncate often, so a late member needs a Raft snapshot.
+    config.snapshot_every = 16;
+    config.snapshot_min_bytes = 0;
+    // The health check needs peer traffic first. This test adds a member at once.
+    config.strict_reconfiguration = false;
+    if mode == StateMode::Shared {
+        config.object_store =
+            slatedb_etcd::object::Config::SharedDirectory(dir.join("shared-objects"));
+    }
+    config
+}
+
+async fn channel(server: &Server) -> Channel {
+    Endpoint::from_shared(server.client_url())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap()
+}
+
+async fn leader(server: &Server) -> u64 {
+    MaintenanceClient::new(channel(server).await)
+        .status(slatedb_etcd::proto::etcdserverpb::StatusRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .leader
+}
+
+/// The local revision and the HashKV result of a member at `revision`.
+async fn local_hash(server: &Server, revision: i64) -> Option<u32> {
+    let channel = channel(server).await;
+    let local = KvClient::new(channel.clone())
+        .range(RangeRequest {
+            serializable: true,
+            ..all()
+        })
+        .await
+        .ok()?
+        .into_inner();
+    if local.header?.revision < revision {
+        return None;
+    }
+    let hash = MaintenanceClient::new(channel)
+        .hash_kv(HashKvRequest { revision })
+        .await
+        .ok()?
+        .into_inner();
+    Some(hash.hash)
+}
+
+/// Run the workload on three voters, then add a learner. Shared and replicated mode give the
+/// same results and hashes. In shared mode the learner joins from a format 6 snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn three_voters_and_a_learner_share_one_state() {
+    use slatedb_etcd::proto::etcdserverpb::{
+        cluster_client::ClusterClient, MemberAddRequest, MoveLeaderRequest,
+    };
+    let mut outputs = vec![];
+    let mut hashes = vec![];
+    for mode in [StateMode::Replicated, StateMode::Shared] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut peers = addresses(4).await;
+        let learner_address = peers.remove(&4).unwrap();
+        let mut servers = vec![];
+        for id in 1..=3 {
+            let config = member_config(dir.path(), mode, id, &peers);
+            servers.push(Server::start(config).await.unwrap());
+        }
+        for server in &servers {
+            server.wait_ready(Duration::from_secs(15)).await.unwrap();
+        }
+        let lead = &servers[leader(&servers[0]).await as usize - 1];
+        outputs.push(workload(channel(lead).await).await);
+        let revision = KvClient::new(channel(lead).await)
+            .range(all())
+            .await
+            .unwrap()
+            .into_inner()
+            .header
+            .unwrap()
+            .revision;
+        // Every voter applies the same state. A follower reads its own base and overlay.
+        let mut values = vec![];
+        for server in &servers {
+            let mut hash = None;
+            eventually("a member hash", async || {
+                hash = local_hash(server, revision).await;
+                hash.is_some()
+            })
+            .await;
+            values.push(hash.unwrap());
+        }
+        assert!(values.iter().all(|hash| *hash == values[0]), "{values:?}");
+
+        // A learner joins after the voters truncated their logs.
+        let added = ClusterClient::new(channel(lead).await)
+            .member_add(MemberAddRequest {
+                peer_ur_ls: vec![format!("http://{learner_address}")],
+                is_learner: true,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let id = added.member.unwrap().id;
+        let mut joined_peers = peers.clone();
+        joined_peers.insert(id, learner_address);
+        let mut learner_config = member_config(dir.path(), mode, id, &joined_peers);
+        learner_config.join = true;
+        let learner = Server::start(learner_config).await.unwrap();
+        let mut learner_hash = None;
+        eventually("the learner hash", async || {
+            learner_hash = local_hash(&learner, revision).await;
+            learner_hash.is_some()
+        })
+        .await;
+        assert_eq!(learner_hash.unwrap(), values[0]);
+        if mode == StateMode::Shared {
+            let joined = status(&learner).await;
+            assert!(
+                joined["installed_snapshots"].as_u64().unwrap() > 0,
+                "{joined}"
+            );
+            // The leader keeps the transfer and the reports of the members.
+            eventually("member reports", async || {
+                status(lead).await["shared_state"]["writer"]["reports"]
+                    .as_u64()
+                    .unwrap()
+                    >= 3
+            })
+            .await;
+            assert!(status(lead).await["snapshot_index"].as_u64().unwrap() > 0);
+            // Phase 2 keeps the bootstrap leader.
+            let current = leader(lead).await;
+            let target = (1..=3).find(|id| *id != current).unwrap();
+            let moved = MaintenanceClient::new(channel(lead).await)
+                .move_leader(MoveLeaderRequest { target_id: target })
+                .await;
+            assert!(moved.is_err());
+        }
+        hashes.push(values[0]);
+        learner.shutdown().await.unwrap();
+        for server in servers {
+            server.shutdown().await.unwrap();
+        }
+    }
+    assert_eq!(outputs[0], outputs[1]);
+    assert_eq!(hashes[0], hashes[1]);
+}
+
+/// A follower stops while the others truncate their logs past it. Its restart opens the newest
+/// checkpoint and adopts it as the snapshot record, because its log ends below the base.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_restarted_follower_adopts_a_checkpoint_above_its_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let peers = addresses(3).await;
+    let configs: Vec<_> = (1..=3)
+        .map(|id| member_config(dir.path(), StateMode::Shared, id, &peers))
+        .collect();
+    let mut servers = vec![];
+    for config in &configs {
+        servers.push(Some(Server::start(config.clone()).await.unwrap()));
+    }
+    for server in servers.iter().flatten() {
+        server.wait_ready(Duration::from_secs(15)).await.unwrap();
+    }
+    let lead = leader(servers[0].as_ref().unwrap()).await as usize - 1;
+    let follower = (lead + 1) % 3;
+    let mut kv = KvClient::new(channel(servers[lead].as_ref().unwrap()).await);
+    kv.put(put("before", "stop")).await.unwrap();
+    let stopped = servers[follower].take().unwrap();
+    let last = status(&stopped).await["last_log_index"].as_u64().unwrap();
+    stopped.shutdown().await.unwrap();
+    for n in 0..64 {
+        kv.put(put(&format!("k{}", n % 8), &format!("v{n}")))
+            .await
+            .unwrap();
+    }
+    let lead_server = servers[lead].as_ref().unwrap();
+    eventually(
+        "a base and a truncation above the stopped log",
+        async || {
+            let status = status(lead_server).await;
+            status["shared_state"]["base_applied_index"]
+                .as_u64()
+                .unwrap()
+                > last
+                && status["snapshot_index"].as_u64().unwrap() > last
+        },
+    )
+    .await;
+    let revision = kv
+        .range(all())
+        .await
+        .unwrap()
+        .into_inner()
+        .header
+        .unwrap()
+        .revision;
+    let expected = local_hash(lead_server, revision).await.unwrap();
+    let restarted = Server::start(configs[follower].clone()).await.unwrap();
+    let mut hash = None;
+    eventually("the restarted follower", async || {
+        hash = local_hash(&restarted, revision).await;
+        hash.is_some()
+    })
+    .await;
+    assert_eq!(hash.unwrap(), expected);
+    let joined = status(&restarted).await;
+    assert!(
+        joined["snapshot_index"].as_u64().unwrap() > last,
+        "{joined}"
+    );
+    restarted.shutdown().await.unwrap();
+    for server in servers.into_iter().flatten() {
+        server.shutdown().await.unwrap();
+    }
 }

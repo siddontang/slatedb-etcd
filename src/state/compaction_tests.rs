@@ -15,7 +15,7 @@ async fn reference_compaction(state: &mut StateMachine, request: &CompactionRequ
         state.apply(index, None).await.unwrap();
         return false;
     }
-    let db = state.db.clone();
+    let db = state.db().clone();
     let mut batch = WriteBatch::new();
     let mut scan = db.scan_prefix(mvcc::HISTORY, ..).await.unwrap();
     let mut previous: Option<(Vec<u8>, bytes::Bytes, usize)> = None;
@@ -87,7 +87,7 @@ pub(super) async fn finish(state: &mut StateMachine) {
 }
 
 async fn rows(state: &StateMachine) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut scan = state.db.scan_prefix(b"etcd/", ..).await.unwrap();
+    let mut scan = state.db().scan_prefix(b"etcd/", ..).await.unwrap();
     let mut rows = vec![];
     while let Some(row) = scan.next().await.unwrap() {
         // Snapshots store the in-memory member list. This test covers MVCC rows.
@@ -99,7 +99,7 @@ async fn rows(state: &StateMachine) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 async fn count(state: &StateMachine, prefix: &[u8]) -> usize {
-    let mut scan = state.db.scan_prefix(prefix, ..).await.unwrap();
+    let mut scan = state.db().scan_prefix(prefix, ..).await.unwrap();
     let mut count = 0;
     while scan.next().await.unwrap().is_some() {
         count += 1;
@@ -265,7 +265,7 @@ async fn stepped_compaction_matches_single_batch_compaction() {
         assert_eq!(state.logical_bytes, reference.logical_bytes);
         assert_eq!(
             state.logical_bytes,
-            maintenance::count_logical_size(state.db.as_ref())
+            maintenance::count_logical_size(state.db().as_ref())
                 .await
                 .unwrap()
         );
@@ -328,10 +328,10 @@ async fn compact_applies_without_deleting_a_large_history() {
     assert!(count(&state, mvcc::HISTORY).await < 1200);
     assert!(count(&state, HASH).await < 1200);
     assert!(count(&state, crate::watch::EVENTS).await <= 101);
-    assert!(state.db.get(compaction::PENDING).await.unwrap().is_none());
+    assert!(state.db().get(compaction::PENDING).await.unwrap().is_none());
     assert_eq!(
         state.logical_bytes,
-        maintenance::count_logical_size(state.db.as_ref())
+        maintenance::count_logical_size(state.db().as_ref())
             .await
             .unwrap()
     );
@@ -413,7 +413,7 @@ async fn restart_resumes_compaction_from_the_durable_step() {
         apply(&mut state, entry).await;
         if position == 3002 {
             // Make a prefix that contains the first steps durable.
-            state.db.flush().await.unwrap();
+            state.db().flush().await.unwrap();
         }
     }
     assert!(state.compaction_pending());
@@ -436,7 +436,7 @@ async fn restart_resumes_compaction_from_the_durable_step() {
     assert_eq!(rows(&state).await, rows(&reference).await);
     assert_eq!(state.logical_bytes, reference.logical_bytes);
     // The node flushes outside ordered apply. After that flush, the finished pass survives.
-    state.db.flush().await.unwrap();
+    state.db().flush().await.unwrap();
     state.close().await.unwrap();
     drop(state);
     let state = StateMachine::open(&path).await.unwrap();
@@ -475,7 +475,7 @@ async fn snapshot_install_carries_a_pending_compaction() {
     for state in [&source, &target] {
         assert_eq!(
             state.logical_bytes,
-            maintenance::count_logical_size(state.db.as_ref())
+            maintenance::count_logical_size(state.db().as_ref())
                 .await
                 .unwrap()
         );
@@ -593,8 +593,8 @@ async fn planned_steps_match_inline_steps_under_concurrent_writes() {
         assert_eq!(a, b);
         assert_eq!(planned.compaction, inline.compaction, "step {round}");
         assert_eq!(
-            planned.db.get(compaction::PENDING).await.unwrap(),
-            inline.db.get(compaction::PENDING).await.unwrap()
+            planned.db().get(compaction::PENDING).await.unwrap(),
+            inline.db().get(compaction::PENDING).await.unwrap()
         );
         round += 1;
     }
@@ -711,7 +711,7 @@ async fn restart_during_a_planned_step_replays_the_same_compaction() {
         apply(&mut state, entry).await;
         if position == 41 * 3 {
             // The first steps become durable. Later steps stay in the memtable.
-            state.db.flush().await.unwrap();
+            state.db().flush().await.unwrap();
         }
     }
     assert!(state.compaction_pending());

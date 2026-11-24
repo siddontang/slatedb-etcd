@@ -68,7 +68,8 @@ struct SnapshotData {
 
 pub struct StateMachine {
     pub(crate) metrics: Arc<crate::metrics::StateMeters>,
-    pub(crate) db: Arc<Db>,
+    /// The replicated database. Shared mode has no writer here: the leader task opens it.
+    database: Option<Arc<Db>>,
     pub auth: Arc<crate::auth::Store>,
     pub members: Arc<crate::cluster::Store>,
     pub(crate) admin: Arc<slatedb::admin::Admin>,
@@ -289,7 +290,15 @@ impl StateMachine {
                 "SlateDB sequence and apply marker differ"
             );
             let reads = StateView::Live(db.clone());
-            Self::load(db.clone(), admin, location, rows, reads, None).await
+            Self::load(
+                Some(db.clone()),
+                Arc::new(admin),
+                location,
+                rows,
+                reads,
+                None,
+            )
+            .await
         }
         .await;
         if result.is_err() {
@@ -302,10 +311,10 @@ impl StateMachine {
         Ok(state)
     }
 
-    /// Build the derived state from `reads`, the applied state of `db`.
+    /// Build the derived state from `reads`, the applied state of `db` or of a shared base.
     async fn load(
-        db: Arc<Db>,
-        admin: slatedb::admin::Admin,
+        db: Option<Arc<Db>>,
+        admin: Arc<slatedb::admin::Admin>,
         location: Arc<transfer::Location>,
         rows: Arc<rows::RowCache>,
         reads: StateView,
@@ -342,7 +351,7 @@ impl StateMachine {
         };
         Ok(Self {
             members: Arc::new(members),
-            admin: Arc::new(admin),
+            admin,
             metrics: Arc::new(crate::metrics::StateMeters::new()?),
             quota: 0,
             current: current::CurrentRows::default(),
@@ -352,7 +361,7 @@ impl StateMachine {
             write_batches: 0,
             alarms,
             auth: Arc::new(auth),
-            db,
+            database: db,
             applied,
             applied_term,
             entry_term: applied_term,
@@ -371,6 +380,18 @@ impl StateMachine {
         })
     }
 
+    /// The replicated database, if any.
+    pub(crate) fn database(&self) -> Option<Arc<Db>> {
+        self.database.clone()
+    }
+
+    /// The replicated database. Only replicated paths call this.
+    pub(crate) fn db(&self) -> &Arc<Db> {
+        self.database
+            .as_ref()
+            .expect("replicated state has a database")
+    }
+
     /// The applied state that apply and the apply owner read. Replicated writes go to `db`.
     pub(crate) fn applied_state(&self) -> &StateView {
         &self.reads
@@ -381,7 +402,7 @@ impl StateMachine {
         if let Some(shared) = &self.shared {
             return Ok(shared.pinned());
         }
-        let snapshot = self.db.snapshot()?;
+        let snapshot = self.db().snapshot()?;
         ensure!(
             snapshot.seq() == self.applied,
             "read view does not match applied state"
@@ -459,7 +480,7 @@ impl StateMachine {
         let batch = Arc::new(batch);
         match &mut self.shared {
             None => {
-                self.db
+                self.db()
                     .write_with_options(batch.to_storage(), &WriteOptions { seqnum: index })
                     .await?;
             }
@@ -489,9 +510,10 @@ impl StateMachine {
 
     pub(crate) async fn close(&self) -> Result<()> {
         // Raft keeps acknowledged writes durable. Shutdown does not require a new checkpoint.
-        self.db
-            .close_with_options(slatedb::config::CloseOptions { flush_type: None })
-            .await?;
+        if let Some(db) = &self.database {
+            db.close_with_options(slatedb::config::CloseOptions { flush_type: None })
+                .await?;
+        }
         Ok(())
     }
 }
