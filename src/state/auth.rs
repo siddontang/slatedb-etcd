@@ -54,18 +54,8 @@ impl StateMachine {
                     L::Expire { .. } => return Err(crate::auth::denied()),
                 };
                 if self.auth.enabled {
-                    let mut scan = self
-                        .applied_state()
-                        .scan_under(mvcc::CURRENT, &Default::default())
-                        .await
-                        .map_err(mvcc::KvError::storage)?;
-                    use prost::Message;
-                    while let Some(row) = scan.next().await.map_err(mvcc::KvError::storage)? {
-                        let kv = crate::proto::mvccpb::KeyValue::decode(row.value)
-                            .map_err(mvcc::KvError::storage)?;
-                        if kv.lease == id {
-                            self.auth.range(auth, &kv.key, &[], write)?;
-                        }
+                    for key in self.key_index.lease_keys_unordered(id) {
+                        self.auth.range(auth, key, &[], write)?;
                     }
                 }
                 Ok(())
@@ -96,18 +86,10 @@ impl StateMachine {
                 _ => (),
             }
         }
-        if self.auth.enabled && !leases.is_empty() {
-            use prost::Message;
-            let mut scan = self
-                .applied_state()
-                .scan_under(mvcc::CURRENT, &Default::default())
-                .await
-                .map_err(mvcc::KvError::storage)?;
-            while let Some(row) = scan.next().await.map_err(mvcc::KvError::storage)? {
-                let kv = crate::proto::mvccpb::KeyValue::decode(row.value)
-                    .map_err(mvcc::KvError::storage)?;
-                if leases.contains(&kv.lease) {
-                    self.auth.range(auth, &kv.key, &[], true)?;
+        if self.auth.enabled {
+            for lease in leases {
+                for key in self.key_index.lease_keys_unordered(lease) {
+                    self.auth.range(auth, key, &[], true)?;
                 }
             }
         }
