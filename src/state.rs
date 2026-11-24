@@ -44,6 +44,8 @@ pub use shared::StateMode;
 pub use source::{Row, StateRead, StateScan};
 use view::StateView;
 #[cfg(test)]
+mod history_tests;
+#[cfg(test)]
 mod key_index_tests;
 pub(crate) mod maintenance;
 #[cfg(test)]

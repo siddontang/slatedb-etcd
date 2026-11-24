@@ -1,0 +1,396 @@
+//! Check historical Range reads against a model of every past revision.
+
+use std::collections::BTreeMap;
+
+use super::*;
+use crate::lease::LeaseCommand;
+use crate::proto::etcdserverpb::request_op::Request as Op;
+use crate::proto::etcdserverpb::response_op::Response as Resp;
+use crate::proto::etcdserverpb::*;
+use crate::proto::mvccpb::KeyValue;
+
+type Model = BTreeMap<i64, BTreeMap<Vec<u8>, KeyValue>>;
+
+struct Random(u64);
+
+impl Random {
+    fn next(&mut self, bound: u64) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 33) % bound
+    }
+}
+
+// Prefix pairs and high bytes check that the history key order matches the user key order.
+const KEYS: &[&[u8]] = &[
+    b"a",
+    b"a\0",
+    b"a\x01",
+    b"ab",
+    b"a\xff",
+    b"b",
+    b"b/",
+    b"b0",
+    b"\xff",
+    b"\xff\xff",
+];
+
+fn key(random: &mut Random) -> Vec<u8> {
+    KEYS[random.next(KEYS.len() as u64) as usize].to_vec()
+}
+
+fn range(key: &[u8], end: &[u8], revision: i64) -> RangeRequest {
+    RangeRequest {
+        key: key.to_vec(),
+        range_end: end.to_vec(),
+        revision,
+        ..Default::default()
+    }
+}
+
+async fn apply(state: &mut StateMachine, request: Op) {
+    state
+        .apply_etcd(
+            state.applied + 1,
+            &RequestOp {
+                request: Some(request),
+            },
+        )
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+}
+
+/// Record the current state with current-revision reads.
+async fn record(state: &StateMachine, model: &mut Model) {
+    let reply = read(state, range(&[0], &[0], 0)).await.unwrap();
+    model.insert(
+        state.revision,
+        reply
+            .kvs
+            .into_iter()
+            .map(|kv| (kv.key.clone(), kv))
+            .collect(),
+    );
+}
+
+async fn read(state: &StateMachine, request: RangeRequest) -> Result<RangeResponse, i32> {
+    let request = RequestOp {
+        request: Some(Op::RequestRange(request)),
+    };
+    // Pinned views and the live database use different scan paths.
+    let pinned = state
+        .read_view()
+        .unwrap()
+        .read(&request, None)
+        .await
+        .unwrap();
+    let live = state.read_etcd(&request).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&pinned).unwrap(),
+        serde_json::to_value(&live).unwrap()
+    );
+    match live.result {
+        Ok(ResponseOp {
+            response: Some(Resp::ResponseRange(reply)),
+        }) => Ok(reply),
+        Ok(other) => panic!("unexpected response {other:?}"),
+        Err(error) => Err(error.code),
+    }
+}
+
+fn expected(model: &Model, revision: i64, key: &[u8], end: &[u8]) -> Vec<KeyValue> {
+    model[&revision]
+        .values()
+        .filter(|kv| crate::mvcc::contains(&kv.key, key, end))
+        .cloned()
+        .collect()
+}
+
+/// Read `[key, end)` at `revision` in pages of `limit` rows, as a paginated LIST does.
+async fn check_pages(
+    state: &StateMachine,
+    model: &Model,
+    revision: i64,
+    key: &[u8],
+    end: &[u8],
+    limit: i64,
+) {
+    let all = expected(model, revision, key, end);
+    let mut start = key.to_vec();
+    let mut seen = vec![];
+    loop {
+        let reply = read(
+            state,
+            RangeRequest {
+                limit,
+                ..range(&start, end, revision)
+            },
+        )
+        .await
+        .unwrap();
+        let rest = expected(model, revision, &start, end);
+        let context = format!("revision {revision} start {start:?} end {end:?} limit {limit}");
+        assert_eq!(reply.count, rest.len() as i64, "{context}");
+        assert_eq!(reply.more, rest.len() as i64 > limit, "{context}");
+        assert_eq!(
+            reply.kvs,
+            rest[..rest.len().min(limit as usize)],
+            "{context}"
+        );
+        assert_eq!(reply.header.unwrap().revision, state.revision);
+        seen.extend(reply.kvs.iter().cloned());
+        if !reply.more {
+            break;
+        }
+        start = [reply.kvs.last().unwrap().key.as_slice(), b"\0"].concat();
+    }
+    assert_eq!(seen, all);
+}
+
+/// Compare every retained revision with the model.
+async fn check(state: &StateMachine, model: &Model, random: &mut Random) {
+    let first = state.compact_revision.max(1);
+    for revision in first..=state.revision {
+        for (key, end) in [
+            (vec![0], vec![0]),
+            (b"a".to_vec(), b"b".to_vec()),
+            (b"a".to_vec(), b"a\x01".to_vec()),
+            (b"a\xff".to_vec(), vec![0]),
+            (b"b".to_vec(), b"a".to_vec()),
+        ] {
+            check_pages(
+                state,
+                model,
+                revision,
+                &key,
+                &end,
+                1 + random.next(4) as i64,
+            )
+            .await;
+        }
+        for key in KEYS {
+            let reply = read(state, range(key, b"", revision)).await.unwrap();
+            assert_eq!(
+                reply.kvs,
+                expected(model, revision, key, b""),
+                "{key:?}@{revision}"
+            );
+        }
+        // Sorted, filtered, and count-only reads collect the whole interval.
+        let all = expected(model, revision, &[0], &[0]);
+        let reply = read(
+            state,
+            RangeRequest {
+                count_only: true,
+                limit: 1,
+                ..range(&[0], &[0], revision)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!((reply.count, reply.kvs.len()), (all.len() as i64, 0));
+        let reply = read(
+            state,
+            RangeRequest {
+                sort_order: 2,
+                limit: 2,
+                keys_only: true,
+                ..range(&[0], &[0], revision)
+            },
+        )
+        .await
+        .unwrap();
+        let keys: Vec<_> = all.iter().rev().take(2).map(|kv| kv.key.clone()).collect();
+        assert_eq!(
+            reply.kvs.iter().map(|kv| &kv.key).collect::<Vec<_>>(),
+            keys.iter().collect::<Vec<_>>()
+        );
+        assert!(reply.kvs.iter().all(|kv| kv.value.is_empty()));
+        let reply = read(
+            state,
+            RangeRequest {
+                min_mod_revision: revision,
+                limit: 1,
+                ..range(&[0], &[0], revision)
+            },
+        )
+        .await
+        .unwrap();
+        let recent: Vec<_> = all
+            .iter()
+            .filter(|kv| kv.mod_revision >= revision)
+            .cloned()
+            .collect();
+        assert_eq!(reply.count, all.len() as i64);
+        assert_eq!(reply.kvs, recent[..recent.len().min(1)]);
+    }
+    if state.compact_revision > 1 {
+        let reply = read(state, range(&[0], &[0], state.compact_revision - 1)).await;
+        assert_eq!(reply.unwrap_err(), tonic::Code::OutOfRange as i32);
+    }
+}
+
+#[tokio::test]
+async fn historical_ranges_match_every_retained_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut random = Random(66);
+    let mut model = Model::new();
+    record(&state, &mut model).await;
+    state
+        .apply_lease(state.applied + 1, &LeaseCommand::Grant { id: 7, ttl: 60 })
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    let mut revoked = false;
+    for round in 0..12 {
+        // Hot keys get more versions than the forward probe reads.
+        for step in 0..10 {
+            let request = match random.next(10) {
+                0..=3 => Op::RequestPut(PutRequest {
+                    key: key(&mut random),
+                    value: format!("{round}-{step}").into_bytes(),
+                    lease: if !revoked && random.next(3) == 0 {
+                        7
+                    } else {
+                        0
+                    },
+                    ..Default::default()
+                }),
+                4..=6 => Op::RequestPut(PutRequest {
+                    key: b"a".to_vec(),
+                    value: format!("hot-{round}-{step}").into_bytes(),
+                    ..Default::default()
+                }),
+                7 => Op::RequestDeleteRange(DeleteRangeRequest {
+                    key: key(&mut random),
+                    ..Default::default()
+                }),
+                8 => Op::RequestDeleteRange(DeleteRangeRequest {
+                    key: b"a\x01".to_vec(),
+                    range_end: b"b0".to_vec(),
+                    ..Default::default()
+                }),
+                // One revision changes several keys.
+                _ => Op::RequestTxn(TxnRequest {
+                    success: [
+                        Op::RequestPut(PutRequest {
+                            key: b"b".to_vec(),
+                            value: format!("txn-{round}-{step}").into_bytes(),
+                            ..Default::default()
+                        }),
+                        Op::RequestPut(PutRequest {
+                            key: b"\xff".to_vec(),
+                            value: b"txn".to_vec(),
+                            ..Default::default()
+                        }),
+                        Op::RequestDeleteRange(DeleteRangeRequest {
+                            key: b"ab".to_vec(),
+                            ..Default::default()
+                        }),
+                    ]
+                    .into_iter()
+                    .map(|request| RequestOp {
+                        request: Some(request),
+                    })
+                    .collect(),
+                    ..Default::default()
+                }),
+            };
+            let before = state.revision;
+            apply(&mut state, request).await;
+            if state.revision != before {
+                record(&state, &mut model).await;
+            }
+        }
+        if round == 6 && !revoked {
+            // Revoking the lease deletes its keys at one revision.
+            state
+                .apply_lease(state.applied + 1, &LeaseCommand::Revoke { id: 7 })
+                .await
+                .unwrap();
+            revoked = true;
+            record(&state, &mut model).await;
+        }
+        check(&state, &model, &mut random).await;
+        if round % 3 == 2 {
+            let target = state.compact_revision.max(1) + random.next(10) as i64;
+            let target = target.min(state.revision);
+            state
+                .apply_compaction(
+                    state.applied + 1,
+                    &CompactionRequest {
+                        revision: target,
+                        physical: false,
+                    },
+                )
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+            // Reads during the pending pass see rows that the pass will remove.
+            check(&state, &model, &mut random).await;
+            if round % 2 == 0 {
+                super::compaction_tests::finish(&mut state).await;
+                check(&state, &model, &mut random).await;
+            }
+        }
+    }
+    super::compaction_tests::finish(&mut state).await;
+    check(&state, &model, &mut random).await;
+    // A restart reads the same history.
+    drop(state);
+    let state = StateMachine::open(dir.path()).await.unwrap();
+    check(&state, &model, &mut random).await;
+}
+
+/// A page at an old revision returns the old versions when many newer versions follow each key.
+#[tokio::test]
+async fn historical_pages_skip_versions_after_the_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    for key in 0..50u8 {
+        apply(
+            &mut state,
+            Op::RequestPut(PutRequest {
+                key: vec![b'k', key],
+                value: b"old".to_vec(),
+                ..Default::default()
+            }),
+        )
+        .await;
+    }
+    let old = state.revision;
+    for round in 0..40 {
+        for key in 0..50u8 {
+            apply(
+                &mut state,
+                Op::RequestPut(PutRequest {
+                    key: vec![b'k', key],
+                    value: format!("new-{round}").into_bytes(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+        }
+    }
+    let reply = read(
+        &state,
+        RangeRequest {
+            limit: 10,
+            ..range(b"k", b"l", old)
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!((reply.count, reply.kvs.len(), reply.more), (50, 10, true));
+    assert!(reply
+        .kvs
+        .iter()
+        .all(|kv| kv.value == b"old" && kv.mod_revision <= old));
+}

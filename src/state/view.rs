@@ -183,6 +183,36 @@ impl StateScan for SharedScan<'_> {
             }
         }
     }
+
+    /// Move forward to the first merged row at or after `key`, like `DbIterator::seek`.
+    /// A buffered row at or after `key` is kept; the base and overlay never move backward.
+    async fn seek(&mut self, key: &[u8]) -> Result<(), slatedb::Error> {
+        if self
+            .base_row
+            .as_ref()
+            .is_none_or(|row| row.key.as_ref() < key)
+        {
+            self.base_row = None;
+            if let Some(base) = &mut self.base {
+                StateScan::seek(base, key).await?;
+            }
+        }
+        if self
+            .overlay_row
+            .as_ref()
+            .is_none_or(|(k, _)| k.as_ref() < key)
+        {
+            self.overlay_row = None;
+            if self.after.as_ref().is_none_or(|after| after.as_ref() < key) {
+                self.after = None;
+                if self.start.as_slice() < key {
+                    self.start = key.to_vec();
+                }
+            }
+            self.overlay_done = false;
+        }
+        Ok(())
+    }
 }
 
 impl StateRead for SharedView {
@@ -255,6 +285,13 @@ impl StateScan for ViewScan<'_> {
         match self {
             Self::Db(scan) => StateScan::next(scan).await,
             Self::Shared(scan) => scan.next().await,
+        }
+    }
+
+    async fn seek(&mut self, key: &[u8]) -> Result<(), slatedb::Error> {
+        match self {
+            Self::Db(scan) => StateScan::seek(scan, key).await,
+            Self::Shared(scan) => scan.seek(key).await,
         }
     }
 }
@@ -360,6 +397,79 @@ mod tests {
         let base = Base::open(store, "state", id, cache).await.unwrap();
         assert_eq!(base.applied, 3);
         (db, Arc::new(base))
+    }
+
+    /// Collect a scan of `range` after `next` rows and a seek to `to`.
+    async fn scan_seek(view: &SharedView, range: Range<&str>, next: usize, to: &str) -> Vec<Row> {
+        let range = range.start.as_bytes().to_vec()..range.end.as_bytes().to_vec();
+        let mut scan = view
+            .scan_range(range, &ScanOptions::default())
+            .await
+            .unwrap();
+        let mut found = vec![];
+        for _ in 0..next {
+            found.push(scan.next().await.unwrap().unwrap());
+        }
+        scan.seek(to.as_bytes()).await.unwrap();
+        while let Some(row) = scan.next().await.unwrap() {
+            found.push(row);
+        }
+        found
+    }
+
+    #[tokio::test]
+    async fn shared_scans_seek_forward_over_base_and_overlay() {
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let (_db, base) = checkpoint_base(store).await;
+        let mut overlay = Overlay::new(3);
+        overlay.push(
+            5,
+            batch(&[("a/0", Some("new")), ("a/2", None), ("a/35", Some("mid"))]),
+        );
+        let view = SharedView::new(base, overlay.segments(), 5);
+        // Merged order: a/0 (overlay), a/1, a/3, a/35 (overlay), a/4. a/2 is deleted.
+        // Seek from the start skips both sources to the first row at or after the key.
+        assert_eq!(
+            scan_seek(&view, "a/".."b", 0, "a/3").await,
+            vec![
+                row("a/3", "base-a/3"),
+                row("a/35", "mid"),
+                row("a/4", "base-a/4")
+            ]
+        );
+        // A seek between rows lands on the next overlay row.
+        assert_eq!(
+            scan_seek(&view, "a/".."b", 1, "a/31").await,
+            vec![
+                row("a/0", "new"),
+                row("a/35", "mid"),
+                row("a/4", "base-a/4")
+            ]
+        );
+        // After a/0 from the overlay, the base row a/1 is buffered. A seek to a key before it
+        // keeps the buffered row instead of seeking the base iterator backward.
+        assert_eq!(
+            scan_seek(&view, "a/".."b", 1, "a/05").await,
+            vec![
+                row("a/0", "new"),
+                row("a/1", "base-a/1"),
+                row("a/3", "base-a/3"),
+                row("a/35", "mid"),
+                row("a/4", "base-a/4"),
+            ]
+        );
+        // A seek onto a deleted key skips it.
+        assert_eq!(
+            scan_seek(&view, "a/".."b", 0, "a/2").await,
+            vec![
+                row("a/3", "base-a/3"),
+                row("a/35", "mid"),
+                row("a/4", "base-a/4")
+            ]
+        );
+        // A seek past the end yields nothing.
+        assert!(scan_seek(&view, "a/".."b", 0, "a/9").await.is_empty());
     }
 
     #[tokio::test]

@@ -224,9 +224,27 @@ Raft log replay and full snapshots restore both current state and historical ver
 The revision is independent of the SlateDB sequence number, which tracks the Raft apply index.
 
 Point reads use the current-key index. Current range reads scan the requested key interval.
-Historical point reads scan one key's versions. Historical range reads currently scan all history.
-Range responses collect matching keys in memory before sorting or applying a limit.
-These choices favor compatibility testing. Large data sets need bounded scans and a history index.
+History rows sort by user key and then by revision, because the hex key encoding keeps key order.
+A historical point read uses one descending scan that ends at the requested revision.
+A key-ordered historical Range without filters first tries the Watch journal after its revision.
+A key that no later journal event names has the same current row now as at the revision.
+The Range merges those current rows with the versions at the revision of the named keys.
+It stops after `limit + 1` rows. Its count starts from the current-key count of the pinned view.
+Each named key then adds or removes one.
+The journal row of a revision shares its batch, and compaction keeps rows after the boundary.
+A page then costs about `limit` current rows plus the writes after its revision.
+It does not depend on the history size.
+Debug builds also read the history rows and check the result against them.
+
+The Range reads the history rows of its key interval instead in two cases.
+The view has no key order, or the later journal has more events than 1024 or the current-key
+count of the interval, whichever is larger.
+This scan reads the versions of a key up to the revision by row key and decodes only one.
+It reads up to eight later versions and then seeks past the rest.
+A key with more than 16 versions up to the revision reads its current row instead.
+If that row is newer than the revision, one descending scan reads the version.
+The cost is about one row and one seek per key in the interval.
+Other historical Ranges collect the interval in memory before they sort or filter it.
 Range scans set `cache_blocks`, so repeated scans read blocks from the state block cache.
 SlateDB scans otherwise bypass that cache and fetch every block from the object store.
 

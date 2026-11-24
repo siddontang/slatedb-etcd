@@ -322,8 +322,17 @@ impl<R: StateRead> ReadDb<'_, R> {
         self.scan_base()?.scan_range(range, &scan_options()).await
     }
 
-    async fn scan_prefix(&self, prefix: &[u8]) -> Result<R::Scan<'_>, slatedb::Error> {
-        self.scan_base()?.scan_under(prefix, &scan_options()).await
+    /// Return the last row of `range`, or `None` when the range is empty.
+    async fn last(
+        &self,
+        range: std::ops::Range<Vec<u8>>,
+    ) -> Result<Option<crate::state::Row>, slatedb::Error> {
+        let options = slatedb::config::ScanOptions {
+            order: slatedb::IterationOrder::Descending,
+            ..scan_options()
+        };
+        let mut scan = self.scan_base()?.scan_range(range, &options).await?;
+        scan.next().await
     }
 }
 
@@ -419,33 +428,251 @@ impl<R: StateRead> View<'_, R> {
         Ok(rows)
     }
 
-    async fn historical(&self, key: &[u8], end: &[u8], revision: i64) -> KvResult<Rows> {
-        let prefix = if end.is_empty() {
-            history_prefix(key)
-        } else {
-            HISTORY.to_vec()
-        };
-        let mut versions = BTreeMap::<Vec<u8>, Version>::new();
-        let mut scan = self
-            .db
-            .scan_prefix(&prefix)
-            .await
-            .map_err(KvError::storage)?;
-        while let Some(row) = scan.next().await.map_err(KvError::storage)? {
-            let v = Version::decode(row.value).map_err(KvError::storage)?;
-            if v.revision <= revision
-                && contains(&v.key, key, end)
-                && versions
-                    .get(&v.key)
-                    .is_none_or(|old| old.revision < v.revision)
-            {
-                versions.insert(v.key.clone(), v);
+    /// Return the version of `key` at `revision`, or `None` if no version precedes it.
+    /// One descending scan reads only that version.
+    async fn version_at(&self, key: &[u8], revision: i64) -> KvResult<Option<Version>> {
+        let range = history_prefix(key)..history_key(key, revision + 1);
+        let row = self.db.last(range).await.map_err(KvError::storage)?;
+        row.map(|row| Version::decode(row.value).map_err(KvError::storage))
+            .transpose()
+    }
+
+    /// Read the live rows of `[key, end)` at `revision` in key order.
+    /// The result holds the first `keep` rows and the count of all live rows.
+    async fn historical(
+        &self,
+        key: &[u8],
+        end: &[u8],
+        revision: i64,
+        keep: usize,
+    ) -> KvResult<(Vec<KeyValue>, i64)> {
+        if end.is_empty() {
+            let kv = self.version_at(key, revision).await?.and_then(|v| v.value);
+            let count = i64::from(kv.is_some());
+            return Ok((kv.into_iter().take(keep).collect(), count));
+        }
+        if keep != usize::MAX {
+            if let Some(result) = self.journal_range(key, end, revision, keep).await? {
+                // Debug builds also read the history rows and check the result against them.
+                if cfg!(debug_assertions) {
+                    let history = self.history_range(key, end, revision, keep).await?;
+                    debug_assert_eq!(result, history, "journal range differs from history");
+                }
+                return Ok(result);
             }
         }
-        Ok(versions
-            .into_iter()
-            .filter_map(|(k, v)| v.value.map(|v| (k, v)))
-            .collect())
+        self.history_range(key, end, revision, keep).await
+    }
+
+    /// Read `[key, end)` at `revision` from the history rows of the interval.
+    ///
+    /// History rows sort by key and then by revision. One ascending scan reads the versions of
+    /// each key up to `revision` by row key and decodes only the selected version. It reads a few
+    /// later versions and then seeks past the rest. A key with more than `PROBE_VERSIONS` versions
+    /// up to `revision` reads its current row instead. If that row is newer than `revision`, one
+    /// descending scan reads the version. The cost is about one seek per key in the interval.
+    async fn history_range(
+        &self,
+        key: &[u8],
+        end: &[u8],
+        revision: i64,
+        keep: usize,
+    ) -> KvResult<(Vec<KeyValue>, i64)> {
+        const PROBE_VERSIONS: usize = 16;
+        // A seek costs more than reading a few adjacent rows.
+        const READ_AHEAD: usize = 8;
+        let mut rows = Vec::new();
+        let mut count = 0;
+        let lower = history_prefix(key);
+        let upper = if end == [0] {
+            // The hex key encoding keeps key order, and `0` sorts after the `/` separator.
+            [&HISTORY[..HISTORY.len() - 1], b"0"].concat()
+        } else {
+            history_prefix(end)
+        };
+        if lower >= upper {
+            return Ok((rows, count));
+        }
+        let decode = |value: bytes::Bytes| Version::decode(value).map_err(KvError::storage);
+        let mut scan = self
+            .db
+            .scan(lower..upper.clone())
+            .await
+            .map_err(KvError::storage)?;
+        let mut next = scan.next().await.map_err(KvError::storage)?;
+        while let Some(mut row) = next.take() {
+            // History keys end with the revision. The rest names the user key.
+            let Some(prefix_len) = row
+                .key
+                .len()
+                .checked_sub(8)
+                .filter(|&len| len > HISTORY.len())
+            else {
+                return Err(KvError::storage("short history key"));
+            };
+            let prefix = row.key.slice(..prefix_len);
+            let row_len = row.key.len();
+            let same_key = |candidate: &crate::state::Row| {
+                candidate.key.len() == row_len && candidate.key.starts_with(&prefix)
+            };
+            let row_revision =
+                |key: &[u8]| i64::from_be_bytes(key[prefix_len..].try_into().unwrap());
+            let mut latest = None;
+            let mut probed = 0;
+            let mut later = 0;
+            // Read versions of this key. `next` gets the first row of the next key.
+            let seek = loop {
+                if row_revision(&row.key) <= revision {
+                    latest = Some(row.value);
+                    probed += 1;
+                    if probed == PROBE_VERSIONS {
+                        break true;
+                    }
+                } else {
+                    later += 1;
+                    if later > READ_AHEAD {
+                        break true;
+                    }
+                }
+                match scan.next().await.map_err(KvError::storage)? {
+                    Some(candidate) if same_key(&candidate) => row = candidate,
+                    other => {
+                        next = other;
+                        break false;
+                    }
+                }
+            };
+            let version = latest.map(decode).transpose()?;
+            let kv = match version {
+                Some(version) if probed == PROBE_VERSIONS => {
+                    // A current row that is not newer than `revision` is the version at it.
+                    // A point read is cheaper than a descending scan.
+                    match self.db.current(&version.key).await? {
+                        Some(kv) if kv.mod_revision <= revision => Some(kv),
+                        _ => self
+                            .version_at(&version.key, revision)
+                            .await?
+                            .and_then(|version| version.value),
+                    }
+                }
+                version => version.and_then(|version| version.value),
+            };
+            if let Some(kv) = kv {
+                count += 1;
+                if rows.len() < keep {
+                    rows.push(kv);
+                }
+            }
+            if seek {
+                // All versions of this key sort before this bound. Longer keys start at it.
+                let mut after = prefix.to_vec();
+                *after
+                    .last_mut()
+                    .expect("history prefix ends with a separator") = b'0';
+                if after >= upper {
+                    break;
+                }
+                scan.seek(&after).await.map_err(KvError::storage)?;
+                next = scan.next().await.map_err(KvError::storage)?;
+            }
+        }
+        Ok((rows, count))
+    }
+
+    /// Read `[key, end)` at `revision` from the current rows and the later Watch journal.
+    ///
+    /// A key that no journal event after `revision` names has the same row now as at `revision`.
+    /// The result merges those current rows with the versions at `revision` of the named keys.
+    /// The count is the current count plus a correction for each named key. The cost is about
+    /// `keep` current rows plus the journal after `revision`. It does not depend on older history.
+    ///
+    /// Journal rows share the batch of their revision, and compaction keeps those after its
+    /// boundary. `None` means that the view has no key order or that the journal costs more
+    /// than reading the history rows of the interval.
+    async fn journal_range(
+        &self,
+        key: &[u8],
+        end: &[u8],
+        revision: i64,
+        keep: usize,
+    ) -> KvResult<Option<(Vec<KeyValue>, i64)>> {
+        let (Some(keys), ReadDb::Pinned { db, .. }) = (self.keys, &self.db) else {
+            return Ok(None);
+        };
+        let bounds = current_bounds(key, end);
+        if bounds.is_empty() {
+            return Ok(Some((vec![], 0)));
+        }
+        let mut count = keys.count(key, end);
+        // Each named key costs one descending scan. Reading the history rows costs about one
+        // seek per key in the interval.
+        let budget = usize::try_from(count).unwrap_or(0).max(1024);
+        let mut events = 0;
+        let mut named = BTreeSet::new();
+        if revision < self.revision {
+            let mut scan = db
+                .scan_range(
+                    crate::watch::key(revision + 1)..crate::watch::key(self.revision + 1),
+                    &scan_options(),
+                )
+                .await
+                .map_err(KvError::storage)?;
+            while let Some(row) = scan.next().await.map_err(KvError::storage)? {
+                let journal =
+                    crate::proto::state::Journal::decode(row.value).map_err(KvError::storage)?;
+                events += journal.events.len();
+                if events > budget {
+                    return Ok(None);
+                }
+                for event in journal.events {
+                    if let Some(kv) = event.kv.filter(|kv| contains(&kv.key, key, end)) {
+                        named.insert(kv.key);
+                    }
+                }
+            }
+        }
+        let mut changed = BTreeMap::new();
+        for named in named {
+            let live_now = keys.count(&named, &[named.as_slice(), &[0]].concat()) == 1;
+            let then = self
+                .version_at(&named, revision)
+                .await?
+                .and_then(|version| version.value);
+            count += i64::from(then.is_some()) - i64::from(live_now);
+            changed.insert(named, then);
+        }
+        let mut rows = Vec::new();
+        if keep == 0 {
+            return Ok(Some((rows, count)));
+        }
+        let mut older = changed.values().flatten().peekable();
+        let mut scan = self.db.scan(bounds).await.map_err(KvError::storage)?;
+        let mut current = None;
+        while rows.len() < keep {
+            if current.is_none() {
+                while let Some(row) = scan.next().await.map_err(KvError::storage)? {
+                    let kv = KeyValue::decode(row.value).map_err(KvError::storage)?;
+                    if !changed.contains_key(&kv.key) {
+                        current = Some(kv);
+                        break;
+                    }
+                }
+            }
+            let take_older = match (&current, older.peek()) {
+                (Some(now), Some(then)) => then.key < now.key,
+                (None, Some(_)) => true,
+                (_, None) => false,
+            };
+            match (take_older, current.take()) {
+                (true, now) => {
+                    current = now;
+                    rows.push(older.next().unwrap().clone());
+                }
+                (false, Some(now)) => rows.push(now),
+                (false, None) => break,
+            }
+        }
+        Ok(Some((rows, count)))
     }
 
     async fn compare(&self, cmp: &Compare) -> KvResult<bool> {
@@ -618,20 +845,31 @@ impl<R: StateRead> View<'_, R> {
         if self.changes.is_empty() && streams_range(r) {
             return self.ordered_range(r).await;
         }
-        let rows: Vec<_> = if r.revision > 0 {
-            self.historical(&r.key, &r.range_end, r.revision)
+        let (rows, count) = if r.revision > 0 {
+            // Key order without filters needs only the first `limit + 1` rows and the count.
+            let keep = if r.count_only {
+                0
+            } else if r.limit > 0 && key_ordered(r) {
+                usize::try_from(r.limit)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(1)
+            } else {
+                usize::MAX
+            };
+            self.historical(&r.key, &r.range_end, r.revision, keep)
                 .await?
-                .into_values()
-                .collect()
-        } else if r.range_end.is_empty() {
-            self.point(&r.key, true).await?.into_iter().collect()
         } else {
-            self.latest(&r.key, &r.range_end, true)
-                .await?
-                .into_values()
-                .collect()
+            let rows: Vec<_> = if r.range_end.is_empty() {
+                self.point(&r.key, true).await?.into_iter().collect()
+            } else {
+                self.latest(&r.key, &r.range_end, true)
+                    .await?
+                    .into_values()
+                    .collect()
+            };
+            let count = rows.len() as i64;
+            (rows, count)
         };
-        let count = rows.len() as i64;
         let mut kvs: Vec<_> = if r.count_only {
             vec![]
         } else {
@@ -808,9 +1046,12 @@ pub(crate) async fn read_snapshot(
 /// Return true when a current Range streams rows in key order from one scan.
 /// Such a Range holds at most `limit` rows. Other Ranges collect the interval before they sort or filter it.
 pub(crate) fn streams_range(r: &RangeRequest) -> bool {
-    !r.range_end.is_empty()
-        && r.revision <= 0
-        && r.sort_target == 0
+    !r.range_end.is_empty() && r.revision <= 0 && key_ordered(r)
+}
+
+/// Return true when a Range returns all rows of its interval in key order.
+fn key_ordered(r: &RangeRequest) -> bool {
+    r.sort_target == 0
         && matches!(r.sort_order, 0 | 1)
         && r.min_mod_revision == 0
         && r.max_mod_revision == 0
