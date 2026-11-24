@@ -112,7 +112,8 @@ subcompactions, because each one buffers SST data until the disk takes it.
 On Linux, jemalloc background threads return freed pages to the OS after 200 ms.
 `_RJEM_MALLOC_CONF` overrides that default.
 The quota can be exceeded by one operation and does not reserve free disk space.
-Native backups and peer snapshot transfers have a 64 MiB limit.
+Native backups and `Maintenance.Snapshot` have a 64 MiB limit. Peer snapshots copy SlateDB
+checkpoint objects and have no size limit; see [object storage Raft snapshots](object-snapshots.md).
 See [log pool accounting](architecture.md#bounded-log-pools) for admission and recovery rules.
 
 ## S3 objects
