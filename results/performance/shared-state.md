@@ -22,8 +22,8 @@ are in `shared-state.jsonl`. `scripts/bench-shared-state.py` produced them, and
 
 - Host: Intel Core i7-6700K, 4 cores and 8 threads, 30 GiB RAM, Samsung MZ7LM1T9 SATA SSD,
   Linux 7.0.0. The CPU governor was `performance` during the run.
-- Binary: `slatedb-etcd` release build at commit `ee2b1bb` (`shared-state-phase4`). The later
-  commits on that branch change only tests. SHA-256 `73130619d0a1a187…`.
+- The benchmark used the `slatedb-etcd` release build from `shared-state-phase4` at
+  `ee2b1bb` (SHA-256 prefix `73130619d0a1a187`). This build predates the final Defragment fixes.
 - S3: MinIO built from source, `github.com/minio/minio v0.0.0-20260212201848-7aac2a2c5b7c`, one
   drive on the same SSD. The MinIO download site no longer serves binaries. `mc` came from
   `github.com/minio/mc v0.0.0-20251106162529-77f82e18b540`.
@@ -52,7 +52,7 @@ are in `shared-state.jsonl`. `scripts/bench-shared-state.py` produced them, and
   otherwise keeps small writes in its memtable.
 - "Stored" is the size of the bucket after that, from `mc du`. The harness now fails a case when
   the checkpoint fails on any member. The run log of the reported runs has no checkpoint
-  failure, so all 24 case runs and both learner runs are valid.
+  failure, so all 24 load runs and the four learner runs (two per mode) completed their checkpoints.
 - RSS is the peak resident set size of each member, sampled every 250 ms during the load.
 - Learner install: after 200,000 puts of 256 B and a checkpoint on each member, a learner joins
   with `--join`. The time runs from its start until its applied index reaches the leader's
