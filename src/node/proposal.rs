@@ -469,6 +469,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn large_puts_wait_before_raft_would_drop_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = super::super::tests::leader_node(dir.path()).await;
+        // 300 x 64 KiB is more than Raft's former 16 MiB uncommitted limit. The second
+        // voter never acknowledges, so nothing commits and every reply must stay open.
+        let mut replies = Vec::new();
+        for _ in 0..300 {
+            replies.push(waiting_put(&mut node, vec![7; 64 * 1024]));
+            node.flush_puts();
+        }
+        for mut reply in replies {
+            match reply.try_recv() {
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                other => panic!("a put was answered before it committed: {other:?}"),
+            }
+        }
+        assert!(!node.waiting_proposals.requests.is_empty());
+    }
+
+    #[tokio::test]
     async fn log_pressure_defers_puts_until_progress_and_drops_stale_requests() {
         let dir = tempfile::tempdir().unwrap();
         let mut node = super::super::tests::leader_node(dir.path()).await;

@@ -427,7 +427,11 @@ impl Node {
                 read_only_option: raft::ReadOnlyOption::Safe,
                 max_size_per_msg: 1024 * 1024,
                 max_inflight_msgs: 64,
-                max_uncommitted_size: 16 * 1024 * 1024,
+                // A safety net only: `backlogged` holds writers once queued and
+                // unstable log bytes reach `log::MAX_BYTES`, so Raft should not drop
+                // a proposal. The headroom covers a proposal group and entries that
+                // are persisted but still waiting for a quorum.
+                max_uncommitted_size: 2 * log::MAX_BYTES as u64,
                 max_committed_size_per_ready: apply::BATCH_BYTES,
                 ..Config::default()
             };
@@ -1111,12 +1115,26 @@ impl Node {
                 .saturating_sub(self.state.applied)
                 >= apply::MAX_APPLY_LAG,
             self.log_queue.len() >= log::MAX_JOBS,
-            self.log_bytes >= log::MAX_BYTES,
+            // Proposed entries that have not reached the log queue yet count too:
+            // Raft drops proposals past `max_uncommitted_size`, and clients do not
+            // retry a dropped Put, so writers wait here well before that limit.
+            self.log_bytes + self.unstable_log_bytes() >= log::MAX_BYTES,
         ];
         for (count, hit) in self.backlog_rejects.iter_mut().zip(causes) {
             *count += u64::from(hit);
         }
         causes.contains(&true)
+    }
+
+    /// Data bytes of entries Raft holds that have not been handed to the log queue.
+    fn unstable_log_bytes(&self) -> usize {
+        self.raw
+            .raft
+            .raft_log
+            .unstable_entries()
+            .iter()
+            .map(|entry| entry.data.len())
+            .sum()
     }
 
     /// Propose a client write. Ordinary writes wait in a bounded FIFO while apply or log
