@@ -32,6 +32,8 @@ pub(crate) enum StateView {
 /// A checkpoint under shared-mode views. An empty base precedes the first checkpoint.
 pub(crate) struct Base {
     reader: Option<DbReader>,
+    /// The checkpoint ID. `None` for the empty base.
+    pub checkpoint: Option<uuid::Uuid>,
     /// `F`: the index of the last state change in the checkpoint.
     pub applied: u64,
 }
@@ -40,6 +42,7 @@ impl Base {
     pub(crate) fn empty() -> Self {
         Self {
             reader: None,
+            checkpoint: None,
             applied: 0,
         }
     }
@@ -64,6 +67,7 @@ impl Base {
         let applied = super::decode_applied(reader.get(super::APPLIED).await?)?;
         Ok(Self {
             reader: Some(reader),
+            checkpoint: Some(id),
             applied,
         })
     }

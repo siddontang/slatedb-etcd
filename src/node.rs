@@ -315,6 +315,7 @@ impl Node {
                 options.state_cache,
                 options.state_mode,
                 options.effective_quota().max(0) as u64,
+                &options.peers.keys().copied().collect::<Vec<_>>(),
             )
             .await?;
         // Mark the directory before the first format 4 row, not on open. See `RowMarker`.

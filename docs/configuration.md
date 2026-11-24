@@ -143,7 +143,10 @@ checkpoint of it, its base, under an in-memory overlay of the newer applied batc
 Phase 1 limits:
 
 - Shared mode supports one voter. It rejects more peers, `--join`, MemberAdd, and Promote.
-- The cluster claim `shared/owner.json` stores the mode and the quota. Later starts use that quota.
+- The cluster claim `shared/owner.json` stores the mode, the quota, and the initial voters.
+  Later starts use that quota. A member with other initial voters refuses to open the writer.
+- On S3, `mode.json` under the cluster prefix fixes the mode before any state write. A shared start
+  also refuses a prefix that holds a replicated member namespace.
 - A directory keeps its mode. A member refuses to start in a different mode.
 - The Raft log is not truncated, and manual checkpoints and snapshot restore are unavailable.
 - A restart opens the newest `view-` checkpoint and replays the log above it.

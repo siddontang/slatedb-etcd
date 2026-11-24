@@ -553,11 +553,17 @@ async fn read_compact_revision(db: &impl StateRead) -> Result<i64> {
 
 /// Return true when a native snapshot or backup can hold `key`.
 ///
-/// This binary never writes `meta/applied-term` to an image or backup. An older binary that
-/// installed a copied checkpoint of this binary exports the row, so readers accept it. Install
-/// replaces it, and restore drops it.
+/// This binary never writes a derived meta row to an image or backup. An older binary that
+/// installed a copied checkpoint of this binary exports `meta/applied-term`, so readers accept
+/// the derived rows. Install replaces or drops them, and restore drops them.
 fn snapshot_key(key: &[u8]) -> bool {
-    key.starts_with(DATA) || key.starts_with(b"etcd/") || key == APPLIED || key == APPLIED_TERM
+    key.starts_with(DATA) || key.starts_with(b"etcd/") || key == APPLIED || derived_key(key)
+}
+
+/// Return true for a meta row that each state derives again: the applied term and the shared-mode
+/// logical size. Format 4 images and backups omit these rows, so the previous reader accepts them.
+fn derived_key(key: &[u8]) -> bool {
+    key == APPLIED_TERM || key == shared::LOGICAL_BYTES
 }
 
 fn data_key(key: &str) -> Vec<u8> {

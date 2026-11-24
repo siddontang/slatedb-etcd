@@ -7,7 +7,8 @@
 //! Follower bases, `ViewAck`, install, rebase, Raft snapshots of format 6, and fencing come in
 //! later phases. Shared mode does not truncate the Raft log yet.
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,8 @@ const VIEW: &str = "view-";
 const CLAIM: &str = "shared/owner.json";
 const BOOTSTRAP: &str = "shared/bootstrap.json";
 const STATE: &str = "shared/state";
+/// The cluster-wide mode claim. Both modes create it before they write state on S3.
+const MODE: &str = "mode.json";
 
 /// The cluster claim. The first member creates it, and every member checks it.
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -52,21 +55,100 @@ struct Claim {
     mode: StateMode,
     /// The logical quota of the cluster. Zero disables it. Every member applies this value.
     quota: u64,
+    /// The initial voters. Members with another bootstrap set refuse to open the writer.
+    voters: Vec<u64>,
 }
 
-/// Create or check the claim under `root`. Return the cluster quota.
+/// The mode claim of one cluster namespace.
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct ModeClaim {
+    version: u32,
+    cluster: String,
+    mode: StateMode,
+}
+
+/// Create or check the mode claim under `root`. Concurrent first starts in different modes
+/// cannot both pass, because only one `PutMode::Create` succeeds.
+pub(crate) async fn claim_mode(
+    store: &dyn ObjectStore,
+    root: &str,
+    cluster: &str,
+    mode: StateMode,
+) -> Result<()> {
+    let path = Path::from(join(root, MODE));
+    let claim = ModeClaim {
+        version: 1,
+        cluster: cluster.to_owned(),
+        mode,
+    };
+    match store
+        .put_opts(
+            &path,
+            serde_json::to_vec(&claim)?.into(),
+            PutMode::Create.into(),
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
+            let data = store.get(&path).await?.bytes().await?;
+            let existing: ModeClaim =
+                serde_json::from_slice(&data).context("invalid cluster mode claim")?;
+            ensure!(
+                existing.version == 1 && existing.cluster == cluster,
+                "the namespace belongs to another cluster"
+            );
+            ensure!(
+                existing.mode == mode,
+                "the cluster uses {:?} state mode",
+                existing.mode
+            );
+            Ok(())
+        }
+        Err(error) => Err(error).context("cannot claim the cluster mode"),
+    }
+}
+
+/// Return true when `root` holds a replicated member namespace. Clusters from before the mode
+/// claim have only these namespaces.
+pub(crate) async fn has_replicated_member(store: &dyn ObjectStore, root: &str) -> Result<bool> {
+    let listing = store.list_with_delimiter(Some(&Path::from(root))).await?;
+    for prefix in listing.common_prefixes {
+        if !prefix
+            .filename()
+            .is_some_and(|name| name.starts_with("member-"))
+        {
+            continue;
+        }
+        match store.head(&prefix.clone().join("owner.json")).await {
+            Ok(_) => return Ok(true),
+            Err(slatedb::object_store::Error::NotFound { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
+}
+
+/// Create or check the shared state claim under `root`. Return the cluster quota.
+///
+/// The claim holds the initial voters. Two members that each bootstrap a separate one-voter
+/// cluster in the same namespace race on one `PutMode::Create`, so only one opens the writer.
 pub(crate) async fn claim(
     store: &dyn ObjectStore,
     root: &str,
     cluster: &str,
     quota: u64,
+    voters: &[u64],
 ) -> Result<u64> {
     let path = Path::from(join(root, CLAIM));
+    let mut voters = voters.to_vec();
+    voters.sort_unstable();
     let claim = Claim {
         version: 1,
         cluster: cluster.to_owned(),
         mode: StateMode::Shared,
         quota,
+        voters,
     };
     match store
         .put_opts(
@@ -88,6 +170,11 @@ pub(crate) async fn claim(
                 existing.mode == StateMode::Shared,
                 "the cluster uses another state mode"
             );
+            ensure!(
+                existing.voters == claim.voters,
+                "the shared state belongs to other initial voters {:?}",
+                existing.voters
+            );
             if existing.quota != quota {
                 tracing::warn!(
                     configured = quota,
@@ -98,15 +185,6 @@ pub(crate) async fn claim(
             Ok(existing.quota)
         }
         Err(error) => Err(error).context("cannot claim the shared state"),
-    }
-}
-
-/// Return an error when `root` holds a shared-mode cluster claim.
-pub(crate) async fn refuse_claim(store: &dyn ObjectStore, root: &str) -> Result<()> {
-    match store.head(&Path::from(join(root, CLAIM))).await {
-        Ok(_) => bail!("the cluster uses shared state mode"),
-        Err(slatedb::object_store::Error::NotFound { .. }) => Ok(()),
-        Err(error) => Err(error.into()),
     }
 }
 
@@ -124,6 +202,8 @@ pub(crate) struct Source {
     /// `<prefix>/<sha256(cluster)>`, or empty for a store that holds one cluster.
     root: String,
     pub cache: Arc<dyn slatedb::db_cache::DbCache>,
+    /// The bases that this member opened. A base with a live reference pins its checkpoint.
+    pins: Mutex<Vec<(uuid::Uuid, Weak<Base>)>>,
 }
 
 impl Source {
@@ -132,8 +212,20 @@ impl Source {
         join(&self.root, STATE)
     }
 
-    pub async fn open_base(&self, id: uuid::Uuid) -> Result<Base> {
-        Base::open(self.store.clone(), &self.state(), id, self.cache.clone()).await
+    pub async fn open_base(&self, id: uuid::Uuid) -> Result<Arc<Base>> {
+        let base = Base::open(self.store.clone(), &self.state(), id, self.cache.clone()).await?;
+        let base = Arc::new(base);
+        let mut pins = self.pins.lock().unwrap();
+        pins.retain(|(_, base)| base.strong_count() > 0);
+        pins.push((id, Arc::downgrade(&base)));
+        Ok(base)
+    }
+
+    /// The checkpoints that a live base of this member uses: a view, the apply state, or a task.
+    pub fn pinned(&self) -> HashSet<uuid::Uuid> {
+        let mut pins = self.pins.lock().unwrap();
+        pins.retain(|(_, base)| base.strong_count() > 0);
+        pins.iter().map(|(id, _)| *id).collect()
     }
 
     /// Return true after the first checkpoint was published.
@@ -192,6 +284,60 @@ pub(crate) async fn view_checkpoints(
         .collect();
     views.sort_by_key(|(seq, _)| *seq);
     Ok(views)
+}
+
+/// Return the view checkpoints to delete: every checkpoint except the newest `keep`, and only
+/// those older than the oldest checkpoint in `pinned`. A base pins memory, not objects, so a
+/// checkpoint under a live view must survive GC.
+pub(crate) fn retired(
+    views: &[(u64, uuid::Uuid)],
+    pinned: &HashSet<uuid::Uuid>,
+    keep: usize,
+) -> Vec<uuid::Uuid> {
+    let oldest_pin = views
+        .iter()
+        .filter(|(_, id)| pinned.contains(id))
+        .map(|(seq, _)| *seq)
+        .min()
+        .unwrap_or(u64::MAX);
+    let old = views.len().saturating_sub(keep);
+    views[..old]
+        .iter()
+        .filter(|(seq, _)| *seq < oldest_pin)
+        .map(|(_, id)| *id)
+        .collect()
+}
+
+/// Delete the old `view-` checkpoints that no live base of this member pins.
+///
+/// Phase 1 has one member, so its own pins are all the pins. Other checkpoints are not ours.
+pub(crate) async fn retain(
+    admin: &slatedb::admin::Admin,
+    source: &Source,
+    keep: usize,
+) -> Result<()> {
+    let views: Vec<_> = view_checkpoints(admin)
+        .await?
+        .into_iter()
+        .map(|(seq, checkpoint)| (seq, checkpoint.id))
+        .collect();
+    for id in retired(&views, &source.pinned(), keep) {
+        admin.delete_checkpoint(id).await?;
+    }
+    Ok(())
+}
+
+/// Open the newest `view-` checkpoint that holds the membership. The publisher deletes a
+/// checkpoint without it, but a stop can leave one behind.
+async fn newest_base(admin: &slatedb::admin::Admin, source: &Source) -> Result<Option<Arc<Base>>> {
+    for (_, checkpoint) in view_checkpoints(admin).await?.into_iter().rev() {
+        let base = source.open_base(checkpoint.id).await?;
+        if base.get(crate::cluster::KEY).await?.is_some() {
+            return Ok(Some(base));
+        }
+        tracing::warn!(checkpoint = %checkpoint.id, "skip a view checkpoint without membership");
+    }
+    Ok(None)
 }
 
 /// Bases that opened in the background. Apply takes the newest one.
@@ -268,7 +414,7 @@ impl Shared {
         let opened = self.opened.clone();
         tokio::spawn(async move {
             match source.open_base(id).await {
-                Ok(base) => opened.offer(Arc::new(base)),
+                Ok(base) => opened.offer(base),
                 // The member keeps its base and waits for the next checkpoint.
                 Err(error) => tracing::warn!(%error, %id, "cannot open a view checkpoint"),
             }
@@ -314,10 +460,12 @@ impl StateMachine {
         cluster: &str,
         cache: StateCache,
         quota: u64,
+        voters: &[u64],
         backend: transfer::Backend,
     ) -> Result<Self> {
         cache.validate()?;
-        let quota = claim(store.as_ref(), root, cluster, quota).await?;
+        // The claim comes before the writer opens. A member that loses it changes nothing.
+        let quota = claim(store.as_ref(), root, cluster, quota, voters).await?;
         let location =
             transfer::Location::open(store.clone(), &join(root, STATE), backend, cache).await?;
         let state_root = location.root();
@@ -325,6 +473,7 @@ impl StateMachine {
             store: store.clone(),
             root: root.to_owned(),
             cache: cache.build(),
+            pins: Mutex::default(),
         });
         ensure!(
             state_root == source.state(),
@@ -342,18 +491,24 @@ impl StateMachine {
         );
         let result = async {
             let written = db.manifest().last_l0_seq();
-            let base = match view_checkpoints(&admin).await?.pop() {
-                Some((_, checkpoint)) => source.open_base(checkpoint.id).await?,
+            let base = match newest_base(&admin, &source).await? {
+                Some(base) => {
+                    // A stop between the first checkpoint and its marker leaves no marker.
+                    if !source.bootstrapped().await? {
+                        source.mark_bootstrapped(base.checkpoint.unwrap()).await?;
+                    }
+                    base
+                }
                 None if source.bootstrapped().await? => {
                     bail!("the shared state has no view checkpoint after its bootstrap")
                 }
-                None => Base::empty(),
+                None => Arc::new(Base::empty()),
             };
             ensure!(
                 base.applied <= written,
                 "the base checkpoint is ahead of the shared database"
             );
-            let shared = Shared::new(Arc::new(base), source, written);
+            let shared = Shared::new(base, source, written);
             let reads = shared.live();
             let mut state =
                 Self::load(db.clone(), admin, location, rows, reads, Some(shared)).await?;

@@ -1249,7 +1249,7 @@ async fn a_snapshot_at_the_applied_index_checks_a_known_term() {
 }
 
 /// Check native snapshot bytes with the rules of the previous format 4 reader.
-fn check_format_4(data: &SnapshotData) {
+pub(super) fn check_format_4(data: &SnapshotData) {
     assert!(crate::readable_snapshot(data.version));
     let mut seen = std::collections::BTreeSet::new();
     for (key, _) in &data.rows {
@@ -1263,7 +1263,7 @@ fn check_format_4(data: &SnapshotData) {
 }
 
 /// Check a native backup like the previous restore: checksum, exact decode, and format 4 rows.
-fn check_format_4_backup(bytes: &[u8]) {
+pub(super) fn check_format_4_backup(bytes: &[u8]) {
     use sha2::{Digest, Sha256};
     let (payload, checksum) = bytes.split_at(bytes.len() - 32);
     assert_eq!(Sha256::digest(payload).as_slice(), checksum);
@@ -1276,7 +1276,7 @@ fn check_format_4_backup(bytes: &[u8]) {
     check_format_4(&data);
 }
 
-fn backup_bytes(mut image: Vec<u8>) -> Vec<u8> {
+pub(super) fn backup_bytes(mut image: Vec<u8>) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     let checksum = Sha256::digest(&image);
     image.extend_from_slice(&checksum);
@@ -1284,7 +1284,7 @@ fn backup_bytes(mut image: Vec<u8>) -> Vec<u8> {
 }
 
 /// Restore `backup` and install its Raft snapshot. Return the restored state.
-async fn restore(dir: &std::path::Path, backup: Vec<u8>) -> (StateMachine, Snapshot) {
+pub(super) async fn restore(dir: &std::path::Path, backup: Vec<u8>) -> (StateMachine, Snapshot) {
     let path = dir.join("backup");
     std::fs::write(&path, backup).unwrap();
     let members = crate::cluster::Store::initial(&std::collections::BTreeMap::from([(

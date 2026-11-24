@@ -189,7 +189,9 @@ struct Binding {
 }
 
 impl Config {
-    /// Open the member state. Shared mode applies `quota` when it creates the cluster claim.
+    /// Open the member state. Shared mode applies `quota` and the initial `voters` when it
+    /// creates the cluster claim.
+    #[allow(clippy::too_many_arguments)]
     pub async fn open(
         &self,
         dir: &Path,
@@ -198,6 +200,7 @@ impl Config {
         cache: crate::state::StateCache,
         mode: StateMode,
         quota: u64,
+        voters: &[u64],
     ) -> Result<StateMachine> {
         #[cfg(test)]
         if let Self::Test(store, path) = self {
@@ -207,8 +210,16 @@ impl Config {
                 }
                 StateMode::Shared => {
                     let backend = crate::state::transfer::Backend::Local;
-                    StateMachine::open_shared(store.clone(), path, cluster, cache, quota, backend)
-                        .await
+                    StateMachine::open_shared(
+                        store.clone(),
+                        path,
+                        cluster,
+                        cache,
+                        quota,
+                        voters,
+                        backend,
+                    )
+                    .await
                 }
             };
         }
@@ -232,7 +243,8 @@ impl Config {
                         slatedb::object_store::local::LocalFileSystem::new_with_prefix(&objects)?;
                     let store = Arc::new(local.with_fsync(true));
                     let backend = crate::state::transfer::Backend::Local;
-                    StateMachine::open_shared(store, "", cluster, cache, quota, backend).await
+                    StateMachine::open_shared(store, "", cluster, cache, quota, voters, backend)
+                        .await
                 }
             };
         };
@@ -246,23 +258,60 @@ impl Config {
         let root = s3.cluster_prefix(cluster);
         match mode {
             StateMode::Replicated => {
-                crate::state::shared::refuse_claim(store.as_ref(), &root).await?;
-                claim(store.as_ref(), &prefix, OWNER, &binding).await?;
+                claim_replicated(store.as_ref(), &root, &prefix, cluster, &binding).await?;
                 StateMachine::open_backend(store, &format!("{prefix}/state"), cache, backend).await
             }
             StateMode::Shared => {
-                // A shared-mode member keeps no state of its own. Its binding records the mode.
-                let owner = format!("{prefix}/{OWNER}").into();
-                match store.head(&owner).await {
-                    Ok(_) => anyhow::bail!("the member uses replicated state mode"),
-                    Err(slatedb::object_store::Error::NotFound { .. }) => {}
-                    Err(error) => return Err(error.into()),
-                }
-                claim(store.as_ref(), &prefix, BINDING, &binding).await?;
-                StateMachine::open_shared(store, &root, cluster, cache, quota, backend).await
+                let quota = claim_shared(
+                    store.as_ref(),
+                    &root,
+                    &prefix,
+                    cluster,
+                    &binding,
+                    quota,
+                    voters,
+                )
+                .await?;
+                StateMachine::open_shared(store, &root, cluster, cache, quota, voters, backend)
+                    .await
             }
         }
     }
+}
+
+/// Claim the cluster mode and the member namespace of a replicated member.
+async fn claim_replicated(
+    store: &dyn ObjectStore,
+    root: &str,
+    prefix: &str,
+    cluster: &str,
+    binding: &Binding,
+) -> Result<()> {
+    crate::state::shared::claim_mode(store, root, cluster, StateMode::Replicated).await?;
+    claim(store, prefix, OWNER, binding).await
+}
+
+/// Claim the cluster mode, the member binding, and the shared state before the writer opens.
+///
+/// A replicated member namespace from before the mode claim marks a replicated cluster. A start
+/// that loses any claim writes no state, so the cluster that won stays usable.
+async fn claim_shared(
+    store: &dyn ObjectStore,
+    root: &str,
+    prefix: &str,
+    cluster: &str,
+    binding: &Binding,
+    quota: u64,
+    voters: &[u64],
+) -> Result<u64> {
+    ensure!(
+        !crate::state::shared::has_replicated_member(store, root).await?,
+        "the cluster uses Replicated state mode"
+    );
+    crate::state::shared::claim_mode(store, root, cluster, StateMode::Shared).await?;
+    // A shared-mode member keeps no state of its own. Its binding records the mode.
+    claim(store, prefix, BINDING, binding).await?;
+    crate::state::shared::claim(store, root, cluster, quota, voters).await
 }
 
 /// The claim of a replicated member namespace.
@@ -401,6 +450,117 @@ mod tests {
         // A replicated binding keeps the encoding of earlier versions.
         let encoded = std::fs::read_to_string(dir.path().join("object-store.json")).unwrap();
         assert!(!encoded.contains("mode"));
+    }
+
+    /// Run the claims of a start. Each member keeps one data directory under `dirs`.
+    async fn start(
+        store: &InMemory,
+        dirs: &Path,
+        member: u64,
+        mode: StateMode,
+        voters: &[u64],
+    ) -> Result<()> {
+        let config = s3();
+        let dir = dirs.join(member.to_string());
+        let binding = bind(&dir, "cluster", member, Some(config.clone()), mode).unwrap();
+        let root = config.cluster_prefix("cluster");
+        let prefix = config.member_prefix("cluster", member);
+        match mode {
+            StateMode::Replicated => {
+                claim_replicated(store, &root, &prefix, "cluster", &binding).await
+            }
+            StateMode::Shared => {
+                claim_shared(store, &root, &prefix, "cluster", &binding, 0, voters)
+                    .await
+                    .map(drop)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn one_cluster_namespace_has_one_mode_and_one_set_of_initial_voters() {
+        // A replicated cluster from before the mode claim refuses a shared member, and its
+        // own member still restarts.
+        let dirs = tempfile::tempdir().unwrap();
+        let store = InMemory::new();
+        let config = s3();
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = bind(
+            dir.path(),
+            "cluster",
+            1,
+            Some(config.clone()),
+            StateMode::Replicated,
+        )
+        .unwrap();
+        claim(&store, &config.member_prefix("cluster", 1), OWNER, &legacy)
+            .await
+            .unwrap();
+        let error = start(&store, dirs.path(), 2, StateMode::Shared, &[2])
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Replicated state mode"),
+            "{error}"
+        );
+        let root = config.cluster_prefix("cluster");
+        claim_replicated(
+            &store,
+            &root,
+            &config.member_prefix("cluster", 1),
+            "cluster",
+            &legacy,
+        )
+        .await
+        .unwrap();
+        assert!(start(&store, dirs.path(), 3, StateMode::Shared, &[3])
+            .await
+            .is_err());
+
+        // Concurrent first starts: exactly one wins, in either mode and with other voters.
+        for (first, second) in [
+            (
+                (1, StateMode::Shared, vec![1]),
+                (2, StateMode::Shared, vec![2]),
+            ),
+            (
+                (1, StateMode::Shared, vec![1]),
+                (2, StateMode::Replicated, vec![2]),
+            ),
+            (
+                (1, StateMode::Replicated, vec![1]),
+                (2, StateMode::Shared, vec![1, 2]),
+            ),
+        ] {
+            let store = InMemory::new();
+            let dirs = tempfile::tempdir().unwrap();
+            let (a, b) = tokio::join!(
+                start(&store, dirs.path(), first.0, first.1, &first.2),
+                start(&store, dirs.path(), second.0, second.1, &second.2)
+            );
+            assert_eq!(u8::from(a.is_ok()) + u8::from(b.is_ok()), 1, "{a:?} {b:?}");
+            // The winner restarts. The loser keeps failing.
+            let (winner, loser) = if a.is_ok() {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            start(&store, dirs.path(), winner.0, winner.1, &winner.2)
+                .await
+                .unwrap();
+            assert!(start(&store, dirs.path(), loser.0, loser.1, &loser.2)
+                .await
+                .is_err());
+        }
+        // A shared cluster accepts its bootstrap voters in any order.
+        let dirs = tempfile::tempdir().unwrap();
+        let store = InMemory::new();
+        start(&store, dirs.path(), 1, StateMode::Shared, &[1, 2])
+            .await
+            .unwrap();
+        start(&store, dirs.path(), 2, StateMode::Shared, &[2, 1])
+            .await
+            .unwrap();
     }
 
     #[test]

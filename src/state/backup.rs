@@ -65,7 +65,7 @@ impl StateMachine {
         }
         // The restored log starts at (1, 1). Install stores that term from the snapshot.
         data.rows
-            .retain(|(key, _)| key != APPLIED && key != APPLIED_TERM && key != crate::cluster::KEY);
+            .retain(|(key, _)| key != APPLIED && !derived_key(key) && key != crate::cluster::KEY);
         data.rows
             .push((APPLIED.to_vec(), 1_u64.to_be_bytes().to_vec()));
         data.rows

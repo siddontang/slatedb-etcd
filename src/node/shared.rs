@@ -12,7 +12,8 @@ use slatedb::config::{CheckpointOptions, CheckpointScope, WriteOptions};
 use crate::state::overlay::Queue;
 use crate::state::shared::{view_checkpoints, view_name, Source, WriterParts};
 
-/// The newest checkpoints that the publisher keeps.
+/// The newest checkpoints that the publisher keeps. It also keeps every newer checkpoint than
+/// the oldest one that a live base pins.
 const KEEP_CHECKPOINTS: usize = 2;
 /// Batches that the materializer takes from the queue at once.
 const MATERIALIZE_BATCHES: usize = 64;
@@ -301,18 +302,8 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
             source.mark_bootstrapped(checkpoint.id).await?;
             bootstrapped = true;
         }
-        retain(&admin).await?;
+        crate::state::shared::retain(&admin, &source, KEEP_CHECKPOINTS).await?;
     }
-}
-
-/// Delete all but the newest `view-` checkpoints. Other checkpoints are not ours.
-async fn retain(admin: &slatedb::admin::Admin) -> Result<()> {
-    let views = view_checkpoints(admin).await?;
-    let old = views.len().saturating_sub(KEEP_CHECKPOINTS);
-    for (_, checkpoint) in &views[..old] {
-        admin.delete_checkpoint(checkpoint.id).await?;
-    }
-    Ok(())
 }
 
 impl Node {

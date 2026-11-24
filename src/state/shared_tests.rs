@@ -14,6 +14,7 @@ async fn open_shared(store: Arc<dyn ObjectStore>) -> StateMachine {
         "test",
         StateCache::default(),
         0,
+        &[1],
         transfer::Backend::Local,
     )
     .await
@@ -265,7 +266,7 @@ async fn checkpoint(state: &StateMachine, written: &mut u64) -> Arc<view::Base> 
         .unwrap()
         .id;
     let source = state.shared.as_ref().unwrap().source.clone();
-    Arc::new(source.open_base(id).await.unwrap())
+    source.open_base(id).await.unwrap()
 }
 
 #[tokio::test]
@@ -360,6 +361,7 @@ async fn bases_switch_monotonically_and_release_covered_segments() {
         "test",
         StateCache::default(),
         0,
+        &[1],
         transfer::Backend::Local,
     )
     .await
@@ -371,10 +373,219 @@ async fn bases_switch_monotonically_and_release_covered_segments() {
 #[tokio::test]
 async fn the_cluster_claim_fixes_the_mode_and_the_quota() {
     let store = InMemory::new();
-    assert_eq!(shared::claim(&store, "root", "one", 5).await.unwrap(), 5);
+    assert_eq!(
+        shared::claim(&store, "root", "one", 5, &[1]).await.unwrap(),
+        5
+    );
     // A later member uses the claimed quota.
-    assert_eq!(shared::claim(&store, "root", "one", 7).await.unwrap(), 5);
-    assert!(shared::claim(&store, "root", "two", 5).await.is_err());
-    assert!(shared::refuse_claim(&store, "root").await.is_err());
-    shared::refuse_claim(&store, "other").await.unwrap();
+    assert_eq!(
+        shared::claim(&store, "root", "one", 7, &[1]).await.unwrap(),
+        5
+    );
+    assert!(shared::claim(&store, "root", "two", 5, &[1]).await.is_err());
+    // A separate one-voter bootstrap in the same namespace refuses before it opens the writer.
+    assert!(shared::claim(&store, "root", "one", 5, &[2]).await.is_err());
+    shared::claim_mode(&store, "root", "one", StateMode::Shared)
+        .await
+        .unwrap();
+    assert!(
+        shared::claim_mode(&store, "root", "one", StateMode::Replicated)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_restart_writes_a_missing_bootstrap_marker() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut state = open_shared(store.clone()).await;
+    state.members = Arc::new(crate::cluster::Store::initial(
+        &[(1, "127.0.0.1:1".to_owned())].into(),
+    ));
+    state.apply(1, None).await.unwrap();
+    // The publisher stopped after its first checkpoint and before the marker.
+    let mut written = 0;
+    checkpoint(&state, &mut written).await;
+    let source = state.shared.as_ref().unwrap().source.clone();
+    assert!(!source.bootstrapped().await.unwrap());
+    state.close().await.unwrap();
+    // A restart with no client write finds the checkpoint and writes the marker.
+    let state = open_shared(store).await;
+    assert!(state
+        .shared
+        .as_ref()
+        .unwrap()
+        .source
+        .bootstrapped()
+        .await
+        .unwrap());
+    assert_eq!(state.shared.as_ref().unwrap().base.applied, 1);
+    state.close().await.unwrap();
+}
+
+#[test]
+fn retention_keeps_every_checkpoint_from_the_oldest_pinned_one() {
+    let ids: Vec<_> = (0..5).map(|_| uuid::Uuid::new_v4()).collect();
+    let views: Vec<_> = ids
+        .iter()
+        .enumerate()
+        .map(|(n, id)| (n as u64 * 10, *id))
+        .collect();
+    let none = std::collections::HashSet::new();
+    assert_eq!(shared::retired(&views, &none, 2), ids[..3]);
+    let pinned = [ids[1]].into_iter().collect();
+    assert_eq!(shared::retired(&views, &pinned, 2), ids[..1]);
+    // A pin on a checkpoint that the publisher keeps anyway changes nothing.
+    let pinned = [ids[4]].into_iter().collect();
+    assert_eq!(shared::retired(&views, &pinned, 2), ids[..3]);
+}
+
+#[tokio::test]
+async fn retention_keeps_the_checkpoint_of_a_live_base() {
+    let mut state = open_shared(Arc::new(InMemory::new())).await;
+    let mut written = 0;
+    let mut bases = vec![];
+    for n in 0..5 {
+        state
+            .apply_etcd(state.applied + 1, &put(&format!("k{n}"), "v"))
+            .await
+            .unwrap();
+        bases.push(checkpoint(&state, &mut written).await);
+    }
+    let source = state.shared.as_ref().unwrap().source.clone();
+    let count = || async { shared::view_checkpoints(&state.admin).await.unwrap().len() };
+    // A slow open still uses the second checkpoint. Retention keeps it and all newer ones.
+    let pinned = bases.remove(1);
+    drop(bases);
+    shared::retain(&state.admin, &source, 2).await.unwrap();
+    assert_eq!(count().await, 4);
+    assert_eq!(
+        pinned.get(b"meta/applied").await.unwrap().unwrap().as_ref(),
+        2_u64.to_be_bytes()
+    );
+    drop(pinned);
+    shared::retain(&state.admin, &source, 2).await.unwrap();
+    assert_eq!(count().await, 2);
+    state.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_shared_export_keeps_the_durable_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut shared_state = open_shared(Arc::new(InMemory::new())).await;
+    let mut replicated = StateMachine::open(dir.path()).await.unwrap();
+    for state in [&mut shared_state, &mut replicated] {
+        state.apply_etcd(1, &put("key", "value")).await.unwrap();
+        assert_eq!(state.durable_applied, 0);
+        state.snapshot_data().await.unwrap();
+    }
+    // The view scan flushed nothing. The shared database is still empty.
+    assert_eq!(shared_state.durable_applied, 0);
+    assert_eq!(shared_state.db.snapshot().unwrap().seq(), 0);
+    // A replicated export flushes the database through the applied index.
+    assert_eq!(replicated.durable_applied, 1);
+    shared_state.close().await.unwrap();
+    replicated.close().await.unwrap();
+}
+
+/// A shared-mode backup restores into a new replicated cluster, and the previous format 4 reader
+/// accepts it. The restored quota accounting equals a restore of the same replicated data.
+#[tokio::test]
+async fn a_shared_backup_restores_into_a_replicated_cluster() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut reference = StateMachine::open(&dir.path().join("reference"))
+        .await
+        .unwrap();
+    let mut state = open_shared(Arc::new(InMemory::new())).await;
+    reference.members_unsaved = true;
+    // A small quota raises the space alarm, so the backups also hold an alarm row.
+    for machine in [&mut state, &mut reference] {
+        machine.quota = 400;
+        for n in 0..12_u64 {
+            let index = machine.applied + 1;
+            machine
+                .apply_etcd_quota(index, &request(n), 1)
+                .await
+                .unwrap();
+        }
+        assert!(!machine.alarms.is_empty());
+    }
+    let shared_image = state.snapshot_data().await.unwrap();
+    let data: SnapshotData = crate::codec::decode(&shared_image).unwrap();
+    assert!(data.rows.iter().all(|(key, _)| !derived_key(key)));
+    super::tests::check_format_4(&data);
+    let shared_backup = super::tests::backup_bytes(shared_image);
+    super::tests::check_format_4_backup(&shared_backup);
+    let reference_backup = super::tests::backup_bytes(reference.snapshot_data().await.unwrap());
+
+    let restored = {
+        let path = dir.path().join("from-shared");
+        std::fs::create_dir(&path).unwrap();
+        super::tests::restore(&path, shared_backup).await.0
+    };
+    let expected = {
+        let path = dir.path().join("from-replicated");
+        std::fs::create_dir(&path).unwrap();
+        super::tests::restore(&path, reference_backup).await.0
+    };
+    assert_eq!(rows(&restored, b"").await, rows(&expected, b"").await);
+    assert_eq!(restored.logical_size(), expected.logical_size());
+    assert_eq!(
+        restored.logical_size(),
+        maintenance::count_logical_size(restored.applied_state())
+            .await
+            .unwrap()
+    );
+    assert_eq!(restored.alarms, expected.alarms);
+    assert_eq!(
+        restored
+            .applied_state()
+            .get(shared::LOGICAL_BYTES)
+            .await
+            .unwrap(),
+        None
+    );
+    for revision in [0, state.revision] {
+        assert_eq!(
+            serde_json::to_value(restored.read_etcd(&range(revision)).await.unwrap()).unwrap(),
+            serde_json::to_value(state.read_etcd(&range(revision)).await.unwrap()).unwrap()
+        );
+    }
+    for machine in [state, reference, restored, expected] {
+        machine.close().await.unwrap();
+    }
+}
+
+/// An image from an exporter that kept the logical size row still installs and restores.
+#[tokio::test]
+async fn readers_drop_a_logical_size_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut source = StateMachine::open(&dir.path().join("source"))
+        .await
+        .unwrap();
+    source.apply_etcd(1, &put("key", "value")).await.unwrap();
+    let mut data: SnapshotData =
+        crate::codec::decode(&source.snapshot_data().await.unwrap()).unwrap();
+    data.rows
+        .push((shared::LOGICAL_BYTES.to_vec(), 7_u64.to_be_bytes().to_vec()));
+    let image = crate::codec::encode(&data).unwrap();
+    let path = dir.path().join("restore");
+    std::fs::create_dir(&path).unwrap();
+    let (restored, _) = super::tests::restore(&path, super::tests::backup_bytes(image)).await;
+    assert_eq!(
+        restored
+            .applied_state()
+            .get(shared::LOGICAL_BYTES)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        restored.logical_size(),
+        maintenance::count_logical_size(restored.applied_state())
+            .await
+            .unwrap()
+    );
+    restored.close().await.unwrap();
+    source.close().await.unwrap();
 }
