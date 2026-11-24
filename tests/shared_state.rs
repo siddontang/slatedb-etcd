@@ -824,6 +824,12 @@ async fn move_leader_publishes_first_and_the_new_leader_writes() {
         let (_, servers) = quiet_cluster(dir.path()).await;
         let lead = leader(servers[0].as_ref().unwrap()).await;
         let old = servers[lead as usize - 1].as_ref().unwrap();
+        // Exercise transfer from an established writer. Member readiness precedes the writer
+        // opening its database and publishing the initial membership checkpoint.
+        eventually("the old leader's initial checkpoint", async || {
+            views(old).await.2 > 0
+        })
+        .await;
         let mut kv = KvClient::new(channel(old).await);
         for n in 0..20 {
             kv.put(put(&format!("k{n}"), "before")).await.unwrap();
