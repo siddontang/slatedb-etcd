@@ -50,7 +50,9 @@ are in `shared-state.jsonl`. `scripts/bench-shared-state.py` produced them, and
   `HeadObject`. The counts cover the load, a 15 s quiet time, and a `POST /checkpoint` on each
   member. The checkpoint makes the state durable in both modes, because replicated mode
   otherwise keeps small writes in its memtable.
-- "Stored" is the size of the bucket after that, from `mc du`.
+- "Stored" is the size of the bucket after that, from `mc du`. The harness now fails a case when
+  the checkpoint fails on any member. The run log of the reported runs has no checkpoint
+  failure, so all 24 case runs and both learner runs are valid.
 - RSS is the peak resident set size of each member, sampled every 250 ms during the load.
 - Learner install: after 200,000 puts of 256 B and a checkpoint on each member, a learner joins
   with `--join`. The time runs from its start until its applied index reaches the leader's
@@ -58,7 +60,9 @@ are in `shared-state.jsonl`. `scripts/bench-shared-state.py` produced them, and
 - Failover: after a burst of 20,000 puts, the leader gets `SIGKILL`. The time runs until an
   `etcdctl put` with a 500 ms timeout succeeds on the other members.
 - Policy check: three voters and a learner ran with MinIO users that had the policies of
-  `docs/shared-state-guide.md`. Then `mc cp` tried three keys outside those policies.
+  `docs/shared-state-guide.md`. Then eight probes read or wrote one object each. Each probe
+  expects one outcome: success, or an `AccessDenied` response for that object. Any other result
+  fails the check. The check ran again after the load run, on the same binary.
 
 ## Load results
 
@@ -115,13 +119,22 @@ The single runs were 88.1 s and 87.5 s, and 21.3 s and 21.2 s, for the learner. 
 
 ## Access policy check
 
-| Check | Result |
-| --- | --- |
-| Three voters start and serve with their own voter policies | Passed |
-| A learner joins with the learner policy and reads a key | Passed |
-| The learner writes under `shared/` | Denied |
-| A voter writes the binding of another member | Denied |
-| A voter writes under the state of another member | Denied |
+Three voters started and served with their own voter policies. A learner joined with the
+learner policy and read a key. Then:
+
+| Probe | Credential | Expected | Result |
+| --- | --- | --- | --- |
+| Read `shared/bootstrap.json` | Learner | Allowed | Allowed |
+| Write under `shared/` | Learner | Denied | `AccessDenied` |
+| Write under its own `member-<id>/` | Learner | Allowed | Allowed |
+| Read `mode.json` | Voter 1 | Allowed | Allowed |
+| Write under `member-1/` | Voter 1 | Allowed | Allowed |
+| Read `member-2/binding.json` | Voter 1 | Denied | `AccessDenied` (HEAD 403) |
+| Write `member-2/` | Voter 1 | Denied | `AccessDenied` |
+| Write `member-2/state/` | Voter 1 | Denied | `AccessDenied` |
+
+A HEAD response has no body, so the denied read shows only its 403 status. The same credential
+passes the allowed probes.
 
 ## Observations
 

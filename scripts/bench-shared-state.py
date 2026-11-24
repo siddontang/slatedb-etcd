@@ -267,14 +267,15 @@ class Trace:
 
 def checkpoint_all(cluster):
     """POST /checkpoint on each member: each flushes, or waits for a covering base. With a
-    separate peer listener, the diagnostic routes are on that listener."""
+    separate peer listener, the diagnostic routes are on that listener. A failure on any member
+    fails the measurement, because the stored bytes then miss that member's state."""
     for i in cluster.procs:
         try:
             urllib.request.urlopen(urllib.request.Request(
                 f"http://127.0.0.1:{cluster.ports[i] + 1}/checkpoint", data=b"{}",
                 headers={"Content-Type": "application/json"}), timeout=60).read()
         except Exception as error:  # noqa: BLE001
-            print(f"checkpoint on member {i} failed: {error}", flush=True)
+            raise RuntimeError(f"checkpoint on member {i} failed: {error}") from error
 
 
 def fresh(minio, args, name):
@@ -442,21 +443,66 @@ def run_policy(minio, args):
                 break
             time.sleep(0.5)
         out["learner_reads"] = value == "checked"
-        # Keys outside each policy are denied.
-        denied = {}
+        # Each probe has one expected outcome: the guide's policy allows it, or MinIO denies it
+        # with AccessDenied. Any other result fails the check.
         probe = work / "probe"
         probe.write_text("x")
-        for name, (user_name, secret), key in [
-            ("learner_writes_shared", cluster.credentials[learner], "shared/denied"),
-            ("voter_writes_other_binding", credentials[1], "member-2/denied"),
-            ("voter_reads_other_state", credentials[1], "member-2/state/denied"),
-        ]:
+        voter = credentials[1]
+        probes = [
+            ("learner_reads_shared", cluster.credentials[learner], "read",
+             "shared/bootstrap.json", "allowed"),
+            ("learner_writes_shared", cluster.credentials[learner], "write", "shared/denied",
+             "denied"),
+            ("learner_writes_own_binding_prefix", cluster.credentials[learner], "write",
+             f"member-{learner}/probe", "allowed"),
+            ("voter_reads_mode", voter, "read", "mode.json", "allowed"),
+            ("voter_writes_own_prefix", voter, "write", "member-1/probe", "allowed"),
+            ("voter_reads_other_binding", voter, "read", "member-2/binding.json", "denied"),
+            ("voter_writes_other_binding", voter, "write", "member-2/denied", "denied"),
+            ("voter_writes_other_state", voter, "write", "member-2/state/denied", "denied"),
+        ]
+        results, passed = {}, True
+        for name, (user_name, secret), action, key, expected in probes:
             minio.mc("alias", "set", name, minio.url, user_name, secret)
-            r = minio.mc("cp", str(probe), f"{name}/{bucket}/{prefix}/{key}", check=False)
+            target = f"{name}/{bucket}/{prefix}/{key}"
+            # `--debug` prints the S3 response, so the check reads the exact error code.
+            if action == "read":
+                r = minio.mc("--debug", "cat", target, check=False)
+            else:
+                r = minio.mc("--debug", "cp", str(probe), target, check=False)
             text = r.stdout + r.stderr
-            denied[name] = {"denied": r.returncode != 0 and "denied" in text.lower(),
-                            "output": text.strip()[-200:]}
-        out["denied"] = denied
+            # mc also probes the bucket, and MinIO denies that. Only the errors of the probed
+            # object count.
+            codes = sorted({
+                re.search(r"<Code>(\w+)</Code>", error).group(1)
+                for error in re.findall(r"<Error>.*?</Error>", text, re.S)
+                if f"<Key>{prefix}/{key}</Key>" in error
+            })
+            # A HEAD response has no body, so a denied stat shows only its 403 status. The same
+            # credentials pass the allowed probes, so a 403 there is a policy denial.
+            statuses, request = [], None
+            for line in text.splitlines():
+                m = re.search(r"\b(GET|HEAD|PUT|POST) (/\S+) HTTP/1\.1", line)
+                if m:
+                    request = (m.group(1), m.group(2))
+                m = re.search(r"HTTP/1\.1 (\d{3})", line)
+                if m and request and request[1].split("?")[0].endswith(f"/{prefix}/{key}"):
+                    statuses.append((request[0], int(m.group(1))))
+                    request = None
+            if not codes and ("HEAD", 403) in statuses:
+                codes = ["AccessDenied"]
+            if r.returncode == 0 and not codes:
+                outcome = "allowed"
+            elif r.returncode != 0 and codes == ["AccessDenied"]:
+                outcome = "denied"
+            else:
+                outcome = "error"
+            results[name] = {"action": action, "key": key, "expected": expected,
+                             "outcome": outcome, "object_errors": codes,
+                             "object_statuses": statuses}
+            passed &= outcome == expected
+        out["probes"] = results
+        out["passed"] = passed and out["learner_reads"]
     finally:
         cluster.stop()
     return out
@@ -490,12 +536,20 @@ def main():
                 print(json.dumps({k: v for k, v in entry.items() if k != "tail"})[:600],
                       flush=True)
             if args.policy:
-                record({"kind": "policy", **run_policy(minio, args)})
+                checked = run_policy(minio, args)
+                record({"kind": "policy", **checked})
+                if not checked["passed"]:
+                    raise SystemExit("the policy check failed")
             for repeat in range(args.repeat):
                 for case in args.cases:
                     for mode in args.modes:
-                        record({"kind": "case", "case": case, "mode": mode, "repeat": repeat,
-                                **run_case(minio, args, mode, case, repeat)})
+                        entry = {"kind": "case", "case": case, "mode": mode, "repeat": repeat}
+                        try:
+                            entry.update(run_case(minio, args, mode, case, repeat))
+                        except Exception as error:  # noqa: BLE001
+                            # An invalid case keeps no measurement.
+                            entry["error"] = str(error)
+                        record(entry)
                 if args.ops:
                     for mode in args.modes:
                         record({"kind": "ops", "mode": mode, "repeat": repeat,
