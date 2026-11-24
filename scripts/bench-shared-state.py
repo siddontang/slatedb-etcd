@@ -288,20 +288,30 @@ def bench(args, eps, tool_args):
 
 
 class Trace:
-    """Count the S3 calls of one bucket between start and stop: {api: [calls, bytes in, bytes
-    out]}. Bytes in are request bodies, and bytes out are response bodies. Stop waits 1 s for
-    calls in flight. A trace that starts at the stop of another one misses no call."""
+    """Count the S3 calls of one bucket in consecutive intervals: {api: [calls, bytes in, bytes
+    out]}. Bytes in are request bodies, and bytes out are response bodies.
+
+    One counter snapshot ends an interval and starts the next, so no call falls between two
+    intervals. The proxy counts a call when it ends.
+    """
 
     def __init__(self, s3, bucket):
         self.s3, self.bucket = s3, bucket
-        self.start = self.s3.counts().get(bucket, {})
+        self.mark = self.counts()
 
-    def stop(self):
-        time.sleep(1)
-        end = self.s3.counts().get(self.bucket, {})
+    def counts(self):
+        return self.s3.counts().get(self.bucket, {})
+
+    def next(self, wait=0.0):
+        """End the interval after `wait` seconds, start the next one, and return the counts of
+        the interval that ended. The last interval waits for calls in flight."""
+        time.sleep(wait)
+        end = self.counts()
         zero = [0, 0, 0]
-        return {api: [a - b for a, b in zip(value, self.start.get(api, zero))]
-                for api, value in end.items() if value != self.start.get(api)}
+        ended = {api: [a - b for a, b in zip(value, self.mark.get(api, zero))]
+                 for api, value in end.items() if value != self.mark.get(api)}
+        self.mark = end
+        return ended
 
 
 def checkpoint_all(cluster):
@@ -341,15 +351,17 @@ def run_case(s3, args, mode, case, repeat):
         trace = Trace(s3, bucket)
         eps = cluster.endpoint(leader) if case.startswith("put") else cluster.eps()
         result = bench(args, eps, CASES[case])
-        result["s3_load"] = trace.stop()
+        # The peaks of the load only. The quiet time and the checkpoint come after it.
+        peaks = dict(cluster.samples)
+        result["s3_load"] = trace.next()
         # Then make the state durable in both modes, and measure the stored bytes.
-        trace = Trace(s3, bucket)
         time.sleep(args.quiet)
         checkpoint_all(cluster)
-        result["s3_settle"] = trace.stop()
+        result["s3_settle"] = trace.next(wait=1)
         result["s3_usage"] = s3.usage(bucket)
         result["rss"] = {("leader" if i == leader else f"follower-{i}"): rss
-                         for i, rss in cluster.samples.items()}
+                         for i, rss in peaks.items()}
+        result["rss_interval"] = "load"
     finally:
         cluster.stop()
     return result
@@ -392,7 +404,7 @@ def run_ops(s3, args, mode, repeat):
                 raise RuntimeError("the learner did not catch up")
             time.sleep(0.05)
         out["learner_install_s"] = time.time() - started
-        out["learner_s3"] = trace.stop()
+        out["learner_s3"] = trace.next(wait=1)
         out["learner_rss"] = cluster.samples.get(learner)
         cluster.procs.pop(learner).kill()
         # Failover: a burst of writes, then SIGKILL of the leader with no further pause.
@@ -537,6 +549,9 @@ def main():
     ap.add_argument("--ops", action="store_true")
     ap.add_argument("--policy", action="store_true")
     args = ap.parse_args()
+    # RustFS runs in the work directory, so relative paths would resolve from there.
+    for name in ["binary", "benchmark", "etcdctl", "work", "out"]:
+        setattr(args, name, getattr(args, name).resolve())
     args.work.mkdir(parents=True, exist_ok=True)
     s3 = S3(args.work, args.go)
     args.s3_url = s3.url

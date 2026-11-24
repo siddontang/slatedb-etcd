@@ -13,9 +13,11 @@ records are in `shared-state.jsonl`. `scripts/bench-shared-state.py` produced th
 - **Reads:** shared mode reads are about 5% to 7% faster, with a lower p99. Each follower warms
   its cache for the SSTs of a new base, so reads do not wait for S3.
 - **Follower downloads:** each follower downloads the current rows of the writes once, for that
-  warm. In put-c256, shared mode read 70 MiB from S3, and replicated mode less than 1 MiB.
+  warm. In put-c256, the cluster-wide S3 response bytes were 70.4 MiB in shared mode, and less
+  than 1 MiB in replicated mode.
 - **Learner install:** 39 s in shared mode, 56 s in replicated mode, for the same data. Shared
-  mode uploads nothing and downloads 74 MiB. Replicated mode uploads 733 MiB.
+  mode uploads nothing, and its cluster-wide S3 response bytes are 74 MiB. Replicated mode
+  uploads 733 MiB.
 - **Failover:** the first write after a leader kill takes 1.0 s to 1.6 s in both modes.
 - **Access policy:** members run with the S3 policies of the shared state guide, and RustFS denies
   the keys outside them.
@@ -31,7 +33,7 @@ records are in `shared-state.jsonl`. `scripts/bench-shared-state.py` produced th
   prefix `250be6671ba447e9`. One data directory on the same SSD.
 - `scripts/s3-counter`, a Go reverse proxy, ran in front of RustFS. Members sent every S3 call
   through it. It counts the calls, request body bytes ("in"), and response body bytes ("out")
-  of each bucket and operation.
+  of each bucket and operation. The counts are for all members together, not per member.
 - Cluster: three members on the loopback interface. Each member had two CPU threads: `0,4`,
   `1,5`, and `2,6`. The etcd v3.6.5 `benchmark` tool, `etcdctl`, RustFS, and the proxy shared
   `3,7`.
@@ -54,10 +56,16 @@ records are in `shared-state.jsonl`. `scripts/bench-shared-state.py` produced th
   and `HeadObject`. The counts cover the load, a 15 s quiet time, and a `POST /checkpoint` on each
   member. The checkpoint makes the state durable in both modes, because replicated mode
   otherwise keeps small writes in its memtable.
+- The harness of these records read the counters twice between the load and the settle window:
+  once to end the load and once to start the settle window. The S3 counts can miss calls made
+  between these two reads. The number of missed calls is unknown. The harness now ends one
+  window and starts the next with one read.
 - "Stored" is the size of the bucket after that, from `ListObjectsV2`. A case fails when the
   checkpoint fails on any member. No case failed, so all 24 load runs and the four learner runs
   completed their checkpoints.
-- RSS is the peak resident set size of each member, sampled every 250 ms during the load.
+- RSS is the peak resident set size of each member, sampled every 250 ms. In these records the
+  peak covers the load, the 15 s quiet time, and the checkpoint. The harness now keeps only the
+  peak of the load.
 - Learner install: after 200,000 puts of 256 B and a checkpoint on each member, a learner joins
   with `--join`. The time runs from its start until its applied index reaches the leader's
   index at the time of the member add.
@@ -71,6 +79,8 @@ records are in `shared-state.jsonl`. `scripts/bench-shared-state.py` produced th
 ## Load results
 
 Throughput, latency, and peak memory:
+
+Peak RSS covers the load, the quiet time, and the checkpoint.
 
 | Case | Mode | Ops/s | p50 ms | p99 ms | Leader RSS MiB | Follower RSS MiB |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -87,7 +97,7 @@ Throughput, latency, and peak memory:
 | watch-latency | replicated | 186 | 2.75 | 30.01 | 39 | 40 |
 | watch-latency | shared | 199 | 2.67 | 25.86 | 46 | 41 |
 
-S3 requests, bytes, and stored bytes:
+S3 requests and bytes of the whole cluster, and stored bytes:
 
 | Case | Mode | S3 PUT-class | S3 GET-class | S3 MiB in | S3 MiB out | Stored MiB |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -143,8 +153,8 @@ learner policy and read a key. Then:
   bytes drop to about one third. The GET-class requests drop to about one third, because only
   the leader compacts.
 - Shared reads no longer wait for S3. A follower warms the index, filters, and current-row blocks
-  of each new L0 SST before it switches its base. In each read case, shared mode read only
-  0.2 MiB from S3, and it was about 5% to 7% faster than replicated mode.
+  of each new L0 SST before it switches its base. In each read case, the cluster-wide S3
+  response bytes were only 0.2 MiB, and shared mode was about 5% to 7% faster.
 - The warm costs downloads. Each follower reads about the current-row bytes of the writes once.
   Each warm reads a contiguous range of blocks with one GET, so it adds few requests.
 - The shared leader uses more memory than a replicated leader in put-c256: it holds the overlay
