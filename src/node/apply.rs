@@ -934,6 +934,7 @@ mod tests {
             join: false,
             empty_log: false,
             pin_max: Duration::from_secs(300),
+            restore: None,
         };
         let store: std::sync::Arc<dyn ObjectStore> = faults.clone();
         let mut state = StateMachine::open_shared(

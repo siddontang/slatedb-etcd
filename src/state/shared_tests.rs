@@ -14,6 +14,7 @@ fn options() -> shared::Options {
         join: false,
         empty_log: false,
         pin_max: Duration::from_secs(300),
+        restore: None,
     }
 }
 

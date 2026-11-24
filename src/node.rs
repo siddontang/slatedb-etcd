@@ -141,6 +141,8 @@ pub struct NodeOptions {
     pub max_clock_skew: Duration,
     /// Shared mode: whether the leader deletes old view checkpoints.
     pub view_retention: crate::state::ViewRetention,
+    /// Shared mode: the rows of a native snapshot that seed a new cluster.
+    pub restore: Option<crate::state::shared::Restore>,
 }
 
 impl NodeOptions {
@@ -331,6 +333,7 @@ impl Node {
             join: options.join,
             empty_log: storage.last_index()? == 0,
             pin_max: options.view_pin_max,
+            restore: options.restore.clone(),
         };
         let mut state = options
             .object_store
@@ -499,6 +502,7 @@ impl Node {
                 let mut writer = shared::Writer::new(handles, options.view_max_age, clock);
                 writer.retention = options.view_retention;
                 writer.retained = Some(retained);
+                writer.gauges = Some(shared::Gauges::register(&state.metrics.registry)?);
                 Some(writer)
             }
             None => None,
@@ -789,6 +793,9 @@ impl Node {
                     M::MoveLeader(target) => {
                         self.move_leader(target, credentials.unwrap_or_default(), response)?
                     }
+                    M::Defragment if self.writer.is_some() => {
+                        self.defragment_shared(credentials.unwrap_or_default(), response)?
+                    }
                     M::Alarm(_) | M::Downgrade(_) => self.propose(
                         RaftCommand::Maintenance {
                             id: uuid::Uuid::new_v4().to_string(),
@@ -1021,15 +1028,18 @@ impl Node {
                 let _ = response.send(Ok(self.status()?));
             }
             Event::Checkpoint(response) => {
-                if self.writer.is_some() {
-                    let _ = response.send(Err(
-                        self.error("shared state mode has no manual checkpoint until phase 4")
-                    ));
-                } else if self.checkpoint_waiters.len() >= apply::MAX_QUERIES {
+                if self.checkpoint_waiters.len() >= apply::MAX_QUERIES {
                     let _ = response.send(Err(self.error("too many checkpoint requests")));
                 } else {
-                    self.checkpoint_waiters
-                        .push((self.raw.raft.raft_log.committed, response));
+                    let committed = self.raw.raft.raft_log.committed;
+                    // Shared mode: the leader publishes a checkpoint through the commit index.
+                    // A follower waits for the base that the leader publishes next.
+                    if let Some(writer) = &self.writer {
+                        if self.raw.raft.state == StateRole::Leader {
+                            writer.request_publication(committed);
+                        }
+                    }
+                    self.checkpoint_waiters.push((committed, response));
                     self.schedule_apply()?;
                 }
             }
@@ -1354,12 +1364,24 @@ impl Node {
             if response.is_closed() {
                 continue;
             }
-            // A manual checkpoint completes only with a complete image.
+            // A manual checkpoint completes only with a complete image. In shared mode the
+            // image is a view checkpoint, so the member's base must hold the state at `index`.
             let store = self.raw.store();
-            if index <= store.snapshot_index()
-                && index <= self.state.applied
-                && (index == 0 || store.has_image())
-            {
+            let done = match &self.writer {
+                Some(writer) => {
+                    index <= self.state.applied
+                        && self
+                            .state
+                            .view
+                            .is_some_and(|(base, _, _)| base >= writer.covering(index))
+                }
+                None => {
+                    index <= store.snapshot_index()
+                        && index <= self.state.applied
+                        && (index == 0 || store.has_image())
+                }
+            };
+            if done {
                 let _ = response.send(Ok(self.status()?));
             } else {
                 waiting.push((index, response));

@@ -163,49 +163,7 @@ impl StateMachine {
         let _active = crate::metrics::Active::new(&self.metrics.defrag_active);
         self.metrics.flush_db(self.db()).await?;
         self.durable_applied = self.applied;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-        loop {
-            let manifest = self
-                .admin
-                .read_manifest(None)
-                .await?
-                .context("missing manifest")?;
-            let mut sources: Vec<_> = manifest
-                .l0()
-                .iter()
-                .map(|v| SourceId::SstView(v.id))
-                .collect();
-            sources.extend(
-                manifest
-                    .compacted()
-                    .iter()
-                    .map(|r| SourceId::SortedRun(r.id)),
-            );
-            if sources.is_empty() {
-                return Ok(());
-            }
-            let destination = manifest.compacted().iter().map(|r| r.id).min().unwrap_or(0);
-            let job = self
-                .admin
-                .submit_compaction(CompactionSpec::new(sources, destination))
-                .await?;
-            loop {
-                ensure!(
-                    tokio::time::Instant::now() < deadline,
-                    "defragmentation timed out"
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                if let Some(job) = self.admin.read_compaction(job.id(), None).await? {
-                    match job.status() {
-                        CompactionStatus::Completed => return Ok(()),
-                        CompactionStatus::Failed => break,
-                        _ => (),
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
+        compact_all(&self.admin).await
     }
 
     pub(super) async fn hash_kv(&self, revision: i64) -> std::result::Result<Value, KvError> {
@@ -466,6 +424,52 @@ pub(crate) async fn count_logical_size(db: &impl StateRead) -> Result<u64> {
             .context("logical size counter overflow")?;
     }
     Ok(size)
+}
+
+/// Compact every L0 SST and sorted run into one sorted run, and wait up to 8 s for the end.
+/// The compactor of the database writer runs the job. Defragment uses this in both state modes.
+pub(crate) async fn compact_all(admin: &slatedb::admin::Admin) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let manifest = admin
+            .read_manifest(None)
+            .await?
+            .context("missing manifest")?;
+        let mut sources: Vec<_> = manifest
+            .l0()
+            .iter()
+            .map(|v| SourceId::SstView(v.id))
+            .collect();
+        sources.extend(
+            manifest
+                .compacted()
+                .iter()
+                .map(|r| SourceId::SortedRun(r.id)),
+        );
+        if sources.is_empty() {
+            return Ok(());
+        }
+        let destination = manifest.compacted().iter().map(|r| r.id).min().unwrap_or(0);
+        let job = admin
+            .submit_compaction(CompactionSpec::new(sources, destination))
+            .await?;
+        loop {
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "defragmentation timed out"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Some(job) = admin.read_compaction(job.id(), None).await? {
+                match job.status() {
+                    CompactionStatus::Completed => return Ok(()),
+                    CompactionStatus::Failed => break,
+                    _ => (),
+                }
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 /// Encode a digest record the way the first format 4 binaries did, for tests of older rows.

@@ -174,6 +174,23 @@ impl RaftStorage {
         }
     }
 
+    /// The initial voters in the identity of an existing log. The offline converter opens a
+    /// log without the startup flags. The open fails while the member runs.
+    pub fn stored_voters(dir: &Path) -> Result<Vec<u64>> {
+        let config = Config {
+            dir: dir.to_string_lossy().into_owned(),
+            enable_log_recycle: false,
+            ..Config::default()
+        };
+        let engine = Engine::open(config)?;
+        let stored = engine
+            .get(GROUP, IDENTITY)
+            .context("the log has no identity")?;
+        let fields: Vec<serde_json::Value> = serde_json::from_slice(&stored)?;
+        let voters = fields.get(3).cloned().context("invalid log identity")?;
+        Ok(serde_json::from_value(voters)?)
+    }
+
     pub fn open(dir: &Path, node_id: u64, cluster_id: &str, voters: Vec<u64>) -> Result<Self> {
         Self::open_with_file_bytes(dir, node_id, cluster_id, voters, DEFAULT_LOG_FILE_BYTES)
     }
@@ -379,14 +396,29 @@ impl RaftStorage {
     /// One synced batch stores the record, its ConfState, the commit `max(commit, index)`, and
     /// the log change. A crash leaves the old log or the new boundary.
     pub fn adopt(&mut self, snapshot: &Snapshot) -> Result<()> {
+        self.adopt_at(snapshot, false)
+    }
+
+    /// Adopt `snapshot`, or replace the record at its own index when the terms match. The offline
+    /// converter uses this, because a member's record can already be at the checkpoint index.
+    pub fn replace_record(&mut self, snapshot: &Snapshot) -> Result<()> {
+        self.adopt_at(snapshot, true)
+    }
+
+    fn adopt_at(&mut self, snapshot: &Snapshot, replace: bool) -> Result<()> {
         let index = snapshot.get_metadata().index;
         let term = snapshot.get_metadata().term;
-        ensure!(index > self.snapshot_index(), "stale adopted snapshot");
+        let same =
+            replace && index == self.snapshot_index() && term == self.snapshot.get_metadata().term;
+        ensure!(
+            same || index > self.snapshot_index(),
+            "stale adopted snapshot"
+        );
         ensure!(
             !snapshot.data.is_empty(),
             "adopted snapshot has no descriptor"
         );
-        let keep = index <= self.last_index()? && self.term(index).ok() == Some(term);
+        let keep = same || (index <= self.last_index()? && self.term(index).ok() == Some(term));
         ensure!(
             keep || index > self.hard_state.commit,
             "committed log term at {index} differs from checkpoint term {term}"

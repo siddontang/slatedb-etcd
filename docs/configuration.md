@@ -135,7 +135,8 @@ The local Raft log remains necessary. S3 does not replace quorum log durability.
 `--state-mode shared` selects the prototype of the shared state design, `docs/shared-state.md`,
 for a new cluster. The leader writes one SlateDB for the whole cluster. Each member reads a
 checkpoint of it, its base, under an in-memory overlay of the newer applied batches.
-`replicated` is the default and keeps the per-member layout.
+`replicated` is the default and keeps the per-member layout. The
+[shared state guide](shared-state-guide.md) covers operation, access, cost, and conversion.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -185,7 +186,9 @@ Rules and limits:
   state from the newest checkpoint and replays the local log.
 - A member that waits on its overlay limit adopts a newer checkpoint in process when its log
   commits the checkpoint index.
-- Manual checkpoints, Defragment, and snapshot restore are unavailable.
+- Defragment runs on the leader. A manual checkpoint returns when the member's base covers the
+  commit index. `--restore-snapshot` seeds a new cluster. See the
+  [shared state guide](shared-state-guide.md#operations).
 
 ### View checkpoint retention
 

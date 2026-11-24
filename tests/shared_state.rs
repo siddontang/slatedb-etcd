@@ -918,3 +918,175 @@ async fn failover_with_a_full_overlay_serves_the_next_write() {
     })
     .await;
 }
+
+/// Send a request to a diagnostics endpoint on the client listener and return the status line.
+async fn http(server: &Server, method: &str, path: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(server.client_addr())
+        .await
+        .unwrap();
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         Content-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let response = String::from_utf8(response).unwrap();
+    response.lines().next().unwrap().to_owned()
+}
+
+/// Defragment on a follower runs on the leader writer: the shared database then has one sorted
+/// run and no L0 SST, and every member keeps its data. A manual checkpoint on each member
+/// returns after its base covers the commit index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn defragment_and_manual_checkpoints_in_shared_mode() {
+    use slatedb_etcd::proto::etcdserverpb::DefragmentRequest;
+    let dir = tempfile::tempdir().unwrap();
+    let (_, servers) = quiet_cluster(dir.path()).await;
+    let lead = leader(servers[0].as_ref().unwrap()).await;
+    let mut kv = KvClient::new(channel(servers[lead as usize - 1].as_ref().unwrap()).await);
+    for n in 0..20 {
+        kv.put(put(&format!("k{n}"), "value")).await.unwrap();
+    }
+    let follower = (1..=3).find(|id| *id != lead).unwrap();
+    let follower = servers[follower as usize - 1].as_ref().unwrap();
+    MaintenanceClient::new(channel(follower).await)
+        .defragment(DefragmentRequest {})
+        .await
+        .unwrap();
+    let store = Arc::new(
+        slatedb::object_store::local::LocalFileSystem::new_with_prefix(
+            dir.path().join("shared-objects"),
+        )
+        .unwrap(),
+    );
+    let manifest = slatedb::admin::Admin::builder("shared/state", store)
+        .build()
+        .read_manifest(None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(manifest.l0().is_empty());
+    assert_eq!(manifest.compacted().len(), 1);
+    // A manual checkpoint waits until the member's base holds every write.
+    let written = status(servers[lead as usize - 1].as_ref().unwrap()).await["shared_state"]
+        ["writer"]["written"]
+        .as_u64()
+        .unwrap();
+    for server in servers.iter().flatten() {
+        let reply = http(server, "POST", "/checkpoint").await;
+        assert!(reply.contains("200"), "{reply}");
+        let base = status(server).await["shared_state"]["base_applied_index"]
+            .as_u64()
+            .unwrap();
+        assert!(base >= written, "base {base} written {written}");
+    }
+    for server in servers.iter().flatten() {
+        let local = KvClient::new(channel(server).await)
+            .range(RangeRequest {
+                serializable: true,
+                ..all()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            local
+                .kvs
+                .iter()
+                .filter(|kv| kv.key.starts_with(b"k"))
+                .count(),
+            20
+        );
+    }
+    converge(&servers).await;
+    for server in servers.into_iter().flatten() {
+        server.shutdown().await.unwrap();
+    }
+}
+
+/// Every member of a new shared cluster starts with the same native snapshot. One member seeds
+/// the shared database at index 1, the others find its marker, and all serve the rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_new_shared_cluster_restores_a_snapshot() {
+    use slatedb_etcd::proto::etcdserverpb::SnapshotRequest;
+    let dir = tempfile::tempdir().unwrap();
+    let (source, channel_source) = start(config(
+        &dir.path().join("source"),
+        StateMode::Replicated,
+        Duration::from_secs(1),
+    ))
+    .await;
+    KvClient::new(channel_source.clone())
+        .put(put("restored", "value"))
+        .await
+        .unwrap();
+    let mut snapshot = MaintenanceClient::new(channel_source)
+        .snapshot(SnapshotRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let mut bytes = Vec::new();
+    while let Some(part) = snapshot.message().await.unwrap() {
+        bytes.extend(part.blob);
+    }
+    source.shutdown().await.unwrap();
+    let backup = dir.path().join("snapshot");
+    std::fs::write(&backup, bytes).unwrap();
+    let peers = addresses(3).await;
+    let mut servers = vec![];
+    for id in 1..=3 {
+        let mut config = member_config(dir.path(), StateMode::Shared, id, &peers);
+        config.restore_snapshot = Some(backup.clone());
+        servers.push(Some(Server::start(config).await.unwrap()));
+    }
+    for server in servers.iter().flatten() {
+        server.wait_ready(Duration::from_secs(15)).await.unwrap();
+    }
+    for server in servers.iter().flatten() {
+        let mut kv = KvClient::new(channel(server).await);
+        eventually("the restored row", async || {
+            kv.range(RangeRequest {
+                key: b"restored".to_vec(),
+                serializable: true,
+                ..Default::default()
+            })
+            .await
+            .is_ok_and(|reply| {
+                reply.into_inner().kvs.first().map(|kv| kv.value.clone()) == Some(b"value".to_vec())
+            })
+        })
+        .await;
+    }
+    let lead = leader(servers[0].as_ref().unwrap()).await;
+    KvClient::new(channel(servers[lead as usize - 1].as_ref().unwrap()).await)
+        .put(put("after", "restore"))
+        .await
+        .unwrap();
+    converge(&servers).await;
+    assert!(checkpoints_in(&dir.path().join("shared-objects")).await >= 1);
+    for server in servers.into_iter().flatten() {
+        server.shutdown().await.unwrap();
+    }
+}
+
+/// The `view-` checkpoints of a shared object directory.
+async fn checkpoints_in(objects: &std::path::Path) -> usize {
+    let store =
+        Arc::new(slatedb::object_store::local::LocalFileSystem::new_with_prefix(objects).unwrap());
+    slatedb::admin::Admin::builder("shared/state", store)
+        .build()
+        .list_checkpoints(None)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|checkpoint| {
+            checkpoint
+                .name
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("view-")
+        })
+        .count()
+}

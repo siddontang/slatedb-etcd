@@ -31,6 +31,9 @@ pub enum Config {
     SharedDirectory(std::path::PathBuf),
     #[cfg(test)]
     Test(Arc<dyn ObjectStore>, String),
+    /// The S3 layout on another store, for tests.
+    #[cfg(test)]
+    TestS3(Arc<dyn ObjectStore>, S3),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +242,8 @@ impl Config {
                 s3.validate()?;
                 Some(s3)
             }
+            #[cfg(test)]
+            Self::TestS3(_, s3) => Some(s3.clone()),
             _ => None,
         };
         let binding = bind(dir, cluster, member, s3, mode)?;
@@ -260,7 +265,7 @@ impl Config {
                 }
             };
         };
-        let store = s3.store()?;
+        let store = self.s3_store(s3)?;
         let prefix = s3.member_prefix(cluster, member);
         let backend = crate::state::transfer::Backend::S3 {
             bucket: s3.bucket.clone(),
@@ -283,6 +288,80 @@ impl Config {
                 StateMachine::open_shared(store, &root, cluster, cache, &shared, backend).await
             }
         }
+    }
+}
+
+impl Config {
+    /// The object store of an S3 configuration.
+    pub(crate) fn s3_store(&self, s3: &S3) -> Result<Arc<dyn ObjectStore>> {
+        #[cfg(test)]
+        if let Self::TestS3(store, _) = self {
+            return Ok(store.clone());
+        }
+        s3.store()
+    }
+}
+
+/// Read the object store binding of a data directory.
+fn read_binding(dir: &Path) -> Result<Binding> {
+    let path = dir.join("object-store.json");
+    ensure!(
+        path.exists(),
+        "the data directory has no object store binding"
+    );
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+
+/// Write the binding of a data directory atomically.
+fn write_binding(dir: &Path, binding: &Binding) -> Result<()> {
+    let temporary = dir.join("object-store.json.pending");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(&serde_json::to_vec(binding)?)?;
+    file.sync_all()?;
+    std::fs::rename(temporary, dir.join("object-store.json"))?;
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// The S3 settings of a replicated member directory of `cluster`, or of a member that a
+/// conversion already changed to shared mode.
+pub(crate) fn converted_s3(dir: &Path, cluster: &str, member: u64) -> Result<(S3, StateMode)> {
+    let binding = read_binding(dir)?;
+    ensure!(
+        binding.version == 1 && binding.cluster == cluster && binding.member == member,
+        "the data directory belongs to another cluster or member"
+    );
+    let s3 = binding
+        .s3
+        .context("only a member with S3 state can be converted")?;
+    Ok((s3, binding.mode))
+}
+
+/// Change the binding of a stopped replicated member to shared mode.
+///
+/// The member writes its shared binding claim first, then its local binding, and then deletes
+/// its replicated owner claim. Each step can run again after a crash. A shared member refuses to
+/// start while any member namespace still has a replicated owner claim, so the cluster starts
+/// only after every member is converted.
+pub(crate) async fn convert_binding(
+    dir: &Path,
+    store: &dyn ObjectStore,
+    cluster: &str,
+    member: u64,
+) -> Result<()> {
+    let mut binding = read_binding(dir)?;
+    let s3 = binding.s3.clone().context("the member has no S3 state")?;
+    let prefix = s3.member_prefix(cluster, member);
+    binding.mode = StateMode::Shared;
+    claim(store, &prefix, BINDING, &binding).await?;
+    write_binding(dir, &binding)?;
+    match store.delete(&format!("{prefix}/{OWNER}").into()).await {
+        Ok(()) | Err(slatedb::object_store::Error::NotFound { .. }) => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -493,6 +572,7 @@ mod tests {
                     join: false,
                     empty_log: true,
                     pin_max: Duration::from_secs(300),
+                    restore: None,
                 };
                 claim_shared(store, &root, &prefix, "cluster", &binding, &options)
                     .await
@@ -594,6 +674,7 @@ mod tests {
             join: true,
             empty_log: true,
             pin_max: Duration::from_secs(300),
+            restore: None,
         };
         let root = config.cluster_prefix("cluster");
         let prefix = config.member_prefix("cluster", 4);

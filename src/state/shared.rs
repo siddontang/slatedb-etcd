@@ -537,6 +537,96 @@ async fn newest_base_through(
 
 /// Open the newest `view-` checkpoint that holds the membership. The publisher deletes a
 /// checkpoint without it, but a stop can leave one behind.
+/// The source of the offline converter. It opens no member state.
+pub(crate) fn offline_source(
+    store: Arc<dyn ObjectStore>,
+    root: &str,
+    cache: StateCache,
+) -> Result<Arc<Source>> {
+    cache.validate()?;
+    Ok(Arc::new(Source {
+        store,
+        root: root.to_owned(),
+        cache: cache.build(),
+        pins: Mutex::default(),
+        received: Mutex::default(),
+    }))
+}
+
+/// The newest valid view checkpoint, with its base, the term at its index, and its members.
+pub(crate) async fn newest_view(
+    source: &Source,
+) -> Result<(uuid::Uuid, Arc<Base>, u64, crate::cluster::Store)> {
+    let admin =
+        slatedb::admin::Admin::builder(source.state().as_str(), source.store.clone()).build();
+    let base = newest_base(&admin, source)
+        .await?
+        .context("the shared state has no view checkpoint")?;
+    let (term, members) = identity(&base).await?;
+    Ok((
+        base.checkpoint.context("the base has no checkpoint")?,
+        base,
+        term,
+        members,
+    ))
+}
+
+/// The term at the index of `base`, and its members. A base without a term cannot become a Raft
+/// snapshot record.
+pub(crate) async fn identity(base: &Base) -> Result<(u64, crate::cluster::Store)> {
+    let term = match base.get(APPLIED_TERM).await? {
+        Some(row) => {
+            let row: [u8; 16] = row.as_ref().try_into().context("invalid applied term")?;
+            let index = u64::from_be_bytes(row[..8].try_into()?);
+            let term = u64::from_be_bytes(row[8..].try_into()?);
+            if index == base.applied {
+                term
+            } else {
+                0
+            }
+        }
+        None => 0,
+    };
+    ensure!(
+        term != 0,
+        "the state at index {} has no applied term",
+        base.applied
+    );
+    let members = base
+        .get(crate::cluster::KEY)
+        .await?
+        .context("the state has no membership")?;
+    Ok((term, serde_json::from_slice(&members)?))
+}
+
+/// Change the mode claim of a stopped replicated cluster to shared. Only the offline converter
+/// does this. A cluster that already has the shared claim keeps it.
+pub(crate) async fn convert_mode(store: &dyn ObjectStore, root: &str, cluster: &str) -> Result<()> {
+    let path = Path::from(join(root, MODE));
+    match store.get(&path).await {
+        Ok(result) => {
+            let existing: ModeClaim = serde_json::from_slice(&result.bytes().await?)
+                .context("invalid cluster mode claim")?;
+            ensure!(
+                existing.version == 1 && existing.cluster == cluster,
+                "the namespace belongs to another cluster"
+            );
+            if existing.mode == StateMode::Shared {
+                return Ok(());
+            }
+        }
+        Err(slatedb::object_store::Error::NotFound { .. }) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let claim = ModeClaim {
+        version: 1,
+        cluster: cluster.to_owned(),
+        mode: StateMode::Shared,
+    };
+    store.put(&path, serde_json::to_vec(&claim)?.into()).await?;
+    Ok(())
+}
+
 async fn newest_base(admin: &slatedb::admin::Admin, source: &Source) -> Result<Option<Arc<Base>>> {
     for (_, checkpoint) in view_checkpoints(admin).await?.into_iter().rev() {
         let base = source.open_base(checkpoint.id).await?;
@@ -643,6 +733,75 @@ pub(crate) struct Options {
     pub empty_log: bool,
     /// The longest time that a read view may pin its base.
     pub pin_max: Duration,
+    /// Rows of a native snapshot that seed a new cluster.
+    pub restore: Option<Restore>,
+}
+
+/// The rows of a native snapshot that seed a new shared cluster. The shared database gets them
+/// at index 1 and term 1, then the first view checkpoint and the bootstrap marker. Each member
+/// then adopts that checkpoint as its base, as at a restart.
+#[derive(Clone)]
+pub struct Restore(Arc<Vec<(Vec<u8>, Vec<u8>)>>);
+
+impl Restore {
+    pub(crate) fn new(rows: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
+        Self(Arc::new(rows))
+    }
+}
+
+impl std::fmt::Debug for Restore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Restore({} rows)", self.0.len())
+    }
+}
+
+/// Write the restored rows into a new shared database at index 1, create the first view
+/// checkpoint, and write the bootstrap marker. A member that finds the marker skips this:
+/// another member of the cluster restored the same snapshot first.
+async fn seed(source: &Source, admin: &slatedb::admin::Admin, restore: &Restore) -> Result<()> {
+    // Another member can be in the middle of the same restore. Wait for its marker.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if source.bootstrapped().await? {
+            tracing::info!("the shared state has its first checkpoint; skip the restore");
+            return Ok(());
+        }
+        let late = std::time::Instant::now() >= deadline;
+        if admin.read_manifest(None).await?.is_none() {
+            match write_seed(source, restore).await {
+                Ok(()) => return Ok(()),
+                Err(error) if !late => {
+                    tracing::warn!(%error, "the shared restore failed; check again")
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            ensure!(!late, "snapshot restore needs a new shared cluster");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn write_seed(source: &Source, restore: &Restore) -> Result<()> {
+    let db = source.open_writer().await?;
+    let mut batch = slatedb::WriteBatch::new();
+    for (key, value) in restore.0.iter() {
+        batch.put(key, value);
+    }
+    batch.put(APPLIED_TERM, applied_term_row(1, 1));
+    db.write_with_options(batch, &slatedb::config::WriteOptions { seqnum: 1 })
+        .await?;
+    db.flush().await?;
+    let options = slatedb::config::CheckpointOptions {
+        name: Some(view_name(1)),
+        ..Default::default()
+    };
+    let checkpoint = db
+        .create_checkpoint(slatedb::config::CheckpointScope::Durable, &options)
+        .await?;
+    source.mark_bootstrapped(checkpoint.id).await?;
+    db.close().await?;
+    Ok(())
 }
 
 /// The apply side of shared mode on one member.
@@ -899,6 +1058,9 @@ impl StateMachine {
         );
         let rows = Arc::new(rows::RowCache::new(cache.row_bytes));
         let admin = Arc::new(slatedb::admin::Admin::builder(state_root.as_str(), store).build());
+        if let Some(restore) = &options.restore {
+            seed(&source, &admin, restore).await?;
+        }
         // A joining member with no log waits for Raft: entries from index 1 or a snapshot.
         let base = match newest_base(&admin, &source).await? {
             Some(_) if options.join && options.empty_log => Arc::new(Base::empty()),

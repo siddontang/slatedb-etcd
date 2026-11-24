@@ -91,6 +91,7 @@ for Auth and separate TLS client and peer listeners.
 | Maintenance | Status, health, HashKV, alarms, native backups, restore, and defragmentation |
 | Transport | Client TLS, peer TLS, mutual authentication, and certificate identity |
 | Storage | Physical Compact, background snapshots, separate apply, and bounded log pools |
+| Shared state | Prototype: one SlateDB in S3 for the cluster, written by the leader |
 
 Native backups and the deprecated backend Hash differ from etcd bbolt.
 Use the native restore flag, not `etcdutl`. Binary Downgrade returns Unimplemented.

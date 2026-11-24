@@ -78,6 +78,31 @@ Each member permits two concurrent scrapes and returns HTTP 503 on overload or t
 A scrape can read one remote manifest when the member uses an object store.
 If this read fails or takes more than one second, the scrape omits only the physical size gauge.
 
+## Shared state gauges
+
+A member in shared state mode also exports these gauges. Replicated members omit them. See the
+[shared state guide](shared-state-guide.md).
+
+| Gauge | Meaning |
+| --- | --- |
+| `slatedb_etcd_shared_base_applied_index` | Raft index of the checkpoint that the member reads |
+| `slatedb_etcd_shared_overlay_bytes` | Bytes of applied batches in the overlay above the base |
+| `slatedb_etcd_shared_apply_paused` | 1 while apply waits above twice `--overlay-max-bytes` |
+| `slatedb_etcd_shared_writer_running` | 1 while this member runs the shared writer |
+| `slatedb_etcd_shared_writer_reopens` | Writer opens after a fence or a lost manifest race |
+| `slatedb_etcd_shared_view_checkpoints` | `view-` checkpoints after the last publication |
+| `slatedb_etcd_shared_clock_skew_milliseconds` | Local clock lag behind the writer clock |
+
+The member sets the first five gauges on each Raft tick. The leader sets the checkpoint count
+after each publication. The clock gauge changes at each writer open.
+
+- A base index that stops while the applied index grows means that no checkpoint reaches the
+  member. Check S3 access and the leader's writer.
+- Overlay bytes near `--overlay-max-bytes` mean that checkpoints are slow. The leader then
+  rejects proposals.
+- A growing checkpoint count with `--view-retention off` means growing storage. See the manual
+  cleanup in the guide.
+
 ## Upstream alerts and dashboard
 
 The v3.6.5 [alerts] contain 15 rules. The [dashboard] defines 16 query targets.

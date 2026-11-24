@@ -11,6 +11,7 @@ use slatedb::config::{CheckpointOptions, CheckpointScope, WriteOptions};
 
 use std::collections::HashSet;
 
+use crate::mvcc::{KvError, Outcome};
 use crate::state::overlay::Queue;
 use crate::state::shared::{view_checkpoints, view_name, Handles, Source};
 
@@ -160,6 +161,50 @@ pub(super) struct Writer {
     reopens: Arc<std::sync::atomic::AtomicU64>,
     pub(super) retention: crate::state::ViewRetention,
     pub(super) retained: Option<prometheus::IntGauge>,
+    /// The writer `Db` while this member leads.
+    open: OpenWriter,
+    pub(super) gauges: Option<Gauges>,
+}
+
+/// The shared-mode gauges of one member. The node sets them on each tick.
+pub(super) struct Gauges {
+    base: prometheus::IntGauge,
+    overlay: prometheus::IntGauge,
+    paused: prometheus::IntGauge,
+    leading: prometheus::IntGauge,
+    reopens: prometheus::IntGauge,
+}
+
+impl Gauges {
+    pub(super) fn register(registry: &prometheus::Registry) -> Result<Self> {
+        let gauge = |name: &str, help: &str| -> Result<prometheus::IntGauge> {
+            let gauge = prometheus::IntGauge::new(name, help)?;
+            registry.register(Box::new(gauge.clone()))?;
+            Ok(gauge)
+        };
+        Ok(Self {
+            base: gauge(
+                "slatedb_etcd_shared_base_applied_index",
+                "Raft index of the view checkpoint that this member reads as its base.",
+            )?,
+            overlay: gauge(
+                "slatedb_etcd_shared_overlay_bytes",
+                "Bytes of applied batches in the overlay above the base.",
+            )?,
+            paused: gauge(
+                "slatedb_etcd_shared_apply_paused",
+                "1 while apply waits for a base switch above twice the overlay limit.",
+            )?,
+            leading: gauge(
+                "slatedb_etcd_shared_writer_running",
+                "1 while this member runs the shared writer.",
+            )?,
+            reopens: gauge(
+                "slatedb_etcd_shared_writer_reopens",
+                "Writer opens after a fence or a lost manifest race while this member led.",
+            )?,
+        })
+    }
 }
 
 impl Writer {
@@ -172,6 +217,8 @@ impl Writer {
             reopens: Arc::default(),
             retention: crate::state::ViewRetention::Off,
             retained: None,
+            open: OpenWriter::default(),
+            gauges: None,
             progress: Arc::new(Progress::new(0)),
             admin: handles.admin.clone(),
             queue: handles.queue.clone(),
@@ -237,6 +284,7 @@ impl Writer {
                 leadership: self.leadership.subscribe(),
                 clock: self.clock.clone(),
                 reopens: self.reopens.clone(),
+                open: self.open.clone(),
             },
         );
         self.tasks.spawn(async move { (term, task.await) });
@@ -418,7 +466,11 @@ struct Leading {
     leadership: tokio::sync::watch::Receiver<(bool, u64)>,
     clock: Clock,
     reopens: Arc<std::sync::atomic::AtomicU64>,
+    open: OpenWriter,
 }
+
+/// The writer `Db` while the writer task runs. Defragment flushes and compacts it.
+type OpenWriter = Arc<Mutex<Option<Arc<slatedb::Db>>>>;
 
 /// Wait until the member asks the writer task to stop. The result holds no borrow, so the task
 /// stays `Send` across later waits.
@@ -467,6 +519,7 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         leadership,
         clock,
         reopens,
+        open,
     } = leading;
     let current = || *leadership.borrow() == (true, term);
     loop {
@@ -521,11 +574,13 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         let mut publisher = publisher.clone();
         publisher.progress.reset(db.manifest().last_l0_seq());
         publisher.db = Some(db.clone());
+        *open.lock().unwrap() = Some(db.clone());
         let result = tokio::select! {
             result = materialize(db.clone(), queue.clone(), publisher.progress.clone()) => result,
             result = publish(publisher, events.clone()) => result,
             _ = stop_requested(&mut stopped) => Ok(()),
         };
+        open.lock().unwrap().take();
         close(db).await;
         match result {
             // Two quick elections can open writers in reverse term order.
@@ -961,6 +1016,60 @@ impl Node {
         }
     }
 
+    /// Defragment the shared database. Only the leader has the writer and its compactor, so a
+    /// follower returns "not leader" and the gRPC layer forwards the request. The leader flushes
+    /// the writer, compacts every SST into one sorted run, and requests a checkpoint, so the
+    /// next base reads the compacted run.
+    pub(super) fn defragment_shared(
+        &mut self,
+        credentials: crate::auth::Credentials,
+        response: Response,
+    ) -> Result<()> {
+        if let Err(error) = self.state.auth.admin(&credentials) {
+            let _ = response.send(Ok(serde_json::to_value(Outcome::<Value> {
+                result: Err(error),
+            })?));
+            return Ok(());
+        }
+        if self.raw.raft.state != StateRole::Leader {
+            let _ = response.send(Err(self.error("not leader")));
+            return Ok(());
+        }
+        let writer = self.writer.as_ref().context("shared mode has no writer")?;
+        let Some(db) = writer.open.lock().unwrap().clone() else {
+            let _ = response.send(Err(self.error("the shared writer is not open yet")));
+            return Ok(());
+        };
+        let admin = writer.admin.clone();
+        let progress = writer.progress.clone();
+        let mut header = ResponseHeader {
+            revision: self.state.revision,
+            ..Default::default()
+        };
+        self.fill_header(Some(&mut header));
+        tokio::spawn(async move {
+            let result = async {
+                db.flush().await?;
+                crate::state::maintenance::compact_all(&admin).await?;
+                progress.request(progress.written());
+                anyhow::Ok(())
+            }
+            .await;
+            let outcome = match result {
+                Ok(()) => Outcome {
+                    result: Ok(json!({ "header": header })),
+                },
+                Err(error) => Outcome {
+                    result: Err(KvError::storage(error)),
+                },
+            };
+            if let Ok(value) = serde_json::to_value(outcome) {
+                let _ = response.send(Ok(value));
+            }
+        });
+        Ok(())
+    }
+
     /// Propose a checkpoint that the publisher created. Only the leader announces. Return true
     /// when Raft took the proposal.
     pub(super) fn announce_view(&mut self, checkpoint: uuid::Uuid) -> Result<bool> {
@@ -1019,6 +1128,15 @@ impl Node {
         };
         writer.ticks += 1;
         let ticks = writer.ticks;
+        if let (Some(gauges), Some((base, _, bytes))) = (&writer.gauges, self.state.view) {
+            gauges.base.set(base as i64);
+            gauges.overlay.set(bytes as i64);
+            gauges.paused.set(writer.paused.into());
+            gauges.leading.set(writer.running().into());
+            gauges
+                .reopens
+                .set(writer.reopens.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        }
         if ticks % POLL_TICKS == 0 && writer.paused {
             self.poll_checkpoints();
         }
@@ -1662,6 +1780,7 @@ mod tests {
             join: false,
             empty_log: false,
             pin_max: Duration::from_secs(300),
+            restore: None,
         };
         let mut state = StateMachine::open_shared(
             Arc::new(InMemory::new()),
@@ -1806,6 +1925,7 @@ mod tests {
             join: false,
             empty_log: false,
             pin_max: Duration::from_secs(300),
+            restore: None,
         };
         let mut state = StateMachine::open_shared(
             Arc::new(InMemory::new()),
@@ -1922,6 +2042,7 @@ mod tests {
             join: false,
             empty_log: false,
             pin_max: Duration::from_secs(300),
+            restore: None,
         };
         let mut state = StateMachine::open_shared(
             Arc::new(InMemory::new()),
@@ -2034,6 +2155,7 @@ mod tests {
             join: false,
             empty_log: false,
             pin_max: Duration::from_secs(300),
+            restore: None,
         };
         // A tiny cache, so the open reads the store.
         let cache = crate::state::StateCache {
@@ -2107,6 +2229,7 @@ mod tests {
             join: false,
             empty_log: false,
             pin_max: Duration::from_secs(300),
+            restore: None,
         };
         // A tiny cache, so each open reads the store.
         let cache = crate::state::StateCache {
@@ -2238,6 +2361,7 @@ mod tests {
             join: false,
             empty_log: false,
             pin_max: Duration::from_secs(300),
+            restore: None,
         };
         let mut state = StateMachine::open_shared(
             Arc::new(InMemory::new()),
