@@ -196,6 +196,10 @@ struct LogTask {
 
 /// Raft tick interval. Election timeouts count these ticks.
 pub(crate) const TICK: Duration = Duration::from_millis(100);
+/// A client write fails if it waits longer than this before proposal, or after it.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Raft's uncommitted byte limit. Writers wait at half of it; see `Node::backlog`.
+const MAX_UNCOMMITTED_BYTES: usize = 2 * log::MAX_BYTES;
 
 pub struct Node {
     pub(crate) metrics: std::sync::Arc<crate::metrics::Member>,
@@ -263,6 +267,8 @@ pub struct Node {
     // Full backlog checks by cause: apply lag, queued log jobs, queued log bytes,
     // uncommitted Raft bytes, unapplied log bytes.
     backlog_rejects: [u64; 5],
+    // `REQUEST_TIMEOUT`. Tests that are slow by design raise it.
+    request_timeout: Duration,
     // Log bytes appended since the last checkpoint started.
     appended_bytes: u64,
     // Count full images started for peers or manual checkpoints.
@@ -431,7 +437,7 @@ impl Node {
                 // A safety net only: `backlogged` holds writers once Raft's uncommitted
                 // bytes reach `log::MAX_BYTES`. The other half is headroom for one
                 // admitted command or put group, so Raft does not drop a client write.
-                max_uncommitted_size: 2 * log::MAX_BYTES as u64,
+                max_uncommitted_size: MAX_UNCOMMITTED_BYTES as u64,
                 max_committed_size_per_ready: apply::BATCH_BYTES,
                 ..Config::default()
             };
@@ -583,6 +589,7 @@ impl Node {
             send_failures: vec![],
             checkpoint_running: false,
             backlog_rejects: [0; 5],
+            request_timeout: REQUEST_TIMEOUT,
             appended_bytes: 0,
             snapshot_images: 0,
             next_checkpoint,
@@ -1107,6 +1114,17 @@ impl Node {
 
     /// Return true when a new proposal must wait. Count each full check by cause for `/status`.
     fn backlogged(&mut self) -> bool {
+        self.backlog(true)
+    }
+
+    /// Return true when a membership change must fail. The change skips the byte holds for
+    /// ordinary writes: they keep room for it, so the remaining voters can remove a failed
+    /// voter while the writes wait for a quorum. The caller checks room for the entry.
+    fn membership_backlogged(&mut self) -> bool {
+        self.backlog(false)
+    }
+
+    fn backlog(&mut self, byte_holds: bool) -> bool {
         let causes = [
             self.raw
                 .store()
@@ -1120,13 +1138,15 @@ impl Node {
             // a dropped Put. Raft counts each proposed entry until it leaves in a Ready
             // as committed, so this also covers entries that are on disk but need a
             // quorum. The open put group is not in Raft yet.
-            self.raw.raft.uncommitted_size() + self.put_proposals.bytes() >= log::MAX_BYTES,
+            byte_holds
+                && self.raw.raft.uncommitted_size() + self.put_proposals.bytes() >= log::MAX_BYTES,
             // The pending log quota holds each entry until it is applied. Hold writers at
             // half of it, so a put fails on this quota only if it is very large.
-            self.raw.store().pending_half_full(
-                self.raw.raft.raft_log.unstable_entries(),
-                self.put_proposals.bytes(),
-            ),
+            byte_holds
+                && self.raw.store().pending_half_full(
+                    self.raw.raft.raft_log.unstable_entries(),
+                    self.put_proposals.bytes(),
+                ),
         ];
         for (count, hit) in self.backlog_rejects.iter_mut().zip(causes) {
             *count += u64::from(hit);
@@ -1135,7 +1155,8 @@ impl Node {
     }
 
     /// Propose a client write. Ordinary writes wait in a bounded FIFO while apply or log
-    /// I/O is behind. Membership changes still fail at once because their checks ran now.
+    /// I/O is behind. A membership change is proposed at once, so its checks stay current,
+    /// or it fails.
     fn propose(&mut self, command: RaftCommand, response: impl Into<ClientResponse>) -> Result<()> {
         let response = response.into();
         if self.raw.raft.state != StateRole::Leader {
@@ -1169,15 +1190,18 @@ impl Node {
             }
             return Ok(());
         };
-        if self.backlogged() {
+        if self.membership_backlogged() {
             response.error(self.error("state apply backlog is full"));
             return Ok(());
         }
-        if !self.admits_proposal(&data) {
+        change.context = data;
+        // Raft drops an entry that does not fit in its uncommitted limit.
+        if !self.admits_proposal(&change.context)
+            || self.raw.raft.uncommitted_size() + change.encoded_len() > MAX_UNCOMMITTED_BYTES
+        {
             response.error(self.error("pending log memory quota is full"));
             return Ok(());
         }
-        change.context = data;
         let proposed = self.raw.propose_conf_change(vec![], change);
         self.track_proposal(id, proposed, response);
         Ok(())
@@ -1398,7 +1422,7 @@ impl Node {
                 !is_leader
                     || p.term != self.raw.raft.term
                     || p.response.is_closed()
-                    || now.duration_since(p.started) > Duration::from_secs(5)
+                    || now.duration_since(p.started) > self.request_timeout
             })
             .map(|(id, _)| id.clone())
             .collect();
