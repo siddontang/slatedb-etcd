@@ -164,9 +164,12 @@ Rules and limits:
   the overlay above the base. The request fails after 10 s if the target does not lead.
 - A new writer, and each explicit publication request, announces the newest checkpoint again
   when no applied announcement or base covers it. A writer that stopped after a checkpoint and
-  before its announcement committed leaves such a checkpoint. A writer does not announce a
-  checkpoint again when the leader applied its announcement, or when its index is at or below
-  the leader's base. It also sends each checkpoint at most once.
+  before its announcement committed leaves such a checkpoint.
+- Raft can drop an announcement proposal, for example during a leader transfer. The writer then
+  announces the checkpoint again after a backoff from 100 ms to 2 s, also on an idle cluster. A
+  failed check of the checkpoint list is also tried again. After Raft takes a proposal, the
+  writer checks again after 2 s. A writer does not announce a checkpoint again when the leader
+  applied its announcement, or when its index is at or below the leader's base.
 - Each member truncates its log through the index of its base checkpoint. Its Raft snapshot names
   that checkpoint. A member that receives the snapshot opens the checkpoint and adopts it.
 - A restart opens the newest checkpoint. It adopts the checkpoint when the log ends below it.

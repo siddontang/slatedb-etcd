@@ -184,6 +184,8 @@ impl Writer {
             applied: Applied {
                 based: handles.based.clone(),
                 announced: handles.announced.clone(),
+                #[cfg(test)]
+                failures: Arc::default(),
             },
             opened: handles.opened.subscribe(),
             opened_slot: handles.opened.clone(),
@@ -564,6 +566,74 @@ struct Applied {
     based: tokio::sync::watch::Receiver<u64>,
     /// The checkpoint of the newest applied `ViewCheckpoint` entry.
     announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
+    /// Checks that fail before they read storage, for tests.
+    #[cfg(test)]
+    failures: Arc<std::sync::atomic::AtomicU32>,
+}
+
+/// The first wait before the publisher checks an announcement again.
+const RETRY_MIN: Duration = Duration::from_millis(100);
+/// The longest wait between two checks.
+const RETRY_MAX: Duration = Duration::from_secs(2);
+
+/// The check of announcements that the publisher sent. An announcement can be lost: the node
+/// can drop its proposal, for example during a leader transfer, or a writer can stop before it
+/// commits. A sent checkpoint counts only after applied state shows it. Until then, the
+/// publisher checks again with a backoff from `RETRY_MIN` to `RETRY_MAX`, also on an idle
+/// cluster.
+struct Retry {
+    /// The checkpoint that the publisher announced last.
+    awaiting: Option<uuid::Uuid>,
+    /// The time of the next check, if one is due.
+    at: Option<Instant>,
+    backoff: Duration,
+}
+
+impl Retry {
+    /// A writer checks for a stranded checkpoint at its open.
+    fn new() -> Self {
+        Self {
+            awaiting: None,
+            at: Some(Instant::now()),
+            backoff: RETRY_MIN,
+        }
+    }
+
+    /// Check at once, for an explicit request.
+    fn now(&mut self) {
+        self.at = Some(Instant::now());
+    }
+
+    fn due(&self) -> bool {
+        self.at.is_some_and(|at| at <= Instant::now())
+    }
+
+    /// Check again after the backoff, and double it.
+    fn again(&mut self) {
+        self.at = Some(Instant::now() + self.backoff);
+        self.backoff = (self.backoff * 2).min(RETRY_MAX);
+    }
+
+    /// The publisher sent checkpoint `id`. Raft took the proposal if `accepted`. An entry in
+    /// the leader's log commits in its term, so the next check waits `RETRY_MAX`. A dropped
+    /// proposal is sent again after the backoff, which grows while the same checkpoint waits.
+    fn sent(&mut self, id: uuid::Uuid, accepted: bool) {
+        if accepted {
+            self.at = Some(Instant::now() + RETRY_MAX);
+        } else {
+            if self.awaiting != Some(id) {
+                self.backoff = RETRY_MIN;
+            }
+            self.again();
+        }
+        self.awaiting = Some(id);
+    }
+
+    fn done(&mut self) {
+        self.awaiting = None;
+        self.at = None;
+        self.backoff = RETRY_MIN;
+    }
 }
 
 /// Find a stranded checkpoint: the newest view checkpoint, when no applied announcement covers
@@ -579,6 +649,18 @@ async fn stranded(
     source: &Source,
     applied: &Applied,
 ) -> Result<Option<uuid::Uuid>> {
+    #[cfg(test)]
+    if applied
+        .failures
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |left| left.checked_sub(1),
+        )
+        .is_ok()
+    {
+        anyhow::bail!("an injected storage error");
+    }
     let views = view_checkpoints(admin).await?;
     let Some((seq, checkpoint)) = views.last() else {
         return Ok(None);
@@ -630,25 +712,16 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
         // The first leader publishes the first checkpoint at once. It holds `etcd/members`.
         progress.request(1);
     }
-    // The newest checkpoint that this publisher sent. It does not send one twice.
-    let mut sent = None;
     // A writer that stopped before its announcement committed can leave a stranded
     // checkpoint. A new writer announces it, so the members do not wait for more writes.
-    if !reannounce(
-        &admin,
-        &source,
-        &applied,
-        &mut sent,
-        &mut bootstrapped,
-        &events,
-    )
-    .await?
-    {
-        return Ok(());
-    }
+    let mut retry = Retry::new();
     let mut status = db.subscribe();
     loop {
-        match progress.deadline(max_age) {
+        let deadline = [progress.deadline(max_age), retry.at]
+            .into_iter()
+            .flatten()
+            .min();
+        match deadline {
             Some(deadline) => tokio::select! {
                 _ = progress.wake.notified() => {}
                 _ = tokio::time::sleep_until(deadline.into()) => {}
@@ -667,12 +740,15 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
         let last = db.manifest().last_l0_seq();
         if last <= published {
             // A request with no new checkpoint can wait for a stranded one.
-            if requested
+            if requested {
+                retry.now();
+            }
+            if retry.due()
                 && !reannounce(
                     &admin,
                     &source,
                     &applied,
-                    &mut sent,
+                    &mut retry,
                     &mut bootstrapped,
                     &events,
                 )
@@ -705,14 +781,10 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
             source.mark_bootstrapped(checkpoint.id).await?;
             bootstrapped = true;
         }
-        if events
-            .send(Event::ViewCheckpoint(checkpoint.id))
-            .await
-            .is_err()
-        {
+        let Some(accepted) = announce(&events, checkpoint.id).await else {
             return Ok(());
-        }
-        sent = Some(checkpoint.id);
+        };
+        retry.sent(checkpoint.id, accepted);
         let views = view_checkpoints(&admin).await?.len();
         if let Some(gauge) = &retained {
             gauge.set(views as i64);
@@ -726,35 +798,57 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
     }
 }
 
-/// Announce a stranded checkpoint that this publisher did not send yet. Return false when the
-/// node no longer takes events.
+/// Check the last announcement, and announce a stranded checkpoint. Return false when the node
+/// no longer takes events.
+///
+/// A failed check keeps the retry due. A sent announcement stays due until applied state
+/// shows it, or until its base covers it.
 async fn reannounce(
     admin: &slatedb::admin::Admin,
     source: &Source,
     applied: &Applied,
-    sent: &mut Option<uuid::Uuid>,
+    retry: &mut Retry,
     bootstrapped: &mut bool,
     events: &mpsc::Sender<Event>,
 ) -> Result<bool> {
-    // The next request or writer checks again. A failed check does not stop the writer.
+    // The usual case reads no storage: the sent announcement applied.
+    if retry.awaiting.is_some() && *applied.announced.borrow() == retry.awaiting {
+        retry.done();
+        return Ok(true);
+    }
     let id = match stranded(admin, source, applied).await {
         Ok(Some(id)) => id,
-        Ok(None) => return Ok(true),
+        Ok(None) => {
+            retry.done();
+            return Ok(true);
+        }
         Err(error) => {
-            tracing::warn!(%error, "cannot check for a stranded view checkpoint");
+            tracing::warn!(%error, "cannot check for a stranded view checkpoint; retry");
+            retry.again();
             return Ok(true);
         }
     };
-    if *sent == Some(id) {
-        return Ok(true);
-    }
     tracing::info!(checkpoint = %id, "announce a stranded view checkpoint");
     if !*bootstrapped {
         source.mark_bootstrapped(id).await?;
         *bootstrapped = true;
     }
-    *sent = Some(id);
-    Ok(events.send(Event::ViewCheckpoint(id)).await.is_ok())
+    let Some(accepted) = announce(events, id).await else {
+        return Ok(false);
+    };
+    retry.sent(id, accepted);
+    Ok(true)
+}
+
+/// Send checkpoint `id` to the node for its announcement. Return whether Raft took the
+/// proposal, or `None` when the node no longer takes events.
+async fn announce(events: &mpsc::Sender<Event>, id: uuid::Uuid) -> Option<bool> {
+    let (reply, accepted) = tokio::sync::oneshot::channel();
+    events
+        .send(Event::ViewCheckpoint(id, Some(reply)))
+        .await
+        .ok()?;
+    Some(accepted.await.unwrap_or(false))
 }
 
 /// Bring Raft's voters and learners to `target` with single membership changes.
@@ -851,24 +945,32 @@ impl Node {
         }
     }
 
-    /// Propose a checkpoint that the publisher created. Only the leader announces.
-    pub(super) fn announce_view(&mut self, checkpoint: uuid::Uuid) -> Result<()> {
+    /// Propose a checkpoint that the publisher created. Only the leader announces. Return true
+    /// when Raft took the proposal.
+    pub(super) fn announce_view(&mut self, checkpoint: uuid::Uuid) -> Result<bool> {
         let Some(writer) = &mut self.writer else {
-            return Ok(());
+            return Ok(false);
         };
         if self.raw.raft.state != StateRole::Leader {
-            return Ok(());
+            return Ok(false);
         }
         let data = RaftCommand::ViewCheckpoint {
             id: uuid::Uuid::new_v4().to_string(),
             checkpoint: checkpoint.to_string(),
         }
         .encode()?;
-        // The entry frees memory, so it bypasses the client admission limits.
-        if self.raw.propose(vec![], data).is_ok() {
-            writer.announced += 1;
+        // The entry frees memory, so it bypasses the client admission limits. Raft can drop the
+        // proposal, for example during a leader transfer. The publisher then announces again.
+        match self.raw.propose(vec![], data) {
+            Ok(()) => {
+                writer.announced += 1;
+                Ok(true)
+            }
+            Err(error) => {
+                tracing::info!(%error, %checkpoint, "a view checkpoint proposal was dropped");
+                Ok(false)
+            }
         }
-        Ok(())
     }
 
     /// The checkpoints that this member pins: live bases, received snapshots, and the
@@ -1228,7 +1330,7 @@ impl Node {
     /// Propose the pending checkpoint. Only the leader proposes.
     pub(super) fn dst_announce(&mut self, dst: &mut DstWriter) -> Result<()> {
         match dst.pending.take() {
-            Some(id) => self.announce_view(id),
+            Some(id) => self.announce_view(id).map(drop),
             None => Ok(()),
         }
     }
@@ -1725,7 +1827,10 @@ mod tests {
         // A checkpoint above the fence appears. The writer task did not stop the member.
         let covered = tokio::time::timeout(Duration::from_secs(20), async {
             while let Some(event) = announced.recv().await {
-                if let Event::ViewCheckpoint(id) = event {
+                if let Event::ViewCheckpoint(id, reply) = event {
+                    if let Some(reply) = reply {
+                        let _ = reply.send(true);
+                    }
                     let base = handles.source.open_base(id).await.unwrap();
                     if base.applied >= 2 {
                         return base;
@@ -1755,12 +1860,46 @@ mod tests {
         state.close().await.unwrap();
     }
 
-    /// A writer creates the first checkpoint and stops before its announcement reaches Raft.
-    /// With no more writes, the next writer announces it. The base
-    /// advances and a physical compaction waiter ends. The adopted checkpoint causes no further
-    /// announcement, also from a later writer.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_new_writer_announces_a_stranded_checkpoint() {
+    /// The announcement events of a publisher. The test answers for the node.
+    struct Announcements(mpsc::Receiver<Event>);
+
+    impl Announcements {
+        /// Wait for the next announcement and reply whether Raft took it.
+        async fn next(&mut self, wait: Duration, accepted: bool) -> uuid::Uuid {
+            tokio::time::timeout(wait, async {
+                loop {
+                    if let Some(Event::ViewCheckpoint(id, reply)) = self.0.recv().await {
+                        if let Some(reply) = reply {
+                            let _ = reply.send(accepted);
+                        }
+                        return id;
+                    }
+                }
+            })
+            .await
+            .expect("an announcement")
+        }
+
+        /// Wait `wait` and fail on any announcement in it.
+        async fn none(&mut self, wait: Duration) {
+            let next = tokio::time::timeout(wait, self.0.recv()).await;
+            assert!(
+                !matches!(next, Ok(Some(Event::ViewCheckpoint(..)))),
+                "an unexpected announcement"
+            );
+        }
+    }
+
+    /// Open a one-voter shared state. A first writer publishes a checkpoint at index 1, and its
+    /// announcement never reaches Raft. Return the state, its handles, the event sender, the
+    /// announcements, and the stranded checkpoint.
+    async fn stranded_checkpoint() -> (
+        StateMachine,
+        Handles,
+        mpsc::Sender<Event>,
+        Announcements,
+        uuid::Uuid,
+    ) {
         let options = crate::state::shared::Options {
             quota: 0,
             voters: vec![1],
@@ -1783,40 +1922,42 @@ mod tests {
         ));
         state.apply(1, None).await.unwrap();
         let handles = state.shared_handles().unwrap();
-        let (events, mut received) = mpsc::channel(64);
-        let max_age = Duration::from_millis(50);
-        let clock = Clock::system(Duration::from_secs(5), None);
-        async fn announcement(received: &mut mpsc::Receiver<Event>, wait: Duration) -> uuid::Uuid {
-            tokio::time::timeout(wait, async {
-                loop {
-                    if let Some(Event::ViewCheckpoint(id)) = received.recv().await {
-                        return id;
-                    }
-                }
-            })
-            .await
-            .expect("an announcement")
-        }
-        // The first writer publishes a checkpoint at index 1. Its announcement is lost.
-        let mut first = Writer::new(&handles, max_age, clock.clone());
+        let (events, received) = mpsc::channel(64);
+        let mut announcements = Announcements(received);
+        let mut first = Writer::new(&handles, STRANDED_AGE, clock());
         first.sync(true, 2, &events);
-        let lost = announcement(&mut received, Duration::from_secs(20)).await;
+        let lost = announcements.next(Duration::from_secs(20), true).await;
         first.sync(false, 2, &events);
         first.stop().await;
+        (state, handles, events, announcements, lost)
+    }
+
+    const STRANDED_AGE: Duration = Duration::from_millis(50);
+
+    fn clock() -> Clock {
+        Clock::system(Duration::from_secs(5), None)
+    }
+
+    /// The next writer has no writes. It announces the stranded checkpoint, and Raft drops the
+    /// proposal, as during a leader transfer. On the idle cluster the publisher announces it
+    /// again within the backoff limit. The base advances and a physical compaction waiter ends.
+    /// The adopted checkpoint causes no further announcement, also from a later writer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_new_writer_announces_a_stranded_checkpoint() {
+        let (mut state, handles, events, mut announcements, lost) = stranded_checkpoint().await;
         // A physical compaction waits for a base that covers index 1.
         let mut based = handles.based.clone();
         assert_eq!(*based.borrow(), 0);
         let waiter = tokio::spawn(async move { based.wait_for(|base| *base >= 1).await.is_ok() });
-        // The next writer has nothing to write. Its open, or at the latest the request through
-        // index 1, announces the stranded checkpoint.
-        let mut second = Writer::new(&handles, max_age, clock.clone());
+        let mut second = Writer::new(&handles, STRANDED_AGE, clock());
         second.sync(true, 3, &events);
-        second.progress.wait_written(1).await.unwrap();
-        second.request_publication(1);
         assert_eq!(
-            announcement(&mut received, Duration::from_secs(2)).await,
+            announcements.next(Duration::from_secs(2), false).await,
             lost
         );
+        // No write and no request follows. The retry timer sends it again.
+        let limit = RETRY_MAX + Duration::from_millis(500);
+        assert_eq!(announcements.next(limit, true).await, lost);
         state
             .apply_view_checkpoint(2, &lost.to_string())
             .await
@@ -1827,26 +1968,40 @@ mod tests {
             .await
             .unwrap()
             .unwrap());
-        // Requests over several flush ages do not announce the adopted checkpoint again.
+        // Requests and retries over several flush ages do not announce it again.
         for _ in 0..4 {
             second.request_publication(1);
-            tokio::time::sleep(max_age).await;
+            announcements.none(STRANDED_AGE).await;
         }
-        assert!(received.try_recv().is_err());
+        announcements.none(limit).await;
         second.sync(false, 3, &events);
         second.stop().await;
         // A later writer does not announce it either.
-        let mut third = Writer::new(&handles, max_age, clock);
+        let mut third = Writer::new(&handles, STRANDED_AGE, clock());
         third.sync(true, 4, &events);
         third.progress.wait_written(1).await.unwrap();
-        for _ in 0..4 {
-            third.request_publication(1);
-            tokio::time::sleep(max_age).await;
-        }
-        assert!(received.try_recv().is_err());
+        third.request_publication(1);
+        announcements.none(limit).await;
         assert!(third.tasks.try_join_next().is_none());
         third.sync(false, 4, &events);
         third.stop().await;
+        state.close().await.unwrap();
+    }
+
+    /// A storage error in the stranded check does not drop it. The publisher checks again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_stranded_check_is_retried() {
+        let (state, handles, events, mut announcements, lost) = stranded_checkpoint().await;
+        let mut second = Writer::new(&handles, STRANDED_AGE, clock());
+        let failures = second.applied.failures.clone();
+        failures.store(3, std::sync::atomic::Ordering::Relaxed);
+        second.sync(true, 3, &events);
+        let limit = RETRY_MAX + Duration::from_secs(1);
+        assert_eq!(announcements.next(limit, true).await, lost);
+        assert_eq!(failures.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(second.tasks.try_join_next().is_none());
+        second.sync(false, 3, &events);
+        second.stop().await;
         state.close().await.unwrap();
     }
 
