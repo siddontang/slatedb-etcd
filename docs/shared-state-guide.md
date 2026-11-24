@@ -146,6 +146,9 @@ Defragment flushes the writer and compacts every SST into one sorted run. The le
 publishes a new checkpoint, also at an unchanged index, and announces it. Each member switches
 its base to the newer checkpoint at the same index, so it reads the compacted run without a
 further write. Old checkpoints keep their SSTs until retention or a manual cleanup deletes them.
+The call returns after the leader applied the announcement of that checkpoint. If the leader
+changes first, the call fails with a retryable `Unavailable` error. Run it again on the new
+leader.
 
 A manual checkpoint keeps its commit index. When apply reaches that index, the leader requests a
 publication that covers it. A follower sends the request to the leader in its view report, and

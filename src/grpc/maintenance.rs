@@ -26,6 +26,12 @@ impl Service {
         if !matches!(command, Command::Status) {
             self.local_barrier().await?;
         }
+        // A shared-mode Defragment waits for its compacted checkpoint.
+        let limit = Duration::from_secs(if matches!(command, Command::Defragment) {
+            60
+        } else {
+            10
+        });
         let (tx, rx) = oneshot::channel();
         self.events
             .send(Event::Authenticated(
@@ -34,7 +40,7 @@ impl Service {
             ))
             .await
             .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?;
-        let value = tokio::time::timeout(Duration::from_secs(10), rx)
+        let value = tokio::time::timeout(limit, rx)
             .await
             .map_err(|_| Status::deadline_exceeded("etcdserver: maintenance timed out"))?
             .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?;

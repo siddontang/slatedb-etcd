@@ -27,6 +27,8 @@ pub(super) struct Progress {
     /// The sequence of the newest batch in the shared `Db`.
     written: tokio::sync::watch::Sender<u64>,
     wake: tokio::sync::Notify,
+    /// The newest checkpoint that the publisher created. Defragment waits for one.
+    published: tokio::sync::watch::Sender<Option<uuid::Uuid>>,
 }
 
 #[derive(Default)]
@@ -45,6 +47,7 @@ impl Progress {
             inner: Mutex::default(),
             written: tokio::sync::watch::channel(written).0,
             wake: tokio::sync::Notify::new(),
+            published: tokio::sync::watch::channel(None).0,
         }
     }
 
@@ -705,6 +708,97 @@ struct Publisher {
     applied: Applied,
 }
 
+/// One Defragment on the leader writer.
+pub(super) struct Defragment {
+    db: Arc<slatedb::Db>,
+    admin: Arc<slatedb::admin::Admin>,
+    progress: Arc<Progress>,
+    /// The newest applied announcement on this member.
+    announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
+    leadership: tokio::sync::watch::Receiver<(bool, u64)>,
+    term: u64,
+    /// A test pause after the compaction: (reached, resume).
+    pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+}
+
+/// The longest time that a Defragment waits for its compacted checkpoint.
+const DEFRAGMENT_WAIT: Duration = Duration::from_secs(20);
+
+impl Defragment {
+    /// Flush, compact every SST into one sorted run, and wait until a checkpoint with that
+    /// layout is published and this member applied its announcement. Members then adopt it.
+    ///
+    /// A leader change before that returns a retryable error. The new leader can then run the
+    /// Defragment again: its compaction is short, and it publishes the compacted checkpoint.
+    pub(super) async fn run(mut self) -> std::result::Result<(), KvError> {
+        let lost = || {
+            KvError::new(
+                tonic::Code::Unavailable,
+                "etcdserver: the leader changed during Defragment; retry",
+            )
+        };
+        self.db
+            .flush()
+            .await
+            .map_err(|error| KvError::storage(anyhow::Error::from(error)))?;
+        crate::state::maintenance::compact_all(&self.admin)
+            .await
+            .map_err(KvError::storage)?;
+        if let Some((reached, resume)) = self.pause.take() {
+            reached.notify_one();
+            resume.notified().await;
+        }
+        let term = self.term;
+        let leads = |leadership: &tokio::sync::watch::Receiver<(bool, u64)>| {
+            *leadership.borrow() == (true, term)
+        };
+        if !leads(&self.leadership) {
+            return Err(lost());
+        }
+        let mut published = self.progress.published.subscribe();
+        published.mark_unchanged();
+        // The next checkpoint, also at the same index, reads the compacted layout.
+        self.progress.republish();
+        let deadline = tokio::time::Instant::now() + DEFRAGMENT_WAIT;
+        let timeout = || {
+            KvError::new(
+                tonic::Code::Unavailable,
+                "etcdserver: Defragment did not publish its checkpoint in time; retry",
+            )
+        };
+        let checkpoint = loop {
+            tokio::select! {
+                changed = published.changed() => {
+                    changed.map_err(|_| lost())?;
+                    if let Some(id) = *published.borrow_and_update() {
+                        break id;
+                    }
+                }
+                changed = self.leadership.changed() => {
+                    if changed.is_err() || !leads(&self.leadership) {
+                        return Err(lost());
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => return Err(timeout()),
+            }
+        };
+        loop {
+            if *self.announced.borrow_and_update() == Some(checkpoint) {
+                return Ok(());
+            }
+            tokio::select! {
+                changed = self.announced.changed() => changed.map_err(|_| lost())?,
+                changed = self.leadership.changed() => {
+                    if changed.is_err() || !leads(&self.leadership) {
+                        return Err(lost());
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => return Err(timeout()),
+            }
+        }
+    }
+}
+
 /// The applied state that a publisher checks before it announces a checkpoint again.
 #[derive(Clone)]
 struct Applied {
@@ -933,6 +1027,7 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
             return Ok(());
         };
         retry.sent(checkpoint.id, accepted);
+        progress.published.send_replace(Some(checkpoint.id));
         let views = view_checkpoints(&admin).await?.len();
         if let Some(gauge) = &retained {
             gauge.set(views as i64);
@@ -1127,29 +1222,26 @@ impl Node {
             let _ = response.send(Err(self.error("the shared writer is not open yet")));
             return Ok(());
         };
-        let admin = writer.admin.clone();
-        let progress = writer.progress.clone();
+        let defragment = Defragment {
+            db,
+            admin: writer.admin.clone(),
+            progress: writer.progress.clone(),
+            announced: writer.applied.announced.clone(),
+            leadership: writer.leadership.subscribe(),
+            term: self.raw.raft.term,
+            pause: None,
+        };
         let mut header = ResponseHeader {
             revision: self.state.revision,
             ..Default::default()
         };
         self.fill_header(Some(&mut header));
         tokio::spawn(async move {
-            let result = async {
-                db.flush().await?;
-                crate::state::maintenance::compact_all(&admin).await?;
-                // The next checkpoint, also at the same index, reads the compacted layout.
-                progress.republish();
-                anyhow::Ok(())
-            }
-            .await;
-            let outcome = match result {
+            let outcome = match defragment.run().await {
                 Ok(()) => Outcome {
                     result: Ok(json!({ "header": header })),
                 },
-                Err(error) => Outcome {
-                    result: Err(KvError::storage(error)),
-                },
+                Err(error) => Outcome { result: Err(error) },
             };
             if let Ok(value) = serde_json::to_value(outcome) {
                 let _ = response.send(Ok(value));
@@ -2750,6 +2842,94 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(3));
         assert_eq!(handles.source.open_base(id).await.unwrap().applied, applied);
         writer.sync(false, 3, &events);
+        writer.stop().await;
+        state.close().await.unwrap();
+    }
+
+    /// The leader changes after the Defragment compaction and before the republish. The call
+    /// returns a retryable error. A retry on the new leader publishes the compacted checkpoint,
+    /// returns after its announcement applies, and the base then has one run and no L0 SST.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_defragment_that_loses_the_lead_returns_a_retryable_error() {
+        let (mut state, handles, events, mut announcements, first) = stranded_checkpoint().await;
+        adopt_announced(&mut state, first).await;
+        let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+        writer.sync(true, 3, &events);
+        writer.progress.wait_written(1).await.unwrap();
+        for n in 0..5 {
+            let put = crate::proto::etcdserverpb::RequestOp {
+                request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
+                    crate::proto::etcdserverpb::PutRequest {
+                        key: format!("key-{n}").into_bytes(),
+                        value: b"value".to_vec(),
+                        ..Default::default()
+                    },
+                )),
+            };
+            let index = state.applied + 1;
+            state.apply_etcd(index, &put).await.unwrap();
+        }
+        // The aged flush publishes a checkpoint with an L0 SST. The members adopt it.
+        let id = announcements.next(Duration::from_secs(10), true).await;
+        adopt_announced(&mut state, id).await;
+        let db = writer.open.lock().unwrap().clone().unwrap();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let defragment = Defragment {
+            db,
+            admin: handles.admin.clone(),
+            progress: writer.progress.clone(),
+            announced: handles.announced.clone(),
+            leadership: writer.leadership.subscribe(),
+            term: 3,
+            pause: Some((reached.clone(), resume.clone())),
+        };
+        let running = tokio::spawn(defragment.run());
+        reached.notified().await;
+        writer.sync(false, 3, &events);
+        writer.stop().await;
+        resume.notify_one();
+        let error = running.await.unwrap().unwrap_err();
+        assert_eq!(error.code, tonic::Code::Unavailable as i32, "{error:?}");
+        // The retry on the next leader.
+        let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+        writer.sync(true, 4, &events);
+        let db = loop {
+            if let Some(db) = writer.open.lock().unwrap().clone() {
+                break db;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let defragment = Defragment {
+            db,
+            admin: handles.admin.clone(),
+            progress: writer.progress.clone(),
+            announced: handles.announced.clone(),
+            leadership: writer.leadership.subscribe(),
+            term: 4,
+            pause: None,
+        };
+        let running = tokio::spawn(defragment.run());
+        let compacted = announcements.next(Duration::from_secs(20), true).await;
+        adopt_announced(&mut state, compacted).await;
+        running.await.unwrap().unwrap();
+        let checkpoint = handles
+            .admin
+            .list_checkpoints(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|checkpoint| Some(checkpoint.id) == state.base_checkpoint())
+            .unwrap();
+        let manifest = handles
+            .admin
+            .read_manifest(Some(checkpoint.manifest_id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(manifest.l0().is_empty());
+        assert_eq!(manifest.compacted().len(), 1);
+        writer.sync(false, 4, &events);
         writer.stop().await;
         state.close().await.unwrap();
     }
