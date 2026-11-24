@@ -1001,8 +1001,8 @@ fn restore_source(store: Arc<dyn ObjectStore>) -> (Arc<shared::Source>, slatedb:
     (source, admin)
 }
 
-/// The restore claim names the snapshot. The same snapshot restores again with success. Another
-/// snapshot fails, and so does a shared state that a normal start created.
+/// The bootstrap claim names the snapshot. The same snapshot restores again with success. Another
+/// snapshot fails, and so does a shared state that an older ordinary start created.
 #[tokio::test]
 async fn a_restore_claim_names_its_snapshot() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1012,7 +1012,10 @@ async fn a_restore_claim_names_its_snapshot() {
     let error = shared::seed(&source, &admin, &restore("b"))
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("another snapshot"), "{error:#}");
+    assert!(
+        error.to_string().contains("new cluster prefix"),
+        "{error:#}"
+    );
     let (id, _) = shared::view_checkpoints(&admin)
         .await
         .unwrap()
@@ -1029,7 +1032,10 @@ async fn a_restore_claim_names_its_snapshot() {
     let error = shared::seed(&source, &admin, &restore("a"))
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("delete shared/"), "{error:#}");
+    assert!(
+        error.to_string().contains("new cluster prefix"),
+        "{error:#}"
+    );
 }
 
 /// A restore stopped after its rows reached the shared database and before its checkpoint and
@@ -1056,9 +1062,12 @@ async fn a_restore_completes_after_a_failure_before_its_marker() {
         base.get(b"etcd/restored").await.unwrap().as_deref(),
         Some(b"a".as_slice())
     );
-    // Another snapshot cannot take over the partial state of this one.
+    // Another snapshot cannot take over the state of this one.
     let error = shared::seed(&source, &admin, &restore("b"))
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("another snapshot"), "{error:#}");
+    assert!(
+        error.to_string().contains("new cluster prefix"),
+        "{error:#}"
+    );
 }

@@ -101,6 +101,8 @@ pub enum Event {
     ViewAck {
         member: u64,
         checkpoints: std::collections::HashSet<uuid::Uuid>,
+        /// A manual checkpoint on the member asks for a publication through this index.
+        publish: Option<u64>,
     },
 }
 
@@ -1032,11 +1034,13 @@ impl Node {
                     let _ = response.send(Err(self.error("too many checkpoint requests")));
                 } else {
                     let committed = self.raw.raft.raft_log.committed;
-                    // Shared mode: the leader publishes a checkpoint through the commit index.
-                    // A follower waits for the base that the leader publishes next.
+                    // Shared mode: the leader publishes a checkpoint through the commit index. A
+                    // follower asks the leader for that publication.
                     if let Some(writer) = &self.writer {
                         if self.raw.raft.state == StateRole::Leader {
                             writer.request_publication(committed);
+                        } else {
+                            self.send_view_ack(Some(committed));
                         }
                     }
                     self.checkpoint_waiters.push((committed, response));
@@ -1053,7 +1057,8 @@ impl Node {
             Event::ViewAck {
                 member,
                 checkpoints,
-            } => self.view_ack(member, checkpoints),
+                publish,
+            } => self.view_ack(member, checkpoints, publish),
             Event::SnapshotDelay(delay_ms, response) => {
                 self.snapshot_delay_ms = delay_ms.min(5000);
                 let _ = response.send(Ok(self.status()?));

@@ -29,7 +29,7 @@ new clusters. A stopped replicated S3 cluster can be converted offline. See
     mode.json                  the cluster mode, written before any state
     shared/owner.json          the cluster claim: mode, quota, and the initial voters
     shared/bootstrap.json      written once after the first checkpoint
-    shared/restore.json        the snapshot of a --restore-snapshot start
+    shared/bootstrap-op.json   the one bootstrap operation: empty, or a snapshot restore
     shared/conversion.json     the plan of an offline conversion
     shared/state/              the one SlateDB: manifest/, compacted/, checkpoints
     member-<id>/binding.json   the member identity and mode. It holds no state.
@@ -66,8 +66,10 @@ An S3 policy has these statements. `<cluster>` is the cluster prefix. A unit tes
 | Voter | `s3:PutObject` | `<cluster>/mode.json`, for the first start |
 | Learner | `s3:GetObject` | `<cluster>/shared/*` |
 
-The offline converter also needs `s3:GetObject` and `s3:DeleteObject` on
-`<cluster>/member-*/*`, because it reads the replicated states and retires owner claims.
+The offline converter also needs `s3:GetObject`, `s3:PutObject`, and `s3:DeleteObject` on
+`<cluster>/member-*/*`. It reads the replicated states, creates and deletes detached checkpoints
+in their manifests, writes bindings, and retires owner claims. The converter test checks these
+keys.
 
 ## Checkpoints and retention
 
@@ -146,23 +148,29 @@ its base to the newer checkpoint at the same index, so it reads the compacted ru
 further write. Old checkpoints keep their SSTs until retention or a manual cleanup deletes them.
 
 A manual checkpoint keeps its commit index. When apply reaches that index, the leader requests a
-publication that covers it. A follower waits for that publication, or for the next one after
-`--view-max-age`.
+publication that covers it. A follower sends the request to the leader in its view report, and
+repeats it while it waits. The request also survives a leader change before the new writer
+opens.
 
-To restore a native snapshot, start each member of the new cluster with
-`--restore-snapshot <file>`, `--state-mode shared`, and an empty data directory.
+To restore a native snapshot, use a new cluster prefix and empty member directories. Start each
+member with `--restore-snapshot <file>` and `--state-mode shared`.
 
-1. A member claims `shared/restore.json` with the snapshot checksum before its first write.
+1. Before any writer opens, a member claims the one bootstrap operation,
+   `shared/bootstrap-op.json`, as a restore with the snapshot checksum.
 2. It writes the rows into the shared database at index 1, publishes the first checkpoint, and
-   writes the bootstrap marker.
+   writes the bootstrap marker with the checksum.
 3. Another member with the same snapshot finds the claim and completes or skips the same steps.
    This also completes a restore that failed between its first write and the marker.
-4. A member with another snapshot fails. A shared state without a restore claim also fails: a
-   normal start or an unknown write created it.
+4. A member without the restore flag waits while a restore is pending. Then it adopts the
+   restored checkpoint. An ordinary first leader claims the operation as an empty bootstrap.
+5. A restore into a cluster that an ordinary start or another snapshot created fails. Use a new
+   cluster prefix.
 
-To start a failed restore again, stop all members and delete `shared/` under the cluster prefix.
-A member that does not use the flag also works: it adopts the first checkpoint. The native
-backup limit is 64 MiB.
+A restore that keeps failing logs the error and names the snapshot. Only for that case: check
+that `shared/bootstrap-op.json` names your snapshot, that `shared/bootstrap.json` is missing,
+and that no member process runs. Then delete `shared/` under the cluster prefix and start the
+restore again. Never delete `shared/` of a cluster that has a bootstrap marker: it holds the
+state of all members. The native backup limit is 64 MiB.
 
 ## Convert a replicated cluster
 

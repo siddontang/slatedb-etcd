@@ -212,6 +212,13 @@ impl Conversion {
         storage: &crate::storage::RaftStorage,
         voters: Vec<u64>,
     ) -> Result<Plan> {
+        // The plan keeps the bootstrap voters for the restart checks. A member that joined later
+        // has none in its log identity.
+        ensure!(
+            !voters.is_empty(),
+            "member {} joined after the bootstrap; run the first conversion on a bootstrap voter",
+            self.id
+        );
         let namespaces = replicated_members(store.as_ref(), root).await?;
         ensure!(
             !namespaces.is_empty(),
@@ -424,10 +431,15 @@ pub fn member_record(dir: &std::path::Path) -> Result<serde_json::Value> {
     }))
 }
 
-/// The term of `index` in a local log: its snapshot record or an entry.
-fn local_term(storage: &crate::storage::RaftStorage, index: u64) -> Option<u64> {
+/// The term of `index` in a local log, only with committed evidence: the snapshot record at
+/// `index`, or an entry at `index` at or below the durable commit index. An uncommitted suffix
+/// can differ from the committed entry.
+pub(crate) fn local_term(storage: &crate::storage::RaftStorage, index: u64) -> Option<u64> {
     if storage.snapshot_index() == index {
         return Some(storage.recovery_snapshot().get_metadata().term);
+    }
+    if storage.commit_index() < index {
+        return None;
     }
     storage.term(index).ok().filter(|term| *term != 0)
 }
@@ -539,15 +551,28 @@ mod tests {
         }
     }
 
-    async fn addresses() -> std::collections::BTreeMap<u64, String> {
-        let mut peers = std::collections::BTreeMap::new();
-        let mut reserved = vec![];
-        for id in 1..=3 {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            peers.insert(id, listener.local_addr().unwrap().to_string());
-            reserved.push(listener);
+    /// A free local port below the Linux ephemeral range, never given out twice in this process.
+    /// A port 0 listener returns its port to the pool, and a parallel test can take it.
+    fn port() -> String {
+        use std::sync::atomic::{AtomicU16, Ordering};
+        static NEXT: AtomicU16 = AtomicU16::new(0);
+        let _ = NEXT.compare_exchange(
+            0,
+            21_000 + (std::process::id() % 1_000) as u16 * 10,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        loop {
+            let port = NEXT.fetch_add(1, Ordering::Relaxed);
+            assert!(port < 32_000, "no free test port");
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                return format!("127.0.0.1:{port}");
+            }
         }
-        peers
+    }
+
+    async fn addresses() -> std::collections::BTreeMap<u64, String> {
+        (1..=3).map(|id| (id, port())).collect()
     }
 
     fn config(
@@ -708,7 +733,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn a_stopped_replicated_cluster_converts_to_shared_mode() {
         let dir = tempfile::tempdir().unwrap();
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let faults = Arc::new(crate::object::faults::FaultStore::new(Arc::new(
+            InMemory::new(),
+        )));
+        let store: Arc<dyn ObjectStore> = faults.clone();
         let peers = addresses().await;
         let servers = start(&replicated(dir.path(), &peers, &store)).await;
         let revision = write(&servers, 50).await;
@@ -721,6 +749,7 @@ mod tests {
         let shared: Vec<_> = (1..=3)
             .map(|id| config(dir.path(), id, &peers, &store, StateMode::Shared))
             .collect();
+        faults.written.lock().unwrap().clear();
         let mut first = conversion(dir.path(), &store, 1);
         first.hide_term = true;
         let first = first.run().await.unwrap();
@@ -738,6 +767,22 @@ mod tests {
                 (first.index, first.term, false)
             );
         }
+        // The converter writes the shared keys, the mode claim, and member keys: bindings, and
+        // the manifests of the detached checkpoints in the replicated member states.
+        let root = format!("{}/", s3().cluster_prefix("slatedb-raft-poc"));
+        let written: Vec<_> = std::mem::take(&mut *faults.written.lock().unwrap())
+            .into_iter()
+            .map(|key| key.strip_prefix(&root).unwrap().to_owned())
+            .collect();
+        assert!(
+            written.iter().all(|key| key.starts_with("shared/")
+                || key == "mode.json"
+                || key.starts_with("member-")),
+            "{written:?}"
+        );
+        assert!(written
+            .iter()
+            .any(|key| key.starts_with("member-") && key.contains("/manifest/")));
         let servers = start(&shared).await;
         assert_eq!(hashes(&servers, revision).await, before);
         let revision = write(&servers, 1).await;
@@ -788,6 +833,88 @@ mod tests {
         let shared: Vec<_> = (1..=3)
             .map(|id| config(dir.path(), id, &peers, &store, StateMode::Shared))
             .collect();
+        let servers = start(&shared).await;
+        assert_eq!(hashes(&servers, revision).await, before);
+        for server in servers {
+            server.shutdown().await.unwrap();
+        }
+    }
+
+    /// A legacy state has no term. Only a log with committed evidence at the index supplies it:
+    /// an entry at or below the durable commit index, or the snapshot record there.
+    #[test]
+    fn a_term_needs_committed_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage =
+            crate::storage::RaftStorage::open(dir.path(), 1, "cluster", vec![1]).unwrap();
+        let entry = raft::eraftpb::Entry {
+            index: 1,
+            term: 2,
+            ..Default::default()
+        };
+        storage
+            .persist(
+                &[entry],
+                Some(&raft::eraftpb::HardState {
+                    term: 2,
+                    commit: 0,
+                    ..Default::default()
+                }),
+                None,
+            )
+            .unwrap();
+        assert_eq!(local_term(&storage, 1), None);
+        storage.persist_commit(1).unwrap();
+        assert_eq!(local_term(&storage, 1), Some(2));
+        assert_eq!(local_term(&storage, 2), None);
+    }
+
+    /// A learner joined after the bootstrap. Its log identity holds no bootstrap voters, so it
+    /// cannot plan the conversion, and its refusal changes no claim. A bootstrap voter plans it.
+    /// The learner then converts with that plan, and all four members start with their flags.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn a_learner_converts_only_after_a_bootstrap_voter_planned() {
+        use crate::proto::etcdserverpb::{cluster_client::ClusterClient, MemberAddRequest};
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let peers = addresses().await;
+        let configs = replicated(dir.path(), &peers, &store);
+        let mut servers = start(&configs).await;
+        write(&servers, 20).await;
+        let address = port();
+        let lead = leader(&servers).await;
+        let id = ClusterClient::new(client(&servers[lead]).await)
+            .member_add(MemberAddRequest {
+                peer_ur_ls: vec![format!("http://{address}")],
+                is_learner: true,
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .member
+            .unwrap()
+            .id;
+        let mut joined = peers.clone();
+        joined.insert(id, address);
+        let mut learner = config(dir.path(), id, &joined, &store, StateMode::Replicated);
+        learner.join = true;
+        servers.push(Server::start(learner.clone()).await.unwrap());
+        let revision = write(&servers[..3], 10).await;
+        let before = hashes(&servers, revision).await;
+        for server in servers {
+            server.shutdown().await.unwrap();
+        }
+        let error = conversion(dir.path(), &store, id).run().await.unwrap_err();
+        assert!(error.to_string().contains("bootstrap voter"), "{error:#}");
+        assert_eq!(mode(&store).await, "replicated");
+        for member in [1, 2, 3, id] {
+            conversion(dir.path(), &store, member).run().await.unwrap();
+        }
+        let mut shared: Vec<_> = (1..=3)
+            .map(|id| config(dir.path(), id, &peers, &store, StateMode::Shared))
+            .collect();
+        learner.state_mode = StateMode::Shared;
+        shared.push(learner);
         let servers = start(&shared).await;
         assert_eq!(hashes(&servers, revision).await, before);
         for server in servers {

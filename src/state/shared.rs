@@ -409,7 +409,31 @@ impl Source {
 
     /// Record that a checkpoint exists. A member never starts from an empty base after this.
     pub async fn mark_bootstrapped(&self, checkpoint: uuid::Uuid) -> Result<()> {
-        let data = serde_json::to_vec(&serde_json::json!({ "first_checkpoint": checkpoint }))?;
+        self.mark_bootstrapped_with(checkpoint, None).await
+    }
+
+    /// The checksum of the snapshot that the bootstrap marker records, if a restore wrote it.
+    pub(crate) async fn restored_snapshot(&self) -> Result<Option<String>> {
+        let data = self
+            .store
+            .get(&Path::from(join(&self.root, BOOTSTRAP)))
+            .await?
+            .bytes()
+            .await?;
+        let marker: serde_json::Value = serde_json::from_slice(&data)?;
+        Ok(marker["restore"].as_str().map(str::to_owned))
+    }
+
+    /// Write the bootstrap marker. A restore records its snapshot checksum in it.
+    pub(crate) async fn mark_bootstrapped_with(
+        &self,
+        checkpoint: uuid::Uuid,
+        restore: Option<&str>,
+    ) -> Result<()> {
+        let data = serde_json::to_vec(&serde_json::json!({
+            "first_checkpoint": checkpoint,
+            "restore": restore,
+        }))?;
         match self
             .store
             .put_opts(
@@ -745,75 +769,89 @@ impl std::fmt::Debug for Restore {
     }
 }
 
-/// The restore claim. It names the snapshot that seeds the shared state.
-const RESTORE: &str = "shared/restore.json";
+/// The one bootstrap operation of a shared cluster. Ordinary startup and a snapshot restore
+/// claim it with a create-only put before any writer opens, so only one of them bootstraps.
+const BOOTSTRAP_OP: &str = "shared/bootstrap-op.json";
 
-/// Read the snapshot ID of the restore claim.
-async fn restored(source: &Source) -> Result<Option<String>> {
+/// The bootstrap operation of a shared cluster.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum BootstrapOp {
+    /// The first leader starts from an empty state.
+    Empty,
+    /// A member restores the snapshot with this checksum at index 1.
+    Restore { snapshot: String },
+}
+
+async fn bootstrap_op(source: &Source) -> Result<Option<BootstrapOp>> {
     match source
         .store
-        .get(&Path::from(join(&source.root, RESTORE)))
+        .get(&Path::from(join(&source.root, BOOTSTRAP_OP)))
         .await
     {
-        Ok(result) => {
-            let claim: serde_json::Value = serde_json::from_slice(&result.bytes().await?)?;
-            Ok(claim["snapshot"].as_str().map(str::to_owned))
-        }
+        Ok(result) => Ok(Some(
+            serde_json::from_slice(&result.bytes().await?).context("invalid bootstrap claim")?,
+        )),
         Err(slatedb::object_store::Error::NotFound { .. }) => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
 
-/// Claim the restore of snapshot `id` before the first write. A claim for another snapshot
-/// fails.
-async fn claim_restore(source: &Source, id: &str) -> Result<()> {
-    let data = serde_json::to_vec(&serde_json::json!({ "version": 1, "snapshot": id }))?;
-    let path = Path::from(join(&source.root, RESTORE));
+/// Claim `op` as the bootstrap operation, or return the operation that another member claimed.
+pub(crate) async fn claim_bootstrap(source: &Source, op: &BootstrapOp) -> Result<BootstrapOp> {
+    let path = Path::from(join(&source.root, BOOTSTRAP_OP));
     match source
         .store
-        .put_opts(&path, data.into(), PutMode::Create.into())
+        .put_opts(
+            &path,
+            serde_json::to_vec(op)?.into(),
+            PutMode::Create.into(),
+        )
         .await
     {
         Ok(_) | Err(slatedb::object_store::Error::AlreadyExists { .. }) => {}
         Err(error) => return Err(error.into()),
     }
-    match restored(source).await? {
-        Some(claimed) if claimed == id => Ok(()),
-        Some(claimed) => bail!("the shared state is restored from another snapshot, {claimed}"),
-        None => bail!("the restore claim disappeared"),
-    }
+    bootstrap_op(source)
+        .await?
+        .context("the bootstrap claim disappeared")
 }
 
+/// The message for a restore into a cluster that this snapshot did not create.
+const FRESH_PREFIX: &str = "a snapshot restore needs a new cluster prefix and empty member \
+    directories; this shared state is not a restore of this snapshot (see \
+    docs/shared-state-guide.md)";
+
 /// Write the restored rows into a new shared database at index 1, create the first view
-/// checkpoint, and write the bootstrap marker.
+/// checkpoint, and write the bootstrap marker with the snapshot checksum.
 ///
-/// `shared/restore.json` records the snapshot checksum before the first write. A later or
-/// concurrent restore of the same snapshot completes the same steps, also after a failure
-/// between the first write and the marker. A restore of another snapshot fails. A shared
-/// state without a restore claim fails too: it came from a normal start or an unknown write.
-/// Delete `shared/` under the cluster prefix to restore again.
+/// The restore claims the bootstrap operation with the checksum before its first write. A later
+/// or concurrent restore of the same snapshot completes the same steps, also after a failure
+/// between the first write and the marker. A restore into a cluster that an ordinary start or
+/// another snapshot created fails. An ordinary start waits while a restore claim is pending.
 pub(crate) async fn seed(
     source: &Source,
     admin: &slatedb::admin::Admin,
     restore: &Restore,
 ) -> Result<()> {
+    let ours = BootstrapOp::Restore {
+        snapshot: restore.id.clone(),
+    };
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        match restored(source).await? {
-            Some(claimed) if claimed != restore.id => {
-                bail!("the shared state is restored from another snapshot, {claimed}")
-            }
-            Some(_) => {}
-            None if source.bootstrapped().await? || admin.read_manifest(None).await?.is_some() => {
-                bail!(
-                    "the shared state exists without a restore claim; delete shared/ under the \
-                     cluster prefix to restore into it"
-                )
-            }
-            None => claim_restore(source, &restore.id).await?,
-        }
         if source.bootstrapped().await? {
+            ensure!(
+                source.restored_snapshot().await?.as_deref() == Some(restore.id.as_str()),
+                FRESH_PREFIX
+            );
             return Ok(());
+        }
+        match bootstrap_op(source).await? {
+            Some(op) => ensure!(op == ours, FRESH_PREFIX),
+            // A state without a claim came from an ordinary start of an older binary or an
+            // unknown write.
+            None if admin.read_manifest(None).await?.is_some() => bail!(FRESH_PREFIX),
+            None => ensure!(claim_bootstrap(source, &ours).await? == ours, FRESH_PREFIX),
         }
         match write_seed(source, admin, restore).await {
             Ok(()) => return Ok(()),
@@ -821,7 +859,13 @@ pub(crate) async fn seed(
             Err(error) if std::time::Instant::now() < deadline => {
                 tracing::warn!(%error, "the shared restore failed; try again")
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(error.context(
+                    "the restore of this snapshot did not complete; if no member runs, delete \
+                     shared/ under the cluster prefix and restore again (see \
+                     docs/shared-state-guide.md)",
+                ))
+            }
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -831,7 +875,10 @@ pub(crate) async fn seed(
 /// failed restore does.
 #[cfg(test)]
 pub(crate) async fn seed_rows_for_test(source: &Source, restore: &Restore) -> Result<()> {
-    claim_restore(source, &restore.id).await?;
+    let op = BootstrapOp::Restore {
+        snapshot: restore.id.clone(),
+    };
+    claim_bootstrap(source, &op).await?;
     let db = source.open_writer().await?;
     let mut batch = slatedb::WriteBatch::new();
     for (key, value) in restore.rows.iter() {
@@ -885,7 +932,9 @@ async fn write_seed(
                 .id
         }
     };
-    source.mark_bootstrapped(checkpoint).await?;
+    source
+        .mark_bootstrapped_with(checkpoint, Some(&restore.id))
+        .await?;
     db.close().await?;
     Ok(())
 }
@@ -901,6 +950,8 @@ pub(crate) struct Shared {
     /// The checkpoint of the newest applied `ViewCheckpoint` entry. A new writer does not
     /// announce it again.
     announced: Arc<tokio::sync::watch::Sender<Option<uuid::Uuid>>>,
+    /// The checkpoint of the current base.
+    base_id: Arc<tokio::sync::watch::Sender<Option<uuid::Uuid>>>,
     /// Background opens of announced checkpoints. DST waits for them to keep schedules exact.
     opening: Vec<tokio::task::JoinHandle<()>>,
     /// A failed open tries again until the base opens or a newer announcement replaces it.
@@ -996,6 +1047,7 @@ impl Shared {
         Self {
             overlay: Overlay::new(base.applied),
             based: Arc::new(tokio::sync::watch::channel(base.applied).0),
+            base_id: Arc::new(tokio::sync::watch::channel(base.checkpoint).0),
             base,
             opened: Arc::default(),
             source,
@@ -1064,6 +1116,7 @@ impl Shared {
 
     fn set_base(&mut self, base: Arc<Base>) {
         self.based.send_replace(base.applied);
+        self.base_id.send_replace(base.checkpoint);
         self.base = base;
     }
 
@@ -1104,6 +1157,8 @@ pub(crate) struct Handles {
     pub based: tokio::sync::watch::Receiver<u64>,
     /// The checkpoint of the newest applied `ViewCheckpoint` entry.
     pub announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
+    /// The checkpoint of the current base.
+    pub base_id: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
     pub opened: Arc<Opened>,
 }
 
@@ -1188,6 +1243,7 @@ impl StateMachine {
             source: shared.source.clone(),
             based: shared.based.subscribe(),
             announced: shared.announced.subscribe(),
+            base_id: shared.base_id.subscribe(),
             opened: shared.opened.clone(),
         })
     }

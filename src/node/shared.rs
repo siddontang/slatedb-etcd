@@ -65,10 +65,13 @@ impl Progress {
         }
     }
 
-    /// Start again after a writer open at `written`.
+    /// Start again after a writer open at `written`. A publication request stays: a manual
+    /// checkpoint can ask for it before the new writer opens.
     fn reset(&self, written: u64) {
         self.written.send_replace(written);
-        *self.inner.lock().unwrap() = Inner::default();
+        let mut inner = self.inner.lock().unwrap();
+        inner.dirty_since = None;
+        inner.republish = false;
     }
 
     /// Publish a new checkpoint at the current sequence, for a changed layout.
@@ -178,6 +181,8 @@ pub(super) struct Writer {
     pub(super) gauges: Option<Gauges>,
     /// The highest manual checkpoint index that requested a publication after apply.
     checkpoint_requested: u64,
+    /// A follower's manual checkpoint index that waits for apply on this leader.
+    remote_checkpoint: u64,
 }
 
 /// The shared-mode gauges of one member. The node sets them on each tick.
@@ -239,6 +244,7 @@ impl Writer {
             open: OpenWriter::default(),
             gauges: None,
             checkpoint_requested: 0,
+            remote_checkpoint: 0,
             progress: Arc::new(Progress::new(0)),
             admin: handles.admin.clone(),
             queue: handles.queue.clone(),
@@ -251,6 +257,7 @@ impl Writer {
             applied: Applied {
                 based: handles.based.clone(),
                 announced: handles.announced.clone(),
+                base_id: handles.base_id.clone(),
                 #[cfg(test)]
                 failures: Arc::default(),
             },
@@ -554,6 +561,15 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
     } = leading;
     let current = || *leadership.borrow() == (true, term);
     loop {
+        // An ordinary start bootstraps an empty state only after it claims the one bootstrap
+        // operation. A pending snapshot restore holds the claim, so the leader waits for it.
+        if let Some(wait) = bootstrap_wait(&publisher.source).await {
+            tracing::warn!(reason = %wait, "the shared writer waits for the bootstrap");
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
+                _ = stop_requested(&mut stopped) => return Ok(()),
+            }
+        }
         let opened = tokio::select! {
             opened = publisher.source.open_writer() => opened,
             _ = stop_requested(&mut stopped) => return Ok(()),
@@ -630,6 +646,28 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
     }
 }
 
+/// Return why the writer cannot open yet: a pending snapshot restore, or an unreadable claim.
+async fn bootstrap_wait(source: &Source) -> Option<String> {
+    let checked = async {
+        if source.bootstrapped().await? {
+            return anyhow::Ok(None);
+        }
+        let op = crate::state::shared::BootstrapOp::Empty;
+        Ok(
+            match crate::state::shared::claim_bootstrap(source, &op).await? {
+                crate::state::shared::BootstrapOp::Empty => None,
+                crate::state::shared::BootstrapOp::Restore { snapshot } => {
+                    Some(format!("the restore of snapshot {snapshot} is pending"))
+                }
+            },
+        )
+    };
+    match checked.await {
+        Ok(wait) => wait,
+        Err(error) => Some(error.to_string()),
+    }
+}
+
 /// Copy overlay batches into the shared `Db` in order, each with its own sequence.
 ///
 /// The writer opened at `last_l0_seq`. The batches at or below the written sequence are already
@@ -674,6 +712,8 @@ struct Applied {
     based: tokio::sync::watch::Receiver<u64>,
     /// The checkpoint of the newest applied `ViewCheckpoint` entry.
     announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
+    /// The checkpoint of the current base.
+    base_id: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
     /// Checks that fail before they read storage, for tests.
     #[cfg(test)]
     failures: Arc<std::sync::atomic::AtomicU32>,
@@ -748,8 +788,9 @@ impl Retry {
 /// it. A writer that stops after a checkpoint and before its announcement commits leaves one.
 /// With no more writes, no newer checkpoint replaces it, and members wait for its base.
 ///
-/// A checkpoint is not stranded when it is the newest announced one, when an announced one is
-/// at the same or a newer sequence, or when its `F` is at or below the current base. Thus an
+/// The newest checkpoint is the last in (index, manifest) order. It is not stranded when it is
+/// the newest announced checkpoint or the current base, or when its `F` is below the base.
+/// After a Defragment a newer checkpoint at the base index is stranded until it applies. Thus an
 /// adopted checkpoint never causes a new announcement, and announcements cannot loop. A
 /// checkpoint without membership is not valid and is not stranded.
 async fn stranded(
@@ -769,21 +810,19 @@ async fn stranded(
     {
         anyhow::bail!("an injected storage error");
     }
+    // The newest checkpoint in (index, manifest) order. A Defragment adds a newer one at the
+    // same index, so the identity counts, not only the index.
     let views = view_checkpoints(admin).await?;
-    let Some((seq, checkpoint)) = views.last() else {
+    let Some((_, checkpoint)) = views.last() else {
         return Ok(None);
     };
-    let announced = *applied.announced.borrow();
-    if let Some(announced) = announced {
-        if views
-            .iter()
-            .any(|(other, view)| view.id == announced && other >= seq)
-        {
-            return Ok(None);
-        }
+    if *applied.announced.borrow() == Some(checkpoint.id)
+        || *applied.base_id.borrow() == Some(checkpoint.id)
+    {
+        return Ok(None);
     }
     let base = source.open_base(checkpoint.id).await?;
-    if base.applied <= *applied.based.borrow() {
+    if base.applied < *applied.based.borrow() {
         return Ok(None);
     }
     if base.get(crate::cluster::KEY).await?.is_none() {
@@ -1007,6 +1046,8 @@ pub(super) fn reconcile_conf(
 
 /// Ticks between two `ViewAck` reports.
 const REPORT_TICKS: u64 = 50;
+/// Ticks between two publication requests of a follower's waiting manual checkpoint.
+const RETRY_TICKS: u64 = 5;
 /// Ticks between two checkpoint polls of a paused member.
 const POLL_TICKS: u64 = 10;
 
@@ -1162,9 +1203,18 @@ impl Node {
     }
 
     /// Record a `ViewAck` from `member`. Only the leader keeps reports.
-    pub(super) fn view_ack(&mut self, member: u64, checkpoints: HashSet<uuid::Uuid>) {
-        if let Some(writer) = &self.writer {
+    pub(super) fn view_ack(
+        &mut self,
+        member: u64,
+        checkpoints: HashSet<uuid::Uuid>,
+        publish: Option<u64>,
+    ) {
+        if let Some(writer) = &mut self.writer {
             writer.report(member, checkpoints);
+            // A follower's manual checkpoint. The publication is due once apply reaches it.
+            if let Some(index) = publish {
+                writer.remote_checkpoint = writer.remote_checkpoint.max(index);
+            }
         }
     }
 
@@ -1193,12 +1243,37 @@ impl Node {
                 .reopens
                 .set(writer.reopens.load(std::sync::atomic::Ordering::Relaxed) as i64);
         }
+        let leader = self.raw.raft.state == StateRole::Leader;
+        if leader && writer.remote_checkpoint > 0 {
+            let index = writer.remote_checkpoint;
+            writer.request_checkpoint(index, self.state.applied);
+            if index <= writer.checkpoint_requested {
+                writer.remote_checkpoint = 0;
+            }
+        }
         if ticks % POLL_TICKS == 0 && writer.paused {
             self.poll_checkpoints();
+        }
+        // A follower repeats the request of a waiting manual checkpoint.
+        if !leader && ticks % RETRY_TICKS == 0 {
+            if let Some(index) = self
+                .checkpoint_waiters
+                .iter()
+                .map(|(index, _)| *index)
+                .max()
+            {
+                self.send_view_ack(Some(index));
+            }
         }
         if ticks % REPORT_TICKS != 0 {
             return;
         }
+        self.send_view_ack(None);
+    }
+
+    /// Report the pinned checkpoints to the leader. `publish` asks the leader to publish through
+    /// an index for a manual checkpoint on this member.
+    pub(super) fn send_view_ack(&mut self, publish: Option<u64>) {
         let pinned = self.pinned_checkpoints();
         let leader = self.raw.raft.leader_id;
         if leader == self.options.id {
@@ -1220,7 +1295,7 @@ impl Node {
             return;
         };
         let url = format!("{}/raft/view-ack", crate::cluster::url(address));
-        let body = json!({"member": self.options.id, "checkpoints": pinned});
+        let body = json!({"member": self.options.id, "checkpoints": pinned, "publish": publish});
         let client = self.options.transport.http.clone();
         let cluster = self.options.cluster_id.clone();
         tokio::spawn(async move {
@@ -1566,6 +1641,7 @@ mod tests {
     use super::*;
     use crate::state::overlay::Overlay;
     use slatedb::object_store::memory::InMemory;
+    use slatedb::object_store::ObjectStore;
 
     fn batch(seq: u64, rows: &[(&str, &str)]) -> Arc<crate::WriteBatch> {
         let mut batch = crate::WriteBatch::new();
@@ -2395,6 +2471,184 @@ mod tests {
             Some(index)
         );
         assert!(!writer.request_checkpoint(index, index));
+        state.close().await.unwrap();
+    }
+
+    /// Apply announcement `id` at the next index and switch to its base.
+    async fn adopt_announced(state: &mut StateMachine, id: uuid::Uuid) {
+        let index = state.applied + 1;
+        state
+            .apply_view_checkpoint(index, &id.to_string())
+            .await
+            .unwrap();
+        state.settle_opens().await;
+        state.switch_base();
+        assert_eq!(state.base_checkpoint(), Some(id));
+    }
+
+    /// A Defragment publishes a newer checkpoint at the base index, and the leader changes
+    /// before its announcement applies. The next writer announces it, because the identity of
+    /// the newest checkpoint differs from the base, and the members adopt it with no write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_new_writer_announces_a_same_index_checkpoint() {
+        let (mut state, handles, events, mut announcements, first) = stranded_checkpoint().await;
+        adopt_announced(&mut state, first).await;
+        let mut second = Writer::new(&handles, STRANDED_AGE, clock());
+        second.sync(true, 3, &events);
+        second.progress.wait_written(1).await.unwrap();
+        announcements.none(Duration::from_millis(300)).await;
+        // The Defragment republish. Its announcement does not apply before the change.
+        second.progress.republish();
+        let compacted = announcements.next(Duration::from_secs(5), true).await;
+        assert_ne!(compacted, first);
+        let base = handles.source.open_base(compacted).await.unwrap();
+        assert_eq!(base.applied, state.shared.as_ref().unwrap().base.applied);
+        drop(base);
+        second.sync(false, 3, &events);
+        second.stop().await;
+        let mut third = Writer::new(&handles, STRANDED_AGE, clock());
+        third.sync(true, 4, &events);
+        assert_eq!(
+            announcements.next(Duration::from_secs(2), true).await,
+            compacted
+        );
+        adopt_announced(&mut state, compacted).await;
+        announcements
+            .none(RETRY_MAX + Duration::from_millis(500))
+            .await;
+        third.sync(false, 4, &events);
+        third.stop().await;
+        state.close().await.unwrap();
+    }
+
+    /// A manual checkpoint requests its publication after apply and before the newly elected
+    /// writer opens. The open keeps the request, so the writer publishes and announces the
+    /// covering checkpoint at once, not after the flush age.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_checkpoint_request_survives_the_writer_open() {
+        let (mut state, handles, events, mut announcements, first) = stranded_checkpoint().await;
+        adopt_announced(&mut state, first).await;
+        let put = crate::proto::etcdserverpb::RequestOp {
+            request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
+                crate::proto::etcdserverpb::PutRequest {
+                    key: b"key".to_vec(),
+                    value: b"value".to_vec(),
+                    ..Default::default()
+                },
+            )),
+        };
+        let index = state.applied + 1;
+        state.apply_etcd(index, &put).await.unwrap();
+        let mut writer = Writer::new(&handles, Duration::from_secs(90), clock());
+        assert!(writer.request_checkpoint(index, index));
+        writer.sync(true, 3, &events);
+        let id = announcements.next(Duration::from_secs(2), true).await;
+        assert_eq!(handles.source.open_base(id).await.unwrap().applied, index);
+        writer.sync(false, 3, &events);
+        writer.stop().await;
+        state.close().await.unwrap();
+    }
+
+    /// A one-voter shared state on `store`, opened without a restore, with its handles.
+    async fn ordinary(store: Arc<dyn ObjectStore>) -> (StateMachine, Handles) {
+        let options = crate::state::shared::Options {
+            quota: 0,
+            voters: vec![1],
+            join: false,
+            empty_log: true,
+            pin_max: Duration::from_secs(300),
+            restore: None,
+        };
+        let mut state = StateMachine::open_shared(
+            store,
+            "root",
+            "test",
+            crate::state::StateCache::default(),
+            &options,
+            crate::state::transfer::Backend::Local,
+        )
+        .await
+        .unwrap();
+        state.members = Arc::new(crate::cluster::Store::initial(
+            &[(1, "127.0.0.1:1".to_owned())].into(),
+        ));
+        let handles = state.shared_handles().unwrap();
+        (state, handles)
+    }
+
+    fn snapshot(id: &str) -> crate::state::shared::Restore {
+        let members = crate::cluster::Store::initial(&[(1, "127.0.0.1:1".to_owned())].into());
+        crate::state::shared::Restore::new(
+            vec![
+                (crate::state::APPLIED.to_vec(), 1_u64.to_be_bytes().to_vec()),
+                (
+                    crate::cluster::KEY.to_vec(),
+                    serde_json::to_vec(&members).unwrap(),
+                ),
+                (b"etcd/restored".to_vec(), id.as_bytes().to_vec()),
+            ],
+            id.to_owned(),
+        )
+    }
+
+    /// A restore claims the bootstrap and stops before its marker. An ordinary leader then
+    /// starts without the restore flag. It does not bootstrap an empty state: it waits. The
+    /// restore completes, and the leader announces the restored checkpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_ordinary_start_waits_for_a_pending_restore() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (state, handles) = ordinary(store.clone()).await;
+        let restore = snapshot("a");
+        crate::state::shared::seed_rows_for_test(&handles.source, &restore)
+            .await
+            .unwrap();
+        let (events, received) = mpsc::channel(64);
+        let mut announcements = Announcements(received);
+        let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+        writer.sync(true, 2, &events);
+        announcements.none(Duration::from_secs(1)).await;
+        assert!(!handles.source.bootstrapped().await.unwrap());
+        let admin =
+            slatedb::admin::Admin::builder(handles.source.state().as_str(), store.clone()).build();
+        crate::state::shared::seed(&handles.source, &admin, &restore)
+            .await
+            .unwrap();
+        let id = announcements.next(Duration::from_secs(10), true).await;
+        let base = handles.source.open_base(id).await.unwrap();
+        assert_eq!(
+            base.get(b"etcd/restored").await.unwrap().as_deref(),
+            Some(b"a".as_slice())
+        );
+        drop(base);
+        writer.sync(false, 2, &events);
+        writer.stop().await;
+        state.close().await.unwrap();
+    }
+
+    /// An ordinary leader bootstraps first. A later restore into that cluster fails, and tells
+    /// the operator that a restore needs a new cluster prefix.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restore_after_an_ordinary_bootstrap_fails() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (mut state, handles) = ordinary(store.clone()).await;
+        state.apply(1, None).await.unwrap();
+        let (events, received) = mpsc::channel(64);
+        let mut announcements = Announcements(received);
+        let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+        writer.sync(true, 2, &events);
+        announcements.next(Duration::from_secs(20), true).await;
+        assert!(handles.source.bootstrapped().await.unwrap());
+        let admin =
+            slatedb::admin::Admin::builder(handles.source.state().as_str(), store.clone()).build();
+        let error = crate::state::shared::seed(&handles.source, &admin, &snapshot("a"))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("new cluster prefix"),
+            "{error:#}"
+        );
+        writer.sync(false, 2, &events);
+        writer.stop().await;
         state.close().await.unwrap();
     }
 

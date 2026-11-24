@@ -450,6 +450,7 @@ pub(crate) async fn compact_all(admin: &slatedb::admin::Admin) -> Result<()> {
             return Ok(());
         }
         let destination = manifest.compacted().iter().map(|r| r.id).min().unwrap_or(0);
+        let l0: Vec<_> = manifest.l0().iter().map(|view| view.id).collect();
         let job = admin
             .submit_compaction(CompactionSpec::new(sources, destination))
             .await?;
@@ -461,7 +462,22 @@ pub(crate) async fn compact_all(admin: &slatedb::admin::Admin) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(50)).await;
             if let Some(job) = admin.read_compaction(job.id(), None).await? {
                 match job.status() {
-                    CompactionStatus::Completed => return Ok(()),
+                    // The compactor commits the manifest after the job. A checkpoint after this
+                    // call must see the new layout, so wait until the compacted L0 SSTs leave it.
+                    CompactionStatus::Completed => loop {
+                        let manifest = admin
+                            .read_manifest(None)
+                            .await?
+                            .context("missing manifest")?;
+                        if !manifest.l0().iter().any(|view| l0.contains(&view.id)) {
+                            return Ok(());
+                        }
+                        ensure!(
+                            tokio::time::Instant::now() < deadline,
+                            "defragmentation timed out"
+                        );
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    },
                     CompactionStatus::Failed => break,
                     _ => (),
                 }

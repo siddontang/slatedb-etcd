@@ -936,10 +936,10 @@ async fn http(server: &Server, method: &str, path: &str) -> String {
     response.lines().next().unwrap().to_owned()
 }
 
-/// A manual checkpoint on each member returns after its base covers the writes. Defragment on
-/// a follower then runs on the idle leader writer. The shared database gets one sorted run and
-/// no L0 SST. Without another write, the leader publishes a new checkpoint at the same index,
-/// and every member's base reads the compacted layout.
+/// A manual checkpoint on each member, followers first, returns after its base covers the
+/// writes. Defragment on a follower then runs on the idle leader writer. The shared database
+/// gets one sorted run and no L0 SST. Without another write, the leader publishes a new
+/// checkpoint at the same index, and every member's base reads the compacted layout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn defragment_and_manual_checkpoints_in_shared_mode() {
     use slatedb_etcd::proto::etcdserverpb::DefragmentRequest;
@@ -954,7 +954,12 @@ async fn defragment_and_manual_checkpoints_in_shared_mode() {
         ["writer"]["written"]
         .as_u64()
         .unwrap();
-    for server in servers.iter().flatten() {
+    // Followers go first. Each asks the leader for the publication, with no write and with a
+    // flush age of 60 s.
+    let order = (1..=3)
+        .filter(|id| *id != lead)
+        .chain(std::iter::once(lead));
+    for server in order.map(|id| servers[id as usize - 1].as_ref().unwrap()) {
         let reply = http(server, "POST", "/checkpoint").await;
         assert!(reply.contains("200"), "{reply}");
         let base = status(server).await["shared_state"]["base_applied_index"]
