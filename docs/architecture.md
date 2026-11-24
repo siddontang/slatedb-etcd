@@ -159,6 +159,8 @@ A dedicated operating-system thread owns raft-engine and all steady-state log I/
 One apply worker owns StateMachine and all mutations.
 It executes committed batches, snapshot installation, and diagnostic queries.
 Watch streams read the event feed and scan journal history on pinned views.
+A stream reads the responses of a page on the view, up to 4 MiB, and releases the view before
+it sends them. A slow client does not hold a pin. The next page resumes on a new view.
 Independent KV read tasks use pinned data and matching applied metadata.
 It also pins checkpoints. A separate task builds each pinned snapshot.
 

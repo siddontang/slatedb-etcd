@@ -55,9 +55,12 @@ Local objects use synced writes, so a flush survives power loss like an S3 write
 Restart reads an apply marker at or above the truncation index and replays the later entries.
 If state is behind a record without an image, startup stops with an explicit error.
 
-A manual checkpoint, or a leader whose peer needs a snapshot, builds a complete image:
+A manual checkpoint, or a leader whose peer needs a snapshot, builds an image. The image is a
+small descriptor of a SlateDB checkpoint, not a copy of the state
+(see [object storage Raft snapshots](object-snapshots.md)):
 
-1. Pins a full SlateDB scan at the applied index, then flushes SlateDB and encodes the scan.
+1. Begins a SlateDB checkpoint at the applied index between two apply jobs, waits for it, and
+   encodes its descriptor: the checkpoint ID, its manifest, and the SST paths.
 2. Writes and syncs a private temporary file on a blocking worker. The worker computes its CRC.
 3. Renames the complete image and syncs its directory on the WAL thread.
 4. Syncs its reference, checksum, metadata, commit marker, and truncation in one WAL batch.
@@ -74,19 +77,21 @@ receipt,
 the node atomically replaces its persistent Raft state before changing SlateDB. A crash in between
 is safe: startup can repeat the state replacement from the durable snapshot payload.
 
-An image file contains a full copy of the state. This makes recovery independent of
-uncopied local object files, but limits the PoC to small data sets. Snapshots use the peer HTTP body
-limit of 64 MiB. Snapshot creation runs in the background.
+The descriptor size grows with the SST count, not with the data size. The follower copies the
+named SST objects before Raft accepts the snapshot, so the 64 MiB peer HTTP body limit does not
+bound the state size. Snapshot creation runs in the background.
+Legacy full-image files stay readable; a node no longer builds them.
 The file writer samples four 4 KiB regions in images of at least 64 KiB.
 It selects LZ4 when the sample shrinks by more than half. Other images use the original bytes.
 The encoder uses 64 KiB blocks. The WAL records the stored length for compressed files.
-Recovery checks both lengths and the CRC of the decoded image. Peer transfers use the full image.
+Recovery checks both lengths and the CRC of the decoded image.
+Peer requests carry the decoded descriptor.
 Members use different positions in each automatic checkpoint interval.
 Their rank in the configured peer list sets the position. Manual checkpoints bypass this schedule.
 Incoming peer snapshots use the ordered WAL thread for both file preparation and publication.
 Slow persistence can still raise client tail latency.
 A separate apply task owns SlateDB, installs snapshots, and executes committed state changes.
-Production use still needs bounded snapshot transfer and bounded state scans.
+Snapshot transfer copies objects; historical and sorted state scans are not bounded yet.
 
 The local PoC polls compaction and manifest updates every 100 ms. The default slower polling caused
 L0 backpressure during repeated checkpoints in an earlier run. That run is retained in

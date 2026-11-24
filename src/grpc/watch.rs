@@ -50,6 +50,9 @@ struct Stream {
     /// Watchers that store their start revision.
     pinned: BTreeSet<i64>,
     next_id: i64,
+    /// Runs once after the next journal scan, before the responses take a new view.
+    #[cfg(test)]
+    after_scan: Option<Box<dyn FnOnce() + Send>>,
 }
 
 fn unavailable() -> Status {
@@ -92,6 +95,8 @@ impl Stream {
             ranges: BTreeSet::new(),
             pinned: BTreeSet::new(),
             next_id: 0,
+            #[cfg(test)]
+            after_scan: None,
         }
     }
 
@@ -242,25 +247,72 @@ impl Stream {
         // A missing or incomplete batch leaves the covered watchers for storage catch-up.
         if let Some(journals) = journals {
             let credentials = self.credentials();
+            let reads = state.view.read_state();
+            // Read every response of the batch on the view first.
             let mut ids = vec![];
-            for (revision, journal) in journals {
+            let mut prepared = vec![];
+            let mut bytes = 0;
+            let mut stopped = None;
+            'rows: for (revision, journal) in journals {
                 self.candidates(journal, &mut ids);
+                let mut sent = vec![];
                 for id in &ids {
-                    let start = self.start(&self.watchers[id]);
-                    let watcher = self.watchers.get_mut(id).expect("indexed watcher");
+                    let watcher = &self.watchers[id];
+                    let start = self.start(watcher);
                     if start > batch.previous && start <= *revision {
-                        deliver(
-                            &self.tx,
-                            &self.meters,
-                            &state,
-                            &credentials,
-                            watcher,
-                            *revision,
-                            journal,
-                        )
-                        .await?;
+                        let response =
+                            prepare(&state, &reads, &credentials, watcher, *revision, journal)
+                                .await;
+                        match response {
+                            Ok(Some(response)) => {
+                                // A full batch stops before this response, and the watcher resumes
+                                // at this revision on a new view. The first response always fits,
+                                // so the watchers make progress.
+                                let size = response.response.encoded_len();
+                                if !prepared.is_empty() && bytes + size > PREPARED_BYTES {
+                                    stopped = Some((*revision, sent));
+                                    break 'rows;
+                                }
+                                bytes += size;
+                                prepared.push((*id, response));
+                                sent.push(*id);
+                            }
+                            Ok(None) => sent.push(*id),
+                            Err(status) if crate::state::view::expired(status.message()) => {
+                                stopped = Some((*revision, sent));
+                                break 'rows;
+                            }
+                            Err(status) => return Err(status),
+                        }
                     }
                 }
+            }
+            // Release the view before any send. A slow client cannot hold the pin.
+            drop((reads, state));
+            record_batch(bytes, prepared.len());
+            for (id, response) in prepared {
+                let watcher = self.watchers.get_mut(&id).expect("prepared watcher");
+                send_prepared(&self.tx, &self.meters, watcher, response).await?;
+            }
+            if let Some((revision, sent)) = stopped {
+                // Each watcher that this batch covers resumes from its own next revision on a
+                // new view, through storage catch-up.
+                let next = self.position + 1;
+                for (&id, watcher) in &mut self.watchers {
+                    let start = watcher.start.unwrap_or(next);
+                    if start > batch.previous && start <= revision {
+                        let resume = if sent.contains(&id) {
+                            revision + 1
+                        } else {
+                            revision
+                        };
+                        watcher.start = Some(resume);
+                        self.pinned.insert(id);
+                    }
+                }
+                self.position = self.position.max(batch.revision);
+                self.unpin();
+                return Ok(());
             }
             // Pinned watchers that this batch covers start after it.
             for id in &self.pinned {
@@ -341,19 +393,25 @@ impl Stream {
                 pending.push((id, start));
             }
         }
-        for id in compacted {
-            self.remove(id);
-            send(
-                &self.tx,
-                WatchResponse {
+        if !compacted.is_empty() {
+            // Build the cancellations, release the view, then send. The next page takes a new
+            // view for the other watchers.
+            let mut responses = vec![];
+            for id in compacted {
+                self.remove(id);
+                responses.push(WatchResponse {
                     header: state.header(view.revision),
                     watch_id: id,
                     canceled: true,
                     compact_revision: view.compact_revision,
                     ..Default::default()
-                },
-            )
-            .await?;
+                });
+            }
+            drop((state, view));
+            for response in responses {
+                send(&self.tx, response).await?;
+            }
+            return Ok(true);
         }
         let Some(from) = pending.iter().map(|&(_, start)| start).min() else {
             return Ok(false);
@@ -362,30 +420,99 @@ impl Stream {
         for (id, _) in &pending {
             permit(&view.auth, &credentials, &self.watchers[id].request)?;
         }
-        let (rows, covered) = crate::watch::scan(view.state(), from, limit, PAGE_REVISIONS)
-            .await
-            .map_err(|e| Status::unavailable(format!("etcdserver: {}", e.message)))?;
+        // Each page is one read with its own pin deadline. An expired page resumes on a new
+        // view after the last revision that each watcher received.
+        let reads = view.read_state();
+        let (rows, covered) = match crate::watch::scan(&reads, from, limit, PAGE_REVISIONS).await {
+            Ok(page) => page,
+            Err(error) if crate::state::view::expired(&error.message) => return Ok(true),
+            Err(error) => {
+                return Err(Status::unavailable(format!(
+                    "etcdserver: {}",
+                    error.message
+                )));
+            }
+        };
+        // The scan used part of the pin. The responses read prev_kv history on a fresh view
+        // with its own deadline, so a page that read its journals always delivers some of them.
+        // Journal and history rows at these revisions do not change. The fresh view's compact
+        // revision decides whether an event keeps its prev_kv, as etcd does.
+        drop((reads, view, state));
+        #[cfg(test)]
+        if let Some(hook) = self.after_scan.take() {
+            hook();
+        }
+        let state = self.current(through.is_none())?;
+        // A compaction between the scan and this view can remove the history of a pending
+        // watcher. The next page then cancels that watcher with the compact revision, as etcd
+        // does, and serves the others. No history read runs below the compact revision.
+        if pending
+            .iter()
+            .any(|&(_, start)| start < state.view.compact_revision)
+        {
+            return Ok(true);
+        }
+        let reads = state.view.read_state();
+        // Read every response of the page on the view first.
         let mut ids = vec![];
-        for (revision, journal) in &rows {
+        let mut prepared = vec![];
+        let mut bytes = 0;
+        let mut stopped = None;
+        'rows: for (revision, journal) in &rows {
             self.candidates(journal, &mut ids);
+            let mut sent = vec![];
             for id in &ids {
                 // Starts do not change in this loop. A pending watcher has `start <= bound` and
                 // is not compacted, so this condition selects the pending watchers.
-                let watcher = self.watchers.get_mut(id).expect("indexed watcher");
+                let watcher = &self.watchers[id];
                 let start = watcher.start.unwrap_or(i64::MAX);
                 if start <= bound && start <= *revision {
-                    deliver(
-                        &self.tx,
-                        &self.meters,
-                        &state,
-                        &credentials,
-                        watcher,
-                        *revision,
-                        journal,
-                    )
-                    .await?;
+                    let response =
+                        prepare(&state, &reads, &credentials, watcher, *revision, journal).await;
+                    match response {
+                        Ok(Some(response)) => {
+                            // A full batch stops before this response, and the watcher resumes
+                            // at this revision on a new view. The first response always fits,
+                            // so the watchers make progress.
+                            let size = response.response.encoded_len();
+                            if !prepared.is_empty() && bytes + size > PREPARED_BYTES {
+                                stopped = Some((*revision, sent));
+                                break 'rows;
+                            }
+                            bytes += size;
+                            prepared.push((*id, response));
+                            sent.push(*id);
+                        }
+                        Ok(None) => sent.push(*id),
+                        Err(status) if crate::state::view::expired(status.message()) => {
+                            stopped = Some((*revision, sent));
+                            break 'rows;
+                        }
+                        Err(status) => return Err(status),
+                    }
                 }
             }
+        }
+        // Release the view before any send. A slow client cannot hold the pin.
+        drop((reads, rows, state));
+        record_batch(bytes, prepared.len());
+        for (id, response) in prepared {
+            let watcher = self.watchers.get_mut(&id).expect("prepared watcher");
+            send_prepared(&self.tx, &self.meters, watcher, response).await?;
+        }
+        if let Some((revision, sent)) = stopped {
+            // Watchers that received this revision resume after it. The others resume at it.
+            for (id, _) in &pending {
+                let watcher = self.watchers.get_mut(id).expect("pending watcher");
+                let start = watcher.start.as_mut().expect("pending start");
+                let resume = if sent.contains(id) {
+                    revision + 1
+                } else {
+                    revision
+                };
+                *start = (*start).max(resume);
+            }
+            return Ok(true);
         }
         for (id, _) in &pending {
             let watcher = self.watchers.get_mut(id).expect("pending watcher");
@@ -405,23 +532,31 @@ impl Stream {
         let state = self.current(true)?;
         self.check_all(&state)?;
         let header = state.header(self.position);
+        // Release the state before any send. A slow client cannot hold the view.
+        drop(state);
         let next = self.position + 1;
-        for watcher in self.watchers.values_mut() {
-            if watcher.request.progress_notify
-                && watcher.start.unwrap_or(next) == next
-                && watcher.progress.elapsed() >= self.progress_interval
-            {
-                send(
-                    &self.tx,
-                    WatchResponse {
-                        header,
-                        watch_id: watcher.request.watch_id,
-                        ..Default::default()
-                    },
-                )
-                .await?;
-                watcher.progress = tokio::time::Instant::now();
-            }
+        let due: Vec<_> = self
+            .watchers
+            .iter()
+            .filter(|(_, watcher)| {
+                watcher.request.progress_notify
+                    && watcher.start.unwrap_or(next) == next
+                    && watcher.progress.elapsed() >= self.progress_interval
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in due {
+            let watcher = self.watchers.get_mut(&id).expect("due watcher");
+            send(
+                &self.tx,
+                WatchResponse {
+                    header,
+                    watch_id: watcher.request.watch_id,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            watcher.progress = tokio::time::Instant::now();
         }
         Ok(())
     }
@@ -455,10 +590,14 @@ impl Stream {
             request.watch_id = self.next_id;
             self.next_id += 1;
         }
+        let header = state.header(self.position);
+        let auth = state.view.auth.clone();
+        // Release the state before the send. The Auth store does not pin the view.
+        drop(state);
         send(
             &self.tx,
             WatchResponse {
-                header: state.header(self.position),
+                header,
                 watch_id: if reason.is_empty() {
                     request.watch_id
                 } else {
@@ -477,7 +616,7 @@ impl Stream {
         if request.start_revision <= 0 {
             request.start_revision = self.position + 1;
         }
-        permit(&state.view.auth, &self.credentials(), &request)?;
+        permit(&auth, &self.credentials(), &request)?;
         let watcher = Watcher {
             _active: self
                 .meters
@@ -498,11 +637,11 @@ impl Stream {
 
     async fn cancel(&mut self, id: i64) -> Result<(), Status> {
         if self.remove(id).is_some() {
-            let state = self.current(false)?;
+            let header = self.current(false)?.header(self.position);
             send(
                 &self.tx,
                 WatchResponse {
-                    header: state.header(self.position),
+                    header,
                     watch_id: id,
                     canceled: true,
                     ..Default::default()
@@ -517,12 +656,12 @@ impl Stream {
     async fn progress(&mut self) -> Result<(), Status> {
         let goal = self.current(false)?.view.revision;
         self.catch_up_all(Some(goal)).await?;
-        let state = self.current(false)?;
+        let header = self.current(false)?.header(goal);
         if !self.watchers.is_empty() && self.watchers.values().all(|w| self.start(w) <= goal + 1) {
             send(
                 &self.tx,
                 WatchResponse {
-                    header: state.header(goal),
+                    header,
                     watch_id: -1,
                     ..Default::default()
                 },
@@ -543,17 +682,43 @@ fn permit(
         .map_err(|e| e.status())
 }
 
-async fn deliver(
-    tx: &Output,
-    meters: &Option<Arc<crate::metrics::WatchMeters>>,
+/// The bytes of the responses that one page or batch holds before it sends them. A full batch
+/// sends what it has and resumes each watcher on a new view.
+#[cfg(not(test))]
+const PREPARED_BYTES: usize = 4 << 20;
+#[cfg(test)]
+pub(crate) const PREPARED_BYTES: usize = 256 << 10;
+
+/// The largest prepared batch with more than one response, for tests. One response that is
+/// larger than the budget is sent alone.
+#[cfg(test)]
+pub(crate) static LARGEST_BATCH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn record_batch(_bytes: usize, _responses: usize) {
+    #[cfg(test)]
+    if _responses > 1 {
+        LARGEST_BATCH.fetch_max(_bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// One response that a page or a batch read on its view. The send runs after the view is gone.
+struct Prepared {
+    response: WatchResponse,
+    events: usize,
+}
+
+/// Read the events of one revision for one watcher. `None` means that no event matches.
+async fn prepare(
     state: &FeedState,
+    reads: &crate::state::view::StateView,
     credentials: &crate::auth::Credentials,
-    watcher: &mut Watcher,
+    watcher: &Watcher,
     revision: i64,
     journal: &crate::proto::state::Journal,
-) -> Result<(), Status> {
+) -> Result<Option<Prepared>, Status> {
     let events = crate::watch::select(
-        state.view.state(),
+        reads,
         &watcher.request,
         revision,
         state.view.compact_revision,
@@ -562,23 +727,29 @@ async fn deliver(
     .await
     .map_err(|e| Status::unavailable(format!("etcdserver: {}", e.message)))?;
     if events.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     permit(&state.view.auth, credentials, &watcher.request)?;
-    let sent = events.len();
-    send_events(
-        tx,
-        WatchResponse {
+    Ok(Some(Prepared {
+        events: events.len(),
+        response: WatchResponse {
             header: state.header(revision),
             watch_id: watcher.request.watch_id,
             events,
             ..Default::default()
         },
-        watcher.request.fragment,
-    )
-    .await?;
+    }))
+}
+
+async fn send_prepared(
+    tx: &Output,
+    meters: &Option<Arc<crate::metrics::WatchMeters>>,
+    watcher: &mut Watcher,
+    prepared: Prepared,
+) -> Result<(), Status> {
+    send_events(tx, prepared.response, watcher.request.fragment).await?;
     if let Some(metrics) = meters {
-        metrics.events.inc_by(sent as u64);
+        metrics.events.inc_by(prepared.events as u64);
     }
     watcher.progress = tokio::time::Instant::now();
     Ok(())
@@ -719,7 +890,7 @@ mod tests {
     struct Fixture {
         _dir: tempfile::TempDir,
         state: StateMachine,
-        feed: watch::Sender<FeedState>,
+        feed: Arc<watch::Sender<FeedState>>,
         output: mpsc::Receiver<Result<WatchResponse, Status>>,
         stream: Stream,
     }
@@ -741,6 +912,7 @@ mod tests {
             let mut state = StateMachine::open(dir.path()).await.unwrap();
             state.watch_capture = Some(Default::default());
             let (feed, changes) = watch::channel(feed_state(&state));
+            let feed = Arc::new(feed);
             let (tx, output) = mpsc::channel(1024);
             let stream = Stream::new(
                 tx,
@@ -972,6 +1144,47 @@ mod tests {
         f.close().await;
     }
 
+    /// Eight following and eight historical watchers receive large values. Each revision has
+    /// more response bytes than the budget, so the feed and catch-up stop inside a revision.
+    #[tokio::test]
+    async fn prepared_batches_stay_in_the_byte_budget_and_deliver_each_revision_once() {
+        let mut f = Fixture::new().await;
+        for id in 1..=8 {
+            f.watch(request(id, "k", 0)).await;
+        }
+        let value = "x".repeat(40 << 10);
+        let mut revisions = vec![];
+        for _ in 0..6 {
+            let batch = f.put("k", &value).await;
+            assert!(batch.journals().is_some());
+            revisions.push(batch.revision);
+            f.stream.batch(&batch).await.unwrap();
+            // The feed stops inside the revision. The other watchers read storage.
+            assert!(f.stream.unsynced());
+            f.stream.catch_up_all(None).await.unwrap();
+            assert!(!f.stream.unsynced());
+        }
+        let mut events = f.events();
+        // A historical watcher catches up when the stream creates it.
+        for id in 9..=16 {
+            f.stream
+                .create(request(id, "k", revisions[0]))
+                .await
+                .unwrap();
+        }
+        events.extend(f.events());
+        let largest = LARGEST_BATCH.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(largest <= PREPARED_BYTES, "{largest} bytes in one batch");
+        let mut seen: HashMap<i64, Vec<i64>> = HashMap::new();
+        for (id, revision, _) in events {
+            seen.entry(id).or_default().push(revision);
+        }
+        for id in 1..=16 {
+            assert_eq!(seen.get(&id), Some(&revisions), "watcher {id}");
+        }
+        f.close().await;
+    }
+
     #[tokio::test]
     async fn incomplete_batch_uses_storage_catch_up() {
         let mut f = Fixture::new().await;
@@ -1082,6 +1295,62 @@ mod tests {
         assert!(responses[1].canceled);
         assert_eq!(responses[1].compact_revision, 3);
         assert!(f.stream.watchers.is_empty());
+        f.close().await;
+    }
+
+    /// A physical compaction lands between the journal scan and the history reads. The
+    /// historical watcher is cancelled with the compact revision. The stream stays open, and a
+    /// current watcher on it receives its next event.
+    #[tokio::test]
+    async fn a_compaction_after_the_scan_cancels_only_the_compacted_watcher() {
+        let mut f = Fixture::new().await;
+        f.watch(request(2, "other", 0)).await;
+        let mut revisions = vec![];
+        for n in 0..3 {
+            let batch = f.put("k", &n.to_string()).await;
+            revisions.push(batch.revision);
+            f.stream.batch(&batch).await.unwrap();
+        }
+        // The feed keeps the view before the compaction until the scan ends.
+        let index = f.state.applied + 1;
+        f.state
+            .apply_compaction(
+                index,
+                &CompactionRequest {
+                    revision: revisions[2],
+                    physical: true,
+                },
+            )
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        while f.state.compaction_pending() {
+            let index = f.state.applied + 1;
+            f.state.apply_compaction_step(index).await.unwrap();
+        }
+        let compacted = feed_state(&f.state);
+        let feed = f.feed.clone();
+        f.stream.after_scan = Some(Box::new(move || {
+            feed.send_replace(compacted);
+        }));
+        f.stream
+            .create(request(1, "k", revisions[0]))
+            .await
+            .unwrap();
+        assert!(f.stream.after_scan.is_none(), "the scan ran");
+        let responses = f.responses();
+        assert_eq!(responses.len(), 2);
+        assert!(responses[0].created);
+        assert!(responses[1].canceled);
+        assert_eq!(
+            (responses[1].watch_id, responses[1].compact_revision),
+            (1, revisions[2])
+        );
+        assert_eq!(f.stream.watchers.keys().copied().collect::<Vec<_>>(), [2]);
+        let next = f.put("other", "1").await;
+        f.stream.batch(&next).await.unwrap();
+        assert_eq!(f.events(), [(2, next.revision, 0)]);
         f.close().await;
     }
 

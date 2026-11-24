@@ -140,13 +140,31 @@ struct Args {
     /// Automatic snapshots also wait for this many appended log bytes. Zero uses only the entry interval.
     #[arg(long, default_value_t = slatedb_etcd::node::DEFAULT_SNAPSHOT_MIN_BYTES)]
     snapshot_min_bytes: u64,
-    /// State layout of a new cluster. Shared keeps one SlateDB for the cluster and supports one
-    /// voter in this release. An existing data directory must keep its mode.
+    /// State layout of a new cluster. Shared keeps one SlateDB for the cluster. Its members need
+    /// one S3 bucket and prefix. An existing data directory must keep its mode.
     #[arg(long, value_enum, default_value = "replicated")]
     state_mode: slatedb_etcd::state::StateMode,
     /// Shared mode: flush and publish a checkpoint when the oldest unflushed write is this old.
     #[arg(long, default_value = "10s", value_parser = humantime::parse_duration)]
     view_max_age: std::time::Duration,
+    /// Shared mode: a read fails with a retryable error when its view is older than this.
+    #[arg(long, default_value = "5m", value_parser = humantime::parse_duration)]
+    view_pin_max: std::time::Duration,
+    /// Shared mode: reject client proposals above this overlay size, in bytes. Apply waits
+    /// above twice this size.
+    #[arg(long, default_value_t = slatedb_etcd::server::DEFAULT_OVERLAY_MAX_BYTES)]
+    overlay_max_bytes: u64,
+    /// Shared mode: a new leader does not start its writer while its clock is behind the shared
+    /// writer clock by more than this.
+    #[arg(long, default_value = "5s", value_parser = humantime::parse_duration)]
+    max_clock_skew: std::time::Duration,
+    /// Shared mode: `off` keeps every view checkpoint. `fenced` deletes unpinned old ones, with
+    /// a known race against a new leader.
+    #[arg(long, value_enum, default_value = "off")]
+    view_retention: slatedb_etcd::state::ViewRetention,
+    /// Size of one Raft log file. Truncation frees disk space one whole file at a time.
+    #[arg(long, default_value_t = slatedb_etcd::storage::DEFAULT_LOG_FILE_BYTES)]
+    log_file_bytes: u64,
     /// Log entry cache budget in bytes.
     #[arg(long, default_value_t = 8 * 1024 * 1024)]
     log_cache_bytes: usize,
@@ -185,7 +203,48 @@ struct Args {
     log_term_bytes: usize,
 }
 
+/// Convert a stopped replicated S3 member to shared state mode. Run it on every member.
+#[derive(Parser)]
+#[command(name = "slatedb-etcd convert-to-shared")]
+struct ConvertArgs {
+    /// Persistent member ID of the data directory.
+    #[arg(long)]
+    id: u64,
+    /// Data directory of the stopped member.
+    #[arg(long)]
+    dir: PathBuf,
+    /// Shared cluster identity.
+    #[arg(long, default_value = "slatedb-raft-poc")]
+    cluster_id: String,
+    /// Logical quota of the shared cluster claim in bytes. Zero selects 2 GiB. A negative value
+    /// disables the quota.
+    #[arg(long, default_value = "0", allow_negative_numbers = true)]
+    quota_backend_bytes: i64,
+}
+
+/// Print the Raft snapshot record of a stopped member and the view checkpoint that it names.
+#[derive(Parser)]
+#[command(name = "slatedb-etcd shared-status")]
+struct StatusArgs {
+    /// Data directory of the stopped member.
+    #[arg(long)]
+    dir: PathBuf,
+}
+
 fn main() -> Result<()> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("shared-status")) {
+        let args = StatusArgs::parse_from(std::env::args_os().skip(1));
+        let record = slatedb_etcd::convert::member_record(&args.dir)?;
+        println!("{}", serde_json::to_string_pretty(&record)?);
+        return Ok(());
+    }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("convert-to-shared")) {
+        let args = ConvertArgs::parse_from(std::env::args_os().skip(1));
+        return tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(convert(args));
+    }
     let args = Args::parse();
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(args.runtime_workers.unwrap_or_else(default_workers).get())
@@ -197,6 +256,36 @@ fn main() -> Result<()> {
 /// Linux derives this from `sched_getaffinity` and the cgroup CPU quota. Two remains the fallback.
 fn default_workers() -> std::num::NonZeroUsize {
     std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::new(2).unwrap())
+}
+
+async fn convert(args: ConvertArgs) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+    let quota = match args.quota_backend_bytes {
+        0 => 2 * 1024 * 1024 * 1024,
+        quota => quota.max(0) as u64,
+    };
+    let converted =
+        slatedb_etcd::convert::Conversion::new(args.id, args.dir, args.cluster_id, quota)
+            .run()
+            .await?;
+    println!(
+        "member {} converted: base index {}, term {}, source member {}{}",
+        args.id,
+        converted.index,
+        converted.term,
+        converted.source,
+        if converted.planned {
+            ", planned here"
+        } else {
+            ""
+        }
+    );
+    Ok(())
 }
 
 async fn run(args: Args) -> Result<()> {
@@ -235,6 +324,7 @@ async fn run(args: Args) -> Result<()> {
         snapshot_every: args.snapshot_every,
         watch_progress_notify_interval: args.watch_progress_notify_interval,
         snapshot_min_bytes: args.snapshot_min_bytes,
+        log_file_bytes: args.log_file_bytes,
         log_memory: LogMemory {
             cache_bytes: args.log_cache_bytes,
             pending_bytes: args.log_pending_bytes,
@@ -253,6 +343,10 @@ async fn run(args: Args) -> Result<()> {
         restore_snapshot: args.restore_snapshot,
         state_mode: args.state_mode,
         view_max_age: args.view_max_age,
+        view_pin_max: args.view_pin_max,
+        overlay_max_bytes: args.overlay_max_bytes,
+        max_clock_skew: args.max_clock_skew,
+        view_retention: args.view_retention,
     };
     let mut server = Server::start(config).await?;
     tracing::info!(node = args.id, listen = %server.client_addr(), "Node started");

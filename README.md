@@ -1,5 +1,10 @@
 # SlateDB etcd service
 
+> [!WARNING]
+> **Early development.** This project changes fast. It gives no compatibility guarantee: APIs,
+> flags, configuration, on-disk and S3 formats, and backup formats can change in any release
+> without a migration path. Do not use it for data that you cannot rebuild.
+
 An experimental etcd v3 compatible service built with Raft and SlateDB.
 Each replica uses `raft-rs` for consensus, `raft-engine` for durable logs, and SlateDB for state.
 SlateDB's native WAL is disabled. Raft protects acknowledged writes.
@@ -86,6 +91,7 @@ for Auth and separate TLS client and peer listeners.
 | Maintenance | Status, health, HashKV, alarms, native backups, restore, and defragmentation |
 | Transport | Client TLS, peer TLS, mutual authentication, and certificate identity |
 | Storage | Physical Compact, background snapshots, separate apply, and bounded log pools |
+| Shared state | Prototype: one SlateDB in S3 for the cluster, written by the leader |
 
 Native backups and the deprecated backend Hash differ from etcd bbolt.
 Use the native restore flag, not `etcdutl`. Binary Downgrade returns Unimplemented.

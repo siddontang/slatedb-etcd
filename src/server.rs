@@ -25,6 +25,10 @@ pub enum MetricsLevel {
 
 /// The default age limit of unflushed shared-mode writes.
 pub const DEFAULT_VIEW_MAX_AGE: Duration = Duration::from_secs(10);
+/// The default time that a shared-mode read view may pin its base checkpoint.
+pub const DEFAULT_VIEW_PIN_MAX: Duration = Duration::from_secs(5 * 60);
+/// The default soft limit of the shared-mode overlay.
+pub const DEFAULT_OVERLAY_MAX_BYTES: u64 = 1 << 30;
 
 /// Configuration for one member. Preserve its ID, cluster ID, and directory across restarts.
 #[derive(Clone)]
@@ -48,6 +52,8 @@ pub struct ServerConfig {
     pub watch_progress_notify_interval: Duration,
     /// Automatic log truncation waits for this many appended log bytes.
     pub snapshot_min_bytes: u64,
+    /// Size of one Raft log file.
+    pub log_file_bytes: u64,
     pub log_memory: LogMemory,
     /// Weight budgets for cached SST blocks and SST metadata.
     pub state_cache: crate::state::StateCache,
@@ -62,6 +68,16 @@ pub struct ServerConfig {
     pub state_mode: crate::state::StateMode,
     /// Shared mode: flush and publish a checkpoint when the oldest unflushed write is this old.
     pub view_max_age: Duration,
+    /// Shared mode: a read fails with a retryable error when its view is older than this.
+    pub view_pin_max: Duration,
+    /// Shared mode: the leader rejects client proposals above this overlay size, and apply
+    /// waits above twice this size.
+    pub overlay_max_bytes: u64,
+    /// Shared mode: a new leader does not start its writer while its clock is behind the
+    /// shared writer clock by more than this.
+    pub max_clock_skew: Duration,
+    /// Shared mode: whether the leader deletes old view checkpoints. Off by default.
+    pub view_retention: crate::state::ViewRetention,
 }
 
 impl ServerConfig {
@@ -85,6 +101,7 @@ impl ServerConfig {
             watch_progress_notify_interval: crate::grpc::DEFAULT_WATCH_PROGRESS_INTERVAL,
             snapshot_every: 10_000,
             snapshot_min_bytes: crate::node::DEFAULT_SNAPSHOT_MIN_BYTES,
+            log_file_bytes: crate::storage::DEFAULT_LOG_FILE_BYTES,
             log_memory: LogMemory::default(),
             state_cache: crate::state::StateCache::default(),
             quota_bytes: 0,
@@ -94,6 +111,10 @@ impl ServerConfig {
             restore_snapshot: None,
             state_mode: crate::state::StateMode::Replicated,
             view_max_age: DEFAULT_VIEW_MAX_AGE,
+            view_pin_max: DEFAULT_VIEW_PIN_MAX,
+            overlay_max_bytes: DEFAULT_OVERLAY_MAX_BYTES,
+            max_clock_skew: Duration::from_secs(5),
+            view_retention: crate::state::ViewRetention::Off,
         }
     }
 }
@@ -127,10 +148,6 @@ impl Server {
         ensure!(
             !config.join || config.restore_snapshot.is_none(),
             "join cannot restore a snapshot"
-        );
-        ensure!(
-            config.state_mode.is_replicated() || config.restore_snapshot.is_none(),
-            "shared state mode cannot restore a snapshot until phase 2"
         );
         ensure!(
             config.id != 0 && !config.peers.contains_key(&0),
@@ -239,6 +256,7 @@ impl Server {
         if let Some(address) = config.client_peers.get_mut(&config.id) {
             resolve_port(address, config.listen)?;
         }
+        let mut restore = None;
         if let Some(backup) = config.restore_snapshot.take() {
             let mut members = crate::cluster::Store::initial(&config.peers);
             for (&id, address) in &config.client_peers {
@@ -246,13 +264,23 @@ impl Server {
                     member.client_ur_ls = vec![crate::cluster::url(address)];
                 }
             }
-            crate::state::StateMachine::restore_backup(
-                &backup,
-                &config.dir,
-                config.id,
-                &config.cluster_id,
-                &members,
-            )?;
+            if config.state_mode.is_replicated() {
+                crate::state::StateMachine::restore_backup(
+                    &backup,
+                    &config.dir,
+                    config.id,
+                    &config.cluster_id,
+                    &members,
+                )?;
+            } else {
+                // A new shared cluster gets the rows in its shared database when it opens.
+                restore = Some(crate::state::StateMachine::restore_shared(
+                    &backup,
+                    &config.dir,
+                    config.id,
+                    &members,
+                )?);
+            }
         }
         // Snapshot restore must see the original data directory before AutoTLS creates fixtures.
         if client_auto {
@@ -282,6 +310,7 @@ impl Server {
                 client_peers: config.client_peers.clone(),
                 snapshot_every: config.snapshot_every,
                 snapshot_min_bytes: config.snapshot_min_bytes,
+                log_file_bytes: config.log_file_bytes,
                 log_memory: config.log_memory,
                 state_cache: config.state_cache,
                 quota_bytes: config.quota_bytes,
@@ -291,6 +320,11 @@ impl Server {
                 require_peer_tls: config.allow_remote,
                 state_mode: config.state_mode,
                 view_max_age: config.view_max_age,
+                view_pin_max: config.view_pin_max,
+                overlay_max_bytes: config.overlay_max_bytes,
+                max_clock_skew: config.max_clock_skew,
+                view_retention: config.view_retention,
+                restore,
                 transport,
             },
             events.clone(),
@@ -300,6 +334,7 @@ impl Server {
             events: events.clone(),
             cluster_id: config.cluster_id.clone(),
             location: Some(node.location.clone()),
+            shared: node.shared_source(),
         });
         // Peer gRPC has no RPC metrics; diagnostics paths never collide with gRPC services.
         let peer_app = App::new(

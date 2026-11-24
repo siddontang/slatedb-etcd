@@ -74,12 +74,14 @@ pub async fn prepare(
     command: &LeaseCommand,
 ) -> Result<PreparedLease, KvError> {
     let (prepared, _) =
-        prepare_with_counts(db, revision, compact_revision, index, leases, command).await?;
+        prepare_with_counts(db, None, revision, compact_revision, index, leases, command).await?;
     Ok(prepared)
 }
 
+/// Evaluate a lease command. `index_keys` must describe the applied current rows of `db`.
 pub(crate) async fn prepare_with_counts(
     db: &impl StateRead,
+    index_keys: Option<&crate::state::key_index::KeyIndex>,
     revision: i64,
     compact_revision: i64,
     index: u64,
@@ -143,7 +145,8 @@ pub(crate) async fn prepare_with_counts(
             }
             if valid {
                 (batch, next, deletes) =
-                    mvcc::revoke_keys(db, revision, compact_revision, id, leases).await?;
+                    mvcc::revoke_keys(db, index_keys, revision, compact_revision, id, leases)
+                        .await?;
                 change = Some((id, None));
             }
             LeaseReply::Revoke(LeaseRevokeResponse {
@@ -158,7 +161,7 @@ pub(crate) async fn prepare_with_counts(
                 ttl: record.map_or(-1, |l| l.ttl),
                 granted_ttl: record.map_or(0, |l| l.ttl),
                 keys: if keys && record.is_some() {
-                    mvcc::lease_keys(db, id).await?
+                    mvcc::lease_keys(db, index_keys, id).await?
                 } else {
                     vec![]
                 },

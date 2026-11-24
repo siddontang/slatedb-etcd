@@ -40,25 +40,29 @@ mod source;
 pub(crate) mod transfer;
 pub(crate) mod view;
 pub(crate) use read::ReadView;
-pub use shared::StateMode;
+pub use shared::{StateMode, ViewRetention};
 pub use source::{Row, StateRead, StateScan};
 use view::StateView;
 #[cfg(test)]
 mod history_tests;
 #[cfg(test)]
 mod key_index_tests;
+#[cfg(test)]
+mod lease_index_tests;
 pub(crate) mod maintenance;
 #[cfg(test)]
 mod quota_tests;
 #[cfg(test)]
 mod shared_tests;
 
-const APPLIED: &[u8] = b"meta/applied";
+pub(crate) const APPLIED: &[u8] = b"meta/applied";
 /// The apply position with its Raft term: `(index, term)`, two big-endian `u64` values.
 /// Every state batch writes it with `meta/applied`. Binaries before this row advance
 /// `meta/applied` alone, so the term is valid only while its index equals `meta/applied`.
 /// Logical images and native backups omit the row. See `read_applied_term`.
 pub(crate) const APPLIED_TERM: &[u8] = b"meta/applied-term";
+/// The logical size counter. Each state batch updates it with the apply marker.
+const LOGICAL_SIZE: &[u8] = b"meta/logical-size";
 const DATA: &[u8] = b"data/";
 
 #[derive(Deserialize, Serialize)]
@@ -70,7 +74,8 @@ struct SnapshotData {
 
 pub struct StateMachine {
     pub(crate) metrics: Arc<crate::metrics::StateMeters>,
-    pub(crate) db: Arc<Db>,
+    /// The replicated database. Shared mode has no writer here: the leader task opens it.
+    database: Option<Arc<Db>>,
     pub auth: Arc<crate::auth::Store>,
     pub members: Arc<crate::cluster::Store>,
     pub(crate) admin: Arc<slatedb::admin::Admin>,
@@ -219,6 +224,33 @@ pub(crate) fn slatedb_settings() -> Settings {
     settings
 }
 
+/// Read the stored logical size, or count it when the counter does not match the apply marker.
+///
+/// Directories from older binaries have no counter. An older binary that writes to a directory
+/// moves the apply marker past the counter, so the next open counts again.
+async fn load_logical_size(db: &impl StateRead, applied: u64) -> Result<u64> {
+    use prost::Message;
+    let stored = match db.get(LOGICAL_SIZE).await? {
+        Some(row) => {
+            let counter =
+                crate::proto::state::LogicalSize::decode(row).context("invalid size counter")?;
+            (counter.applied == applied).then_some(counter.bytes)
+        }
+        None => None,
+    };
+    let Some(bytes) = stored else {
+        return maintenance::count_logical_size(db).await;
+    };
+    if cfg!(debug_assertions) {
+        let counted = maintenance::count_logical_size(db).await?;
+        ensure!(
+            counted == bytes,
+            "stored logical size {bytes} differs from the counted size {counted}"
+        );
+    }
+    Ok(bytes)
+}
+
 /// The first key after every `etcd/current/` key.
 const CURRENT_END: &[u8] = b"etcd/current0";
 
@@ -291,7 +323,15 @@ impl StateMachine {
                 "SlateDB sequence and apply marker differ"
             );
             let reads = StateView::Live(db.clone());
-            Self::load(db.clone(), admin, location, rows, reads, None).await
+            Self::load(
+                Some(db.clone()),
+                Arc::new(admin),
+                location,
+                rows,
+                reads,
+                None,
+            )
+            .await
         }
         .await;
         if result.is_err() {
@@ -304,10 +344,10 @@ impl StateMachine {
         Ok(state)
     }
 
-    /// Build the derived state from `reads`, the applied state of `db`.
+    /// Build the derived state from `reads`, the applied state of `db` or of a shared base.
     async fn load(
-        db: Arc<Db>,
-        admin: slatedb::admin::Admin,
+        db: Option<Arc<Db>>,
+        admin: Arc<slatedb::admin::Admin>,
         location: Arc<transfer::Location>,
         rows: Arc<rows::RowCache>,
         reads: StateView,
@@ -340,11 +380,12 @@ impl StateMachine {
             (Some(_), Some(bytes)) => {
                 u64::from_be_bytes(bytes.as_ref().try_into().context("invalid logical size")?)
             }
-            _ => maintenance::count_logical_size(&reads).await?,
+            (Some(_), None) => maintenance::count_logical_size(&reads).await?,
+            (None, _) => load_logical_size(&reads, applied).await?,
         };
         Ok(Self {
             members: Arc::new(members),
-            admin: Arc::new(admin),
+            admin,
             metrics: Arc::new(crate::metrics::StateMeters::new()?),
             quota: 0,
             current: current::CurrentRows::default(),
@@ -354,7 +395,7 @@ impl StateMachine {
             write_batches: 0,
             alarms,
             auth: Arc::new(auth),
-            db,
+            database: db,
             applied,
             applied_term,
             entry_term: applied_term,
@@ -373,6 +414,18 @@ impl StateMachine {
         })
     }
 
+    /// The replicated database, if any.
+    pub(crate) fn database(&self) -> Option<Arc<Db>> {
+        self.database.clone()
+    }
+
+    /// The replicated database. Only replicated paths call this.
+    pub(crate) fn db(&self) -> &Arc<Db> {
+        self.database
+            .as_ref()
+            .expect("replicated state has a database")
+    }
+
     /// The applied state that apply and the apply owner read. Replicated writes go to `db`.
     pub(crate) fn applied_state(&self) -> &StateView {
         &self.reads
@@ -383,7 +436,7 @@ impl StateMachine {
         if let Some(shared) = &self.shared {
             return Ok(shared.pinned());
         }
-        let snapshot = self.db.snapshot()?;
+        let snapshot = self.db().snapshot()?;
         ensure!(
             snapshot.seq() == self.applied,
             "read view does not match applied state"
@@ -455,13 +508,24 @@ impl StateMachine {
                 self.rows.invalidate(key, index);
             }
         }
+        // The counters are outside `etcd/`, so they do not count themselves.
         if self.is_shared() {
             batch.put(shared::LOGICAL_BYTES, size.to_be_bytes());
+        } else {
+            use prost::Message;
+            batch.put(
+                LOGICAL_SIZE,
+                crate::proto::state::LogicalSize {
+                    applied: index,
+                    bytes: size,
+                }
+                .encode_to_vec(),
+            );
         }
         let batch = Arc::new(batch);
         match &mut self.shared {
             None => {
-                self.db
+                self.db()
                     .write_with_options(batch.to_storage(), &WriteOptions { seqnum: index })
                     .await?;
             }
@@ -491,9 +555,10 @@ impl StateMachine {
 
     pub(crate) async fn close(&self) -> Result<()> {
         // Raft keeps acknowledged writes durable. Shutdown does not require a new checkpoint.
-        self.db
-            .close_with_options(slatedb::config::CloseOptions { flush_type: None })
-            .await?;
+        if let Some(db) = &self.database {
+            db.close_with_options(slatedb::config::CloseOptions { flush_type: None })
+                .await?;
+        }
         Ok(())
     }
 }
@@ -562,10 +627,10 @@ fn snapshot_key(key: &[u8]) -> bool {
     key.starts_with(DATA) || key.starts_with(b"etcd/") || key == APPLIED || derived_key(key)
 }
 
-/// Return true for a meta row that each state derives again: the applied term and the shared-mode
-/// logical size. Format 4 images and backups omit these rows, so the previous reader accepts them.
+/// Return true for a meta row that each state derives again: the applied term and the logical
+/// size counters. Format 4 images and backups omit these rows, so the previous reader accepts them.
 fn derived_key(key: &[u8]) -> bool {
-    key == APPLIED_TERM || key == shared::LOGICAL_BYTES
+    key == APPLIED_TERM || key == shared::LOGICAL_BYTES || key == LOGICAL_SIZE
 }
 
 fn data_key(key: &str) -> Vec<u8> {

@@ -31,6 +31,7 @@ def main():
               "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
               "jepsen_requested": args.jepsen, "runs": []}
     for seed in seeds:
+        print(f"Checking process faults for seed {seed}", flush=True)
         started = time.time()
         folder = directory / f"robustness-{seed}"
         env = dict(os.environ, SLATEDB_TEST_RESULTS=str(directory), SLATEDB_TEST_SEED=str(seed))

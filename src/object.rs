@@ -26,8 +26,14 @@ pub enum Config {
     #[default]
     Local,
     S3(S3),
+    /// A local directory that several members of one host share. Only shared state mode uses
+    /// it. It serves tests and single-host experiments. It is not a production layout.
+    SharedDirectory(std::path::PathBuf),
     #[cfg(test)]
     Test(Arc<dyn ObjectStore>, String),
+    /// The S3 layout on another store, for tests.
+    #[cfg(test)]
+    TestS3(Arc<dyn ObjectStore>, S3),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,19 +195,17 @@ struct Binding {
 }
 
 impl Config {
-    /// Open the member state. Shared mode applies `quota` and the initial `voters` when it
-    /// creates the cluster claim.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn open(
+    /// Open the member state. Shared mode uses `shared` for the cluster claim and its views.
+    pub(crate) async fn open(
         &self,
         dir: &Path,
         cluster: &str,
         member: u64,
         cache: crate::state::StateCache,
         mode: StateMode,
-        quota: u64,
-        voters: &[u64],
+        shared: &crate::state::shared::Options,
     ) -> Result<StateMachine> {
+        let local = crate::state::transfer::Backend::Local;
         #[cfg(test)]
         if let Self::Test(store, path) = self {
             return match mode {
@@ -209,19 +213,28 @@ impl Config {
                     StateMachine::open_store_with_cache(store.clone(), path, cache).await
                 }
                 StateMode::Shared => {
-                    let backend = crate::state::transfer::Backend::Local;
-                    StateMachine::open_shared(
-                        store.clone(),
-                        path,
-                        cluster,
-                        cache,
-                        quota,
-                        voters,
-                        backend,
-                    )
-                    .await
+                    StateMachine::open_shared(store.clone(), path, cluster, cache, shared, local)
+                        .await
                 }
             };
+        }
+        if let Self::SharedDirectory(objects) = self {
+            ensure!(
+                mode == StateMode::Shared,
+                "a shared directory needs shared state mode"
+            );
+            let binding = bind(dir, cluster, member, None, mode)?;
+            std::fs::create_dir_all(objects)?;
+            let store = slatedb::object_store::local::LocalFileSystem::new_with_prefix(objects)?;
+            let store: Arc<dyn ObjectStore> = Arc::new(store.with_fsync(true));
+            let prefix = format!("member-{member}");
+            let quota =
+                claim_shared(store.as_ref(), "", &prefix, cluster, &binding, shared).await?;
+            let shared = crate::state::shared::Options {
+                quota,
+                ..shared.clone()
+            };
+            return StateMachine::open_shared(store, "", cluster, cache, &shared, local).await;
         }
         let s3 = match self {
             Self::S3(s3) => {
@@ -229,6 +242,8 @@ impl Config {
                 s3.validate()?;
                 Some(s3)
             }
+            #[cfg(test)]
+            Self::TestS3(_, s3) => Some(s3.clone()),
             _ => None,
         };
         let binding = bind(dir, cluster, member, s3, mode)?;
@@ -236,19 +251,21 @@ impl Config {
             let objects = dir.join("objects");
             return match mode {
                 StateMode::Replicated => StateMachine::open_with_cache(&objects, cache).await,
-                // A local shared store serves one host. Phase 1 uses it for one-voter tests.
+                // A member-local store serves one voter. Several members need a shared store.
                 StateMode::Shared => {
+                    ensure!(
+                        shared.voters.len() == 1 && !shared.join,
+                        "several shared-mode members need a shared object store"
+                    );
                     std::fs::create_dir_all(&objects)?;
-                    let local =
+                    let store =
                         slatedb::object_store::local::LocalFileSystem::new_with_prefix(&objects)?;
-                    let store = Arc::new(local.with_fsync(true));
-                    let backend = crate::state::transfer::Backend::Local;
-                    StateMachine::open_shared(store, "", cluster, cache, quota, voters, backend)
-                        .await
+                    let store = Arc::new(store.with_fsync(true));
+                    StateMachine::open_shared(store, "", cluster, cache, shared, local).await
                 }
             };
         };
-        let store = s3.store()?;
+        let store = self.s3_store(s3)?;
         let prefix = s3.member_prefix(cluster, member);
         let backend = crate::state::transfer::Backend::S3 {
             bucket: s3.bucket.clone(),
@@ -262,20 +279,89 @@ impl Config {
                 StateMachine::open_backend(store, &format!("{prefix}/state"), cache, backend).await
             }
             StateMode::Shared => {
-                let quota = claim_shared(
-                    store.as_ref(),
-                    &root,
-                    &prefix,
-                    cluster,
-                    &binding,
+                let quota =
+                    claim_shared(store.as_ref(), &root, &prefix, cluster, &binding, shared).await?;
+                let shared = crate::state::shared::Options {
                     quota,
-                    voters,
-                )
-                .await?;
-                StateMachine::open_shared(store, &root, cluster, cache, quota, voters, backend)
-                    .await
+                    ..shared.clone()
+                };
+                StateMachine::open_shared(store, &root, cluster, cache, &shared, backend).await
             }
         }
+    }
+}
+
+impl Config {
+    /// The object store of an S3 configuration.
+    pub(crate) fn s3_store(&self, s3: &S3) -> Result<Arc<dyn ObjectStore>> {
+        #[cfg(test)]
+        if let Self::TestS3(store, _) = self {
+            return Ok(store.clone());
+        }
+        s3.store()
+    }
+}
+
+/// Read the object store binding of a data directory.
+fn read_binding(dir: &Path) -> Result<Binding> {
+    let path = dir.join("object-store.json");
+    ensure!(
+        path.exists(),
+        "the data directory has no object store binding"
+    );
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+
+/// Write the binding of a data directory atomically.
+fn write_binding(dir: &Path, binding: &Binding) -> Result<()> {
+    let temporary = dir.join("object-store.json.pending");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(&serde_json::to_vec(binding)?)?;
+    file.sync_all()?;
+    std::fs::rename(temporary, dir.join("object-store.json"))?;
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// The S3 settings of a replicated member directory of `cluster`, or of a member that a
+/// conversion already changed to shared mode.
+pub(crate) fn converted_s3(dir: &Path, cluster: &str, member: u64) -> Result<(S3, StateMode)> {
+    let binding = read_binding(dir)?;
+    ensure!(
+        binding.version == 1 && binding.cluster == cluster && binding.member == member,
+        "the data directory belongs to another cluster or member"
+    );
+    let s3 = binding
+        .s3
+        .context("only a member with S3 state can be converted")?;
+    Ok((s3, binding.mode))
+}
+
+/// Change the binding of a stopped replicated member to shared mode.
+///
+/// The member writes its shared binding claim first, then its local binding, and then deletes
+/// its replicated owner claim. Each step can run again after a crash. A shared member refuses to
+/// start while any member namespace still has a replicated owner claim, so the cluster starts
+/// only after every member is converted.
+pub(crate) async fn convert_binding(
+    dir: &Path,
+    store: &dyn ObjectStore,
+    cluster: &str,
+    member: u64,
+) -> Result<()> {
+    let mut binding = read_binding(dir)?;
+    let s3 = binding.s3.clone().context("the member has no S3 state")?;
+    let prefix = s3.member_prefix(cluster, member);
+    binding.mode = StateMode::Shared;
+    claim(store, &prefix, BINDING, &binding).await?;
+    write_binding(dir, &binding)?;
+    match store.delete(&format!("{prefix}/{OWNER}").into()).await {
+        Ok(()) | Err(slatedb::object_store::Error::NotFound { .. }) => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -301,17 +387,26 @@ async fn claim_shared(
     prefix: &str,
     cluster: &str,
     binding: &Binding,
-    quota: u64,
-    voters: &[u64],
+    shared: &crate::state::shared::Options,
 ) -> Result<u64> {
     ensure!(
         !crate::state::shared::has_replicated_member(store, root).await?,
         "the cluster uses Replicated state mode"
     );
+    // A joining member is not an initial voter. It checks the existing cluster before it writes
+    // anything, so a failed join leaves an empty namespace empty.
+    let joined = if shared.join {
+        Some(crate::state::shared::claimed_quota(store, root, cluster).await?)
+    } else {
+        None
+    };
     crate::state::shared::claim_mode(store, root, cluster, StateMode::Shared).await?;
     // A shared-mode member keeps no state of its own. Its binding records the mode.
     claim(store, prefix, BINDING, binding).await?;
-    crate::state::shared::claim(store, root, cluster, quota, voters).await
+    if let Some(quota) = joined {
+        return Ok(quota);
+    }
+    crate::state::shared::claim(store, root, cluster, shared.quota, &shared.voters).await
 }
 
 /// The claim of a replicated member namespace.
@@ -394,6 +489,7 @@ async fn claim(store: &dyn ObjectStore, prefix: &str, name: &str, binding: &Bind
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use slatedb::object_store::memory::InMemory;
 
     fn s3() -> S3 {
@@ -470,7 +566,15 @@ mod tests {
                 claim_replicated(store, &root, &prefix, "cluster", &binding).await
             }
             StateMode::Shared => {
-                claim_shared(store, &root, &prefix, "cluster", &binding, 0, voters)
+                let options = crate::state::shared::Options {
+                    quota: 0,
+                    voters: voters.to_vec(),
+                    join: false,
+                    empty_log: true,
+                    pin_max: Duration::from_secs(300),
+                    restore: None,
+                };
+                claim_shared(store, &root, &prefix, "cluster", &binding, &options)
                     .await
                     .map(drop)
             }
@@ -552,6 +656,37 @@ mod tests {
                 .await
                 .is_err());
         }
+        // A failed join writes nothing, so a replicated bootstrap still succeeds.
+        let dirs = tempfile::tempdir().unwrap();
+        let store = InMemory::new();
+        let config = s3();
+        let binding = bind(
+            &dirs.path().join("4"),
+            "cluster",
+            4,
+            Some(config.clone()),
+            StateMode::Shared,
+        )
+        .unwrap();
+        let joining = crate::state::shared::Options {
+            quota: 0,
+            voters: vec![],
+            join: true,
+            empty_log: true,
+            pin_max: Duration::from_secs(300),
+            restore: None,
+        };
+        let root = config.cluster_prefix("cluster");
+        let prefix = config.member_prefix("cluster", 4);
+        assert!(
+            claim_shared(&store, &root, &prefix, "cluster", &binding, &joining)
+                .await
+                .is_err()
+        );
+        assert!(store.list(None).next().await.is_none());
+        start(&store, dirs.path(), 1, StateMode::Replicated, &[1])
+            .await
+            .unwrap();
         // A shared cluster accepts its bootstrap voters in any order.
         let dirs = tempfile::tempdir().unwrap();
         let store = InMemory::new();
@@ -585,6 +720,82 @@ mod tests {
             let mut config = s3();
             config.prefix = prefix.into();
             assert!(config.validate().is_err());
+        }
+    }
+
+    /// The object keys that shared members touch at startup. The S3 policy in the shared state
+    /// guide grants exactly these. Every member reads `mode.json`, the shared claims, the shared
+    /// state, and the owner claims of all members. A voter writes its own binding and the shared
+    /// keys. A joining learner writes only its own binding.
+    #[tokio::test]
+    async fn shared_members_touch_the_keys_of_the_guide_policy() {
+        use crate::object::faults::FaultStore;
+        let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+        let config = Config::TestS3(faults.clone(), s3());
+        let root = format!("{}/", s3().cluster_prefix("cluster"));
+        let dirs = tempfile::tempdir().unwrap();
+        let open = |member: u64, join: bool| {
+            let config = config.clone();
+            let dir = dirs.path().join(member.to_string());
+            async move {
+                let options = crate::state::shared::Options {
+                    quota: 0,
+                    voters: vec![1, 2],
+                    join,
+                    empty_log: true,
+                    pin_max: Duration::from_secs(300),
+                    restore: None,
+                };
+                config
+                    .open(
+                        &dir,
+                        "cluster",
+                        member,
+                        crate::state::StateCache::default(),
+                        StateMode::Shared,
+                        &options,
+                    )
+                    .await
+                    .unwrap()
+                    .close()
+                    .await
+                    .unwrap();
+            }
+        };
+        let keys = |set: &std::sync::Mutex<std::collections::BTreeSet<String>>| {
+            let keys: Vec<String> = std::mem::take(&mut *set.lock().unwrap())
+                .into_iter()
+                .map(|key| key.strip_prefix(&root).expect("a cluster key").to_owned())
+                .collect();
+            keys
+        };
+        open(1, false).await;
+        let written = keys(&faults.written);
+        assert!(
+            written.iter().all(|key| key == "mode.json"
+                || key == "member-1/binding.json"
+                || key.starts_with("shared/")),
+            "{written:?}"
+        );
+        keys(&faults.read);
+        for (member, join) in [(2, false), (3, true)] {
+            open(member, join).await;
+            let written = keys(&faults.written);
+            let own = format!("member-{member}/");
+            assert!(
+                written
+                    .iter()
+                    .all(|key| key.starts_with(&own) || (!join && key.starts_with("shared/"))),
+                "member {member} wrote {written:?}"
+            );
+            let read = keys(&faults.read);
+            assert!(
+                read.iter().all(|key| key == "mode.json"
+                    || key.starts_with("shared/")
+                    || key.starts_with(&own)
+                    || (key.starts_with("member-") && key.ends_with("/owner.json"))),
+                "member {member} read {read:?}"
+            );
         }
     }
 }

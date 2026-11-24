@@ -42,6 +42,19 @@ A partition test replays retained history on a lagging member, then checks rejec
 
 [watch-guarantees]: https://etcd.io/docs/v3.6/learning/api_guarantees/#watch-apis
 
+## Pull request checks
+
+Every pull request runs the Rust tests, lint, release builds, and publication checks.
+Smoke tests compare three-member KV operations with etcd and check single-member write metrics.
+Documentation, saved reports, examples, Rust integration tests, metrics, and the health RPC use
+these fast checks. Any other changed path selects full verification for the whole pull request.
+Full verification adds the upstream suites, process faults, recovery, fuzzing, and benchmarks.
+
+Add the `ci:full` label to run full verification on any pull request.
+The Verify workflow also runs the full suite on each push to main and daily at 02:37 UTC.
+Use the Verify workflow dispatch to run it on a branch. Select `extended` for more fault seeds.
+The separate weekly Full etcd suites workflow runs the larger upstream matrix on Sundays.
+
 ## Repeat a saved history
 
 ```sh
@@ -73,6 +86,13 @@ Repeat a failing seed with the same command. Each run also writes a partial `see
 The test drives real storage with a simulated transport and Raft clock.
 It checks lease generations, Watch journals, auth revocation, and physical compaction after
 recovery. It does not simulate lease expiry time.
+
+`--shared-seeds`, default `1,2,3`, runs the shared state schedules. Three members share one
+in-memory object store, and the simulation drives the leader writer one step at a time. The
+schedules stop members between writer steps, open late writers, fail SST writes, partition a
+member, and run retention and GC. After every step each member's view must equal a replicated
+reference at the same index. The simulated writer compacts only on request, so GC deletes the
+same SSTs on every replay. Each run writes `shared-seed-N.json`.
 The scheduler controls disk execution, completion delivery, and apply jobs.
 A 1 KiB cache forces asynchronous reads. Each schedule checks all four log pool limits.
 It injects read and write failure, restart, and late read completion after a term change.

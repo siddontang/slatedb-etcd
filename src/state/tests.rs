@@ -27,7 +27,7 @@ async fn read(state: &StateMachine, key: &[u8], revision: i64) -> Outcome {
 }
 
 async fn history_len(state: &StateMachine) -> usize {
-    let mut scan = state.db.scan_prefix(b"etcd/history/", ..).await.unwrap();
+    let mut scan = state.db().scan_prefix(b"etcd/history/", ..).await.unwrap();
     let mut count = 0;
     while scan.next().await.unwrap().is_some() {
         count += 1;
@@ -109,7 +109,7 @@ async fn read_path_matches_transaction_evaluation_without_a_write_batch() {
                         },
                     ] {
                         let expected = mvcc::prepare(
-                            state.db.as_ref(),
+                            state.db().as_ref(),
                             state.revision,
                             state.compact_revision,
                             &request,
@@ -263,8 +263,8 @@ async fn compaction_removes_history_and_preserves_boundary_versions() {
     let current = read(&state, b"a", 7).await.result.unwrap();
     assert!(matches!(current.response, Some(Resp::ResponseRange(r))
         if r.kvs[0].value == b"fourth" && r.kvs[0].create_revision == 6));
-    state.db.flush().await.unwrap();
-    state.db.close().await.unwrap();
+    state.db().flush().await.unwrap();
+    state.db().close().await.unwrap();
     drop(state);
     let state = StateMachine::open(dir.path()).await.unwrap();
     assert_eq!(
@@ -293,10 +293,10 @@ async fn streamed_snapshot_matches_the_complete_state_encoding() {
             .unwrap();
     }
     let mut rows = vec![];
-    let mut scan = state.db.scan_prefix(b"", ..).await.unwrap();
+    let mut scan = state.db().scan_prefix(b"", ..).await.unwrap();
     while let Some(row) = scan.next().await.unwrap() {
-        // The image omits the term row. Install takes the term from the Raft snapshot.
-        if row.key.as_ref() != crate::cluster::KEY && row.key.as_ref() != APPLIED_TERM {
+        // The image omits the derived rows. Install takes the term from the Raft snapshot.
+        if row.key.as_ref() != crate::cluster::KEY && !derived_key(&row.key) {
             rows.push((row.key.to_vec(), row.value.to_vec()));
         }
     }
@@ -485,8 +485,8 @@ async fn renewed_lease_and_watch_history_survive_snapshot_and_stale_expiry() {
             Some(Resp::ResponseRange(r)) if r.kvs.is_empty())
         );
     }
-    restored.db.flush().await.unwrap();
-    restored.db.close().await.unwrap();
+    restored.db().flush().await.unwrap();
+    restored.db().close().await.unwrap();
     drop(restored);
     let restored = StateMachine::open(other.path()).await.unwrap();
     assert_eq!(restored.applied, 5);
@@ -541,7 +541,7 @@ async fn lease_revoke_deletes_more_keys_than_the_user_transaction_limit() {
         .unwrap();
     assert_eq!(page.responses.len(), 1);
     assert_eq!(page.responses[0].events.len(), 130);
-    assert!(crate::mvcc::lease_keys(state.db.as_ref(), 9)
+    assert!(crate::mvcc::scan_lease_keys(state.db().as_ref(), 9)
         .await
         .unwrap()
         .is_empty());
@@ -814,7 +814,7 @@ async fn hash_rows_in_every_stored_form_hash_and_compact_alike() {
         }
         compare(&state, &mixed, target).await;
         let hash_keys = |state: &StateMachine| {
-            let db = state.db.clone();
+            let db = state.db().clone();
             async move {
                 let mut scan = db.scan_prefix(hash, ..).await.unwrap();
                 let mut keys = vec![];
@@ -841,7 +841,7 @@ async fn direct_put_txns_write_value_once_rows_like_the_evaluator() {
     use prost::Message;
 
     async fn all_rows(state: &StateMachine) -> Vec<(bytes::Bytes, bytes::Bytes)> {
-        let mut scan = state.db.scan_prefix(b"", ..).await.unwrap();
+        let mut scan = state.db().scan_prefix(b"", ..).await.unwrap();
         let mut rows = vec![];
         while let Some(row) = scan.next().await.unwrap() {
             rows.push((row.key, row.value));
@@ -962,7 +962,7 @@ async fn direct_put_txns_write_value_once_rows_like_the_evaluator() {
 
     // The stored rows use the value-once format.
     let get = |state: &StateMachine, key: Vec<u8>| {
-        let db = state.db.clone();
+        let db = state.db().clone();
         async move { db.get(key).await.unwrap().unwrap() }
     };
     for (i, &revision) in revisions.iter().enumerate() {
@@ -1052,7 +1052,7 @@ async fn direct_put_txns_write_value_once_rows_like_the_evaluator() {
         assert_eq!(events(state.watch(&request, None).await.unwrap()), expected);
     }
     // Watch catch-up reads the history rows after a reopen too.
-    direct.db.flush().await.unwrap();
+    direct.db().flush().await.unwrap();
     direct.close().await.unwrap();
     let reopened = StateMachine::open(left.path()).await.unwrap();
     assert_eq!(
@@ -1114,7 +1114,7 @@ async fn the_first_hash_or_journal_row_marks_the_directory() {
         read(&state, b"a", 0).await;
         assert!(!marker.is_marked());
         let hash_or_journal = |state: &StateMachine| {
-            let db = state.db.clone();
+            let db = state.db().clone();
             async move {
                 for prefix in [crate::maintenance::HASH, crate::watch::EVENTS] {
                     if db
@@ -1187,7 +1187,7 @@ async fn apply_without_term(state: &mut StateMachine, index: u64) {
 }
 
 async fn reopen(state: StateMachine, dir: &std::path::Path) -> StateMachine {
-    state.db.flush().await.unwrap();
+    state.db().flush().await.unwrap();
     state.close().await.unwrap();
     drop(state);
     StateMachine::open(dir).await.unwrap()
@@ -1414,7 +1414,7 @@ async fn the_applied_term_changes_no_quota_or_hash() {
         assert_eq!(stored_term(&state).await, Some(term));
         assert_eq!(
             state.logical_size(),
-            maintenance::count_logical_size(state.db.as_ref())
+            maintenance::count_logical_size(state.db().as_ref())
                 .await
                 .unwrap()
         );

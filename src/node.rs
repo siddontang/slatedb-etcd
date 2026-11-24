@@ -94,8 +94,16 @@ pub enum Event {
         snapshot: bool,
         success: bool,
     },
-    /// The shared-mode publisher created this checkpoint. The leader announces it.
-    ViewCheckpoint(uuid::Uuid),
+    /// The shared-mode publisher created this checkpoint. The leader announces it. The reply
+    /// tells whether Raft took the proposal.
+    ViewCheckpoint(uuid::Uuid, Option<tokio::sync::oneshot::Sender<bool>>),
+    /// A member reports the checkpoints that it pins. The leader keeps them.
+    ViewAck {
+        member: u64,
+        checkpoints: std::collections::HashSet<uuid::Uuid>,
+        /// A manual checkpoint on the member asks for a publication through this index.
+        publish: Option<u64>,
+    },
 }
 
 /// Flush SlateDB for log truncation about once per L0 SST instead of once per entry interval.
@@ -110,6 +118,8 @@ pub struct NodeOptions {
     /// Automatic log truncation also waits for this many appended log bytes. Each truncation
     /// flushes SlateDB with synced writes, so small flushes cost more than the log they free.
     pub snapshot_min_bytes: u64,
+    /// Size of one Raft log file. Truncation frees disk space one whole file at a time.
+    pub log_file_bytes: u64,
     pub log_memory: LogMemory,
     pub state_cache: crate::state::StateCache,
     pub quota_bytes: i64,
@@ -123,6 +133,18 @@ pub struct NodeOptions {
     pub state_mode: crate::state::StateMode,
     /// Shared mode: the age of the oldest unflushed write that starts a flush and a checkpoint.
     pub view_max_age: Duration,
+    /// Shared mode: the longest time that a read view may pin its base checkpoint.
+    pub view_pin_max: Duration,
+    /// Shared mode: the leader rejects client proposals above this overlay size. Apply waits
+    /// above twice this size.
+    pub overlay_max_bytes: u64,
+    /// Shared mode: a new writer does not start while the local clock is behind the manifest
+    /// clock by more than this.
+    pub max_clock_skew: Duration,
+    /// Shared mode: whether the leader deletes old view checkpoints.
+    pub view_retention: crate::state::ViewRetention,
+    /// Shared mode: the rows of a native snapshot that seed a new cluster.
+    pub restore: Option<crate::state::shared::Restore>,
 }
 
 impl NodeOptions {
@@ -178,6 +200,10 @@ struct LogTask {
 
 /// Raft tick interval. Election timeouts count these ticks.
 pub(crate) const TICK: Duration = Duration::from_millis(100);
+/// A client write fails if it waits longer than this before proposal, or after it.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Raft's uncommitted byte limit. Writers wait at half of it; see `Node::backlog`.
+const MAX_UNCOMMITTED_BYTES: usize = 2 * log::MAX_BYTES;
 
 pub struct Node {
     pub(crate) metrics: std::sync::Arc<crate::metrics::Member>,
@@ -242,8 +268,11 @@ pub struct Node {
     recovered_from_index: u64,
     send_failures: Vec<(u64, bool)>,
     checkpoint_running: bool,
-    // Full backlog checks by cause: apply lag, queued log jobs, queued log bytes.
-    backlog_rejects: [u64; 3],
+    // Full backlog checks by cause: apply lag, queued log jobs, queued log bytes,
+    // uncommitted Raft bytes, unapplied log bytes.
+    backlog_rejects: [u64; 5],
+    // `REQUEST_TIMEOUT`. Tests that are slow by design raise it.
+    request_timeout: Duration,
     // Log bytes appended since the last checkpoint started.
     appended_bytes: u64,
     // Count full images started for peers or manual checkpoints.
@@ -286,17 +315,17 @@ impl Node {
         );
         if options.state_mode == crate::state::StateMode::Shared {
             ensure!(
-                options.peers.len() == 1 && !options.join,
-                "shared state mode supports one voter until phase 2"
+                !options.view_max_age.is_zero() && !options.view_pin_max.is_zero(),
+                "the view age limits must be positive"
             );
             ensure!(
-                !options.view_max_age.is_zero(),
-                "the view age limit must be positive"
+                options.overlay_max_bytes > 0,
+                "the overlay limit must be positive"
             );
         }
         std::fs::create_dir_all(&options.dir)?;
         // Open Raft first. Its exclusive file lock also protects this node's SlateDB directory.
-        let mut storage = RaftStorage::open(
+        let mut storage = RaftStorage::open_with_file_bytes(
             &options.dir.join("raft"),
             options.id,
             &options.cluster_id,
@@ -305,7 +334,16 @@ impl Node {
             } else {
                 options.peers.keys().copied().collect()
             },
+            options.log_file_bytes,
         )?;
+        let shared = crate::state::shared::Options {
+            quota: options.effective_quota().max(0) as u64,
+            voters: options.peers.keys().copied().collect(),
+            join: options.join,
+            empty_log: storage.last_index()? == 0,
+            pin_max: options.view_pin_max,
+            restore: options.restore.clone(),
+        };
         let mut state = options
             .object_store
             .open(
@@ -314,8 +352,7 @@ impl Node {
                 options.id,
                 options.state_cache,
                 options.state_mode,
-                options.effective_quota().max(0) as u64,
-                &options.peers.keys().copied().collect::<Vec<_>>(),
+                &shared,
             )
             .await?;
         // Mark the directory before the first format 4 row, not on open. See `RowMarker`.
@@ -335,6 +372,8 @@ impl Node {
             if !state.is_shared() {
                 state.quota = options.effective_quota().max(0) as u64;
             }
+            // A shared base can be ahead of the log, or on another term at its index.
+            Self::align_log(&mut storage, &state)?;
             // Flushed state proves this prefix was committed, even if its commit marker was lost.
             if state.applied > storage.commit_index() {
                 storage.persist_commit(state.applied)?;
@@ -400,7 +439,10 @@ impl Node {
                 read_only_option: raft::ReadOnlyOption::Safe,
                 max_size_per_msg: 1024 * 1024,
                 max_inflight_msgs: 64,
-                max_uncommitted_size: 16 * 1024 * 1024,
+                // A safety net only: `backlogged` holds writers once Raft's uncommitted
+                // bytes reach `log::MAX_BYTES`. The other half is headroom for one
+                // admitted command or put group, so Raft does not drop a client write.
+                max_uncommitted_size: MAX_UNCOMMITTED_BYTES as u64,
                 max_committed_size_per_ready: apply::BATCH_BYTES,
                 ..Config::default()
             };
@@ -418,6 +460,7 @@ impl Node {
             }
         };
         let manual_apply = transport_override.is_some();
+        state.set_open_retries(!manual_apply);
         let mut traffic = BTreeMap::<u64, std::sync::Arc<crate::metrics::PeerTraffic>>::new();
         let mut transports = tokio::task::JoinSet::new();
         let mut peer_addresses = BTreeMap::new();
@@ -451,15 +494,38 @@ impl Node {
             state.admin.clone(),
             state.metrics.registry.clone(),
         )?);
-        let writer = state
-            .writer_parts()
-            .map(|parts| shared::Writer::new(parts, options.view_max_age));
+        let handles = state.shared_handles();
+        let writer = match &handles {
+            Some(handles) => {
+                let gauge = prometheus::IntGauge::new(
+                    "slatedb_etcd_shared_clock_skew_milliseconds",
+                    "Milliseconds that the local clock is behind the shared writer clock.",
+                )?;
+                state.metrics.registry.register(Box::new(gauge.clone()))?;
+                let clock = shared::Clock::system(options.max_clock_skew, Some(gauge));
+                let retained = prometheus::IntGauge::new(
+                    "slatedb_etcd_shared_view_checkpoints",
+                    "View checkpoints of the shared state. Each one pins its SSTs.",
+                )?;
+                state
+                    .metrics
+                    .registry
+                    .register(Box::new(retained.clone()))?;
+                let mut writer = shared::Writer::new(handles, options.view_max_age, clock);
+                writer.retention = options.view_retention;
+                writer.retained = Some(retained);
+                writer.gauges = Some(shared::Gauges::register(&state.metrics.registry)?);
+                Some(writer)
+            }
+            None => None,
+        };
         let mut compaction = compaction::Flush::new(&state);
-        if let Some(writer) = &writer {
-            compaction.share(writer.progress());
+        if let Some(handles) = handles {
+            compaction.share(handles.based);
         }
         let compact_plan = compaction::PlanReady::new(&state, manual_apply);
-        let worker = Worker::start(state, events.clone(), manual_apply);
+        let log_reader = state.is_shared().then(|| storage.reader());
+        let worker = Worker::start(state, events.clone(), manual_apply, log_reader);
         let log_worker = log::Worker::start(storage, manual_apply)?;
         let next_checkpoint = options.next_checkpoint(raw.store().snapshot_index());
         let mut node = Self {
@@ -528,7 +594,8 @@ impl Node {
             recovered_from_index,
             send_failures: vec![],
             checkpoint_running: false,
-            backlog_rejects: [0; 3],
+            backlog_rejects: [0; 5],
+            request_timeout: REQUEST_TIMEOUT,
             appended_bytes: 0,
             snapshot_images: 0,
             next_checkpoint,
@@ -547,6 +614,11 @@ impl Node {
         };
         node.sync_members();
         Ok(node)
+    }
+
+    /// The shared-mode objects that the snapshot receive path opens.
+    pub(crate) fn shared_source(&self) -> Option<std::sync::Arc<crate::state::shared::Source>> {
+        self.writer.as_ref().map(|writer| writer.source.clone())
     }
 
     pub async fn run(self, events: mpsc::Receiver<Event>) -> Result<()> {
@@ -599,16 +671,23 @@ impl Node {
                 _ = tokio::time::sleep_until(
                     self.compact_ready_at.unwrap_or_else(Instant::now).into()
                 ), if self.compact_ready_at.is_some() => { self.compact_ready_at = None; }
-                _ = ticks.tick() => { self.raw.tick(); self.retry_reads(); self.expire_leases()?; self.publish_member()?; }
+                _ = ticks.tick() => {
+                    self.raw.tick();
+                    self.retry_reads();
+                    self.expire_leases()?;
+                    self.publish_member()?;
+                    self.tick_shared();
+                }
                 persisted = self.log_worker.next() => { self.complete_log(persisted?)?; }
                 _ = self.compact_plan.changed() => {}
                 target = self.compaction.next(), if self.compaction.active() => {
                     self.finish_compaction_flush(target?)?;
                 }
                 completed = self.worker.next() => { self.complete_apply(completed?)?; }
-                error = shared::failed(&mut self.writer),
-                    if self.writer.as_ref().is_some_and(shared::Writer::running) => {
-                    return Err(error);
+                event = shared::next(&mut self.writer), if self.writer.is_some() => {
+                    if let shared::WriterEvent::Failed(error) = event {
+                        return Err(error);
+                    }
                 }
                 read = self.read_executor.next(), if self.read_executor.len() > 0 => {
                     self.complete_read(read?)?;
@@ -726,6 +805,9 @@ impl Node {
                 match request {
                     M::MoveLeader(target) => {
                         self.move_leader(target, credentials.unwrap_or_default(), response)?
+                    }
+                    M::Defragment if self.writer.is_some() => {
+                        self.defragment_shared(credentials.unwrap_or_default(), response)?
                     }
                     M::Alarm(_) | M::Downgrade(_) => self.propose(
                         RaftCommand::Maintenance {
@@ -959,20 +1041,35 @@ impl Node {
                 let _ = response.send(Ok(self.status()?));
             }
             Event::Checkpoint(response) => {
-                if self.writer.is_some() {
-                    let _ = response.send(Err(
-                        self.error("shared state mode has no manual checkpoint until phase 2")
-                    ));
-                } else if self.checkpoint_waiters.len() >= apply::MAX_QUERIES {
+                if self.checkpoint_waiters.len() >= apply::MAX_QUERIES {
                     let _ = response.send(Err(self.error("too many checkpoint requests")));
                 } else {
-                    self.checkpoint_waiters
-                        .push((self.raw.raft.raft_log.committed, response));
+                    let committed = self.raw.raft.raft_log.committed;
+                    // Shared mode: the leader publishes a checkpoint through the commit index. A
+                    // follower asks the leader for that publication.
+                    if let Some(writer) = &self.writer {
+                        if self.raw.raft.state == StateRole::Leader {
+                            writer.request_publication(committed);
+                        } else {
+                            self.send_view_ack(Some(committed));
+                        }
+                    }
+                    self.checkpoint_waiters.push((committed, response));
                     self.schedule_apply()?;
                 }
             }
             Event::SnapshotBuilt(built) => self.checkpoint_built(built)?,
-            Event::ViewCheckpoint(checkpoint) => self.announce_view(checkpoint)?,
+            Event::ViewCheckpoint(checkpoint, reply) => {
+                let accepted = self.announce_view(checkpoint)?;
+                if let Some(reply) = reply {
+                    let _ = reply.send(accepted);
+                }
+            }
+            Event::ViewAck {
+                member,
+                checkpoints,
+                publish,
+            } => self.view_ack(member, checkpoints, publish),
             Event::SnapshotDelay(delay_ms, response) => {
                 self.snapshot_delay_ms = delay_ms.min(5000);
                 let _ = response.send(Ok(self.status()?));
@@ -1032,6 +1129,17 @@ impl Node {
 
     /// Return true when a new proposal must wait. Count each full check by cause for `/status`.
     fn backlogged(&mut self) -> bool {
+        self.backlog(true)
+    }
+
+    /// Return true when a membership change must fail. The change skips the byte holds for
+    /// ordinary writes: they keep room for it, so the remaining voters can remove a failed
+    /// voter while the writes wait for a quorum. The caller checks room for the entry.
+    fn membership_backlogged(&mut self) -> bool {
+        self.backlog(false)
+    }
+
+    fn backlog(&mut self, byte_holds: bool) -> bool {
         let causes = [
             self.raw
                 .store()
@@ -1041,6 +1149,19 @@ impl Node {
                 >= apply::MAX_APPLY_LAG,
             self.log_queue.len() >= log::MAX_JOBS,
             self.log_bytes >= log::MAX_BYTES,
+            // Raft drops proposals past `max_uncommitted_size`, and clients do not retry
+            // a dropped Put. Raft counts each proposed entry until it leaves in a Ready
+            // as committed, so this also covers entries that are on disk but need a
+            // quorum. The open put group is not in Raft yet.
+            byte_holds
+                && self.raw.raft.uncommitted_size() + self.put_proposals.bytes() >= log::MAX_BYTES,
+            // The pending log quota holds each entry until it is applied. Hold writers at
+            // half of it, so a put fails on this quota only if it is very large.
+            byte_holds
+                && self.raw.store().pending_half_full(
+                    self.raw.raft.raft_log.unstable_entries(),
+                    self.put_proposals.bytes(),
+                ),
         ];
         for (count, hit) in self.backlog_rejects.iter_mut().zip(causes) {
             *count += u64::from(hit);
@@ -1049,14 +1170,15 @@ impl Node {
     }
 
     /// Propose a client write. Ordinary writes wait in a bounded FIFO while apply or log
-    /// I/O is behind. Membership changes still fail at once because their checks ran now.
+    /// I/O is behind. A membership change is proposed at once, so its checks stay current,
+    /// or it fails.
     fn propose(&mut self, command: RaftCommand, response: impl Into<ClientResponse>) -> Result<()> {
         let response = response.into();
         if self.raw.raft.state != StateRole::Leader {
             response.error(self.error("not leader"));
             return Ok(());
         }
-        if self.pending.len() >= 1024 {
+        if self.pending.len() >= 1024 || self.overlay_full() {
             response.error(self.error("too many pending requests"));
             return Ok(());
         }
@@ -1083,15 +1205,18 @@ impl Node {
             }
             return Ok(());
         };
-        if self.backlogged() {
+        if self.membership_backlogged() {
             response.error(self.error("state apply backlog is full"));
             return Ok(());
         }
-        if !self.admits_proposal(&data) {
+        change.context = data;
+        // Raft drops an entry that does not fit in its uncommitted limit.
+        if !self.admits_proposal(&change.context)
+            || self.raw.raft.uncommitted_size() + change.encoded_len() > MAX_UNCOMMITTED_BYTES
+        {
             response.error(self.error("pending log memory quota is full"));
             return Ok(());
         }
-        change.context = data;
         let proposed = self.raw.propose_conf_change(vec![], change);
         self.track_proposal(id, proposed, response);
         Ok(())
@@ -1237,7 +1362,7 @@ impl Node {
             return Ok(());
         }
         let store = self.raw.store();
-        let advances = self.state.applied > store.snapshot_index();
+        let advances = self.checkpointable(self.state.applied) > store.snapshot_index();
         // An image can replace a record without an image at the same index.
         let attaches = image && store.snapshot_index() > 0 && !store.has_image();
         if !advances && !attaches {
@@ -1279,16 +1404,37 @@ impl Node {
 
     fn finish_checkpoint_waiters(&mut self) -> Result<()> {
         let mut waiting = vec![];
+        let leader = self.raw.raft.state == StateRole::Leader;
+        let applied = self.state.applied;
         for (index, response) in std::mem::take(&mut self.checkpoint_waiters) {
             if response.is_closed() {
                 continue;
             }
-            // A manual checkpoint completes only with a complete image.
+            // Shared mode: the first request can arrive before apply reaches its commit index.
+            // The covering publication is due once apply reaches it.
+            if let Some(writer) = &mut self.writer {
+                if leader {
+                    writer.request_checkpoint(index, applied);
+                }
+            }
+            // A manual checkpoint completes only with a complete image. In shared mode the
+            // image is a view checkpoint, so the member's base must hold the state at `index`.
             let store = self.raw.store();
-            if index <= store.snapshot_index()
-                && index <= self.state.applied
-                && (index == 0 || store.has_image())
-            {
+            let done = match &self.writer {
+                Some(writer) => {
+                    index <= self.state.applied
+                        && self
+                            .state
+                            .view
+                            .is_some_and(|(base, _, _)| base >= writer.covering(index))
+                }
+                None => {
+                    index <= store.snapshot_index()
+                        && index <= self.state.applied
+                        && (index == 0 || store.has_image())
+                }
+            };
+            if done {
                 let _ = response.send(Ok(self.status()?));
             } else {
                 waiting.push((index, response));
@@ -1312,7 +1458,7 @@ impl Node {
                 !is_leader
                     || p.term != self.raw.raft.term
                     || p.response.is_closed()
-                    || now.duration_since(p.started) > Duration::from_secs(5)
+                    || now.duration_since(p.started) > self.request_timeout
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -1369,8 +1515,17 @@ impl Node {
         }
         status["quorum_reply_index"] = self.quorum_reply_index.into();
         if let (Some(writer), Some((base, applied, bytes))) = (&self.writer, self.state.view) {
+            let record = crate::state::transfer::ViewDescriptor::decode(
+                self.raw.store().recovery_snapshot().get_data(),
+            )
+            .ok()
+            .flatten()
+            .and_then(|view| view.checkpoint().ok());
             status["shared_state"] = json!({
                 "base_applied_index": base,
+                "base_checkpoint": self.state.base_checkpoint,
+                "record_index": self.raw.store().snapshot_index(),
+                "record_checkpoint": record,
                 "applied_view_checkpoints": applied,
                 "overlay_bytes": bytes,
                 "writer": writer.status(),
@@ -1383,6 +1538,8 @@ impl Node {
             "apply_lag": self.backlog_rejects[0],
             "log_jobs": self.backlog_rejects[1],
             "log_bytes": self.backlog_rejects[2],
+            "uncommitted_bytes": self.backlog_rejects[3],
+            "pending_log_bytes": self.backlog_rejects[4],
         });
         Ok(status)
     }

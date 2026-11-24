@@ -243,7 +243,7 @@ mod tests {
     }
 
     async fn rows(state: &StateMachine) -> Vec<(bytes::Bytes, bytes::Bytes)> {
-        let mut scan = state.db.scan_prefix(b"", ..).await.unwrap();
+        let mut scan = state.db().scan_prefix(b"", ..).await.unwrap();
         let mut rows = vec![];
         while let Some(row) = scan.next().await.unwrap() {
             rows.push((row.key, row.value));
@@ -302,12 +302,15 @@ mod tests {
             assert_eq!(grouped.logical_bytes, separate.logical_bytes);
             assert_eq!(
                 grouped.logical_bytes,
-                maintenance::count_logical_size(grouped.db.as_ref())
+                maintenance::count_logical_size(grouped.db().as_ref())
                     .await
                     .unwrap()
             );
-            assert_eq!(grouped.db.snapshot().unwrap().seq(), requests.len() as u64);
-            grouped.db.flush().await.unwrap();
+            assert_eq!(
+                grouped.db().snapshot().unwrap().seq(),
+                requests.len() as u64
+            );
+            grouped.db().flush().await.unwrap();
             grouped.close().await.unwrap();
             drop(grouped);
             let reopened = StateMachine::open(left.path()).await.unwrap();

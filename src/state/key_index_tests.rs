@@ -62,7 +62,7 @@ async fn current(state: &StateMachine, key: &[u8]) -> Option<KeyValue> {
 }
 
 async fn check(state: &StateMachine) {
-    assert!(state.key_index.matches(&state.db).await.unwrap());
+    assert!(state.key_index.matches(state.db()).await.unwrap());
 }
 
 async fn apply(state: &mut StateMachine, request: &RequestOp) -> ResponseOp {
@@ -180,7 +180,7 @@ async fn index_follows_puts_transactions_deletes_revocations_snapshots_and_resta
     assert_eq!(target.key_index.get(b"c"), state.key_index.get(b"c"));
     target.close().await.unwrap();
 
-    state.db.flush().await.unwrap();
+    state.db().flush().await.unwrap();
     let expected = *state.key_index.get(b"c").unwrap();
     state.close().await.unwrap();
     drop(state);
@@ -262,7 +262,7 @@ async fn indexed_transactions_match_storage_evaluation() {
     ));
     for request in &requests {
         let expected = mvcc::prepare_with_counts(
-            state.db.as_ref(),
+            state.db().as_ref(),
             None,
             state.revision,
             state.compact_revision,
@@ -271,7 +271,7 @@ async fn indexed_transactions_match_storage_evaluation() {
         )
         .await;
         let actual = mvcc::prepare_with_counts(
-            state.db.as_ref(),
+            state.db().as_ref(),
             Some(&state.key_index),
             state.revision,
             state.compact_revision,
@@ -428,7 +428,7 @@ async fn watch_omits_a_missing_previous_value() {
 
     // Like etcd, Watch leaves prev_kv empty when the previous version cannot be found.
     state
-        .db
+        .db()
         .delete(crate::mvcc::history_key(b"a", first))
         .await
         .unwrap();

@@ -49,6 +49,11 @@ impl StateMachine {
                 }
                 Ok(json!({"header": mvcc::header(self.revision), "hash": hash}))
             }
+            // The shared database belongs to the leader writer. Phase 4 adds Defragment there.
+            Command::Defragment if self.is_shared() => Err(KvError::new(
+                Code::Unimplemented,
+                "shared state mode has no Defragment until phase 4",
+            )),
             Command::Defragment => self
                 .defragment()
                 .await
@@ -143,10 +148,10 @@ impl StateMachine {
     }
 
     pub(crate) async fn manifest_size(admin: &slatedb::admin::Admin) -> Result<u64> {
-        let manifest = admin
-            .read_manifest(None)
-            .await?
-            .context("missing manifest")?;
+        // A shared database has no manifest until its first leader opens the writer.
+        let Some(manifest) = admin.read_manifest(None).await? else {
+            return Ok(0);
+        };
         Ok(manifest
             .all_sst_views()
             .map(|v| v.sst.estimate_size())
@@ -156,54 +161,9 @@ impl StateMachine {
     async fn defragment(&mut self) -> Result<()> {
         let _timer = self.metrics.defrag.start_timer();
         let _active = crate::metrics::Active::new(&self.metrics.defrag_active);
-        self.metrics.flush_db(&self.db).await?;
-        // A shared-mode flush covers only the materialized prefix.
-        if !self.is_shared() {
-            self.durable_applied = self.applied;
-        }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-        loop {
-            let manifest = self
-                .admin
-                .read_manifest(None)
-                .await?
-                .context("missing manifest")?;
-            let mut sources: Vec<_> = manifest
-                .l0()
-                .iter()
-                .map(|v| SourceId::SstView(v.id))
-                .collect();
-            sources.extend(
-                manifest
-                    .compacted()
-                    .iter()
-                    .map(|r| SourceId::SortedRun(r.id)),
-            );
-            if sources.is_empty() {
-                return Ok(());
-            }
-            let destination = manifest.compacted().iter().map(|r| r.id).min().unwrap_or(0);
-            let job = self
-                .admin
-                .submit_compaction(CompactionSpec::new(sources, destination))
-                .await?;
-            loop {
-                ensure!(
-                    tokio::time::Instant::now() < deadline,
-                    "defragmentation timed out"
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                if let Some(job) = self.admin.read_compaction(job.id(), None).await? {
-                    match job.status() {
-                        CompactionStatus::Completed => return Ok(()),
-                        CompactionStatus::Failed => break,
-                        _ => (),
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
+        self.metrics.flush_db(self.db()).await?;
+        self.durable_applied = self.applied;
+        compact_all(&self.admin).await.map(drop)
     }
 
     pub(super) async fn hash_kv(&self, revision: i64) -> std::result::Result<Value, KvError> {
@@ -464,6 +424,75 @@ pub(crate) async fn count_logical_size(db: &impl StateRead) -> Result<u64> {
             .context("logical size counter overflow")?;
     }
     Ok(size)
+}
+
+/// Compact every L0 SST and sorted run into one sorted run, and wait up to 8 s for the end.
+/// The compactor of the database writer runs the job. Defragment uses this in both state modes.
+/// Return the version of the manifest that shows compaction is complete.
+pub(crate) async fn compact_all(admin: &slatedb::admin::Admin) -> Result<u64> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let manifest = admin
+            .read_manifest(None)
+            .await?
+            .context("missing manifest")?;
+        let mut sources: Vec<_> = manifest
+            .l0()
+            .iter()
+            .map(|v| SourceId::SstView(v.id))
+            .collect();
+        sources.extend(
+            manifest
+                .compacted()
+                .iter()
+                .map(|r| SourceId::SortedRun(r.id)),
+        );
+        if sources.is_empty() {
+            return Ok(manifest.id());
+        }
+        let destination = manifest.compacted().iter().map(|r| r.id).min().unwrap_or(0);
+        // SlateDB can reuse the destination run ID, so the input SST views identify the input.
+        let input: std::collections::HashSet<_> =
+            manifest.all_sst_views().map(|view| view.id).collect();
+        let job = admin
+            .submit_compaction(CompactionSpec::new(sources, destination))
+            .await?;
+        loop {
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "defragmentation timed out"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Some(job) = admin.read_compaction(job.id(), None).await? {
+                match job.status() {
+                    // The compactor commits the manifest after the job. A checkpoint after this
+                    // call must see the new layout: one sorted run and none of the input SSTs.
+                    CompactionStatus::Completed => loop {
+                        let manifest = admin
+                            .read_manifest(None)
+                            .await?
+                            .context("missing manifest")?;
+                        if manifest.compacted().len() <= 1
+                            && !manifest
+                                .all_sst_views()
+                                .any(|view| input.contains(&view.id))
+                        {
+                            return Ok(manifest.id());
+                        }
+                        ensure!(
+                            tokio::time::Instant::now() < deadline,
+                            "defragmentation timed out"
+                        );
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    },
+                    CompactionStatus::Failed => break,
+                    _ => (),
+                }
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 /// Encode a digest record the way the first format 4 binaries did, for tests of older rows.

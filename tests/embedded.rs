@@ -125,34 +125,59 @@ async fn embedded_watch_lease_shutdown_and_immediate_restart() {
     }
 }
 
+// Keep each address reserved until its member starts. Only retry the initial bind race.
+async fn start_three_members(
+    dir: &std::path::Path,
+    configure: impl Fn(&mut ServerConfig),
+) -> Vec<Option<Server>> {
+    let attempts = 4;
+    'startup: for attempt in 1..=attempts {
+        let mut reservations = Vec::new();
+        let mut peers = BTreeMap::new();
+        for id in 1..=3 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            peers.insert(id, listener.local_addr().unwrap().to_string());
+            reservations.push((id, listener));
+        }
+
+        let mut servers = Vec::new();
+        for (id, listener) in reservations {
+            let mut config = ServerConfig::single_node(dir.join(format!("{attempt}-{id}")));
+            config.id = id;
+            config.listen = listener.local_addr().unwrap();
+            config.peers = peers.clone();
+            config.client_peers = peers.clone();
+            configure(&mut config);
+            drop(listener);
+            match Server::start(config).await {
+                Ok(server) => servers.push(Some(server)),
+                Err(error) => {
+                    for server in servers.into_iter().flatten() {
+                        server.shutdown().await.unwrap();
+                    }
+                    let collision = error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|err| err.kind() == std::io::ErrorKind::AddrInUse);
+                    assert!(
+                        collision && attempt < attempts,
+                        "member {id} startup: {error:#}"
+                    );
+                    continue 'startup;
+                }
+            }
+        }
+        for server in servers.iter().flatten() {
+            ready(server).await;
+        }
+        return servers;
+    }
+    unreachable!("the final startup error fails the test")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn embedded_three_members_fail_over_and_rejoin() {
     let dir = tempfile::tempdir().unwrap();
-    let mut reservations = Vec::new();
-    let mut peers = BTreeMap::new();
-    for id in 1..=3 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        peers.insert(id, listener.local_addr().unwrap().to_string());
-        reservations.push(listener);
-    }
-    let configs: Vec<_> = (1..=3)
-        .map(|id| {
-            let mut config = ServerConfig::single_node(dir.path().join(id.to_string()));
-            config.id = id;
-            config.listen = peers[&id].parse().unwrap();
-            config.peers = peers.clone();
-            config.client_peers = peers.clone();
-            config
-        })
-        .collect();
-    drop(reservations);
-    let mut servers = Vec::new();
-    for config in &configs {
-        servers.push(Some(Server::start(config.clone()).await.unwrap()));
-    }
-    for server in servers.iter().flatten() {
-        ready(server).await;
-    }
+    let mut servers = start_three_members(dir.path(), |_| {}).await;
     let status = MaintenanceClient::connect(servers[0].as_ref().unwrap().client_url())
         .await
         .unwrap()
@@ -162,11 +187,13 @@ async fn embedded_three_members_fail_over_and_rejoin() {
         .into_inner();
     let leader = status.leader as usize - 1;
     put(servers[0].as_ref().unwrap(), b"before", b"durable").await;
-    servers[leader].take().unwrap().shutdown().await.unwrap();
+    let stopped = servers[leader].take().unwrap();
+    let restart = stopped.config().clone();
+    stopped.shutdown().await.unwrap();
     let survivor = servers.iter().flatten().next().unwrap();
     ready(survivor).await;
     put(survivor, b"after", b"available").await;
-    servers[leader] = Some(Server::start(configs[leader].clone()).await.unwrap());
+    servers[leader] = Some(Server::start(restart).await.unwrap());
     for server in servers.iter().flatten() {
         ready(server).await;
         assert_eq!(get(server, b"before").await, b"durable");
@@ -411,34 +438,12 @@ async fn eventually(what: &str, mut check: impl std::ops::AsyncFnMut() -> bool) 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn follower_behind_an_imageless_truncation_catches_up_from_an_on_demand_image() {
     let dir = tempfile::tempdir().unwrap();
-    let mut reservations = Vec::new();
-    let mut peers = BTreeMap::new();
-    for id in 1..=3 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        peers.insert(id, listener.local_addr().unwrap().to_string());
-        reservations.push(listener);
-    }
-    let configs: Vec<_> = (1..=3)
-        .map(|id| {
-            let mut config = ServerConfig::single_node(dir.path().join(id.to_string()));
-            config.id = id;
-            config.listen = peers[&id].parse().unwrap();
-            config.peers = peers.clone();
-            config.client_peers = peers.clone();
-            // Truncate often, as automatic checkpoints do, without waiting for 64 MiB of log.
-            config.snapshot_every = 16;
-            config.snapshot_min_bytes = 0;
-            config
-        })
-        .collect();
-    drop(reservations);
-    let mut servers = Vec::new();
-    for config in &configs {
-        servers.push(Some(Server::start(config.clone()).await.unwrap()));
-    }
-    for server in servers.iter().flatten() {
-        ready(server).await;
-    }
+    let mut servers = start_three_members(dir.path(), |config| {
+        // Truncate often, as automatic checkpoints do, without waiting for 64 MiB of log.
+        config.snapshot_every = 16;
+        config.snapshot_min_bytes = 0;
+    })
+    .await;
     let status = MaintenanceClient::connect(servers[0].as_ref().unwrap().client_url())
         .await
         .unwrap()
@@ -453,7 +458,9 @@ async fn follower_behind_an_imageless_truncation_catches_up_from_an_on_demand_im
         ["last_log_index"]
         .as_u64()
         .unwrap();
-    servers[lagging].take().unwrap().shutdown().await.unwrap();
+    let stopped = servers[lagging].take().unwrap();
+    let restart = stopped.config().clone();
+    stopped.shutdown().await.unwrap();
 
     let value = |i: usize| format!("{i}:{}", "v".repeat(512));
     for i in 0..256 {
@@ -478,7 +485,7 @@ async fn follower_behind_an_imageless_truncation_catches_up_from_an_on_demand_im
         assert_eq!(status["snapshot_images_built"], 0, "{status}");
     }
 
-    servers[lagging] = Some(Server::start(configs[lagging].clone()).await.unwrap());
+    servers[lagging] = Some(Server::start(restart).await.unwrap());
     let follower = servers[lagging].as_ref().unwrap();
     ready(follower).await;
     eventually("snapshot installation", async || {

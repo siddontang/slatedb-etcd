@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  schedule:
+    - cron: '37 2 * * *'
   workflow_dispatch:
     inputs:
       extended:
@@ -12,7 +15,7 @@ on:
         default: false
 
 concurrency:
-  group: verify-${{ github.head_ref || github.ref_name }}
+  group: verify-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -20,6 +23,8 @@ permissions:
 
 jobs:
   public-files:
+    outputs:
+      tier: ${{ steps.classify.outputs.tier }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -52,6 +57,33 @@ jobs:
             exit 1
           fi
           echo "HISTORY_RANGE=$base..HEAD" >> "$GITHUB_ENV"
+      - name: Select verification tier
+        id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          FORCE_FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+        run: |
+          tier=full
+          if [[ "$EVENT" == pull_request && "$FORCE_FULL" != true ]]; then
+            # Include both names of a rename. A diff error must fail classification.
+            git diff --no-renames --name-only -z "$PR_BASE...HEAD" > "$RUNNER_TEMP/changed-paths"
+            if [[ -s "$RUNNER_TEMP/changed-paths" ]]; then
+              tier=fast
+              while IFS= read -r -d '' path; do
+                case "$path" in
+                  README.md|AGENTS.md|COMPATIBILITY.md|CONTRIBUTING.md|RESULTS.md|SECURITY.md|LICENSE|NOTICE|\
+                  docs/*.md|results/*.md|results/*.json|tests/README.md|.github/pull_request_template.md|\
+                  examples/*.rs|tests/embedded.rs|tests/engine_sync.rs|tests/recovery.rs|tests/shared_state.rs|\
+                  src/metrics.rs|src/metrics/*.rs|src/grpc/health.rs)
+                    continue ;;
+                  *) tier=full; break ;;
+                esac
+              done < "$RUNNER_TEMP/changed-paths"
+            fi
+          fi
+          echo "tier=$tier" >> "$GITHUB_OUTPUT"
+          echo "Verification tier: $tier" >> "$GITHUB_STEP_SUMMARY"
       - name: Check publication files and history
         run: |
           python3 scripts/check-public.py
@@ -143,8 +175,36 @@ jobs:
           path: results/ci/*.json
           retention-days: 14
 
-  compat-upstream:
+  smoke:
     needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: tests/compat/go.sum
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-binaries
+          path: target/release
+      - name: Run official-client KV and metrics tests
+        run: |
+          chmod +x target/release/slatedb-etcd
+          python3 scripts/check-compat.py --run '^(TestDifferentialKV|TestMetricsCountAppliedWrites)$' \
+            --output results/ci/smoke.json
+          python3 - <<'PYTHON'
+          import json
+          from pathlib import Path
+          report = json.loads(Path("results/ci/smoke.json").read_text())
+          passed = {t["name"] for t in report["tests"] if t["result"] == "pass"}
+          assert report["complete"] and {"TestDifferentialKV", "TestMetricsCountAppliedWrites"} <= passed
+          PYTHON
+
+  compat-upstream:
+    needs: [public-files, build]
+    if: needs.public-files.outputs.tier == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -174,8 +234,9 @@ jobs:
           path: results/ci/*.json
           retention-days: 14
 
-  test:
-    needs: build
+  upstream-process:
+    needs: [public-files, build]
+    if: needs.public-files.outputs.tier == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -186,29 +247,6 @@ jobs:
           cache-dependency-path: |
             tests/compat/go.sum
             tests/downstream/go.sum
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
-      - name: Install pinned Jepsen test runner
-        run: |
-          curl --fail --location --retry 3 \
-            https://github.com/technomancy/leiningen/releases/download/2.11.2/leiningen-2.11.2-standalone.jar \
-            --output "$RUNNER_TEMP/lein.jar"
-          echo "7d31ae23ae769e927438b0cd55d15a93e7dabab09fd4fc15877979161e108774  $RUNNER_TEMP/lein.jar" | sha256sum --check
-          echo "LEIN_JAR=$RUNNER_TEMP/lein.jar" >> "$GITHUB_ENV"
-      - name: Select test seeds
-        env:
-          EXTENDED: ${{ inputs.extended }}
-        run: |
-          python3 - <<'PY'
-          import os
-          extended = os.environ["EXTENDED"] == "true"
-          with open(os.environ["GITHUB_ENV"], "a") as env:
-              dst = ",".join(map(str, range(1, 101))) if extended else "1,2,42,58,70"
-              faults = ",".join(map(str, range(1, 17))) if extended else "1,2,3,4"
-              env.write(f"SLATEDB_DST_SEEDS={dst}\nFAULT_SEEDS={faults}\n")
-          PY
       - uses: actions/download-artifact@v4
         with:
           name: release-binaries
@@ -250,6 +288,62 @@ jobs:
         with:
           name: upstream-smoke
           path: results/ci/upstream-*
+
+  service-tests:
+    needs: [public-files, build]
+    if: needs.public-files.outputs.tier == 'full'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: |
+            tests/compat/go.sum
+            tests/downstream/go.sum
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-dependency-path: tests/jepsen/project.clj
+      - name: Install pinned Jepsen test runner
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/technomancy/leiningen/releases/download/2.11.2/leiningen-2.11.2-standalone.jar \
+            --output "$RUNNER_TEMP/lein.jar"
+          echo "7d31ae23ae769e927438b0cd55d15a93e7dabab09fd4fc15877979161e108774  $RUNNER_TEMP/lein.jar" | sha256sum --check
+          echo "LEIN_JAR=$RUNNER_TEMP/lein.jar" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-binaries
+          path: target/release
+      - name: Restore binary permissions
+        run: chmod +x target/release/slatedb-etcd target/release/slatedb-etcd-fault
+      - name: Fetch Jepsen dependencies
+        working-directory: tests/jepsen
+        timeout-minutes: 6
+        run: |
+          for attempt in 1 2; do
+            echo "Resolve Jepsen dependencies (attempt $attempt of 2)"
+            if timeout --kill-after=5s 150s java -cp "$LEIN_JAR" clojure.main -m leiningen.core.main deps; then
+              exit 0
+            fi
+          done
+          exit 1
+      - name: Test the Jepsen checker
+        timeout-minutes: 5
+        run: python3 scripts/check-jepsen.py --self-test
+      - name: Check process faults with etcd and Jepsen models
+        timeout-minutes: ${{ inputs.extended && 40 || 12 }}
+        env:
+          EXTENDED: ${{ inputs.extended }}
+        run: |
+          seeds=1,2,3,4
+          if [ "$EXTENDED" = true ]; then seeds=$(seq 1 16 | paste -sd, -); fi
+          python3 scripts/check-robustness.py --seeds "$seeds" --jepsen \
+            --output results/ci/robustness.json
       - name: Check etcd compatibility and recovery
         run: |
           python3 scripts/check-compat.py --output results/ci/etcd-compatibility.json
@@ -262,11 +356,6 @@ jobs:
         run: |
           python3 scripts/check-compat.py --binary target/release/slatedb-etcd-fault \
             --tags failpoints --run '^TestFailpointRecovery$' --output results/ci/failpoints.json
-      - name: Check process faults with etcd and Jepsen models
-        run: |
-          python3 scripts/check-jepsen.py --self-test
-          python3 scripts/check-robustness.py --seeds "$FAULT_SEEDS" --jepsen \
-            --output results/ci/robustness.json
       - name: Run bounded API fuzzing
         run: |
           cd tests/compat
@@ -296,8 +385,34 @@ jobs:
           path: results/ci/*.json
           retention-days: 14
 
+  test:
+    if: always()
+    needs: [public-files, rust, build, smoke, upstream-process, service-tests, compat-upstream,
+            performance-build, performance]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the checks for the selected tier
+        env:
+          TIER: ${{ needs.public-files.outputs.tier }}
+          JOBS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import os
+          tier = os.environ["TIER"]
+          if tier not in ("fast", "full"):
+              raise SystemExit("Missing verification tier")
+          always = {"public-files", "rust", "build", "smoke"}
+          for job, details in json.loads(os.environ["JOBS"]).items():
+              expected = "success" if tier == "full" or job in always else "skipped"
+              if details["result"] != expected:
+                  raise SystemExit(f"{job}: expected {expected}, got {details['result']}")
+          PYTHON
+
   performance-build:
     needs: public-files
+    if: needs.public-files.outputs.tier == 'full'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -324,7 +439,7 @@ jobs:
         id: base-cache
         uses: actions/cache/restore@v4
         with:
-          path: tmp/performance-base
+          path: tmp/performance-head
           key: performance-binaries-${{ env.BASE_SHA }}-${{ hashFiles('rust-toolchain.toml') }}
       - name: Build head and base with the same settings
         env:
@@ -336,8 +451,8 @@ jobs:
           cargo build --locked --release --features write-profile
           cp target/release/slatedb-etcd tmp/performance/head-counted
           if [ "$BASE_CACHED" = true ]; then
-            cp tmp/performance-base/head tmp/performance/base
-            cp tmp/performance-base/head-counted tmp/performance/base-counted
+            cp tmp/performance-head/head tmp/performance/base
+            cp tmp/performance-head/head-counted tmp/performance/base-counted
           else
             git worktree add --detach "$RUNNER_TEMP/performance-base" "$BASE_SHA"
             CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --locked --release \

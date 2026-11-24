@@ -20,6 +20,8 @@ pub struct ApiState {
     pub cluster_id: String,
     /// The object namespace that serves and receives snapshot objects.
     pub(crate) location: Option<std::sync::Arc<crate::state::transfer::Location>>,
+    /// Shared mode: the objects that a received format 6 snapshot names.
+    pub(crate) shared: Option<std::sync::Arc<crate::state::shared::Source>>,
 }
 
 impl IntoResponse for ApiError {
@@ -41,6 +43,7 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/kv", post(propose))
         .route("/raft", post(raft_message))
+        .route("/raft/view-ack", post(view_ack))
         .route(crate::state::transfer::FILE_ROUTE, get(snapshot_file))
         .route("/status", get(status))
         .route("/debug/log-stats", get(log_stats))
@@ -101,6 +104,25 @@ async fn raft_message(State(state): State<ApiState>, headers: HeaderMap, body: B
         return StatusCode::BAD_REQUEST.into_response();
     };
     if message.get_msg_type() == raft::eraftpb::MessageType::MsgSnapshot {
+        // A format 6 snapshot names a shared checkpoint. Open it before Raft accepts the
+        // snapshot, and keep it until the install. A failed open fails the request.
+        let data = message.get_snapshot().get_data();
+        match crate::state::transfer::ViewDescriptor::decode(data) {
+            Ok(Some(view)) => {
+                let (Some(source), Ok(id)) = (&state.shared, view.checkpoint()) else {
+                    return StatusCode::BAD_REQUEST.into_response();
+                };
+                if let Err(error) = source.receive(id).await {
+                    tracing::warn!(%error, "cannot open the snapshot checkpoint");
+                    return (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response();
+                }
+                return dispatch(state, |tx| Event::PeerFrame(message, size, tx))
+                    .await
+                    .into_response();
+            }
+            Ok(None) => {}
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        }
         // Copy the checkpoint objects before Raft accepts the snapshot. A failed copy fails the
         // request, so the leader reports the snapshot as failed and retries later.
         let descriptor =
@@ -118,6 +140,39 @@ async fn raft_message(State(state): State<ApiState>, headers: HeaderMap, body: B
     dispatch(state, |tx| Event::PeerFrame(message, size, tx))
         .await
         .into_response()
+}
+
+#[derive(Deserialize)]
+struct ViewAck {
+    member: u64,
+    checkpoints: std::collections::HashSet<uuid::Uuid>,
+    /// A manual checkpoint on the member asks the leader to publish through this index.
+    #[serde(default)]
+    publish: Option<u64>,
+}
+
+/// Receive the checkpoints that a shared-mode member pins. The leader keeps them for a time.
+async fn view_ack(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(report): Json<ViewAck>,
+) -> Response {
+    if headers
+        .get("x-cluster-id")
+        .and_then(|value| value.to_str().ok())
+        != Some(&state.cluster_id)
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let event = Event::ViewAck {
+        member: report.member,
+        checkpoints: report.checkpoints,
+        publish: report.publish,
+    };
+    match state.events.try_send(event) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 #[derive(Deserialize)]

@@ -1314,7 +1314,20 @@ pub fn fill_header(op: &mut ResponseOp, cluster: u64, member: u64, term: u64) {
     }
 }
 
-pub(crate) async fn lease_keys(db: &impl StateRead, id: i64) -> KvResult<Vec<Vec<u8>>> {
+/// Return the current keys of a lease in key order. Without the key index, scan every current row.
+pub(crate) async fn lease_keys(
+    db: &impl StateRead,
+    index: Option<&crate::state::key_index::KeyIndex>,
+    id: i64,
+) -> KvResult<Vec<Vec<u8>>> {
+    if let Some(index) = index {
+        return Ok(index.lease_keys(id));
+    }
+    scan_lease_keys(db, id).await
+}
+
+/// Find the current keys of a lease with a scan of every current row.
+pub(crate) async fn scan_lease_keys(db: &impl StateRead, id: i64) -> KvResult<Vec<Vec<u8>>> {
     let mut scan = db
         .scan_under(CURRENT, &Default::default())
         .await
@@ -1331,6 +1344,7 @@ pub(crate) async fn lease_keys(db: &impl StateRead, id: i64) -> KvResult<Vec<Vec
 
 pub(crate) async fn revoke_keys(
     db: &impl StateRead,
+    index: Option<&crate::state::key_index::KeyIndex>,
     revision: i64,
     compact_revision: i64,
     id: i64,
@@ -1349,7 +1363,7 @@ pub(crate) async fn revoke_keys(
         row_budget: None,
         keys: None,
     };
-    for key in lease_keys(db, id).await? {
+    for key in lease_keys(db, index, id).await? {
         view.execute(
             Plan::Op(std::borrow::Cow::Owned(Op::RequestDeleteRange(
                 DeleteRangeRequest {

@@ -99,13 +99,13 @@ async fn a_follower_installs_copied_checkpoint_objects() {
     put(&mut follower, 51, "key-1", "changed").await;
     assert!(!follower.members_unsaved);
     assert!(follower
-        .db
+        .db()
         .get(crate::cluster::KEY)
         .await
         .unwrap()
         .is_some());
     // Raft replays unflushed entries after a crash. Flush to keep this test local.
-    follower.db.flush().await.unwrap();
+    follower.db().flush().await.unwrap();
     follower.close().await.unwrap();
     drop(follower);
 
@@ -164,7 +164,7 @@ async fn an_object_snapshot_supplies_an_unknown_checkpoint_term() {
     assert_eq!((follower.applied, follower.applied_term), (2, 9));
     put(&mut follower, 3, "key", "next").await;
     let row = follower
-        .db
+        .db()
         .get(crate::state::APPLIED_TERM)
         .await
         .unwrap()
@@ -366,7 +366,7 @@ async fn cleanup_keeps_a_sibling_database_that_this_member_does_not_own() {
         .await
         .unwrap();
     put(&mut sibling, 1, "sibling", "kept").await;
-    sibling.db.flush().await.unwrap();
+    sibling.db().flush().await.unwrap();
     sibling.close().await.unwrap();
     drop(sibling);
 

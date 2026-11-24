@@ -119,7 +119,7 @@ impl StateMachine {
     ) -> Result<crate::watch::WatchPage> {
         // Some tests write the database directly, so replicated mode skips the apply check.
         let state = match &self.shared {
-            None => StateView::Snapshot(self.db.snapshot()?),
+            None => StateView::Snapshot(self.db().snapshot()?),
             Some(shared) => shared.pinned(),
         };
         crate::watch::read(
