@@ -128,6 +128,30 @@ See [log pool accounting](architecture.md#bounded-log-pools) for admission and r
 See [remote storage](remote-storage.md) for credentials, ownership, retry bounds, and recovery.
 The local Raft log remains necessary. S3 does not replace quorum log durability.
 
+## Shared state mode
+
+`--state-mode shared` selects the prototype of the shared state design, `docs/shared-state.md`,
+for a new cluster. The leader writes one SlateDB for the whole cluster. Each member reads a
+checkpoint of it, its base, under an in-memory overlay of the newer applied batches.
+`replicated` is the default and keeps the per-member layout.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--state-mode` | `replicated` | State layout of a new cluster: `replicated` or `shared`. |
+| `--view-max-age` | `10s` | Age of the oldest unflushed write that starts a flush and checkpoint. |
+
+Phase 1 limits:
+
+- Shared mode supports one voter. It rejects more peers, `--join`, MemberAdd, and Promote.
+- The cluster claim `shared/owner.json` stores the mode, the quota, and the initial voters.
+  Later starts use that quota. A member with other initial voters refuses to open the writer.
+- On S3, `mode.json` under the cluster prefix fixes the mode before any state write. A shared start
+  also refuses a prefix that holds a replicated member namespace.
+- A directory keeps its mode. A member refuses to start in a different mode.
+- The Raft log is not truncated, and manual checkpoints and snapshot restore are unavailable.
+- A restart opens the newest `view-` checkpoint and replays the log above it.
+- The local object store works for tests. Several members need S3, which a later phase adds.
+
 ## Environment
 
 `RUST_LOG` selects log filters. The default is `info`.

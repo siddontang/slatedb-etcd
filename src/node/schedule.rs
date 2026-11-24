@@ -50,6 +50,10 @@ impl Node {
     /// The checkpoint to start once `applied` entries have been applied, if one is due.
     /// `Some(true)` builds a complete image; `Some(false)` only flushes state and truncates.
     fn checkpoint_due(&self, applied: u64) -> Option<bool> {
+        // Shared mode keeps its whole log until phase 2 adds checkpoint snapshots.
+        if self.writer.is_some() {
+            return None;
+        }
         let store = self.raw.store();
         let snapshot_index = store.snapshot_index();
         // A peer snapshot or a manual checkpoint needs a complete image.
@@ -221,6 +225,10 @@ impl Node {
         self.raw.mut_store().applied_to(self.state.applied);
         if membership_changed {
             self.sync_members();
+            // Each checkpoint must hold the membership that Raft uses.
+            if let Some(writer) = &self.writer {
+                writer.request_publication(self.state.applied);
+            }
         }
         Ok(())
     }
@@ -269,12 +277,12 @@ impl Node {
                         } => {
                             self.wait_physical_compact(&command.id, (index, revision, value));
                             if let Some(physical) = flush {
-                                self.compaction.request(index, physical);
+                                self.flush_compaction(index, physical);
                             }
                             continue;
                         }
                         Reply::CompactFlush { index, revision } => {
-                            self.compaction.request(index, revision);
+                            self.flush_compaction(index, revision);
                             continue;
                         }
                         Reply::Encoded(_) | Reply::Kv(_) | Reply::Lease(_) => {}

@@ -157,7 +157,10 @@ impl StateMachine {
         let _timer = self.metrics.defrag.start_timer();
         let _active = crate::metrics::Active::new(&self.metrics.defrag_active);
         self.metrics.flush_db(&self.db).await?;
-        self.durable_applied = self.applied;
+        // A shared-mode flush covers only the materialized prefix.
+        if !self.is_shared() {
+            self.durable_applied = self.applied;
+        }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         loop {
             let manifest = self

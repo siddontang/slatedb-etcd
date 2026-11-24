@@ -3,7 +3,10 @@ use super::*;
 impl StateMachine {
     pub async fn snapshot_data(&mut self) -> Result<Vec<u8>> {
         let data = self.snapshot_job()?.await?;
-        self.durable_applied = self.applied;
+        // Only a replicated export flushes the database. A shared view scan makes nothing durable.
+        if !self.is_shared() {
+            self.durable_applied = self.applied;
+        }
         Ok(data)
     }
 
@@ -11,26 +14,25 @@ impl StateMachine {
     pub fn snapshot_job(
         &self,
     ) -> Result<impl std::future::Future<Output = Result<Vec<u8>>> + Send + 'static> {
-        let snapshot = self.db.snapshot()?;
-        let db = Arc::clone(&self.db);
+        // A shared-mode view needs no flush. Its rows are in a checkpoint or in memory.
+        let snapshot = self.pinned_state()?;
+        let db = (!self.is_shared()).then(|| Arc::clone(&self.db));
         let metrics = self.metrics.clone();
         let applied = self.applied;
         let members = serde_json::to_vec(self.members.as_ref())?;
-        ensure!(
-            snapshot.seq() == applied,
-            "snapshot does not match the apply marker"
-        );
         Ok(async move {
-            metrics.flush_db(&db).await?;
+            if let Some(db) = db {
+                metrics.flush_db(&db).await?;
+            }
             let mut data = crate::codec::encode(&(crate::SNAPSHOT_FORMAT, applied))?;
             let count_offset = data.len();
             crate::codec::write(&mut data, &0_u64)?;
             let mut count = 0_u64;
             let mut iterator = snapshot.scan_under(b"", &Default::default()).await?;
             while let Some(row) = iterator.next().await? {
-                // Format 4 readers reject the term row. Install takes the term from the Raft
-                // snapshot metadata instead.
-                if row.key.as_ref() != crate::cluster::KEY && row.key.as_ref() != APPLIED_TERM {
+                // Format 4 readers reject the derived meta rows. Install takes the term from the
+                // Raft snapshot metadata and counts the logical size from the rows.
+                if row.key.as_ref() != crate::cluster::KEY && !derived_key(&row.key) {
                     crate::codec::write(&mut data, &(row.key, row.value))?;
                     count += 1;
                 }
@@ -46,6 +48,10 @@ impl StateMachine {
 
     pub async fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<()> {
         let index = snapshot.get_metadata().index;
+        ensure!(
+            !self.is_shared() || index <= self.applied,
+            "shared state mode cannot install a snapshot before phase 2"
+        );
         let term = snapshot.get_metadata().term;
         if index == self.applied {
             self.reconcile_term(term)?;
@@ -83,7 +89,10 @@ impl StateMachine {
         drop(rows);
         for (key, value) in data.rows {
             ensure!(snapshot_key(&key), "invalid snapshot key");
-            batch.put(key, value);
+            // Shared mode derives the logical size row again from the installed rows.
+            if key != shared::LOGICAL_BYTES {
+                batch.put(key, value);
+            }
         }
         crate::failpoint::hit("snapshot-before-install");
         // The snapshot metadata holds the term of the entry at `index`. Images have no term

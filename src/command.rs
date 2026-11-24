@@ -85,6 +85,11 @@ mod tests {
                     physical: true,
                 },
             },
+            RaftCommand::ViewCheckpoint {
+                id: "view".into(),
+                checkpoint: uuid::Uuid::new_v4().to_string(),
+            },
+            RaftCommand::CompactStep { id: "step".into() },
             RaftCommand::Lease {
                 id: "lease".into(),
                 origin: 3,

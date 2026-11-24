@@ -31,6 +31,10 @@ The CLI and embedded API share the same lifecycle and runtime paths.
 | `state/kv` and `state/put_batch` | Commit MVCC changes and maintain quota accounting |
 | `state/read` | Pin data, revision, Auth, and Lease metadata together |
 | `state/source` | Define the read interface that apply, read views, and Watch catch-up share |
+| `state/view` | Read the live database, a pinned snapshot, or a shared-mode base and overlay |
+| `state/overlay` | Keep shared-mode batches above the base for views and the materializer |
+| `state/shared` | Claim the shared state, open checkpoint bases, and switch them in order |
+| `node/shared` | Run the shared-mode materializer and checkpoint publisher on the leader |
 | `state/auth`, `state/cluster`, and `state/lease` | Apply their replicated domain changes |
 | `state/snapshot` and `state/backup` | Build, install, export, and restore complete state |
 | `state/maintenance` | Execute hashes, alarms, and physical storage work |
@@ -65,6 +69,11 @@ A checkpoint freezes one applied prefix and flushes it outside Raft.
 The log worker saves the snapshot metadata and truncates its covered entries in one synced batch.
 A manual checkpoint or a peer snapshot request also encodes a complete image.
 Restart installs a newer durable snapshot, then replays the remaining committed entries.
+
+Shared state mode, phase 1, has one voter. Apply adds each batch to the overlay, not to SlateDB.
+The leader materializer writes the batches into the shared `Db` with their own sequences.
+The publisher flushes by age, creates one checkpoint per L0 advance, and proposes `ViewCheckpoint`.
+That entry closes an overlay segment. The opened checkpoint becomes the base of later views.
 
 ## Change rules
 

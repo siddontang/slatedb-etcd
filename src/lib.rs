@@ -121,6 +121,14 @@ pub enum RaftCommand {
         id: String,
         compact: proto::etcdserverpb::CompactionRequest,
     },
+    /// The shared-mode leader announces a durable checkpoint of the shared state. Members open
+    /// it as their next base. It changes no etcd state.
+    ///
+    /// The enum is untagged, so this variant must precede `CompactStep`, which matches any `id`.
+    ViewCheckpoint {
+        id: String,
+        checkpoint: String,
+    },
     /// The leader proposes bounded physical compaction work after a Compact entry.
     CompactStep {
         id: String,
@@ -149,6 +157,7 @@ impl RaftCommand {
             | Self::Etcd { id, .. }
             | Self::Compact { id, .. }
             | Self::CompactStep { id }
+            | Self::ViewCheckpoint { id, .. }
             | Self::Lease { id, .. } => id,
         }
     }

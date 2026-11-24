@@ -79,6 +79,7 @@ Create one `ServerConfig` for each member. Set these fields before `Server::star
 | `snapshot_min_bytes` | Set the log bytes an automatic checkpoint waits for. Zero disables it. |
 | `auth_token` | Select the same simple or JWT token configuration as the CLI. |
 | `join`, `restore_snapshot` | Select member join or native restore. They cannot both be enabled. |
+| `state_mode`, `view_max_age` | Select shared mode for a new one-voter cluster and its flush age. |
 | `strict_reconfiguration` | Enable quorum health checks for membership changes. |
 
 Start all initial members before waiting for readiness.

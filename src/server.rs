@@ -23,6 +23,9 @@ pub enum MetricsLevel {
     Extensive,
 }
 
+/// The default age limit of unflushed shared-mode writes.
+pub const DEFAULT_VIEW_MAX_AGE: Duration = Duration::from_secs(10);
+
 /// Configuration for one member. Preserve its ID, cluster ID, and directory across restarts.
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -54,6 +57,11 @@ pub struct ServerConfig {
     pub strict_reconfiguration: bool,
     pub join: bool,
     pub restore_snapshot: Option<PathBuf>,
+    /// The state mode of a new cluster. Shared mode keeps one SlateDB for the cluster. Phase 1
+    /// supports it for one voter only. An existing directory keeps its mode.
+    pub state_mode: crate::state::StateMode,
+    /// Shared mode: flush and publish a checkpoint when the oldest unflushed write is this old.
+    pub view_max_age: Duration,
 }
 
 impl ServerConfig {
@@ -84,6 +92,8 @@ impl ServerConfig {
             strict_reconfiguration: true,
             join: false,
             restore_snapshot: None,
+            state_mode: crate::state::StateMode::Replicated,
+            view_max_age: DEFAULT_VIEW_MAX_AGE,
         }
     }
 }
@@ -117,6 +127,10 @@ impl Server {
         ensure!(
             !config.join || config.restore_snapshot.is_none(),
             "join cannot restore a snapshot"
+        );
+        ensure!(
+            config.state_mode.is_replicated() || config.restore_snapshot.is_none(),
+            "shared state mode cannot restore a snapshot until phase 2"
         );
         ensure!(
             config.id != 0 && !config.peers.contains_key(&0),
@@ -275,6 +289,8 @@ impl Server {
                 join: config.join,
                 object_store: config.object_store.clone(),
                 require_peer_tls: config.allow_remote,
+                state_mode: config.state_mode,
+                view_max_age: config.view_max_age,
                 transport,
             },
             events.clone(),

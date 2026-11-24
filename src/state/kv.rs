@@ -117,8 +117,13 @@ impl StateMachine {
         request: &crate::proto::etcdserverpb::WatchCreateRequest,
         through: Option<i64>,
     ) -> Result<crate::watch::WatchPage> {
+        // Some tests write the database directly, so replicated mode skips the apply check.
+        let state = match &self.shared {
+            None => StateView::Snapshot(self.db.snapshot()?),
+            Some(shared) => shared.pinned(),
+        };
         crate::watch::read(
-            &*self.db.snapshot()?,
+            &state,
             through.unwrap_or(self.revision).min(self.revision),
             self.compact_revision,
             request,
