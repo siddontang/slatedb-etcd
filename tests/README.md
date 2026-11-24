@@ -42,6 +42,19 @@ A partition test replays retained history on a lagging member, then checks rejec
 
 [watch-guarantees]: https://etcd.io/docs/v3.6/learning/api_guarantees/#watch-apis
 
+## Pull request checks
+
+Every pull request runs the Rust tests, lint, release builds, and publication checks.
+Smoke tests compare three-member KV operations with etcd and check single-member write metrics.
+Documentation, saved reports, examples, Rust integration tests, metrics, and the health RPC use
+these fast checks. Any other changed path selects full verification for the whole pull request.
+Full verification adds the upstream suites, process faults, recovery, fuzzing, and benchmarks.
+
+Add the `ci:full` label to run full verification on any pull request.
+The Verify workflow also runs the full suite on each push to main and daily at 02:37 UTC.
+Use the Verify workflow dispatch to run it on a branch. Select `extended` for more fault seeds.
+The separate weekly Full etcd suites workflow runs the larger upstream matrix on Sundays.
+
 ## Repeat a saved history
 
 ```sh
