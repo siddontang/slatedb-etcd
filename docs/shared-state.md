@@ -1,6 +1,6 @@
 # Shared state: one writer and read-only followers
 
-**Status:** design proposal. Nothing in this document is implemented.
+**Status:** accepted design for an opt-in prototype. Nothing in this document is implemented.
 It extends [object storage snapshots](object-snapshots.md) and changes parts of the
 [architecture](architecture.md) contract. Source facts are from `b1fc78d` and SlateDB 0.18.1.
 
@@ -539,7 +539,7 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
 
 ## Decisions
 
-Sig-Codex recommended these answers. They are open until the owner accepts them.
+Sig-Codex recommended these answers, and siddontang accepted them on 2026-11-24.
 
 1. **Leader memory:** accept about 2× the unflushed data for the prototype. Slow uploads, queued
    writes, and long reads can retain more, so enforce a total memory budget and measure peak RSS.
