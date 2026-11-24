@@ -262,7 +262,7 @@ async fn indexed_transactions_match_storage_evaluation() {
     ));
     for request in &requests {
         let expected = mvcc::prepare_with_counts(
-            &state.db,
+            state.db.as_ref(),
             None,
             state.revision,
             state.compact_revision,
@@ -271,7 +271,7 @@ async fn indexed_transactions_match_storage_evaluation() {
         )
         .await;
         let actual = mvcc::prepare_with_counts(
-            &state.db,
+            state.db.as_ref(),
             Some(&state.key_index),
             state.revision,
             state.compact_revision,

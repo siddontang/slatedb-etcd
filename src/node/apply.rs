@@ -136,7 +136,11 @@ pub(super) enum Job {
     #[cfg(test)]
     Panic,
     Entries(Vec<Entry>),
-    PreparePuts(Vec<(u64, RaftCommand)>),
+    /// Evaluate committed Puts of one term before their state write.
+    PreparePuts {
+        commands: Vec<(u64, RaftCommand)>,
+        term: u64,
+    },
     PublishPuts(crate::state::put_batch::PreparedPuts),
     Snapshot(Snapshot),
     Query(Query),
@@ -252,7 +256,7 @@ impl Executor {
         );
         let copy_state = changes_state || matches!(work.job, Job::Query(Query::Maintenance(..)));
         let previous_revision = self.state.revision;
-        if (changes_state || matches!(work.job, Job::PreparePuts(_))) && !work.delay.is_zero() {
+        if (changes_state || matches!(work.job, Job::PreparePuts { .. })) && !work.delay.is_zero() {
             tokio::time::sleep(work.delay).await;
         }
         let output = match work.job {
@@ -261,9 +265,9 @@ impl Executor {
             Job::Entries(entries) => {
                 Output::Entries(apply_entries(&mut self.state, entries, work.header).await?)
             }
-            Job::PreparePuts(commands) => {
+            Job::PreparePuts { commands, term } => {
                 let (batch, replies) =
-                    super::quorum_put::prepare(&self.state, &commands, work.header).await?;
+                    super::quorum_put::prepare(&self.state, &commands, term, work.header).await?;
                 Output::PreparedPuts(batch, replies)
             }
             Job::PublishPuts(batch) => {
@@ -517,6 +521,8 @@ async fn apply_entries(
             "apply batch has an index gap"
         );
         let kind = EntryType::try_from(entry.entry_type)?;
+        // Each state batch stores the term of its last entry beside `meta/applied`.
+        state.entry_term = entry.term;
         if entry.data.is_empty() {
             state.apply(entry.index, None).await?;
             continue;
@@ -537,6 +543,7 @@ async fn apply_entries(
         )?;
         if change.is_none() && super::quorum_put::kv_command(&command).is_some() {
             let mut commands = vec![(entry.index, command)];
+            let mut term = entry.term;
             // Later members read earlier group writes through a point-read overlay only.
             while let Some(next) = entries.peek() {
                 if next.entry_type != EntryType::EntryNormal as i32 || next.data.is_empty() {
@@ -548,9 +555,12 @@ async fn apply_entries(
                         if !crate::mvcc::needs_scan(request, credentials.is_some()) => {}
                     _ => break,
                 }
-                commands.push((entries.next().unwrap().index, command));
+                let next = entries.next().unwrap();
+                term = next.term;
+                commands.push((next.index, command));
             }
-            let (batch, outcomes) = super::quorum_put::prepare(state, &commands, header).await?;
+            let (batch, outcomes) =
+                super::quorum_put::prepare(state, &commands, term, header).await?;
             state.publish_puts(batch).await?;
             replies.extend(outcomes);
             continue;
@@ -829,6 +839,146 @@ mod tests {
         state.close().await.unwrap();
     }
 
+    /// Return the stored applied term. The row must hold the applied index, and the in-memory
+    /// term must match it.
+    async fn stored_term(state: &StateMachine) -> u64 {
+        let row = state
+            .db
+            .get(crate::state::APPLIED_TERM)
+            .await
+            .unwrap()
+            .unwrap();
+        let term = u64::from_be_bytes(row[8..].try_into().unwrap());
+        assert_eq!(
+            row.as_ref(),
+            crate::state::applied_term_row(state.applied, term)
+        );
+        assert_eq!(term, state.applied_term);
+        term
+    }
+
+    #[tokio::test]
+    async fn every_state_batch_stores_the_term_of_its_last_entry() {
+        use crate::proto::authpb::UserAddOptions;
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = StateMachine::open(directory.path()).await.unwrap();
+        assert_eq!(state.applied_term, 0);
+        let credentials = crate::auth::Credentials::default;
+        let etcd = |id: &str, etcd| {
+            Some(RaftCommand::Etcd {
+                id: id.into(),
+                origin: 1,
+                etcd,
+            })
+        };
+        // Each group applies as one state batch. A group of two puts uses the term of the last.
+        let groups = vec![
+            ("empty entry", vec![None]),
+            (
+                "grouped puts",
+                vec![etcd("a", put_op(b"a", b"1")), etcd("b", put_op(b"b", b"2"))],
+            ),
+            ("range", vec![etcd("range", range_op(b"a", b"z", 0))]),
+            (
+                "lease",
+                vec![Some(RaftCommand::Lease {
+                    id: "lease".into(),
+                    origin: 1,
+                    lease: LeaseCommand::Grant { id: 5, ttl: 60 },
+                })],
+            ),
+            (
+                "auth",
+                vec![Some(RaftCommand::Auth {
+                    id: "auth".into(),
+                    auth: crate::auth::Command::UserAdd(AuthUserAddRequest {
+                        name: "user".into(),
+                        options: Some(UserAddOptions { no_password: true }),
+                        ..Default::default()
+                    }),
+                    credentials: credentials(),
+                })],
+            ),
+            (
+                "cluster",
+                vec![Some(RaftCommand::Cluster {
+                    id: "cluster".into(),
+                    request: crate::cluster::Command::List(MemberListRequest::default()),
+                    credentials: credentials(),
+                })],
+            ),
+            (
+                "maintenance",
+                vec![Some(RaftCommand::Maintenance {
+                    id: "alarm".into(),
+                    request: crate::maintenance::Command::Alarm(AlarmRequest::default()),
+                    credentials: credentials(),
+                })],
+            ),
+            (
+                "diagnostic",
+                vec![Some(RaftCommand::Diagnostic(crate::Command {
+                    id: "diagnostic".into(),
+                    request: crate::Request {
+                        operations: vec![crate::Operation::Put {
+                            key: "k".into(),
+                            value: "v".into(),
+                        }],
+                    },
+                }))],
+            ),
+            (
+                "compaction",
+                vec![Some(RaftCommand::Compact {
+                    id: "compact".into(),
+                    compact: CompactionRequest {
+                        revision: 2,
+                        physical: false,
+                    },
+                })],
+            ),
+            (
+                "compaction step",
+                vec![Some(RaftCommand::CompactStep { id: "step".into() })],
+            ),
+        ];
+        let header = Header {
+            cluster: 1,
+            member: 1,
+            term: 1,
+        };
+        let (mut index, mut term) = (0, 0);
+        for (name, commands) in groups {
+            let batches = state.write_batches;
+            let entries = commands
+                .iter()
+                .map(|command| {
+                    index += 1;
+                    term += 3;
+                    Entry {
+                        index,
+                        term,
+                        data: command.as_ref().map_or(vec![], |c| c.encode().unwrap()),
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            apply_entries(&mut state, entries, header).await.unwrap();
+            assert_eq!(state.write_batches, batches + 1, "{name}");
+            assert_eq!(
+                (state.applied, stored_term(&state).await),
+                (index, term),
+                "{name}"
+            );
+        }
+        state.db.flush().await.unwrap();
+        state.close().await.unwrap();
+        drop(state);
+        let state = StateMachine::open(directory.path()).await.unwrap();
+        assert_eq!((state.applied, state.applied_term), (index, term));
+        state.close().await.unwrap();
+    }
+
     fn put_op(key: &[u8], value: &[u8]) -> RequestOp {
         RequestOp {
             request: Some(Op::RequestPut(PutRequest {
@@ -985,6 +1135,8 @@ mod tests {
             let right = tempfile::tempdir().unwrap();
             let mut grouped = StateMachine::open(left.path()).await.unwrap();
             let mut separate = StateMachine::open(right.path()).await.unwrap();
+            // Grouped apply stores the entry term. Direct apply calls store `entry_term`.
+            separate.entry_term = 1;
             grouped.quota = quota;
             separate.quota = quota;
             let mut commands = vec![RaftCommand::Lease {
@@ -1041,13 +1193,13 @@ mod tests {
             assert_eq!(grouped.logical_size(), separate.logical_size());
             assert_eq!(
                 grouped.logical_size(),
-                crate::state::maintenance::count_logical_size(&grouped.db)
+                crate::state::maintenance::count_logical_size(grouped.db.as_ref())
                     .await
                     .unwrap()
             );
             assert_eq!(
                 separate.logical_size(),
-                crate::state::maintenance::count_logical_size(&separate.db)
+                crate::state::maintenance::count_logical_size(separate.db.as_ref())
                     .await
                     .unwrap()
             );
@@ -1405,6 +1557,8 @@ mod tests {
             let right = tempfile::tempdir().unwrap();
             let mut grouped = StateMachine::open(left.path()).await.unwrap();
             let mut separate = StateMachine::open(right.path()).await.unwrap();
+            // Grouped apply stores the entry term. Direct apply calls store `entry_term`.
+            separate.entry_term = 1;
             for state in [&mut grouped, &mut separate] {
                 if secured {
                     enable_auth(state).await;
@@ -1468,7 +1622,7 @@ mod tests {
             assert_eq!(index_rows(&grouped), index_rows(&separate), "{context}");
             assert_eq!(
                 grouped.logical_size(),
-                crate::state::maintenance::count_logical_size(&grouped.db)
+                crate::state::maintenance::count_logical_size(grouped.db.as_ref())
                     .await
                     .unwrap(),
                 "{context}"

@@ -27,8 +27,8 @@ impl StateMachine {
                         let value = if let Some(value) = overlay.get(key) {
                             value.clone()
                         } else {
-                            self.db
-                                .get(data_key(key))
+                            self.applied_state()
+                                .get(&data_key(key))
                                 .await?
                                 .map(|v| String::from_utf8(v.to_vec()))
                                 .transpose()?
@@ -38,7 +38,7 @@ impl StateMachine {
                 }
             }
         }
-        batch.put(APPLIED, index.to_be_bytes());
+        self.mark_applied(&mut batch, index);
         // Raft already made this command durable. Waiting for SlateDB here would wait for L0.
         self.write_batch(batch, index).await?;
         self.applied = index;
@@ -46,8 +46,8 @@ impl StateMachine {
     }
 
     pub async fn local_value(&self, key: &str) -> Result<Option<String>> {
-        self.db
-            .get(data_key(key))
+        self.applied_state()
+            .get(&data_key(key))
             .await?
             .map(|value| String::from_utf8(value.to_vec()).map_err(Into::into))
             .transpose()

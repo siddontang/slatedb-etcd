@@ -4,9 +4,9 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
 use prost::bytes::Bytes;
-use slatedb::Db;
 
 use crate::state::key_index::KeyIndex;
+use crate::state::StateRead;
 
 /// An atomic state batch. The last mutation for a key replaces earlier mutations.
 #[derive(Clone, Debug, Default)]
@@ -109,14 +109,19 @@ impl WriteBatch {
         }
     }
 
-    pub(crate) async fn logical_size(&self, db: &Db, index: &KeyIndex, size: u64) -> Result<u64> {
+    pub(crate) async fn logical_size(
+        &self,
+        db: &impl StateRead,
+        index: &KeyIndex,
+        size: u64,
+    ) -> Result<u64> {
         self.logical_size_after(db, index, None, size).await
     }
 
     /// Update the logical size. The key index supplies old current-row lengths without a read.
     pub(crate) async fn logical_size_after(
         &self,
-        db: &Db,
+        db: &impl StateRead,
         index: &KeyIndex,
         previous: Option<&Self>,
         mut size: u64,
@@ -162,6 +167,14 @@ impl WriteBatch {
         self.changes.keys()
     }
 
+    /// Return the final mutation of each key in key order. `None` is a delete.
+    /// The values are the batch's own `Bytes`, so a caller can keep them without a copy.
+    pub(crate) fn rows(&self) -> impl Iterator<Item = (&Bytes, Option<&Bytes>)> {
+        self.changes
+            .iter()
+            .map(|(key, change)| (key, change.value.as_ref()))
+    }
+
     pub(crate) fn into_rows(self) -> impl Iterator<Item = (Bytes, Option<Bytes>)> {
         self.changes
             .into_iter()
@@ -170,8 +183,8 @@ impl WriteBatch {
 
     pub(crate) fn to_storage(&self) -> slatedb::WriteBatch {
         let mut batch = slatedb::WriteBatch::new();
-        for (key, change) in &self.changes {
-            if let Some(value) = &change.value {
+        for (key, value) in self.rows() {
+            if let Some(value) = value {
                 batch.put_bytes(key.clone(), value.clone());
             } else {
                 batch.delete(key);
@@ -192,4 +205,41 @@ pub(crate) fn row_size_after(
         .context("logical size counter underflow")?
         .checked_add(new.map_or(0, bytes))
         .context("logical size counter overflow")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rows_hold_the_final_mutations_without_a_copy() {
+        let mut batch = WriteBatch::new();
+        let value = Bytes::from(vec![7; 64]);
+        batch.put(b"b", b"first");
+        batch.put_bytes(Bytes::from_static(b"b"), value.clone());
+        batch.put(b"a", b"kept");
+        batch.put(b"c", b"removed");
+        batch.delete(b"c");
+        batch.delete(b"d");
+        let rows: Vec<_> = batch.rows().collect();
+        assert_eq!(
+            rows,
+            [
+                (
+                    &Bytes::from_static(b"a"),
+                    Some(&Bytes::from_static(b"kept"))
+                ),
+                (&Bytes::from_static(b"b"), Some(&value)),
+                (&Bytes::from_static(b"c"), None),
+                (&Bytes::from_static(b"d"), None),
+            ]
+        );
+        // The row shares the buffer of the put value.
+        assert_eq!(rows[1].1.unwrap().as_ptr(), value.as_ptr());
+        let owned: Vec<_> = batch
+            .rows()
+            .map(|(key, value)| (key.clone(), value.cloned()))
+            .collect();
+        assert_eq!(batch.into_rows().collect::<Vec<_>>(), owned);
+    }
 }

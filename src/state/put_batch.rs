@@ -12,6 +12,8 @@ pub(crate) struct PreparedPuts {
     counts: crate::metrics::Writes,
     first: u64,
     pub last: u64,
+    /// The Raft term of the entry at `last`.
+    term: u64,
     writes: WriteBatch,
     revision: i64,
     size: u64,
@@ -22,14 +24,16 @@ impl StateMachine {
     /// Commit KV entries together. Each request keeps its own result and revision.
     #[cfg(test)]
     pub(crate) async fn apply_puts(&mut self, puts: &[KvEntry<'_>]) -> Result<Vec<Outcome>> {
-        let (batch, replies) = self.prepare_puts(puts).await?;
+        let (batch, replies) = self.prepare_puts(puts, self.entry_term).await?;
         self.publish_puts(batch).await?;
         Ok(replies)
     }
 
+    /// Evaluate a group of KV entries. `term` is the Raft term of the last entry.
     pub(crate) async fn prepare_puts(
         &self,
         puts: &[KvEntry<'_>],
+        term: u64,
     ) -> Result<(PreparedPuts, Vec<Outcome>)> {
         ensure!(!puts.is_empty(), "empty put batch");
         let mut batch = WriteBatch::new();
@@ -71,7 +75,12 @@ impl StateMachine {
                     let mut alarm_write = WriteBatch::new();
                     alarm_write.put(crate::maintenance::ALARMS, serde_json::to_vec(&alarms)?);
                     size = alarm_write
-                        .logical_size_after(&self.db, &self.key_index, Some(&batch), size)
+                        .logical_size_after(
+                            self.applied_state(),
+                            &self.key_index,
+                            Some(&batch),
+                            size,
+                        )
                         .await?;
                     batch.extend(alarm_write);
                     Err(if corrupt {
@@ -84,7 +93,7 @@ impl StateMachine {
                     })
                 } else {
                     let view = mvcc::CurrentView {
-                        db: &self.db,
+                        db: self.applied_state(),
                         rows: &self.current,
                         index: &self.key_index,
                     };
@@ -132,7 +141,7 @@ impl StateMachine {
                                 Ok((reply, writes, next, count)) => {
                                     size = writes
                                         .logical_size_after(
-                                            &self.db,
+                                            self.applied_state(),
                                             &self.key_index,
                                             Some(&batch),
                                             size,
@@ -168,12 +177,13 @@ impl StateMachine {
             batch.put(mvcc::REVISION, revision.to_be_bytes());
         }
         let last = puts.last().unwrap().index;
-        batch.put(APPLIED, last.to_be_bytes());
+        mark_applied(&mut batch, last, term);
         Ok((
             PreparedPuts {
                 counts,
                 first: puts[0].index,
                 last,
+                term,
                 writes: batch,
                 revision,
                 size,
@@ -188,6 +198,7 @@ impl StateMachine {
             counts,
             first,
             last,
+            term,
             writes,
             revision,
             size,
@@ -202,6 +213,7 @@ impl StateMachine {
             crate::failpoint::hit("apply-batch-after-write");
         }
         self.applied = last;
+        self.applied_term = term;
         self.revision = revision;
         self.logical_bytes = size;
         counts.publish(&self.metrics);
@@ -290,7 +302,9 @@ mod tests {
             assert_eq!(grouped.logical_bytes, separate.logical_bytes);
             assert_eq!(
                 grouped.logical_bytes,
-                maintenance::count_logical_size(&grouped.db).await.unwrap()
+                maintenance::count_logical_size(grouped.db.as_ref())
+                    .await
+                    .unwrap()
             );
             assert_eq!(grouped.db.snapshot().unwrap().seq(), requests.len() as u64);
             grouped.db.flush().await.unwrap();

@@ -5,7 +5,7 @@ use slatedb::object_store::path::Path;
 use slatedb::object_store::ObjectStoreExt;
 
 use super::*;
-use crate::state::StateMachine;
+use crate::state::{StateMachine, StateRead};
 use crate::{Command, Operation};
 
 async fn put(state: &mut StateMachine, index: u64, key: &str, value: &str) {
@@ -54,6 +54,7 @@ async fn a_follower_installs_copied_checkpoint_objects() {
     let leader_dir = tempfile::tempdir().unwrap();
     let follower_dir = tempfile::tempdir().unwrap();
     let mut leader = open(leader_dir.path(), 1).await;
+    leader.entry_term = 7;
     for index in 1..=50 {
         put(
             &mut leader,
@@ -78,8 +79,15 @@ async fn a_follower_installs_copied_checkpoint_objects() {
     let mut snapshot = Snapshot::default();
     snapshot.mut_metadata().index = 50;
     snapshot.data = data;
+    // A known checkpoint term must equal the snapshot term. The check runs before the switch.
+    let root = follower.location.root();
+    snapshot.mut_metadata().term = 8;
+    let error = follower.install_snapshot(&snapshot).await.unwrap_err();
+    assert!(error.to_string().contains("snapshot term"), "{error}");
+    assert_eq!((follower.applied, follower.location.root()), (1, root));
+    snapshot.mut_metadata().term = 7;
     follower.install_snapshot(&snapshot).await.unwrap();
-    assert_eq!(follower.applied, 50);
+    assert_eq!((follower.applied, follower.applied_term), (50, 7));
     assert_eq!(follower.location.root(), "state-1");
     assert_eq!(
         follower.local_value("key-1").await.unwrap().as_deref(),
@@ -115,6 +123,53 @@ async fn a_follower_installs_copied_checkpoint_objects() {
         exists(&leader, &format!("state/{}", descriptor.ssts[0])).await,
         "the copy must not move leader objects"
     );
+    follower.close().await.unwrap();
+    leader.close().await.unwrap();
+}
+
+/// A checkpoint whose term row is stale, after an older binary advanced `meta/applied`, has an
+/// unknown term. The install takes the term from the snapshot.
+#[tokio::test]
+async fn an_object_snapshot_supplies_an_unknown_checkpoint_term() {
+    let leader_dir = tempfile::tempdir().unwrap();
+    let follower_dir = tempfile::tempdir().unwrap();
+    let mut leader = open(leader_dir.path(), 1).await;
+    leader.entry_term = 7;
+    put(&mut leader, 1, "key", "value").await;
+    let mut batch = crate::WriteBatch::new();
+    batch.put(crate::state::APPLIED, 2_u64.to_be_bytes());
+    leader.write_batch(batch, 2).await.unwrap();
+    leader.applied = 2;
+    let mut snapshot = image(&leader).await;
+    snapshot.mut_metadata().term = 9;
+    let mut follower = open(follower_dir.path(), 2).await;
+    follower.install_snapshot(&snapshot).await.unwrap();
+    assert_eq!((follower.applied, follower.applied_term), (2, 9));
+    // A restart before the next entry finds no valid term row. Startup passes the durable
+    // Raft snapshot again, and it restores the term.
+    follower.close().await.unwrap();
+    drop(follower);
+    let mut follower = open(follower_dir.path(), 2).await;
+    assert_eq!((follower.applied, follower.applied_term), (2, 0));
+    follower.install_snapshot(&snapshot).await.unwrap();
+    assert_eq!((follower.applied, follower.applied_term), (2, 9));
+    // A snapshot at an older index does not change the term. A conflicting term fails.
+    let mut older = Snapshot::default();
+    older.mut_metadata().index = 1;
+    older.mut_metadata().term = 5;
+    follower.install_snapshot(&older).await.unwrap();
+    snapshot.mut_metadata().term = 8;
+    let error = follower.install_snapshot(&snapshot).await.unwrap_err();
+    assert!(error.to_string().contains("snapshot term"), "{error}");
+    assert_eq!((follower.applied, follower.applied_term), (2, 9));
+    put(&mut follower, 3, "key", "next").await;
+    let row = follower
+        .db
+        .get(crate::state::APPLIED_TERM)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.as_ref(), crate::state::applied_term_row(3, 9));
     follower.close().await.unwrap();
     leader.close().await.unwrap();
 }
@@ -353,7 +408,7 @@ async fn a_read_view_keeps_the_replaced_database_open() {
     // The retire task waits for the view. The pinned snapshot stays readable.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert!(view
-        .snapshot
+        .state()
         .get(crate::state::APPLIED)
         .await
         .unwrap()

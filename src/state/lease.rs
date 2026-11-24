@@ -44,7 +44,7 @@ impl StateMachine {
                 crate::maintenance::ALARMS,
                 serde_json::to_vec(&self.alarms)?,
             );
-            batch.put(APPLIED, index.to_be_bytes());
+            self.mark_applied(&mut batch, index);
             self.write_batch(batch, index).await?;
             self.applied = index;
             return Ok(Outcome {
@@ -60,7 +60,7 @@ impl StateMachine {
         }
         let (result, mut batch, revision, change, deletes) =
             match crate::lease::prepare_with_counts(
-                &self.db,
+                self.applied_state(),
                 self.revision,
                 self.compact_revision,
                 index,
@@ -81,7 +81,7 @@ impl StateMachine {
                     (Err(error), WriteBatch::new(), self.revision, None, 0)
                 }
             };
-        batch.put(APPLIED, index.to_be_bytes());
+        self.mark_applied(&mut batch, index);
         self.write_batch(batch, index).await?;
         self.applied = index;
         self.revision = revision;

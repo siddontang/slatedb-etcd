@@ -7,6 +7,7 @@ use crate::proto::etcdserverpb::WatchResponse;
 use crate::proto::etcdserverpb::{ResponseHeader, WatchCreateRequest};
 use crate::proto::mvccpb::{Event, KeyValue};
 use crate::proto::state::Journal;
+use crate::state::{StateRead, StateScan};
 
 pub(crate) const EVENTS: &[u8] = b"etcd/events/";
 
@@ -77,12 +78,12 @@ pub(crate) fn record_journal(
 /// etcd fetches prev_kv with a Range at `mod_revision - 1` and omits it when the Range finds
 /// nothing. A missing or deleted version therefore yields `None`. Storage errors still fail.
 async fn previous_value(
-    db: &slatedb::DbSnapshot,
+    db: &impl StateRead,
     key: &[u8],
     revision: i64,
 ) -> Result<Option<KeyValue>, KvError> {
     let Some(row) = db
-        .get(mvcc::history_key(key, revision))
+        .get(&mvcc::history_key(key, revision))
         .await
         .map_err(KvError::storage)?
     else {
@@ -293,7 +294,7 @@ pub struct Subscription {
 /// A journal can name the history revision of a previous value instead of storing it inline.
 /// `db` must be a view that includes `revision`.
 pub(crate) async fn select(
-    db: &slatedb::DbSnapshot,
+    db: &impl StateRead,
     request: &WatchCreateRequest,
     revision: i64,
     compact_revision: i64,
@@ -312,7 +313,7 @@ pub(crate) async fn select(
         }
         let kv = if value_in_history(journal, event) {
             let row = db
-                .get(mvcc::history_key(&kv.key, kv.mod_revision))
+                .get(&mvcc::history_key(&kv.key, kv.mod_revision))
                 .await
                 .map_err(KvError::storage)?;
             stored_value(kv, row)?
@@ -338,7 +339,7 @@ pub(crate) async fn select(
 /// Read at most `limit` journal revisions in `[from, through]` from a pinned view.
 /// Returns the rows and the last revision that the page covers.
 pub(crate) async fn scan(
-    db: &slatedb::DbSnapshot,
+    db: &impl StateRead,
     from: i64,
     through: i64,
     limit: usize,
@@ -348,7 +349,7 @@ pub(crate) async fn scan(
         return Ok((rows, through));
     }
     let mut scan = db
-        .scan(key(from)..key(through + 1))
+        .scan_range(key(from)..key(through + 1), &Default::default())
         .await
         .map_err(KvError::storage)?;
     while let Some(row) = scan.next().await.map_err(KvError::storage)? {
@@ -376,7 +377,7 @@ pub struct WatchPage {
 
 #[cfg(test)]
 pub(crate) async fn read(
-    db: &slatedb::DbSnapshot,
+    db: &impl StateRead,
     current: i64,
     compact_revision: i64,
     request: &WatchCreateRequest,

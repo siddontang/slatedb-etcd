@@ -26,9 +26,11 @@ impl StateMachine {
             let count_offset = data.len();
             crate::codec::write(&mut data, &0_u64)?;
             let mut count = 0_u64;
-            let mut iterator = snapshot.scan_prefix(b"", ..).await?;
+            let mut iterator = snapshot.scan_under(b"", &Default::default()).await?;
             while let Some(row) = iterator.next().await? {
-                if row.key.as_ref() != crate::cluster::KEY {
+                // Format 4 readers reject the term row. Install takes the term from the Raft
+                // snapshot metadata instead.
+                if row.key.as_ref() != crate::cluster::KEY && row.key.as_ref() != APPLIED_TERM {
                     crate::codec::write(&mut data, &(row.key, row.value))?;
                     count += 1;
                 }
@@ -44,9 +46,13 @@ impl StateMachine {
 
     pub async fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<()> {
         let index = snapshot.get_metadata().index;
+        let term = snapshot.get_metadata().term;
+        if index == self.applied {
+            self.reconcile_term(term)?;
+        }
         if let Some(descriptor) = transfer::Descriptor::decode(snapshot.get_data())? {
             // Box the copy and database open. They are large futures on the apply stack.
-            return Box::pin(self.install_object(descriptor, index)).await;
+            return Box::pin(self.install_object(descriptor, index, term)).await;
         }
         if index <= self.applied {
             return Ok(());
@@ -67,19 +73,23 @@ impl StateMachine {
             "invalid snapshot metadata"
         );
         let mut batch = WriteBatch::new();
-        let mut iterator = self.db.scan_prefix(b"", ..).await?;
-        while let Some(row) = iterator.next().await? {
+        let mut rows = self
+            .applied_state()
+            .scan_under(b"", &Default::default())
+            .await?;
+        while let Some(row) = rows.next().await? {
             batch.delete(row.key);
         }
+        drop(rows);
         for (key, value) in data.rows {
-            ensure!(
-                key.starts_with(DATA) || key.starts_with(b"etcd/") || key == APPLIED,
-                "invalid snapshot key"
-            );
+            ensure!(snapshot_key(&key), "invalid snapshot key");
             batch.put(key, value);
         }
         crate::failpoint::hit("snapshot-before-install");
-        batch.put(APPLIED, index.to_be_bytes());
+        // The snapshot metadata holds the term of the entry at `index`. Images have no term
+        // row, except from an older exporter. The metadata replaces any stored value.
+        self.entry_term = snapshot.get_metadata().term;
+        self.mark_applied(&mut batch, index);
         self.write_batch(batch, index).await?;
         crate::failpoint::hit("snapshot-after-install-write");
         // The durable Raft snapshot lets a restart repeat this atomic replacement.
@@ -87,20 +97,20 @@ impl StateMachine {
         crate::failpoint::hit("snapshot-after-install-flush");
         self.applied = index;
         self.durable_applied = index;
-        self.revision = read_revision(&self.db).await?;
-        self.compact_revision = read_compact_revision(&self.db).await?;
-        self.compaction = compaction::load(&self.db).await?;
+        self.revision = read_revision(self.applied_state()).await?;
+        self.compact_revision = read_compact_revision(self.applied_state()).await?;
+        self.compaction = compaction::load(self.applied_state()).await?;
         self.plan_compaction();
-        self.leases = Arc::new(crate::lease::load(&self.db).await?);
-        self.alarms = match self.db.get(crate::maintenance::ALARMS).await? {
+        self.leases = Arc::new(crate::lease::load(self.applied_state()).await?);
+        self.alarms = match self.applied_state().get(crate::maintenance::ALARMS).await? {
             Some(data) => serde_json::from_slice(&data)?,
             None => vec![],
         };
-        self.members = Arc::new(match self.db.get(crate::cluster::KEY).await? {
+        self.members = Arc::new(match self.applied_state().get(crate::cluster::KEY).await? {
             Some(data) => serde_json::from_slice(&data)?,
             None => crate::cluster::Store::default(),
         });
-        self.auth = Arc::new(match self.db.get(crate::auth::KEY).await? {
+        self.auth = Arc::new(match self.applied_state().get(crate::auth::KEY).await? {
             Some(data) => serde_json::from_slice(&data)?,
             None => crate::auth::Store::default(),
         });
@@ -111,8 +121,37 @@ impl StateMachine {
         Ok(())
     }
 
+    /// Check the applied term against the term of a Raft snapshot at the applied index.
+    ///
+    /// A checkpoint from an older binary has no valid term row, so its install sets the term
+    /// only in memory. Startup passes the durable Raft snapshot again, and this fills the term.
+    /// The row is not written here: a SlateDB write needs a sequence above `applied`. The
+    /// durable snapshot stays until the log truncates at a later checkpoint, and the batch of
+    /// any later entry stores the term.
+    fn reconcile_term(&mut self, term: u64) -> Result<()> {
+        if term == 0 {
+            return Ok(());
+        }
+        if self.applied_term == 0 {
+            self.applied_term = term;
+            self.entry_term = term;
+        }
+        ensure!(
+            self.applied_term == term,
+            "applied term {} differs from snapshot term {term}",
+            self.applied_term
+        );
+        Ok(())
+    }
+
     /// Open the copied checkpoint as the new database and replace the current one.
-    async fn install_object(&mut self, descriptor: transfer::Descriptor, index: u64) -> Result<()> {
+    /// `term` is the Raft snapshot term. It must equal a known term of the checkpoint.
+    async fn install_object(
+        &mut self,
+        descriptor: transfer::Descriptor,
+        index: u64,
+        term: u64,
+    ) -> Result<()> {
         if index <= self.applied {
             // A bootstrap membership is stored by the first write after the install.
             if index == self.applied && self.db.get(crate::cluster::KEY).await?.is_none() {
@@ -134,6 +173,13 @@ impl StateMachine {
             let _ = next.close().await;
             anyhow::bail!("copied state does not match the snapshot index");
         }
+        // A checkpoint from an older binary has no valid term. The snapshot supplies it.
+        if next.applied_term != 0 && next.applied_term != term {
+            let _ = next.close().await;
+            anyhow::bail!("copied state does not match the snapshot term");
+        }
+        next.applied_term = term;
+        next.entry_term = term;
         let old_name = location.switch(&staging, index).await?;
         crate::failpoint::hit("snapshot-after-install-write");
         next.metrics = self.metrics.clone();

@@ -362,7 +362,7 @@ impl Stream {
         for (id, _) in &pending {
             permit(&view.auth, &credentials, &self.watchers[id].request)?;
         }
-        let (rows, covered) = crate::watch::scan(&view.snapshot, from, limit, PAGE_REVISIONS)
+        let (rows, covered) = crate::watch::scan(view.state(), from, limit, PAGE_REVISIONS)
             .await
             .map_err(|e| Status::unavailable(format!("etcdserver: {}", e.message)))?;
         let mut ids = vec![];
@@ -553,7 +553,7 @@ async fn deliver(
     journal: &crate::proto::state::Journal,
 ) -> Result<(), Status> {
     let events = crate::watch::select(
-        &state.view.snapshot,
+        state.view.state(),
         &watcher.request,
         revision,
         state.view.compact_revision,

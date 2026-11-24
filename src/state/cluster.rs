@@ -28,7 +28,7 @@ impl StateMachine {
         });
         let mut batch = WriteBatch::new();
         batch.put(crate::cluster::KEY, serde_json::to_vec(&members)?);
-        batch.put(APPLIED, index.to_be_bytes());
+        self.mark_applied(&mut batch, index);
         self.write_batch(batch, index).await?;
         self.members = Arc::new(members);
         self.applied = index;

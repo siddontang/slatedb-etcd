@@ -30,6 +30,7 @@ The CLI and embedded API share the same lifecycle and runtime paths.
 | `state` | Open storage and own mutable applied metadata |
 | `state/kv` and `state/put_batch` | Commit MVCC changes and maintain quota accounting |
 | `state/read` | Pin data, revision, Auth, and Lease metadata together |
+| `state/source` | Define the read interface that apply, read views, and Watch catch-up share |
 | `state/auth`, `state/cluster`, and `state/lease` | Apply their replicated domain changes |
 | `state/snapshot` and `state/backup` | Build, install, export, and restore complete state |
 | `state/maintenance` | Execute hashes, alarms, and physical storage work |

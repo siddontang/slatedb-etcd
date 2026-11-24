@@ -5,7 +5,6 @@ use std::pin::Pin;
 use crate::WriteBatch;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use slatedb::Db;
 use tonic::{Code, Status};
 
 use crate::proto::etcdserverpb::request_op::Request as Op;
@@ -13,6 +12,7 @@ use crate::proto::etcdserverpb::response_op::Response as Resp;
 use crate::proto::etcdserverpb::*;
 use crate::proto::mvccpb::KeyValue;
 use crate::proto::state::Version;
+use crate::state::{StateRead, StateScan};
 
 mod put;
 #[cfg(test)]
@@ -244,27 +244,31 @@ fn scan_options() -> slatedb::config::ScanOptions {
     }
 }
 
-enum ReadDb<'a> {
-    Live(&'a Db),
-    Pinned(&'a slatedb::DbSnapshot, &'a crate::state::rows::RowCache),
+enum ReadDb<'a, R> {
+    Live(&'a R),
+    /// A pinned view at sequence `seq`. Its point reads share rows through the row cache.
+    Pinned {
+        db: &'a R,
+        rows: &'a crate::state::rows::RowCache,
+        seq: u64,
+    },
     /// Applied state plus earlier writes of the same apply group.
     Overlay {
-        db: &'a Db,
+        db: &'a R,
         previous: &'a WriteBatch,
         rows: &'a crate::state::current::CurrentRows,
     },
 }
 
-impl ReadDb<'_> {
-    async fn get(&self, key: Vec<u8>) -> Result<Option<bytes::Bytes>, slatedb::Error> {
+impl<R: StateRead> ReadDb<'_, R> {
+    async fn get(&self, key: &[u8]) -> Result<Option<bytes::Bytes>, slatedb::Error> {
         match self {
-            Self::Live(db) => db.get(key).await,
-            Self::Pinned(db, _) => db.get(key).await,
+            Self::Live(db) | Self::Pinned { db, .. } => db.get(key).await,
             Self::Overlay { db, previous, rows } => {
-                if let Some(value) = previous.get(&key) {
+                if let Some(value) = previous.get(key) {
                     return Ok(value);
                 }
-                if let Some(value) = rows.get(&key) {
+                if let Some(value) = rows.get(key) {
                     return Ok(Some(value));
                 }
                 db.get(key).await
@@ -275,15 +279,18 @@ impl ReadDb<'_> {
     /// Read the current row of a user key. Pinned views share rows through the row cache.
     async fn current(&self, key: &[u8]) -> KvResult<Option<KeyValue>> {
         let decode = |row: &[u8]| KeyValue::decode(row).map_err(KvError::storage);
-        let Self::Pinned(db, rows) = self else {
-            let row = self.get(current_key(key)).await.map_err(KvError::storage)?;
+        let Self::Pinned { db, rows, seq } = self else {
+            let row = self
+                .get(&current_key(key))
+                .await
+                .map_err(KvError::storage)?;
             return row.as_deref().map(decode).transpose();
         };
-        let seq = db.seq();
+        let seq = *seq;
         if let Some(kv) = rows.get(key, seq, decode) {
             return kv.map(Some);
         }
-        let row = db.get(current_key(key)).await.map_err(KvError::storage)?;
+        let row = db.get(&current_key(key)).await.map_err(KvError::storage)?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -301,46 +308,28 @@ impl ReadDb<'_> {
     }
 
     // The overlay merges only point reads. Grouping places scans before earlier group writes.
-    fn scan_base(&self) -> Result<&Db, slatedb::Error> {
+    fn scan_base(&self) -> Result<&R, slatedb::Error> {
         match self {
             Self::Overlay { db, previous, .. } if previous.is_empty() => Ok(db),
             Self::Overlay { .. } => Err(slatedb::Error::unavailable(
                 "scan over an apply group overlay".to_string(),
             )),
-            Self::Live(db) => Ok(db),
-            Self::Pinned(..) => unreachable!("pinned scans use the snapshot"),
+            Self::Live(db) | Self::Pinned { db, .. } => Ok(db),
         }
     }
 
-    async fn scan(
-        &self,
-        range: std::ops::Range<Vec<u8>>,
-    ) -> Result<slatedb::DbIterator, slatedb::Error> {
-        let options = scan_options();
-        match self {
-            Self::Pinned(db, _) => db.scan_with_options(range, &options).await,
-            _ => self.scan_base()?.scan_with_options(range, &options).await,
-        }
+    async fn scan(&self, range: std::ops::Range<Vec<u8>>) -> Result<R::Scan<'_>, slatedb::Error> {
+        self.scan_base()?.scan_range(range, &scan_options()).await
     }
 
-    async fn scan_prefix(&self, prefix: Vec<u8>) -> Result<slatedb::DbIterator, slatedb::Error> {
-        match self {
-            Self::Pinned(db, _) => {
-                db.scan_prefix_with_options(prefix, .., &scan_options())
-                    .await
-            }
-            _ => {
-                self.scan_base()?
-                    .scan_prefix_with_options(prefix, .., &scan_options())
-                    .await
-            }
-        }
+    async fn scan_prefix(&self, prefix: &[u8]) -> Result<R::Scan<'_>, slatedb::Error> {
+        self.scan_base()?.scan_under(prefix, &scan_options()).await
     }
 }
 
-struct View<'a> {
+struct View<'a, R> {
     writes: crate::metrics::Writes,
-    db: ReadDb<'a>,
+    db: ReadDb<'a, R>,
     revision: i64,
     compact_revision: i64,
     changes: BTreeMap<Vec<u8>, Option<KeyValue>>,
@@ -356,7 +345,7 @@ struct View<'a> {
     keys: Option<&'a crate::state::key_index::KeyPin>,
 }
 
-impl View<'_> {
+impl<R: StateRead> View<'_, R> {
     /// Find the base metadata of a key. `None` means that the index is unavailable.
     fn indexed(&self, key: &[u8]) -> Option<Option<KeyValue>> {
         let index = self.index?;
@@ -439,7 +428,7 @@ impl View<'_> {
         let mut versions = BTreeMap::<Vec<u8>, Version>::new();
         let mut scan = self
             .db
-            .scan_prefix(prefix)
+            .scan_prefix(&prefix)
             .await
             .map_err(KvError::storage)?;
         while let Some(row) = scan.next().await.map_err(KvError::storage)? {
@@ -773,7 +762,7 @@ impl View<'_> {
 
 /// Evaluate a read without constructing a state write batch.
 pub async fn read(
-    db: &Db,
+    db: &impl StateRead,
     revision: i64,
     compact_revision: i64,
     request: &RequestOp,
@@ -792,7 +781,7 @@ pub async fn read(
 }
 
 pub(crate) async fn read_snapshot(
-    db: &slatedb::DbSnapshot,
+    db: &impl StateRead,
     rows: &crate::state::rows::RowCache,
     revision: i64,
     compact_revision: i64,
@@ -801,7 +790,11 @@ pub(crate) async fn read_snapshot(
     keys: &crate::state::key_index::KeyPin,
 ) -> KvResult<ResponseOp> {
     read_from(
-        ReadDb::Pinned(db, rows),
+        ReadDb::Pinned {
+            db,
+            rows,
+            seq: keys.seq(),
+        },
         revision,
         compact_revision,
         request,
@@ -841,7 +834,7 @@ fn row_bytes(kv: &KeyValue) -> usize {
 /// without a budget and get the same result.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_snapshot_within(
-    db: &slatedb::DbSnapshot,
+    db: &impl StateRead,
     rows: &crate::state::rows::RowCache,
     revision: i64,
     compact_revision: i64,
@@ -851,7 +844,11 @@ pub(crate) async fn read_snapshot_within(
     budget: usize,
 ) -> Option<KvResult<ResponseOp>> {
     let result = read_from(
-        ReadDb::Pinned(db, rows),
+        ReadDb::Pinned {
+            db,
+            rows,
+            seq: keys.seq(),
+        },
         revision,
         compact_revision,
         request,
@@ -871,8 +868,8 @@ pub(crate) async fn read_snapshot_within(
     }
 }
 
-async fn read_from<'a>(
-    db: ReadDb<'a>,
+async fn read_from<'a, R: StateRead>(
+    db: ReadDb<'a, R>,
     revision: i64,
     compact_revision: i64,
     request: &RequestOp,
@@ -907,7 +904,7 @@ async fn read_from<'a>(
 
 /// Build one atomic state batch. Semantic errors discard all changes.
 pub async fn prepare(
-    db: &Db,
+    db: &impl StateRead,
     revision: i64,
     compact_revision: i64,
     request: &RequestOp,
@@ -920,7 +917,7 @@ pub async fn prepare(
 
 /// Evaluate a write on the live applied state. `index` must describe the same applied rows.
 pub(crate) async fn prepare_with_counts(
-    db: &Db,
+    db: &impl StateRead,
     index: Option<&crate::state::key_index::KeyIndex>,
     revision: i64,
     compact_revision: i64,
@@ -941,7 +938,7 @@ pub(crate) async fn prepare_with_counts(
 /// Evaluate a request after earlier writes of the same apply group.
 /// Point reads and index lookups see `previous` first. A scan must come before any group write.
 pub(crate) async fn prepare_grouped(
-    current: &CurrentView<'_>,
+    current: &CurrentView<'_, impl StateRead>,
     previous: &WriteBatch,
     revision: i64,
     compact_revision: i64,
@@ -965,7 +962,7 @@ pub(crate) async fn prepare_grouped(
 }
 
 async fn prepare_view(
-    db: ReadDb<'_>,
+    db: ReadDb<'_, impl StateRead>,
     index: Option<&crate::state::key_index::KeyIndex>,
     revision: i64,
     compact_revision: i64,
@@ -1076,9 +1073,9 @@ pub fn fill_header(op: &mut ResponseOp, cluster: u64, member: u64, term: u64) {
     }
 }
 
-pub(crate) async fn lease_keys(db: &Db, id: i64) -> KvResult<Vec<Vec<u8>>> {
+pub(crate) async fn lease_keys(db: &impl StateRead, id: i64) -> KvResult<Vec<Vec<u8>>> {
     let mut scan = db
-        .scan_prefix(CURRENT, ..)
+        .scan_under(CURRENT, &Default::default())
         .await
         .map_err(KvError::storage)?;
     let mut keys = vec![];
@@ -1092,7 +1089,7 @@ pub(crate) async fn lease_keys(db: &Db, id: i64) -> KvResult<Vec<Vec<u8>>> {
 }
 
 pub(crate) async fn revoke_keys(
-    db: &Db,
+    db: &impl StateRead,
     revision: i64,
     compact_revision: i64,
     id: i64,

@@ -109,7 +109,7 @@ async fn read_path_matches_transaction_evaluation_without_a_write_batch() {
                         },
                     ] {
                         let expected = mvcc::prepare(
-                            &state.db,
+                            state.db.as_ref(),
                             state.revision,
                             state.compact_revision,
                             &request,
@@ -295,7 +295,8 @@ async fn streamed_snapshot_matches_the_complete_state_encoding() {
     let mut rows = vec![];
     let mut scan = state.db.scan_prefix(b"", ..).await.unwrap();
     while let Some(row) = scan.next().await.unwrap() {
-        if row.key.as_ref() != crate::cluster::KEY {
+        // The image omits the term row. Install takes the term from the Raft snapshot.
+        if row.key.as_ref() != crate::cluster::KEY && row.key.as_ref() != APPLIED_TERM {
             rows.push((row.key.to_vec(), row.value.to_vec()));
         }
     }
@@ -540,7 +541,7 @@ async fn lease_revoke_deletes_more_keys_than_the_user_transaction_limit() {
         .unwrap();
     assert_eq!(page.responses.len(), 1);
     assert_eq!(page.responses[0].events.len(), 130);
-    assert!(crate::mvcc::lease_keys(&state.db, 9)
+    assert!(crate::mvcc::lease_keys(state.db.as_ref(), 9)
         .await
         .unwrap()
         .is_empty());
@@ -1157,5 +1158,287 @@ async fn the_first_hash_or_journal_row_marks_the_directory() {
         drop((storage, marker, state));
         let storage = crate::storage::RaftStorage::open(raft.path(), 1, "test", vec![1]).unwrap();
         assert!(storage.row_marker().is_marked());
+    }
+}
+
+/// Return the stored `(index, term)` apply position, or `None` when the row is missing.
+async fn stored_position(state: &StateMachine) -> Option<(u64, u64)> {
+    let row = state.applied_state().get(APPLIED_TERM).await.unwrap()?;
+    assert_eq!(row.len(), 16);
+    let index = u64::from_be_bytes(row[..8].try_into().unwrap());
+    let term = u64::from_be_bytes(row[8..].try_into().unwrap());
+    Some((index, term))
+}
+
+/// Return the stored term. It is valid only when the row holds the applied index.
+async fn stored_term(state: &StateMachine) -> Option<u64> {
+    let (index, term) = stored_position(state).await?;
+    assert_eq!(index, state.applied);
+    Some(term)
+}
+
+/// Write a state batch the way binaries without the term row did: `meta/applied` alone.
+async fn apply_without_term(state: &mut StateMachine, index: u64) {
+    let mut batch = WriteBatch::new();
+    batch.put(data_key("key"), index.to_string());
+    batch.put(APPLIED, index.to_be_bytes());
+    state.write_batch(batch, index).await.unwrap();
+    state.applied = index;
+}
+
+async fn reopen(state: StateMachine, dir: &std::path::Path) -> StateMachine {
+    state.db.flush().await.unwrap();
+    state.close().await.unwrap();
+    drop(state);
+    StateMachine::open(dir).await.unwrap()
+}
+
+/// The term row is valid only at its own index. A database from an older binary has no row, or
+/// a row that an older binary left behind when it advanced `meta/applied`. Both open with an
+/// unknown term, and the next state batch stores the correct position.
+#[tokio::test]
+async fn a_term_row_is_valid_only_at_its_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    apply_without_term(&mut state, 1).await;
+    let mut state = reopen(state, dir.path()).await;
+    assert_eq!((state.applied, state.applied_term), (1, 0));
+    assert_eq!(stored_position(&state).await, None);
+    assert_eq!(
+        state.local_value("key").await.unwrap().as_deref(),
+        Some("1")
+    );
+    state.entry_term = 2;
+    state.apply(2, None).await.unwrap();
+    assert_eq!(stored_position(&state).await, Some((2, 2)));
+    let mut state = reopen(state, dir.path()).await;
+    assert_eq!((state.applied, state.applied_term), (2, 2));
+    // An older binary applies index 3 in term 3 and keeps the row of index 2.
+    apply_without_term(&mut state, 3).await;
+    let mut state = reopen(state, dir.path()).await;
+    assert_eq!(stored_position(&state).await, Some((2, 2)));
+    assert_eq!((state.applied, state.applied_term), (3, 0));
+    state.entry_term = 3;
+    state.apply(4, None).await.unwrap();
+    assert_eq!(stored_position(&state).await, Some((4, 3)));
+    assert_eq!(state.applied_term, 3);
+    state.close().await.unwrap();
+}
+
+/// A Raft snapshot at the applied index must agree with a known stored term.
+#[tokio::test]
+async fn a_snapshot_at_the_applied_index_checks_a_known_term() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    state.entry_term = 6;
+    state.apply(1, None).await.unwrap();
+    let mut state = reopen(state, dir.path()).await;
+    assert_eq!((state.applied, state.applied_term), (1, 6));
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = 1;
+    snapshot.mut_metadata().term = 7;
+    let error = state.install_snapshot(&snapshot).await.unwrap_err();
+    assert!(error.to_string().contains("snapshot term"), "{error}");
+    snapshot.mut_metadata().term = 6;
+    state.install_snapshot(&snapshot).await.unwrap();
+    assert_eq!(
+        (state.applied_term, stored_term(&state).await),
+        (6, Some(6))
+    );
+    state.close().await.unwrap();
+}
+
+/// Check native snapshot bytes with the rules of the previous format 4 reader.
+fn check_format_4(data: &SnapshotData) {
+    assert!(crate::readable_snapshot(data.version));
+    let mut seen = std::collections::BTreeSet::new();
+    for (key, _) in &data.rows {
+        assert!(
+            key.starts_with(DATA) || key.starts_with(b"etcd/") || key == APPLIED,
+            "the previous reader rejects {}",
+            String::from_utf8_lossy(key)
+        );
+        assert!(seen.insert(key.clone()));
+    }
+}
+
+/// Check a native backup like the previous restore: checksum, exact decode, and format 4 rows.
+fn check_format_4_backup(bytes: &[u8]) {
+    use sha2::{Digest, Sha256};
+    let (payload, checksum) = bytes.split_at(bytes.len() - 32);
+    assert_eq!(Sha256::digest(payload).as_slice(), checksum);
+    let (data, consumed): (SnapshotData, _) = bincode::serde::decode_from_slice(
+        payload,
+        bincode::config::legacy().with_limit::<{ 64 * 1024 * 1024 }>(),
+    )
+    .unwrap();
+    assert_eq!(consumed, payload.len());
+    check_format_4(&data);
+}
+
+fn backup_bytes(mut image: Vec<u8>) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let checksum = Sha256::digest(&image);
+    image.extend_from_slice(&checksum);
+    image
+}
+
+/// Restore `backup` and install its Raft snapshot. Return the restored state.
+async fn restore(dir: &std::path::Path, backup: Vec<u8>) -> (StateMachine, Snapshot) {
+    let path = dir.join("backup");
+    std::fs::write(&path, backup).unwrap();
+    let members = crate::cluster::Store::initial(&std::collections::BTreeMap::from([(
+        1,
+        "http://127.0.0.1:2380".into(),
+    )]));
+    let restore = dir.join("restore");
+    StateMachine::restore_backup(&path, &restore, 1, "test", &members).unwrap();
+    let snapshot =
+        crate::storage::RaftStorage::open(&restore.join("raft"), 1, "test", members.conf().voters)
+            .unwrap()
+            .recovery_snapshot()
+            .clone();
+    let mut restored = StateMachine::open(&restore.join("state")).await.unwrap();
+    restored.install_snapshot(&snapshot).await.unwrap();
+    (restored, snapshot)
+}
+
+/// Images and backups keep the format 4 rows, so the previous binary reads them. Install takes
+/// the term from the Raft snapshot metadata, and a restored backup starts at (1, 1).
+#[tokio::test]
+async fn images_and_backups_omit_the_term_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut source = StateMachine::open(&dir.path().join("source"))
+        .await
+        .unwrap();
+    for (index, term) in [(1, 4), (2, 6)] {
+        source.entry_term = term;
+        source
+            .apply_etcd(index, &put(&[index as u8], b"value"))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+    }
+    assert_eq!(stored_position(&source).await, Some((2, 6)));
+    let image = source.snapshot_data().await.unwrap();
+    let data: SnapshotData = crate::codec::decode(&image).unwrap();
+    assert_eq!(data.version, crate::SNAPSHOT_FORMAT);
+    check_format_4(&data);
+    check_format_4_backup(&backup_bytes(image.clone()));
+
+    let mut target = StateMachine::open(&dir.path().join("target"))
+        .await
+        .unwrap();
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = 2;
+    snapshot.mut_metadata().term = 6;
+    snapshot.set_data(image.clone());
+    target.install_snapshot(&snapshot).await.unwrap();
+    assert_eq!(
+        (target.applied_term, stored_term(&target).await),
+        (6, Some(6))
+    );
+    let target = reopen(target, &dir.path().join("target")).await;
+    assert_eq!((target.applied, target.applied_term), (2, 6));
+    target.close().await.unwrap();
+
+    let (restored, snapshot) = restore(dir.path(), backup_bytes(image)).await;
+    check_format_4(&crate::codec::decode(&snapshot.data).unwrap());
+    assert_eq!((restored.applied, restored.applied_term), (1, 1));
+    assert_eq!(stored_term(&restored).await, Some(1));
+    restored.close().await.unwrap();
+    source.close().await.unwrap();
+}
+
+/// An older member that installed a copied checkpoint of this binary exports the term row in
+/// its format 4 images and backups. Install and restore accept it and use the Raft term.
+#[tokio::test]
+async fn images_and_backups_from_an_older_exporter_may_hold_the_term_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut source = StateMachine::open(&dir.path().join("source"))
+        .await
+        .unwrap();
+    source.entry_term = 5;
+    source
+        .apply_etcd(1, &put(b"key", b"value"))
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    let mut data: SnapshotData =
+        crate::codec::decode(&source.snapshot_data().await.unwrap()).unwrap();
+    data.rows
+        .push((APPLIED_TERM.to_vec(), applied_term_row(1, 5).to_vec()));
+    let image = crate::codec::encode(&data).unwrap();
+
+    let mut target = StateMachine::open(&dir.path().join("target"))
+        .await
+        .unwrap();
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = 1;
+    snapshot.mut_metadata().term = 5;
+    snapshot.set_data(image.clone());
+    target.install_snapshot(&snapshot).await.unwrap();
+    assert_eq!(
+        (target.applied_term, stored_term(&target).await),
+        (5, Some(5))
+    );
+    target.close().await.unwrap();
+
+    let (restored, snapshot) = restore(dir.path(), backup_bytes(image)).await;
+    check_format_4(&crate::codec::decode(&snapshot.data).unwrap());
+    assert_eq!((restored.applied, restored.applied_term), (1, 1));
+    assert_eq!(stored_term(&restored).await, Some(1));
+    restored.close().await.unwrap();
+    source.close().await.unwrap();
+}
+
+/// The term row is outside `etcd/`, so the quota counter and the hashes do not depend on it.
+#[tokio::test]
+async fn the_applied_term_changes_no_quota_or_hash() {
+    let mut states = vec![];
+    let mut dirs = vec![];
+    for term in [0, 9] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = StateMachine::open(dir.path()).await.unwrap();
+        state.entry_term = term;
+        for index in 1..=3 {
+            state
+                .apply_etcd(index, &put(b"key", &[index as u8; 10]))
+                .await
+                .unwrap()
+                .result
+                .unwrap();
+        }
+        assert_eq!(stored_term(&state).await, Some(term));
+        assert_eq!(
+            state.logical_size(),
+            maintenance::count_logical_size(state.db.as_ref())
+                .await
+                .unwrap()
+        );
+        states.push(state);
+        dirs.push(dir);
+    }
+    assert_eq!(states[0].logical_size(), states[1].logical_size());
+    let mut hashes = vec![];
+    for state in &mut states {
+        let command = crate::maintenance::Command::HashAll;
+        let outcome = state
+            .maintenance(&command, &Default::default(), Default::default())
+            .await
+            .unwrap();
+        hashes.push(serde_json::to_value(outcome).unwrap());
+    }
+    assert_eq!(hashes[0], hashes[1]);
+    for revision in [0, 2, 4] {
+        assert_eq!(
+            serde_json::to_value(states[0].hash_kv(revision).await).unwrap(),
+            serde_json::to_value(states[1].hash_kv(revision).await).unwrap()
+        );
+    }
+    for state in states {
+        state.close().await.unwrap();
     }
 }

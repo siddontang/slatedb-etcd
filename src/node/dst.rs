@@ -1114,7 +1114,7 @@ impl Simulation {
             let state = node.worker.state();
             assert_eq!(
                 state.logical_size(),
-                crate::state::maintenance::count_logical_size(&state.db)
+                crate::state::maintenance::count_logical_size(state.db.as_ref())
                     .await
                     .unwrap()
             );
@@ -1385,7 +1385,7 @@ impl Simulation {
             }
             assert_eq!(
                 state.logical_size(),
-                crate::state::maintenance::count_logical_size(&state.db)
+                crate::state::maintenance::count_logical_size(state.db.as_ref())
                     .await
                     .unwrap()
             );

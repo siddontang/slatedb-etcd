@@ -124,8 +124,9 @@ impl Node {
         {
             return Ok(false);
         }
-        self.prepare_term = raft.term;
-        self.submit_apply(Job::PreparePuts(commands), self.state.applied)?;
+        let term = raft.term;
+        self.prepare_term = term;
+        self.submit_apply(Job::PreparePuts { commands, term }, self.state.applied)?;
         Ok(true)
     }
 }
@@ -159,9 +160,11 @@ pub(super) fn kv_command(
 }
 
 /// Prepare one apply group. Callers place any member that needs a scan first.
+/// `term` is the Raft term of the last command.
 pub(super) async fn prepare(
     state: &StateMachine,
     commands: &[(u64, RaftCommand)],
+    term: u64,
     header: Header,
 ) -> Result<(PreparedPuts, Vec<AppliedCommand>)> {
     let puts = commands
@@ -177,7 +180,7 @@ pub(super) async fn prepare(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let (batch, outcomes) = state.prepare_puts(&puts).await?;
+    let (batch, outcomes) = state.prepare_puts(&puts, term).await?;
     let replies = commands
         .iter()
         .zip(outcomes)
@@ -314,6 +317,13 @@ mod tests {
             panic!("expected range");
         };
         assert!(old.kvs.is_empty());
+        // The prepared batch stores the term of its entries beside the apply marker.
+        use crate::state::StateRead;
+        let row = node.state.state().get(crate::state::APPLIED_TERM).await;
+        assert_eq!(
+            row.unwrap().unwrap().as_ref(),
+            crate::state::applied_term_row(index, node.raw.raft.term)
+        );
     }
     #[tokio::test]
     async fn a_locally_durable_put_replies_before_its_state_write_and_commit_marker() {
