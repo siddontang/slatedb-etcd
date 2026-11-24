@@ -1,38 +1,44 @@
 # Shared state mode compared with replicated mode
 
-This report compares the two state modes on one host with a local S3 service. The raw records
-are in `shared-state.jsonl`. `scripts/bench-shared-state.py` produced them, and
+This report compares the two state modes on one host with a local RustFS service. The raw
+records are in `shared-state.jsonl`. `scripts/bench-shared-state.py` produced them, and
 `scripts/run-shared-bench.sh` ran it under the machine-wide benchmark lock.
 
 ## Summary
 
 - **Storage:** shared mode stores about one third of the bytes of replicated mode. It writes
-  about one third of the S3 PUT requests, and two thirds fewer GET requests during writes.
-- **Writes:** throughput is equal or a little higher in shared mode. The p99 latency of large
-  writes is much lower, because only the leader flushes and compacts.
-- **Reads:** shared mode reads are about 2.1 to 2.4 times slower, with a p99 of about 60 ms.
-  The cause is not measured yet. This is the main open problem of this prototype.
-- **Learner install:** 21 s in shared mode, 88 s in replicated mode, for the same data. Shared
-  mode copies about 1.7 MiB instead of 741 MiB.
-- **Failover:** the first write after a leader kill takes about 1.1 s in both modes.
-- **Access policy:** members run with the S3 policies of the shared state guide, and MinIO denies
+  about 40% of the S3 PUT requests, and one third to one half of the GET requests.
+- **Writes:** throughput is equal for small loads and about 20% higher in shared mode for large
+  loads. The p99 latency of put-c256 is half, because only the leader flushes and compacts.
+- **Reads:** shared mode reads are about 5% to 7% faster, with a lower p99. Each follower warms
+  its cache for the SSTs of a new base, so reads do not wait for S3.
+- **Follower downloads:** each follower downloads the current rows of the writes once, for that
+  warm. In put-c256, shared mode read 70 MiB from S3, and replicated mode less than 1 MiB.
+- **Learner install:** 39 s in shared mode, 56 s in replicated mode, for the same data. Shared
+  mode uploads nothing and downloads 74 MiB. Replicated mode uploads 733 MiB.
+- **Failover:** the first write after a leader kill takes 1.0 s to 1.6 s in both modes.
+- **Access policy:** members run with the S3 policies of the shared state guide, and RustFS denies
   the keys outside them.
 
 ## Method
 
 - Host: Intel Core i7-6700K, 4 cores and 8 threads, 30 GiB RAM, Samsung MZ7LM1T9 SATA SSD,
   Linux 7.0.0. The CPU governor was `performance` during the run.
-- The benchmark used the `slatedb-etcd` release build from `shared-state-phase4` at
-  `ee2b1bb` (SHA-256 prefix `73130619d0a1a187`). This build predates the final Defragment fixes.
-- S3: MinIO built from source, `github.com/minio/minio v0.0.0-20260212201848-7aac2a2c5b7c`, one
-  drive on the same SSD. The MinIO download site no longer serves binaries. `mc` came from
-  `github.com/minio/mc v0.0.0-20251106162529-77f82e18b540`.
+- The benchmark used a `slatedb-etcd` release build of `ac8b19b`: `main` at `6041ace` with the
+  shared-mode cache warm (SHA-256 prefix `4d4b81e11833d200`). Its source equals `82a76b7` of
+  `perf/shared-read-cache`.
+- S3: the RustFS 1.0.6 release of `scripts/rustfs_fixture.py`, `linux-x86_64-gnu`, binary SHA-256
+  prefix `250be6671ba447e9`. One data directory on the same SSD.
+- `scripts/s3-counter`, a Go reverse proxy, ran in front of RustFS. Members sent every S3 call
+  through it. It counts the calls, request body bytes ("in"), and response body bytes ("out")
+  of each bucket and operation.
 - Cluster: three members on the loopback interface. Each member had two CPU threads: `0,4`,
-  `1,5`, and `2,6`. The etcd v3.6.5 `benchmark` tool, `etcdctl`, and MinIO shared `3,7`.
+  `1,5`, and `2,6`. The etcd v3.6.5 `benchmark` tool, `etcdctl`, RustFS, and the proxy shared
+  `3,7`.
 - Both modes used S3 for state, with the same bucket settings and default flags. Shared mode
   added `--state-mode shared`, with `--view-max-age 10s` and `--view-retention off`.
-- Each case started a new cluster in a new bucket, two times for each mode. The tables show
-  medians of the two runs. The run took 20 minutes on 2026-11-24.
+- Each case started RustFS on an empty data directory and a new cluster, two times for each mode.
+  The tables show medians of the two runs. The run took 25 minutes on 2026-11-24.
 - Cases are a subset of the v3 harness cases, with 32-byte keys:
 
   | Case | Load |
@@ -44,25 +50,23 @@ are in `shared-state.jsonl`. `scripts/bench-shared-state.py` produced them, and
   | get-s-c64 | The same with serializable reads, on all members |
   | watch-latency | 100 streams with 10 watchers each, 2,000 puts at 200 per second |
 
-- S3 requests and bytes come from `mc admin trace` for the bucket of each case. The MinIO
-  Prometheus counters are cached, so they missed calls of short cases. "PUT-class" counts
-  `PutObject`, multipart parts, and `CopyObject`. "GET-class" counts `GetObject` and
-  `HeadObject`. The counts cover the load, a 15 s quiet time, and a `POST /checkpoint` on each
+- "PUT-class" counts `PutObject`, `UploadPart`, and `CopyObject`. "GET-class" counts `GetObject`
+  and `HeadObject`. The counts cover the load, a 15 s quiet time, and a `POST /checkpoint` on each
   member. The checkpoint makes the state durable in both modes, because replicated mode
   otherwise keeps small writes in its memtable.
-- "Stored" is the size of the bucket after that, from `mc du`. The harness now fails a case when
-  the checkpoint fails on any member. The run log of the reported runs has no checkpoint
-  failure, so all 24 load runs and the four learner runs (two per mode) completed their checkpoints.
+- "Stored" is the size of the bucket after that, from `ListObjectsV2`. A case fails when the
+  checkpoint fails on any member. No case failed, so all 24 load runs and the four learner runs
+  completed their checkpoints.
 - RSS is the peak resident set size of each member, sampled every 250 ms during the load.
 - Learner install: after 200,000 puts of 256 B and a checkpoint on each member, a learner joins
   with `--join`. The time runs from its start until its applied index reaches the leader's
   index at the time of the member add.
 - Failover: after a burst of 20,000 puts, the leader gets `SIGKILL`. The time runs until an
   `etcdctl put` with a 500 ms timeout succeeds on the other members.
-- Policy check: three voters and a learner ran with MinIO users that had the policies of
-  `docs/shared-state-guide.md`. Then eight probes read or wrote one object each. Each probe
-  expects one outcome: success, or an `AccessDenied` response for that object. Any other result
-  fails the check. The check ran again after the load run, on the same binary.
+- Policy check: three voters and a learner ran with RustFS users that had the policies of
+  `docs/shared-state-guide.md`. The RustFS admin API created the users and canned policies. Then
+  eight signed requests read or wrote one object each. Each probe expects one outcome: HTTP 200,
+  or HTTP 403 with the S3 error code `AccessDenied`. Any other result fails the check.
 
 ## Load results
 
@@ -70,52 +74,52 @@ Throughput, latency, and peak memory:
 
 | Case | Mode | Ops/s | p50 ms | p99 ms | Leader RSS MiB | Follower RSS MiB |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| put-c16 | replicated | 10,035 | 1.53 | 3.18 | 137 | 137 |
-| put-c16 | shared | 10,162 | 1.52 | 3.03 | 191 | 125 |
-| put-c256 | replicated | 23,265 | 9.22 | 38.32 | 265 | 252 |
-| put-c256 | shared | 25,328 | 9.52 | 21.23 | 428 | 294 |
-| put-v4096 | replicated | 8,073 | 17.23 | 316.45 | 424 | 445 |
-| put-v4096 | shared | 9,367 | 19.94 | 97.57 | 353 | 187 |
-| get-l-c64 | replicated | 27,417 | 2.09 | 5.69 | 218 | 218 |
-| get-l-c64 | shared | 11,536 | 1.89 | 58.00 | 185 | 156 |
-| get-s-c64 | replicated | 30,484 | 1.68 | 5.73 | 218 | 212 |
-| get-s-c64 | shared | 14,808 | 0.97 | 66.65 | 185 | 148 |
-| watch-latency | replicated | 190 | 2.66 | 28.61 | 39 | 39 |
-| watch-latency | shared | 198 | 1.79 | 19.97 | 45 | 39 |
+| put-c16 | replicated | 11,354 | 1.32 | 3.58 | 145 | 146 |
+| put-c16 | shared | 11,237 | 1.34 | 3.21 | 195 | 140 |
+| put-c256 | replicated | 20,560 | 8.93 | 48.56 | 278 | 269 |
+| put-c256 | shared | 24,820 | 9.37 | 23.00 | 432 | 321 |
+| put-v4096 | replicated | 6,039 | 26.23 | 126.86 | 549 | 557 |
+| put-v4096 | shared | 7,112 | 25.32 | 109.59 | 541 | 389 |
+| get-l-c64 | replicated | 26,977 | 2.12 | 6.05 | 228 | 223 |
+| get-l-c64 | shared | 28,274 | 2.07 | 5.55 | 178 | 175 |
+| get-s-c64 | replicated | 30,069 | 1.73 | 5.48 | 223 | 226 |
+| get-s-c64 | shared | 32,285 | 1.65 | 4.71 | 176 | 174 |
+| watch-latency | replicated | 186 | 2.75 | 30.01 | 39 | 40 |
+| watch-latency | shared | 199 | 2.67 | 25.86 | 46 | 41 |
 
-S3 requests and stored bytes:
+S3 requests, bytes, and stored bytes:
 
-| Case | Mode | S3 PUT-class | S3 GET-class | S3 MiB in | Stored MiB |
-| --- | --- | ---: | ---: | ---: | ---: |
-| put-c16 | replicated | 18 | 5,466 | 83.7 | 83.3 |
-| put-c16 | shared | 7 | 1,784 | 27.9 | 27.8 |
-| put-c256 | replicated | 48 | 5,794 | 271.6 | 271.1 |
-| put-c256 | shared | 18 | 1,908 | 90.6 | 90.4 |
-| put-v4096 | replicated | 365 | 7,131 | 2,095.7 | 2,100.1 |
-| put-v4096 | shared | 128 | 3,111 | 713.2 | 712.9 |
-| get-l-c64 | replicated | 21 | 6,506 | 98.7 | 275.5 |
-| get-l-c64 | shared | 0 | 18,095 | 1.5 | 91.9 |
-| get-s-c64 | replicated | 21 | 6,348 | 98.7 | 275.5 |
-| get-s-c64 | shared | 0 | 13,966 | 1.2 | 91.9 |
-| watch-latency | replicated | 6 | 7,215 | 6.2 | 5.6 |
-| watch-latency | shared | 6 | 2,430 | 2.1 | 1.9 |
+| Case | Mode | S3 PUT-class | S3 GET-class | S3 MiB in | S3 MiB out | Stored MiB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| put-c16 | replicated | 12 | 4,978 | 84.0 | 0.6 | 84.0 |
+| put-c16 | shared | 5 | 1,598 | 27.8 | 21.4 | 27.9 |
+| put-c256 | replicated | 36 | 5,432 | 271.5 | 0.7 | 271.5 |
+| put-c256 | shared | 14 | 1,751 | 90.4 | 70.4 | 90.4 |
+| put-v4096 | replicated | 268 | 6,024 | 1,953.4 | 1,091.6 | 1,928.4 |
+| put-v4096 | shared | 106 | 3,012 | 712.8 | 985.4 | 712.8 |
+| get-l-c64 | replicated | 15 | 6,122 | 98.6 | 0.7 | 275.8 |
+| get-l-c64 | shared | 0 | 1,918 | 0.0 | 0.2 | 91.9 |
+| get-s-c64 | replicated | 15 | 5,984 | 98.6 | 0.7 | 275.8 |
+| get-s-c64 | shared | 0 | 1,845 | 0.0 | 0.2 | 91.9 |
+| watch-latency | replicated | 6 | 6,812 | 5.8 | 0.8 | 5.8 |
+| watch-latency | shared | 4 | 2,264 | 1.9 | 1.7 | 1.9 |
 
-The two runs of each case differ by less than 10% in throughput. The read cases include the
+The two runs of each case differ by less than 6% in throughput. The read cases include the
 preload in "Stored", but not in the request counts. The watch-latency rate is the put rate of
 the tool, not a capacity.
 
 ## Operations
 
-| Mode | Stored MiB | Install s | GET-class | PUT-class | MiB in | Failover s |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| replicated | 551.2 | 87.8 | 102,536 | 146 | 741.3 | 1.18 |
-| shared | 360.4 | 21.3 | 20,129 | 4 | 1.7 | 1.15 |
+| Mode | Stored MiB | Install s | GET-class | PUT-class | MiB in | MiB out | Failover s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| replicated | 551.9 | 55.6 | 40,664 | 136 | 732.6 | 819.5 | 1.51 |
+| shared | 360.4 | 39.4 | 21,510 | 4 | 0.0 | 74.0 | 1.25 |
 
 "Stored" is the bucket before the learner joins. The request columns are the S3 calls during the
 learner install. "Failover" is the time to the first write after the leader kill.
 
-The single runs were 88.1 s and 87.5 s, and 21.3 s and 21.2 s, for the learner. Failover took
-1.03 s and 1.34 s in replicated mode, and 1.23 s and 1.07 s in shared mode.
+The single runs were 56.8 s and 54.3 s, and 40.0 s and 38.8 s, for the learner. Failover took
+1.43 s and 1.60 s in replicated mode, and 1.49 s and 1.02 s in shared mode.
 
 ## Access policy check
 
@@ -124,45 +128,44 @@ learner policy and read a key. Then:
 
 | Probe | Credential | Expected | Result |
 | --- | --- | --- | --- |
-| Read `shared/bootstrap.json` | Learner | Allowed | Allowed |
-| Write under `shared/` | Learner | Denied | `AccessDenied` |
-| Write under its own `member-<id>/` | Learner | Allowed | Allowed |
-| Read `mode.json` | Voter 1 | Allowed | Allowed |
-| Write under `member-1/` | Voter 1 | Allowed | Allowed |
-| Read `member-2/binding.json` | Voter 1 | Denied | `AccessDenied` (HEAD 403) |
-| Write `member-2/` | Voter 1 | Denied | `AccessDenied` |
-| Write `member-2/state/` | Voter 1 | Denied | `AccessDenied` |
-
-A HEAD response has no body, so the denied read shows only its 403 status. The same credential
-passes the allowed probes.
+| Read `shared/bootstrap.json` | Learner | Allowed | 200 |
+| Write under `shared/` | Learner | Denied | 403 `AccessDenied` |
+| Write under its own `member-<id>/` | Learner | Allowed | 200 |
+| Read `mode.json` | Voter 1 | Allowed | 200 |
+| Write under `member-1/` | Voter 1 | Allowed | 200 |
+| Read `member-2/binding.json` | Voter 1 | Denied | 403 `AccessDenied` |
+| Write `member-2/` | Voter 1 | Denied | 403 `AccessDenied` |
+| Write `member-2/state/` | Voter 1 | Denied | 403 `AccessDenied` |
 
 ## Observations
 
-- Shared mode removes the copy of each SST on two members. The stored bytes and the PUT-class
-  requests drop to about one third. The GET-class requests during writes drop, because only the
-  leader compacts.
+- Shared mode removes the copy of each SST on two members. The stored bytes and the uploaded
+  bytes drop to about one third. The GET-class requests drop to about one third, because only
+  the leader compacts.
+- Shared reads no longer wait for S3. A follower warms the index, filters, and current-row blocks
+  of each new L0 SST before it switches its base. In each read case, shared mode read only
+  0.2 MiB from S3, and it was about 5% to 7% faster than replicated mode.
+- The warm costs downloads. Each follower reads about the current-row bytes of the writes once.
+  Each warm reads a contiguous range of blocks with one GET, so it adds few requests.
 - The shared leader uses more memory than a replicated leader in put-c256: it holds the overlay
   and the writer memtable. Its followers use less memory than replicated followers in the large
   value case, because they do no flush or compaction.
-- Shared reads are slower. The cause is a hypothesis, not a measurement. Each member keeps one
-  block cache, and each new base reader shares it, so a switch that keeps the same SSTs should
-  not empty it. Possible causes are reads of SSTs that compaction created after the preload,
-  which no member has read yet, and the first reads after the preload, which replicated members
-  serve from blocks that their own writes left in cache. Cache hit and miss counters, and a
-  controlled warm-read comparison, must separate these before a fix is chosen.
 - With retention off, the shared bucket keeps every view checkpoint. In the learner scenario it
   holds 360 MiB for data that a replicated member stores in about 184 MiB, because older
   checkpoints pin SSTs that compaction replaced.
-- A shared learner reads its base from S3 on demand. It needs no copy, so it is ready four times
-  faster.
+- A shared learner reads its base from S3 on demand. It copies no SST, so it is ready about 30%
+  faster here.
 
 ## Caveats
 
-- One host. The members, MinIO, and the client share CPUs and one SSD. MinIO on the loopback
-  interface has a much lower latency than a remote S3 service. The read results would be worse
-  with a remote service.
-- MinIO came from a source build, not a release binary.
+- One host. The members, RustFS, the proxy, and the client share CPUs and one SSD. RustFS on the
+  loopback interface has a much lower latency than a remote S3 service. Cold reads would cost
+  more with a remote service.
+- The proxy adds one local HTTP hop to every S3 call, in both modes.
+- Earlier records of this report used MinIO. Their absolute values, such as the learner install
+  times, differ from RustFS values. Compare modes only within one S3 service.
 - Two runs for each case. The differences in this report are larger than the run variation, but
   small differences are not significant.
-- The cases are short. Long runs with compaction and retention are not covered.
+- The cases are short. Long runs with compaction and retention are not covered. After a
+  compaction, both modes read cold compaction output.
 - The failover time includes the 500 ms client timeout and the election timeout.
