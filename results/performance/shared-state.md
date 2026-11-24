@@ -11,8 +11,7 @@ are in `shared-state.jsonl`. `scripts/bench-shared-state.py` produced them, and
 - **Writes:** throughput is equal or a little higher in shared mode. The p99 latency of large
   writes is much lower, because only the leader flushes and compacts.
 - **Reads:** shared mode reads are about 2.1 to 2.4 times slower, with a p99 of about 60 ms.
-  After a checkpoint switch, reads go to the base checkpoint in S3 with a cold cache. This is
-  the main open problem of this prototype.
+  The cause is not measured yet. This is the main open problem of this prototype.
 - **Learner install:** 21 s in shared mode, 88 s in replicated mode, for the same data. Shared
   mode copies about 1.7 MiB instead of 741 MiB.
 - **Failover:** the first write after a leader kill takes about 1.1 s in both modes.
@@ -132,10 +131,12 @@ The single runs were 88.1 s and 87.5 s, and 21.3 s and 21.2 s, for the learner. 
 - The shared leader uses more memory than a replicated leader in put-c256: it holds the overlay
   and the writer memtable. Its followers use less memory than replicated followers in the large
   value case, because they do no flush or compaction.
-- Shared reads are slower. After the preload, the checkpoint switch moves each member to a new
-  base with an empty cache, and each read fetches SST blocks from S3. Replicated members read
-  the blocks that their own writes left in cache. A warm base cache, or a local cache of the
-  base SSTs, is needed before shared mode can serve read-heavy work.
+- Shared reads are slower. The cause is a hypothesis, not a measurement. Each member keeps one
+  block cache, and each new base reader shares it, so a switch that keeps the same SSTs should
+  not empty it. Possible causes are reads of SSTs that compaction created after the preload,
+  which no member has read yet, and the first reads after the preload, which replicated members
+  serve from blocks that their own writes left in cache. Cache hit and miss counters, and a
+  controlled warm-read comparison, must separate these before a fix is chosen.
 - With retention off, the shared bucket keeps every view checkpoint. In the learner scenario it
   holds 360 MiB for data that a replicated member stores in about 184 MiB, because older
   checkpoints pin SSTs that compaction replaced.
