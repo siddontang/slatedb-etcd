@@ -225,11 +225,14 @@ impl StateRead for SharedView {
 
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, slatedb::Error> {
         self.check()?;
+        let meters = &crate::metrics::reads::READS;
         for segment in self.segments.iter().rev() {
             if let Some(value) = segment.get(key, self.seq) {
+                meters.overlay_reads.inc();
                 return Ok(value);
             }
         }
+        meters.base_reads.inc();
         self.bounded(Box::pin(self.base.get(key))).await
     }
 

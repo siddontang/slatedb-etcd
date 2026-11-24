@@ -287,10 +287,15 @@ impl<R: StateRead> ReadDb<'_, R> {
             return row.as_deref().map(decode).transpose();
         };
         let seq = *seq;
+        let meters = &crate::metrics::reads::READS;
         if let Some(kv) = rows.get(key, seq, decode) {
+            meters.row.hit.inc();
             return kv.map(Some);
         }
+        meters.row.miss.inc();
+        let timer = meters.row_read.start_timer();
         let row = db.get(&current_key(key)).await.map_err(KvError::storage)?;
+        timer.observe_duration();
         let Some(row) = row else {
             return Ok(None);
         };

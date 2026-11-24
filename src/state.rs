@@ -160,12 +160,12 @@ impl StateCache {
                 time_to_idle: None,
             })) as Arc<dyn DbCache>)
         };
-        Arc::new(
+        Arc::new(crate::metrics::reads::Counted(Arc::new(
             SplitCache::new()
                 .with_block_cache(moka(self.block_bytes))
                 .with_meta_cache(moka(self.meta_bytes))
                 .build(),
-        )
+        )))
     }
 }
 
