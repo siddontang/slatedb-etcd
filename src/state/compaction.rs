@@ -187,7 +187,7 @@ impl Planner {
         self.plan = None;
     }
 
-    fn start(&mut self, db: &Arc<Db>, progress: Option<&Progress>) {
+    fn start(&mut self, state: StateView, progress: Option<&Progress>) {
         let Some(progress) = progress else {
             self.plan = None;
             return;
@@ -202,13 +202,12 @@ impl Planner {
         self.generation += 1;
         let generation = self.generation;
         let ready = self.ready.clone();
-        let db = db.clone();
         let input = progress.clone();
         let task = tokio::spawn(async move {
             // Publish also after a failure or panic, so the leader proposes the step and reads
             // it inline.
             let _ready = Ready(ready, generation);
-            read_step(db.as_ref(), input).await
+            read_step(&state, input).await
         });
         self.plan = Some(Plan {
             input: progress.clone(),
@@ -373,8 +372,13 @@ impl StateMachine {
 
     /// Start reading the next step for the current progress in the background.
     pub(crate) fn plan_compaction(&mut self) {
-        self.compaction_plan
-            .start(&self.db, self.compaction.as_ref());
+        // The planner reads in the background while apply continues. Replicated mode reads the
+        // live database, whose compacted history rows do not change. Shared mode pins a view.
+        let state = match &self.shared {
+            None => StateView::Live(self.db.clone()),
+            Some(shared) => shared.pinned(),
+        };
+        self.compaction_plan.start(state, self.compaction.as_ref());
     }
 }
 

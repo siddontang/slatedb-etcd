@@ -28,21 +28,28 @@ mod diagnostic;
 pub(crate) mod key_index;
 mod kv;
 mod lease;
+pub(crate) mod overlay;
 pub(crate) mod put_batch;
 mod read;
 pub(crate) mod rows;
 #[cfg(test)]
 mod rows_tests;
+pub(crate) mod shared;
 mod snapshot;
 mod source;
 pub(crate) mod transfer;
+pub(crate) mod view;
 pub(crate) use read::ReadView;
+pub use shared::StateMode;
 pub use source::{Row, StateRead, StateScan};
+use view::StateView;
 #[cfg(test)]
 mod key_index_tests;
 pub(crate) mod maintenance;
 #[cfg(test)]
 mod quota_tests;
+#[cfg(test)]
+mod shared_tests;
 
 const APPLIED: &[u8] = b"meta/applied";
 /// The apply position with its Raft term: `(index, term)`, two big-endian `u64` values.
@@ -95,8 +102,13 @@ pub struct StateMachine {
     pub(crate) row_marker: Option<Arc<crate::storage::RowMarker>>,
     /// The object namespace and current database path. Snapshot installs replace the database.
     pub(crate) location: Arc<transfer::Location>,
-    /// The membership exists only in memory. The next write batch stores it.
+    /// The membership exists only in memory. The next write batch stores it. Shared mode does
+    /// not use it: the first applied entry stores the bootstrap membership.
     pub(crate) members_unsaved: bool,
+    /// The state that apply reads: the live database, or the shared-mode overlay and base.
+    reads: StateView,
+    /// The overlay and base of shared state mode. `None` in replicated mode.
+    pub(crate) shared: Option<shared::Shared>,
 }
 
 /// Weight budgets of the state cache. Both are separate from Raft log memory.
@@ -180,7 +192,7 @@ fn block_cache_policy() -> slatedb::BlockCachePolicy {
 }
 
 /// SlateDB settings for the state machine.
-fn slatedb_settings() -> Settings {
+pub(crate) fn slatedb_settings() -> Settings {
     let mut settings = Settings {
         wal_enabled: false,
         flush_interval: None,
@@ -271,64 +283,13 @@ impl StateMachine {
             .await?;
         let db = Arc::new(db);
         let result = async {
-            let applied = match db.get(APPLIED).await? {
-                Some(bytes) => {
-                    u64::from_be_bytes(bytes.as_ref().try_into().context("invalid apply marker")?)
-                }
-                None => 0,
-            };
+            let applied = decode_applied(db.get(APPLIED).await?)?;
             ensure!(
                 db.snapshot()?.seq() == applied,
                 "SlateDB sequence and apply marker differ"
             );
-            let applied_term = read_applied_term(db.as_ref(), applied).await?;
-            let revision = read_revision(db.as_ref()).await?;
-            let compact_revision = read_compact_revision(db.as_ref()).await?;
-            ensure!(
-                compact_revision <= revision,
-                "compaction exceeds current revision"
-            );
-            let compaction = compaction::load(db.as_ref()).await?;
-            let leases = crate::lease::load(db.as_ref()).await?;
-            let auth = match db.get(crate::auth::KEY).await? {
-                Some(data) => serde_json::from_slice(&data)?,
-                None => crate::auth::Store::default(),
-            };
-            let alarms = match db.get(crate::maintenance::ALARMS).await? {
-                Some(data) => serde_json::from_slice(&data)?,
-                None => vec![],
-            };
-            let members = match db.get(crate::cluster::KEY).await? {
-                Some(data) => serde_json::from_slice(&data)?,
-                None => crate::cluster::Store::default(),
-            };
-            Ok(Self {
-                members: Arc::new(members),
-                admin: Arc::new(admin),
-                metrics: Arc::new(crate::metrics::StateMeters::new()?),
-                quota: 0,
-                current: current::CurrentRows::default(),
-                key_index: key_index::KeyIndex::load(db.as_ref()).await?,
-                rows,
-                logical_bytes: maintenance::count_logical_size(db.as_ref()).await?,
-                write_batches: 0,
-                alarms,
-                auth: Arc::new(auth),
-                db: Arc::clone(&db),
-                applied,
-                applied_term,
-                entry_term: applied_term,
-                durable_applied: applied,
-                revision,
-                compact_revision,
-                compaction,
-                compaction_plan: compaction::Planner::default(),
-                leases: Arc::new(leases),
-                watch_capture: None,
-                row_marker: None,
-                location,
-                members_unsaved: false,
-            })
+            let reads = StateView::Live(db.clone());
+            Self::load(db.clone(), admin, location, rows, reads, None).await
         }
         .await;
         if result.is_err() {
@@ -341,9 +302,91 @@ impl StateMachine {
         Ok(state)
     }
 
-    /// The applied state that apply and the apply owner read. Writes go to `db`.
-    pub(crate) fn applied_state(&self) -> &impl StateRead {
-        self.db.as_ref()
+    /// Build the derived state from `reads`, the applied state of `db`.
+    async fn load(
+        db: Arc<Db>,
+        admin: slatedb::admin::Admin,
+        location: Arc<transfer::Location>,
+        rows: Arc<rows::RowCache>,
+        reads: StateView,
+        shared: Option<shared::Shared>,
+    ) -> Result<Self> {
+        let applied = decode_applied(reads.get(APPLIED).await?)?;
+        let applied_term = read_applied_term(&reads, applied).await?;
+        let revision = read_revision(&reads).await?;
+        let compact_revision = read_compact_revision(&reads).await?;
+        ensure!(
+            compact_revision <= revision,
+            "compaction exceeds current revision"
+        );
+        let compaction = compaction::load(&reads).await?;
+        let leases = crate::lease::load(&reads).await?;
+        let auth = match reads.get(crate::auth::KEY).await? {
+            Some(data) => serde_json::from_slice(&data)?,
+            None => crate::auth::Store::default(),
+        };
+        let alarms = match reads.get(crate::maintenance::ALARMS).await? {
+            Some(data) => serde_json::from_slice(&data)?,
+            None => vec![],
+        };
+        let members = match reads.get(crate::cluster::KEY).await? {
+            Some(data) => serde_json::from_slice(&data)?,
+            None => crate::cluster::Store::default(),
+        };
+        // Shared mode stores the counter in each batch, so a base needs no full scan.
+        let logical_bytes = match (&shared, reads.get(shared::LOGICAL_BYTES).await?) {
+            (Some(_), Some(bytes)) => {
+                u64::from_be_bytes(bytes.as_ref().try_into().context("invalid logical size")?)
+            }
+            _ => maintenance::count_logical_size(&reads).await?,
+        };
+        Ok(Self {
+            members: Arc::new(members),
+            admin: Arc::new(admin),
+            metrics: Arc::new(crate::metrics::StateMeters::new()?),
+            quota: 0,
+            current: current::CurrentRows::default(),
+            key_index: key_index::KeyIndex::load(&reads).await?,
+            rows,
+            logical_bytes,
+            write_batches: 0,
+            alarms,
+            auth: Arc::new(auth),
+            db,
+            applied,
+            applied_term,
+            entry_term: applied_term,
+            durable_applied: applied,
+            revision,
+            compact_revision,
+            compaction,
+            compaction_plan: compaction::Planner::default(),
+            leases: Arc::new(leases),
+            watch_capture: None,
+            row_marker: None,
+            location,
+            members_unsaved: false,
+            reads,
+            shared,
+        })
+    }
+
+    /// The applied state that apply and the apply owner read. Replicated writes go to `db`.
+    pub(crate) fn applied_state(&self) -> &StateView {
+        &self.reads
+    }
+
+    /// Pin the applied state for a read that runs outside apply.
+    pub(crate) fn pinned_state(&self) -> Result<StateView> {
+        if let Some(shared) = &self.shared {
+            return Ok(shared.pinned());
+        }
+        let snapshot = self.db.snapshot()?;
+        ensure!(
+            snapshot.seq() == self.applied,
+            "read view does not match applied state"
+        );
+        Ok(StateView::Snapshot(snapshot))
     }
 
     /// Mark `index` applied in `batch`, with the term of its entry from `entry_term`.
@@ -364,8 +407,21 @@ impl StateMachine {
     /// Store `batch` and return `size` with the added membership row, if any.
     async fn store_batch(&mut self, mut batch: WriteBatch, index: u64, size: u64) -> Result<u64> {
         let members_saved = self.members_unsaved;
+        // Shared mode stores the bootstrap membership in the first applied entry on every
+        // member, so the row does not depend on member-local events.
+        let first = self.is_shared() && self.applied == 0;
+        if self.is_shared()
+            && !first
+            && batch
+                .keys()
+                .all(|key| key == APPLIED || key == APPLIED_TERM)
+        {
+            // An entry that changes no state writes no batch. Otherwise each announcement would
+            // dirty the memtable, and its flush would cause the next announcement.
+            return Ok(size);
+        }
         let mut size = size;
-        if members_saved && !batch.contains(crate::cluster::KEY) {
+        if (members_saved || first) && !batch.contains(crate::cluster::KEY) {
             let value = serde_json::to_vec(self.members.as_ref())?;
             let old = self
                 .applied_state()
@@ -397,19 +453,29 @@ impl StateMachine {
                 self.rows.invalidate(key, index);
             }
         }
-        self.db
-            .write_with_options(batch.to_storage(), &WriteOptions { seqnum: index })
-            .await?;
+        if self.is_shared() {
+            batch.put(shared::LOGICAL_BYTES, size.to_be_bytes());
+        }
+        let batch = Arc::new(batch);
+        match &mut self.shared {
+            None => {
+                self.db
+                    .write_with_options(batch.to_storage(), &WriteOptions { seqnum: index })
+                    .await?;
+            }
+            // Apply reads the overlay at once. The leader materializer writes the `Db` later.
+            Some(shared) => shared.overlay.push(index, batch.clone()),
+        }
         self.write_batches += 1;
         if members_saved {
             self.members_unsaved = false;
         }
-        for (key, value) in batch.into_rows() {
+        for (key, value) in batch.rows() {
             if let Some(capture) = &mut self.watch_capture {
-                capture.record(&key, value.as_ref());
+                capture.record(key, value);
             }
-            self.current.publish(&key, value.as_ref());
-            self.key_index.publish(&key, value.as_ref())?;
+            self.current.publish(key, value);
+            self.key_index.publish(key, value)?;
         }
         self.key_index.commit(index);
         Ok(size)
@@ -442,6 +508,16 @@ pub(crate) fn applied_term_row(index: u64, term: u64) -> [u8; 16] {
     row[..8].copy_from_slice(&index.to_be_bytes());
     row[8..].copy_from_slice(&term.to_be_bytes());
     row
+}
+
+/// Decode the `meta/applied` row. A state without the row has applied nothing.
+fn decode_applied(row: Option<bytes::Bytes>) -> Result<u64> {
+    Ok(match row {
+        Some(bytes) => {
+            u64::from_be_bytes(bytes.as_ref().try_into().context("invalid apply marker")?)
+        }
+        None => 0,
+    })
 }
 
 /// Read the term of the entry at `applied`. Zero means that the term is unknown: the row is

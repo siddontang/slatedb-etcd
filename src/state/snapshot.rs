@@ -11,17 +11,16 @@ impl StateMachine {
     pub fn snapshot_job(
         &self,
     ) -> Result<impl std::future::Future<Output = Result<Vec<u8>>> + Send + 'static> {
-        let snapshot = self.db.snapshot()?;
-        let db = Arc::clone(&self.db);
+        // A shared-mode view needs no flush. Its rows are in a checkpoint or in memory.
+        let snapshot = self.pinned_state()?;
+        let db = (!self.is_shared()).then(|| Arc::clone(&self.db));
         let metrics = self.metrics.clone();
         let applied = self.applied;
         let members = serde_json::to_vec(self.members.as_ref())?;
-        ensure!(
-            snapshot.seq() == applied,
-            "snapshot does not match the apply marker"
-        );
         Ok(async move {
-            metrics.flush_db(&db).await?;
+            if let Some(db) = db {
+                metrics.flush_db(&db).await?;
+            }
             let mut data = crate::codec::encode(&(crate::SNAPSHOT_FORMAT, applied))?;
             let count_offset = data.len();
             crate::codec::write(&mut data, &0_u64)?;
@@ -46,6 +45,10 @@ impl StateMachine {
 
     pub async fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<()> {
         let index = snapshot.get_metadata().index;
+        ensure!(
+            !self.is_shared() || index <= self.applied,
+            "shared state mode cannot install a snapshot before phase 2"
+        );
         let term = snapshot.get_metadata().term;
         if index == self.applied {
             self.reconcile_term(term)?;

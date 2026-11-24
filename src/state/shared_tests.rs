@@ -1,0 +1,380 @@
+//! Compare shared-mode apply with replicated apply, and check bases, claims, and reopen.
+
+use super::*;
+use crate::proto::etcdserverpb::request_op::Request as Op;
+use crate::proto::etcdserverpb::*;
+use slatedb::config::{CheckpointOptions, CheckpointScope};
+use slatedb::object_store::memory::InMemory;
+use slatedb::object_store::ObjectStore;
+
+async fn open_shared(store: Arc<dyn ObjectStore>) -> StateMachine {
+    StateMachine::open_shared(
+        store,
+        "cluster",
+        "test",
+        StateCache::default(),
+        0,
+        transfer::Backend::Local,
+    )
+    .await
+    .unwrap()
+}
+
+fn put(key: &str, value: &str) -> RequestOp {
+    RequestOp {
+        request: Some(Op::RequestPut(PutRequest {
+            key: key.as_bytes().to_vec(),
+            value: value.as_bytes().to_vec(),
+            ..Default::default()
+        })),
+    }
+}
+
+fn delete(key: &str, end: &str) -> RequestOp {
+    RequestOp {
+        request: Some(Op::RequestDeleteRange(DeleteRangeRequest {
+            key: key.as_bytes().to_vec(),
+            range_end: end.as_bytes().to_vec(),
+            ..Default::default()
+        })),
+    }
+}
+
+fn range(revision: i64) -> RequestOp {
+    RequestOp {
+        request: Some(Op::RequestRange(RangeRequest {
+            key: vec![0],
+            range_end: vec![0],
+            revision,
+            ..Default::default()
+        })),
+    }
+}
+
+/// The request for step `n` of a fixed workload with overwrites, deletes, and transactions.
+fn request(n: u64) -> RequestOp {
+    let key = ["a", "b", "c", "d", "e"][(n * 7 % 5) as usize];
+    match n % 9 {
+        0..=4 => put(key, &format!("value-{n}")),
+        5 => delete(key, ""),
+        6 => delete("b", "d"),
+        _ => RequestOp {
+            request: Some(Op::RequestTxn(TxnRequest {
+                success: vec![put("a", "txn"), put("e", &n.to_string()), delete("c", "")],
+                ..Default::default()
+            })),
+        },
+    }
+}
+
+/// Every row under `prefix` except the membership, which only shared mode stores at entry 1.
+async fn rows(state: &StateMachine, prefix: &[u8]) -> Vec<Row> {
+    source::rows(state.applied_state(), prefix)
+        .await
+        .into_iter()
+        .filter(|row| row.key.as_ref() != crate::cluster::KEY)
+        .collect()
+}
+
+async fn compare(state: &StateMachine, reference: &StateMachine) {
+    assert_eq!(state.revision, reference.revision);
+    assert_eq!(state.compact_revision, reference.compact_revision);
+    assert_eq!(rows(state, b"etcd/").await, rows(reference, b"etcd/").await);
+    for revision in state.compact_revision.max(1)..=state.revision {
+        assert_eq!(
+            serde_json::to_value(state.hash_kv(revision).await).unwrap(),
+            serde_json::to_value(reference.hash_kv(revision).await).unwrap(),
+            "HashKV revision {revision}"
+        );
+        assert_eq!(
+            serde_json::to_value(state.read_etcd(&range(revision)).await.unwrap()).unwrap(),
+            serde_json::to_value(reference.read_etcd(&range(revision)).await.unwrap()).unwrap(),
+            "Range revision {revision}"
+        );
+    }
+}
+
+/// Apply the same workload to `state` and `reference`. Before each compaction step, `inline`
+/// drops the background plan of `state`, so the step reads the state inline.
+async fn run(state: &mut StateMachine, reference: &mut StateMachine, inline: bool) {
+    // Shared mode stores the membership with the first entry. Let the reference do the same.
+    reference.members_unsaved = true;
+    for n in 0..80_u64 {
+        if n % 20 == 19 {
+            let request = CompactionRequest {
+                revision: state.revision - 3,
+                physical: true,
+            };
+            let expected = reference
+                .apply_compaction(reference.applied + 1, &request)
+                .await
+                .unwrap();
+            let actual = state
+                .apply_compaction(state.applied + 1, &request)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            while state.compaction_pending() {
+                if inline {
+                    state.compaction_plan.clear();
+                }
+                state
+                    .apply_compaction_step(state.applied + 1)
+                    .await
+                    .unwrap();
+                reference
+                    .apply_compaction_step(reference.applied + 1)
+                    .await
+                    .unwrap();
+            }
+            assert!(!reference.compaction_pending());
+        } else {
+            let request = request(n);
+            let expected = reference
+                .apply_etcd(reference.applied + 1, &request)
+                .await
+                .unwrap();
+            let actual = state.apply_etcd(state.applied + 1, &request).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+        if n % 10 == 9 {
+            compare(state, reference).await;
+        }
+    }
+    compare(state, reference).await;
+    assert_eq!(state.logical_bytes, reference.logical_bytes);
+}
+
+#[tokio::test]
+async fn shared_apply_matches_replicated_apply_from_the_overlay() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut reference = StateMachine::open(dir.path()).await.unwrap();
+    let mut state = open_shared(Arc::new(InMemory::new())).await;
+    run(&mut state, &mut reference, false).await;
+    // The rows exist only in the overlay. Apply never wrote the shared database.
+    assert_eq!(state.db.get(APPLIED).await.unwrap(), None);
+    assert!(state.write_batches > 0);
+    // Each batch stores the logical size, so a later base needs no full scan.
+    let stored = state.applied_state().get(shared::LOGICAL_BYTES).await;
+    assert_eq!(
+        stored.unwrap().unwrap().as_ref(),
+        state.logical_bytes.to_be_bytes()
+    );
+    assert_eq!(
+        state.logical_bytes,
+        maintenance::count_logical_size(state.applied_state())
+            .await
+            .unwrap()
+    );
+    state.close().await.unwrap();
+    reference.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn background_and_inline_compaction_steps_read_the_same_overlay_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut planned = open_shared(Arc::new(InMemory::new())).await;
+    let mut inline = open_shared(Arc::new(InMemory::new())).await;
+    let mut first = StateMachine::open(&dir.path().join("first")).await.unwrap();
+    let mut second = StateMachine::open(&dir.path().join("second"))
+        .await
+        .unwrap();
+    run(&mut planned, &mut first, false).await;
+    run(&mut inline, &mut second, true).await;
+    // The planner read a pinned view of the overlay for the steps.
+    assert!(planned.compaction_plan.planned > 0);
+    assert_eq!(inline.compaction_plan.planned, 0);
+    assert_eq!(
+        rows(&planned, b"etcd/").await,
+        rows(&inline, b"etcd/").await
+    );
+    for revision in [0, planned.revision, planned.compact_revision] {
+        assert_eq!(
+            planned.hash_kv(revision).await.unwrap(),
+            inline.hash_kv(revision).await.unwrap()
+        );
+    }
+    for state in [planned, inline, first, second] {
+        state.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn no_op_entries_write_no_batch_after_the_membership_entry() {
+    let mut state = open_shared(Arc::new(InMemory::new())).await;
+    state.members = Arc::new(crate::cluster::Store::initial(
+        &[(1, "127.0.0.1:1".to_owned())].into(),
+    ));
+    // The first entry stores the bootstrap membership on every member, even when it is empty.
+    state.apply(1, None).await.unwrap();
+    assert_eq!(state.write_batches, 1);
+    let members = state.applied_state().get(crate::cluster::KEY).await;
+    assert!(members.unwrap().is_some());
+    let queue = state.shared.as_ref().unwrap().overlay.queue();
+    assert_eq!(queue.pushed(), 1);
+    state.apply(2, None).await.unwrap();
+    state
+        .apply_view_checkpoint(3, &uuid::Uuid::new_v4().to_string())
+        .await
+        .unwrap();
+    assert_eq!(state.applied, 3);
+    assert_eq!(state.write_batches, 1);
+    assert_eq!(queue.pushed(), 1);
+    // The view at the applied index equals the state of the last batch.
+    let view = state.read_view().unwrap();
+    assert_eq!(
+        view.state().get(APPLIED).await.unwrap().unwrap().as_ref(),
+        1_u64.to_be_bytes()
+    );
+    state.apply_etcd(4, &put("k", "v")).await.unwrap();
+    assert_eq!(state.write_batches, 2);
+    assert_eq!(queue.pushed(), 4);
+    // The view of index 3 does not see the later write.
+    assert_eq!(view.state().get(b"etcd/current/k").await.unwrap(), None);
+    state.close().await.unwrap();
+}
+
+/// Write the overlay batches into the shared database, flush, and open a checkpoint of it.
+async fn checkpoint(state: &StateMachine, written: &mut u64) -> Arc<view::Base> {
+    let queue = state.shared.as_ref().unwrap().overlay.queue();
+    for (seq, batch) in queue.after(*written, usize::MAX) {
+        state
+            .db
+            .write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
+            .await
+            .unwrap();
+        *written = seq;
+    }
+    state.db.flush().await.unwrap();
+    let id = state
+        .db
+        .create_checkpoint(
+            CheckpointScope::Durable,
+            &CheckpointOptions {
+                name: Some(shared::view_name(*written)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+    let source = state.shared.as_ref().unwrap().source.clone();
+    Arc::new(source.open_base(id).await.unwrap())
+}
+
+#[tokio::test]
+async fn bases_switch_monotonically_and_release_covered_segments() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut state = open_shared(store.clone()).await;
+    let mut written = 0;
+    for n in 0..10 {
+        state
+            .apply_etcd(state.applied + 1, &put(&format!("k{n}"), "one"))
+            .await
+            .unwrap();
+    }
+    let older = checkpoint(&state, &mut written).await;
+    assert_eq!(older.applied, 10);
+    state
+        .apply_view_checkpoint(state.applied + 1, &uuid::Uuid::new_v4().to_string())
+        .await
+        .unwrap();
+    for n in 0..10 {
+        state
+            .apply_etcd(state.applied + 1, &put(&format!("k{n}"), "two"))
+            .await
+            .unwrap();
+    }
+    let newer = checkpoint(&state, &mut written).await;
+    assert_eq!(newer.applied, 21);
+    state
+        .apply_view_checkpoint(state.applied + 1, &uuid::Uuid::new_v4().to_string())
+        .await
+        .unwrap();
+    state
+        .apply_etcd(state.applied + 1, &delete("k0", ""))
+        .await
+        .unwrap();
+    let before = state.read_view().unwrap();
+    let expected = rows(&state, b"etcd/").await;
+    let bytes = state.shared.as_ref().unwrap().overlay.bytes();
+
+    // The newer open finishes first. The older one must not lower the base.
+    let shared = state.shared.as_ref().unwrap();
+    shared.offer(newer.clone());
+    shared.offer(older.clone());
+    state.switch_base();
+    assert_eq!(state.shared.as_ref().unwrap().base.applied, 21);
+    state.shared.as_ref().unwrap().offer(older);
+    state.switch_base();
+    assert_eq!(state.shared.as_ref().unwrap().base.applied, 21);
+    // The two closed segments are covered. The open segment holds the delete.
+    let overlay = &state.shared.as_ref().unwrap().overlay;
+    assert_eq!(overlay.segments().len(), 1);
+    assert!(overlay.bytes() < bytes);
+    assert_eq!(rows(&state, b"etcd/").await, expected);
+    assert_eq!(
+        source::rows(state.read_view().unwrap().state(), b"etcd/").await,
+        source::rows(before.state(), b"etcd/").await
+    );
+    // The view taken before the switch still reads its released segments.
+    let old_value = before.state().get(b"etcd/current/k1").await.unwrap();
+    assert!(old_value.is_some());
+    assert_eq!(
+        old_value,
+        state.applied_state().get(b"etcd/current/k1").await.unwrap()
+    );
+
+    // A reopen starts from the newest checkpoint and rebuilds the same derived state.
+    state
+        .shared
+        .as_ref()
+        .unwrap()
+        .source
+        .mark_bootstrapped(uuid::Uuid::nil())
+        .await
+        .unwrap();
+    let revision = state.revision;
+    state.close().await.unwrap();
+    let reopened = open_shared(store.clone()).await;
+    assert_eq!(reopened.applied, 21);
+    assert_eq!(reopened.revision, revision - 1);
+    assert_eq!(reopened.shared.as_ref().unwrap().base.applied, 21);
+    let k0 = reopened.applied_state().get(b"etcd/current/k0").await;
+    assert!(k0.unwrap().is_some());
+    let admin = reopened.admin.clone();
+    reopened.close().await.unwrap();
+    // After the bootstrap marker exists, a member never starts from an empty base.
+    for (_, checkpoint) in shared::view_checkpoints(&admin).await.unwrap() {
+        admin.delete_checkpoint(checkpoint.id).await.unwrap();
+    }
+    let error = StateMachine::open_shared(
+        store,
+        "cluster",
+        "test",
+        StateCache::default(),
+        0,
+        transfer::Backend::Local,
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("no view checkpoint"), "{error}");
+}
+
+#[tokio::test]
+async fn the_cluster_claim_fixes_the_mode_and_the_quota() {
+    let store = InMemory::new();
+    assert_eq!(shared::claim(&store, "root", "one", 5).await.unwrap(), 5);
+    // A later member uses the claimed quota.
+    assert_eq!(shared::claim(&store, "root", "one", 7).await.unwrap(), 5);
+    assert!(shared::claim(&store, "root", "two", 5).await.is_err());
+    assert!(shared::refuse_claim(&store, "root").await.is_err());
+    shared::refuse_claim(&store, "other").await.unwrap();
+}

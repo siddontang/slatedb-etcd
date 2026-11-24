@@ -175,6 +175,7 @@ impl WriteBatch {
             .map(|(key, change)| (key, change.value.as_ref()))
     }
 
+    #[cfg(test)]
     pub(crate) fn into_rows(self) -> impl Iterator<Item = (Bytes, Option<Bytes>)> {
         self.changes
             .into_iter()

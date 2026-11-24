@@ -109,6 +109,12 @@ impl Node {
         if matches!(request, C::List(_)) {
             return Ok(());
         }
+        if self.writer.is_some() && matches!(request, C::Add(_) | C::Promote(_)) {
+            return Err(KvError::new(
+                Code::FailedPrecondition,
+                "shared state mode supports one voter until phase 2",
+            ));
+        }
         if self.raw.raft.pending_conf_index > self.state.applied {
             return Err(KvError::new(
                 Code::Unavailable,

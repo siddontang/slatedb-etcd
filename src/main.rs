@@ -140,6 +140,13 @@ struct Args {
     /// Automatic snapshots also wait for this many appended log bytes. Zero uses only the entry interval.
     #[arg(long, default_value_t = slatedb_etcd::node::DEFAULT_SNAPSHOT_MIN_BYTES)]
     snapshot_min_bytes: u64,
+    /// State layout of a new cluster. Shared keeps one SlateDB for the cluster and supports one
+    /// voter in this release. An existing data directory must keep its mode.
+    #[arg(long, value_enum, default_value = "replicated")]
+    state_mode: slatedb_etcd::state::StateMode,
+    /// Shared mode: flush and publish a checkpoint when the oldest unflushed write is this old.
+    #[arg(long, default_value = "10s", value_parser = humantime::parse_duration)]
+    view_max_age: std::time::Duration,
     /// Log entry cache budget in bytes.
     #[arg(long, default_value_t = 8 * 1024 * 1024)]
     log_cache_bytes: usize,
@@ -244,6 +251,8 @@ async fn run(args: Args) -> Result<()> {
         strict_reconfiguration: args.strict_reconfig_check,
         join: args.join,
         restore_snapshot: args.restore_snapshot,
+        state_mode: args.state_mode,
+        view_max_age: args.view_max_age,
     };
     let mut server = Server::start(config).await?;
     tracing::info!(node = args.id, listen = %server.client_addr(), "Node started");

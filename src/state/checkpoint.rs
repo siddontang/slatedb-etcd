@@ -12,6 +12,10 @@ impl StateMachine {
     /// state covers the local log without a copy. Only a peer that needs a snapshot requests an
     /// image. The image is a descriptor of a SlateDB checkpoint at the pinned index.
     pub(crate) async fn checkpoint_job(&self, image: bool) -> Result<CheckpointJob> {
+        ensure!(
+            !self.is_shared(),
+            "shared state mode has no local checkpoints before phase 2"
+        );
         if image {
             // A peer copies the SlateDB checkpoint objects. See `transfer`.
             ensure!(

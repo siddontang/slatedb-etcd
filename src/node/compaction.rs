@@ -19,6 +19,8 @@ pub(super) struct Flush {
     meters: Arc<crate::metrics::StateMeters>,
     running: Option<FlushJob>,
     queued: Option<(u64, i64)>,
+    /// Shared mode: the materializer progress. A flush first waits for the batches.
+    shared: Option<Arc<super::shared::Progress>>,
     /// The physical boundary that has reached object storage.
     pub durable: watch::Sender<i64>,
     /// Physical Compact replies. A long pass can exceed the proposal timeout, so these replies
@@ -75,6 +77,7 @@ impl Flush {
             meters: state.metrics.clone(),
             running: None,
             queued: None,
+            shared: None,
             durable: watch::channel(state.physical_revision()).0,
             replies: vec![],
         }
@@ -83,6 +86,11 @@ impl Flush {
     /// Use the database that a snapshot install opened. A running flush finishes on the old one.
     pub fn rebind(&mut self, db: std::sync::Arc<slatedb::Db>) {
         self.db = db;
+    }
+
+    /// Flush only after the shared-mode materializer has written the requested batches.
+    pub fn share(&mut self, progress: Arc<super::shared::Progress>) {
+        self.shared = Some(progress);
     }
 
     pub fn cancel(&mut self) {
@@ -94,7 +102,8 @@ impl Flush {
         self.running.is_some()
     }
 
-    pub fn request(&mut self, index: u64, revision: i64) {
+    /// Flush through `index`. In shared mode `wait` is the batch sequence that holds `index`.
+    pub fn request(&mut self, index: u64, revision: i64, wait: Option<u64>) {
         if self.active() {
             // Apply submits requests in log order. One later flush covers the queued prefix.
             self.queued = Some((index, revision));
@@ -102,7 +111,11 @@ impl Flush {
         }
         let db = self.db.clone();
         let meters = self.meters.clone();
+        let shared = self.shared.clone().zip(wait);
         self.running = Some(Box::pin(async move {
+            if let Some((progress, seq)) = shared {
+                progress.wait_written(seq).await?;
+            }
             crate::failpoint::hit("compact-before-flush");
             meters.flush_db(&db).await?;
             crate::failpoint::hit("compact-after-flush");
@@ -143,9 +156,15 @@ impl Node {
             waiter.response.json(waiter.value)?;
         }
         if let Some((index, revision)) = self.compaction.queued.take() {
-            self.compaction.request(index, revision);
+            self.flush_compaction(index, revision);
         }
         Ok(())
+    }
+
+    /// Flush storage through `index` for the physical boundary `revision`.
+    pub(super) fn flush_compaction(&mut self, index: u64, revision: i64) {
+        let wait = self.writer.as_ref().map(|writer| writer.covering(index));
+        self.compaction.request(index, revision, wait);
     }
 
     pub(super) fn wait_physical_compact(

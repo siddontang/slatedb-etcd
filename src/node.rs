@@ -37,6 +37,7 @@ mod read;
 mod ready;
 mod response;
 mod schedule;
+mod shared;
 mod watch;
 use crate::peer::transport_to;
 use apply::{AppliedState, Completion, Header, Job, Output, Query, Reply, Work, Worker};
@@ -93,6 +94,8 @@ pub enum Event {
         snapshot: bool,
         success: bool,
     },
+    /// The shared-mode publisher created this checkpoint. The leader announces it.
+    ViewCheckpoint(uuid::Uuid),
 }
 
 /// Flush SlateDB for log truncation about once per L0 SST instead of once per entry interval.
@@ -116,6 +119,10 @@ pub struct NodeOptions {
     pub transport: crate::tls::Transport,
     pub object_store: crate::object::Config,
     pub require_peer_tls: bool,
+    /// The state mode. Only a new cluster can select shared mode.
+    pub state_mode: crate::state::StateMode,
+    /// Shared mode: the age of the oldest unflushed write that starts a flush and a checkpoint.
+    pub view_max_age: Duration,
 }
 
 impl NodeOptions {
@@ -254,6 +261,8 @@ pub struct Node {
     /// Whether this leader term has built its lease deadlines.
     lease_promoted: bool,
     renewals: lease::Renewals,
+    /// The shared-mode leader writer. `None` in replicated mode.
+    writer: Option<shared::Writer>,
 }
 
 impl Node {
@@ -275,6 +284,16 @@ impl Node {
             !options.peers.contains_key(&0),
             "zero is not a valid voter id"
         );
+        if options.state_mode == crate::state::StateMode::Shared {
+            ensure!(
+                options.peers.len() == 1 && !options.join,
+                "shared state mode supports one voter until phase 2"
+            );
+            ensure!(
+                !options.view_max_age.is_zero(),
+                "the view age limit must be positive"
+            );
+        }
         std::fs::create_dir_all(&options.dir)?;
         // Open Raft first. Its exclusive file lock also protects this node's SlateDB directory.
         let mut storage = RaftStorage::open(
@@ -294,6 +313,8 @@ impl Node {
                 &options.cluster_id,
                 options.id,
                 options.state_cache,
+                options.state_mode,
+                options.effective_quota().max(0) as u64,
             )
             .await?;
         // Mark the directory before the first format 4 row, not on open. See `RowMarker`.
@@ -309,7 +330,10 @@ impl Node {
         );
         let location = state.location.clone();
         let recovered = async {
-            state.quota = options.effective_quota().max(0) as u64;
+            // Shared mode takes the quota from the cluster claim, so every member uses one value.
+            if !state.is_shared() {
+                state.quota = options.effective_quota().max(0) as u64;
+            }
             // Flushed state proves this prefix was committed, even if its commit marker was lost.
             if state.applied > storage.commit_index() {
                 storage.persist_commit(state.applied)?;
@@ -333,7 +357,8 @@ impl Node {
                     }
                 }
                 state.members = std::sync::Arc::new(members);
-                state.members_unsaved = true;
+                // Shared mode stores the bootstrap membership with the first applied entry.
+                state.members_unsaved = !state.is_shared();
             }
             if options.require_peer_tls {
                 ensure!(
@@ -425,7 +450,13 @@ impl Node {
             state.admin.clone(),
             state.metrics.registry.clone(),
         )?);
-        let compaction = compaction::Flush::new(&state);
+        let writer = state
+            .writer_parts()
+            .map(|parts| shared::Writer::new(parts, options.view_max_age));
+        let mut compaction = compaction::Flush::new(&state);
+        if let Some(writer) = &writer {
+            compaction.share(writer.progress());
+        }
         let compact_plan = compaction::PlanReady::new(&state, manual_apply);
         let worker = Worker::start(state, events.clone(), manual_apply);
         let log_worker = log::Worker::start(storage, manual_apply)?;
@@ -511,6 +542,7 @@ impl Node {
             lease_view: None,
             lease_promoted: false,
             renewals: lease::Renewals::default(),
+            writer,
         };
         node.sync_members();
         Ok(node)
@@ -539,6 +571,9 @@ impl Node {
         self.transports.shutdown().await;
         // Keep the Raft directory locked until the state worker has stopped.
         self.compaction.cancel();
+        if let Some(writer) = &mut self.writer {
+            writer.stop().await;
+        }
         self.read_executor.shutdown().await;
         let apply = self.worker.shutdown().await;
         let log = self.log_worker.shutdown().await;
@@ -570,6 +605,10 @@ impl Node {
                     self.finish_compaction_flush(target?)?;
                 }
                 completed = self.worker.next() => { self.complete_apply(completed?)?; }
+                error = shared::failed(&mut self.writer),
+                    if self.writer.as_ref().is_some_and(shared::Writer::running) => {
+                    return Err(error);
+                }
                 read = self.read_executor.next(), if self.read_executor.len() > 0 => {
                     self.complete_read(read?)?;
                 }
@@ -607,6 +646,7 @@ impl Node {
                 self.raw.raft.leader_id,
             );
             if role != old_role {
+                self.sync_writer();
                 self.publish_watch(None);
                 self.publish_local_reads();
                 tracing::info!(node = self.options.id, role = ?role.0, term = role.1,
@@ -918,7 +958,11 @@ impl Node {
                 let _ = response.send(Ok(self.status()?));
             }
             Event::Checkpoint(response) => {
-                if self.checkpoint_waiters.len() >= apply::MAX_QUERIES {
+                if self.writer.is_some() {
+                    let _ = response.send(Err(
+                        self.error("shared state mode has no manual checkpoint until phase 2")
+                    ));
+                } else if self.checkpoint_waiters.len() >= apply::MAX_QUERIES {
                     let _ = response.send(Err(self.error("too many checkpoint requests")));
                 } else {
                     self.checkpoint_waiters
@@ -927,6 +971,7 @@ impl Node {
                 }
             }
             Event::SnapshotBuilt(built) => self.checkpoint_built(built)?,
+            Event::ViewCheckpoint(checkpoint) => self.announce_view(checkpoint)?,
             Event::SnapshotDelay(delay_ms, response) => {
                 self.snapshot_delay_ms = delay_ms.min(5000);
                 let _ = response.send(Ok(self.status()?));
@@ -1322,6 +1367,14 @@ impl Node {
             status["write_profile"] = crate::write_profile::snapshot();
         }
         status["quorum_reply_index"] = self.quorum_reply_index.into();
+        if let (Some(writer), Some((base, applied, bytes))) = (&self.writer, self.state.view) {
+            status["shared_state"] = json!({
+                "base_applied_index": base,
+                "applied_view_checkpoints": applied,
+                "overlay_bytes": bytes,
+                "writer": writer.status(),
+            });
+        }
         status["snapshot_has_image"] = self.raw.store().has_image().into();
         status["snapshot_image_wanted"] = self.raw.store().image_wanted().into();
         status["snapshot_images_built"] = self.snapshot_images.into();

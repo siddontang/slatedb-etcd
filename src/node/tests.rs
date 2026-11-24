@@ -6,6 +6,8 @@ fn options(dir: &std::path::Path) -> NodeOptions {
         client_peers: BTreeMap::new(),
         transport: crate::tls::Transport::default(),
         require_peer_tls: false,
+        state_mode: Default::default(),
+        view_max_age: std::time::Duration::from_secs(10),
         object_store: crate::object::Config::Local,
         strict_reconfiguration: false,
         join: false,

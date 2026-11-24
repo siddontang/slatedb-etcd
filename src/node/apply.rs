@@ -25,6 +25,8 @@ pub(super) struct AppliedState {
     /// The background read generation that the next compaction step needs.
     pub compaction_plan: u64,
     pub physical_revision: i64,
+    /// Shared mode: the base index, the applied `ViewCheckpoint` entries, and the overlay bytes.
+    pub view: Option<(u64, u64, u64)>,
 }
 
 impl std::ops::Deref for AppliedState {
@@ -47,6 +49,7 @@ impl AppliedState {
             compaction_pending: state.compaction_pending(),
             compaction_plan: state.compaction_plan.generation(),
             physical_revision: state.physical_revision(),
+            view: state.view_status(),
         })
     }
 }
@@ -256,6 +259,10 @@ impl Executor {
         );
         let copy_state = changes_state || matches!(work.job, Job::Query(Query::Maintenance(..)));
         let previous_revision = self.state.revision;
+        // A checkpoint that opened in the background becomes the base of the next view.
+        if changes_state {
+            self.state.switch_base();
+        }
         if (changes_state || matches!(work.job, Job::PreparePuts { .. })) && !work.delay.is_zero() {
             tokio::time::sleep(work.delay).await;
         }
@@ -662,6 +669,10 @@ async fn apply_entries(
                     Reply::Encoded(value)
                 }
             }
+            RaftCommand::ViewCheckpoint { checkpoint, .. } => {
+                state.apply_view_checkpoint(entry.index, checkpoint).await?;
+                Reply::Encoded(Value::Null)
+            }
             RaftCommand::CompactStep { .. } => {
                 match state.apply_compaction_step(entry.index).await? {
                     Some(revision) => Reply::CompactFlush {
@@ -707,7 +718,8 @@ pub(super) async fn recover(
             )
         });
     }
-    if physical {
+    // Shared mode has no local flush. The leader materializer writes the shared database.
+    if physical && !state.is_shared() {
         state.metrics.flush_db(&state.db).await?;
         state.durable_applied = state.applied;
     }
