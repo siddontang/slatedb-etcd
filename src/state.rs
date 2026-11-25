@@ -489,6 +489,27 @@ impl StateMachine {
         })
     }
 
+    /// The fields that `load` builds from the rows, in one text. Two states at one index must
+    /// give the same text, whether they applied the entries or loaded a base. The membership is
+    /// its row digest, because the in-memory set before the seed is member-local.
+    #[cfg(test)]
+    pub(crate) fn loaded_fields(&self) -> String {
+        format!(
+            "{} {} {} {} {:?} {} {} {:?} {:?} {:?} {}",
+            self.applied,
+            self.applied_term,
+            self.revision,
+            self.compact_revision,
+            self.compaction,
+            serde_json::to_string(self.leases.as_ref()).unwrap_or_default(),
+            serde_json::to_string(self.auth.as_ref()).unwrap_or_default(),
+            self.alarms,
+            self.members_row.as_ref().map(|row| &row.digest),
+            self.logical_bytes,
+            self.key_index.len(),
+        )
+    }
+
     /// The replicated database, if any.
     pub(crate) fn database(&self) -> Option<Arc<Db>> {
         self.database.clone()
@@ -549,7 +570,11 @@ impl StateMachine {
                 .all(|key| key == APPLIED || key == APPLIED_TERM)
         {
             // An entry that changes no state writes no batch. Otherwise each announcement would
-            // dirty the memtable, and its flush would cause the next announcement.
+            // dirty the memtable, and its flush would cause the next announcement. The overlay
+            // still records that the state at `index` is the state after its newest batch.
+            if let Some(shared) = &mut self.shared {
+                shared.overlay.cover(index);
+            }
             return Ok(size);
         }
         let mut size = size;

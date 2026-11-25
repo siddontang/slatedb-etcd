@@ -2250,3 +2250,73 @@ async fn the_quota_warning_follows_the_cluster_quota() {
     quota_tests::apply_committed(&mut node).await;
     assert_eq!(node.warning_bytes(), Some(8_192));
 }
+
+/// Raft restores a requested snapshot at the follower's commit index, also when the follower's
+/// record is already there. The follower then stores nothing, stays live, clears its request,
+/// and takes the next append.
+#[tokio::test]
+async fn an_equal_index_snapshot_clears_the_request_and_keeps_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_log(dir.path(), 20);
+    let (events, mut receiver) = mpsc::channel(256);
+    let mut node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    let (tx, mut reply) = oneshot::channel();
+    node.handle(Event::Checkpoint(tx), &mut vec![])
+        .await
+        .unwrap();
+    for _ in 0..1000 {
+        node.drive_ready().await.unwrap();
+        node.drain_log().await.unwrap();
+        if let Some(completed) = node.worker.step().await.unwrap() {
+            node.complete_apply(completed).unwrap();
+        }
+        while let Ok(event) = receiver.try_recv() {
+            node.handle(event, &mut vec![]).await.unwrap();
+        }
+        node.finish_checkpoint_waiters().unwrap();
+        if reply.try_recv().is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let record = node.raw.store().recovery_snapshot().clone();
+    assert_eq!(record.get_metadata().index, 20);
+    let message = |kind: MessageType| Message {
+        msg_type: kind as i32,
+        from: 2,
+        to: 1,
+        term: 1,
+        ..Default::default()
+    };
+    node.step_peer(message(MessageType::MsgHeartbeat)).unwrap();
+    node.raw.request_snapshot().unwrap();
+    assert_eq!(node.raw.raft.pending_request_snapshot, 20);
+    let mut install = message(MessageType::MsgSnapshot);
+    install.set_snapshot(record.clone());
+    node.step_peer(install).unwrap();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    assert_eq!(node.raw.raft.pending_request_snapshot, 0);
+    assert_eq!(node.raw.store().recovery_snapshot(), &record);
+    let mut append = message(MessageType::MsgAppend);
+    append.index = 20;
+    append.log_term = 1;
+    append.commit = 21;
+    append.entries = vec![Entry {
+        index: 21,
+        term: 1,
+        ..Default::default()
+    }];
+    node.step_peer(append).unwrap();
+    for _ in 0..20 {
+        node.drive_ready().await.unwrap();
+        node.drain_log().await.unwrap();
+        if let Some(completed) = node.worker.step().await.unwrap() {
+            node.complete_apply(completed).unwrap();
+        }
+    }
+    assert_eq!(node.raw.raft.raft_log.last_index(), 21);
+    assert_eq!(node.state.applied, 21);
+}

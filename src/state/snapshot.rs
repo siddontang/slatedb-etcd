@@ -72,6 +72,17 @@ impl StateMachine {
         })
     }
 
+    /// Shared mode: raise the base to the checkpoint of a Raft snapshot record that this member
+    /// applied past. Raft persisted the record, but apply installs nothing for it. The base
+    /// index then normally reaches the record index. See `install_view`.
+    pub async fn raise_to_record(&mut self, snapshot: &Snapshot) -> Result<()> {
+        ensure!(
+            snapshot.get_metadata().index <= self.applied,
+            "the record is above the applied index"
+        );
+        self.install_snapshot(snapshot).await
+    }
+
     pub async fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<()> {
         let index = snapshot.get_metadata().index;
         let term = snapshot.get_metadata().term;

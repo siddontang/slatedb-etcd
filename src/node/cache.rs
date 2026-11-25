@@ -127,6 +127,17 @@ pub(super) struct Cache {
     hard_state: HardState,
     // Raft asked for a transferable image that the durable snapshot does not contain.
     image_wanted: Cell<bool>,
+    // The snapshot index that each requesting follower needs, pinned at its first request. See
+    // `Storage::snapshot`.
+    wanted: RefCell<BTreeMap<u64, u64>>,
+    // The leader term of the requests in `wanted`.
+    wanted_term: Cell<u64>,
+    // The process of each peer, for the coverage capability. See `PeerProcess`.
+    peers: RefCell<BTreeMap<u64, PeerProcess>>,
+    // A member without the coverage capability needs a record at its checkpoint row.
+    exact_wanted: Cell<bool>,
+    // Shared mode: the checkpoint and the index of this member's base.
+    base: Cell<Option<(uuid::Uuid, u64)>>,
     member: u64,
     pub durable: log::Durable,
 }
@@ -148,6 +159,11 @@ impl Cache {
             initial_conf: None,
             hard_state: durable.hard_state,
             image_wanted: Cell::new(false),
+            wanted: RefCell::default(),
+            wanted_term: Cell::new(0),
+            peers: RefCell::default(),
+            exact_wanted: Cell::new(false),
+            base: Cell::new(None),
             member: storage.member(),
             durable,
         };
@@ -261,6 +277,7 @@ impl Cache {
                 || durable.snapshot.data != self.durable.snapshot.data);
         if new_image {
             self.image_wanted.set(false);
+            self.exact_wanted.set(false);
         }
         if durable.snapshot.get_metadata().index > self.snapshot.get_metadata().index {
             let end = durable.snapshot.get_metadata().index + 1;
@@ -411,6 +428,10 @@ impl Cache {
             "read_limit": self.limits.read_bytes, "hits": h.hits, "misses": h.misses,
             "evictions": h.evictions, "disk_reads": h.reads, "stale_reads": h.stale})
     }
+    /// The index of the newest staged snapshot record, durable or not.
+    pub fn staged_snapshot_index(&self) -> u64 {
+        self.snapshot.get_metadata().index
+    }
     pub fn snapshot_pending(&self) -> bool {
         self.snapshot.get_metadata().index > self.snapshot_index()
     }
@@ -427,10 +448,110 @@ impl Cache {
     pub fn image_wanted(&self) -> bool {
         self.image_wanted.get()
     }
-    /// Return true when the durable snapshot holds an image that this member can send.
-    pub fn has_image(&self) -> bool {
-        crate::state::transfer::sendable(&self.durable.snapshot.data, self.member)
+    /// The highest snapshot index that a requesting follower needs above the durable record.
+    /// Zero when the record serves every request. A peer keeps its pinned target until it gets
+    /// the snapshot, but a record that reaches the target ends the demand.
+    pub fn wanted_index(&self) -> u64 {
+        let record = self.snapshot_index();
+        self.wanted
+            .borrow()
+            .values()
+            .copied()
+            .filter(|target| *target > record)
+            .max()
+            .unwrap_or(0)
     }
+    /// Drop the requests at a term change. Raft sends a current request again.
+    pub fn clear_wanted(&self) {
+        self.wanted.borrow_mut().clear();
+    }
+    /// Note the term of this leader. A new term drops the requests of the old one.
+    pub fn lead_term(&self, term: u64) {
+        if self.wanted_term.replace(term) != term {
+            self.clear_wanted();
+        }
+    }
+    /// Note the process that sent the last transport frame of `peer`. A new process loses the
+    /// coverage capability of the old one.
+    pub fn note_process(&self, peer: u64, process: Option<u64>) {
+        let mut peers = self.peers.borrow_mut();
+        let entry = peers.entry(peer).or_default();
+        if entry.process != process {
+            *entry = PeerProcess {
+                process,
+                advertised: None,
+            };
+        }
+    }
+    /// Note that process `process` of `peer` installs a base above its checkpoint row. A report
+    /// without a process, from an earlier binary, removes the capability.
+    pub fn note_coverage(&self, peer: u64, process: Option<u64>) {
+        self.peers.borrow_mut().entry(peer).or_default().advertised = process;
+    }
+    /// `peer` refused a snapshot that named process `target`. That process loses the capability
+    /// until it reports again. A refusal that comes late, for an earlier process, changes
+    /// nothing. The process of the stream stays, because a stream names it only in its first
+    /// frame. The next report can thus restore the capability in the middle of a stream.
+    pub fn note_refused(&self, peer: u64, target: u64) {
+        let mut peers = self.peers.borrow_mut();
+        if let Some(entry) = peers.get_mut(&peer) {
+            if entry.advertised == Some(target) {
+                entry.advertised = None;
+            }
+        }
+    }
+    /// Return true when the current process of `peer` advertised the coverage capability.
+    pub fn coverage_capable(&self, peer: u64) -> bool {
+        self.peers
+            .borrow()
+            .get(&peer)
+            .is_some_and(|entry| entry.process.is_some() && entry.advertised == entry.process)
+    }
+    /// The process of `peer` that advertised the coverage capability, while it runs.
+    pub fn capable_process(&self, peer: u64) -> Option<u64> {
+        self.coverage_capable(peer)
+            .then(|| self.peers.borrow()[&peer].process)
+            .flatten()
+    }
+    /// Return true after a member without the capability needed a record at its row.
+    pub fn exact_wanted(&self) -> bool {
+        self.exact_wanted.get()
+    }
+    /// Note the checkpoint and the index of this member's base.
+    pub fn note_base(&self, base: Option<(uuid::Uuid, u64)>) {
+        self.base.set(base);
+    }
+    /// Return true when the durable snapshot holds an image that this member can send.
+    ///
+    /// A view record is sendable only while it names the checkpoint of the base, at any index.
+    /// Only a live base pins its checkpoint, so retention can delete the checkpoint of the record
+    /// after a base switch, and a restart or a rebase can use another checkpoint for that
+    /// reason. A member with no base checkpoint yet, such as a new member before its install,
+    /// pins none. A received record can also be above the base. The owner records the base once
+    /// the base index reaches the record. See `Node::certify_base`.
+    pub fn has_image(&self) -> bool {
+        let data = &self.durable.snapshot.data;
+        let stale = match crate::state::transfer::ViewDescriptor::decode(data) {
+            Ok(Some(view)) => self
+                .base
+                .get()
+                .is_none_or(|(checkpoint, _)| view.checkpoint().ok() != Some(checkpoint)),
+            _ => false,
+        };
+        crate::state::transfer::sendable(data, self.member) && !stale
+    }
+}
+
+/// The process of a peer. A member sends a random process ID with its transport frames and its
+/// `ViewAck` reports. An earlier binary sends none. The coverage capability holds only for the
+/// process that advertised it, so a restart on an earlier binary with the same member ID loses
+/// it at its first frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerProcess {
+    /// The process of the last transport frame.
+    process: Option<u64>,
+    /// The process whose `ViewAck` advertised the capability.
+    advertised: Option<u64>,
 }
 
 impl Storage for Cache {
@@ -520,14 +641,50 @@ impl Storage for Cache {
     fn last_index(&self) -> raft::Result<u64> {
         Ok(self.last)
     }
-    fn snapshot(&self, request_index: u64, _: u64) -> raft::Result<Snapshot> {
+    /// Return the durable record for a follower, or ask the owner for one.
+    ///
+    /// A follower's request can name an index that this leader never has: raft-rs keeps a
+    /// pending request across a term change, and the follower sends it again to each leader. The
+    /// leader therefore serves `min(request, last)`, with its last log index, and pins that
+    /// target at the first request of the peer. Raft repeats the original index at each retry,
+    /// and the pinned target does not follow the log, so the entries that serve it do not move
+    /// it. The target ends when the peer gets a snapshot, or at a term change.
+    ///
+    /// Raft accepts any snapshot at or above the follower's commit index, and that clears the
+    /// follower's pending request. The leader's log holds every committed entry, so the target
+    /// is at or above that index. Both state modes use this rule.
+    fn snapshot(&self, request_index: u64, to: u64) -> raft::Result<Snapshot> {
+        // Raft calls this as soon as it leads, before the node sees the new role. The staged
+        // HardState already has the term, because a candidate persists its term before it asks
+        // for votes. A target of an earlier term goes.
+        self.lead_term(self.hard_state.term);
+        let pinned = self.wanted.borrow().get(&to).copied();
+        let target = pinned.unwrap_or_else(|| request_index.min(self.last));
         // A record without an image only truncates the local log. Raft retries after the owner
         // builds and publishes a complete image.
-        if self.snapshot_index() == 0 || self.snapshot_index() < request_index || !self.has_image()
-        {
+        if self.snapshot_index() == 0 || self.snapshot_index() < target || !self.has_image() {
             self.image_wanted.set(true);
+            if target > self.snapshot_index() {
+                self.wanted.borrow_mut().insert(to, target);
+                // An earlier binary gets only a record at its row.
+                if !self.coverage_capable(to) {
+                    self.exact_wanted.set(true);
+                }
+            }
             return Err(StorageError::SnapshotTemporarilyUnavailable.into());
         }
+        // An earlier binary installs a view record only at its checkpoint row.
+        if let Ok(Some(view)) =
+            crate::state::transfer::ViewDescriptor::decode(&self.durable.snapshot.data)
+        {
+            if view.row.is_some_and(|row| row < self.snapshot_index()) && !self.coverage_capable(to)
+            {
+                self.image_wanted.set(true);
+                self.exact_wanted.set(true);
+                return Err(StorageError::SnapshotTemporarilyUnavailable.into());
+            }
+        }
+        self.wanted.borrow_mut().remove(&to);
         Ok(self.durable.snapshot.clone())
     }
 }
@@ -667,6 +824,103 @@ mod tests {
         assert_eq!(cache.stats()["stale_reads"], 3);
         assert_eq!(cache.last_index().unwrap(), 10);
         assert!(cache.snapshot_pending());
+    }
+
+    /// A request above the last log index pins `min(request, last)` at its first call. Raft
+    /// repeats the original index, and the pin holds while the log grows. A record at the target
+    /// ends the demand but not the pin, so the next retry gets that record. A later term drops
+    /// the requests, also at a call before the node sees its new role.
+    #[test]
+    fn a_snapshot_request_pins_its_target_until_the_peer_gets_it() {
+        let (_dir, mut storage, mut cache) = stored();
+        assert_eq!(cache.last_index().unwrap(), 8);
+        assert!(cache.snapshot(34, 2).is_err());
+        assert_eq!(cache.wanted_index(), 8);
+        // The log grows, and Raft asks again with the same index.
+        cache.stage(&[entry(9, 1)], None, None).unwrap();
+        assert!(cache.snapshot(34, 2).is_err());
+        assert_eq!(cache.wanted_index(), 8);
+        // The record at 8 of the base ends the demand. The retry then gets it.
+        let id = uuid::Uuid::new_v4();
+        let data = crate::state::transfer::ViewDescriptor::new(id)
+            .encode()
+            .unwrap();
+        storage.checkpoint(8, data).unwrap();
+        cache.note_base(Some((id, 8)));
+        cache
+            .complete(log::Durable::read(&storage).unwrap())
+            .unwrap();
+        assert_eq!(cache.wanted_index(), 0);
+        assert_eq!(cache.snapshot(34, 2).unwrap().get_metadata().index, 8);
+        // The next request starts again at the last index.
+        assert!(cache.snapshot(34, 2).is_err());
+        assert_eq!(cache.wanted_index(), 9);
+        // The member leads again in a later term. Raft asks before the node sees the role. The
+        // staged HardState has the new term, so the old target goes, and the request pins the
+        // last index of now.
+        let hs = HardState {
+            term: 2,
+            commit: 8,
+            ..Default::default()
+        };
+        cache.stage(&[entry(10, 2)], Some(&hs), None).unwrap();
+        assert!(cache.snapshot(34, 2).is_err());
+        assert_eq!(cache.wanted_index(), 10);
+        // The node also drops the targets when it sees a new term.
+        cache.lead_term(3);
+        assert_eq!(cache.wanted_index(), 0);
+    }
+
+    /// A record above its checkpoint row goes only to a peer whose current process advertised
+    /// the capability. A new process of the same member, of an earlier binary, loses it.
+    #[test]
+    fn a_record_above_its_row_needs_a_capable_process() {
+        let (_dir, mut storage, mut cache) = stored();
+        cache.applied_to(8);
+        let id = uuid::Uuid::new_v4();
+        let data = crate::state::transfer::ViewDescriptor::above_row(id, 3)
+            .encode()
+            .unwrap();
+        storage.checkpoint(6, data).unwrap();
+        cache
+            .complete(log::Durable::read(&storage).unwrap())
+            .unwrap();
+        // Before a matching base opens, the record pins nothing, so it is not sendable.
+        assert!(!cache.has_image());
+        cache.note_base(Some((uuid::Uuid::new_v4(), 6)));
+        assert!(!cache.has_image());
+        cache.note_base(Some((id, 6)));
+        assert!(cache.has_image());
+        assert!(cache.snapshot(6, 2).is_err());
+        assert!(cache.exact_wanted());
+        cache.note_process(2, Some(7));
+        cache.note_coverage(2, Some(7));
+        assert!(cache.coverage_capable(2));
+        assert_eq!(cache.snapshot(6, 2).unwrap().get_metadata().index, 6);
+        // The same member starts again on an earlier binary.
+        cache.note_process(2, None);
+        assert!(!cache.coverage_capable(2));
+        assert!(cache.snapshot(6, 2).is_err());
+        // A new process of this binary reports the capability. Its stream named it first.
+        cache.note_process(2, Some(9));
+        assert!(!cache.coverage_capable(2));
+        cache.note_coverage(2, Some(9));
+        assert!(cache.coverage_capable(2));
+        assert_eq!(cache.capable_process(2), Some(9));
+        // A late 409 for an earlier process leaves the new one capable.
+        cache.note_refused(2, 7);
+        assert_eq!(cache.capable_process(2), Some(9));
+        // A refusal for the current process ends the capability until it reports again. Its
+        // report restores the match also in the middle of its stream.
+        cache.note_refused(2, 9);
+        assert!(!cache.coverage_capable(2));
+        cache.note_coverage(2, Some(9));
+        assert!(cache.coverage_capable(2));
+        // A late report of an earlier process does not count for the current one.
+        cache.note_coverage(2, Some(7));
+        assert!(!cache.coverage_capable(2));
+        cache.note_coverage(2, Some(9));
+        assert!(cache.coverage_capable(2));
     }
 
     #[test]

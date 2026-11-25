@@ -12,6 +12,11 @@ pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, DecodeError
     bincode::serde::decode_from_slice(bytes, legacy()).map(|(value, _)| value)
 }
 
+/// Decode a value from the start of `bytes`, and return it with the number of bytes it used.
+pub(crate) fn decode_prefix<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, usize), DecodeError> {
+    bincode::serde::decode_from_slice(bytes, legacy())
+}
+
 pub(crate) fn write(
     out: &mut impl std::io::Write,
     value: &impl Serialize,

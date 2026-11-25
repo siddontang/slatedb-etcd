@@ -38,8 +38,11 @@ pub(crate) const STALL_STATE_PUT: u8 = 8;
 pub(crate) const DELAY_SST_GET: u8 = 9;
 /// Report the next SST read as missing, like an SST that GC deleted.
 pub(crate) const LOSE_SST_ONCE: u8 = 7;
+/// Report the next two SST reads as missing. A failed cache load in SlateDB falls back to one
+/// direct read, so only this mode fails a read that goes through the block cache.
+pub(crate) const LOSE_SST_TWICE: u8 = 10;
 /// Fail every SST read with a retryable error, like a local file with a persistent I/O error.
-pub(crate) const RETRYABLE_SST_GET: u8 = 10;
+pub(crate) const RETRYABLE_SST_GET: u8 = 11;
 
 impl FaultStore {
     pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
@@ -139,8 +142,13 @@ impl ObjectStore for FaultStore {
     async fn get_opts(&self, path: &Path, options: GetOptions) -> Result<GetResult> {
         self.read.lock().unwrap().insert(path.to_string());
         let mode = self.mode.load(Ordering::SeqCst);
-        if mode == LOSE_SST_ONCE && path.as_ref().ends_with(".sst") {
-            self.mode.store(0, Ordering::SeqCst);
+        if (mode == LOSE_SST_ONCE || mode == LOSE_SST_TWICE) && path.as_ref().ends_with(".sst") {
+            let next = if mode == LOSE_SST_TWICE {
+                LOSE_SST_ONCE
+            } else {
+                0
+            };
+            self.mode.store(next, Ordering::SeqCst);
             self.entered.add_permits(1);
             return Err(Error::NotFound {
                 path: path.to_string(),

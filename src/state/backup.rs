@@ -621,6 +621,7 @@ impl StateMachine {
                     empty_log: false,
                     pin_max: std::time::Duration::from_secs(300),
                     restore: None,
+                    record: None,
                 },
             )
             .await?;

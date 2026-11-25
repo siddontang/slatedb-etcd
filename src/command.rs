@@ -88,6 +88,7 @@ mod tests {
             RaftCommand::ViewCheckpoint {
                 id: "view".into(),
                 checkpoint: uuid::Uuid::new_v4().to_string(),
+                covers: 12,
             },
             RaftCommand::SetQuota {
                 id: "quota".into(),
@@ -163,6 +164,43 @@ mod tests {
         }
         let json = serde_json::to_vec(&seed_members(None)).unwrap();
         assert!(serde_json::from_slice::<OlderCompactStep>(&json).is_err());
+    }
+
+    /// An announcement of an earlier binary has no coverage, and zero means the checkpoint row.
+    /// An earlier binary reads a new announcement and ignores the coverage.
+    #[test]
+    fn a_view_checkpoint_decodes_with_and_without_coverage() {
+        let checkpoint = uuid::Uuid::new_v4().to_string();
+        let older = serde_json::json!({"id": "view", "checkpoint": checkpoint});
+        let data = Envelope {
+            payload: Some(Payload::Json(serde_json::to_vec(&older).unwrap())),
+        }
+        .encode_to_vec();
+        let decoded = RaftCommand::decode(&data).unwrap();
+        assert!(
+            matches!(&decoded, RaftCommand::ViewCheckpoint { covers: 0, checkpoint: c, .. }
+                if *c == checkpoint),
+            "{decoded:?}"
+        );
+        let command = RaftCommand::ViewCheckpoint {
+            id: "view".into(),
+            checkpoint: checkpoint.clone(),
+            covers: 9,
+        };
+        let decoded = RaftCommand::decode(&command.encode().unwrap()).unwrap();
+        assert!(
+            matches!(decoded, RaftCommand::ViewCheckpoint { covers: 9, .. }),
+            "{decoded:?}"
+        );
+        // The earlier variant had only these fields, before `CompactStep`.
+        #[derive(serde::Deserialize)]
+        struct OlderViewCheckpoint {
+            id: String,
+            checkpoint: String,
+        }
+        let json = serde_json::to_vec(&command).unwrap();
+        let older: OlderViewCheckpoint = serde_json::from_slice(&json).unwrap();
+        assert_eq!((older.id.as_str(), older.checkpoint), ("view", checkpoint));
     }
 
     /// `CompactStep` matches any `id`, so `SetQuota` must decode before it.

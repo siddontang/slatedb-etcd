@@ -8,11 +8,15 @@ struct Pending {
     completed: oneshot::Receiver<Result<serde_json::Value, crate::ApiError>>,
 }
 
+/// Receive the frames of one peer stream. The first frame names the peer, so the node learns
+/// the process of that peer before it steps the frame. See `PROCESS`.
 pub(super) async fn run(
     mut incoming: tonic::Streaming<Frame>,
     events: mpsc::Sender<Event>,
     responses: &mpsc::Sender<Result<Receipt, Status>>,
+    process: Option<u64>,
 ) -> Result<(), Status> {
+    let mut named = false;
     let mut sequence = 0_u64;
     let mut pending: VecDeque<Pending> = VecDeque::new();
     let mut bytes = 0;
@@ -40,6 +44,12 @@ pub(super) async fn run(
                     .map_err(|_| Status::invalid_argument("invalid Raft message"))?;
                 if message.get_msg_type() == MessageType::MsgSnapshot {
                     return Err(Status::invalid_argument("snapshots require the durable endpoint"));
+                }
+                if !named {
+                    named = true;
+                    let member = message.from;
+                    events.try_send(Event::PeerProcess { member, process })
+                        .map_err(|_| Status::unavailable("peer queue is unavailable"))?;
                 }
                 let (response, completed) = oneshot::channel();
                 events.try_send(Event::PeerFrame(message, size, response))
