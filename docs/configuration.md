@@ -86,7 +86,8 @@ For example, use `--watch-progress-notify-interval=200ms` for the upstream clien
 | `--snapshot-every` | 10000 | Applied entries between checkpoint opportunities; zero disables it. |
 | `--snapshot-min-bytes` | 67108864 | Log bytes needed before auto truncation; zero disables it. |
 | `--log-file-bytes` | 67108864 | Log file size, at least 65536. Truncation frees whole files. |
-| `--quota-backend-bytes` | 0 | Zero selects 2 GiB. A negative value disables the quota. |
+| `--quota-backend-bytes` | 0 | Seeds or changes the cluster quota. Zero selects 2 GiB. |
+| `--quota-reassert` | off | Requests the quota flag again as the newest change. Use it once. |
 | `--quota-warning-fraction` | 0.8 | Quota share that raises the early warning; zero disables it. |
 | `--auto-compaction-mode` | periodic | `periodic` keeps a duration; `revision` keeps a count. |
 | `--auto-compaction-retention` | 0 | History to keep. Zero disables automatic compaction. |
@@ -115,6 +116,8 @@ Compaction reads ahead 2 x 512 KiB per input SST. Each compaction job runs at mo
 subcompactions, because each one buffers SST data until the disk takes it.
 On Linux, jemalloc background threads return freed pages to the OS after 200 ms.
 `_RJEM_MALLOC_CONF` overrides that default.
+A negative quota value disables the quota. The quota is cluster state, so a flag change takes
+effect only when that member leads; see [quota changes](operations.md#change-the-quota).
 The quota can be exceeded by one operation and does not reserve free disk space.
 Native backups and `Maintenance.Snapshot` have a 64 MiB limit. Peer snapshots copy SlateDB
 checkpoint objects and have no size limit; see [object storage Raft snapshots](object-snapshots.md).

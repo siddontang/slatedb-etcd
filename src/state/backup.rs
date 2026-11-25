@@ -48,7 +48,9 @@ impl StateMachine {
         members: &crate::cluster::Store,
     ) -> Result<shared::Restore> {
         check_restore_target(dir, id, members)?;
-        let (data, checksum) = restored_data(backup, members)?;
+        let (mut data, checksum) = restored_data(backup, members)?;
+        // The cluster claim sets the quota of shared mode.
+        data.rows.retain(|(key, _)| key != quota::KEY);
         Ok(shared::Restore::new(data.rows, checksum))
     }
 }

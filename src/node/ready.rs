@@ -2,6 +2,8 @@ use super::*;
 
 impl Node {
     pub(super) async fn drive_ready(&mut self) -> Result<()> {
+        // Queued client writes enter Raft below, after a `SetQuota` entry of this term.
+        self.propose_quota()?;
         self.resume_proposals();
         self.flush_puts();
         self.drive_compaction()?;
@@ -39,9 +41,24 @@ impl Node {
             #[cfg(feature = "write-profile")]
             crate::write_profile::Stage::Raft.batch(ready.entries().len());
             let snapshot = (!ready.snapshot().is_empty()).then(|| ready.snapshot().clone());
+            // A requested snapshot can arrive when the commit index already covers it. Raft then
+            // has no HardState change, but the snapshot record needs one.
+            let hs = ready
+                .hs()
+                .cloned()
+                .or_else(|| snapshot.as_ref().map(|_| self.raw.raft.hard_state()));
             self.raw
                 .mut_store()
-                .stage(ready.entries(), ready.hs(), snapshot.as_ref())?;
+                .stage(ready.entries(), hs.as_ref(), snapshot.as_ref())?;
+            // New entries can hold a quota-checked entry of an earlier binary. Find it before a
+            // vote or apply reaches it. A snapshot or a conflict replaces the scanned suffix.
+            let replaced = match &snapshot {
+                Some(snapshot) => Some(snapshot.get_metadata().index + 1),
+                None => ready.entries().first().map(|entry| entry.index),
+            };
+            if replaced.is_some() {
+                self.scan_quota_log(replaced)?;
+            }
             self.appended_bytes = ready
                 .entries()
                 .iter()
@@ -50,7 +67,7 @@ impl Node {
                 });
             let job = log::Job::Ready {
                 entries: ready.take_entries(),
-                hs: ready.hs().cloned(),
+                hs,
                 snapshot,
             };
             let early = ready.take_messages();

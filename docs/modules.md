@@ -27,6 +27,8 @@ The CLI and embedded API share the same lifecycle and runtime paths.
 | `node/read` | Confirm Safe ReadIndex and reject obsolete proofs |
 | `node/read/executor` | Run bounded reads on immutable applied views |
 | `node/lease` | Schedule leader lease expiry from replicated generations |
+| `node/quota` | Keep the local quota flag record and propose the replicated cluster quota |
+| `state/quota` | Store the cluster quota row and select the quota that apply uses |
 | `state` | Open storage and own mutable applied metadata |
 | `state/kv` and `state/put_batch` | Commit MVCC changes and maintain quota accounting |
 | `state/read` | Pin data, revision, Auth, and Lease metadata together |

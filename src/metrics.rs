@@ -80,6 +80,8 @@ pub struct Sample {
     pub(crate) usage: crate::batch::Usage,
     /// The quota usage that raises the early warning. `None` disables the warning.
     pub(crate) warning_bytes: Option<u64>,
+    /// The flag of this member differs from `quota`.
+    pub(crate) quota_mismatch: bool,
     pub(crate) revision: i64,
     pub(crate) compact: i64,
     pub(crate) auth_revision: u64,
