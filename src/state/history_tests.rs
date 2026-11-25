@@ -539,3 +539,83 @@ async fn journal_pages_skip_the_values_of_unrelated_deletes() {
     assert_eq!((reply.count, reply.kvs.len()), (1, 1));
     assert!(peak < all / 4, "peak {peak} of {all} bytes");
 }
+
+/// Read `request` and return the reply with the versions that its journal page read.
+async fn counted_read(state: &StateMachine, request: RangeRequest) -> (RangeResponse, u64) {
+    crate::mvcc::JOURNAL_VERSION_READS.set(0);
+    let reply = read(state, request).await.unwrap();
+    (reply, crate::mvcc::JOURNAL_VERSION_READS.get())
+}
+
+/// The count of a page at an old revision follows the first later event of each key: a new key,
+/// a deleted key, a key deleted and created again, and a key created and deleted again. Only the
+/// named keys that the page holds read a version.
+#[tokio::test]
+async fn historical_counts_follow_the_first_later_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut model = Model::new();
+    let put = |key: &[u8], value: &str| {
+        Op::RequestPut(PutRequest {
+            key: key.to_vec(),
+            value: value.as_bytes().to_vec(),
+            ..Default::default()
+        })
+    };
+    let delete = |key: &[u8]| {
+        Op::RequestDeleteRange(DeleteRangeRequest {
+            key: key.to_vec(),
+            ..Default::default()
+        })
+    };
+    for key in [b"k1", b"k3", b"k5", b"k7"] {
+        apply(&mut state, put(key, "old")).await;
+    }
+    record(&state, &mut model).await;
+    let old = state.revision;
+    let later = [
+        put(b"k0", "new"), // created after `old`
+        delete(b"k1"),     // deleted after `old`
+        put(b"k2", "new"), // created, then deleted
+        delete(b"k2"),
+        delete(b"k3"), // deleted, then created again
+        put(b"k3", "again"),
+        put(b"k5", "update"), // updated twice
+        put(b"k5", "update2"),
+        delete(b"k7"),     // deleted after the page
+        put(b"k9", "new"), // created after the page
+    ];
+    for request in later {
+        apply(&mut state, request).await;
+        record(&state, &mut model).await;
+    }
+    for revision in old..=state.revision {
+        for limit in 1..=5 {
+            check_pages(&state, &model, revision, b"k", b"l", limit).await;
+        }
+    }
+    let request = RangeRequest {
+        limit: 2,
+        ..range(b"k", b"l", old)
+    };
+    let (reply, reads) = counted_read(&state, request).await;
+    assert_eq!((reply.count, reply.more), (4, true));
+    assert_eq!(
+        reply
+            .kvs
+            .iter()
+            .map(|kv| kv.key.as_slice())
+            .collect::<Vec<_>>(),
+        [b"k1", b"k3"]
+    );
+    assert!(reply.kvs.iter().all(|kv| kv.value == b"old"));
+    // The page holds two named keys and reads one more row to set `more`. The count reads none
+    // of the six named keys.
+    assert_eq!(reads, 3);
+    let request = RangeRequest {
+        count_only: true,
+        ..range(b"k", b"l", old)
+    };
+    let (reply, reads) = counted_read(&state, request).await;
+    assert_eq!((reply.count, reads), (4, 0));
+}
