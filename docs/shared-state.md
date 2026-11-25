@@ -703,12 +703,17 @@ backend whose calls hang forever with no error can keep old SlateDB workers, bec
 cannot end a pending put. Only a timeout at the object store call bounds them. S3 calls time out
 after 10 s.
 
-A clock over `--max-clock-skew` counts as a storage fault. Due storage work that makes no
-durable progress for 30 s also counts: a read of the bootstrap marker and claim, a writer open,
-a flush at its age limit, or a requested publication. Each durable step restarts the timer: an
-open, a flush, a checkpoint, its read back, and the bootstrap marker. A buffered write before
-its age limit is not due. A pending snapshot restore is not a fault, because each member meets
-it.
+A clock over `--max-clock-skew` counts as a storage fault at once. The task does not wait for
+the close of that writer either.
+
+Due storage work that makes no durable progress for 30 s also counts. Each step of the writer
+task has its own timer: the read of the bootstrap marker and claim, the open, the first reads
+of the publisher, a flush, a checkpoint, and its read back. A step that ends restarts the timer
+for the next one. A failure or a restart stops the timer until the next try starts its I/O, so
+a long backoff is no stall. Without a running step, the timer starts when a flush reaches its
+age limit, or when a manual checkpoint, a snapshot, or a Defragment requests a publication. A
+request waits until a publication serves it. A buffered write before its age limit is not due.
+A pending snapshot restore is not a fault, because each member meets it.
 
 The leader hands its lead to another voter after three faults in a row, after one data fault,
 or after 30 s without durable progress. The target is the voter with the longest matched log
@@ -720,8 +725,10 @@ A member sets its mark at each fault and clears it only when its own writer publ
 sends the age of the mark in each `ViewAck`. An earlier binary sends none and is never a target.
 A mark older than the leader's last publication is a last resort, because another writer
 published after it. The leader tries each voter once per incident, and only its own
-publication ends the incident. A handoff that does not end within two election timeouts is
-aborted, so Raft takes proposals again, and the leader tries the next voter.
+publication ends the incident. Raft ends a transfer that does not complete within an election
+timeout, and the handoff record ends with it. The leader then tries the next voter. If Raft
+still holds the handoff's own transfer after two election timeouts, the leader aborts it, so
+Raft takes proposals again. A MoveLeader transfer is never aborted.
 
 With no target left the leader keeps the lead. After a stall it drops the stalled step and
 opens the writer again, so the writer recovers within 30 s plus the backoff, also when the
