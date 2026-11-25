@@ -2,9 +2,17 @@
 //!
 //! A synced `LocalFileSystem` writes a whole SST to the page cache and then calls `fsync`. A
 //! 64 MiB L0 SST then reaches the disk in one burst, and Raft log syncs queue behind it. This
-//! store starts writeback one `PACE_BYTES` window at a time, as RocksDB `bytes_per_sync` does.
-//! A final sync, rename, and directory sync then publish the SST. Other objects, such as
-//! manifests, use the synced inner store and keep its conditional writes.
+//! store starts writeback one window at a time, as RocksDB `bytes_per_sync` does. A window is
+//! normally one SST block, because SlateDB passes each block as its own chunk. A Raft log sync
+//! then waits behind only a few blocks. A final sync, rename, and directory sync then publish the
+//! SST. Other objects, such as manifests, use the synced inner store and keep its conditional
+//! writes.
+//!
+//! Block-sized windows cost one disk round trip per block. After a bulk load, flushes and
+//! compaction then fell behind: unflushed memtables reached `max_unflushed_bytes`, and SlateDB
+//! held the apply pipeline for seconds. So while SlateDB reports unflushed memtable bytes of at
+//! least [`BACKLOG_PERCENT`] of that limit, each window fills `PACE_BYTES`. Raft log syncs then
+//! wait longer, but writers no longer wait for seconds of backpressure.
 //!
 //! SlateDB uploads a large SST as 10 MiB multipart parts, up to 8 at a time, and flushes and
 //! compactions run concurrently. Pacing each writer alone still left dozens of windows in
@@ -24,6 +32,7 @@ use std::io::ErrorKind;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path as FsPath, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use async_trait::async_trait;
@@ -34,9 +43,16 @@ use slatedb::object_store::*;
 
 use super::sst_reads::{self, SstReads};
 
+/// The largest window. Windows are this large only during a write backlog.
 const PACE_BYTES: u64 = 1024 * 1024;
-/// SST windows in writeback across the process. About 4 MiB in flight keeps a SATA SSD busy
-/// with SST data while a Raft log sync waits behind only a few milliseconds of it.
+/// Unflushed memtable bytes, in percent of `max_unflushed_bytes`, that start backlog windows.
+///
+/// A bulk load reached the limit within 5 s and then stalled apply for seconds. Short write
+/// bursts, such as 100,000 puts of 4 KiB values, came to about 70 % on a slow disk. Backlog
+/// windows during such a burst moved more SST writeback in front of Raft log syncs and cost
+/// 10-15 % throughput.
+pub(crate) const BACKLOG_PERCENT: usize = 85;
+/// SST windows in writeback across the process.
 const MAX_WINDOWS: usize = 4;
 /// Windows compaction output may hold. One keeps compaction moving while memtable flushes get
 /// the rest; with two, flush fell behind under 4 KiB-value writes and immutable memtables piled
@@ -60,6 +76,9 @@ pub(crate) struct PacedStore {
     inner: Arc<LocalFileSystem>,
     reads: Arc<SstReads>,
     lane: &'static Lane,
+    /// SlateDB of this store has a write backlog, so its windows fill `PACE_BYTES`. Each store
+    /// has its own flag: embedded members share the lane but not their memtables.
+    backlog: Arc<AtomicBool>,
 }
 
 impl PacedStore {
@@ -69,6 +88,7 @@ impl PacedStore {
             inner: Arc::new(inner),
             reads: Arc::default(),
             lane: &LANE,
+            backlog: Arc::default(),
         }
     }
 
@@ -200,6 +220,8 @@ struct LaneState {
     max_used: usize,
     #[cfg(test)]
     max_compaction: usize,
+    #[cfg(test)]
+    windows: usize,
 }
 
 static LANE: Lane = Lane::new();
@@ -216,6 +238,8 @@ impl Lane {
                 max_used: 0,
                 #[cfg(test)]
                 max_compaction: 0,
+                #[cfg(test)]
+                windows: 0,
             }),
             freed: Condvar::new(),
         }
@@ -223,31 +247,13 @@ impl Lane {
 
     fn acquire(&self, writer: Writer) -> Window<'_> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        match writer {
-            Writer::Flush => {
-                st.flush_waiting += 1;
-                while st.used >= MAX_WINDOWS {
-                    st = self.freed.wait(st).unwrap_or_else(|e| e.into_inner());
-                }
-                st.flush_waiting -= 1;
-            }
-            Writer::Compaction => {
-                while st.used >= MAX_WINDOWS
-                    || st.compaction >= st.compaction_windows()
-                    || st.flush_waiting > 0
-                {
-                    st = self.freed.wait(st).unwrap_or_else(|e| e.into_inner());
-                }
-                st.compaction += 1;
-            }
+        if writer == Writer::Flush {
+            st.flush_waiting += 1;
         }
-        st.used += 1;
-        #[cfg(test)]
-        {
-            st.max_used = st.max_used.max(st.used);
-            st.max_compaction = st.max_compaction.max(st.compaction);
+        while !st.admits(writer) {
+            st = self.freed.wait(st).unwrap_or_else(|e| e.into_inner());
         }
-        Window { lane: self, writer }
+        self.grant(st, writer)
     }
 
     /// [`Lane::acquire`] that gives up after `timeout`, so a test cannot hang on a wrong policy.
@@ -255,22 +261,39 @@ impl Lane {
     fn try_acquire(&self, writer: Writer, timeout: std::time::Duration) -> Option<Window<'_>> {
         let deadline = std::time::Instant::now() + timeout;
         let mut st = self.state.lock().unwrap();
-        loop {
-            let admitted = match writer {
-                Writer::Flush => st.used < MAX_WINDOWS,
-                Writer::Compaction => {
-                    st.used < MAX_WINDOWS
-                        && st.compaction < st.compaction_windows()
-                        && st.flush_waiting == 0
+        if writer == Writer::Flush {
+            st.flush_waiting += 1;
+        }
+        while !st.admits(writer) {
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                if writer == Writer::Flush {
+                    st.flush_waiting -= 1;
                 }
+                return None;
             };
-            if admitted {
-                drop(st);
-                return Some(self.acquire(writer));
-            }
-            let left = deadline.checked_duration_since(std::time::Instant::now())?;
             st = self.freed.wait_timeout(st, left).unwrap().0;
         }
+        Some(self.grant(st, writer))
+    }
+
+    /// Take a window that [`LaneState::admits`] allowed, under the same lock.
+    fn grant<'a>(
+        &'a self,
+        mut st: std::sync::MutexGuard<'_, LaneState>,
+        writer: Writer,
+    ) -> Window<'a> {
+        match writer {
+            Writer::Flush => st.flush_waiting -= 1,
+            Writer::Compaction => st.compaction += 1,
+        }
+        st.used += 1;
+        #[cfg(test)]
+        {
+            st.max_used = st.max_used.max(st.used);
+            st.max_compaction = st.max_compaction.max(st.compaction);
+            st.windows += 1;
+        }
+        Window { lane: self, writer }
     }
 
     /// Mark one SST of `writer` as being written until the guard drops.
@@ -283,6 +306,18 @@ impl Lane {
 }
 
 impl LaneState {
+    /// Whether `writer` may take a window now. A waiting flush counts itself in
+    /// `flush_waiting`, and compaction waits for every waiting flush.
+    fn admits(&self, writer: Writer) -> bool {
+        self.used < MAX_WINDOWS
+            && match writer {
+                Writer::Flush => true,
+                Writer::Compaction => {
+                    self.compaction < self.compaction_windows() && self.flush_waiting == 0
+                }
+            }
+    }
+
     fn compaction_windows(&self) -> usize {
         if self.flushes > 0 {
             MAX_COMPACTION_WINDOWS
@@ -340,9 +375,47 @@ impl Drop for Window<'_> {
     }
 }
 
-/// Write `data` at `offset`, one `PACE_BYTES` window in writeback at a time.
+/// The window in writeback of one writer.
+struct Pacer<'a> {
+    file: &'a File,
+    path: &'a FsPath,
+    lane: &'a Lane,
+    writer: Writer,
+    previous: Option<(u64, u64, Window<'a>)>,
+}
+
+impl<'a> Pacer<'a> {
+    /// Wait for the previous window, then start writeback of `len` bytes at `start`.
+    fn submit(&mut self, start: u64, len: u64) -> Result<()> {
+        self.wait()?;
+        let window = self.lane.acquire(self.writer);
+        sync_range(self.file, start, len, libc::SYNC_FILE_RANGE_WRITE)
+            .map_err(|e| io_error(e, self.path))?;
+        self.previous = Some((start, len, window));
+        Ok(())
+    }
+
+    /// Wait until the previous window is on the device, then release it.
+    fn wait(&mut self) -> Result<()> {
+        if let Some((start, size, _window)) = self.previous.take() {
+            sync_range(
+                self.file,
+                start,
+                size,
+                libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                    | libc::SYNC_FILE_RANGE_WRITE
+                    | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+            )
+            .map_err(|e| io_error(e, self.path))?;
+        }
+        Ok(())
+    }
+}
+
+/// Write `data` at `offset`, one window in writeback at a time.
 ///
-/// The next window is copied into the page cache while the previous one is on the device.
+/// A window ends with each chunk of `data`, or at `PACE_BYTES` during a write backlog. The next
+/// window is copied into the page cache while the previous one is on the device.
 fn write_paced(
     file: &File,
     mut offset: u64,
@@ -350,38 +423,34 @@ fn write_paced(
     path: &FsPath,
     lane: &Lane,
     writer: Writer,
+    backlog: &AtomicBool,
 ) -> Result<()> {
-    let mut previous: Option<(u64, u64, Window<'_>)> = None;
-    let wait = |previous: &mut Option<(u64, u64, Window<'_>)>| -> Result<()> {
-        if let Some((start, size, _window)) = previous.take() {
-            sync_range(
-                file,
-                start,
-                size,
-                libc::SYNC_FILE_RANGE_WAIT_BEFORE
-                    | libc::SYNC_FILE_RANGE_WRITE
-                    | libc::SYNC_FILE_RANGE_WAIT_AFTER,
-            )
-            .map_err(|e| io_error(e, path))?;
-        }
-        Ok(())
+    let mut pacer = Pacer {
+        file,
+        path,
+        lane,
+        writer,
+        previous: None,
     };
+    let mut start = offset;
     for chunk in data.iter() {
         let mut chunk = chunk.as_ref();
         while !chunk.is_empty() {
-            let len = chunk.len().min(PACE_BYTES as usize);
+            let len = chunk.len().min((PACE_BYTES - (offset - start)) as usize);
             file.write_all_at(&chunk[..len], offset)
                 .map_err(|e| io_error(e, path))?;
-            wait(&mut previous)?;
-            let window = lane.acquire(writer);
-            sync_range(file, offset, len as u64, libc::SYNC_FILE_RANGE_WRITE)
-                .map_err(|e| io_error(e, path))?;
-            previous = Some((offset, len as u64, window));
             offset += len as u64;
             chunk = &chunk[len..];
+            if offset - start == PACE_BYTES || !backlog.load(Ordering::Relaxed) {
+                pacer.submit(start, offset - start)?;
+                start = offset;
+            }
         }
     }
-    wait(&mut previous)
+    if offset > start {
+        pacer.submit(start, offset - start)?;
+    }
+    pacer.wait()
 }
 
 /// Sync the staged file, then atomically publish it and sync its directory.
@@ -477,12 +546,12 @@ impl PacedStore {
         }
         let dest = self.inner.path_to_filesystem(location)?;
         let writer = Writer::of(&opts.extensions);
-        let lane = self.lane;
+        let (lane, backlog) = (self.lane, self.backlog.clone());
         let active = lane.start(writer);
         tokio::task::spawn_blocking(move || {
             let _active = active;
             let (file, staged) = stage(&dest)?;
-            let result = write_paced(&file, 0, &payload, &staged, lane, writer)
+            let result = write_paced(&file, 0, &payload, &staged, lane, writer, &backlog)
                 .and_then(|_| publish(file, &staged, &dest));
             if result.is_err() {
                 let _ = std::fs::remove_file(&staged);
@@ -513,6 +582,7 @@ impl PacedStore {
         Ok(Box::new(PacedUpload {
             active: Some(Arc::new(self.lane.start(writer))),
             lane: self.lane,
+            backlog: self.backlog.clone(),
             store: self.inner.clone(),
             reads: self.reads.clone(),
             location: location.clone(),
@@ -531,6 +601,7 @@ struct PacedUpload {
     /// write exits. A cancelled part's write keeps running after its task is gone.
     active: Option<Arc<Active<'static>>>,
     lane: &'static Lane,
+    backlog: Arc<AtomicBool>,
     store: Arc<LocalFileSystem>,
     reads: Arc<SstReads>,
     location: Path,
@@ -562,13 +633,13 @@ impl MultipartUpload for PacedUpload {
         self.offset += data.content_length() as u64;
         let file = self.file();
         let staged = self.staged.clone();
-        let (lane, writer) = (self.lane, self.writer);
+        let (lane, writer, backlog) = (self.lane, self.writer, self.backlog.clone());
         let active = self.active.clone();
         Box::pin(async move {
             let file = file?;
             tokio::task::spawn_blocking(move || {
                 let _active = active;
-                write_paced(&file, offset, &data, &staged, lane, writer)
+                write_paced(&file, offset, &data, &staged, lane, writer, &backlog)
             })
             .await
             .map_err(join_error)?
@@ -612,6 +683,86 @@ impl MultipartUpload for PacedUpload {
         })
         .await
         .map_err(join_error)?
+    }
+}
+
+impl PacedStore {
+    /// A SlateDB metrics recorder that turns backlog windows of this store on and off.
+    ///
+    /// SlateDB sets its unflushed memtable gauge before each write. The recorder compares it
+    /// with [`BACKLOG_PERCENT`] of `max_unflushed_bytes`. It drops every other metric.
+    pub(crate) fn backlog_recorder(
+        &self,
+        max_unflushed_bytes: usize,
+    ) -> Arc<dyn slatedb_common::metrics::MetricsRecorder> {
+        Arc::new(BacklogRecorder {
+            gauge: Arc::new(UnflushedGauge {
+                backlog: self.backlog.clone(),
+                threshold: (max_unflushed_bytes / 100 * BACKLOG_PERCENT) as i64,
+            }),
+            noop: slatedb_common::metrics::NoopMetricsRecorder::new(),
+        })
+    }
+}
+
+struct BacklogRecorder {
+    gauge: Arc<UnflushedGauge>,
+    noop: slatedb_common::metrics::NoopMetricsRecorder,
+}
+
+struct UnflushedGauge {
+    backlog: Arc<AtomicBool>,
+    threshold: i64,
+}
+
+impl slatedb_common::metrics::GaugeFn for UnflushedGauge {
+    fn set(&self, value: i64) {
+        self.backlog
+            .store(value >= self.threshold, Ordering::Relaxed);
+    }
+}
+
+impl slatedb_common::metrics::MetricsRecorder for BacklogRecorder {
+    fn register_counter(
+        &self,
+        name: &str,
+        description: &str,
+        labels: &[(&str, &str)],
+    ) -> Arc<dyn slatedb_common::metrics::CounterFn> {
+        self.noop.register_counter(name, description, labels)
+    }
+
+    fn register_gauge(
+        &self,
+        name: &str,
+        description: &str,
+        labels: &[(&str, &str)],
+    ) -> Arc<dyn slatedb_common::metrics::GaugeFn> {
+        if name == slatedb::db_stats::TOTAL_MEM_SIZE_BYTES {
+            return self.gauge.clone();
+        }
+        self.noop.register_gauge(name, description, labels)
+    }
+
+    fn register_up_down_counter(
+        &self,
+        name: &str,
+        description: &str,
+        labels: &[(&str, &str)],
+    ) -> Arc<dyn slatedb_common::metrics::UpDownCounterFn> {
+        self.noop
+            .register_up_down_counter(name, description, labels)
+    }
+
+    fn register_histogram(
+        &self,
+        name: &str,
+        description: &str,
+        labels: &[(&str, &str)],
+        boundaries: &[f64],
+    ) -> Arc<dyn slatedb_common::metrics::HistogramFn> {
+        self.noop
+            .register_histogram(name, description, labels, boundaries)
     }
 }
 
@@ -1018,6 +1169,114 @@ mod tests {
             (0, 0, 0, 0)
         );
         assert_eq!(st.max_compaction, MAX_IDLE_COMPACTION_WINDOWS);
+    }
+
+    /// Windows end with each chunk, so a Raft log sync waits behind a few SST blocks. During a
+    /// write backlog they fill `PACE_BYTES`, across chunk and part boundaries.
+    #[tokio::test]
+    async fn backlog_windows_fill_pace_bytes() {
+        use slatedb_common::metrics::MetricsRecorder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lane: &'static Lane = Box::leak(Box::new(Lane::new()));
+        let store =
+            PacedStore::with_lane(LocalFileSystem::new_with_prefix(dir.path()).unwrap(), lane);
+        let block = 4096;
+        let data: Vec<u8> = (0..(5 * PACE_BYTES / 2) as usize)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let payload = || {
+            data.chunks(block)
+                .map(bytes::Bytes::copy_from_slice)
+                .collect::<PutPayload>()
+        };
+        let windows = |lane: &Lane| std::mem::take(&mut lane.state.lock().unwrap().windows);
+
+        let path = Path::from("state/compacted/a.sst");
+        store.put(&path, payload()).await.unwrap();
+        assert_eq!(windows(lane), data.len().div_ceil(block));
+
+        // SlateDB reports its unflushed bytes through the recorder.
+        let recorder = BacklogRecorder {
+            gauge: Arc::new(UnflushedGauge {
+                backlog: store.backlog.clone(),
+                threshold: 100,
+            }),
+            noop: slatedb_common::metrics::NoopMetricsRecorder::new(),
+        };
+        let gauge = recorder.register_gauge(slatedb::db_stats::TOTAL_MEM_SIZE_BYTES, "", &[]);
+        gauge.set(99);
+        assert!(!store.backlog.load(Ordering::Relaxed));
+        gauge.set(100);
+        assert!(store.backlog.load(Ordering::Relaxed));
+
+        store.put(&path, payload()).await.unwrap();
+        assert_eq!(windows(lane), 3);
+        assert_eq!(store.get(&path).await.unwrap().bytes().await.unwrap(), data);
+
+        // Each multipart part paces its own range. Parts hold block-sized chunks and end off a
+        // block boundary, as SlateDB parts do.
+        let (first, second) = data.split_at(PACE_BYTES as usize + 7);
+        let multipart = || async {
+            let mut upload = store.put_multipart(&path).await.unwrap();
+            for part in [first, second] {
+                let part: PutPayload = part
+                    .chunks(block)
+                    .map(bytes::Bytes::copy_from_slice)
+                    .collect();
+                upload.put_part(part).await.unwrap();
+            }
+            upload.complete().await.unwrap();
+            assert_eq!(store.get(&path).await.unwrap().bytes().await.unwrap(), data);
+        };
+        multipart().await;
+        assert_eq!(windows(lane), 2 + 2);
+
+        gauge.set(0);
+        store.put(&path, payload()).await.unwrap();
+        assert_eq!(windows(lane), data.len().div_ceil(block));
+        multipart().await;
+        assert_eq!(
+            windows(lane),
+            first.len().div_ceil(block) + second.len().div_ceil(block)
+        );
+    }
+
+    /// Embedded members share one process and the lane. A small write on member B must not
+    /// turn off the backlog windows of member A while A waits for its flush.
+    #[tokio::test]
+    async fn backlog_of_one_store_survives_another_stores_gauge() {
+        let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let lane: &'static Lane = Box::leak(Box::new(Lane::new()));
+        let store = |dir: &tempfile::TempDir| {
+            PacedStore::with_lane(LocalFileSystem::new_with_prefix(dir.path()).unwrap(), lane)
+        };
+        let (a, b) = (store(&dir_a), store(&dir_b));
+        let max = 100 << 20;
+        let gauge = |store: &PacedStore| {
+            store.backlog_recorder(max).register_gauge(
+                slatedb::db_stats::TOTAL_MEM_SIZE_BYTES,
+                "",
+                &[],
+            )
+        };
+        gauge(&a).set(max as i64 / 100 * 90);
+        gauge(&b).set(max as i64 / 100 * 10);
+        let data = vec![3_u8; PACE_BYTES as usize];
+        let payload = || -> PutPayload {
+            data.chunks(4096)
+                .map(bytes::Bytes::copy_from_slice)
+                .collect()
+        };
+        a.put(&Path::from("state/compacted/a.sst"), payload())
+            .await
+            .unwrap();
+        assert_eq!(std::mem::take(&mut lane.state.lock().unwrap().windows), 1);
+        // B still writes one block per window.
+        b.put(&Path::from("state/compacted/b.sst"), payload())
+            .await
+            .unwrap();
+        assert_eq!(lane.state.lock().unwrap().windows, data.len() / 4096);
     }
 
     #[test]

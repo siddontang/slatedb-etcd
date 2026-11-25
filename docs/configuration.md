@@ -114,6 +114,11 @@ These flags do not bound process RSS, SlateDB, state scans, or snapshot buffers.
 A memtable flush caches the SST index, filters, and current-row blocks; reads cache the rest.
 Compaction reads ahead 2 x 512 KiB per input SST. Each compaction job runs at most two
 subcompactions, because each one buffers SST data until the disk takes it.
+On Linux, SST writes of replicated state on local storage start disk writeback one SST block at
+a time, so Raft log syncs wait behind only a few blocks. Shared state mode and S3 do not pace SST
+writes. While SlateDB's latest write-side sample of unflushed memtable bytes is at least 85 % of
+its `max_unflushed_bytes`, writeback of that member starts 1 MiB at a time, so flushes and
+compaction catch up. A background flush alone does not update the sample.
 On Linux, jemalloc background threads return freed pages to the OS after 200 ms.
 `_RJEM_MALLOC_CONF` overrides that default.
 A negative quota value disables the quota. The quota is cluster state, so a flag change takes
