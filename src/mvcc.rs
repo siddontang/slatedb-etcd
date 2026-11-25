@@ -366,18 +366,40 @@ struct JournalKeys {
     events: Vec<EventKey>,
 }
 
-// The key of a `mvccpb.Event`.
+// The type and key of a `mvccpb.Event`.
 #[derive(prost::Message)]
 struct EventKey {
+    #[prost(int32, tag = "1")]
+    r#type: i32,
     #[prost(message, optional, tag = "2")]
     kv: Option<KeyOnly>,
 }
 
-// The key of a `mvccpb.KeyValue`.
+// The key and revisions of a `mvccpb.KeyValue`.
 #[derive(prost::Message)]
 struct KeyOnly {
     #[prost(bytes = "vec", tag = "1")]
     key: Vec<u8>,
+    #[prost(int64, tag = "2")]
+    create_revision: i64,
+    #[prost(int64, tag = "3")]
+    mod_revision: i64,
+}
+
+impl KeyOnly {
+    /// Whether the key was live just before an event of `kind` wrote this row. A delete removes
+    /// a live key. A put of a live key keeps its create revision, and a new key starts at its own.
+    fn live_before(&self, kind: i32) -> bool {
+        kind == crate::proto::mvccpb::event::EventType::Delete as i32
+            || self.create_revision < self.mod_revision
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Versions that journal pages read on this thread.
+    pub(crate) static JOURNAL_VERSION_READS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 impl<R: StateRead> View<'_, R> {
@@ -609,8 +631,10 @@ impl<R: StateRead> View<'_, R> {
     ///
     /// A key that no journal event after `revision` names has the same row now as at `revision`.
     /// The result merges those current rows with the versions at `revision` of the named keys.
-    /// The count is the current count plus a correction for each named key. The cost is about
-    /// `keep` current rows plus the journal after `revision`. It does not depend on older history.
+    /// The count is the current count plus a correction for each named key. The first event of a
+    /// key after `revision` shows whether the key was live at `revision`, so the count reads no
+    /// history. Only named keys that the result holds read their version. The cost is about
+    /// `keep` rows plus the journal after `revision`. It does not depend on older history.
     ///
     /// Journal rows share the batch of their revision, and compaction keeps those after its
     /// boundary. `None` means that the view has no key order or that the journal costs more
@@ -630,11 +654,12 @@ impl<R: StateRead> View<'_, R> {
             return Ok(Some((vec![], 0)));
         }
         let mut count = keys.count(key, end);
-        // Each named key costs one descending scan. Reading the history rows costs about one
-        // seek per key in the interval.
+        // Each later event costs one key decode. Reading the history rows costs about one seek
+        // per key in the interval.
         let budget = usize::try_from(count).unwrap_or(0).max(1024);
         let mut events = 0;
-        let mut named = BTreeSet::new();
+        // Each key that an event after `revision` names, and whether it was live at `revision`.
+        let mut named = BTreeMap::<Vec<u8>, bool>::new();
         if revision < self.revision {
             let mut scan = db
                 .scan_range(
@@ -651,52 +676,62 @@ impl<R: StateRead> View<'_, R> {
                     return Ok(None);
                 }
                 for event in journal.events {
-                    if let Some(kv) = event.kv.filter(|kv| contains(&kv.key, key, end)) {
-                        named.insert(kv.key);
-                    }
+                    let Some(kv) = event.kv.filter(|kv| contains(&kv.key, key, end)) else {
+                        continue;
+                    };
+                    // The state before the first later event of a key is its state at `revision`.
+                    let live = kv.live_before(event.r#type);
+                    named.entry(kv.key).or_insert(live);
                 }
             }
         }
-        // Only the first `keep` older versions in key order can enter the page.
-        let mut older = Vec::new();
-        for named in &named {
+        for (named, &then) in &named {
             let live_now = keys.count(named, &[named.as_slice(), &[0]].concat()) == 1;
-            let then = self
-                .version_at(named, revision)
-                .await?
-                .and_then(|version| version.value);
-            count += i64::from(then.is_some()) - i64::from(live_now);
-            if older.len() < keep {
-                older.extend(then);
-            }
+            count += i64::from(then) - i64::from(live_now);
         }
-        let changed = named;
         let mut rows = Vec::new();
         if keep == 0 {
             return Ok(Some((rows, count)));
         }
-        let mut older = older.iter().peekable();
+        // Collect first: an iterator adapter held across an await fails the `Send` bound.
+        let live: Vec<&[u8]> = named
+            .iter()
+            .filter(|(_, live)| **live)
+            .map(|(key, _)| key.as_slice())
+            .collect();
+        let mut older = live.into_iter().peekable();
         let mut scan = self.db.scan(bounds).await.map_err(KvError::storage)?;
         let mut current = None;
         while rows.len() < keep {
             if current.is_none() {
                 while let Some(row) = scan.next().await.map_err(KvError::storage)? {
                     let kv = KeyValue::decode(row.value).map_err(KvError::storage)?;
-                    if !changed.contains(&kv.key) {
+                    if !named.contains_key(&kv.key) {
                         current = Some(kv);
                         break;
                     }
                 }
             }
             let take_older = match (&current, older.peek()) {
-                (Some(now), Some(then)) => then.key < now.key,
+                (Some(now), Some(then)) => *then < now.key.as_slice(),
                 (None, Some(_)) => true,
                 (_, None) => false,
             };
             match (take_older, current.take()) {
                 (true, now) => {
                     current = now;
-                    rows.push(older.next().unwrap().clone());
+                    let named = older.next().unwrap();
+                    #[cfg(test)]
+                    JOURNAL_VERSION_READS.set(JOURNAL_VERSION_READS.get() + 1);
+                    // The journal shows the key live at `revision`, so a version holds its row.
+                    let then = self
+                        .version_at(named, revision)
+                        .await?
+                        .and_then(|version| version.value)
+                        .ok_or_else(|| {
+                            KvError::storage("history has no live version that the journal names")
+                        })?;
+                    rows.push(then);
                 }
                 (false, Some(now)) => rows.push(now),
                 (false, None) => break,
