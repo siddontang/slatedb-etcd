@@ -37,6 +37,8 @@ struct Inner {
     publish_through: Option<u64>,
     /// Publish a new checkpoint even at an unchanged sequence. Defragment sets this.
     republish: bool,
+    /// The time of the oldest request or republish that no publication served yet.
+    requested: Option<Instant>,
 }
 
 impl Progress {
@@ -75,7 +77,10 @@ impl Progress {
 
     /// Publish a new checkpoint at the current sequence, for a changed layout.
     fn republish(&self) {
-        self.inner.lock().unwrap().republish = true;
+        let mut inner = self.inner.lock().unwrap();
+        inner.republish = true;
+        inner.requested.get_or_insert_with(Instant::now);
+        drop(inner);
         self.wake.notify_one();
     }
 
@@ -89,8 +94,29 @@ impl Progress {
             .publish_through
             .map_or(through, |old| old.max(through));
         inner.publish_through = Some(through);
+        inner.requested.get_or_insert_with(Instant::now);
         drop(inner);
         self.wake.notify_one();
+    }
+
+    /// The time of the oldest request that no publication served yet.
+    fn requested(&self) -> Option<Instant> {
+        self.inner.lock().unwrap().requested
+    }
+
+    /// A publication served the requests that a pass took. A request that came later waits
+    /// from now.
+    fn served(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        let pending = inner.publish_through.is_some() || inner.republish;
+        inner.requested = pending.then(Instant::now);
+    }
+
+    /// A new term starts the wait of the requests that an earlier term left.
+    fn rearm(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        let pending = inner.publish_through.is_some() || inner.republish;
+        inner.requested = pending.then(Instant::now);
     }
 
     /// Wait until the shared `Db` holds every batch through `seq`.
@@ -138,6 +164,7 @@ impl Demand<'_> {
     fn served(mut self) {
         self.through = None;
         self.republish = false;
+        self.progress.served();
     }
 }
 
@@ -380,6 +407,7 @@ impl Writer {
         self.term = term;
         let health = self.health.begin();
         self.handoff.lead(true);
+        self.progress.rearm();
         let (stop, stopped) = tokio::sync::watch::channel(false);
         self.stop = Some(stop);
         let task = lead(
@@ -415,20 +443,18 @@ impl Writer {
             stop.send_replace(true);
         }
         // A clean stop closes the writer. A stuck close must not hold the shutdown, also not
-        // the close of a failed writer.
-        let mut failed = self.health.take_close();
-        let closing = async {
-            while self.tasks.join_next().await.is_some() {}
-            if let Some(failed) = &mut failed {
-                let _ = failed.await;
-            }
-        };
-        if tokio::time::timeout(Duration::from_secs(5), closing)
-            .await
-            .is_err()
-        {
+        // the close of a failed writer. One deadline covers both.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let joined = async { while self.tasks.join_next().await.is_some() {} };
+        if tokio::time::timeout_at(deadline, joined).await.is_err() {
             self.tasks.shutdown().await;
-            if let Some(failed) = failed {
+        }
+        // A task can abandon a failed writer until it ends, so the close comes after the join.
+        if let Some(mut failed) = self.health.take_close() {
+            if tokio::time::timeout_at(deadline, &mut failed)
+                .await
+                .is_err()
+            {
                 failed.abort();
             }
         }
@@ -696,7 +722,8 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         health.due();
         let checked = attempt(bootstrap_wait(&publisher.source), &mut stopped, &mut health);
         match checked.await {
-            Attempt::Done(Ok(None)) => {}
+            // The open is a new step with its own timer.
+            Attempt::Done(Ok(None)) => health.progressed(),
             Attempt::Done(Ok(Some(wait))) => {
                 health.done();
                 tracing::warn!(reason = %wait, "the shared writer waits for the bootstrap");
@@ -715,7 +742,11 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         }
         let opened = attempt(publisher.source.open_writer(), &mut stopped, &mut health);
         let db = match opened.await {
-            Attempt::Done(Ok(db)) => Arc::new(db),
+            Attempt::Done(Ok(db)) => {
+                // The open wrote the manifest. The next step has its own timer.
+                health.progressed();
+                Arc::new(db)
+            }
             // A newer open fenced this one while the member still leads the same term.
             // Two opens can also race for the same manifest version. The open that loses must
             // read the new manifest and try again.
@@ -758,11 +789,12 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
             }
         };
         if !passed {
-            close(db).await;
+            // The fault counts at once. The close of this writer can wait on its I/O.
             delay = health.failed(
                 fault::Fault::Clock,
                 "the local clock is behind the shared writer clock",
             );
+            health.abandon(db);
             continue;
         }
         health.opened();

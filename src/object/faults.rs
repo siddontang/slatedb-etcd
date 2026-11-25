@@ -45,6 +45,10 @@ pub(crate) const FAIL_STATE_PUT: u8 = 11;
 pub(crate) const CORRUPT_MANIFEST: u8 = 12;
 /// Hold every read of the bootstrap marker and claim until the mode changes.
 pub(crate) const STALL_BOOTSTRAP_READ: u8 = 13;
+/// Hold every read of a manifest of the shared database until the mode changes.
+pub(crate) const STALL_MANIFEST_READ: u8 = 14;
+/// Hold the next read of a manifest of the shared database until `release`.
+pub(crate) const PAUSE_MANIFEST_READ: u8 = 15;
 /// Report the next two SST reads as missing. A failed cache load in SlateDB falls back to one
 /// direct read, so only this mode fails a read that goes through the block cache.
 pub(crate) const LOSE_SST_TWICE: u8 = 10;
@@ -170,6 +174,18 @@ impl ObjectStore for FaultStore {
         self.read.lock().unwrap().insert(path.to_string());
         if path.as_ref().contains("shared/bootstrap") {
             self.hold(STALL_BOOTSTRAP_READ).await;
+        }
+        if state(path) && path.as_ref().ends_with(".manifest") {
+            self.hold(STALL_MANIFEST_READ).await;
+            let pause = Ordering::SeqCst;
+            if self
+                .mode
+                .compare_exchange(PAUSE_MANIFEST_READ, 0, pause, pause)
+                .is_ok()
+            {
+                self.entered.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+            }
         }
         let mode = self.mode.load(Ordering::SeqCst);
         if (mode == LOSE_SST_ONCE || mode == LOSE_SST_TWICE) && path.as_ref().ends_with(".sst") {

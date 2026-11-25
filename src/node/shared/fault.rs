@@ -196,7 +196,7 @@ impl Default for Health {
 struct Record {
     /// The writer task that may change this record. A start or a stop of a task changes it.
     generation: u64,
-    /// Failures since the writer last ran for `HEALTHY_RUN`.
+    /// Failures since the last publication of this member's writer.
     consecutive: u32,
     /// The first failure of those.
     since: Option<Instant>,
@@ -226,9 +226,12 @@ impl Record {
     }
 
     /// Count a failure and return the wait before the next try. Only a publication starts a
-    /// new count: a writer that opens and then fails each flush is still down.
+    /// new count: a writer that opens and then fails each flush is still down. The failed step
+    /// ended, so the watchdog stops until the next try starts its I/O. A wait that is longer
+    /// than `STALL` is thus no stall.
     fn fail(&mut self, fault: Fault) -> Duration {
         self.running = None;
+        self.done();
         self.consecutive += 1;
         self.since.get_or_insert_with(Instant::now);
         let (first, cap) = match fault {
@@ -277,12 +280,13 @@ impl Health {
 
     /// Return true when due work just passed `STALL`.
     ///
-    /// `overdue` is the time when the oldest unflushed write of the open writer reached its age
-    /// limit. It covers a publisher that waits elsewhere and has not started the flush.
-    pub(super) fn check(&self, overdue: Option<Instant>) -> bool {
+    /// A running step of the writer task has its own timer, which each durable step restarts.
+    /// Only without one, `waiting` counts: the time since work that the publisher has not
+    /// started became due. See `Writer::waiting`.
+    pub(super) fn check(&self, waiting: Option<Instant>) -> bool {
         let mut record = self.record();
-        let overdue = overdue.filter(|at| *at <= Instant::now());
-        let Some(due) = record.due.into_iter().chain(overdue).min() else {
+        let waiting = waiting.filter(|at| *at <= Instant::now());
+        let Some(due) = record.due.or(waiting) else {
             return false;
         };
         if record.stalled.is_some() || due.elapsed() < STALL {
@@ -433,14 +437,9 @@ impl TaskHealth {
     }
 
     /// The node dropped a stalled attempt. The stall is already a fault. Return the wait
-    /// before the next open. The due work stays, so the watchdog watches the next attempt.
+    /// before the next open. The watchdog starts again with the I/O of the next attempt.
     pub(super) fn restarted(&self) -> Duration {
-        let delay = self.update(|record| {
-            let delay = record.fail(Fault::Stalled);
-            record.due = Some(Instant::now());
-            record.stalled = None;
-            delay
-        });
+        let delay = self.update(|record| record.fail(Fault::Stalled));
         tracing::warn!(
             ?delay,
             "drop the stalled shared writer attempt and open it again"
@@ -601,6 +600,8 @@ pub(super) struct Tick<'a> {
     /// The start of the incident. Only a report from after it counts.
     pub incident: Option<Instant>,
     pub term: u64,
+    /// The targets of MoveLeader requests in flight. The handoff never aborts their transfer.
+    pub moves: &'a [u64],
 }
 
 /// What the node does after a tick of a writer fault handoff.
@@ -689,9 +690,9 @@ impl Handoff {
     /// Decide the handoff of one tick on the leader.
     ///
     /// Only a publication of this member's writer ends an incident, so a writer that opens and
-    /// fails again does not try a voter twice. A transfer that does not complete within
-    /// `tick.wait` is aborted, so Raft takes proposals again. With no target left, a stalled
-    /// writer drops its attempt and opens again.
+    /// fails again does not try a voter twice. The handoff aborts only its own transfer that
+    /// Raft still holds after `tick.wait`, so Raft takes proposals again. With no target left,
+    /// a stalled writer drops its attempt and opens again.
     pub(super) fn step(&mut self, tick: &Tick) -> Decision {
         let mut decision = Decision::default();
         if self.published != tick.published {
@@ -699,13 +700,18 @@ impl Handoff {
             self.tried.clear();
             self.exhausted = false;
         }
+        // Raft ends a transfer that does not complete within an election timeout. The record
+        // follows Raft, so a later transfer to the same voter is not this one.
         if let Some((target, started)) = self.pending {
-            if started.elapsed() < tick.wait {
+            if tick.transferee != Some(target) || tick.moves.contains(&target) {
+                self.pending = None;
+            } else if started.elapsed() < tick.wait {
                 return decision;
+            } else {
+                tracing::warn!(target, "the writer handoff did not complete");
+                decision.abort = true;
+                self.pending = None;
             }
-            tracing::warn!(target, "the writer handoff did not complete");
-            decision.abort = tick.transferee == Some(target);
-            self.pending = None;
         }
         if !tick.due {
             return decision;
@@ -760,6 +766,19 @@ fn rank(
         .map(|candidate| candidate.id)
 }
 
+impl Writer {
+    /// The time since work that the publisher has not started became due: the oldest unflushed
+    /// write at its age limit, or an explicit publication request. A writer that is not open
+    /// holds the progress of an earlier one, so only an open writer counts.
+    pub(super) fn waiting(&self) -> Option<Instant> {
+        if self.open.lock().unwrap().is_none() {
+            return None;
+        }
+        let aged = self.progress.deadline(self.max_age);
+        aged.into_iter().chain(self.progress.requested()).min()
+    }
+}
+
 impl Node {
     /// The voters other than this member, with their matched log and transport process.
     pub(in crate::node) fn handoff_candidates(&self) -> Vec<Candidate> {
@@ -800,16 +819,13 @@ impl Node {
         };
         let wait = TICK * HANDOFF_TIMEOUTS * self.raw.raft.election_timeout() as u32;
         let (term, transferee) = (self.raw.raft.term, self.raw.raft.lead_transferee);
+        let mut moves: Vec<u64> = self.transfers.iter().map(|(target, ..)| *target).collect();
         let Some(writer) = &mut self.writer else {
             return;
         };
-        // A writer that is not open holds the progress of an earlier one.
-        let open = writer.open.lock().unwrap().is_some();
-        let overdue = open
-            .then(|| writer.progress.deadline(writer.max_age))
-            .flatten();
+        moves.extend(writer.transfer.map(|(target, _)| target));
         if leader {
-            writer.health.check(overdue);
+            writer.health.check(writer.waiting());
         }
         if let Some(gauges) = &writer.gauges {
             let health = &writer.health;
@@ -836,6 +852,7 @@ impl Node {
             published: health.published_at(),
             incident: health.incident(),
             term,
+            moves: &moves,
         });
         if decision.restart {
             health.restart();

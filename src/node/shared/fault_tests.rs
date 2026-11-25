@@ -4,8 +4,8 @@
 use super::super::tests::{eventually, status};
 use super::*;
 use crate::object::faults::{
-    FaultStore, CORRUPT_MANIFEST, FAIL_PUT, FAIL_STATE_PUT, PAUSE_PUT, STALL_BOOTSTRAP_READ,
-    STALL_STATE_PUT,
+    FaultStore, CORRUPT_MANIFEST, FAIL_PUT, FAIL_STATE_PUT, PAUSE_MANIFEST_READ, PAUSE_PUT,
+    STALL_BOOTSTRAP_READ, STALL_MANIFEST_READ, STALL_STATE_PUT,
 };
 use crate::proto::etcdserverpb::{
     kv_client::KvClient, maintenance_client::MaintenanceClient, MoveLeaderRequest, PutRequest,
@@ -131,6 +131,42 @@ fn each_durable_step_restarts_the_watchdog() {
     assert!(health.check(None));
 }
 
+/// Round 2, item 1: a running step has its own timer. A later batch that ages past `STALL`
+/// does not make a stall while the step is within its timer.
+#[test]
+fn a_running_step_keeps_its_own_timer() {
+    let health = Health::default();
+    let task = health.begin();
+    task.due();
+    health.record().due = Some(Instant::now() - Duration::from_secs(10));
+    let aged = Some(Instant::now() - STALL - Duration::from_secs(1));
+    assert!(!health.check(aged));
+    // With no step running, the aged batch counts.
+    task.done();
+    assert!(health.check(aged));
+}
+
+/// Round 2, item 2: a failure ends the step. The long wait after a data fault is no stall, and
+/// the timer starts again with the I/O of the next try. A restart works the same way.
+#[test]
+fn a_retry_wait_is_no_stall() {
+    let health = Health::default();
+    let task = health.begin();
+    task.due();
+    let delay = task.failed(Fault::Data, "bad manifest");
+    assert!(delay >= STALL);
+    assert!(health.record().due.is_none());
+    assert!(!health.check(None));
+    assert_eq!(health.status()["last_error_class"], "data");
+    task.due();
+    assert!(health.record().due.is_some());
+    // A restart after a stall also clears the stall, so the node stops asking for restarts.
+    health.record().due = Some(Instant::now() - STALL - Duration::from_secs(1));
+    assert!(health.check(None));
+    task.restarted();
+    assert!(health.record().due.is_none() && !health.stalled());
+}
+
 /// A task of an earlier term changes nothing, also with a late error.
 #[test]
 fn a_late_result_of_an_earlier_term_changes_nothing() {
@@ -179,7 +215,42 @@ fn tick<'a>(candidates: &'a [Candidate], published: Option<Instant>) -> Tick<'a>
         published,
         incident: None,
         term: 7,
+        moves: &[],
     }
+}
+
+/// Round 2, item 5: Raft ends a transfer after one election timeout. The handoff record ends
+/// with it, so a MoveLeader to the same voter that starts later is not aborted.
+#[test]
+fn a_handoff_never_aborts_a_later_move_leader() {
+    let now = Instant::now();
+    let mut handoff = Handoff {
+        led: Some(now - Duration::from_secs(60)),
+        ..Default::default()
+    };
+    let candidates = [candidate(3, 30, Some(3))];
+    handoff.reports.insert(3, received(3, now, None));
+    let started = handoff.step(&tick(&candidates, None));
+    assert_eq!(started.transfer, Some(3));
+    // Raft timed the transfer out.
+    let idle = Tick {
+        due: false,
+        ..tick(&candidates, None)
+    };
+    assert_eq!(handoff.step(&idle), Decision::default());
+    assert!(handoff.pending.is_none());
+    // A MoveLeader to the same voter, after the handoff's own wait.
+    let moving = Tick {
+        due: false,
+        transferee: Some(3),
+        moves: &[3],
+        ..tick(&candidates, None)
+    };
+    assert_eq!(handoff.step(&moving), Decision::default());
+    // Also a MoveLeader that starts while the handoff record still holds the voter.
+    handoff.pending = Some((3, now - Duration::from_secs(3)));
+    assert_eq!(handoff.step(&moving), Decision::default());
+    assert!(handoff.pending.is_none());
 }
 
 /// Only a current report from this term without a mark makes a target. A mark does not
@@ -525,6 +596,129 @@ async fn a_hung_bootstrap_read_starts_the_watchdog_and_ends_at_a_step_down() {
     leader.close().await;
 }
 
+/// Round 2, item 3: the bootstrap read, the open, and the first reads of the publisher are
+/// steps, each with its own timer. Two slow steps in a row are no stall.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_writer_start_step_has_its_own_timer() {
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let mut leader = Leader::open(faults.clone(), Duration::from_millis(100), clock()).await;
+    faults.set(STALL_BOOTSTRAP_READ);
+    leader.lead(2);
+    let health = leader.writer().health.clone();
+    eventually("the bootstrap step", async || health.record().due.is_some()).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // The bootstrap read ends. The open of the shared database hangs instead.
+    let opening = Instant::now();
+    faults.set(STALL_STATE_PUT);
+    eventually("the open step", async || {
+        health.record().due.is_some_and(|due| due >= opening)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // The open ends. The first read of the publisher hangs instead.
+    let reading = Instant::now();
+    faults.set(STALL_BOOTSTRAP_READ);
+    let open = leader.writer().open.clone();
+    eventually("the writer open", async || open.lock().unwrap().is_some()).await;
+    let due = health.record().due.unwrap();
+    assert!(
+        due >= reading,
+        "the publisher reads inherit an earlier timer"
+    );
+    faults.set(0);
+    leader.covered(1, Duration::from_secs(10)).await;
+    leader.close().await;
+}
+
+/// Round 2, item 4: the read after a publication hangs, and an idle Defragment asks for a
+/// republish. The request has its own timer, so the watchdog sees the stall.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_behind_a_hung_read_starts_the_watchdog() {
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let mut leader = Leader::open(faults.clone(), Duration::from_millis(100), clock()).await;
+    leader.lead(2);
+    leader.covered(1, Duration::from_secs(10)).await;
+    let index = leader.put("k").await;
+    // The publisher reads the checkpoint list after this announcement. That read hangs.
+    let announced = tokio::time::timeout(Duration::from_secs(10), leader.announced.recv());
+    let Some(Event::ViewCheckpoint(_, row, Some(reply))) = announced.await.unwrap() else {
+        panic!("no announcement");
+    };
+    assert!(row >= index);
+    faults.set(STALL_MANIFEST_READ);
+    reply.send(true).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let requested = Instant::now();
+    leader.writer().progress.republish();
+    let writer = leader.writer.as_ref().unwrap();
+    until("the stall", STALL + Duration::from_secs(5), async || {
+        writer.health.check(writer.waiting())
+    })
+    .await;
+    assert!(requested.elapsed() >= STALL);
+    faults.set(0);
+    leader.close().await;
+}
+
+/// A clock refusal counts at once, and the next open does not wait for the old writer, whose
+/// close waits on a held manifest read. The clock recovers, and the new writer publishes while
+/// that read is still held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clock_refusal_does_not_wait_for_the_old_close() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let mut first = Leader::open(faults.clone(), Duration::from_millis(100), clock()).await;
+    first.lead(2);
+    first.covered(1, Duration::from_secs(10)).await;
+    first.put("tick").await;
+    first.covered(2, Duration::from_secs(10)).await;
+    let events = first.events.clone();
+    first.writer().sync(false, 2, &events);
+    // The clock check holds the next manifest read of the opened writer, then refuses. That
+    // read then holds the close of the refused writer.
+    let (lagging, armed) = (
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(true)),
+    );
+    let mut skewed = clock();
+    let now = clock().now_ms;
+    let (lag, arm, store) = (lagging.clone(), armed.clone(), faults.clone());
+    skewed.now_ms = Arc::new(move || {
+        if !lag.load(Ordering::SeqCst) {
+            return now();
+        }
+        if arm.swap(false, Ordering::SeqCst) {
+            // The opened writer polls its manifest each 100 ms. Its next poll is the held read.
+            store.set(PAUSE_MANIFEST_READ);
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        now() - 60_000
+    });
+    let mut writer = Writer::new(&first.handles, Duration::from_millis(100), skewed);
+    writer.sync(true, 3, &events);
+    let health = writer.health.clone();
+    eventually("the clock fault", async || {
+        health.status()["last_error_class"] == "clock"
+    })
+    .await;
+    let held = tokio::time::timeout(Duration::from_secs(5), faults.entered.acquire());
+    held.await.unwrap().unwrap().forget();
+    lagging.store(false, Ordering::SeqCst);
+    let index = first.state.applied + 1;
+    let put = crate::proto::etcdserverpb::RequestOp {
+        request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
+            put("after", "v"),
+        )),
+    };
+    first.state.apply_etcd(index, &put).await.unwrap();
+    first.covered(index, Duration::from_secs(15)).await;
+    assert_eq!(health.pending_closes(), 1);
+    faults.release.add_permits(1);
+    writer.sync(false, 3, &events);
+    writer.stop().await;
+    first.close().await;
+}
+
 /// A database whose memtable flush hangs in an SST put that never returns.
 async fn hung_writer(faults: &Arc<FaultStore>, path: &str) -> Arc<slatedb::Db> {
     let store: Arc<dyn ObjectStore> = faults.clone();
@@ -559,6 +753,15 @@ async fn at_most_one_hung_close_stays_and_a_shutdown_does_not_wait_for_it() {
     let health = &leader.writer().health;
     assert_eq!(health.pending_closes(), 1);
     assert_eq!(health.aborted_closes(), 2);
+    // Round 2: a task that ends during the shutdown abandons one more writer. The shutdown
+    // still takes that close and aborts it within its limit.
+    let late = hung_writer(&faults, "hung-late").await;
+    let (ending, closing) = (task.clone(), late.clone());
+    leader.writer().tasks.spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        ending.abandon(closing);
+        (2, Ok(()))
+    });
     // The test and the hung flush hold each writer. Only the newest close holds one more.
     let held: Vec<_> = writers.iter().map(Arc::strong_count).collect();
     assert_eq!(held, [2, 2, 3]);
@@ -570,6 +773,8 @@ async fn at_most_one_hung_close_stays_and_a_shutdown_does_not_wait_for_it() {
         started.elapsed()
     );
     assert_eq!(leader.writer().health.pending_closes(), 0);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(Arc::strong_count(&late), 2, "the late close still runs");
     leader.close().await;
 }
 
@@ -754,10 +959,12 @@ async fn a_data_error_halts_the_writer_and_keeps_the_member() {
     *leader.handles.source.fail_writer.lock().unwrap() = Some(data.into());
     leader.lead(2);
     leader.no_failure(Duration::from_secs(3)).await;
-    let health = &leader.writer().health;
+    let health = leader.writer().health.clone();
     assert_eq!(health.status()["last_error_class"], "data");
     assert!(health.handoff_due());
     assert!(leader.writer().open.lock().unwrap().is_none());
+    // The 30 s wait runs with no step timer, so it cannot turn into a stall.
+    assert!(health.record().due.is_none());
     leader.close().await;
 }
 
@@ -1276,4 +1483,76 @@ async fn a_hung_upload_restarts_the_writer_within_the_bound() {
     })
     .await;
     server.shutdown().await.unwrap();
+}
+
+/// Liveness (a): one voter whose writes fail for more than 70 s, past the 30 s backoff cap.
+/// After the store recovers, the writer publishes within one backoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_voter_publishes_within_a_backoff_after_a_long_outage() {
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(shared_config(dir.path(), &faults))
+        .await
+        .unwrap();
+    server.wait_ready(Duration::from_secs(15)).await.unwrap();
+    eventually("the first checkpoint", async || {
+        status(&server).await["shared_state"]["applied_view_checkpoints"].as_u64() > Some(0)
+    })
+    .await;
+    faults.set(FAIL_STATE_PUT);
+    let mut kv = KvClient::new(channel(&server).await);
+    kv.put(put("k-outage", "v")).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(75)).await;
+    let failing = status(&server).await;
+    assert!(health(&failing)["consecutive_failures"].as_u64() >= Some(6));
+    // The 30 s waits of the backoff are no stall.
+    assert_eq!(health(&failing)["stalled"], false);
+    assert_eq!(
+        health(&failing)["faults"],
+        health(&failing)["consecutive_failures"]
+    );
+    faults.set(0);
+    until(
+        "a publication after the outage",
+        RETRY_CAP + Duration::from_secs(10),
+        async || {
+            let status = status(&server).await;
+            status["shared_state"]["overlay_bytes"] == 0 && health(&status)["marked"] == false
+        },
+    )
+    .await;
+    server.shutdown().await.unwrap();
+}
+
+/// Liveness (b): every voter fails long enough to lead once and get a mark. The last leader has
+/// no target. After the store recovers, it publishes within one backoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_last_leader_publishes_within_a_backoff_after_a_long_outage() {
+    let cluster = Cluster::start(|_| {}).await;
+    for id in 1..=3 {
+        cluster.fault(id).set(FAIL_STATE_PUT);
+    }
+    cluster.put("k-outage").await.unwrap();
+    tokio::time::sleep(Duration::from_secs(90)).await;
+    let last = cluster.leader().await;
+    let failing = status(cluster.member(last)).await;
+    let failures = health(&failing)["consecutive_failures"].as_u64();
+    assert!(failures >= Some(6), "{failures:?}");
+    // The 30 s waits of the backoff are no stall.
+    assert_eq!(health(&failing)["stalled"], false);
+    for id in 1..=3 {
+        cluster.fault(id).set(0);
+    }
+    until(
+        "a publication after the outage",
+        RETRY_CAP + Duration::from_secs(10),
+        async || {
+            let leader = cluster.leader().await;
+            let status = status(cluster.member(leader)).await;
+            status["shared_state"]["overlay_bytes"] == 0 && health(&status)["marked"] == false
+        },
+    )
+    .await;
+    cluster.all_up().await;
+    cluster.shutdown().await;
 }
