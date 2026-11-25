@@ -2251,6 +2251,37 @@ async fn the_quota_warning_follows_the_cluster_quota() {
     assert_eq!(node.warning_bytes(), Some(8_192));
 }
 
+/// A lone voter campaigns before the loop handles its first event. A member of a larger voter
+/// set still waits for its election timeout.
+#[tokio::test]
+async fn only_a_lone_voter_leads_before_its_first_event() {
+    for (voters, role) in [(1, "Leader"), (3, "Follower")] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = options(dir.path());
+        config.peers = (1..=voters)
+            .map(|id| (id, format!("127.0.0.1:{id}")))
+            .collect();
+        let (events, receiver) = mpsc::channel(256);
+        let node = Node::open(config, events.clone()).await.unwrap();
+        let (status, first) = oneshot::channel();
+        events.send(Event::Status(status)).await.unwrap();
+        let (stop, stopped) = oneshot::channel::<()>();
+        let run = tokio::spawn(node.run_until(receiver, async {
+            let _ = stopped.await;
+        }));
+        let first = match tokio::time::timeout(Duration::from_secs(10), first)
+            .await
+            .unwrap()
+        {
+            Ok(first) => first.unwrap(),
+            Err(_) => panic!("loop ended: {:?}", run.await),
+        };
+        assert_eq!(first["role"], role, "{voters} voters: {first}");
+        stop.send(()).unwrap();
+        run.await.unwrap().unwrap();
+    }
+}
+
 /// Raft restores a requested snapshot at the follower's commit index, also when the follower's
 /// record is already there. The follower then stores nothing, stays live, clears its request,
 /// and takes the next append.

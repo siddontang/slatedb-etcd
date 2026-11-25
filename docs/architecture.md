@@ -351,6 +351,9 @@ If recovery exceeds the pending quota, startup replays committed entries in boun
 It then loads only the remaining uncommitted tail into the pending pool.
 An oversized uncommitted tail fails startup with an explicit quota error.
 Startup disk reads run before the Raft event loop begins.
+A member that is the only voter campaigns when the loop starts, like etcd's election tick advance.
+It waits for its election timeout instead when its committed backlog leaves the pending log no
+room for the term-start entries.
 
 Status separates `raft_commit_index` from durable `commit_index`.
 It also exposes `cached_last_log_index`, `log_busy`, queued log jobs and bytes, and pending reads.
@@ -374,7 +377,8 @@ The HashKV row stores their CRC and length, and the Watch journal omits the valu
 
 The apply owner keeps an in-memory index of every current etcd key, like etcd's `treeIndex`.
 Each entry holds the create revision, modification revision, version, lease, and row length.
-Startup builds it with one scan of `etcd/current/`.
+Startup builds it with one scan of `etcd/current/`. The scan reads several SST blocks per
+request, and the ordered key set is built in bulk from the sorted rows.
 Every state write updates it after SlateDB accepts the batch.
 Snapshot installation, compaction, deletes, transactions, and lease revocation use this path.
 

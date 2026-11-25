@@ -86,13 +86,43 @@ pub(crate) struct KeyIndex {
 
 impl KeyIndex {
     /// Scan all current rows once.
+    ///
+    /// Startup time grows with this scan. It reads several SST blocks per request, and it builds
+    /// the key order in bulk from the sorted rows instead of one tree insertion per key.
     pub(crate) async fn load(db: &impl StateRead) -> Result<Self> {
+        let started = std::time::Instant::now();
         let mut index = Self::default();
-        let mut scan = db.scan_under(CURRENT, &Default::default()).await?;
+        let options = slatedb::config::ScanOptions {
+            read_ahead_bytes: 1024 * 1024,
+            max_fetch_tasks: 4,
+            ..Default::default()
+        };
+        let mut scan = db.scan_under(CURRENT, &options).await?;
+        let mut sorted = Vec::new();
         while let Some(row) = scan.next().await? {
-            index.publish(&row.key, Some(&row.value))?;
+            let Some(key) = row.key.strip_prefix(CURRENT) else {
+                continue;
+            };
+            let meta = KeyMeta::decode(&row.value)?;
+            let key: Arc<[u8]> = key.into();
+            index.link(meta.lease, key.clone());
+            index.keys.insert(key.clone(), meta);
+            sorted.push((key, Presence::Live));
         }
-        index.commit(0);
+        // The scan returns each key once in ascending order, so `collect` builds the tree in bulk.
+        let keys = sorted.into_iter().collect();
+        index.order = Arc::new(KeyOrder {
+            keys: RwLock::new(Ordered {
+                keys,
+                history: VecDeque::new(),
+            }),
+            pins: Mutex::default(),
+        });
+        tracing::info!(
+            keys = index.keys.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "loaded key index"
+        );
         Ok(index)
     }
 
@@ -494,5 +524,79 @@ mod tests {
         assert_eq!(history_len(&index), 0);
         assert_eq!(index.order.keys.read().unwrap().keys.len(), 3);
         assert!(index.order.pins.lock().unwrap().is_empty());
+    }
+
+    /// The startup load reads rows from several SSTs and the memtable with read-ahead. It must
+    /// match an index that applied the same mutations one by one.
+    #[tokio::test]
+    async fn load_matches_incremental_publish() {
+        use slatedb::object_store::memory::InMemory;
+        // Without the block cache, the load reads the flushed blocks from the object store.
+        let db = slatedb::Db::builder("db", Arc::new(InMemory::new()))
+            .with_db_cache_disabled()
+            .build()
+            .await
+            .unwrap();
+        let mut expected = KeyIndex::default();
+        // `step` makes an overwrite differ from the flushed row in its revisions and lease.
+        let write = |batch: &mut slatedb::WriteBatch, index: &mut KeyIndex, i: u32, step: i64| {
+            let key = format!("key/{i:05}").into_bytes();
+            let kv = KeyValue {
+                key: key.clone(),
+                create_revision: i64::from(i) + 1,
+                mod_revision: i64::from(i) + 2 + step,
+                version: 1 + step,
+                lease: (i64::from(i) + step) % 7,
+                value: vec![1; 2048],
+            };
+            let (row_key, value) = ([CURRENT, &key].concat(), kv.encode_to_vec().into());
+            batch.put(&row_key, &value);
+            index.publish(&row_key, Some(&value)).unwrap();
+        };
+        // Two L0 SSTs of about 4 MiB each, larger than one read-ahead request.
+        let memtable = slatedb::config::FlushOptions {
+            flush_type: slatedb::config::FlushType::MemTable,
+        };
+        for part in 0..2 {
+            let mut batch = slatedb::WriteBatch::new();
+            for i in (part..4000).step_by(2) {
+                write(&mut batch, &mut expected, i, 0);
+            }
+            db.write(batch).await.unwrap();
+            db.flush_with_options(memtable.clone()).await.unwrap();
+        }
+        assert_eq!(db.manifest().l0().len(), 2);
+        // Unflushed changes: deletes, overwrites, and rows next to the prefix.
+        let mut batch = slatedb::WriteBatch::new();
+        for i in (0..4000).step_by(3) {
+            let row_key = [CURRENT, format!("key/{i:05}").as_bytes()].concat();
+            batch.delete(&row_key);
+            expected.publish(&row_key, None).unwrap();
+        }
+        for i in (1..4000).step_by(9) {
+            write(&mut batch, &mut expected, i, 1);
+        }
+        batch.put(b"etcd/curren", b"x");
+        batch.put(b"etcd/current0", b"x");
+        db.write(batch).await.unwrap();
+        expected.commit(0);
+
+        assert!(expected.matches(&db).await.unwrap());
+        let loaded = KeyIndex::load(&db).await.unwrap();
+        assert_eq!(loaded.len(), expected.len());
+        assert_eq!(loaded.pin(u64::MAX).count(b"", &[0]), loaded.len() as i64);
+        // The ordered user keys, not only their number, match the visible keys.
+        let visible = |index: &KeyIndex| -> Vec<Arc<[u8]>> {
+            let ordered = index.order.keys.read().unwrap();
+            ordered
+                .keys
+                .iter()
+                .filter(|(_, presence)| presence.visible(u64::MAX))
+                .map(|(key, _)| key.clone())
+                .collect()
+        };
+        assert_eq!(visible(&loaded), visible(&expected));
+        assert_eq!(loaded.lease_keys(3), expected.lease_keys(3));
+        db.close().await.unwrap();
     }
 }

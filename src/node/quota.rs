@@ -1087,6 +1087,115 @@ pub(super) mod tests {
         assert_eq!(node.raw.raft.raft_log.last_index(), 4);
     }
 
+    /// A lone voter on an empty directory campaigns before its first event. A write of that
+    /// event follows the term-start entries in the log, so the member can apply it.
+    #[tokio::test]
+    async fn a_lone_voter_seeds_its_log_before_the_first_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = options(dir.path());
+        config.peers = BTreeMap::from([(1, "127.0.0.1:1".to_string())]);
+        let (events, _) = mpsc::channel(256);
+        let mut node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
+            .await
+            .unwrap();
+        node.campaign_alone().unwrap();
+        assert_eq!(node.raw.raft.state, StateRole::Leader);
+        let (tx, _reply) = oneshot::channel();
+        node.propose(quota_put(1), ClientResponse::Kv(tx)).unwrap();
+        apply_committed(&mut node).await;
+        let entries = node
+            .raw
+            .raft
+            .raft_log
+            .entries(1, u64::MAX, raft::GetEntriesContext::empty(false))
+            .unwrap();
+        let commands: Vec<_> = entries
+            .iter()
+            .filter(|entry| !entry.data.is_empty())
+            .map(|entry| RaftCommand::decode(&entry.data).unwrap())
+            .collect();
+        assert!(matches!(commands[0], RaftCommand::SeedMembers(_)));
+        assert!(matches!(commands[1], RaftCommand::SetQuota { .. }));
+        assert!(matches!(commands[2], RaftCommand::Etcd { .. }));
+        assert!(node.quota.blocked().is_none());
+        assert_eq!(node.state.revision, 2);
+    }
+
+    /// A lone voter restarts with a committed backlog that leaves the pending log less room
+    /// than an entry. It does not campaign at run-loop start, as the empty entry of its term
+    /// would exceed the pending quota. Once replay frees the room, it leads and takes writes.
+    #[tokio::test]
+    async fn a_lone_voter_waits_for_replay_room_before_it_campaigns() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |pending: usize| {
+            let mut config = options(dir.path());
+            config.peers = BTreeMap::from([(1, "127.0.0.1:1".to_string())]);
+            config.log_memory.pending_bytes = pending;
+            async move {
+                let (events, _) = mpsc::channel(256);
+                Node::open_with_transport(config, events, Some(BTreeMap::new()))
+                    .await
+                    .unwrap()
+            }
+        };
+        let mut node = open(256 << 20).await;
+        node.campaign_alone().unwrap();
+        for command in &large_entries(9, 1 << 20)[..9] {
+            let (tx, _reply) = oneshot::channel();
+            node.propose(command.clone(), ClientResponse::Kv(tx))
+                .unwrap();
+        }
+        apply_committed(&mut node).await;
+        drop(node);
+        let used = open(256 << 20).await.raw.store().stats()["pending_bytes"]
+            .as_u64()
+            .unwrap() as usize;
+        assert!(used > 9 << 20, "replayed {used} bytes");
+        let mut node = open(used + 32).await;
+        node.drive_ready().await.unwrap();
+        node.campaign_alone().unwrap();
+        assert_eq!(node.raw.raft.state, StateRole::Follower);
+        apply_committed(&mut node).await;
+        node.campaign_alone().unwrap();
+        assert_eq!(node.raw.raft.state, StateRole::Leader);
+        let (tx, _reply) = oneshot::channel();
+        node.propose(quota_put(100), ClientResponse::Kv(tx))
+            .unwrap();
+        apply_committed(&mut node).await;
+        assert_eq!(node.state.revision, 11);
+    }
+
+    /// A lone voter that holds an accepted snapshot that apply did not install does not
+    /// campaign at run-loop start: Raft would scan unapplied entries below the first log index.
+    /// The tick hold of `tick_raft` covers it until the install.
+    #[tokio::test]
+    async fn a_lone_voter_does_not_campaign_before_its_snapshot_installs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = options(dir.path());
+        config.peers = BTreeMap::from([(1, "127.0.0.1:1".to_string())]);
+        let (events, _) = mpsc::channel(256);
+        let mut node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
+            .await
+            .unwrap();
+        let mut message = Message {
+            msg_type: MessageType::MsgSnapshot as i32,
+            from: 2,
+            to: 1,
+            term: 2,
+            ..Default::default()
+        };
+        let metadata = message.mut_snapshot().mut_metadata();
+        metadata.index = 20;
+        metadata.term = 2;
+        metadata.mut_conf_state().voters = vec![1];
+        node.step_peer(message).unwrap();
+        assert!(node.raw.raft.prs().is_singleton());
+        assert!(node.installing());
+        node.campaign_alone().unwrap();
+        assert_eq!(node.raw.raft.state, StateRole::Follower);
+        assert_eq!(node.raw.raft.term, 2);
+    }
+
     async fn open_node(dir: &Path, flag: i64, reassert: bool) -> Node {
         let mut config = options(dir);
         config.quota_bytes = flag;

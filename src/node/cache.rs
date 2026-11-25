@@ -322,6 +322,12 @@ impl Cache {
         self.pending_bytes + unstaged + proposal_bytes >= self.limits.pending_bytes / 2
     }
 
+    /// Return true when the unapplied entries leave the control reserve free, so the
+    /// term-start entries of a new leader fit.
+    pub fn has_control_room(&self) -> bool {
+        self.pending_bytes + CONTROL_RESERVE <= self.limits.pending_bytes
+    }
+
     pub fn admits(&self, unstable: &[Entry], incoming: &[Entry], proposal_bytes: usize) -> bool {
         if incoming
             .iter()
