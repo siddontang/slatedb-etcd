@@ -666,6 +666,59 @@ async fn newest_base_through(
     Ok(None)
 }
 
+/// Open the newest `view-` checkpoint whose row is in `[low, high]` and that holds the
+/// membership. The name gives only a lower bound of the row, so each candidate opens and its own
+/// row decides.
+///
+/// A record above its checkpoint row needs that checkpoint, or one in this range: the leader
+/// certified that no entry in `(low, high]` changed state, so each checkpoint of this shared
+/// state with its row in the range holds the state at `high`.
+async fn newest_base_between(
+    admin: &slatedb::admin::Admin,
+    source: &Source,
+    low: u64,
+    high: u64,
+) -> Result<Option<Arc<Base>>> {
+    for (seq, checkpoint) in view_checkpoints(admin).await?.into_iter().rev() {
+        if seq > high {
+            continue;
+        }
+        let base = source.open_base(checkpoint.id).await?;
+        if (low..=high).contains(&base.applied) && base.get(crate::cluster::KEY).await?.is_some() {
+            return Ok(Some(base));
+        }
+    }
+    Ok(None)
+}
+
+/// Open checkpoint `checkpoint` of a base above its row `row` at `index`. If it is gone, take
+/// the newest checkpoint with its row in `[row, index]`. A missing row means the record names no
+/// range, so only the checkpoint itself can serve.
+async fn reopen_above_row(
+    admin: &slatedb::admin::Admin,
+    source: &Source,
+    checkpoint: uuid::Uuid,
+    row: Option<u64>,
+    index: u64,
+) -> Result<Arc<Base>> {
+    let error = match source.open_base(checkpoint).await {
+        Ok(base) => return Ok(base),
+        Err(error) => error,
+    };
+    let replacement = match row {
+        Some(row) => newest_base_between(admin, source, row, index).await?,
+        None => None,
+    };
+    replacement.ok_or(error).with_context(|| {
+        format!(
+            "cannot open checkpoint {checkpoint}, which holds the state at {index}, and no other \
+             view checkpoint has a row from {} to {index}; restore the checkpoint, or give this \
+             member an empty data directory so that it receives a snapshot",
+            row.map_or("its row".to_owned(), |row| row.to_string()),
+        )
+    })
+}
+
 /// Open the newest `view-` checkpoint that holds the membership. The publisher deletes a
 /// checkpoint without it, but a stop can leave one behind.
 /// The source of the offline converter. It opens no member state.
@@ -1495,12 +1548,8 @@ impl StateMachine {
         let record = options.record.filter(|record| base.applied < record.index);
         let base = match record {
             Some(record) if base.checkpoint != Some(record.checkpoint) => {
-                source.open_base(record.checkpoint).await.with_context(|| {
-                    format!(
-                        "cannot open checkpoint {} of the Raft snapshot record",
-                        record.checkpoint
-                    )
-                })?
+                reopen_above_row(&admin, &source, record.checkpoint, record.row, record.index)
+                    .await?
             }
             _ => base,
         };
@@ -1672,12 +1721,16 @@ impl StateMachine {
             .shared
             .as_ref()
             .context("rebase needs shared state mode")?;
-        let (current, index) = (shared.base.checkpoint, shared.base_index);
+        let (current, row, index) = (
+            shared.base.checkpoint,
+            shared.base.applied,
+            shared.base_index,
+        );
         let newest = newest_base_through(&self.admin, &shared.source, limit).await?;
         let base = match (newest, current) {
             (Some(base), _) if base.applied >= index => base,
-            (_, Some(current)) if index > shared.base.applied => {
-                shared.source.open_base(current).await?
+            (_, Some(current)) if index > row => {
+                reopen_above_row(&self.admin, &shared.source, current, Some(row), index).await?
             }
             (Some(base), _) => base,
             (None, _) => {
@@ -1690,7 +1743,7 @@ impl StateMachine {
             applied = self.applied,
             "rebase on a new checkpoint"
         );
-        let extend = base.checkpoint == current && base.applied < index;
+        let extend = index > row && (row..index).contains(&base.applied);
         self.adopt_base(base, 0).await?;
         if extend {
             self.extend_base(index, term(index)?)?;

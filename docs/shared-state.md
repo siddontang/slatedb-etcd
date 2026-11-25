@@ -388,7 +388,8 @@ mode a missing SST rebases the member instead. Every other storage error still s
 
 A rebase rescans the live data. It is the cost of losing a base, not of a leader change. The
 log can start above the newest checkpoint row. If no newer checkpoint reaches the base index,
-the rebase opens the current base again at its base index, with the log term there.
+the rebase opens the current base again at its base index, with the log term there. If the base
+checkpoint is gone, it takes a checkpoint in the same range as a restart does.
 
 ## Log truncation and Raft snapshots
 
@@ -552,6 +553,10 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
    member opens that checkpoint by its ID, because a Defragment can add a newer one at the same
    row. It loads the state at `F` and starts at the record index with the record term. This
    runs before the log check, because the log starts after the record index.
+   If retention deleted that checkpoint, the member takes the newest checkpoint whose own row,
+   read from the checkpoint, is between the record row and the record index. No entry in that
+   range changed state, so that checkpoint holds the same state. A record without a row, or no
+   such checkpoint, stops the start with an error that says how to recover.
 2. [Install](#install) the base. If the local log ends below `F` or its term at `F` differs,
    this is an adopt. Otherwise it is a local rebuild with nothing to replay yet.
 3. Replay committed log entries above `F` into the overlay. This is the current replay path with

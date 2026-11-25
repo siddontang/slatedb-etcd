@@ -225,7 +225,8 @@ Rules and limits:
   its record is above the row.
 - A restart opens the newest checkpoint. It adopts the checkpoint when the log ends below it. A
   Raft snapshot record above the newest checkpoint row names its checkpoint, and the restart
-  opens that one at the record index.
+  opens that one at the record index. If retention deleted it, the restart takes the newest
+  checkpoint whose row is between the record row and the record index.
 - A missing checkpoint object fails a read with a retryable error. In apply it rebuilds the
   state from the newest checkpoint and replays the local log.
 - A member that waits on its overlay limit adopts a newer checkpoint in process when its log
