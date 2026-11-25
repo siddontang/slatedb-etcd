@@ -33,12 +33,25 @@ fn message(snapshot: bool) -> Message {
     }
 }
 
+/// The next event that is not the process notice of a stream or request. A sender of this
+/// binary names its process. A raw test stream, like an earlier binary, names none.
+async fn next_event(events: &mut mpsc::Receiver<Event>) -> Event {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Event::PeerProcess { process, .. } => {
+                assert!(process.is_none_or(|process| process == process_id()))
+            }
+            event => return event,
+        }
+    }
+}
+
 async fn step(events: &mut mpsc::Receiver<Event>, snapshot: bool) -> crate::node::Response {
-    match tokio::time::timeout(Duration::from_secs(3), events.recv())
-        .await
-        .unwrap()
-        .unwrap()
-    {
+    match next_event(events).await {
         Event::PeerFrame(message, _, response) => {
             assert_eq!(message.get_msg_type() == MessageType::MsgSnapshot, snapshot);
             response
@@ -96,11 +109,7 @@ async fn stream_window_and_snapshot_storage_ack_bound_the_sender() {
         let mut pending = None;
         let mut heartbeat = None;
         for _ in 0..2 {
-            match tokio::time::timeout(Duration::from_secs(3), received.recv())
-                .await
-                .unwrap()
-                .unwrap()
-            {
+            match next_event(&mut received).await {
                 Event::PeerFrame(message, _, response) => {
                     if message.get_msg_type() == MessageType::MsgSnapshot {
                         pending = Some(response);
@@ -409,7 +418,10 @@ async fn failed_stream_discards_its_backlog_and_rejects_a_queued_snapshot() {
         }
     }
     assert_eq!(messages.capacity(), 256);
-    while let Ok(Event::PeerFrame(_, _, response)) = received.try_recv() {
+    while let Ok(event) = received.try_recv() {
+        let Event::PeerFrame(_, _, response) = event else {
+            continue;
+        };
         assert!(
             response.is_closed(),
             "failed stream kept an accepted message waiter"
@@ -543,4 +555,117 @@ async fn changed_address_applies_when_the_sender_dials_again() {
     sender.await.unwrap();
     reports.abort();
     second_server.abort();
+}
+
+/// A view snapshot above its checkpoint row, as a leader sends it to `process`.
+fn covered_snapshot(process: Option<u64>) -> Message {
+    let mut message = message(true);
+    let mut snapshot = raft::eraftpb::Snapshot::default();
+    snapshot.mut_metadata().index = 9;
+    snapshot.data = crate::state::transfer::ViewDescriptor::above_row(uuid::Uuid::new_v4(), 7)
+        .encode()
+        .unwrap();
+    message.set_snapshot(snapshot);
+    message.context = process.unwrap_or(0).to_le_bytes().to_vec();
+    message
+}
+
+/// An earlier binary restarted on the member after the leader built a snapshot above its row.
+/// Its server has only the old route, so it answers 404 before its Raft sees the snapshot. The
+/// leader then treats the member as an earlier binary and reports the snapshot as failed.
+#[tokio::test]
+async fn an_earlier_binary_refuses_a_snapshot_above_its_row_before_raft() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let old_route = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let calls = old_route.clone();
+    let router = axum::Router::new().route(
+        "/raft",
+        axum::routing::post(move || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            async { axum::http::StatusCode::NO_CONTENT }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    let (events, mut received) = mpsc::channel(8);
+    let traffic = std::sync::Arc::new(crate::metrics::PeerTraffic::default());
+    let client = reqwest::Client::new();
+    let url = format!("http://{address}/raft");
+    spawn_snapshot(
+        &client,
+        &url,
+        "test",
+        covered_snapshot(Some(7)),
+        &traffic,
+        &events,
+        2,
+    );
+    let first = tokio::time::timeout(Duration::from_secs(3), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        first,
+        Event::SnapshotRefused {
+            member: 2,
+            target: 7
+        }
+    ));
+    let second = tokio::time::timeout(Duration::from_secs(3), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        second,
+        Event::NetworkResult {
+            peer: 2,
+            snapshot: true,
+            success: false
+        }
+    ));
+    assert_eq!(old_route.load(std::sync::atomic::Ordering::Relaxed), 0);
+    // A snapshot at its row has no target, and it still takes the old route.
+    let mut exact = covered_snapshot(None);
+    exact.context.clear();
+    let mut snapshot = exact.take_snapshot();
+    snapshot.data = crate::state::transfer::ViewDescriptor::new(uuid::Uuid::new_v4())
+        .encode()
+        .unwrap();
+    exact.set_snapshot(snapshot);
+    let delivery = post_snapshot(&client, &url, "test", exact, &traffic).await;
+    assert_eq!(delivery, Delivery::Sent);
+    assert_eq!(old_route.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+/// This binary takes a snapshot above its row only when it names this process. A snapshot for
+/// another process of the member gets 409 before Raft, and the sender falls back.
+#[tokio::test]
+async fn a_snapshot_above_its_row_must_name_the_receiver_process() {
+    let (address, mut received, _task) = server().await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{address}/raft");
+    let traffic = crate::metrics::PeerTraffic::default();
+    for target in [None, Some(process_id().wrapping_add(1))] {
+        let delivery = post_snapshot(
+            &client,
+            &url,
+            "stream-test",
+            covered_snapshot(target),
+            &traffic,
+        )
+        .await;
+        assert_eq!(delivery, Delivery::Refused, "target {target:?}");
+    }
+    assert!(received.try_recv().is_err());
+    // The named process passes the check. This test server has no shared state, so the open of
+    // the checkpoint fails later with an ordinary error.
+    let delivery = post_snapshot(
+        &client,
+        &url,
+        "stream-test",
+        covered_snapshot(Some(process_id())),
+        &traffic,
+    )
+    .await;
+    assert_eq!(delivery, Delivery::Failed);
 }

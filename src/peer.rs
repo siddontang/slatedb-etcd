@@ -55,11 +55,17 @@ impl Transport for Service {
         {
             return Err(Status::permission_denied("peer cluster does not match"));
         }
+        let process = process_of(
+            request
+                .metadata()
+                .get(PROCESS)
+                .map(|value| value.as_bytes()),
+        );
         let incoming = request.into_inner();
         let events = self.0.events.clone();
         let (responses, stream) = mpsc::channel(WINDOW);
         tokio::spawn(async move {
-            if let Err(error) = receive::run(incoming, events, &responses).await {
+            if let Err(error) = receive::run(incoming, events, &responses, process).await {
                 let _ = responses.send(Err(error)).await;
             }
         });
@@ -98,6 +104,25 @@ async fn failed(
     if snapshot {
         report(events, peer, true, false).await;
     }
+}
+
+/// The header and metadata name of the sender's process ID on peer traffic.
+pub(crate) const PROCESS: &str = "x-member-process";
+/// The route of a view snapshot above its checkpoint row. An earlier binary has no such route.
+pub(crate) const COVERED_ROUTE: &str = "/raft/covered";
+/// The header that names the receiver process of a snapshot on `COVERED_ROUTE`.
+pub(crate) const TARGET_PROCESS: &str = "x-target-process";
+
+/// A random ID of this OS process. A member sends it with its peer traffic and its `ViewAck`
+/// reports, so the leader knows when a member runs a new process, maybe of an earlier binary.
+pub(crate) fn process_id() -> u64 {
+    static ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| uuid::Uuid::new_v4().as_u64_pair().0)
+}
+
+/// Read a process ID from peer request headers. An earlier binary sends none.
+pub(crate) fn process_of(value: Option<&[u8]>) -> Option<u64> {
+    std::str::from_utf8(value?).ok()?.parse().ok()
 }
 
 /// Send to a fixed address. Tests use this form.
@@ -166,6 +191,9 @@ pub(crate) async fn transport_to(
             return;
         };
         request.metadata_mut().insert("x-cluster-id", cluster);
+        if let Ok(process) = process_id().to_string().parse() {
+            request.metadata_mut().insert(PROCESS, process);
+        }
         let result = tokio::time::timeout(PROGRESS_TIMEOUT, client.exchange(request)).await;
         let Ok(Ok(response)) = result else {
             failed(&events, peer, &mut messages, false, 1, &traffic).await;
@@ -279,30 +307,70 @@ fn spawn_snapshot(
     let (client, url, cluster) = (client.clone(), url.to_owned(), cluster.to_owned());
     let (traffic, events) = (traffic.clone(), events.clone());
     tokio::spawn(async move {
-        let success = post_snapshot(&client, &url, &cluster, message, &traffic).await;
-        report(&events, peer, true, success).await;
+        let target = <[u8; 8]>::try_from(message.context.as_ref()).map(u64::from_le_bytes);
+        let delivery = post_snapshot(&client, &url, &cluster, message, &traffic).await;
+        // The member does not run the process that the snapshot names. That process loses the
+        // capability, but a later process that reported it keeps it.
+        if let (Delivery::Refused, Ok(target)) = (delivery, target) {
+            let _ = events
+                .send(Event::SnapshotRefused {
+                    member: peer,
+                    target,
+                })
+                .await;
+        }
+        report(&events, peer, true, delivery == Delivery::Sent).await;
     });
 }
 
-async fn post_snapshot(
+/// The result of one snapshot request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    Sent,
+    Failed,
+    /// The receiver has no route for a snapshot above its row, or it runs another process.
+    Refused,
+}
+
+/// Send one snapshot. The node names a receiver process in the context of a view snapshot above
+/// its checkpoint row, and zero when it knows none. Such a snapshot goes to `COVERED_ROUTE`. An
+/// earlier binary answers 404, and another process 409, before Raft sees the snapshot.
+pub(crate) async fn post_snapshot(
     client: &reqwest::Client,
     url: &str,
     cluster: &str,
     message: Message,
     traffic: &crate::metrics::PeerTraffic,
-) -> bool {
+) -> Delivery {
+    let target = <[u8; 8]>::try_from(message.context.as_ref())
+        .ok()
+        .map(u64::from_le_bytes);
+    let covered = target.is_some();
+    let mut refused = false;
     let result: Result<()> = async {
         let payload = message.encode_to_vec();
         let size = payload.len();
-        let response = client
-            .post(url)
+        let mut request = match (covered, url.strip_suffix("/raft")) {
+            (true, Some(base)) => client.post(format!("{base}{COVERED_ROUTE}")),
+            _ => client.post(url),
+        };
+        if let (true, Some(target)) = (covered, target) {
+            request = request.header(TARGET_PROCESS, target.to_string());
+        }
+        let response = request
             .header("x-cluster-id", cluster)
+            .header(PROCESS, process_id().to_string())
             // The follower copies the checkpoint objects before it replies. A retry continues
             // from the objects that it already copied.
             .timeout(Duration::from_secs(600))
             .body(payload)
             .send()
             .await?;
+        refused = covered
+            && matches!(
+                response.status(),
+                reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::CONFLICT
+            );
         ensure!(
             response.status().is_success(),
             "peer returned {}",
@@ -315,10 +383,16 @@ async fn post_snapshot(
         Ok(())
     }
     .await;
-    if result.is_err() {
-        traffic.failed(1);
+    match result {
+        Ok(()) => Delivery::Sent,
+        Err(_) => {
+            traffic.failed(1);
+            match refused {
+                true => Delivery::Refused,
+                false => Delivery::Failed,
+            }
+        }
     }
-    result.is_ok()
 }
 
 #[cfg(test)]

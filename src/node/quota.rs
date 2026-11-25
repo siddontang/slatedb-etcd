@@ -622,8 +622,8 @@ impl Node {
 
     /// Ask the leader for a snapshot that replaces the entries before the cluster quota. Raft
     /// drops the request on a leader, without a leader, or with a request in flight. The next
-    /// tick asks again. In shared mode an idle leader cannot yet offer a base above its last
-    /// batch, so the recovery of an idle cluster depends on #96.
+    /// tick asks again. The request is for the last index of this member. In shared mode an idle
+    /// leader serves it with its base, certified through that index. See `certify_base`.
     fn request_quota_snapshot(&mut self) {
         if self.quota.blocked() == Some(self.state.applied + 1) {
             let _ = self.raw.request_snapshot();
@@ -641,17 +641,18 @@ impl Node {
     pub(super) fn tick_raft(&mut self) -> Result<()> {
         if self.quota.blocked().is_some() {
             self.quota.silent += 1;
-            let raft = &mut self.raw.raft;
-            if self.quota.silent < 3 * raft.election_timeout() {
-                // Keep the timer past the leader lease, so the member still votes, but below
-                // the largest randomized timeout, so it does not campaign.
-                let timeout = 2 * raft.election_timeout() - 1;
-                raft.set_randomized_election_timeout(timeout);
-                raft.election_elapsed = raft.election_elapsed.min(timeout - 2);
+            if self.quota.silent < 3 * self.raw.raft.election_timeout() {
+                self.hold_campaign();
             }
             self.request_quota_snapshot();
         } else {
             self.quota.silent = 0;
+        }
+        // Between an accepted snapshot and its install, Raft scans the unapplied entries from its
+        // applied index at a campaign. The log starts above that index, so the scan fails and
+        // Raft stops the process. The install is local, so the member waits for it.
+        if self.installing() {
+            self.hold_campaign();
         }
         self.raw.tick();
         self.propose_term_start()
@@ -660,7 +661,9 @@ impl Node {
     /// Step a peer message. A member that waits for a snapshot ignores a leadership transfer.
     /// A new leader proposes the cluster quota before the next client write.
     pub(super) fn step_peer(&mut self, message: Message) -> raft::Result<()> {
-        if message.get_msg_type() == MessageType::MsgTimeoutNow && self.quota.blocked().is_some() {
+        if message.get_msg_type() == MessageType::MsgTimeoutNow
+            && (self.quota.blocked().is_some() || self.installing())
+        {
             tracing::info!(
                 from = message.from,
                 "ignore a leadership transfer before a snapshot"
@@ -1098,6 +1101,37 @@ pub(super) mod tests {
         assert!(matches!(commands[2], RaftCommand::Etcd { .. }));
         assert!(node.quota.blocked().is_none());
         assert_eq!(node.state.revision, 2);
+    }
+
+    /// A lone voter that holds an accepted snapshot that apply did not install does not
+    /// campaign at run-loop start: Raft would scan unapplied entries below the first log index.
+    /// The tick hold of `tick_raft` covers it until the install.
+    #[tokio::test]
+    async fn a_lone_voter_does_not_campaign_before_its_snapshot_installs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = options(dir.path());
+        config.peers = BTreeMap::from([(1, "127.0.0.1:1".to_string())]);
+        let (events, _) = mpsc::channel(256);
+        let mut node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
+            .await
+            .unwrap();
+        let mut message = Message {
+            msg_type: MessageType::MsgSnapshot as i32,
+            from: 2,
+            to: 1,
+            term: 2,
+            ..Default::default()
+        };
+        let metadata = message.mut_snapshot().mut_metadata();
+        metadata.index = 20;
+        metadata.term = 2;
+        metadata.mut_conf_state().voters = vec![1];
+        node.step_peer(message).unwrap();
+        assert!(node.raw.raft.prs().is_singleton());
+        assert!(node.installing());
+        node.campaign_alone().unwrap();
+        assert_eq!(node.raw.raft.state, StateRole::Follower);
+        assert_eq!(node.raw.raft.term, 2);
     }
 
     async fn open_node(dir: &Path, flag: i64, reassert: bool) -> Node {

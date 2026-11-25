@@ -168,9 +168,7 @@ impl Executor {
                 .storage
                 .persist(&entries, hs.as_ref(), snapshot.as_ref())?,
             Job::Checkpoint { index, image, conf } => {
-                let attach = image.is_some()
-                    && index == self.storage.snapshot_index()
-                    && self.storage.metadata_only();
+                let attach = self.storage.replaces_at(index, image.as_ref());
                 // A received snapshot can make this result obsolete.
                 if index > self.storage.snapshot_index() || attach {
                     self.storage.publish_checkpoint(index, image, conf)?;

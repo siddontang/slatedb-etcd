@@ -96,15 +96,28 @@ pub enum Event {
         snapshot: bool,
         success: bool,
     },
-    /// The shared-mode publisher created this checkpoint. The leader announces it. The reply
-    /// tells whether Raft took the proposal.
-    ViewCheckpoint(uuid::Uuid, Option<tokio::sync::oneshot::Sender<bool>>),
+    /// The shared-mode publisher created this checkpoint with this row `F`. The leader
+    /// announces it. The reply tells whether Raft took the proposal.
+    ViewCheckpoint(uuid::Uuid, u64, Option<tokio::sync::oneshot::Sender<bool>>),
     /// A member reports the checkpoints that it pins. The leader keeps them.
     ViewAck {
         member: u64,
         checkpoints: std::collections::HashSet<uuid::Uuid>,
         /// A manual checkpoint on the member asks for a publication through this index.
         publish: Option<u64>,
+        /// The process of a member that installs a base above its checkpoint row.
+        coverage: Option<u64>,
+    },
+    /// The first peer frame of a stream or request came from this process of `member`. An
+    /// earlier binary sends no process.
+    PeerProcess {
+        member: u64,
+        process: Option<u64>,
+    },
+    /// `member` refused a snapshot above its row that named process `target`.
+    SnapshotRefused {
+        member: u64,
+        target: u64,
     },
 }
 
@@ -387,6 +400,7 @@ impl Node {
             empty_log,
             pin_max: options.view_pin_max,
             restore: options.restore.clone(),
+            record: crate::state::shared::Record::of(storage.recovery_snapshot())?,
         };
         let mut state = options
             .object_store
@@ -727,6 +741,9 @@ impl Node {
         node.sync_members();
         node.observe_quota()?;
         node.observe_members();
+        // A request can arrive before the first apply or tick. The log cache must already know
+        // the base to judge the record. See `Cache::has_image`.
+        node.note_base();
         Ok(node)
     }
 
@@ -751,7 +768,7 @@ impl Node {
         self.retry_reads();
         self.expire_leases()?;
         self.publish_member()?;
-        self.tick_shared();
+        self.tick_shared()?;
         self.drive_auto_compaction(Instant::now())?;
         self.check_quota_warning();
         Ok(())
@@ -760,9 +777,10 @@ impl Node {
     /// Like etcd's election tick advance: a lone voter cannot lose an election, so it
     /// campaigns at once instead of after a randomized timeout. Raft safety does not depend
     /// on when a node campaigns. The new leader proposes its term-start entries before any
-    /// client write of the first event. The run loop then sees the role change.
+    /// client write of the first event. The run loop then sees the role change. A member with
+    /// an accepted snapshot that apply did not install waits, as in `tick_raft`.
     fn campaign_alone(&mut self) -> Result<()> {
-        if self.raw.raft.prs().is_singleton() && self.raw.raft.promotable() {
+        if self.raw.raft.prs().is_singleton() && self.raw.raft.promotable() && !self.installing() {
             self.raw.campaign()?;
         }
         self.propose_term_start()
@@ -1209,8 +1227,8 @@ impl Node {
                 }
             }
             Event::SnapshotBuilt(built) => self.checkpoint_built(built)?,
-            Event::ViewCheckpoint(checkpoint, reply) => {
-                let accepted = self.announce_view(checkpoint)?;
+            Event::ViewCheckpoint(checkpoint, row, reply) => {
+                let accepted = self.announce_view(checkpoint, row)?;
                 if let Some(reply) = reply {
                     let _ = reply.send(accepted);
                 }
@@ -1219,7 +1237,14 @@ impl Node {
                 member,
                 checkpoints,
                 publish,
-            } => self.view_ack(member, checkpoints, publish),
+                coverage,
+            } => self.view_ack(member, checkpoints, publish, coverage),
+            Event::PeerProcess { member, process } => {
+                self.raw.store().note_process(member, process);
+            }
+            Event::SnapshotRefused { member, target } => {
+                self.raw.store().note_refused(member, target);
+            }
             Event::SnapshotDelay(delay_ms, response) => {
                 self.snapshot_delay_ms = delay_ms.min(5000);
                 let _ = response.send(Ok(self.status()?));
@@ -1453,7 +1478,16 @@ impl Node {
     }
 
     fn send(&mut self, messages: Vec<Message>) {
-        for message in messages {
+        for mut message in messages {
+            // A view snapshot above its row names the receiver process that can install it, or
+            // zero, which no process has. The transport sends it on its own route. See
+            // `peer::post_snapshot`.
+            if message.get_msg_type() == MessageType::MsgSnapshot
+                && crate::state::transfer::above_row(message.get_snapshot())
+            {
+                let process = self.raw.store().capable_process(message.to).unwrap_or(0);
+                message.context = process.to_le_bytes().to_vec();
+            }
             if self.raw.raft.state == StateRole::Leader {
                 crate::failpoint::hit("raft-before-leader-send");
             } else {
@@ -1509,6 +1543,10 @@ impl Node {
 
     fn start_checkpoint(&mut self, image: bool) -> Result<()> {
         if self.checkpoint_running || self.apply_busy || self.prepared_puts.is_some() {
+            return Ok(());
+        }
+        // A record built at a base below the record could not replace it. See `certify_base`.
+        if self.base_below_record() {
             return Ok(());
         }
         let store = self.raw.store();

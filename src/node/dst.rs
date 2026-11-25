@@ -6,6 +6,7 @@ use crate::mvcc::Outcome;
 use crate::proto::etcdserverpb::request_op::Request as Op;
 use crate::proto::etcdserverpb::response_op::Response as Resp;
 use crate::proto::etcdserverpb::{PutRequest, RangeRequest, WatchCreateRequest};
+use crate::state::shared::Record;
 use crate::state::{StateRead, StateScan};
 
 /// A digest of every `etcd/` row of a state.
@@ -18,6 +19,9 @@ async fn rows_digest(state: &impl StateRead) -> std::result::Result<u32, slatedb
     }
     Ok(digest)
 }
+
+#[path = "shared/dst_tests.rs"]
+mod coverage;
 
 struct ClientRequest {
     key: String,
@@ -53,6 +57,8 @@ struct Simulation {
     committed_entries: BTreeMap<u64, Vec<u8>>,
     terms: BTreeMap<u64, u64>,
     isolated: Option<u64>,
+    /// A member that starts as a joiner, as after MemberAdd. With no log it has an empty base.
+    joining: Option<u64>,
     paused_apply: Option<u64>,
     paused_flush: Option<u64>,
     paused_reads: Option<u64>,
@@ -73,6 +79,9 @@ struct Simulation {
     reference: Option<StateMachine>,
     /// The reference digest of the `etcd/` rows after each index.
     digests: BTreeMap<u64, u32>,
+    /// Shared mode: the loaded fields of the first member seen at each index. A member that
+    /// opens or installs a base above its row must give the same fields as one that applied.
+    loaded: BTreeMap<u64, String>,
     /// The last applied index that the view check covered on each member.
     checked: BTreeMap<u64, u64>,
     /// Member views that matched the reference.
@@ -83,6 +92,22 @@ struct Simulation {
     upgraded: bool,
     /// Started members propose no `SeedMembers`, like an earlier binary.
     hold_members: bool,
+    /// The number of voters.
+    members: u64,
+    /// The process ID of each started member, new at each start.
+    processes: BTreeMap<u64, u64>,
+    /// Shared mode: members that run an earlier binary. They send no process ID and do not
+    /// advertise the coverage capability, and they install a view snapshot only at its row.
+    old: BTreeSet<u64>,
+    /// View snapshots that an earlier binary received, each checked at its row.
+    old_installs: u64,
+    /// View snapshots above their row that the receiver refused before Raft saw them.
+    refused_snapshots: u64,
+    /// The checkpoints of the view snapshots that Raft received. IDs are random, so they stay
+    /// out of the trace.
+    delivered_views: Vec<uuid::Uuid>,
+    /// Opens and installs of stopped members that raised a base above its row.
+    extended: u64,
 }
 
 impl Drop for Simulation {
@@ -99,13 +124,13 @@ impl Drop for Simulation {
 
 /// The `--client-peer` flags of member `id`. Each member writes other URL text for the same
 /// peers, so a member-local membership row would differ from the reference.
-fn client_urls(id: u64) -> BTreeMap<u64, String> {
+fn client_urls(id: u64, members: u64) -> BTreeMap<u64, String> {
     let host = match id {
         1 => "127.0.0.1".to_owned(),
         2 => "localhost".to_owned(),
         _ => format!("{}example", "a.".repeat(100)),
     };
-    (1..=3)
+    (1..=members)
         .map(|n| (n, format!("http://{host}:{}", 2379 + n)))
         .collect()
 }
@@ -145,6 +170,23 @@ impl Simulation {
         upgraded: bool,
         hold_members: bool,
     ) -> Self {
+        Self::build(seed, shared, quotas, reference, upgraded, hold_members, 3).await
+    }
+
+    /// Start a simulation with `members` voters. Shared mode has a reference state.
+    async fn with_size(seed: u64, shared: bool, members: u64) -> Self {
+        Self::build(seed, shared, BTreeMap::new(), shared, false, false, members).await
+    }
+
+    async fn build(
+        seed: u64,
+        shared: bool,
+        quotas: BTreeMap<u64, i64>,
+        reference: bool,
+        upgraded: bool,
+        hold_members: bool,
+        members: u64,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let reference = if reference {
             // The reference has no flags. The seed entry of the first leader gives it the
@@ -172,6 +214,7 @@ impl Simulation {
             committed_entries: BTreeMap::new(),
             terms: BTreeMap::new(),
             isolated: None,
+            joining: None,
             paused_apply: None,
             paused_flush: None,
             paused_reads: None,
@@ -191,13 +234,21 @@ impl Simulation {
             }),
             reference,
             digests: BTreeMap::new(),
+            loaded: BTreeMap::new(),
             checked: BTreeMap::new(),
             view_checks: 0,
             quotas,
             upgraded,
             hold_members,
+            members,
+            processes: BTreeMap::new(),
+            old: BTreeSet::new(),
+            old_installs: 0,
+            refused_snapshots: 0,
+            delivered_views: vec![],
+            extended: 0,
         };
-        for id in 1..=3 {
+        for id in 1..=sim.members {
             sim.start(id).await;
         }
         sim.nodes.get_mut(&1).unwrap().raw.campaign().unwrap();
@@ -215,7 +266,7 @@ impl Simulation {
     async fn start(&mut self, id: u64) {
         let (events, _) = mpsc::channel(256);
         let mut senders = BTreeMap::new();
-        for peer in 1..=3 {
+        for peer in 1..=self.members {
             if peer == id {
                 continue;
             }
@@ -259,7 +310,7 @@ impl Simulation {
         // Box the large open future, so the schedule future fits the test thread stack.
         let mut node = Box::pin(Node::open_with_transport(
             NodeOptions {
-                client_peers: client_urls(id),
+                client_peers: client_urls(id, self.members),
                 transport: crate::tls::Transport::default(),
                 require_peer_tls: false,
                 state_mode: if shared {
@@ -278,7 +329,7 @@ impl Simulation {
                     if shared { "root" } else { "state" }.into(),
                 ),
                 strict_reconfiguration: false,
-                join: false,
+                join: self.joining == Some(id),
                 quota_bytes: flag,
                 quota_reassert: false,
                 quota_warning_fraction: 0.0,
@@ -286,7 +337,9 @@ impl Simulation {
                 id,
                 cluster_id: "dst".into(),
                 dir: self.root.path().join(id.to_string()),
-                peers: (1..=3).map(|n| (n, format!("127.0.0.1:{n}"))).collect(),
+                peers: (1..=self.members)
+                    .map(|n| (n, format!("127.0.0.1:{n}")))
+                    .collect(),
                 // Shared members truncate often, so a lagging member needs a format 6 snapshot.
                 snapshot_every: if shared { 8 } else { 0 },
                 snapshot_min_bytes: 0,
@@ -305,12 +358,15 @@ impl Simulation {
         node.quota.hold = self.upgraded;
         node.hold_members = self.hold_members;
         self.nodes.insert(id, node);
+        let process = self.processes.values().max().map_or(1, |last| last + 1);
+        self.processes.insert(id, process);
         self.trace.push(format!("start {id}"));
     }
 
     fn stop(&mut self, id: u64) {
         if let Some(node) = self.nodes.remove(&id) {
             self.installed_snapshots += node.installed_snapshots;
+            self.extended += node.worker.state().extensions();
             drop(node);
         }
         self.trace.push(format!("stop {id}"));
@@ -538,11 +594,9 @@ impl Simulation {
     /// stays exact.
     async fn settle_opens(&mut self) {
         for node in self.nodes.values_mut() {
-            if node.worker.state_mut().settle_opens().await {
-                if let Some(writer) = &mut node.writer {
-                    writer.switch_due = true;
-                }
-            }
+            node.worker.state_mut().settle_opens().await;
+            // An announcement of the current base offers it at once, with no open.
+            node.note_offers();
         }
     }
 
@@ -564,6 +618,7 @@ impl Simulation {
             let digest = rows_digest(reference.applied_state()).await.unwrap();
             self.digests.insert(reference.applied, digest);
         }
+        self.check_loaded();
         for (&id, node) in &self.nodes {
             let applied = node.state.applied;
             if self.checked.get(&id) == Some(&applied) {
@@ -590,7 +645,7 @@ impl Simulation {
             return;
         }
         let index = self.choose(self.messages.len());
-        let message = self.messages.remove(index);
+        let mut message = self.messages.remove(index);
         self.trace.push(format!(
             "message {} {} {:?} {} {}",
             message.from,
@@ -608,8 +663,16 @@ impl Simulation {
         if faults && self.choose(40) == 0 {
             self.messages.push(message.clone());
         }
+        if message.get_msg_type() == MessageType::MsgSnapshot {
+            let Some(accepted) = self.receive_snapshot(message.clone()).await else {
+                return;
+            };
+            message = accepted;
+        }
+        let process = self.process(message.from);
         let mut saved = None;
         if let Some(node) = self.nodes.get_mut(&message.to) {
+            node.raw.store().note_process(message.from, process);
             let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
             let from = message.from;
             let to = message.to;
@@ -645,13 +708,18 @@ impl Simulation {
     async fn tick(&mut self, id: u64) {
         if let Some(node) = self.nodes.get_mut(&id) {
             // Fix the timeout before every logical tick, including after a Raft role change.
+            // Five members need timeouts below twice the election tick.
+            let step = if self.members > 3 { 1 } else { 2 };
             node.raw
                 .raft
-                .set_randomized_election_timeout(10 + id as usize * 2);
+                .set_randomized_election_timeout(10 + id as usize * step);
             node.tick_raft().unwrap();
+            // The shared leader serves a demand for a base at each tick, as `tick_shared` does.
+            node.certify_base().unwrap();
             node.retry_reads();
             self.trace.push(format!("tick {id}"));
         }
+        self.report_view(id);
         self.drive().await;
     }
 
@@ -830,11 +898,12 @@ impl Simulation {
     /// Tick every member `rounds` times and deliver the resulting messages.
     /// 25 rounds pass an election timeout.
     async fn settle(&mut self, rounds: usize) {
+        let deliveries = if self.members > 3 { 60 } else { 30 };
         for _ in 0..rounds {
-            for id in 1..=3 {
+            for id in 1..=self.members {
                 self.tick(id).await;
             }
-            for _ in 0..30 {
+            for _ in 0..deliveries {
                 self.deliver(false).await;
             }
         }
@@ -2249,7 +2318,9 @@ impl Simulation {
     /// A follower, not `except`.
     fn follower(&self, except: u64) -> u64 {
         let leader = self.leader().unwrap();
-        (1..=3).find(|&id| id != leader && id != except).unwrap()
+        (1..=self.members)
+            .find(|&id| id != leader && id != except)
+            .unwrap()
     }
 
     /// The indexes of the committed `SetQuota` entries that set `bytes`.
@@ -2872,8 +2943,19 @@ impl Simulation {
                 11..=12 => {
                     let id = sim.choose(3) as u64 + 1;
                     sim.tick(id).await;
+                    // A follower asks for a snapshot at its last index. Announcements and
+                    // unmaterialized batches can follow the leader's base row.
+                    if sim.choose(2) == 0 {
+                        if let Some(node) = sim.nodes.get_mut(&id) {
+                            if node.raw.request_snapshot().is_ok() {
+                                sim.trace.push(format!("request snapshot {id}"));
+                            }
+                        }
+                    }
                 }
-                13..=17 => sim.propose().await,
+                // A failed update changes no state, so an announcement can cover it.
+                13..=14 => sim.propose_noop().await,
+                15..=17 => sim.propose().await,
                 18 => sim.view_read().await,
                 31..=33 => {
                     if let Some(leader) = leader {
@@ -2988,6 +3070,10 @@ impl Simulation {
             }
             if round < 40 {
                 sim.propose().await;
+                // A failed update after the Put lets the next announcement cover it.
+                if round % 2 == 0 {
+                    sim.propose_noop().await;
+                }
                 sim.view_read().await;
             }
             for _ in 0..30 {
@@ -3010,6 +3096,8 @@ impl Simulation {
                 }
             }
         }
+        sim.restart_above_rows().await;
+        sim.assert_records_open().await;
         // Every member reaches the last commit with the reference state.
         let commit = sim
             .nodes
@@ -3042,8 +3130,14 @@ impl Simulation {
         for (_, mut writer) in writers {
             writer.close().await;
         }
+        let extended = sim.extended
+            + sim
+                .nodes
+                .values()
+                .map(|node| node.worker.state().extensions())
+                .sum::<u64>();
         sim.trace.push(format!(
-            "acknowledged {} views checked {}",
+            "acknowledged {} views checked {} extended {extended}",
             sim.acknowledged.len(),
             sim.view_checks
         ));
@@ -3054,6 +3148,9 @@ impl Simulation {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shared_store_schedules_replay_identically() {
     let seeds = std::env::var("SLATEDB_DST_SHARED_SEEDS").unwrap_or_else(|_| "1,2,3".into());
+    // Opens and installs above a checkpoint row, over all seeds. The loaded-field check covers
+    // that path only when it runs.
+    let mut extended = 0;
     for seed in seeds.split(',').map(|s| s.parse::<u64>().unwrap()) {
         eprintln!("shared DST seed {seed}: starting");
         let first = Simulation::run_shared(seed).await;
@@ -3070,8 +3167,21 @@ async fn shared_store_schedules_replay_identically() {
             first, second,
             "shared seed {seed}: simulation schedule changed"
         );
-        eprintln!("shared DST seed {seed}: {} events replayed", first.len());
+        let count = first
+            .last()
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|count| count.parse::<u64>().ok())
+            .unwrap();
+        extended += count;
+        eprintln!(
+            "shared DST seed {seed}: {} events replayed, {count} bases above their row",
+            first.len()
+        );
     }
+    assert!(
+        extended > 0,
+        "no member opened or installed a base above its row"
+    );
 }
 
 impl Simulation {
