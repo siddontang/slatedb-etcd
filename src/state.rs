@@ -122,6 +122,9 @@ pub struct StateMachine {
     /// The next write batch stores the in-memory membership. Only a log of an earlier binary
     /// sets it. See `state::cluster`.
     pub(crate) members_unsaved: bool,
+    /// The length of the membership row that `before_entry` counted in the logical size before
+    /// the next batch stores it. See `state::cluster`.
+    members_counted: Option<usize>,
     /// The stored `etcd/members` row, if any. See `cluster::MembersRow`.
     pub(crate) members_row: Option<cluster::MembersRow>,
     /// The leader of the last `SeedMembers` entry whose row digest differed from this row.
@@ -473,6 +476,7 @@ impl StateMachine {
             row_marker: None,
             location,
             members_unsaved: false,
+            members_counted: None,
             members_row,
             members_mismatch: None,
             reads,
@@ -544,6 +548,11 @@ impl StateMachine {
             return Ok(size);
         }
         let mut size = size;
+        // The size of this batch counts the row that it stores, so remove the count of
+        // `before_entry`.
+        if let Some(counted) = self.members_counted.take() {
+            size.replace_row(crate::cluster::KEY, Some(counted), None)?;
+        }
         if members_saved && !batch.contains(crate::cluster::KEY) {
             let value = serde_json::to_vec(self.members.as_ref())?;
             let old = self

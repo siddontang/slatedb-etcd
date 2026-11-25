@@ -805,4 +805,79 @@ mod tests {
         assert!(node.state.members_row.is_some());
         assert!(!node.quota_guarded());
     }
+
+    /// An earlier binary counted its bootstrap row from its first batch. A member that replays
+    /// the log from empty counts the row before the first other entry checks the quota. That
+    /// entry can start an apply batch or fall inside one. Each member then makes the decisions
+    /// of a member that flushed the first entry, also at the quota boundary.
+    #[tokio::test]
+    async fn a_legacy_replay_counts_the_row_before_the_first_put() {
+        let members = std::sync::Arc::new(crate::cluster::Store::initial(
+            &options(std::path::Path::new("")).peers,
+        ));
+        // The row alone fills the quota. A member that counts it rejects the first Put.
+        let quota = (crate::cluster::KEY.len()
+            + serde_json::to_vec(members.as_ref()).unwrap().len()) as i64;
+        let entries: Vec<_> = (1..=5)
+            .map(|index| Entry {
+                index,
+                term: 1,
+                data: if index > 2 {
+                    put(index as usize).encode().unwrap()
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            })
+            .collect();
+        let header = apply::Header {
+            cluster: 1,
+            member: 1,
+            term: 1,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut flushed = StateMachine::open(&dir.path().join("flushed"))
+            .await
+            .unwrap();
+        flushed.set_quota_flag(quota);
+        flushed.members = members.clone();
+        flushed.members_unsaved = true;
+        flushed.apply(1, None).await.unwrap();
+        flushed.db().flush().await.unwrap();
+        flushed.close().await.unwrap();
+        drop(flushed);
+        let mut flushed = StateMachine::open(&dir.path().join("flushed"))
+            .await
+            .unwrap();
+        flushed.set_quota_flag(quota);
+        apply::apply_entries(&mut flushed, entries[1..].to_vec(), header)
+            .await
+            .unwrap();
+        let expected = applied(&flushed).await;
+        assert_eq!((expected.1, expected.3), (1, 1));
+        flushed.close().await.unwrap();
+        // The first Put starts a batch, is inside one, or ends one.
+        for batches in [
+            vec![5],
+            vec![2, 3],
+            vec![1, 4],
+            vec![3, 2],
+            vec![1, 1, 1, 1, 1],
+        ] {
+            let path = dir.path().join(format!("replayed-{batches:?}"));
+            let mut replayed = StateMachine::open(&path).await.unwrap();
+            replayed.set_quota_flag(quota);
+            replayed.members = members.clone();
+            let mut rest = entries.as_slice();
+            for count in &batches {
+                let (batch, tail) = rest.split_at(*count);
+                apply::apply_entries(&mut replayed, batch.to_vec(), header)
+                    .await
+                    .unwrap();
+                rest = tail;
+            }
+            assert_eq!(applied(&replayed).await, expected, "batches {batches:?}");
+            replayed.close().await.unwrap();
+        }
+    }
 }

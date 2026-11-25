@@ -891,11 +891,15 @@ pub(super) mod tests {
             let dir = tempfile::tempdir().unwrap();
             append_committed(dir.path(), 1, &commands);
             if flushed {
-                // The earlier binary applied and flushed every entry under its flag.
+                // The earlier binary applied and flushed every entry under its flag. It stored
+                // its bootstrap membership with its first batch.
                 let mut state = StateMachine::open(&dir.path().join("objects"))
                     .await
                     .unwrap();
                 state.quota = 3000;
+                let peers = options(dir.path()).peers;
+                state.members = std::sync::Arc::new(crate::cluster::Store::initial(&peers));
+                state.members_unsaved = true;
                 for (index, command) in (1..).zip(&commands) {
                     let RaftCommand::Etcd { etcd, origin, .. } = command else {
                         unreachable!()

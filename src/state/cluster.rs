@@ -13,9 +13,9 @@
 //! A leader proposes `SeedMembers` right after its election, before any other entry of its term
 //! except `SetQuota`. An earlier binary has no seed, and it stored the bootstrap membership with
 //! its first batch. So another entry that finds no row comes from a log of an earlier binary.
-//! The batch of that entry then stores the in-memory membership, as that binary did. An upgraded
-//! member that replays such a log gets the row of the members that flushed it. Only the quota
-//! check of that one entry does not count the row. A state that this binary created empty never
+//! The batch of that entry then stores the in-memory membership, as that binary did, and the
+//! quota check of that entry already counts it. An upgraded member that replays such a log gets
+//! the row and the decisions of the members that flushed it. A state that this binary created empty never
 //! applies such an entry. The quota guard stops it there and asks for a snapshot; see
 //! `node::quota`.
 //!
@@ -168,11 +168,22 @@ impl StateMachine {
     /// Prepare the state for the next entry, `command`. An entry that `needs_members` selects
     /// and that finds no row comes from a log of an earlier binary. Its batch then stores the
     /// in-memory membership, as that binary did. See the module comment.
-    pub(crate) fn before_entry(&mut self, command: &crate::RaftCommand) {
-        if self.members_row.is_none() && !self.members.members.is_empty() && needs_members(command)
+    ///
+    /// That binary counted the row before this entry. So the logical size counts it now, before
+    /// the entry checks the quota, wherever the entry falls in an apply batch.
+    pub(crate) fn before_entry(&mut self, command: &crate::RaftCommand) -> Result<()> {
+        if self.members_row.is_none()
+            && !self.members_unsaved
+            && !self.members.members.is_empty()
+            && needs_members(command)
         {
+            let len = serde_json::to_vec(self.members.as_ref())?.len();
+            self.logical_bytes
+                .replace_row(crate::cluster::KEY, None, Some(len))?;
+            self.members_counted = Some(len);
             self.members_unsaved = true;
         }
+        Ok(())
     }
 
     /// Apply a seed of the in-memory membership at `index`, as a first leader does.
