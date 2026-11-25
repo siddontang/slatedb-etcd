@@ -254,6 +254,11 @@ The materializer runs only on the leader that holds the writer epoch.
    result is correct (invariant 1).
 4. Repeat step 3 as apply adds batches.
 
+The task waits past its own position, the higher of `last` and the last released index, not
+past `last_l0_seq`. A released batch is in the base, so the task skips it and sleeps until a
+later batch arrives. The physical sequence stays where the writes left it, and publications
+take their checkpoint row from it.
+
 The materializer may lag apply. The overlay keeps the lagging batches (invariant 4).
 A materializer error closes the writer and starts the recovery in
 [Leader change](#leader-change-and-fencing).
@@ -329,7 +334,8 @@ cluster with no leader therefore keep their checkpoints.
    log truncation through it (invariant 5).
 
 A member can release a batch above `F(C)`. The batch holds only rows that `C` already holds, so
-a new leader's materializer can skip it. `last_l0_seq` is at or above `F(C)`.
+a new leader's materializer can skip it. `last_l0_seq` is at or above `F(C)`, but it can be
+below the released batch.
 
 A failed open does not change the current base. The member keeps its view and overlay, and it
 waits for the next checkpoint.
@@ -403,11 +409,12 @@ the rebase opens the current base again at its base index, with the log term the
 - **Demand:** Raft can ask the leader for a snapshot at a follower's last index. A guarded member
   does this, and on an idle cluster no batch follows the leader's base. A follower's manual
   checkpoint can also need a base above the leader's base index, because the follower grouped
-  its entries in another way. The leader keeps the highest such index until a durable record
-  reaches it. At each tick it serves the demand:
+  its entries in another way. At each tick the leader serves the highest such index that no
+  durable record reaches:
   1. If its base index reaches the demand, it does nothing. The snapshot record follows the base.
-  2. It reads the base row, then the position. If a batch is above the row, it asks for a
-     publication and waits for that checkpoint.
+  2. It reads the base, then the position. If an unreleased batch is above the base row, it asks
+     for a publication and waits for that checkpoint. A batch that a base released holds no
+     change above that base row, so it does not count.
   3. Otherwise it announces the same checkpoint again with its covered index. This needs no new
      checkpoint. The entry raises the base index of every member, and the leader records the
      base there with the Raft term at that index.

@@ -145,6 +145,8 @@ pub(crate) struct Queue {
     batches: Mutex<VecDeque<(u64, Arc<WriteBatch>)>>,
     /// One channel sends both values, so a reader gets them from the same applied state.
     position: tokio::sync::watch::Sender<Position>,
+    /// The base index of the last release. The base holds every batch at or below it.
+    released: AtomicU64,
 }
 
 impl Queue {
@@ -156,6 +158,7 @@ impl Queue {
                 covered: base,
             })
             .0,
+            released: AtomicU64::new(base),
         }
     }
 
@@ -203,7 +206,10 @@ impl Queue {
 
     /// Drop every batch and start again after `base`.
     fn reset(&self, base: u64) {
-        self.batches.lock().unwrap().clear();
+        let mut batches = self.batches.lock().unwrap();
+        batches.clear();
+        self.released.store(base, Ordering::Release);
+        drop(batches);
         self.position.send_replace(Position {
             pushed: base,
             covered: base,
@@ -215,6 +221,13 @@ impl Queue {
         while batches.front().is_some_and(|(seq, _)| *seq <= through) {
             batches.pop_front();
         }
+        self.released.fetch_max(through, Ordering::AcqRel);
+    }
+
+    /// The base index of the last release. A base holds every batch at or below it, so the
+    /// materializer has nothing to write there, even above the physical sequence of the `Db`.
+    pub(crate) fn released(&self) -> u64 {
+        self.released.load(Ordering::Acquire)
     }
 
     pub(crate) fn len(&self) -> usize {

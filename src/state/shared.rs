@@ -1152,8 +1152,8 @@ pub(crate) struct Shared {
     /// The checkpoint of the newest applied `ViewCheckpoint` entry. A new writer does not
     /// announce it again.
     announced: Arc<tokio::sync::watch::Sender<Option<uuid::Uuid>>>,
-    /// The checkpoint of the current base and its row `F`.
-    base_id: Arc<tokio::sync::watch::Sender<Option<(uuid::Uuid, u64)>>>,
+    /// The checkpoint of the current base, its row `F`, and its base index.
+    base_id: Arc<tokio::sync::watch::Sender<Option<BaseRef>>>,
     /// Background opens of announced checkpoints. DST waits for them to keep schedules exact.
     opening: Vec<tokio::task::JoinHandle<()>>,
     /// A failed open tries again until the base opens or a newer announcement replaces it.
@@ -1265,7 +1265,7 @@ impl Shared {
         Self {
             overlay: Overlay::new(base.applied),
             based: Arc::new(tokio::sync::watch::channel(base.applied).0),
-            base_id: Arc::new(tokio::sync::watch::channel(base_id(&base)).0),
+            base_id: Arc::new(tokio::sync::watch::channel(base_ref(&base, base.applied)).0),
             base_index: base.applied,
             base,
             opened: Arc::default(),
@@ -1342,7 +1342,7 @@ impl Shared {
 
     fn set_base(&mut self, base: Arc<Base>, index: u64) {
         self.based.send_replace(index);
-        self.base_id.send_replace(base_id(&base));
+        self.base_id.send_replace(base_ref(&base, index));
         self.base_index = index;
         self.base = base;
     }
@@ -1388,11 +1388,25 @@ impl Shared {
         self.overlay.cover(index);
         self.base_index = index;
         self.based.send_replace(index);
+        self.base_id.send_replace(base_ref(&self.base, index));
     }
 }
 
-fn base_id(base: &Base) -> Option<(uuid::Uuid, u64)> {
-    base.checkpoint.map(|id| (id, base.applied))
+/// The checkpoint of a member's base, with its row `F` and the member's base index. One value
+/// holds all three, so a reader never pairs the index of one base with the row of another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BaseRef {
+    pub checkpoint: uuid::Uuid,
+    pub row: u64,
+    pub index: u64,
+}
+
+fn base_ref(base: &Base, index: u64) -> Option<BaseRef> {
+    base.checkpoint.map(|checkpoint| BaseRef {
+        checkpoint,
+        row: base.applied,
+        index,
+    })
 }
 
 /// The shared-mode handles that the node uses outside apply.
@@ -1404,8 +1418,8 @@ pub(crate) struct Handles {
     pub based: tokio::sync::watch::Receiver<u64>,
     /// The checkpoint of the newest applied `ViewCheckpoint` entry.
     pub announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
-    /// The checkpoint of the current base and its row `F`.
-    pub base_id: tokio::sync::watch::Receiver<Option<(uuid::Uuid, u64)>>,
+    /// The checkpoint of the current base, its row `F`, and its base index.
+    pub base_id: tokio::sync::watch::Receiver<Option<BaseRef>>,
     pub opened: Arc<Opened>,
 }
 

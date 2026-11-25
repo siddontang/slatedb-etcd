@@ -40,7 +40,7 @@ struct Inner {
 }
 
 impl Progress {
-    fn new(written: u64) -> Self {
+    pub(super) fn new(written: u64) -> Self {
         Self {
             inner: Mutex::default(),
             written: tokio::sync::watch::channel(written).0,
@@ -362,9 +362,11 @@ impl Writer {
         self.progress.request(self.covering(index));
     }
 
-    /// The batch sequence that holds the state through `index`. A later no-op entry has no batch.
+    /// The batch sequence that holds the state through `index`. A later no-op entry has no batch,
+    /// and a batch that the base released holds no change above the base row.
     pub fn covering(&self, index: u64) -> u64 {
-        index.min(self.queue.pushed())
+        let base = *self.applied.base_id.borrow();
+        index.min(demand::last_change(base, self.queue.position()))
     }
 
     /// Record the checkpoints that `member` pins. The publisher keeps them.
@@ -688,21 +690,31 @@ async fn bootstrap_wait(source: &Source) -> Option<String> {
 /// The writer opened at `last_l0_seq`. The batches at or below the written sequence are already
 /// in the `Db`. A batch that spans it is written whole: its rows are final values, so the result
 /// is the state at its sequence.
+///
+/// The task wakes past `next`, not past the physical sequence. A base can hold a released batch
+/// above that sequence: a member that grouped entries in another way stored a batch where the
+/// checkpoint row is lower, and a certified announcement released it. Such a batch changes no
+/// state in the base, so the task skips it and waits for a later batch. The physical sequence,
+/// which publications use as the checkpoint row, stays where the writes left it.
 pub(super) async fn materialize(
     db: Arc<slatedb::Db>,
     queue: Arc<Queue>,
     progress: Arc<Progress>,
 ) -> Result<()> {
-    let mut written = progress.written();
+    let mut next = progress.written();
     let mut pushed = queue.subscribe();
     loop {
-        pushed
-            .wait_for(|position| position.pushed > written)
-            .await?;
-        for (seq, batch) in queue.after(written, MATERIALIZE_BATCHES) {
+        next = next.max(queue.released());
+        pushed.wait_for(|position| position.pushed > next).await?;
+        let batches = queue.after(next, MATERIALIZE_BATCHES);
+        if batches.is_empty() {
+            // A release took the batches after the wait. The next pass reads its index.
+            continue;
+        }
+        for (seq, batch) in batches {
             db.write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
                 .await?;
-            written = seq;
+            next = seq;
             progress.wrote(seq);
         }
     }
@@ -853,8 +865,8 @@ struct Applied {
     based: tokio::sync::watch::Receiver<u64>,
     /// The checkpoint of the newest applied `ViewCheckpoint` entry.
     announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
-    /// The checkpoint of the current base and its row `F`.
-    base_id: tokio::sync::watch::Receiver<Option<(uuid::Uuid, u64)>>,
+    /// The checkpoint of the current base, its row `F`, and its base index.
+    base_id: tokio::sync::watch::Receiver<Option<crate::state::shared::BaseRef>>,
     /// Checks that fail before they read storage, for tests.
     #[cfg(test)]
     failures: Arc<std::sync::atomic::AtomicU32>,
@@ -958,12 +970,12 @@ async fn stranded(
         return Ok(None);
     };
     if *applied.announced.borrow() == Some(checkpoint.id)
-        || applied.base_id.borrow().map(|(id, _)| id) == Some(checkpoint.id)
+        || applied.base_id.borrow().map(|base| base.checkpoint) == Some(checkpoint.id)
     {
         return Ok(None);
     }
     let base = source.open_base(checkpoint.id).await?;
-    if base.applied < applied.base_id.borrow().map_or(0, |(_, row)| row) {
+    if base.applied < applied.base_id.borrow().map_or(0, |base| base.row) {
         return Ok(None);
     }
     if base.get(crate::cluster::KEY).await?.is_none() {
@@ -1302,7 +1314,8 @@ impl Node {
         let Some(writer) = &self.writer else {
             return Ok(false);
         };
-        let covers = demand::coverage(row, writer.queue.position());
+        let base = *writer.applied.base_id.borrow();
+        let covers = demand::coverage(row, base, writer.queue.position());
         self.propose_view(checkpoint, covers)
     }
 
@@ -1802,6 +1815,8 @@ impl Node {
 }
 
 mod demand;
+#[cfg(test)]
+mod materialize_tests;
 #[cfg(test)]
 mod record_tests;
 

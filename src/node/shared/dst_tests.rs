@@ -25,7 +25,9 @@ impl Simulation {
     /// Propose a Put on the leader that no client waits for. With `ignore_value` on a missing
     /// key it fails, so it changes no state and stores no batch.
     async fn propose_put(&mut self, put: PutRequest) {
-        let leader = self.leader().unwrap();
+        let Some(leader) = self.leader() else {
+            return;
+        };
         self.next_request += 1;
         let (tx, _) = oneshot::channel();
         self.nodes
@@ -331,6 +333,80 @@ async fn a_follower_manual_checkpoint_completes_with_a_certified_base() {
             .len(),
         views
     );
+
+    // Critic's probe: `grouped` released its batch at `j + 1`, and now it leads. Its writer
+    // opens below that batch, at `j`.
+    sim.lead(grouped).await;
+    sim.writer_step(&mut writers, grouped, WriterStep::Open)
+        .await;
+    let writer = &writers[&grouped];
+    assert_eq!(writer.written, j);
+    let queue = sim.nodes[&grouped]
+        .worker
+        .state()
+        .shared_handles()
+        .unwrap()
+        .queue;
+    assert!(queue.after(writer.written, 1).is_empty());
+    // The idle materializer waits for the next batch. The timer goes first, so a busy future
+    // cannot starve it.
+    use std::future::Future;
+    let progress = std::sync::Arc::new(shared::Progress::new(writer.written));
+    let mut materializer = Box::pin(shared::materialize(
+        writer.db.as_ref().unwrap().clone(),
+        queue,
+        progress,
+    ));
+    let mut polls = 0;
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+        result = std::future::poll_fn(|cx| {
+            polls += 1;
+            materializer.as_mut().poll(cx)
+        }) => panic!("idle materializer returned: {result:?}"),
+    }
+    drop(materializer);
+    // A new request extends the same checkpoint without a client write: the released batch
+    // holds no change above the row.
+    sim.settle(2).await;
+    let covered = sim.base(grouped).0;
+    let wanted = sim.nodes[&grouped].state.applied;
+    assert!(wanted > covered);
+    let receiver = sim.follower(grouped);
+    let store = sim.nodes[&grouped].raw.store();
+    assert!(store.snapshot(wanted, receiver).is_err());
+    assert_eq!(store.wanted_index(), wanted);
+    let announced = sim.announcements().len();
+    sim.settle(30).await;
+    let store = sim.nodes[&grouped].raw.store();
+    assert_eq!(
+        ((1..=4).contains(&polls), store.wanted_index()),
+        (true, 0),
+        "idle materializer polled {polls} times; durable snapshot at {}",
+        store.snapshot_index()
+    );
+    assert!(store.snapshot_index() >= wanted);
+    assert_eq!(sim.announcements().len(), announced + 1);
+    assert_eq!(
+        crate::state::shared::view_checkpoints(&admin)
+            .await
+            .unwrap()
+            .len(),
+        views
+    );
+    // The new leader publishes, accepts a write, and stops cleanly.
+    sim.propose().await;
+    sim.settle(2).await;
+    let key = format!("key-{}", sim.next_request);
+    assert!(sim.acknowledged.contains_key(&key));
+    sim.publish_view(&mut writers).await;
+    sim.settle(4).await;
+    assert!(sim.base(grouped).0 > wanted);
+    if let Some(mut writer) = writers.remove(&grouped) {
+        writer.close().await;
+    }
+    sim.stop(grouped);
 }
 
 /// Condition (a): a Put at `b + 1` is applied but not materialized, and a failed update follows.
