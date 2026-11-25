@@ -95,6 +95,19 @@ impl Drop for Simulation {
     }
 }
 
+/// The `--client-peer` flags of member `id`. Each member writes other URL text for the same
+/// peers, so a member-local membership row would differ from the reference.
+fn client_urls(id: u64) -> BTreeMap<u64, String> {
+    let host = match id {
+        1 => "127.0.0.1".to_owned(),
+        2 => "localhost".to_owned(),
+        _ => format!("{}example", "a.".repeat(100)),
+    };
+    (1..=3)
+        .map(|n| (n, format!("http://{host}:{}", 2379 + n)))
+        .collect()
+}
+
 impl Simulation {
     /// Start three replicated members. Their quota flags differ, but none rejects a write.
     async fn new(seed: u64) -> Self {
@@ -119,12 +132,11 @@ impl Simulation {
     ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let reference = if reference {
-            let mut reference = StateMachine::open(&root.path().join("reference"))
+            // The reference has no flags. The seed entry of the first leader gives it the
+            // membership row.
+            let reference = StateMachine::open(&root.path().join("reference"))
                 .await
                 .unwrap();
-            let peers = (1..=3).map(|n| (n, format!("127.0.0.1:{n}"))).collect();
-            reference.members = std::sync::Arc::new(crate::cluster::Store::initial(&peers));
-            reference.members_unsaved = true;
             Some(reference)
         } else {
             None
@@ -231,7 +243,7 @@ impl Simulation {
         // Box the large open future, so the schedule future fits the test thread stack.
         let mut node = Box::pin(Node::open_with_transport(
             NodeOptions {
-                client_peers: BTreeMap::new(),
+                client_peers: client_urls(id),
                 transport: crate::tls::Transport::default(),
                 require_peer_tls: false,
                 state_mode: if shared {
@@ -2089,6 +2101,12 @@ impl Simulation {
             assert_eq!(state.usage.total(), first.usage.total(), "member {id}");
             assert_eq!(state.cluster_quota, first.cluster_quota, "member {id}");
             assert_eq!(
+                state.members_row.as_ref().map(|row| &row.digest),
+                first.members_row.as_ref().map(|row| &row.digest),
+                "member {id}"
+            );
+            assert_eq!(state.members_mismatch, None, "member {id}");
+            assert_eq!(
                 node.worker.state().alarms.len(),
                 self.nodes[&1].worker.state().alarms.len(),
                 "member {id}"
@@ -2181,8 +2199,9 @@ impl Simulation {
     }
 }
 
-/// Members with different quota flags apply one cluster quota. Each member state at each applied
-/// index equals a reference state that applies the committed entries in order.
+/// Members with different quota flags apply one cluster quota. They also have other client URL
+/// text, but store one membership row. Each member state at each applied index equals a
+/// reference state that applies the committed entries in order.
 #[tokio::test]
 async fn members_with_different_quota_flags_switch_quota_at_one_index() {
     let quotas = BTreeMap::from([(1, 1 << 20), (2, 3000), (3, 1 << 20)]);
@@ -2195,6 +2214,11 @@ async fn members_with_different_quota_flags_switch_quota_at_one_index() {
     sim.write(40).await;
     assert_eq!(sim.cluster_quota(), Some(1 << 20));
     assert_eq!(sim.acknowledged.len(), 40);
+    // The first leader seeded the row with its own client URL text.
+    assert_eq!(
+        sim.nodes[&3].state.members.members[&3].client_ur_ls,
+        ["http://127.0.0.1:2382"]
+    );
     assert!(sim.nodes[&2].state.usage.total() > 3000);
     assert!(sim.nodes[&2].state.quota_mismatch);
     assert!(!sim.nodes[&1].state.quota_mismatch);

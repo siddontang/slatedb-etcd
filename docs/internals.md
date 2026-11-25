@@ -289,6 +289,18 @@ row keeps that index, so a restart retries the checkpoint. So the log of a leade
 holds such entries of earlier binaries. A new member installs a snapshot instead.
 A state that this binary created empty also stops before such an entry and requests a snapshot.
 See [quota changes](operations.md#change-the-quota).
+
+The `etcd/members` row also counts toward the logical size, so every replica must store the
+same bytes. The membership that a member builds from its `--peer` and `--client-peer` flags stays
+in memory. The leader proposes `SeedMembers` right after its election, before `SetQuota`. On a
+state without the row, this entry stores the membership of the leader. Later, cluster commands
+change the stored row, and a rejected command writes nothing. Raft snapshots carry the stored
+row and nothing else. A log of an earlier binary has other entries before any seed. Such an
+entry that finds no row stores the in-memory membership with its batch, as that binary did. A
+state that this binary created empty stops before such an entry and requests a snapshot, as for
+the quota. Each seed also carries a digest of the row of the leader. See
+[membership row](operations.md#membership-row).
+
 Each member flushes SlateDB outside ordered apply when a step finishes a physical boundary.
 Writes can apply during this flush. One flush can run at a time.
 The highest queued index covers intervening requests.

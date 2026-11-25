@@ -1234,8 +1234,8 @@ async fn read_index_retries_after_the_first_commit_in_a_new_term() {
     confirm_read(&mut node, &id).await;
     node.drain_apply().await.unwrap();
     assert!(reply.await.unwrap().is_ok());
-    // The empty entry and the `SetQuota` entry of the new leader. The retries append nothing.
-    assert_eq!(node.raw.store().durable.last_index, 2);
+    // The empty entry, `SeedMembers`, and `SetQuota` of the new leader. Retries append none.
+    assert_eq!(node.raw.store().durable.last_index, 3);
     assert_eq!(node.raw.store().durable.sync_writes, syncs);
     assert!(node.reads.is_empty());
 }
@@ -1650,7 +1650,7 @@ async fn applied_state_enforces_the_effective_etcd_quota() {
     }
 }
 
-async fn commit_with_peer(node: &mut Node) {
+pub(super) async fn commit_with_peer(node: &mut Node) {
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
     let ack = Message {

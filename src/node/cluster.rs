@@ -4,6 +4,66 @@ use crate::mvcc::{KvError, Outcome};
 use tonic::Code;
 
 impl Node {
+    /// Propose `SeedMembers` once in each term of this leader. It seeds a state without the
+    /// membership row. Otherwise it lets every member compare its row with the row of this leader.
+    pub(super) fn propose_members(&mut self) -> Result<()> {
+        let term = self.raw.raft.term;
+        if self.raw.raft.state != StateRole::Leader || self.members_proposed == term {
+            return Ok(());
+        }
+        let row = self.state.members_row.as_ref();
+        // A joining member has no bootstrap membership. It gets the row from the cluster.
+        if row.is_none() && (self.options.join || self.state.members.members.is_empty()) {
+            return Ok(());
+        }
+        let data = RaftCommand::SeedMembers(crate::cluster::Seed {
+            id: uuid::Uuid::new_v4().to_string(),
+            origin: self.options.id,
+            members: serde_json::to_string(self.state.members.as_ref())?,
+            digest: row.map(|row| row.digest.clone()),
+            applied: self.state.applied,
+        })
+        .encode()?;
+        // Like `SetQuota`, the small entry skips the memory admission check. Raft drops it only
+        // during a leadership transfer, with every other proposal. The next call tries again.
+        if self.raw.propose(vec![], data).is_ok() {
+            self.members_proposed = term;
+        }
+        Ok(())
+    }
+
+    /// Warn once when the first stored row that this node sees differs from the bootstrap
+    /// membership of its flags. The stored row wins.
+    pub(super) fn observe_members(&mut self) {
+        if self.members_observed || self.state.members_row.is_none() {
+            return;
+        }
+        self.members_observed = true;
+        if self.options.join {
+            return;
+        }
+        let flags =
+            crate::cluster::Store::bootstrap(&self.options.peers, &self.options.client_peers);
+        let differences = flags.differences(&self.state.members);
+        if !differences.is_empty() {
+            tracing::warn!(
+                members = ?differences,
+                "the stored membership differs from the --peer and --client-peer flags; the \
+                 stored membership applies"
+            );
+        }
+    }
+
+    /// The membership row fields of `/status`.
+    pub(super) fn members_status(&self) -> Value {
+        let row = self.state.members_row.as_ref();
+        json!({
+            "digest": row.map(|row| row.digest.clone()),
+            "written": row.map(|row| row.written),
+            "mismatch_leader": self.state.members_mismatch,
+        })
+    }
+
     pub(super) fn publish_member(&mut self) -> Result<()> {
         if self.raw.raft.leader_id == 0
             || self.state.members.members.is_empty()
@@ -220,5 +280,394 @@ impl Node {
             ));
         }
         self.options.peers = peers;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{commit_with_peer, leader_node_with, options};
+    use super::*;
+    use crate::state::StateRead as _;
+    use raft::eraftpb::HardState;
+
+    /// A host name that makes each client URL about 200 bytes longer.
+    fn long_host() -> String {
+        format!("{}example", "a.".repeat(100))
+    }
+
+    /// The client URLs of members 1 to 3, with the host text `host`.
+    fn client_urls(host: &str) -> BTreeMap<u64, String> {
+        (1..=3)
+            .map(|id| (id, format!("http://{host}:{}", 2379 + id)))
+            .collect()
+    }
+
+    fn put(n: usize) -> RaftCommand {
+        RaftCommand::Etcd {
+            id: format!("put-{n}"),
+            origin: 1,
+            etcd: RequestOp {
+                request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
+                    crate::proto::etcdserverpb::PutRequest {
+                        key: format!("key-{n}").into_bytes(),
+                        value: vec![b'v'; 32],
+                        ..Default::default()
+                    },
+                )),
+            },
+        }
+    }
+
+    /// The committed log of a leader with the quota flag `quota` and then `puts` client Puts.
+    async fn leader_log(quota: i64, puts: usize) -> Vec<Entry> {
+        let dir = tempfile::tempdir().unwrap();
+        let mut leader = leader_node_with(dir.path(), |config| {
+            config.quota_bytes = quota;
+            config.client_peers = client_urls("127.0.0.1");
+        })
+        .await;
+        for n in 0..puts {
+            let (tx, _reply) = oneshot::channel();
+            leader.propose(put(n), ClientResponse::Kv(tx)).unwrap();
+            commit_with_peer(&mut leader).await;
+        }
+        let commit = leader.raw.store().commit_index();
+        leader
+            .raw
+            .raft
+            .raft_log
+            .entries(1, u64::MAX, raft::GetEntriesContext::empty(false))
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.index <= commit)
+            .collect()
+    }
+
+    /// Append `entries` as committed entries to the log of member `id` in `dir`. Then open the
+    /// member with `configure` and apply them.
+    async fn replay(
+        dir: &std::path::Path,
+        id: u64,
+        entries: &[Entry],
+        configure: impl FnOnce(&mut NodeOptions),
+    ) -> Node {
+        let mut config = options(dir);
+        config.id = id;
+        configure(&mut config);
+        let voters = if config.join { vec![] } else { vec![1, 2, 3] };
+        let mut storage = RaftStorage::open(&dir.join("raft"), id, "worker-test", voters).unwrap();
+        let last = entries.last().unwrap();
+        storage
+            .persist(
+                entries,
+                Some(&HardState {
+                    term: last.term,
+                    vote: 1,
+                    commit: last.index,
+                }),
+                None,
+            )
+            .unwrap();
+        drop(storage);
+        let (events, _) = mpsc::channel(256);
+        let mut node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            node.drive_ready().await.unwrap();
+            node.drain_log().await.unwrap();
+            node.drain_apply().await.unwrap();
+        }
+        assert_eq!(node.state.applied, last.index);
+        node
+    }
+
+    /// The apply results that must not depend on the member: index, revision, logical size,
+    /// alarms, and the bytes of the membership row.
+    type Applied = (u64, i64, u64, usize, Option<Vec<u8>>);
+
+    async fn applied(state: &StateMachine) -> Applied {
+        let row = state
+            .applied_state()
+            .get(crate::cluster::KEY)
+            .await
+            .unwrap();
+        (
+            state.applied,
+            state.revision,
+            state.logical_size(),
+            state.alarms.len(),
+            row.map(|row| row.to_vec()),
+        )
+    }
+
+    /// Two members that differ only in their client URL text apply one log alike, also when the
+    /// quota rejects some of its Puts. An earlier binary stored the flags of each member.
+    #[tokio::test]
+    async fn client_url_text_changes_no_replicated_apply_result() {
+        let entries = leader_log(3000, 40).await;
+        let mut results = vec![];
+        for (id, host) in [(2, "127.0.0.1".to_owned()), (3, long_host())] {
+            let dir = tempfile::tempdir().unwrap();
+            let node = replay(dir.path(), id, &entries, |config| {
+                config.client_peers = client_urls(&host);
+            })
+            .await;
+            results.push(applied(node.worker.state()).await);
+        }
+        assert_eq!(results[0], results[1]);
+        let (_, revision, _, alarms, row) = &results[0];
+        assert!(*revision > 1 && *revision < 41, "revision {revision}");
+        assert_eq!(*alarms, 1);
+        let row: crate::cluster::Store = serde_json::from_slice(row.as_ref().unwrap()).unwrap();
+        assert_eq!(row.members[&3].client_ur_ls, ["http://127.0.0.1:2382"]);
+    }
+
+    /// Shared mode: two members on one store apply the same log alike. Only their bootstrap
+    /// client URL text differs. Earlier, the first entry stored the flags of each member.
+    #[tokio::test]
+    async fn client_url_text_changes_no_shared_apply_result() {
+        let entries = leader_log(-1, 40).await;
+        let store = std::sync::Arc::new(slatedb::object_store::memory::InMemory::new());
+        let shared = crate::state::shared::Options {
+            quota: 3000,
+            voters: vec![1, 2, 3],
+            join: false,
+            empty_log: true,
+            pin_max: Duration::from_secs(300),
+            restore: None,
+        };
+        let mut results = vec![];
+        for host in ["127.0.0.1".to_owned(), long_host()] {
+            let mut state = StateMachine::open_shared(
+                store.clone(),
+                "root",
+                "test",
+                crate::state::StateCache::default(),
+                &shared,
+                crate::state::transfer::Backend::Local,
+            )
+            .await
+            .unwrap();
+            // Node startup builds this membership from the flags.
+            let mut members =
+                crate::cluster::Store::initial(&options(std::path::Path::new("")).peers);
+            for (id, url) in client_urls(&host) {
+                members.members.get_mut(&id).unwrap().client_ur_ls = vec![url];
+            }
+            state.members = std::sync::Arc::new(members);
+            let header = apply::Header {
+                cluster: 1,
+                member: 1,
+                term: 1,
+            };
+            apply::apply_entries(&mut state, entries.clone(), header)
+                .await
+                .unwrap();
+            results.push(applied(&state).await);
+            state.close().await.unwrap();
+        }
+        assert_eq!(results[0], results[1]);
+        let (_, revision, _, alarms, row) = &results[0];
+        assert!(*revision > 1 && *revision < 41, "revision {revision}");
+        assert_eq!(*alarms, 1);
+        assert!(row.is_some());
+    }
+
+    /// A member that restarts before the seed applies keeps its bootstrap membership in memory
+    /// only. It then applies the seed like any other member. A joining member gets the row from
+    /// the log.
+    #[tokio::test]
+    async fn the_row_comes_from_the_seed_after_a_restart_or_a_join() {
+        let entries = leader_log(3000, 40).await;
+        let seed = entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    RaftCommand::decode(&entry.data),
+                    Ok(RaftCommand::SeedMembers(_))
+                )
+            })
+            .unwrap();
+        let reference = tempfile::tempdir().unwrap();
+        let reference = replay(reference.path(), 2, &entries, |_| {}).await;
+        let expected = applied(reference.worker.state()).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let host = long_host();
+        let node = replay(dir.path(), 3, &entries[..seed], |config| {
+            config.client_peers = client_urls(&host);
+        })
+        .await;
+        assert!(node.state.members_row.is_none());
+        assert_eq!(node.state.usage.total(), 0);
+        assert_eq!(
+            node.state.members.members[&1].client_ur_ls,
+            [format!("http://{host}:2380")]
+        );
+        drop(node);
+        let node = replay(dir.path(), 3, &entries[seed..], |config| {
+            config.client_peers = client_urls(&host);
+        })
+        .await;
+        assert_eq!(applied(node.worker.state()).await, expected);
+        // The stored row replaces the bootstrap membership in memory.
+        assert_eq!(
+            node.state.members.members[&1].client_ur_ls,
+            ["http://127.0.0.1:2380"]
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let node = replay(dir.path(), 3, &entries, |config| config.join = true).await;
+        assert_eq!(applied(node.worker.state()).await, expected);
+    }
+
+    /// Open a member of a one-voter cluster and tick it until it leads. Return the commands of
+    /// its log.
+    async fn lead_alone(configure: impl FnOnce(&mut Node)) -> (Node, Vec<RaftCommand>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = options(dir.path());
+        config.peers = BTreeMap::from([(1, "127.0.0.1:1".to_owned())]);
+        let (events, _) = mpsc::channel(256);
+        let mut node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
+            .await
+            .unwrap();
+        configure(&mut node);
+        while node.raw.raft.state != StateRole::Leader {
+            node.tick().unwrap();
+        }
+        let commands = node
+            .raw
+            .raft
+            .raft_log
+            .entries(1, u64::MAX, raft::GetEntriesContext::empty(false))
+            .unwrap()
+            .iter()
+            .filter(|entry| !entry.data.is_empty())
+            .map(|entry| RaftCommand::decode(&entry.data).unwrap())
+            .collect();
+        (node, commands)
+    }
+
+    /// A leader proposes `SeedMembers`, then `SetQuota`, before the `Publish` of the tick that
+    /// elects it. A joining member without the row proposes no seed.
+    #[tokio::test]
+    async fn a_new_leader_seeds_the_members_before_other_entries() {
+        let (mut node, commands) = lead_alone(|node| {
+            // A client URL that differs from the flag makes the member publish at once.
+            let mut members = node.state.members.as_ref().clone();
+            members.members.get_mut(&1).unwrap().client_ur_ls = vec!["http://other:1".into()];
+            node.state.members = std::sync::Arc::new(members);
+        })
+        .await;
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [
+                    RaftCommand::SeedMembers(crate::cluster::Seed { digest: None, .. }),
+                    RaftCommand::SetQuota { .. },
+                    RaftCommand::Cluster {
+                        request: C::Publish { .. },
+                        ..
+                    },
+                ]
+            ),
+            "{commands:?}"
+        );
+        // One seed in each term.
+        node.propose_term_start().unwrap();
+        assert_eq!(node.raw.raft.raft_log.last_index(), 4);
+
+        let (_, commands) = lead_alone(|node| node.options.join = true).await;
+        assert!(
+            matches!(commands.as_slice(), [RaftCommand::SetQuota { .. }]),
+            "{commands:?}"
+        );
+    }
+
+    /// A log of an earlier binary has no seed. Its first other entry stores the bootstrap
+    /// membership, as that binary did with its first batch. A member that replays the log from
+    /// index 1 after an upgrade then matches a member that flushed a prefix under that binary.
+    #[tokio::test]
+    async fn a_log_of_an_earlier_binary_replays_as_that_binary_applied_it() {
+        let publish = RaftCommand::Cluster {
+            id: "publish-2".into(),
+            request: C::Publish {
+                id: 2,
+                client_urls: vec!["http://published:2381".into()],
+            },
+            credentials: Default::default(),
+        };
+        let commands: Vec<_> = std::iter::once(publish).chain((0..40).map(put)).collect();
+        let entries: Vec<_> = std::iter::once(Entry {
+            index: 1,
+            term: 1,
+            ..Default::default()
+        })
+        .chain((2..).zip(&commands).map(|(index, command)| Entry {
+            index,
+            term: 1,
+            data: command.encode().unwrap(),
+            ..Default::default()
+        }))
+        .collect();
+        let header = apply::Header {
+            cluster: 1,
+            member: 1,
+            term: 1,
+        };
+        let flags = || {
+            let mut members =
+                crate::cluster::Store::initial(&options(std::path::Path::new("")).peers);
+            for (id, url) in client_urls("127.0.0.1") {
+                members.members.get_mut(&id).unwrap().client_ur_ls = vec![url];
+            }
+            std::sync::Arc::new(members)
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // The earlier binary stored the flags with entry 1, applied two more, and flushed.
+        let mut flushed = StateMachine::open(&dir.path().join("flushed"))
+            .await
+            .unwrap();
+        flushed.set_quota_flag(3000);
+        flushed.members = flags();
+        flushed.members_unsaved = true;
+        flushed.apply(1, None).await.unwrap();
+        apply::apply_entries(&mut flushed, entries[1..3].to_vec(), header)
+            .await
+            .unwrap();
+        flushed.db().flush().await.unwrap();
+        flushed.close().await.unwrap();
+        drop(flushed);
+        let mut flushed = StateMachine::open(&dir.path().join("flushed"))
+            .await
+            .unwrap();
+        flushed.set_quota_flag(3000);
+        apply::apply_entries(&mut flushed, entries[3..].to_vec(), header)
+            .await
+            .unwrap();
+        // This member flushed nothing. It replays the whole log.
+        let mut replayed = StateMachine::open(&dir.path().join("replayed"))
+            .await
+            .unwrap();
+        replayed.set_quota_flag(3000);
+        replayed.members = flags();
+        apply::apply_entries(&mut replayed, entries[..1].to_vec(), header)
+            .await
+            .unwrap();
+        assert!(replayed.members_row.is_none());
+        apply::apply_entries(&mut replayed, entries[1..].to_vec(), header)
+            .await
+            .unwrap();
+        let expected = applied(&flushed).await;
+        assert_eq!(applied(&replayed).await, expected);
+        let (_, revision, _, alarms, row) = expected;
+        assert!(revision > 1 && revision < 41, "revision {revision}");
+        assert_eq!(alarms, 1);
+        let row: crate::cluster::Store = serde_json::from_slice(&row.unwrap()).unwrap();
+        assert_eq!(row.members[&2].client_ur_ls, ["http://published:2381"]);
+        assert_eq!(row.members[&1].client_ur_ls, ["http://127.0.0.1:2380"]);
+        flushed.close().await.unwrap();
+        replayed.close().await.unwrap();
     }
 }
