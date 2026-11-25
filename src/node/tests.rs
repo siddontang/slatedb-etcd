@@ -2115,9 +2115,11 @@ async fn a_snapshot_that_raft_skips_releases_its_staging_reservation() {
     state.close().await.unwrap();
 }
 
+type Hook = Box<dyn FnOnce(&std::path::Path)>;
+
 thread_local! {
     /// Runs in `Node::open` between the first restore marker check and the Raft lock.
-    pub(super) static BEFORE_RAFT_LOCK: std::cell::Cell<Option<Box<dyn FnOnce(&std::path::Path)>>> =
+    pub(super) static BEFORE_RAFT_LOCK: std::cell::Cell<Option<Hook>> =
         const { std::cell::Cell::new(None) };
 }
 
