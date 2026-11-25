@@ -10,7 +10,7 @@
 use std::fmt;
 use std::future::Future;
 use std::ops::Range;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -151,35 +151,64 @@ async fn run<T: Send + 'static>(
     work: impl Future<Output = Result<T>> + Send + 'static,
 ) -> Result<T> {
     let deadline = Instant::now() + limiter.timeout;
-    let mut slot = limiter.acquire(deadline).await?;
-    let task = tokio::spawn(async move {
-        let mut work = std::pin::pin!(work);
-        if let Ok(result) = tokio::time::timeout_at(deadline, &mut work).await {
-            return result;
-        }
-        slot.mark_late();
-        work.await
-    });
+    let slot = limiter.acquire(deadline).await?;
+    let task = tokio::spawn(hold(slot, deadline, work));
     match tokio::time::timeout_at(deadline, task).await {
         Ok(result) => result?,
         Err(_) => Err(limiter.timed_out()),
     }
 }
 
+/// Run `work` with `slot`. Mark the slot late when `work` passes `deadline`.
+async fn hold<T>(mut slot: Slot, deadline: Instant, work: impl Future<Output = T>) -> T {
+    let mut work = std::pin::pin!(work);
+    if let Ok(result) = tokio::time::timeout_at(deadline, &mut work).await {
+        return result;
+    }
+    slot.mark_late();
+    work.await
+}
+
+type Items<T> = BoxStream<'static, Result<T>>;
+
+/// Pull the next item of `stream` as one call.
+async fn pull<T: Send + 'static>(
+    limiter: &Arc<Limiter>,
+    mut stream: Items<T>,
+) -> Result<(Option<Result<T>>, Items<T>)> {
+    run(limiter, async move { Ok((stream.next().await, stream)) }).await
+}
+
 /// Pull each item of `stream` as one call. A late item ends the stream with an error.
-fn items<T: Send + 'static>(
-    limiter: Arc<Limiter>,
-    stream: BoxStream<'static, Result<T>>,
-) -> BoxStream<'static, Result<T>> {
+fn items<T: Send + 'static>(limiter: Arc<Limiter>, stream: Items<T>) -> Items<T> {
     futures::stream::unfold(Some(stream), move |stream| {
         let limiter = limiter.clone();
         async move {
-            let mut stream = stream?;
-            let next = run(&limiter, async move { Ok((stream.next().await, stream)) }).await;
-            match next {
+            match pull(&limiter, stream?).await {
                 Ok((Some(item), stream)) => Some((item, Some(stream))),
                 Ok((None, _)) => None,
                 Err(error) => Some((Err(error), None)),
+            }
+        }
+    })
+    .boxed()
+}
+
+/// Pull each chunk of a body of `len` bytes as one call. The stream ends after the last byte,
+/// so its end takes no call.
+fn body(limiter: Arc<Limiter>, stream: Items<Bytes>, len: u64) -> Items<Bytes> {
+    futures::stream::unfold((Some(stream), len), move |(stream, left)| {
+        let limiter = limiter.clone();
+        async move {
+            let stream = stream.filter(|_| left > 0)?;
+            match pull(&limiter, stream).await {
+                Ok((Some(Ok(chunk)), stream)) => {
+                    let left = left.saturating_sub(chunk.len() as u64);
+                    Some((Ok(chunk), (Some(stream), left)))
+                }
+                Ok((Some(Err(error)), stream)) => Some((Err(error), (Some(stream), left))),
+                Ok((None, _)) => None,
+                Err(error) => Some((Err(error), (None, left))),
             }
         }
     })
@@ -271,7 +300,8 @@ impl<S: ObjectStore> ObjectStore for Bounded<S> {
             }
             .into_stream(),
         };
-        result.payload = GetResultPayload::Stream(items(self.limiter.clone(), stream));
+        let len = result.range.end - result.range.start;
+        result.payload = GetResultPayload::Stream(body(self.limiter.clone(), stream, len));
         Ok(result)
     }
 
@@ -341,21 +371,36 @@ impl<S: ObjectStore> ObjectStore for Bounded<S> {
 
 /// A multipart upload whose calls hold call slots.
 ///
-/// A drop before `complete` or `abort` aborts the upload in a task that holds a slot. The
-/// inner upload then does no cleanup of its own outside the slots.
+/// The inner upload finishes only in a task that holds a slot: in `complete`, in `abort`, or
+/// after a drop. A call that gets no slot leaves the upload unfinished, so a drop still aborts
+/// it under a slot. The inner upload then does no cleanup of its own outside the slots.
+///
+/// A drop spawns the abort on the runtime that created the upload, also from a thread outside
+/// it. If that runtime has stopped, the inner upload removes its staging file on its own.
 #[derive(Debug)]
 struct Upload {
-    inner: Arc<Mutex<Box<dyn MultipartUpload>>>,
+    shared: Arc<Shared>,
     limiter: Arc<Limiter>,
-    finished: bool,
+    runtime: tokio::runtime::Handle,
+}
+
+#[derive(Debug)]
+struct Shared {
+    upload: Mutex<Box<dyn MultipartUpload>>,
+    /// Set under the lock by the task that completes or aborts the upload.
+    finished: AtomicBool,
 }
 
 impl Upload {
-    fn new(inner: Box<dyn MultipartUpload>, limiter: Arc<Limiter>) -> Self {
+    fn new(upload: Box<dyn MultipartUpload>, limiter: Arc<Limiter>) -> Self {
+        let shared = Shared {
+            upload: Mutex::new(upload),
+            finished: AtomicBool::new(false),
+        };
         Self {
-            inner: Arc::new(Mutex::new(inner)),
+            shared: Arc::new(shared),
             limiter,
-            finished: false,
+            runtime: tokio::runtime::Handle::current(),
         }
     }
 }
@@ -363,7 +408,7 @@ impl Upload {
 #[async_trait]
 impl MultipartUpload for Upload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
-        let part = match self.inner.try_lock() {
+        let part = match self.shared.upload.try_lock() {
             Ok(mut upload) => upload.put_part(data),
             Err(_) => {
                 let busy = error("the upload is completing or aborting".into());
@@ -375,39 +420,43 @@ impl MultipartUpload for Upload {
     }
 
     async fn complete(&mut self) -> Result<PutResult> {
-        self.finished = true;
-        let inner = self.inner.clone();
-        run(
-            &self.limiter,
-            async move { inner.lock().await.complete().await },
-        )
+        let shared = self.shared.clone();
+        run(&self.limiter, async move {
+            let mut upload = shared.upload.lock().await;
+            shared.finished.store(true, Ordering::SeqCst);
+            upload.complete().await
+        })
         .await
     }
 
     async fn abort(&mut self) -> Result<()> {
-        self.finished = true;
-        let inner = self.inner.clone();
-        run(
-            &self.limiter,
-            async move { inner.lock().await.abort().await },
-        )
+        let shared = self.shared.clone();
+        run(&self.limiter, async move {
+            let mut upload = shared.upload.lock().await;
+            shared.finished.store(true, Ordering::SeqCst);
+            upload.abort().await
+        })
         .await
     }
 }
 
 impl Drop for Upload {
     fn drop(&mut self) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        if self.finished {
+        if self.shared.finished.load(Ordering::SeqCst) {
             return;
         }
-        let inner = self.inner.clone();
+        let shared = self.shared.clone();
         let limiter = self.limiter.clone();
-        runtime.spawn(async move {
-            let _slot = limiter.wait().await;
-            let _ = inner.lock().await.abort().await;
+        self.runtime.spawn(async move {
+            let slot = limiter.wait().await;
+            let deadline = Instant::now() + limiter.timeout;
+            hold(slot, deadline, async move {
+                let mut upload = shared.upload.lock().await;
+                if !shared.finished.swap(true, Ordering::SeqCst) {
+                    let _ = upload.abort().await;
+                }
+            })
+            .await;
         });
     }
 }

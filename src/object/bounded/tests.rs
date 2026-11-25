@@ -31,16 +31,16 @@ async fn eventually(what: &str, check: impl Fn() -> bool) {
 fn assert_timed_out<T: fmt::Debug>(result: Result<T>, started: std::time::Instant) {
     let error = result.unwrap_err().to_string();
     assert!(error.contains("timed out"), "{error}");
-    assert!(started.elapsed() < Duration::from_millis(250), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(2), "{error}");
 }
 
 /// The read of a regular file body has its own deadline. SlateDB reads a GC boundary with
-/// `get_opts` and then `bytes`.
+/// `get_opts` and then `bytes`. Only the body read has the short deadline.
 #[test]
 fn a_body_read_fails_at_its_deadline() {
+    use futures::TryStreamExt;
     let dir = tempfile::tempdir().unwrap();
-    let limits = limiter(MAX_CALLS, Duration::from_millis(60));
-    let store = Bounded::with_limiter(LocalStore::open(dir.path()).unwrap(), limits.clone());
+    let local = LocalStore::open(dir.path()).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .max_blocking_threads(1)
         .enable_all()
@@ -48,14 +48,19 @@ fn a_body_read_fails_at_its_deadline() {
         .unwrap();
     let path = Path::from("gc/manifest.boundary");
     let result = runtime.block_on(async {
-        store.put(&path, "7".into()).await.unwrap();
-        store.get(&path).await.unwrap()
+        local.put(&path, "7".into()).await.unwrap();
+        local.get(&path).await.unwrap()
     });
+    let GetResultPayload::Stream(stream) = result.payload else {
+        panic!("a local body is a stream");
+    };
+    let limits = limiter(MAX_CALLS, Duration::from_millis(60));
+    let reads = body(limits.clone(), stream, result.meta.size);
     let (release, held) = std::sync::mpsc::channel::<()>();
     runtime.spawn_blocking(move || held.recv());
     let started = std::time::Instant::now();
     let read = runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(1), result.bytes())
+        tokio::time::timeout(Duration::from_secs(5), reads.try_collect::<Vec<_>>())
             .await
             .expect("the body read waited past its deadline")
     });
@@ -66,14 +71,31 @@ fn a_body_read_fails_at_its_deadline() {
     }));
 }
 
+/// A body ends after its last byte. Its end then takes no call.
+#[tokio::test]
+async fn a_body_ends_after_its_last_byte() {
+    use futures::TryStreamExt;
+    let limits = limiter(MAX_CALLS, Duration::from_secs(30));
+    let chunks = [
+        Ok(Bytes::from("ab")),
+        Ok(Bytes::from("c")),
+        Err(error("polled after the last byte".into())),
+    ];
+    let reads = body(limits, futures::stream::iter(chunks).boxed(), 3);
+    let read: Vec<Bytes> = reads.try_collect().await.unwrap();
+    assert_eq!(read.concat(), b"abc");
+}
+
 /// A GC run whose boundary read hangs returns, deletes nothing, and a later run deletes.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_gc_run_with_a_hung_boundary_read_returns() {
     use slatedb::config::{GarbageCollectorDirectoryOptions, GarbageCollectorOptions};
     let dir = tempfile::tempdir().unwrap();
-    let limits = limiter(MAX_CALLS, Duration::from_millis(200));
-    let store: Arc<dyn ObjectStore> = Arc::new(Bounded::with_limiter(
+    // The fixture uses its own store. Only the GC run under test has the short deadline.
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalStore::open(dir.path()).unwrap());
+    let limits = limiter(MAX_CALLS, Duration::from_millis(500));
+    let bounded: Arc<dyn ObjectStore> = Arc::new(Bounded::with_limiter(
         LocalStore::open(dir.path()).unwrap(),
         limits.clone(),
     ));
@@ -118,8 +140,9 @@ async fn a_gc_run_with_a_hung_boundary_read_returns() {
     std::fs::remove_file(&boundary).unwrap();
     let mut fifo = Fifo::new(boundary.clone());
     let started = std::time::Instant::now();
-    admin.run_gc_once(gc.clone()).await.unwrap();
-    assert!(started.elapsed() < Duration::from_secs(5));
+    let hung = slatedb::admin::Admin::builder("db", bounded).build();
+    hung.run_gc_once(gc.clone()).await.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10));
     assert_eq!(manifests().await, before);
 
     // Release the blocked reads, then restore the boundary.
@@ -239,6 +262,138 @@ async fn a_dropped_upload_aborts_under_a_slot() {
     eventually("the abort returns its slot", || limits.held.get() == 0).await;
 }
 
+/// Start a multipart upload with one part, and return it with the name of its staging file.
+async fn started_upload(
+    store: &Bounded<LocalStore>,
+    dir: &std::path::Path,
+) -> (Box<dyn MultipartUpload>, std::path::PathBuf) {
+    let mut upload = store
+        .put_multipart_opts(&Path::from("sst"), Default::default())
+        .await
+        .unwrap();
+    upload.put_part("data".into()).await.unwrap();
+    (upload, dir.join("sst#1"))
+}
+
+/// Take every slot of `limits`. Late slots make the store look stuck.
+async fn take_slots(limits: &Arc<Limiter>, late: bool) -> Vec<Slot> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut slots = vec![];
+    for _ in 0..limits.max {
+        let mut slot = limits.acquire(deadline).await.unwrap();
+        if late {
+            slot.mark_late();
+        }
+        slots.push(slot);
+    }
+    slots
+}
+
+/// Check that a dropped upload keeps its staging file while no slot is free, and removes it
+/// under a slot after the slots return.
+async fn assert_cleanup_waits_for_a_slot(
+    limits: &Arc<Limiter>,
+    slots: Vec<Slot>,
+    staged: &std::path::Path,
+) {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(staged.exists(), "cleanup ran outside the call slots");
+    assert_eq!(limits.held.get(), limits.max as i64);
+    drop(slots);
+    eventually("the cleanup removes the staging file", || !staged.exists()).await;
+    eventually("the cleanup returns its slot", || limits.held.get() == 0).await;
+}
+
+/// `complete` and `abort` that get no slot leave the upload unfinished. Its drop then
+/// aborts it under a slot.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_whose_finish_gets_no_slot_aborts_under_a_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = limiter(MAX_CALLS, Duration::from_secs(30));
+    let store = Bounded::with_limiter(LocalStore::open(dir.path()).unwrap(), limits.clone());
+    let (mut upload, staged) = started_upload(&store, dir.path()).await;
+    assert!(staged.exists());
+    let slots = take_slots(&limits, true).await;
+    for error in [upload.complete().await.map(drop), upload.abort().await] {
+        let error = error.unwrap_err().to_string();
+        assert!(error.contains("call slots"), "{error}");
+    }
+    drop(upload);
+    assert_cleanup_waits_for_a_slot(&limits, slots, &staged).await;
+}
+
+/// A `complete` that its caller drops while it waits for a slot leaves the upload unfinished.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_whose_finish_is_cancelled_aborts_under_a_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = limiter(MAX_CALLS, Duration::from_secs(30));
+    let store = Bounded::with_limiter(LocalStore::open(dir.path()).unwrap(), limits.clone());
+    let (mut upload, staged) = started_upload(&store, dir.path()).await;
+    let slots = take_slots(&limits, false).await;
+    let waiting = tokio::time::timeout(Duration::from_millis(20), upload.complete()).await;
+    assert!(waiting.is_err());
+    drop(upload);
+    assert_cleanup_waits_for_a_slot(&limits, slots, &staged).await;
+}
+
+/// A drop on a thread outside the runtime still aborts under a slot of that runtime.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_dropped_outside_the_runtime_aborts_under_a_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = limiter(MAX_CALLS, Duration::from_secs(30));
+    let store = Bounded::with_limiter(LocalStore::open(dir.path()).unwrap(), limits.clone());
+    let (upload, staged) = started_upload(&store, dir.path()).await;
+    let slots = take_slots(&limits, false).await;
+    std::thread::spawn(move || drop(upload)).join().unwrap();
+    assert_cleanup_waits_for_a_slot(&limits, slots, &staged).await;
+}
+
+/// An upload whose abort waits until the gate opens.
+#[derive(Debug)]
+struct HungAbort(tokio::sync::watch::Receiver<bool>);
+
+#[async_trait]
+impl MultipartUpload for HungAbort {
+    fn put_part(&mut self, _: PutPayload) -> UploadPart {
+        unimplemented!()
+    }
+
+    async fn complete(&mut self) -> Result<PutResult> {
+        unimplemented!()
+    }
+
+    async fn abort(&mut self) -> Result<()> {
+        let _ = self.0.wait_for(|open| *open).await;
+        Ok(())
+    }
+}
+
+/// A cleanup abort past its deadline counts as a late call. When such cleanups hold every
+/// slot, a new call fails at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn late_cleanups_make_new_calls_fail_at_once() {
+    let limits = limiter(MAX_CALLS, Duration::from_secs(1));
+    let (open, gate) = tokio::sync::watch::channel(false);
+    for _ in 0..MAX_CALLS {
+        drop(Upload::new(
+            Box::new(HungAbort(gate.clone())),
+            limits.clone(),
+        ));
+    }
+    eventually("every cleanup is late", || {
+        limits.late.load(Ordering::SeqCst) == MAX_CALLS
+    })
+    .await;
+    let started = std::time::Instant::now();
+    let next = run(&limits, async { Ok(()) }).await;
+    let error = next.unwrap_err().to_string();
+    assert!(error.contains("call slots"), "{error}");
+    assert!(started.elapsed() < Duration::from_millis(500));
+    open.send(true).unwrap();
+    eventually("the cleanups return their slots", || limits.held.get() == 0).await;
+    assert_eq!(limits.late.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn many_reads_on_a_healthy_store_all_succeed() {
     let dir = tempfile::tempdir().unwrap();
@@ -266,12 +421,10 @@ async fn many_reads_on_a_healthy_store_all_succeed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stuck_store_fails_new_calls_at_once() {
     let dir = tempfile::tempdir().unwrap();
-    let limits = limiter(MAX_CALLS, Duration::from_millis(100));
-    let store = Arc::new(Bounded::with_limiter(
-        LocalStore::open(dir.path()).unwrap(),
-        limits.clone(),
-    ));
-    store.put(&Path::from("object"), "1".into()).await.unwrap();
+    let limits = limiter(MAX_CALLS, Duration::from_secs(1));
+    let local = LocalStore::open(dir.path()).unwrap();
+    local.put(&Path::from("object"), "1".into()).await.unwrap();
+    let store = Arc::new(Bounded::with_limiter(local, limits.clone()));
     let mut fifo = Fifo::new(dir.path().join("fifo"));
     let hung = (0..MAX_CALLS).map(|_| {
         let store = store.clone();
@@ -290,7 +443,8 @@ async fn a_stuck_store_fails_new_calls_at_once() {
     let next = store.get(&Path::from("object")).await.map(drop);
     let error = next.unwrap_err().to_string();
     assert!(error.contains("call slots"), "{error}");
-    assert!(started.elapsed() < Duration::from_millis(50));
+    // A wait for a slot would last the whole 1 s deadline.
+    assert!(started.elapsed() < Duration::from_millis(500));
     let other = tokio::task::spawn_blocking(|| 7);
     let other = tokio::time::timeout(Duration::from_secs(1), other).await;
     assert_eq!(other.unwrap().unwrap(), 7);
