@@ -87,6 +87,7 @@ For example, use `--watch-progress-notify-interval=200ms` for the upstream clien
 | `--snapshot-min-bytes` | 67108864 | Log bytes needed before auto truncation; zero disables it. |
 | `--log-file-bytes` | 67108864 | Log file size, at least 65536. Truncation frees whole files. |
 | `--quota-backend-bytes` | 0 | Seeds or changes the cluster quota. Zero selects 2 GiB. |
+| `--quota-reassert` | off | Requests the quota flag again as the newest change. Use it once. |
 | `--quota-warning-fraction` | 0.8 | Quota share that raises the early warning; zero disables it. |
 | `--auto-compaction-mode` | periodic | `periodic` keeps a duration; `revision` keeps a count. |
 | `--auto-compaction-retention` | 0 | History to keep. Zero disables automatic compaction. |

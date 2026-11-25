@@ -41,9 +41,15 @@ impl Node {
             #[cfg(feature = "write-profile")]
             crate::write_profile::Stage::Raft.batch(ready.entries().len());
             let snapshot = (!ready.snapshot().is_empty()).then(|| ready.snapshot().clone());
+            // A requested snapshot can arrive when the commit index already covers it. Raft then
+            // has no HardState change, but the snapshot record needs one.
+            let hs = ready
+                .hs()
+                .cloned()
+                .or_else(|| snapshot.as_ref().map(|_| self.raw.raft.hard_state()));
             self.raw
                 .mut_store()
-                .stage(ready.entries(), ready.hs(), snapshot.as_ref())?;
+                .stage(ready.entries(), hs.as_ref(), snapshot.as_ref())?;
             self.appended_bytes = ready
                 .entries()
                 .iter()
@@ -52,7 +58,7 @@ impl Node {
                 });
             let job = log::Job::Ready {
                 entries: ready.take_entries(),
-                hs: ready.hs().cloned(),
+                hs,
                 snapshot,
             };
             let early = ready.take_messages();

@@ -125,6 +125,9 @@ pub struct NodeOptions {
     pub log_memory: LogMemory,
     pub state_cache: crate::state::StateCache,
     pub quota_bytes: i64,
+    /// Request `quota_bytes` again at startup with a new time, so that it replaces a newer
+    /// cluster quota. See `node::quota`.
+    pub quota_reassert: bool,
     /// Quota usage fraction that raises the early warning. Zero disables the warning.
     pub quota_warning_fraction: f64,
     /// Automatic compaction retention. `None` disables automatic compaction.
@@ -366,11 +369,13 @@ impl Node {
             },
             options.log_file_bytes,
         )?;
+        let empty_log = storage.last_index()? == 0;
+        let empty_raft = empty_log && storage.snapshot_index() == 0;
         let shared = crate::state::shared::Options {
             quota: options.effective_quota().max(0) as u64,
             voters: options.peers.keys().copied().collect(),
             join: options.join,
-            empty_log: storage.last_index()? == 0,
+            empty_log,
             pin_max: options.view_pin_max,
             restore: options.restore.clone(),
         };
@@ -397,6 +402,24 @@ impl Node {
             Some(options.transport.http.clone()),
         );
         let location = state.location.clone();
+        let quota = quota::Quota::open(
+            &options.dir,
+            quota::Startup {
+                member: options.id,
+                flag: options.effective_quota(),
+                shared: state.is_shared(),
+                empty: empty_raft && state.applied == 0,
+                reassert: options.quota_reassert,
+                now: quota::now_millis(),
+            },
+        );
+        let quota = match quota {
+            Ok(quota) => quota,
+            Err(error) => {
+                let _ = state.close().await;
+                return Err(error);
+            }
+        };
         let recovered = async {
             // Replicated apply uses the flag only until a `SetQuota` entry applies. Shared mode
             // takes the quota from the cluster claim.
@@ -451,6 +474,7 @@ impl Node {
                             member: options.id,
                             term: storage.initial_state()?.hard_state.term,
                         },
+                        quota.created_empty(),
                     )
                     .await?;
                     log::Cache::load(&storage, state.applied, options.log_memory)?
@@ -488,14 +512,6 @@ impl Node {
                 return Err(error);
             }
         };
-        let quota =
-            match quota::Quota::open(&options.dir, options.effective_quota(), state.is_shared()) {
-                Ok(quota) => quota,
-                Err(error) => {
-                    let _ = state.close().await;
-                    return Err(error);
-                }
-            };
         let manual_apply = transport_override.is_some();
         state.set_open_retries(!manual_apply);
         let mut traffic = BTreeMap::<u64, std::sync::Arc<crate::metrics::PeerTraffic>>::new();

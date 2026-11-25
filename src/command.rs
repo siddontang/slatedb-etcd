@@ -93,6 +93,8 @@ mod tests {
                 id: "quota".into(),
                 bytes: -1,
                 seed: true,
+                requested_at: 0,
+                member: 2,
             },
             RaftCommand::CompactStep { id: "step".into() },
             RaftCommand::Lease {
@@ -123,18 +125,20 @@ mod tests {
     /// `CompactStep` matches any `id`, so `SetQuota` must decode before it.
     #[test]
     fn set_quota_does_not_decode_as_a_compaction_step() {
-        for (bytes, seed) in [(2 << 30, true), (0, false), (-3, false)] {
+        for (bytes, seed, at) in [(2 << 30, true, 0), (0, false, 7), (-3, false, u64::MAX)] {
             let command = RaftCommand::SetQuota {
                 id: "quota".into(),
                 bytes,
                 seed,
+                requested_at: at,
+                member: 3,
             };
             let decoded = RaftCommand::decode(&command.encode().unwrap()).unwrap();
             assert!(
                 matches!(
                     decoded,
-                    RaftCommand::SetQuota { ref id, bytes: b, seed: s } if id == "quota"
-                        && b == bytes && s == seed
+                    RaftCommand::SetQuota { ref id, bytes: b, seed: s, requested_at: t, member: 3 }
+                        if id == "quota" && b == bytes && s == seed && t == at
                 ),
                 "{decoded:?}"
             );
@@ -153,6 +157,8 @@ mod tests {
             id: "quota".into(),
             bytes: 1,
             seed: false,
+            requested_at: 1,
+            member: 1,
         })
         .unwrap();
         assert!(serde_json::from_slice::<OlderCompactStep>(&json).is_err());

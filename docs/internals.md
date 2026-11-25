@@ -281,7 +281,14 @@ Apply compares the logical size with the cluster quota in `etcd/quota`. A `SetQu
 writes that row, so every replica changes the quota at the same index. The row counts toward the
 logical size, like the alarms row. A replica with no row uses its own flag, as earlier binaries
 did, so replicas of such a state can differ. The leader proposes `SetQuota` right after its
-election, before its client writes. See [quota changes](operations.md#change-the-quota).
+election, before its client writes. An entry applies only when its request is newer than the
+row: `(requested_at, member, bytes)` orders requests on every replica.
+
+A replica checkpoints through a first `SetQuota` entry that follows quota-checked entries. So
+the log of a leader no longer holds such entries of earlier binaries. A new member installs a
+snapshot instead.
+A state that this binary created empty also stops before such an entry and requests a snapshot.
+See [quota changes](operations.md#change-the-quota).
 Each member flushes SlateDB outside ordered apply when a step finishes a physical boundary.
 Writes can apply during this flush. One flush can run at a time.
 The highest queued index covers intervening requests.

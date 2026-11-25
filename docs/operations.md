@@ -84,17 +84,28 @@ Shared mode keeps the quota of its cluster claim instead; see [shared state](sha
 - `--quota-backend-bytes` seeds the cluster quota and requests changes to it. The first leader
   of a new cluster stores its flag before the first client write.
 - A member records its flag in `quota-flag.json` in its data directory. A restart with another
-  flag marks a pending change. The member proposes it each time it leads, until the cluster
-  quota equals the flag. The newest proposal wins.
+  flag makes a request with the wall-clock time of that start. The member proposes the request
+  each time it leads, until the cluster quota equals it or holds a newer request.
+- The newest request wins, on every member and in every order of apply. Equal times compare the
+  member ID, then the value.
 - A member with an unchanged flag does not change the cluster quota when it leads. So a rolling
   restart with a new flag takes effect when the first updated member leads. Use
   `etcdctl move-leader` to select it.
 - A member whose flag differs from the cluster quota logs a warning and sets the
   `slatedb_etcd_quota_flag_mismatch` gauge. The `quota` field of `/status` shows both values.
 - A native backup carries the cluster quota. After a restore, it wins over the flag until an
-  operator changes a flag.
+  operator makes a new request.
 - A directory from an earlier binary has no cluster quota. Its members use their own flags until
-  the first leader on this binary stores one.
+  the first leader on this binary stores one. Then every member checkpoints through that entry.
+
+Set one value on every member. The order of requests uses member clocks. With clock skew, the
+later time can belong to the earlier operator action. The mismatch gauge shows a split. To make
+a request again with the same flag, restart that member once with `--quota-reassert`. Remove the
+option from later restart commands.
+
+A member with a new data directory never applies a Put, a transaction with a Put, or a lease
+grant that an earlier binary wrote before the first cluster quota. Apply stops at that entry,
+logs an error, and asks the leader for a snapshot. It resumes after the install.
 
 Equal flags do not repair members that already applied entries under different quotas.
 Compare revisions, alarms, and HashKV. Remove a member that differs, and add it again as a new

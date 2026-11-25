@@ -429,7 +429,12 @@ async fn shared_mode_ignores_a_set_quota_entry() {
     state.set_quota_flag(1 << 20);
     state.apply(1, None).await.unwrap();
     let batches = state.write_batches;
-    state.apply_set_quota(2, 7, false).await.unwrap();
+    let request = quota::ClusterQuota {
+        bytes: 7,
+        requested_at: 1,
+        member: 1,
+    };
+    state.apply_set_quota(2, request, false).await.unwrap();
     assert_eq!(state.applied, 2);
     assert_eq!(state.write_batches, batches);
     assert_eq!((state.quota, state.quota_bytes()), (500, 500));

@@ -85,7 +85,9 @@ pub struct StateMachine {
     /// The effective flag value of this member. Replicated apply uses it without a cluster quota.
     quota_flag: i64,
     /// The quota of the last applied `SetQuota` entry. `None` in shared mode.
-    cluster_quota: Option<i64>,
+    cluster_quota: Option<quota::ClusterQuota>,
+    /// The first `SetQuota` entry applied after quota-checked entries. See `quota`.
+    pub(crate) seeded_late: bool,
     logical_bytes: crate::batch::Usage,
     pub(crate) current: current::CurrentRows,
     pub(crate) key_index: key_index::KeyIndex,
@@ -443,9 +445,10 @@ impl StateMachine {
             members: Arc::new(members),
             admin,
             metrics: Arc::new(crate::metrics::StateMeters::new()?),
-            quota: cluster_quota.map_or(0, |bytes| bytes.max(0) as u64),
+            quota: cluster_quota.map_or(0, |quota| quota.bytes.max(0) as u64),
             quota_flag: 0,
             cluster_quota,
+            seeded_late: false,
             current: current::CurrentRows::default(),
             key_index: key_index::KeyIndex::load(&reads).await?,
             rows,

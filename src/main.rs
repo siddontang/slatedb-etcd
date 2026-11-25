@@ -180,6 +180,10 @@ struct Args {
     /// Logical quota in bytes. Zero selects 2 GiB. A negative value disables the quota.
     #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
     quota_backend_bytes: i64,
+    /// Request --quota-backend-bytes again as the newest quota change in replicated mode.
+    /// Remove it from later restart commands.
+    #[arg(long)]
+    quota_reassert: bool,
     /// Quota usage fraction that sets the early-warning gauge and log. Zero disables it.
     #[arg(long, default_value_t = slatedb_etcd::server::DEFAULT_QUOTA_WARNING_FRACTION)]
     quota_warning_fraction: f64,
@@ -347,6 +351,7 @@ async fn run(args: Args) -> Result<()> {
             row_bytes: args.state_row_cache_bytes,
         },
         quota_bytes: args.quota_backend_bytes,
+        quota_reassert: args.quota_reassert,
         quota_warning_fraction: args.quota_warning_fraction,
         auto_compaction: slatedb_etcd::compactor::Retention::parse(
             args.auto_compaction_mode,

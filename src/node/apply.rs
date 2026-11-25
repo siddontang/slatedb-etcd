@@ -30,11 +30,13 @@ pub(super) struct AppliedState {
     /// Shared mode: the checkpoint of the base.
     pub base_checkpoint: Option<uuid::Uuid>,
     /// The quota of the last applied `SetQuota` entry. See `StateMachine::cluster_quota`.
-    pub cluster_quota: Option<i64>,
+    pub cluster_quota: Option<crate::state::quota::ClusterQuota>,
     /// The quota that apply uses. A non-positive value means no limit.
     pub quota_bytes: i64,
     /// The flag of this member differs from `quota_bytes`.
     pub quota_mismatch: bool,
+    /// The first cluster quota followed quota-checked entries of an earlier binary.
+    pub seeded_late: bool,
 }
 
 impl std::ops::Deref for AppliedState {
@@ -62,6 +64,7 @@ impl AppliedState {
             cluster_quota: state.cluster_quota(),
             quota_bytes: state.quota_bytes(),
             quota_mismatch: state.quota_mismatch(),
+            seeded_late: state.seeded_late,
         })
     }
 }
@@ -781,8 +784,19 @@ pub(super) async fn apply_entries(
                 state.apply_view_checkpoint(entry.index, checkpoint).await?;
                 Reply::Encoded(Value::Null)
             }
-            RaftCommand::SetQuota { bytes, seed, .. } => {
-                state.apply_set_quota(entry.index, *bytes, *seed).await?;
+            RaftCommand::SetQuota {
+                bytes,
+                seed,
+                requested_at,
+                member,
+                ..
+            } => {
+                let request = crate::state::quota::ClusterQuota {
+                    bytes: *bytes,
+                    requested_at: *requested_at,
+                    member: *member,
+                };
+                state.apply_set_quota(entry.index, request, *seed).await?;
                 Reply::Encoded(Value::Null)
             }
             RaftCommand::CompactStep { .. } => {
@@ -811,17 +825,19 @@ pub(super) async fn recover(
     state: &mut StateMachine,
     storage: &RaftStorage,
     header: Header,
+    created_empty: bool,
 ) -> Result<()> {
     let mut physical = false;
     while state.applied < storage.commit_index() {
         let low = state.applied + 1;
-        let entries = storage.entries(
+        let mut entries = storage.entries(
             low,
             (low + BATCH_ENTRIES).min(storage.commit_index() + 1),
             Some(BATCH_BYTES),
             raft::GetEntriesContext::empty(false),
         )?;
         ensure!(!entries.is_empty(), "empty recovery batch");
+        state.guard_replay(created_empty, &mut entries)?;
         let replies = apply_entries(state, entries, header).await?;
         physical |= replies.iter().any(|r| {
             matches!(

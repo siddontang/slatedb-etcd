@@ -475,6 +475,20 @@ async fn put_many(state: &mut StateMachine, count: u64) -> usize {
     failed
 }
 
+/// A request of `member` at `requested_at`. Zero time marks a seed.
+fn request(bytes: i64, requested_at: u64, member: u64) -> quota::ClusterQuota {
+    quota::ClusterQuota {
+        bytes,
+        requested_at,
+        member,
+    }
+}
+
+/// The value of the cluster quota row.
+fn cluster_bytes(state: &StateMachine) -> Option<i64> {
+    state.cluster_quota().map(|quota| quota.bytes)
+}
+
 async fn same_state(left: &StateMachine, right: &StateMachine) {
     assert_eq!(left.applied, right.applied);
     assert_eq!(left.revision, right.revision);
@@ -497,11 +511,17 @@ async fn members_with_different_flags_apply_one_cluster_quota() {
     let mut failed = vec![];
     for state in [&mut small, &mut large] {
         assert_eq!(state.cluster_quota(), None);
-        state.apply_set_quota(1, 2000, true).await.unwrap();
+        state
+            .apply_set_quota(1, request(2000, 0, 1), true)
+            .await
+            .unwrap();
         assert_eq!((state.quota, state.quota_bytes()), (2000, 2000));
         // A later seed changes nothing. A leader with an old view proposes it.
-        state.apply_set_quota(2, 9, true).await.unwrap();
-        assert_eq!(state.cluster_quota(), Some(2000));
+        state
+            .apply_set_quota(2, request(9, 0, 2), true)
+            .await
+            .unwrap();
+        assert_eq!(cluster_bytes(state), Some(2000));
         failed.push(put_many(state, 40).await);
         assert_eq!(state.alarms.len(), 1);
     }
@@ -519,7 +539,10 @@ async fn a_non_positive_cluster_quota_disables_the_check() {
     let dir = tempfile::tempdir().unwrap();
     let mut state = StateMachine::open(dir.path()).await.unwrap();
     state.set_quota_flag(100);
-    state.apply_set_quota(1, -1, false).await.unwrap();
+    state
+        .apply_set_quota(1, request(-1, 5, 1), false)
+        .await
+        .unwrap();
     assert_eq!((state.quota, state.quota_bytes()), (0, -1));
     assert_eq!(put_many(&mut state, 10).await, 0);
     assert!(state.alarms.is_empty());
@@ -528,7 +551,7 @@ async fn a_non_positive_cluster_quota_disables_the_check() {
     state.snapshot_data().await.unwrap();
     state.close().await.unwrap();
     let mut state = StateMachine::open(dir.path()).await.unwrap();
-    assert_eq!(state.cluster_quota(), Some(-1));
+    assert_eq!(state.cluster_quota(), Some(request(-1, 5, 1)));
     state.set_quota_flag(100);
     assert_eq!(state.quota, 0);
     state.close().await.unwrap();
@@ -543,7 +566,10 @@ async fn images_and_backups_carry_the_cluster_quota() {
         .await
         .unwrap();
     source.set_quota_flag(1 << 20);
-    source.apply_set_quota(1, 2000, false).await.unwrap();
+    source
+        .apply_set_quota(1, request(2000, 5, 1), false)
+        .await
+        .unwrap();
     assert_eq!(put_many(&mut source, 10).await, 0);
     let image = source.snapshot_data().await.unwrap();
     let data: SnapshotData = crate::codec::decode(&image).unwrap();
@@ -559,7 +585,7 @@ async fn images_and_backups_carry_the_cluster_quota() {
     snapshot.mut_metadata().term = 1;
     snapshot.set_data(image.clone());
     follower.install_snapshot(&snapshot).await.unwrap();
-    assert_eq!(follower.cluster_quota(), Some(2000));
+    assert_eq!(follower.cluster_quota(), Some(request(2000, 5, 1)));
     assert_eq!(follower.quota, 2000);
 
     let backup = super::tests::backup_bytes(image);
@@ -568,7 +594,7 @@ async fn images_and_backups_carry_the_cluster_quota() {
     std::fs::create_dir(&path).unwrap();
     let (mut restored, _) = super::tests::restore(&path, backup).await;
     restored.set_quota_flag(1 << 20);
-    assert_eq!(restored.cluster_quota(), Some(2000));
+    assert_eq!(restored.cluster_quota(), Some(request(2000, 5, 1)));
     assert_eq!(restored.quota, 2000);
 
     let failed = put_many(&mut source, 30).await;
@@ -580,6 +606,39 @@ async fn images_and_backups_carry_the_cluster_quota() {
         check(state).await;
     }
     for state in [source, follower, restored] {
+        state.close().await.unwrap();
+    }
+}
+
+/// A leader that is behind on apply can append an older request after a newer one commits.
+/// Every member keeps the newer value. Equal times compare the member ID, then the value.
+#[tokio::test]
+async fn an_older_request_does_not_replace_a_newer_cluster_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut members = vec![];
+    for (name, flag) in [("one", 100), ("two", 1 << 20)] {
+        let mut state = StateMachine::open(&dir.path().join(name)).await.unwrap();
+        state.set_quota_flag(flag);
+        members.push(state);
+    }
+    let entries = [
+        (request(300, 50, 2), false, 300),
+        (request(200, 40, 1), false, 300),
+        (request(9, 0, 3), true, 300),
+        (request(250, 50, 1), false, 300),
+        (request(260, 50, 3), false, 260),
+        (request(270, 50, 3), false, 270),
+    ];
+    for state in &mut members {
+        for (index, (quota, seed, expected)) in (1..).zip(entries) {
+            state.apply_set_quota(index, quota, seed).await.unwrap();
+            assert_eq!(cluster_bytes(state), Some(expected), "entry {index}");
+        }
+        assert_eq!(state.applied, 6);
+        check(state).await;
+    }
+    same_state(&members[0], &members[1]).await;
+    for state in members {
         state.close().await.unwrap();
     }
 }
