@@ -250,6 +250,36 @@ pub(crate) fn slatedb_settings() -> Settings {
     settings
 }
 
+/// SlateDB settings for the state machine of one member; `local_disk` when its store is a
+/// member-local directory.
+///
+/// Compaction rewrites the sorted runs several times while a large data set loads. Each replaced
+/// SST stays until its compactor checkpoint expires and the next GC run. With SlateDB's defaults
+/// (a 15-minute checkpoint and GC every 10 minutes) that took 15 to 25 minutes. On a local
+/// directory GC runs every minute, so a replaced SST leaves 15-16 minutes after the compaction.
+/// Any other store, including one a caller passes to `open_store`, keeps the defaults, because
+/// each GC run lists the SSTs of the store.
+///
+/// The checkpoint lifetime stays at SlateDB's default on every store. A read fails if it still
+/// iterates an input SST after the checkpoint expires and GC deletes it. Several reads scan once
+/// with one iterator: the index rebuild at open, a committed DeleteRange, HashKV, export and the
+/// usage count of an older directory. On a cold, busy volume such a scan can run for minutes.
+pub(crate) fn member_settings(local_disk: bool) -> Settings {
+    let mut settings = slatedb_settings();
+    if !local_disk {
+        return settings;
+    }
+    if let Some(gc) = settings.garbage_collector_options.as_mut() {
+        if let Some(compacted) = gc.compacted_options.as_mut() {
+            compacted.interval = Some(COMPACTED_GC_INTERVAL);
+        }
+    }
+    settings
+}
+
+/// How often SlateDB deletes compacted SSTs that no manifest or checkpoint references.
+const COMPACTED_GC_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Read the stored logical size, or count it when the counter does not match the apply marker.
 ///
 /// Directories from older binaries have no counter. An older binary that writes to a directory
@@ -345,7 +375,7 @@ impl StateMachine {
         #[cfg(not(target_os = "linux"))]
         let (object_store, metrics) = (Arc::new(local), None);
         let local = transfer::Backend::Local;
-        Self::open_backend(object_store, "state", cache, local, metrics).await
+        Self::open_location(object_store, "state", cache, local, true, metrics).await
     }
 
     pub async fn open_store(
@@ -370,9 +400,23 @@ impl StateMachine {
         backend: transfer::Backend,
         metrics: Option<Arc<dyn slatedb_common::metrics::MetricsRecorder>>,
     ) -> Result<Self> {
+        Self::open_location(object_store, prefix, cache, backend, false, metrics).await
+    }
+
+    /// Open the state in `object_store`. `local_disk` is true only when this server built the
+    /// store on a member-local directory.
+    async fn open_location(
+        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+        prefix: &str,
+        cache: StateCache,
+        backend: transfer::Backend,
+        local_disk: bool,
+        metrics: Option<Arc<dyn slatedb_common::metrics::MetricsRecorder>>,
+    ) -> Result<Self> {
         cache.validate()?;
         let location =
-            transfer::Location::open(object_store, prefix, backend, cache, metrics).await?;
+            transfer::Location::open(object_store, prefix, backend, local_disk, cache, metrics)
+                .await?;
         let state = Self::open_at(location.clone(), &location.root()).await?;
         if let Err(error) = location.remove_orphans().await {
             tracing::warn!(%error, "cannot delete unused state databases");
@@ -386,7 +430,7 @@ impl StateMachine {
         let object_store = location.store();
         let rows = Arc::new(rows::RowCache::new(cache.row_bytes));
         let cache = cache.build();
-        let settings = slatedb_settings();
+        let settings = member_settings(location.local_disk);
         let admin = slatedb::admin::Admin::builder(root, object_store.clone()).build();
         let mut builder = Db::builder(root, object_store);
         if let Some(metrics) = &location.metrics {
