@@ -735,6 +735,90 @@ async fn a_checkpoint_with_an_eight_byte_total_reopens() {
     state.close().await.unwrap();
 }
 
+/// A member behind a checkpoint from a binary before the usage split installs it. The install
+/// counts the split from the rows, and the quota uses it on the next write.
+#[tokio::test]
+async fn a_member_installs_a_checkpoint_with_an_eight_byte_total() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut ahead = open_shared(store.clone()).await;
+    let mut behind = open_shared(store).await;
+    for state in [&mut ahead, &mut behind] {
+        state.entry_term = 4;
+    }
+    for n in 1..=10 {
+        ahead
+            .apply_etcd(n, &put(&format!("k{n}"), "one"))
+            .await
+            .unwrap();
+    }
+    ahead.apply_etcd(11, &put("k1", "two")).await.unwrap();
+    let size = ahead.logical_bytes;
+    assert!(size.current > 0 && size.history > 0 && size.other > 0);
+    behind.apply_etcd(1, &put("k1", "one")).await.unwrap();
+    // Write the batches the way the older binary did: the total only, and no counter row.
+    let writer = writer(&ahead).await;
+    let queue = ahead.shared.as_ref().unwrap().overlay.queue();
+    let mut written = 0;
+    for (seq, batch) in queue.after(0, usize::MAX) {
+        let mut batch = (*batch).clone();
+        if batch.contains(LOGICAL_SIZE) {
+            batch.delete(LOGICAL_SIZE);
+        }
+        writer
+            .write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
+            .await
+            .unwrap();
+        written = seq;
+    }
+    writer.flush().await.unwrap();
+    let id = writer
+        .create_checkpoint(
+            CheckpointScope::Durable,
+            &CheckpointOptions {
+                name: Some(shared::view_name(written)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+    let stored = writer.get(shared::LOGICAL_BYTES).await.unwrap().unwrap();
+    assert_eq!(stored.as_ref(), size.total().to_be_bytes());
+    assert_eq!(writer.get(LOGICAL_SIZE).await.unwrap(), None);
+    let source = behind.shared.as_ref().unwrap().source.clone();
+    let base = source.open_base(id).await.unwrap();
+    assert_eq!(base.applied, 11);
+
+    behind.adopt_opened(base, 4).await.unwrap();
+    assert_eq!(behind.applied, 11);
+    assert_eq!(behind.logical_bytes, size);
+    // The next write stores the split, and the quota checks the updated total.
+    behind.quota = size.total() + 1;
+    let outcome = behind.apply_etcd_quota(12, &put("k2", "two"), 1).await;
+    assert!(outcome.unwrap().result.is_ok());
+    assert!(behind.logical_size() > behind.quota);
+    assert_eq!(
+        stored_counter(&behind).await,
+        (behind.applied, Some(behind.logical_bytes))
+    );
+    assert_eq!(
+        behind.logical_bytes,
+        maintenance::count_logical_usage(behind.applied_state())
+            .await
+            .unwrap()
+    );
+    let outcome = behind.apply_etcd_quota(13, &put("k3", "two"), 1).await;
+    let error = outcome.unwrap().result.err().unwrap();
+    assert!(
+        format!("{error:?}").contains("database space exceeded"),
+        "{error:?}"
+    );
+    writer.close().await.unwrap();
+    for state in [ahead, behind] {
+        state.close().await.unwrap();
+    }
+}
+
 /// Five checkpoints with no live base, and their `(seq, id)` list.
 async fn five_checkpoints(state: &mut StateMachine) -> Vec<(u64, uuid::Uuid)> {
     let mut written = 0;
