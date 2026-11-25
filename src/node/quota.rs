@@ -1624,6 +1624,100 @@ pub(super) mod tests {
         assert_eq!(node.state.revision, revision);
     }
 
+    /// The membership row of a seed with the default peers.
+    fn seed_members() -> RaftCommand {
+        let members = crate::cluster::Store::initial(&options(Path::new("")).peers);
+        RaftCommand::SeedMembers(crate::cluster::Seed {
+            id: "seed".into(),
+            origin: 2,
+            members: serde_json::to_string(&members).unwrap(),
+            digest: None,
+            applied: 0,
+        })
+    }
+
+    /// Persist `committed` from index 1, and `uncommitted` after it, on a member that started
+    /// empty.
+    fn persist_log(dir: &Path, committed: &[Entry], uncommitted: &[Entry]) {
+        let mut storage =
+            RaftStorage::open(&dir.join("raft"), 1, "worker-test", vec![1, 2, 3]).unwrap();
+        let log: Vec<_> = committed.iter().chain(uncommitted).cloned().collect();
+        let state = HardState {
+            term: 1,
+            vote: 1,
+            commit: committed.len() as u64,
+        };
+        storage.persist(&log, Some(&state), None).unwrap();
+    }
+
+    fn entry(index: u64, term: u64, command: Option<&RaftCommand>) -> Entry {
+        Entry {
+            index,
+            term,
+            data: command.map_or(vec![], |command| command.encode().unwrap()),
+            ..Default::default()
+        }
+    }
+
+    /// The rules of the quota guard also hold for an index of the membership guard. The log of
+    /// an earlier binary holds only membership entries. A new leader replaces only the uncommitted
+    /// entry 4 with its seed, and the guard at 1 stays until a snapshot passes it. A replacement
+    /// at the guard computes the gate again.
+    #[tokio::test]
+    async fn a_membership_guard_keeps_the_rules_of_the_quota_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(open_node(dir.path(), 3000, false).await);
+        let committed: Vec<_> = (1..=3)
+            .map(|index| entry(index, 1, Some(&publish())))
+            .collect();
+        persist_log(dir.path(), &committed, &[entry(4, 1, Some(&publish()))]);
+        let mut node = open_node(dir.path(), 3000, false).await;
+        assert_eq!(node.quota.blocked(), Some(1));
+        let mut append = message(MessageType::MsgAppend, 2, 2);
+        append.index = 3;
+        append.log_term = 1;
+        append.commit = 4;
+        append.entries.push(entry(4, 2, Some(&seed_members())));
+        node.step_peer(append).unwrap();
+        drive(&mut node).await;
+        assert_eq!((node.state.applied, node.quota.blocked()), (0, Some(1)));
+        let commands = [publish(), publish(), publish(), seed_members()];
+        let (snapshot, revision) = covering_snapshot(dir.path(), &commands).await;
+        install_requested(&mut node, snapshot).await;
+        assert_eq!(node.state.revision, revision);
+        assert!(node.state.members_row.is_some());
+
+        let dir = tempfile::tempdir().unwrap();
+        drop(open_node(dir.path(), 3000, false).await);
+        let committed: Vec<_> = (1..=3).map(|index| entry(index, 1, None)).collect();
+        persist_log(dir.path(), &committed, &[entry(4, 1, Some(&publish()))]);
+        let mut node = open_node(dir.path(), 3000, false).await;
+        assert_eq!(node.quota.blocked(), Some(4));
+        let mut append = message(MessageType::MsgAppend, 2, 2);
+        append.index = 3;
+        append.log_term = 1;
+        append.commit = 4;
+        append.entries.push(entry(4, 2, Some(&seed_members())));
+        node.step_peer(append).unwrap();
+        drive(&mut node).await;
+        assert_eq!((node.state.applied, node.quota.blocked()), (4, None));
+        assert!(node.state.members_row.is_some());
+    }
+
+    /// A member that waits on a membership entry before a backlog above its pending limit
+    /// starts as a learner, like a member that waits on a quota-checked entry.
+    #[tokio::test]
+    async fn a_member_waiting_on_a_membership_entry_skips_its_backlog_as_a_learner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut entries = vec![publish()];
+        entries.extend(large_entries(12, 1 << 20));
+        let node = waiting_member(dir.path(), &entries, 9 << 20).await;
+        assert_eq!(node.quota.blocked(), Some(1));
+        assert_eq!(node.state.applied, 0);
+        assert_eq!(node.raw.raft.raft_log.applied, 14);
+        assert!(!node.raw.raft.prs().conf().voters().contains(1));
+    }
+
     /// A replacement at or before the guard computes the gate again.
     #[tokio::test]
     async fn a_replaced_guard_entry_is_scanned_again() {
