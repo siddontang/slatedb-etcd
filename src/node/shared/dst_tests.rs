@@ -1734,3 +1734,146 @@ async fn an_empty_base_sends_a_record_only_after_its_first_base() {
     );
     sim.assert_records_open().await;
 }
+
+impl Simulation {
+    /// Deliver until the leader sends member `to` a snapshot, and take that message out.
+    async fn take_snapshot_to(
+        &mut self,
+        to: u64,
+        writers: &mut BTreeMap<u64, shared::DstWriter>,
+    ) -> Message {
+        for round in 0..3000 {
+            let found = self.messages.iter().position(|message| {
+                message.to == to && message.get_msg_type() == MessageType::MsgSnapshot
+            });
+            if let Some(position) = found {
+                return self.messages.remove(position);
+            }
+            if self.messages.is_empty() {
+                let leader = self.leader().unwrap();
+                self.tick(leader).await;
+                if round % 50 == 49 {
+                    self.publish_view(writers).await;
+                }
+            }
+            self.deliver(false).await;
+        }
+        panic!("no snapshot for member {to}");
+    }
+
+    /// A follower in snapshot install: its apply is paused, and it asks for a snapshot above
+    /// its applied index. Return the leader, the member, and the third member.
+    async fn installing_member(
+        seed: u64,
+        writers: &mut BTreeMap<u64, shared::DstWriter>,
+    ) -> (Self, u64, u64, u64) {
+        let mut sim = Simulation::with_mode(seed, true).await;
+        sim.settle(4).await;
+        sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+        sim.write(10).await;
+        sim.publish_view(writers).await;
+        sim.settle(20).await;
+        let leader = sim.leader().unwrap();
+        let member = sim.follower(0);
+        let other = sim.follower(member);
+        sim.paused_apply = Some(member);
+        sim.paused_reads = Some(member);
+        sim.write(2).await;
+        sim.settle(4).await;
+        let node = sim.nodes.get_mut(&member).unwrap();
+        node.raw.request_snapshot().unwrap();
+        (sim, leader, member, other)
+    }
+}
+
+/// Sig-Codex and Critic: Raft accepted the snapshot and the log cache staged it, but its write
+/// waits. Raft already dropped its unstable snapshot, and the durable record is the old one.
+/// Election timeouts start no campaign and stop nothing. Once the write ends and the install
+/// runs, leadership works as usual.
+#[tokio::test]
+async fn a_member_does_not_campaign_while_its_snapshot_is_staged() {
+    let mut writers = BTreeMap::new();
+    let (mut sim, leader, member, other) = Simulation::installing_member(97, &mut writers).await;
+    let message = sim.take_snapshot_to(member, &mut writers).await;
+    let index = message.get_snapshot().get_metadata().index;
+    sim.paused_log = Some(member);
+    let accepted = sim.receive_snapshot(message).await.unwrap();
+    let node = sim.nodes.get_mut(&member).unwrap();
+    node.step_peer(accepted).unwrap();
+    let node = sim.nodes.get_mut(&leader).unwrap();
+    node.raw.report_snapshot(member, SnapshotStatus::Finish);
+    sim.drive().await;
+    let node = &sim.nodes[&member];
+    assert!(node.raw.raft.raft_log.unstable.snapshot.is_none());
+    assert_eq!(node.raw.store().staged_snapshot_index(), index);
+    assert!(node.raw.store().snapshot_index() < index);
+    // The leader goes silent, and the election timer of the member runs out many times.
+    if let Some(mut writer) = writers.remove(&leader) {
+        writer.close().await;
+    }
+    sim.isolated = Some(leader);
+    for _ in 0..60 {
+        for id in 1..=3 {
+            sim.tick(id).await;
+        }
+        for _ in 0..30 {
+            sim.deliver(false).await;
+        }
+    }
+    let node = &sim.nodes[&member];
+    assert_eq!(node.raw.raft.state, StateRole::Follower);
+    assert_eq!(node.raw.store().staged_snapshot_index(), index);
+    // The write ends, and the install runs. The member then leads.
+    sim.paused_log = None;
+    sim.paused_apply = None;
+    sim.paused_reads = None;
+    sim.isolated = None;
+    sim.settle(30).await;
+    assert!(sim.nodes[&member].state.applied >= index);
+    sim.lead(member).await;
+    sim.settle(10).await;
+    assert_eq!(
+        sim.nodes[&member].state.applied,
+        sim.nodes[&other].state.applied
+    );
+}
+
+/// Sig-Codex: a snapshot and a leadership transfer arrive in the same event batch. Raft holds
+/// the snapshot as unstable when the transfer comes, and the member ignores the transfer.
+#[tokio::test]
+async fn a_transfer_after_a_snapshot_in_one_batch_is_ignored() {
+    let mut writers = BTreeMap::new();
+    let (mut sim, leader, member, other) = Simulation::installing_member(101, &mut writers).await;
+    let message = sim.take_snapshot_to(member, &mut writers).await;
+    let index = message.get_snapshot().get_metadata().index;
+    let term = message.term;
+    let accepted = sim.receive_snapshot(message).await.unwrap();
+    let mut transfer = Message::default();
+    transfer.set_msg_type(MessageType::MsgTimeoutNow);
+    transfer.from = leader;
+    transfer.to = member;
+    transfer.term = term;
+    let node = sim.nodes.get_mut(&member).unwrap();
+    node.step_peer(accepted).unwrap();
+    assert!(node.raw.raft.raft_log.unstable.snapshot.is_some());
+    node.step_peer(transfer).unwrap();
+    assert_eq!(node.raw.raft.state, StateRole::Follower);
+    assert_eq!(node.raw.raft.term, term);
+    // The transport reports the sent snapshot, as `deliver` does.
+    let node = sim.nodes.get_mut(&leader).unwrap();
+    node.raw.report_snapshot(member, SnapshotStatus::Finish);
+    // The install runs, and the member then leads.
+    sim.paused_apply = None;
+    sim.paused_reads = None;
+    sim.settle(30).await;
+    assert!(sim.nodes[&member].state.applied >= index);
+    if let Some(mut writer) = writers.remove(&leader) {
+        writer.close().await;
+    }
+    sim.lead(member).await;
+    sim.settle(10).await;
+    assert_eq!(
+        sim.nodes[&member].state.applied,
+        sim.nodes[&other].state.applied
+    );
+}

@@ -471,9 +471,16 @@ checkpoint is gone, it takes a checkpoint in the same range as a restart does.
   - A leader with an empty base gets a base from its writer at open, with no client write. The
     writer publishes a first checkpoint when the shared database has writes above the newest
     checkpoint. Otherwise it announces the newest checkpoint, which this member did not open.
-  - A member does not campaign or take a leadership transfer between a stored snapshot and its
-    install, but it still votes. At a campaign Raft scans the unapplied entries from its
-    applied index, which is below the start of the log, and that scan stops the process.
+  - A member does not campaign or take a leadership transfer from the time Raft accepts a
+    snapshot until apply installs it, but it still votes. At a campaign Raft scans the
+    unapplied entries from its applied index, which is below the start of the log, and that
+    scan stops the process. The window covers the snapshot that Raft holds, the one that the
+    log cache staged, and the stored one that waits for apply.
+  - Unlike the guard of a member that waits for a snapshot, this guard has no time limit,
+    because a campaign in the window stops the process. If the only live member with a current
+    log is in the window, the cluster has no leader until its install ends: a checkpoint open
+    in shared mode, or the image copy in replicated mode. Before this guard, that member
+    stopped at its first campaign.
 
 ## Install
 

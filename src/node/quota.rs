@@ -648,7 +648,7 @@ impl Node {
         } else {
             self.quota.silent = 0;
         }
-        // Between a stored snapshot and its install, Raft scans the unapplied entries from its
+        // Between an accepted snapshot and its install, Raft scans the unapplied entries from its
         // applied index at a campaign. The log starts above that index, so the scan fails and
         // Raft stops the process. The install is local, so the member waits for it.
         if self.installing() {

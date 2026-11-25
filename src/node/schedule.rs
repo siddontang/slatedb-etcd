@@ -146,9 +146,16 @@ impl Node {
         raft.election_elapsed = raft.election_elapsed.min(timeout - 2);
     }
 
-    /// Return true while Raft stored a snapshot that apply did not install yet.
+    /// Return true from the time Raft accepts a snapshot until apply installs it: while Raft
+    /// holds it as unstable, while the log cache stages it, and while it waits for apply. The
+    /// log cache moves its first index at staging, and Raft drops its unstable snapshot before
+    /// the write ends, so each step needs its own index.
     pub(super) fn installing(&self) -> bool {
-        self.raw.store().snapshot_index() > self.state.applied
+        let store = self.raw.store();
+        let unstable = self.raw.raft.raft_log.unstable.snapshot.as_ref();
+        let accepted = unstable.map_or(0, |snapshot| snapshot.get_metadata().index);
+        let stored = store.staged_snapshot_index().max(store.snapshot_index());
+        accepted.max(stored) > self.state.applied
     }
 
     pub(super) fn schedule_apply(&mut self) -> Result<()> {
