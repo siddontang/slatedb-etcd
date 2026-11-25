@@ -561,17 +561,19 @@ impl RaftStorage {
         Ok(())
     }
 
+    /// Return true for a directory without a snapshot, a vote, or log entries.
+    pub(crate) fn is_new(&self) -> bool {
+        self.snapshot_index() == 0
+            && self.hard_state == HardState::default()
+            && self.engine.last_index(GROUP).is_none()
+    }
+
     /// Record a restored state at `index` in a new directory, with a snapshot without an image.
     ///
     /// The caller must first flush the restored SlateDB state with its apply marker at `index`.
     /// That state covers the log before `index`, as after `publish_checkpoint` without an image.
     pub(crate) fn restore(&mut self, index: u64, conf: ConfState) -> Result<()> {
-        ensure!(
-            self.snapshot_index() == 0
-                && self.hard_state == HardState::default()
-                && self.engine.last_index(GROUP).is_none(),
-            "restore requires a new Raft directory"
-        );
+        ensure!(self.is_new(), "restore requires a new Raft directory");
         let mut snapshot = Snapshot::default();
         snapshot.mut_metadata().index = index;
         snapshot.mut_metadata().term = 1;

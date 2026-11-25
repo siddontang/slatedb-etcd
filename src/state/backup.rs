@@ -25,8 +25,10 @@ const ALIGN: u64 = 512;
 const DIGEST: u64 = 32;
 /// The largest image that a shared-mode backup builds in memory.
 const MAX_VIEW_BACKUP_BYTES: usize = 64 * 1024 * 1024;
-/// The largest row that a restore decodes. A Raft entry holds at most 8 MiB.
-const MAX_ROW_BYTES: usize = 64 * 1024 * 1024;
+/// The largest encoded row of an image. A restore decodes rows up to this size, and a backup
+/// rejects a larger row before it publishes the image. A Raft entry holds at most 8 MiB, but
+/// the auth row holds every user and role and can grow beyond that.
+pub(super) const MAX_ROW_BYTES: usize = 64 * 1024 * 1024;
 /// The row bytes of one restore write batch.
 const RESTORE_BATCH_BYTES: usize = 4 * 1024 * 1024;
 /// The row bytes a restore writes between flushes. Without a flush, SlateDB keeps up to
@@ -39,6 +41,40 @@ pub(crate) const RESTORE_MARKER: &str = "restore-incomplete";
 pub struct Chunk {
     pub blob: Vec<u8>,
     pub remaining: u64,
+}
+
+/// A backup above a size limit. The Snapshot RPC returns ResourceExhausted for it.
+#[derive(Debug)]
+pub(crate) struct TooLarge(String);
+
+impl std::fmt::Display for TooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TooLarge {}
+
+/// The status of a failed backup: ResourceExhausted above a size limit, else `other`.
+pub(crate) fn backup_error(
+    error: anyhow::Error,
+    other: impl FnOnce(anyhow::Error) -> crate::mvcc::KvError,
+) -> crate::mvcc::KvError {
+    match error.downcast_ref::<TooLarge>() {
+        Some(TooLarge(message)) => {
+            crate::mvcc::KvError::new(tonic::Code::ResourceExhausted, message)
+        }
+        None => other(error),
+    }
+}
+
+/// Pad the membership JSON with spaces so that `etcdctl snapshot save` accepts the image. It
+/// requires a multiple of 512 bytes plus the digest. `before` is the image size before the row.
+pub(super) fn pad_members(members: &mut Vec<u8>, before: u64) -> Result<()> {
+    let size = before + encoded_size(&(crate::cluster::KEY, &*members))?;
+    let padding = (ALIGN - size % ALIGN) % ALIGN;
+    members.resize(members.len() + padding as usize, b' ');
+    Ok(())
 }
 
 /// A started backup: the response header of its applied boundary and the image chunks.
@@ -59,7 +95,7 @@ impl StateMachine {
     /// Like `backup`, with a checkpoint that expires after `lifetime` unless refreshed.
     pub(super) async fn backup_with_lifetime(&self, lifetime: Duration) -> Result<Stream> {
         if self.is_shared() {
-            return self.view_backup().await;
+            return self.view_backup(MAX_VIEW_BACKUP_BYTES).await;
         }
         ensure!(
             self.db().snapshot()?.seq() == self.applied,
@@ -123,13 +159,13 @@ impl StateMachine {
 impl StateMachine {
     /// Shared mode keeps applied rows in view checkpoints and in memory, not in `db`. Build the
     /// image from the pinned view in memory, as before streaming backups, and send it in chunks.
-    async fn view_backup(&self) -> Result<Stream> {
+    /// The image with its padding and digest can hold at most `limit` bytes.
+    pub(super) async fn view_backup(&self, limit: usize) -> Result<Stream> {
         let timer = self.metrics.snapshot.start_timer();
-        let mut bytes = self.snapshot_job()?.await?;
-        ensure!(
-            bytes.len() + DIGEST as usize <= MAX_VIEW_BACKUP_BYTES,
-            "native snapshot exceeds 64 MiB"
-        );
+        let mut bytes = self.image_job(true)?.await?;
+        if bytes.len() + DIGEST as usize > limit {
+            return Err(TooLarge(format!("native snapshot exceeds {} MiB", limit >> 20)).into());
+        }
         timer.observe_duration();
         let digest = Sha256::digest(&bytes);
         bytes.extend_from_slice(&digest);
@@ -191,19 +227,17 @@ impl Source {
             ensure!(!tx.is_closed(), "the snapshot client went away");
             if !omitted(&row.key) {
                 rows += 1;
-                size += encoded_size(&(row.key, row.value))?;
+                size += row_size(&row.key, &row.value)?;
             }
         }
-        // Pad the membership JSON with spaces so that `etcdctl snapshot save` accepts the size.
         let mut members = self.members.clone();
-        size += encoded_size(&(crate::cluster::KEY, &members))?;
-        let padding = (ALIGN - size % ALIGN) % ALIGN;
-        members.resize(members.len() + padding as usize, b' ');
+        pad_members(&mut members, size)?;
+        size += row_size(crate::cluster::KEY, &members)?;
         let mut image = Image {
             tx,
             buffer: Vec::with_capacity(2 * CHUNK_BYTES),
             hash: Sha256::new(),
-            remaining: size + padding + DIGEST,
+            remaining: size + DIGEST,
         };
         image.write(&header).await?;
         image.write(&(rows + 1)).await?;
@@ -236,6 +270,20 @@ async fn rows_of(reader: &DbReader) -> Result<slatedb::DbIterator> {
 /// format 4 readers reject the derived meta rows. See `derived_key`.
 fn omitted(key: &[u8]) -> bool {
     key == crate::cluster::KEY || derived_key(key)
+}
+
+/// The encoded size of a row. Reject a row that a restore cannot decode.
+pub(super) fn row_size(key: &[u8], value: &[u8]) -> Result<u64> {
+    let size = encoded_size(&(key, value))?;
+    if size > MAX_ROW_BYTES as u64 {
+        return Err(TooLarge(format!(
+            "native snapshot row {:?} has {size} bytes, above the restore limit of {} MiB",
+            String::from_utf8_lossy(&key[..key.len().min(64)]),
+            MAX_ROW_BYTES >> 20
+        ))
+        .into());
+    }
+    Ok(size)
 }
 
 fn encoded_size(value: &impl serde::Serialize) -> Result<u64> {
@@ -483,15 +531,27 @@ impl StateMachine {
     ) -> Result<()> {
         let started = std::time::Instant::now();
         std::fs::create_dir_all(dir)?;
-        let marker = dir.join(RESTORE_MARKER);
-        std::fs::File::create(&marker)?.sync_all()?;
-        sync_dir(dir)?;
+        // The Raft directory lock reserves the data directory, as at startup. Check the target
+        // again under it: another restore or a started member can have taken it since the check
+        // in `restore_backup`. Only then create the marker, so a losing restore leaves no marker.
         let mut storage = crate::storage::RaftStorage::open(
             &dir.join("raft"),
             id,
             cluster_id,
             members.conf().voters,
         )?;
+        let mut others = std::fs::read_dir(dir)?.filter(|entry| {
+            entry
+                .as_ref()
+                .map_or(true, |entry| entry.file_name() != "raft")
+        });
+        ensure!(
+            storage.is_new() && others.next().is_none(),
+            "snapshot restore requires a new, empty data directory"
+        );
+        let marker = dir.join(RESTORE_MARKER);
+        std::fs::File::create(&marker)?.sync_all()?;
+        sync_dir(dir)?;
         // A shared cluster restores with `restore_shared`, so the restored state is replicated.
         let mut state = objects
             .open(
@@ -512,63 +572,89 @@ impl StateMachine {
             )
             .await?;
         state.row_marker = Some(storage.row_marker());
-        let member = *members.members.keys().next().unwrap();
-        let result = async {
-            let mut image = ImageFile::open(&checked.path)?;
-            let mut written = 0;
-            let rows = async {
-                image.header()?;
-                let mut batch = WriteBatch::new();
-                let mut bytes = 0;
-                let mut unflushed = 0;
-                while let Some((key, value)) = image.next()? {
-                    if replaced(&key) {
-                        continue;
-                    }
-                    let value = restored(&key, value, member)?;
-                    bytes += key.len() + value.len();
-                    // The database starts empty, and the check rules out duplicate keys.
-                    batch.put_new(key, value);
-                    written += 1;
-                    if bytes >= RESTORE_BATCH_BYTES {
-                        state
-                            .write_batch(std::mem::take(&mut batch), written)
-                            .await?;
-                        unflushed += bytes;
-                        bytes = 0;
-                        if unflushed >= RESTORE_FLUSH_BYTES {
-                            state.metrics.flush_db(state.db()).await?;
-                            unflushed = 0;
-                        }
-                    }
-                }
-                if !batch.is_empty() {
-                    state.write_batch(batch, written).await?;
-                }
-                Ok(())
-            }
-            .await;
-            // The file can change after the check. Its digest must match the checked one before
-            // the marker goes away.
-            ensure!(
-                image.finish(rows)? == checked.digest,
-                "snapshot changed during restore"
-            );
-            let index = written + 1;
-            let mut batch = WriteBatch::new();
-            batch.put(crate::cluster::KEY, serde_json::to_vec(members)?);
-            // The Raft directory records the snapshot at `index` with term 1.
-            mark_applied(&mut batch, index, 1);
-            state.write_batch(batch, index).await?;
-            state.metrics.flush_db(state.db()).await?;
+        let result = state.restore_rows(checked, members).await;
+        if let Ok(index) = &result {
             tracing::info!(index, elapsed = ?started.elapsed(), "restored the snapshot rows");
-            Ok(index)
         }
-        .await;
         state.close().await?;
         storage.restore(result?, members.conf())?;
         std::fs::remove_file(&marker)?;
         sync_dir(dir)
+    }
+
+    /// Copy the rows of a checked image into this empty state, then store the apply marker and
+    /// `members`. Return the restored index, and flush the state at it.
+    pub(super) async fn restore_rows(
+        &mut self,
+        checked: &Checked,
+        members: &crate::cluster::Store,
+    ) -> Result<u64> {
+        let member = *members.members.keys().next().unwrap();
+        let mut image = ImageFile::open(&checked.path)?;
+        let mut written = 0;
+        let rows = async {
+            image.header()?;
+            let mut batch = WriteBatch::new();
+            let mut bytes = 0;
+            let mut unflushed = 0;
+            while let Some((key, value)) = image.next()? {
+                if replaced(&key) {
+                    continue;
+                }
+                let value = restored(&key, value, member)?;
+                bytes += key.len() + value.len();
+                // The database starts empty, and the check rules out duplicate keys.
+                batch.put_new(key, value);
+                written += 1;
+                if bytes >= RESTORE_BATCH_BYTES {
+                    self.store_restored(std::mem::take(&mut batch), written)
+                        .await?;
+                    unflushed += bytes;
+                    bytes = 0;
+                    if unflushed >= RESTORE_FLUSH_BYTES {
+                        self.metrics.flush_db(self.db()).await?;
+                        unflushed = 0;
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                self.store_restored(batch, written).await?;
+            }
+            Ok(())
+        }
+        .await;
+        // The file can change after the check. Its digest must match the checked one before
+        // the marker goes away.
+        ensure!(
+            image.finish(rows)? == checked.digest,
+            "snapshot changed during restore"
+        );
+        let index = written + 1;
+        let mut batch = WriteBatch::new();
+        batch.put(crate::cluster::KEY, serde_json::to_vec(members)?);
+        // The Raft directory records the snapshot at `index` with term 1.
+        mark_applied(&mut batch, index, 1);
+        self.write_batch(batch, index).await?;
+        self.metrics.flush_db(self.db()).await?;
+        Ok(index)
+    }
+
+    /// Store new restored rows at `index` and count their logical size. Unlike `write_batch`,
+    /// do not publish them to the key index and the row caches: the restoring state closes
+    /// after the copy, and startup builds them from the stored rows.
+    async fn store_restored(&mut self, mut batch: WriteBatch, index: u64) -> Result<()> {
+        ensure!(!self.is_shared(), "a restore writes a replicated state");
+        // Every row is new, so the size needs no reads.
+        let size = batch
+            .logical_size(self.applied_state(), &self.key_index, self.logical_bytes)
+            .await?;
+        self.mark_format_4(&batch)?;
+        self.put_logical_size(&mut batch, index, size);
+        self.db()
+            .write_with_options(batch.to_storage(), &WriteOptions { seqnum: index })
+            .await?;
+        self.logical_bytes = size;
+        Ok(())
     }
 
     /// Check and read a native snapshot for a new shared cluster. The shared database gets its

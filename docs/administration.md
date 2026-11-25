@@ -108,17 +108,30 @@ Remove `--restore-snapshot` when restarting the restored cluster. Existing direc
 replaced. A damaged checksum stops restoration before any data directory is created.
 The member pins its applied state in a SlateDB checkpoint and streams the image from it.
 Writes continue while the stream runs and do not reach the image.
-The server holds a few 64 KiB messages, not the image, so backups have no size limit.
+The server holds a few 64 KiB messages, not the image, so the image has no size limit.
+Restore decodes one row at a time, so one encoded row can have at most 64 MiB.
+The auth row holds all users and roles and is the row that can grow this large.
+A backup checks every row before it sends the first message. It returns ResourceExhausted for a
+larger row, so it never publishes an image that restore rejects.
 The server reads the checkpoint twice: first to count the rows, then to send them.
 The checkpoint lives 10 minutes. While the stream runs, even with a client that stops reading,
 the member renews it every minute, and it deletes it at the end.
 Restore checks the file in one pass and writes the rows in 4 MiB batches in a second pass.
 The second pass must read a file with the checked digest.
 It also holds only a few rows in memory. The restored Raft index is the copied row count plus one.
+A restore holds the Raft directory lock while it writes, and a starting member takes the same lock.
+A restore that loses the lock, or finds the directory in use, leaves the directory unchanged.
 An interrupted restore leaves a `restore-incomplete` file, and startup rejects that directory.
 Remove the directory and restore again.
+With S3 state objects, the restore has also claimed the member namespace
+`<s3-prefix>/<SHA-256 of the cluster ID>/member-<id>/` and can have written objects there.
+The claim names the random owner in the removed directory, so a retry with the same settings
+fails with `S3 namespace belongs to another data directory`.
+Before the retry, delete every object under that member namespace, or restore all members with a
+new cluster ID or `--s3-prefix`.
 In [shared state mode](shared-state.md) the member still builds the image of its pinned view
-in memory, up to 64 MiB, and sends it in the same messages.
+in memory and sends it in the same messages. That image, with its padding and digest, is limited
+to 64 MiB. A larger one returns ResourceExhausted.
 
 Downgrade authenticates the administrator and returns Unimplemented.
 The SlateDB format cannot run an older etcd binary. No rolling binary downgrade is claimed.

@@ -330,7 +330,8 @@ impl Node {
                 .dir
                 .join(crate::state::backup::RESTORE_MARKER)
                 .exists(),
-            "the data directory holds an interrupted snapshot restore; remove it and restore again"
+            "the data directory holds an interrupted snapshot restore; remove it, and with S3 its member \
+             namespace, and restore again"
         );
         std::fs::create_dir_all(&options.dir)?;
         // Open Raft first. Its exclusive file lock also protects this node's SlateDB directory.

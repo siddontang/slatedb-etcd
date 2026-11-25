@@ -154,9 +154,13 @@ impl maintenance_server::Maintenance for Service {
             }),
             Err(error) => {
                 tracing::warn!(%error, "native backup stream failed");
-                Err(Status::unavailable(format!(
-                    "etcdserver: snapshot failed: {error}"
-                )))
+                Err(crate::state::backup::backup_error(error, |error| {
+                    crate::mvcc::KvError::new(
+                        tonic::Code::Unavailable,
+                        &format!("snapshot failed: {error}"),
+                    )
+                })
+                .status())
             }
         });
         Ok(Response::new(Box::pin(stream)))

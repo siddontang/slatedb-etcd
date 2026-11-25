@@ -15,12 +15,21 @@ impl StateMachine {
     pub fn snapshot_job(
         &self,
     ) -> Result<impl std::future::Future<Output = Result<Vec<u8>>> + Send + 'static> {
+        self.image_job(false)
+    }
+
+    /// Like `snapshot_job`. With `align`, pad the membership row for `etcdctl snapshot save`.
+    /// See `backup::pad_members`.
+    pub(super) fn image_job(
+        &self,
+        align: bool,
+    ) -> Result<impl std::future::Future<Output = Result<Vec<u8>>> + Send + 'static> {
         // A shared-mode view needs no flush. Its rows are in a checkpoint or in memory.
         let snapshot = self.pinned_state()?;
         let db = self.database.clone();
         let metrics = self.metrics.clone();
         let applied = self.applied;
-        let members = serde_json::to_vec(self.members.as_ref())?;
+        let mut members = serde_json::to_vec(self.members.as_ref())?;
         Ok(async move {
             if let Some(db) = db {
                 metrics.flush_db(&db).await?;
@@ -37,6 +46,9 @@ impl StateMachine {
                     crate::codec::write(&mut data, &(row.key, row.value))?;
                     count += 1;
                 }
+            }
+            if align {
+                backup::pad_members(&mut members, data.len() as u64)?;
             }
             crate::codec::write(&mut data, &(crate::cluster::KEY, members))?;
             count += 1;

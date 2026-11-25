@@ -548,14 +548,34 @@ async fn a_shared_backup_restores_into_a_replicated_cluster() {
     super::tests::check_format_4(&data);
     let shared_backup = super::tests::backup_bytes(shared_image);
     super::tests::check_format_4_backup(&shared_backup);
-    // A Snapshot RPC in shared mode sends the same image of the pinned view.
-    assert_eq!(super::tests::streamed_backup(&state).await, shared_backup);
+    // A Snapshot RPC in shared mode sends the same image of the pinned view. It pads the
+    // membership JSON, so `etcdctl snapshot save` accepts the length: 512 * n + the digest.
+    let streamed = super::tests::streamed_backup(&state).await;
+    assert_eq!(
+        streamed.len() % 512,
+        32,
+        "etcdctl snapshot save checks this size"
+    );
+    super::tests::check_format_4_backup(&streamed);
+    let mut padded: SnapshotData = crate::codec::decode(&streamed[..streamed.len() - 32]).unwrap();
+    let members = padded.rows.last_mut().unwrap();
+    assert_eq!(members.0, crate::cluster::KEY);
+    members.1.truncate(members.1.trim_ascii_end().len());
+    assert_eq!(padded.rows, data.rows);
+    // A shared image above the limit returns ResourceExhausted, as before streaming backups.
+    let error = state.view_backup(1024).await.err().unwrap();
+    let error = super::backup::backup_error(error, crate::mvcc::KvError::storage);
+    assert_eq!(
+        error.code,
+        tonic::Code::ResourceExhausted as i32,
+        "{error:?}"
+    );
     let reference_backup = super::tests::backup_bytes(reference.snapshot_data().await.unwrap());
 
     let restored = {
         let path = dir.path().join("from-shared");
         std::fs::create_dir(&path).unwrap();
-        super::tests::restore(&path, shared_backup).await
+        super::tests::restore(&path, streamed).await
     };
     let expected = {
         let path = dir.path().join("from-replicated");
