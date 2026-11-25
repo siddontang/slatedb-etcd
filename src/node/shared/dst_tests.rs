@@ -973,6 +973,17 @@ impl Simulation {
         }
         false
     }
+
+    /// Make the record of the leader above its row: a follower asks for a snapshot at its last
+    /// index, and the leader certifies its base through it.
+    async fn certify_for(&mut self, follower: u64) -> crate::state::shared::Record {
+        let node = self.nodes.get_mut(&follower).unwrap();
+        node.raw.request_snapshot().unwrap();
+        self.settle(20).await;
+        let leader = self.leader().unwrap();
+        let record = self.nodes[&leader].raw.store().recovery_snapshot().clone();
+        Record::of(&record).unwrap().unwrap()
+    }
 }
 
 /// Critic's send race. The leader builds a snapshot above its row for the process that
@@ -1018,4 +1029,142 @@ async fn a_snapshot_above_its_row_to_a_restarted_earlier_binary_is_refused() {
         sim.nodes[&leader].state.applied
     );
     sim.assert_acknowledged(member).await;
+}
+
+/// Critic's stall. An earlier binary asks for a snapshot above the record: one above its row,
+/// or one at its row. Its request feeds the publication of a checkpoint at its row.
+async fn an_earlier_binary_request(above_row: bool) {
+    let mut sim = Simulation::with_mode(59, true).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(10).await;
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(10).await;
+    let leader = sim.leader().unwrap();
+    let old = sim.follower(0);
+    if above_row {
+        let record = sim.certify_for(sim.follower(old)).await;
+        assert!(record.row.is_some_and(|row| row < record.index));
+    }
+    sim.old.insert(old);
+    sim.propose_noop().await;
+    sim.settle(4).await;
+    let record = sim.nodes[&leader].raw.store().snapshot_index();
+    let node = sim.nodes.get_mut(&old).unwrap();
+    node.raw.request_snapshot().unwrap();
+    let requested = node.raw.raft.pending_request_snapshot;
+    assert!(requested > record);
+    sim.settle(10).await;
+    assert!(sim.nodes[&leader].raw.store().exact_wanted());
+    sim.publish_view(&mut writers).await;
+    sim.settle(30).await;
+    let node = &sim.nodes[&old];
+    assert_eq!(node.raw.raft.pending_request_snapshot, 0);
+    let served = Record::of(node.raw.store().recovery_snapshot()).unwrap();
+    assert_eq!(served.map(|record| record.row), Some(None));
+    assert!(node.raw.store().snapshot_index() >= requested);
+    assert!(sim.old_installs > 0);
+}
+
+#[tokio::test]
+async fn an_earlier_binary_request_above_a_record_above_its_row_is_served() {
+    an_earlier_binary_request(true).await;
+}
+
+#[tokio::test]
+async fn an_earlier_binary_request_above_a_record_at_its_row_is_served() {
+    an_earlier_binary_request(false).await;
+}
+
+/// Sig-Codex's inverse case. A member of this binary asks above the record while another voter
+/// runs an earlier binary, so no certification can serve it. The leader publishes a checkpoint
+/// at its row instead, with no client write, and the requester recovers.
+#[tokio::test]
+async fn a_request_beside_an_earlier_binary_voter_gets_a_snapshot_at_its_row() {
+    let mut sim = Simulation::with_mode(61, true).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(10).await;
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(10).await;
+    let leader = sim.leader().unwrap();
+    let old = sim.follower(0);
+    let member = sim.follower(old);
+    sim.old.insert(old);
+    sim.propose_noop().await;
+    sim.settle(4).await;
+    assert!(!sim.nodes[&leader].extension_allowed());
+    let record = sim.nodes[&leader].raw.store().snapshot_index();
+    let node = sim.nodes.get_mut(&member).unwrap();
+    node.raw.request_snapshot().unwrap();
+    let requested = node.raw.raft.pending_request_snapshot;
+    assert!(requested > record);
+    let acknowledged = sim.acknowledged.len();
+    sim.settle(10).await;
+    sim.publish_view(&mut writers).await;
+    sim.settle(30).await;
+    assert_eq!(sim.acknowledged.len(), acknowledged);
+    let node = &sim.nodes[&member];
+    assert_eq!(node.raw.raft.pending_request_snapshot, 0);
+    assert!(node.raw.store().snapshot_index() >= requested);
+    let served = Record::of(node.raw.store().recovery_snapshot()).unwrap();
+    assert_eq!(served.map(|record| record.row), Some(None));
+}
+
+/// Critic's stale descriptor. Retention deleted checkpoint X of the leader's record above its
+/// row, and the restart opened Y at the record index instead. A new member then needs a
+/// snapshot. The leader records Y at that index and sends it, and it never sends X.
+#[tokio::test]
+async fn a_restart_on_another_checkpoint_sends_that_checkpoint() {
+    let mut sim = Simulation::with_mode(67, true).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(10).await;
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(10).await;
+    let leader = sim.leader().unwrap();
+    let record = sim.certify_for(sim.follower(0)).await;
+    let x = record.checkpoint;
+    let row = record.row.unwrap();
+    assert!(row < record.index);
+    // Y has the same row, and retention deletes X.
+    let db = writers[&leader].db.clone().unwrap();
+    let options = slatedb::config::CheckpointOptions {
+        name: Some(crate::state::shared::view_name(row)),
+        ..Default::default()
+    };
+    let y = db
+        .create_checkpoint(slatedb::config::CheckpointScope::Durable, &options)
+        .await
+        .unwrap()
+        .id;
+    let admin = sim.nodes[&leader].writer.as_ref().unwrap().admin.clone();
+    admin.delete_checkpoint(x).await.unwrap();
+    if let Some(mut writer) = writers.remove(&leader) {
+        writer.close().await;
+    }
+    // Only the leader restarts. The others keep the term, so it leads again.
+    sim.stop(leader);
+    sim.start(leader).await;
+    let restarted = sim.delivered_views.len();
+    let node = &sim.nodes[&leader];
+    assert_eq!(node.worker.state().base_checkpoint(), Some(y));
+    assert_eq!(node.state.applied, record.index);
+    sim.settle(30).await;
+    let now = sim.leader().unwrap();
+    let joining = sim.follower(0);
+    sim.replace(joining, 0).await;
+    sim.settle(40).await;
+    let delivered = &sim.delivered_views[restarted..];
+    assert!(!delivered.contains(&x), "{delivered:?}");
+    assert!(delivered.contains(&y), "{delivered:?}");
+    let node = &sim.nodes[&joining];
+    assert_eq!(node.state.applied, sim.nodes[&now].state.applied);
+    if now == leader {
+        let record = Record::of(sim.nodes[&leader].raw.store().recovery_snapshot());
+        assert_ne!(record.unwrap().unwrap().checkpoint, x);
+    }
 }

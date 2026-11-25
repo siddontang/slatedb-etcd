@@ -443,11 +443,18 @@ checkpoint is gone, it takes a checkpoint in the same range as a restart does.
     leader publishes a checkpoint at its applied index: if no batch is there, apply first stores
     a batch with only the apply marker and the counters. The leader then records that base at
     its row and sends it. This costs one flush and one checkpoint.
+  - The same publication serves every request above the record that no certification can
+    serve: a request of a member without the capability, and any request while some member
+    lacks it.
   - A snapshot above its row goes to its own route, `/raft/covered`, with the process that
     advertised the capability. An earlier binary has no such route and answers 404, and
     another process answers 409, before Raft sees the snapshot. The leader then counts the
     member as an earlier binary. So a member that restarts on an earlier binary while the
     snapshot travels never stores it.
+- **Record checkpoint:** a restart or a rebase can use another checkpoint at the record index,
+  when retention deleted the one that the record names. The log cache does not send a record of
+  a checkpoint other than the base at the base index. The leader records the base at that index
+  instead, so a peer never gets a checkpoint that it cannot open.
 
 ## Install
 

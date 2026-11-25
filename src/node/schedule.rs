@@ -256,6 +256,7 @@ impl Node {
             self.raw.advance_apply_to(self.state.applied);
         }
         self.raw.mut_store().applied_to(self.state.applied);
+        self.note_base();
         if membership_changed {
             self.sync_members();
             // Each checkpoint must hold the membership that Raft uses.

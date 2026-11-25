@@ -502,6 +502,29 @@ impl RaftStorage {
         self.publish_checkpoint(index, Some(prepared), conf)
     }
 
+    /// Return true when an image at `index` replaces the record at the same index: the record
+    /// has no transferable image, or it names another view checkpoint. A restart or a rebase can
+    /// move the base to another checkpoint at the record index when retention deleted the one
+    /// that the record names.
+    pub(crate) fn replaces_at(&self, index: u64, prepared: Option<&PreparedCheckpoint>) -> bool {
+        let Some(prepared) = prepared else {
+            return false;
+        };
+        if index != self.snapshot_index() {
+            return false;
+        }
+        let view = |data: &[u8]| {
+            crate::state::transfer::ViewDescriptor::decode(data)
+                .ok()
+                .flatten()
+                .map(|view| view.checkpoint)
+        };
+        self.metadata_only()
+            || view(&self.snapshot.data)
+                .zip(view(&prepared.data))
+                .is_some_and(|(old, new)| old != new)
+    }
+
     /// Return true when the current snapshot record has no transferable image.
     ///
     /// A received or aged checkpoint descriptor is not transferable. See `transfer::sendable`.
@@ -529,7 +552,7 @@ impl RaftStorage {
             index <= self.hard_state.commit,
             "cannot snapshot uncommitted data"
         );
-        let attach = prepared.is_some() && index == self.snapshot_index() && self.metadata_only();
+        let attach = self.replaces_at(index, prepared.as_ref());
         ensure!(
             index > self.snapshot_index() || attach,
             "snapshot did not advance"

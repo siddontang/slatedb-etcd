@@ -136,6 +136,8 @@ pub(super) struct Cache {
     peers: RefCell<BTreeMap<u64, PeerProcess>>,
     // A member without the coverage capability needs a record at its checkpoint row.
     exact_wanted: Cell<bool>,
+    // Shared mode: the checkpoint and the index of this member's base.
+    base: Cell<Option<(uuid::Uuid, u64)>>,
     member: u64,
     pub durable: log::Durable,
 }
@@ -161,6 +163,7 @@ impl Cache {
             wanted_term: Cell::new(0),
             peers: RefCell::default(),
             exact_wanted: Cell::new(false),
+            base: Cell::new(None),
             member: storage.member(),
             durable,
         };
@@ -502,9 +505,27 @@ impl Cache {
     pub fn exact_wanted(&self) -> bool {
         self.exact_wanted.get()
     }
+    /// Note the checkpoint and the index of this member's base.
+    pub fn note_base(&self, base: Option<(uuid::Uuid, u64)>) {
+        self.base.set(base);
+    }
     /// Return true when the durable snapshot holds an image that this member can send.
+    ///
+    /// A view record at the base index that names another checkpoint than the base is not
+    /// sendable. A restart or a rebase uses another checkpoint when retention deleted the one of
+    /// the record, so peers could not open it. The owner then records the base at that index.
     pub fn has_image(&self) -> bool {
-        crate::state::transfer::sendable(&self.durable.snapshot.data, self.member)
+        let data = &self.durable.snapshot.data;
+        let stale = match (
+            crate::state::transfer::ViewDescriptor::decode(data),
+            self.base.get(),
+        ) {
+            (Ok(Some(view)), Some((checkpoint, index))) => {
+                index == self.snapshot_index() && view.checkpoint().ok() != Some(checkpoint)
+            }
+            _ => false,
+        };
+        crate::state::transfer::sendable(data, self.member) && !stale
     }
 }
 
@@ -620,6 +641,10 @@ impl Storage for Cache {
     /// follower's pending request. The leader's log holds every committed entry, so the target
     /// is at or above that index. Both state modes use this rule.
     fn snapshot(&self, request_index: u64, to: u64) -> raft::Result<Snapshot> {
+        // Raft calls this as soon as it leads, before the node sees the new role. The staged
+        // HardState already has the term, because a candidate persists its term before it asks
+        // for votes. A target of an earlier term goes.
+        self.lead_term(self.hard_state.term);
         let pinned = self.wanted.borrow().get(&to).copied();
         let target = pinned.unwrap_or_else(|| request_index.min(self.last));
         // A record without an image only truncates the local log. Raft retries after the owner
@@ -628,6 +653,10 @@ impl Storage for Cache {
             self.image_wanted.set(true);
             if target > self.snapshot_index() {
                 self.wanted.borrow_mut().insert(to, target);
+                // An earlier binary gets only a record at its row.
+                if !self.coverage_capable(to) {
+                    self.exact_wanted.set(true);
+                }
             }
             return Err(StorageError::SnapshotTemporarilyUnavailable.into());
         }
@@ -786,8 +815,8 @@ mod tests {
 
     /// A request above the last log index pins `min(request, last)` at its first call. Raft
     /// repeats the original index, and the pin holds while the log grows. A record at the target
-    /// ends the demand but not the pin, so the next retry gets that record. A term change drops
-    /// the requests.
+    /// ends the demand but not the pin, so the next retry gets that record. A later term drops
+    /// the requests, also at a call before the node sees its new role.
     #[test]
     fn a_snapshot_request_pins_its_target_until_the_peer_gets_it() {
         let (_dir, mut storage, mut cache) = stored();
@@ -809,13 +838,21 @@ mod tests {
         assert_eq!(cache.wanted_index(), 0);
         assert_eq!(cache.snapshot(34, 2).unwrap().get_metadata().index, 8);
         // The next request starts again at the last index.
-        cache.lead_term(5);
         assert!(cache.snapshot(34, 2).is_err());
         assert_eq!(cache.wanted_index(), 9);
-        cache.lead_term(5);
-        assert_eq!(cache.wanted_index(), 9);
-        // A new term of this leader drops the request.
-        cache.lead_term(6);
+        // The member leads again in a later term. Raft asks before the node sees the role. The
+        // staged HardState has the new term, so the old target goes, and the request pins the
+        // last index of now.
+        let hs = HardState {
+            term: 2,
+            commit: 8,
+            ..Default::default()
+        };
+        cache.stage(&[entry(10, 2)], Some(&hs), None).unwrap();
+        assert!(cache.snapshot(34, 2).is_err());
+        assert_eq!(cache.wanted_index(), 10);
+        // The node also drops the targets when it sees a new term.
+        cache.lead_term(3);
         assert_eq!(cache.wanted_index(), 0);
     }
 

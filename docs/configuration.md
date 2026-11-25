@@ -222,12 +222,14 @@ Rules and limits:
 - A member reports whether it installs a base above its checkpoint row, with the ID of its
   process. The leader extends coverage only while every member reported it. An earlier binary
   gets only a snapshot at its checkpoint row: the leader publishes a new checkpoint for it when
-  its record is above the row. A snapshot above its row uses its own route, which an earlier
+  its record is above the row. While some member lacks the capability, any request above the
+  record gets such a checkpoint. A snapshot above its row uses its own route, which an earlier
   binary refuses before Raft.
 - A restart opens the newest checkpoint. It adopts the checkpoint when the log ends below it. A
   Raft snapshot record above the newest checkpoint row names its checkpoint, and the restart
   opens that one at the record index. If retention deleted it, the restart takes the newest
-  checkpoint whose row is between the record row and the record index.
+  checkpoint whose row is between the record row and the record index, and the leader then
+  records and sends that checkpoint.
 - A missing checkpoint object fails a read with a retryable error. In apply it rebuilds the
   state from the newest checkpoint and replays the local log.
 - A member that waits on its overlay limit adopts a newer checkpoint in process when its log
