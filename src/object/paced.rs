@@ -48,9 +48,10 @@ const PACE_BYTES: u64 = 1024 * 1024;
 /// Unflushed memtable bytes, in percent of `max_unflushed_bytes`, that start backlog windows.
 ///
 /// A bulk load reached the limit within 5 s and then stalled apply for seconds. Short write
-/// bursts, such as 100,000 puts of 4 KiB values, stayed below 40 %. Backlog windows during such
-/// a burst moved more SST writeback in front of Raft log syncs and cost 10-15 % throughput.
-pub(crate) const BACKLOG_PERCENT: usize = 50;
+/// bursts, such as 100,000 puts of 4 KiB values, came to about 70 % on a slow disk. Backlog
+/// windows during such a burst moved more SST writeback in front of Raft log syncs and cost
+/// 10-15 % throughput.
+pub(crate) const BACKLOG_PERCENT: usize = 85;
 /// SST windows in writeback across the process.
 const MAX_WINDOWS: usize = 4;
 /// Windows compaction output may hold. One keeps compaction moving while memtable flushes get

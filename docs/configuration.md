@@ -111,7 +111,7 @@ A memtable flush caches the SST index, filters, and current-row blocks; reads ca
 Compaction reads ahead 2 x 512 KiB per input SST. Each compaction job runs at most two
 subcompactions, because each one buffers SST data until the disk takes it.
 On Linux, local SST writes start disk writeback one SST block at a time, so Raft log syncs wait
-behind only a few blocks. While unflushed memtables hold at least half of SlateDB's
+behind only a few blocks. While unflushed memtables hold at least 85 % of SlateDB's
 `max_unflushed_bytes`, writeback starts 1 MiB at a time, so flushes and compaction catch up.
 On Linux, jemalloc background threads return freed pages to the OS after 200 ms.
 `_RJEM_MALLOC_CONF` overrides that default.
