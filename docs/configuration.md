@@ -224,7 +224,8 @@ Rules and limits:
   gets only a snapshot at its checkpoint row: the leader publishes a new checkpoint for it when
   its record is above the row. While some member lacks the capability, any request above the
   record or follower's manual checkpoint gets such a checkpoint. A snapshot above its row uses
-  its own route, which an earlier binary refuses before Raft.
+  its own route, which an earlier binary refuses before Raft. A refusal ends the capability of
+  the process that the snapshot named, not of a later one.
 - A restart opens the newest checkpoint. It adopts the checkpoint when the log ends below it. A
   Raft snapshot record above the newest checkpoint row names its checkpoint, and the restart
   opens that one at the record index. If retention deleted it, the restart takes the newest

@@ -488,6 +488,18 @@ impl Cache {
     pub fn note_coverage(&self, peer: u64, process: Option<u64>) {
         self.peers.borrow_mut().entry(peer).or_default().advertised = process;
     }
+    /// `peer` refused a snapshot that named process `target`. That process loses the capability
+    /// until it reports again. A refusal that comes late, for an earlier process, changes
+    /// nothing. The process of the stream stays, because a stream names it only in its first
+    /// frame. The next report can thus restore the capability in the middle of a stream.
+    pub fn note_refused(&self, peer: u64, target: u64) {
+        let mut peers = self.peers.borrow_mut();
+        if let Some(entry) = peers.get_mut(&peer) {
+            if entry.advertised == Some(target) {
+                entry.advertised = None;
+            }
+        }
+    }
     /// Return true when the current process of `peer` advertised the coverage capability.
     pub fn coverage_capable(&self, peer: u64) -> bool {
         self.peers
@@ -879,10 +891,26 @@ mod tests {
         cache.note_process(2, None);
         assert!(!cache.coverage_capable(2));
         assert!(cache.snapshot(6, 2).is_err());
-        // A report of an earlier process does not count for the new one.
+        // A new process of this binary reports the capability. Its stream named it first.
         cache.note_process(2, Some(9));
+        assert!(!cache.coverage_capable(2));
+        cache.note_coverage(2, Some(9));
+        assert!(cache.coverage_capable(2));
+        assert_eq!(cache.capable_process(2), Some(9));
+        // A late 409 for an earlier process leaves the new one capable.
+        cache.note_refused(2, 7);
+        assert_eq!(cache.capable_process(2), Some(9));
+        // A refusal for the current process ends the capability until it reports again. Its
+        // report restores the match also in the middle of its stream.
+        cache.note_refused(2, 9);
+        assert!(!cache.coverage_capable(2));
+        cache.note_coverage(2, Some(9));
+        assert!(cache.coverage_capable(2));
+        // A late report of an earlier process does not count for the current one.
         cache.note_coverage(2, Some(7));
         assert!(!cache.coverage_capable(2));
+        cache.note_coverage(2, Some(9));
+        assert!(cache.coverage_capable(2));
     }
 
     #[test]

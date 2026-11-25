@@ -114,6 +114,11 @@ pub enum Event {
         member: u64,
         process: Option<u64>,
     },
+    /// `member` refused a snapshot above its row that named process `target`.
+    SnapshotRefused {
+        member: u64,
+        target: u64,
+    },
 }
 
 /// Flush SlateDB for log truncation about once per L0 SST instead of once per entry interval.
@@ -1220,6 +1225,9 @@ impl Node {
             } => self.view_ack(member, checkpoints, publish, coverage),
             Event::PeerProcess { member, process } => {
                 self.raw.store().note_process(member, process);
+            }
+            Event::SnapshotRefused { member, target } => {
+                self.raw.store().note_refused(member, target);
             }
             Event::SnapshotDelay(delay_ms, response) => {
                 self.snapshot_delay_ms = delay_ms.min(5000);

@@ -449,9 +449,10 @@ checkpoint is gone, it takes a checkpoint in the same range as a restart does.
     these demands.
   - A snapshot above its row goes to its own route, `/raft/covered`, with the process that
     advertised the capability. An earlier binary has no such route and answers 404, and
-    another process answers 409, before Raft sees the snapshot. The leader then counts the
-    member as an earlier binary. So a member that restarts on an earlier binary while the
-    snapshot travels never stores it.
+    another process answers 409, before Raft sees the snapshot. Either answer ends the
+    capability of the process that the snapshot named. A late answer for an earlier process
+    does not change the capability of the current one. So a member that restarts on an earlier
+    binary while the snapshot travels never stores it.
 - **Record checkpoint:** a restart or a rebase can use another checkpoint at the record index,
   when retention deleted the one that the record names. The log cache does not send a record of
   a checkpoint other than the base at the base index. The leader records the base at that index

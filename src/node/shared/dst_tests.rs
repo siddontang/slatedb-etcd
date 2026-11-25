@@ -55,8 +55,9 @@ impl Simulation {
 
     /// The HTTP routes of a snapshot. A view snapshot above its row goes to its own route with
     /// the receiver process that the leader named. An earlier binary has no such route, and
-    /// another process refuses it. Then the transport tells the leader that the member is not
-    /// capable, and reports the snapshot as failed. Return the message that Raft gets, if any.
+    /// another process refuses it. Then the transport tells the leader that the named process is
+    /// not capable, and reports the snapshot as failed. Return the message that Raft gets, if
+    /// any.
     pub(super) async fn receive_snapshot(&mut self, mut message: Message) -> Option<Message> {
         let (from, to) = (message.from, message.to);
         if crate::state::transfer::above_row(message.get_snapshot()) {
@@ -70,7 +71,7 @@ impl Simulation {
                 self.refused_snapshots += 1;
                 self.trace.push(format!("refuse snapshot {from} {to}"));
                 if let Some(sender) = self.nodes.get_mut(&from) {
-                    sender.raw.store().note_process(to, None);
+                    sender.raw.store().note_refused(to, target.unwrap());
                     sender.raw.report_snapshot(to, SnapshotStatus::Failure);
                 }
                 return None;
@@ -1234,4 +1235,42 @@ async fn a_follower_manual_checkpoint_beside_an_earlier_binary_gets_a_row_checkp
     let source = sim.nodes[&leader].shared_source().unwrap();
     let row = source.open_base(checkpoint.unwrap()).await.unwrap().applied;
     assert!(base >= index && row >= index, "base {base}, row {row}");
+}
+
+/// Sig-Codex: a 409 for an earlier process of a member arrives after its new process reported
+/// the capability. The new process stays capable, and the leader certifies its base again with
+/// no new checkpoint.
+#[tokio::test]
+async fn a_late_refusal_for_an_earlier_process_keeps_the_capability() {
+    let mut sim = Simulation::with_mode(9, true).await;
+    sim.settle(4).await;
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(10).await;
+    let leader = sim.leader().unwrap();
+    let follower = sim.follower(0);
+    let process = sim.process(follower).unwrap();
+    sim.nodes[&leader]
+        .raw
+        .store()
+        .note_refused(follower, process + 1000);
+    assert!(sim.nodes[&leader].raw.store().coverage_capable(follower));
+    let admin = sim.nodes[&leader].writer.as_ref().unwrap().admin.clone();
+    let views = crate::state::shared::view_checkpoints(&admin)
+        .await
+        .unwrap()
+        .len();
+    let announced = sim.announcements().len();
+    let node = sim.nodes.get_mut(&follower).unwrap();
+    node.raw.request_snapshot().unwrap();
+    sim.settle(30).await;
+    assert_eq!(sim.nodes[&follower].raw.raft.pending_request_snapshot, 0);
+    assert_eq!(sim.announcements().len(), announced + 1);
+    assert_eq!(
+        crate::state::shared::view_checkpoints(&admin)
+            .await
+            .unwrap()
+            .len(),
+        views
+    );
 }

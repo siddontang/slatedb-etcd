@@ -606,9 +606,9 @@ async fn an_earlier_binary_refuses_a_snapshot_above_its_row_before_raft() {
         .unwrap();
     assert!(matches!(
         first,
-        Event::PeerProcess {
+        Event::SnapshotRefused {
             member: 2,
-            process: None
+            target: 7
         }
     ));
     let second = tokio::time::timeout(Duration::from_secs(3), received.recv())

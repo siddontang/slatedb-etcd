@@ -307,14 +307,15 @@ fn spawn_snapshot(
     let (client, url, cluster) = (client.clone(), url.to_owned(), cluster.to_owned());
     let (traffic, events) = (traffic.clone(), events.clone());
     tokio::spawn(async move {
+        let target = <[u8; 8]>::try_from(message.context.as_ref()).map(u64::from_le_bytes);
         let delivery = post_snapshot(&client, &url, &cluster, message, &traffic).await;
-        // The member does not run the process that advertised the coverage capability, so the
-        // leader treats it as an earlier binary until it reports again.
-        if delivery == Delivery::Refused {
+        // The member does not run the process that the snapshot names. That process loses the
+        // capability, but a later process that reported it keeps it.
+        if let (Delivery::Refused, Ok(target)) = (delivery, target) {
             let _ = events
-                .send(Event::PeerProcess {
+                .send(Event::SnapshotRefused {
                     member: peer,
-                    process: None,
+                    target,
                 })
                 .await;
         }
