@@ -129,8 +129,8 @@ after each publication. The clock gauge changes at each writer open.
 
 ## Read path counters
 
-Every member also exports these counters. They count the reads of the whole process, so embedded
-members of one process share them.
+Every member also exports these metrics. They count the reads and store calls of the whole
+process, so embedded members of one process share them.
 
 | Family | Meaning |
 | --- | --- |
@@ -138,6 +138,7 @@ members of one process share them.
 | `slatedb_etcd_row_cache_lookups_total` | Current-row cache lookups of point reads, by `result` |
 | `slatedb_etcd_row_read_duration_seconds` | Storage reads of rows that the row cache missed |
 | `slatedb_etcd_shared_point_reads_total` | Shared-mode point reads by `source`: `overlay`, `base` |
+| `slatedb_etcd_local_store_calls_in_flight` | Local object store calls that hold a call slot |
 
 The `kind` label is `data`, `index`, `filter`, or `stats`. Each data, index, or filter miss is
 one object store read. A low data hit ratio with a slow row read time means cold SST blocks.

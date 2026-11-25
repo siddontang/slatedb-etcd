@@ -19,7 +19,7 @@
 //! L0 is full, and only compaction frees L0 then.
 
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::ErrorKind;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
@@ -117,33 +117,7 @@ fn join_error(source: tokio::task::JoinError) -> Error {
 
 /// Open a new staged file next to `dest`. The inner store's listings skip `#<digits>` names.
 fn stage(dest: &FsPath) -> Result<(File, PathBuf)> {
-    let mut id = 1_u64;
-    loop {
-        let mut name = dest.as_os_str().to_owned();
-        name.push(format!("#{id}"));
-        let path = PathBuf::from(name);
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => return Ok((file, path)),
-            Err(source) => match source.kind() {
-                ErrorKind::AlreadyExists => id += 1,
-                ErrorKind::NotFound => {
-                    let parent = dest.parent().expect("object path has a parent");
-                    std::fs::create_dir_all(parent).map_err(|e| io_error(e, parent))?;
-                    sync_dir(parent)?;
-                    if let Some(grand) = parent.parent() {
-                        sync_dir(grand)?;
-                    }
-                }
-                _ => return Err(io_error(source, &path)),
-            },
-        }
-    }
-}
-
-fn sync_dir(dir: &FsPath) -> Result<()> {
-    File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(|e| io_error(e, dir))
+    super::local::stage(dest).map_err(|e| io_error(e, dest))
 }
 
 fn sync_range(file: &File, offset: u64, len: u64, flags: libc::c_uint) -> std::io::Result<()> {
@@ -386,10 +360,7 @@ fn write_paced(
 
 /// Sync the staged file, then atomically publish it and sync its directory.
 fn publish(file: File, staged: &FsPath, dest: &FsPath) -> Result<()> {
-    file.sync_all().map_err(|e| io_error(e, staged))?;
-    drop(file);
-    std::fs::rename(staged, dest).map_err(|e| io_error(e, dest))?;
-    sync_dir(dest.parent().expect("object path has a parent"))
+    super::local::publish(file, staged, dest).map_err(|e| io_error(e, dest))
 }
 
 #[async_trait]

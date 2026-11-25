@@ -631,6 +631,7 @@ impl Node {
             state.metrics.registry.clone(),
         )?);
         crate::metrics::reads::READS.register(&state.metrics.registry)?;
+        crate::object::bounded::LIMITER.register(&state.metrics.registry)?;
         let handles = state.shared_handles();
         let writer = match &handles {
             Some(handles) => {

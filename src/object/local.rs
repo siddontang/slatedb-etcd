@@ -1,31 +1,34 @@
-//! A local object store with conditional updates.
+//! A local object store with conditional updates, and the staging rules of local files.
 //!
 //! `LocalFileSystem` rejects `PutMode::Update`, and SlateDB advances its GC boundary files with
 //! it. `LocalStore` implements the update with an `flock` lock and an atomic rename. Processes
 //! that share one POSIX filesystem then see one order of updates. NFS is not supported.
 //!
-//! Each call returns an error after `TIMEOUT`, like an S3 request. A hung filesystem call then
-//! fails a SlateDB task and does not stop it forever.
+//! `LocalStore` does its filesystem work on blocking threads only. `bounded::Bounded` adds the
+//! deadline and the limit of calls in flight.
 
 use std::fmt;
 use std::fs::{File, Metadata, OpenOptions};
-use std::future::Future;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
 use slatedb::object_store::local::LocalFileSystem;
 use slatedb::object_store::path::Path;
 use slatedb::object_store::{
-    CopyOptions, Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
-    Result, UploadPart,
+    CopyOptions, Error, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    RenameOptions, Result,
 };
 
-/// The limit of one call. A synced SST write takes far less on a working disk.
-const TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest wait of an update for the lock of its object.
+const LOCK_WAIT: Duration = Duration::from_secs(30);
+/// The largest read of an object body on one blocking thread.
+const READ_CHUNK: u64 = 4 << 20;
 /// The mtime steps after the previous version. A coarse filesystem can round a small step back
 /// to the previous mtime. HFS+ keeps whole seconds, and FAT keeps two seconds.
 const MTIME_STEPS: [Duration; 4] = [
@@ -44,12 +47,10 @@ type SetMtime = fn(&File, SystemTime) -> std::io::Result<()>;
 /// e-tag and renames a new file over the object. `PutMode::Create` needs no lock: its hard link
 /// fails while the object exists, and an update needs the object to exist. Deletes and
 /// overwrites are not ordered against updates. SlateDB does neither on its boundary files.
-///
-/// A call that passes `timeout` returns an error. Its blocking filesystem work can continue.
 #[derive(Debug)]
 pub(crate) struct LocalStore {
     inner: LocalFileSystem,
-    timeout: Duration,
+    lock_wait: Duration,
     /// Tests replace it to model a filesystem with coarse timestamps.
     set_mtime: SetMtime,
 }
@@ -61,7 +62,7 @@ impl LocalStore {
         let inner = LocalFileSystem::new_with_prefix(root)?.with_fsync(true);
         Ok(Self {
             inner,
-            timeout: TIMEOUT,
+            lock_wait: LOCK_WAIT,
             set_mtime: File::set_modified,
         })
     }
@@ -82,7 +83,7 @@ impl ObjectStore for LocalStore {
         opts: PutOptions,
     ) -> Result<PutResult> {
         let PutMode::Update(version) = opts.mode else {
-            return bound(self.timeout, self.inner.put_opts(location, payload, opts)).await;
+            return self.inner.put_opts(location, payload, opts).await;
         };
         if !opts.attributes.is_empty() {
             return Err(Error::NotImplemented {
@@ -92,23 +93,24 @@ impl ObjectStore for LocalStore {
         }
         let target = self.inner.path_to_filesystem(location)?;
         let location = location.to_string();
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + self.lock_wait;
         let set_mtime = self.set_mtime;
-        // The blocking task owns the lock, so a dropped future cannot release it early.
-        let update = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let expected = version.e_tag.as_deref();
-            update(&target, &payload, expected, deadline, set_mtime).map_err(|error| match error {
-                Update::Changed(reason) => Error::Precondition {
+            match update(&target, &payload, expected, deadline, set_mtime) {
+                Ok(e_tag) => Ok(PutResult {
+                    e_tag: Some(e_tag),
+                    version: None,
+                    extensions: Default::default(),
+                }),
+                Err(Update::Changed(reason)) => Err(Error::Precondition {
                     path: location,
                     source: reason.into(),
-                },
-                Update::Io(source) => Error::Generic {
-                    store: "LocalStore",
-                    source: Box::new(source),
-                },
-            })
-        });
-        bound(self.timeout, async { update.await? }).await
+                }),
+                Err(Update::Io(source)) => Err(io_error(source, &target)),
+            }
+        })
+        .await?
     }
 
     async fn put_multipart_opts(
@@ -116,34 +118,41 @@ impl ObjectStore for LocalStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
-        let inner = bound(self.timeout, self.inner.put_multipart_opts(location, opts)).await?;
-        Ok(Box::new(Upload {
-            inner,
-            timeout: self.timeout,
-        }))
+        // `LocalFileSystem` creates the staging file when its future is first polled. Run that
+        // on a blocking thread, not on a runtime thread.
+        let inner = self.inner.clone();
+        let location = location.clone();
+        tokio::task::spawn_blocking(move || {
+            futures::executor::block_on(inner.put_multipart_opts(&location, opts))
+        })
+        .await?
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        bound(self.timeout, self.inner.get_opts(location, options)).await
+        let mut result = self.inner.get_opts(location, options).await?;
+        let empty = GetResultPayload::Stream(futures::stream::empty().boxed());
+        result.payload = match std::mem::replace(&mut result.payload, empty) {
+            GetResultPayload::File(file, path) => {
+                GetResultPayload::Stream(body(file, path, result.range.clone()))
+            }
+            stream => stream,
+        };
+        Ok(result)
     }
 
-    async fn get_ranges(
-        &self,
-        location: &Path,
-        ranges: &[std::ops::Range<u64>],
-    ) -> Result<Vec<bytes::Bytes>> {
-        bound(self.timeout, self.inner.get_ranges(location, ranges)).await
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        self.inner.get_ranges(location, ranges).await
     }
 
     fn delete_stream(
         &self,
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
-        bound_stream(self.timeout, self.inner.delete_stream(locations))
+        self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-        bound_stream(self.timeout, self.inner.list(prefix))
+        self.inner.list(prefix)
     }
 
     fn list_with_offset(
@@ -151,71 +160,57 @@ impl ObjectStore for LocalStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
-        bound_stream(self.timeout, self.inner.list_with_offset(prefix, offset))
+        self.inner.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-        bound(self.timeout, self.inner.list_with_delimiter(prefix)).await
+        self.inner.list_with_delimiter(prefix).await
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-        bound(self.timeout, self.inner.copy_opts(from, to, options)).await
+        self.inner.copy_opts(from, to, options).await
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
-        bound(self.timeout, self.inner.rename_opts(from, to, options)).await
+        self.inner.rename_opts(from, to, options).await
     }
 }
 
-/// A multipart upload whose calls have a timeout.
-#[derive(Debug)]
-struct Upload {
-    inner: Box<dyn MultipartUpload>,
-    timeout: Duration,
-}
-
-#[async_trait]
-impl MultipartUpload for Upload {
-    fn put_part(&mut self, data: PutPayload) -> UploadPart {
-        Box::pin(bound(self.timeout, self.inner.put_part(data)))
-    }
-
-    async fn complete(&mut self) -> Result<PutResult> {
-        bound(self.timeout, self.inner.complete()).await
-    }
-
-    async fn abort(&mut self) -> Result<()> {
-        bound(self.timeout, self.inner.abort()).await
+fn io_error(source: std::io::Error, path: &std::path::Path) -> Error {
+    Error::Generic {
+        store: "LocalStore",
+        source: format!("{}: {source}", path.display()).into(),
     }
 }
 
-/// Run `call`, or fail when it passes `limit`.
-async fn bound<T>(limit: Duration, call: impl Future<Output = Result<T>>) -> Result<T> {
-    tokio::time::timeout(limit, call)
-        .await
-        .unwrap_or_else(|_| Err(timed_out(limit)))
-}
-
-/// Give each item of `stream` the time `limit`. A late item ends the stream with an error.
-fn bound_stream<T: Send + 'static>(
-    limit: Duration,
-    stream: BoxStream<'static, Result<T>>,
-) -> BoxStream<'static, Result<T>> {
-    futures::stream::unfold(Some(stream), move |stream| async move {
-        let mut stream = stream?;
-        match tokio::time::timeout(limit, stream.next()).await {
-            Ok(item) => item.map(|item| (item, Some(stream))),
-            Err(_) => Some((Err(timed_out(limit)), None)),
+/// Read `range` of `file` in chunks. Each chunk is one read on a blocking thread.
+fn body(file: File, path: PathBuf, range: Range<u64>) -> BoxStream<'static, Result<Bytes>> {
+    futures::stream::try_unfold((file, path, range), |(mut file, path, range)| async move {
+        if range.is_empty() {
+            return Ok(None);
         }
+        let end = range.end.min(range.start + READ_CHUNK);
+        let (chunk, file, path) =
+            tokio::task::spawn_blocking(move || (read(&mut file, range.start..end), file, path))
+                .await?;
+        let chunk = chunk.map_err(|source| io_error(source, &path))?;
+        Ok(Some((chunk, (file, path, end..range.end))))
     })
     .boxed()
 }
 
-fn timed_out(limit: Duration) -> Error {
-    Error::Generic {
-        store: "LocalStore",
-        source: format!("the local filesystem call timed out after {limit:?}").into(),
+fn read(file: &mut File, range: Range<u64>) -> std::io::Result<Bytes> {
+    let len = range.end - range.start;
+    file.seek(SeekFrom::Start(range.start))?;
+    let mut buffer = Vec::with_capacity(len.try_into().unwrap_or_default());
+    file.take(len).read_to_end(&mut buffer)?;
+    if buffer.len() as u64 != len {
+        return Err(std::io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "the file ended inside the range",
+        ));
     }
+    Ok(buffer.into())
 }
 
 /// The reason that an update failed.
@@ -238,7 +233,7 @@ fn update(
     expected: Option<&str>,
     deadline: Instant,
     set_mtime: SetMtime,
-) -> std::result::Result<PutResult, Update> {
+) -> std::result::Result<String, Update> {
     let _lock = match lock(target, deadline) {
         Err(error) if error.kind() == ErrorKind::NotFound => {
             return Err(Update::Changed("the object does not exist".into()))
@@ -257,39 +252,20 @@ fn update(
             "{found} does not match {expected:?}"
         )));
     }
-    let (file, staged) = stage(target)?;
-    let previous = micros(&current);
-    let e_tag = publish(file, &staged, target, payload, previous, set_mtime).inspect_err(|_| {
+    let (mut file, staged) = stage(target)?;
+    let replaced = (|| -> std::io::Result<String> {
+        for chunk in payload.iter() {
+            file.write_all(chunk)?;
+        }
+        follow(&file, micros(&current), set_mtime)?;
+        let e_tag = e_tag(&file.metadata()?);
+        publish(file, &staged, target)?;
+        Ok(e_tag)
+    })();
+    if replaced.is_err() {
         let _ = std::fs::remove_file(&staged);
-    })?;
-    Ok(PutResult {
-        e_tag: Some(e_tag),
-        version: None,
-        extensions: Default::default(),
-    })
-}
-
-/// Write `payload` to the staging file, give it an mtime after `previous` microseconds, sync
-/// it, and rename it over `target`. Return its e-tag.
-fn publish(
-    mut file: File,
-    staged: &std::path::Path,
-    target: &std::path::Path,
-    payload: &PutPayload,
-    previous: u128,
-    set_mtime: SetMtime,
-) -> std::io::Result<String> {
-    for chunk in payload.iter() {
-        file.write_all(chunk)?;
     }
-    follow(&file, previous, set_mtime)?;
-    file.sync_all()?;
-    let e_tag = e_tag(&file.metadata()?);
-    std::fs::rename(staged, target)?;
-    if let Some(parent) = target.parent() {
-        File::open(parent)?.sync_all()?;
-    }
-    Ok(e_tag)
+    Ok(replaced?)
 }
 
 /// Give `file` an mtime after `previous`, in microseconds. A stale e-tag then cannot match a
@@ -312,8 +288,8 @@ fn follow(file: &File, previous: u128, set_mtime: SetMtime) -> std::io::Result<(
 }
 
 /// Take the exclusive lock of `target`, or fail at `deadline`. The lock file name ends in `#0`.
-/// `LocalFileSystem` lists no file whose name ends in `#` and digits, and it stages uploads from
-/// `#1`.
+/// `LocalFileSystem` lists no file whose name ends in `#` and digits, and staging names start
+/// at `#1`.
 fn lock(target: &std::path::Path, deadline: Instant) -> std::io::Result<File> {
     let file = OpenOptions::new()
         .create(true)
@@ -337,17 +313,45 @@ fn lock(target: &std::path::Path, deadline: Instant) -> std::io::Result<File> {
     }
 }
 
-/// Create a new staging file beside `target`, with the naming of `LocalFileSystem`.
-fn stage(target: &std::path::Path) -> std::io::Result<(File, PathBuf)> {
-    for n in 1.. {
+/// Create a new staging file beside `target`, with the naming of `LocalFileSystem`. Create and
+/// sync missing parent directories.
+pub(crate) fn stage(target: &std::path::Path) -> std::io::Result<(File, PathBuf)> {
+    let mut n = 1;
+    loop {
         let path = sibling(target, n);
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(file) => return Ok((file, path)),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => n += 1,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let parent = target.parent().ok_or(error)?;
+                std::fs::create_dir_all(parent)?;
+                sync_dir(parent)?;
+                if let Some(grand) = parent.parent() {
+                    sync_dir(grand)?;
+                }
+            }
             Err(error) => return Err(error),
         }
     }
-    unreachable!("the staging names are unbounded")
+}
+
+/// Sync the staged file, then rename it over `target` and sync the directory.
+pub(crate) fn publish(
+    file: File,
+    staged: &std::path::Path,
+    target: &std::path::Path,
+) -> std::io::Result<()> {
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(staged, target)?;
+    match target.parent() {
+        Some(parent) => sync_dir(parent),
+        None => Ok(()),
+    }
+}
+
+fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    File::open(dir)?.sync_all()
 }
 
 fn sibling(target: &std::path::Path, n: u64) -> PathBuf {
@@ -376,308 +380,4 @@ fn micros(metadata: &Metadata) -> u128 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::TryStreamExt;
-    use slatedb::object_store::{ObjectStoreExt, UpdateVersion};
-
-    fn update_to(e_tag: Option<String>) -> PutOptions {
-        PutMode::Update(UpdateVersion {
-            e_tag,
-            version: None,
-        })
-        .into()
-    }
-
-    #[tokio::test]
-    async fn update_replaces_only_the_expected_version() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::open(dir.path()).unwrap();
-        let path = Path::from("gc/manifest.boundary");
-        let missing = store.put_opts(&path, "1".into(), update_to(None)).await;
-        assert!(
-            matches!(missing, Err(Error::Precondition { .. })),
-            "{missing:?}"
-        );
-
-        let created = store
-            .put_opts(&path, "1".into(), PutMode::Create.into())
-            .await
-            .unwrap();
-        let again = store
-            .put_opts(&path, "2".into(), PutMode::Create.into())
-            .await;
-        assert!(
-            matches!(again, Err(Error::AlreadyExists { .. })),
-            "{again:?}"
-        );
-
-        // Equal sizes keep the e-tags apart only by inode and mtime.
-        let mut e_tags = vec![created.e_tag.clone().unwrap()];
-        for n in 2..10 {
-            let previous = e_tags.last().cloned();
-            let updated = store
-                .put_opts(&path, n.to_string().into(), update_to(previous))
-                .await
-                .unwrap();
-            let meta = store.head(&path).await.unwrap();
-            assert_eq!(meta.e_tag, updated.e_tag);
-            assert!(!e_tags.contains(meta.e_tag.as_ref().unwrap()), "{e_tags:?}");
-            e_tags.push(meta.e_tag.unwrap());
-        }
-        let bytes = store.get(&path).await.unwrap().bytes().await.unwrap();
-        assert_eq!(bytes.as_ref(), b"9");
-
-        let stale = store
-            .put_opts(&path, "10".into(), update_to(created.e_tag))
-            .await;
-        assert!(
-            matches!(stale, Err(Error::Precondition { .. })),
-            "{stale:?}"
-        );
-        // The lock file and staging files stay out of listings.
-        let listed: Vec<_> = store.list(None).try_collect().await.unwrap();
-        let listed: Vec<_> = listed.into_iter().map(|meta| meta.location).collect();
-        assert_eq!(listed, vec![path]);
-    }
-
-    /// A hung read and a held update lock both fail at the timeout.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_hung_call_fails_at_the_timeout() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = LocalStore::open(dir.path()).unwrap();
-        store.timeout = Duration::from_millis(200);
-        let fails_in_time = |result: Result<()>, started: Instant| {
-            let error = result.unwrap_err();
-            assert!(error.to_string().contains("timed out"), "{error}");
-            assert!(started.elapsed() < Duration::from_secs(2));
-        };
-        // An open of a FIFO waits for a writer, like a hung filesystem.
-        let fifo = dir.path().join("fifo");
-        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
-        assert!(made.unwrap().success());
-        let started = Instant::now();
-        fails_in_time(store.get(&Path::from("fifo")).await.map(drop), started);
-        // Release the blocked open, so that the runtime can stop.
-        drop(OpenOptions::new().write(true).open(&fifo).unwrap());
-
-        let path = Path::from("boundary");
-        let created = store
-            .put_opts(&path, "1".into(), PutMode::Create.into())
-            .await
-            .unwrap();
-        let held = lock(&dir.path().join("boundary"), Instant::now()).unwrap();
-        let started = Instant::now();
-        let blocked = store
-            .put_opts(&path, "2".into(), update_to(created.e_tag.clone()))
-            .await;
-        fails_in_time(blocked.map(drop), started);
-        drop(held);
-        store
-            .put_opts(&path, "2".into(), update_to(created.e_tag))
-            .await
-            .unwrap();
-    }
-
-    /// The names of the staging files in `dir`. The lock file `#0` is not one.
-    fn staged(dir: &std::path::Path) -> Vec<String> {
-        std::fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name.contains('#') && !name.ends_with("#0"))
-            .collect()
-    }
-
-    /// Set the mtime rounded down to a whole second, like HFS+.
-    fn whole_seconds(file: &File, time: SystemTime) -> std::io::Result<()> {
-        let seconds = time.duration_since(UNIX_EPOCH).unwrap().as_secs();
-        file.set_modified(UNIX_EPOCH + Duration::from_secs(seconds))
-    }
-
-    /// Set nothing, like a filesystem that keeps one mtime.
-    fn ignore_mtime(_: &File, _: SystemTime) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn a_coarse_mtime_gets_a_larger_step_or_fails_the_update() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = LocalStore::open(dir.path()).unwrap();
-        let path = Path::from("boundary");
-        let file = dir.path().join("boundary");
-        store
-            .put_opts(&path, "1".into(), PutMode::Create.into())
-            .await
-            .unwrap();
-        // The current version has a whole-second mtime after the clock. A new file gets an
-        // earlier mtime, and a 1 µs or 1 ms step rounds back to the current one.
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        let ahead = UNIX_EPOCH + Duration::from_secs(now.as_secs() + 5);
-        File::open(&file).unwrap().set_modified(ahead).unwrap();
-        let current = store.head(&path).await.unwrap();
-
-        store.set_mtime = ignore_mtime;
-        let kept = store
-            .put_opts(&path, "2".into(), update_to(current.e_tag.clone()))
-            .await;
-        let kept = kept.unwrap_err().to_string();
-        assert!(kept.contains("keeps the mtime"), "{kept}");
-        assert_eq!(store.head(&path).await.unwrap().e_tag, current.e_tag);
-        let bytes = store.get(&path).await.unwrap().bytes().await.unwrap();
-        assert_eq!(bytes.as_ref(), b"1");
-        assert!(staged(dir.path()).is_empty(), "{:?}", staged(dir.path()));
-
-        store.set_mtime = whole_seconds;
-        let updated = store
-            .put_opts(&path, "2".into(), update_to(current.e_tag.clone()))
-            .await
-            .unwrap();
-        let meta = store.head(&path).await.unwrap();
-        assert_eq!(meta.e_tag, updated.e_tag);
-        assert_ne!(meta.e_tag, current.e_tag);
-        let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
-        assert_eq!(mtime, ahead + Duration::from_secs(1));
-    }
-
-    /// Equal-size updates on an HFS+ disk image, a filesystem with whole-second mtimes. The test
-    /// does nothing where `hdiutil` cannot make and attach the image.
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn equal_size_updates_on_hfs_plus_get_new_e_tags() {
-        let dir = tempfile::tempdir().unwrap();
-        let image = dir.path().join("hfs.dmg");
-        let mount = dir.path().join("mount");
-        let hdiutil = |args: &[&std::ffi::OsStr]| {
-            std::process::Command::new("hdiutil")
-                .args(args)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
-        };
-        let made = hdiutil(&[
-            "create".as_ref(),
-            "-size".as_ref(),
-            "4m".as_ref(),
-            "-fs".as_ref(),
-            "HFS+".as_ref(),
-            "-volname".as_ref(),
-            "boundary".as_ref(),
-            image.as_os_str(),
-        ]);
-        std::fs::create_dir(&mount).unwrap();
-        if !made
-            || !hdiutil(&[
-                "attach".as_ref(),
-                "-nobrowse".as_ref(),
-                "-mountpoint".as_ref(),
-                mount.as_os_str(),
-                image.as_os_str(),
-            ])
-        {
-            eprintln!("skipped: hdiutil cannot make an HFS+ image here");
-            return;
-        }
-        let result = async {
-            let store = LocalStore::open(&mount.join("objects")).unwrap();
-            let path = Path::from("boundary");
-            let created = store
-                .put_opts(&path, "0".into(), PutMode::Create.into())
-                .await
-                .unwrap();
-            let mut e_tags = vec![created.e_tag.unwrap()];
-            let mut mtime = store.head(&path).await.unwrap().last_modified;
-            for n in 1..4 {
-                let previous = e_tags.last().cloned();
-                let updated = store
-                    .put_opts(&path, n.to_string().into(), update_to(previous))
-                    .await
-                    .unwrap();
-                let meta = store.head(&path).await.unwrap();
-                assert_eq!(meta.e_tag, updated.e_tag);
-                assert!(!e_tags.contains(updated.e_tag.as_ref().unwrap()));
-                // Each version has a later mtime, so a reused inode cannot repeat an e-tag.
-                assert!(meta.last_modified > mtime, "{} {mtime}", meta.last_modified);
-                mtime = meta.last_modified;
-                e_tags.push(updated.e_tag.unwrap());
-            }
-        };
-        let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(result)).await;
-        assert!(hdiutil(&[
-            "detach".as_ref(),
-            "-force".as_ref(),
-            mount.as_os_str()
-        ]));
-        if let Err(panic) = result {
-            std::panic::resume_unwind(panic);
-        }
-    }
-
-    /// The environment variables of a racing child process.
-    const RACE_DIR: &str = "SLATEDB_ETCD_TEST_RACE_DIR";
-    const RACE_ETAG: &str = "SLATEDB_ETCD_TEST_RACE_ETAG";
-
-    /// Two processes update one object with the same expected e-tag. Exactly one wins.
-    #[test]
-    fn one_of_two_racing_processes_updates() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let path = Path::from("gc/manifest.boundary");
-        if let Ok(dir) = std::env::var(RACE_DIR) {
-            // A child waits for the start file, then tries its update once.
-            let dir = std::path::Path::new(&dir);
-            while !dir.join("start").exists() {
-                std::thread::sleep(Duration::from_micros(100));
-            }
-            let store = LocalStore::open(&dir.join("objects")).unwrap();
-            let id = std::process::id().to_string();
-            let e_tag = std::env::var(RACE_ETAG).ok();
-            let result = runtime.block_on(store.put_opts(&path, id.into(), update_to(e_tag)));
-            match result {
-                Ok(_) => std::process::exit(0),
-                Err(Error::Precondition { .. }) => std::process::exit(3),
-                Err(error) => panic!("{error}"),
-            }
-        }
-        let test = module_path!().split_once("::").unwrap().1;
-        let test = format!("{test}::one_of_two_racing_processes_updates");
-        for round in 0..8 {
-            let dir = tempfile::tempdir().unwrap();
-            let store = LocalStore::open(&dir.path().join("objects")).unwrap();
-            let e_tag = runtime
-                .block_on(store.put_opts(&path, "0".into(), PutMode::Create.into()))
-                .unwrap()
-                .e_tag
-                .unwrap();
-            let children: Vec<_> = (0..2)
-                .map(|_| {
-                    std::process::Command::new(std::env::current_exe().unwrap())
-                        .args([test.as_str(), "--exact", "--test-threads=1"])
-                        .env(RACE_DIR, dir.path())
-                        .env(RACE_ETAG, &e_tag)
-                        .stdout(std::process::Stdio::null())
-                        .spawn()
-                        .unwrap()
-                })
-                .collect();
-            std::fs::write(dir.path().join("start"), b"").unwrap();
-            let mut winners = vec![];
-            for mut child in children {
-                let id = child.id();
-                match child.wait().unwrap().code() {
-                    Some(0) => winners.push(id),
-                    Some(3) => {}
-                    code => panic!("round {round}: child exited with {code:?}"),
-                }
-            }
-            assert_eq!(winners.len(), 1, "round {round}");
-            let bytes = runtime
-                .block_on(async { store.get(&path).await.unwrap().bytes().await })
-                .unwrap();
-            assert_eq!(bytes.as_ref(), winners[0].to_string().as_bytes());
-        }
-    }
-}
+mod tests;
