@@ -295,6 +295,21 @@ impl Drop for Prune<'_> {
     }
 }
 
+/// Checkpoints that retention selected for deletion. Dropping it ends the marks.
+pub(crate) struct Retiring<'a> {
+    source: &'a Source,
+    pub ids: Vec<uuid::Uuid>,
+}
+
+impl Drop for Retiring<'_> {
+    fn drop(&mut self) {
+        let mut pins = self.source.pins.lock().unwrap();
+        for id in &self.ids {
+            pins.retiring.remove(id);
+        }
+    }
+}
+
 /// An open in flight. Dropping it ends the reservation.
 pub(crate) struct Opening<'a> {
     source: &'a Source,
@@ -428,25 +443,19 @@ impl Source {
     }
 
     /// Select the checkpoints to delete and mark them, under the lock that opens take. A later
-    /// open of a marked checkpoint fails. Call `end_retire` after the deletions.
+    /// open of a marked checkpoint fails. The marks end when the returned value drops, also when
+    /// the caller stops before its deletions end.
     pub(crate) fn begin_retire(
         &self,
         views: &[(u64, uuid::Uuid)],
         reported: &HashSet<uuid::Uuid>,
         keep: usize,
-    ) -> Vec<uuid::Uuid> {
+    ) -> Retiring<'_> {
         let mut pins = self.pins.lock().unwrap();
         let pinned = pins.pinned();
-        let candidates = retired(views, &pinned, reported, keep);
-        pins.retiring.extend(candidates.iter().copied());
-        candidates
-    }
-
-    pub(crate) fn end_retire(&self, ids: &[uuid::Uuid]) {
-        let mut pins = self.pins.lock().unwrap();
-        for id in ids {
-            pins.retiring.remove(id);
-        }
+        let ids = retired(views, &pinned, reported, keep);
+        pins.retiring.extend(ids.iter().copied());
+        Retiring { source: self, ids }
     }
 
     /// Open the checkpoint of a received snapshot before Raft accepts it. A failed open fails the
@@ -629,9 +638,10 @@ pub(crate) async fn retain(
         .into_iter()
         .map(|(seq, checkpoint)| (seq, checkpoint.id))
         .collect();
-    let candidates = source.begin_retire(&views, reported, keep);
+    // A stopped writer task drops this future at an await. `retiring` then ends the marks.
+    let retiring = source.begin_retire(&views, reported, keep);
     let mut result = Ok(());
-    for id in &candidates {
+    for id in &retiring.ids {
         if let Some(epoch) = epoch {
             let current = admin.read_manifest(None).await.map_err(anyhow::Error::from);
             match current.map(|manifest| manifest.map(|manifest| manifest.writer_epoch())) {
@@ -651,7 +661,7 @@ pub(crate) async fn retain(
             break;
         }
     }
-    source.end_retire(&candidates);
+    drop(retiring);
     result
 }
 
