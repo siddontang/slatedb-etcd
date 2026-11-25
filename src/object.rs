@@ -14,8 +14,10 @@ use slatedb::object_store::{ClientOptions, ObjectStore, ObjectStoreExt, PutMode,
 
 use crate::state::{StateMachine, StateMode};
 
+pub(crate) mod bounded;
 #[cfg(test)]
 pub(crate) mod faults;
+pub(crate) mod local;
 #[cfg(target_os = "linux")]
 pub(crate) mod paced;
 #[cfg(target_os = "linux")]
@@ -224,9 +226,7 @@ impl Config {
                 "a shared directory needs shared state mode"
             );
             let binding = bind(dir, cluster, member, None, mode)?;
-            std::fs::create_dir_all(objects)?;
-            let store = slatedb::object_store::local::LocalFileSystem::new_with_prefix(objects)?;
-            let store: Arc<dyn ObjectStore> = Arc::new(store.with_fsync(true));
+            let store: Arc<dyn ObjectStore> = Arc::new(local_store(objects)?);
             let prefix = format!("member-{member}");
             let quota =
                 claim_shared(store.as_ref(), "", &prefix, cluster, &binding, shared).await?;
@@ -257,10 +257,7 @@ impl Config {
                         shared.voters.len() == 1 && !shared.join,
                         "several shared-mode members need a shared object store"
                     );
-                    std::fs::create_dir_all(&objects)?;
-                    let store =
-                        slatedb::object_store::local::LocalFileSystem::new_with_prefix(&objects)?;
-                    let store = Arc::new(store.with_fsync(true));
+                    let store = Arc::new(local_store(&objects)?);
                     StateMachine::open_shared(store, "", cluster, cache, shared, local).await
                 }
             };
@@ -301,6 +298,11 @@ impl Config {
         }
         s3.store()
     }
+}
+
+/// A shared-mode store in a local directory. Its calls have a deadline and a limit in flight.
+fn local_store(objects: &Path) -> Result<bounded::Bounded<local::LocalStore>> {
+    Ok(bounded::Bounded::new(local::LocalStore::open(objects)?))
 }
 
 /// Read the object store binding of a data directory.

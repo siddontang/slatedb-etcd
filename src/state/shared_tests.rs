@@ -265,12 +265,8 @@ async fn writer(state: &StateMachine) -> slatedb::Db {
     source.open_writer().await.unwrap()
 }
 
-/// Write the overlay batches into the shared database, flush, and open a checkpoint of it.
-async fn checkpoint(
-    state: &StateMachine,
-    writer: &slatedb::Db,
-    written: &mut u64,
-) -> Arc<view::Base> {
+/// Write the overlay batches into the shared database and flush it.
+async fn flush(state: &StateMachine, writer: &slatedb::Db, written: &mut u64) {
     let queue = state.shared.as_ref().unwrap().overlay.queue();
     for (seq, batch) in queue.after(*written, usize::MAX) {
         writer
@@ -280,6 +276,15 @@ async fn checkpoint(
         *written = seq;
     }
     writer.flush().await.unwrap();
+}
+
+/// Write the overlay batches into the shared database, flush, and open a checkpoint of it.
+async fn checkpoint(
+    state: &StateMachine,
+    writer: &slatedb::Db,
+    written: &mut u64,
+) -> Arc<view::Base> {
+    flush(state, writer, written).await;
     let id = writer
         .create_checkpoint(
             CheckpointScope::Durable,
@@ -1844,4 +1849,74 @@ async fn timed_out_warms_keep_the_warm_set_bounded() {
     );
     writer.close().await.unwrap();
     state.close().await.unwrap();
+}
+
+/// SlateDB advances its GC boundary files with conditional updates. Both local store layouts
+/// must accept them after a writer change, or manifest GC stops deleting files.
+#[tokio::test]
+async fn manifest_gc_continues_on_a_local_store_after_a_writer_change() {
+    use futures::StreamExt;
+    use slatedb::config::{GarbageCollectorDirectoryOptions, GarbageCollectorOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let gc = GarbageCollectorOptions {
+        manifest_options: Some(GarbageCollectorDirectoryOptions {
+            interval: None,
+            min_age: Duration::ZERO,
+            dry_run: false,
+        }),
+        wal_options: None,
+        wal_fence_options: None,
+        compacted_options: None,
+        compactions_options: None,
+        detach_options: None,
+        boundary_files_enabled: true,
+        ..Default::default()
+    };
+    for config in [
+        crate::object::Config::Local,
+        crate::object::Config::SharedDirectory(dir.path().join("shared")),
+    ] {
+        let data = tempfile::tempdir_in(dir.path()).unwrap();
+        let mut state = config
+            .open(
+                data.path(),
+                "cluster",
+                1,
+                StateCache::default(),
+                StateMode::Shared,
+                &options(),
+            )
+            .await
+            .unwrap();
+        state.members = Arc::new(crate::cluster::Store::initial(
+            &[(1, "127.0.0.1:1".to_owned())].into(),
+        ));
+        state.seed_for_test(1).await.unwrap();
+        let source = state.shared.as_ref().unwrap().source.clone();
+        let prefix =
+            slatedb::object_store::path::Path::from(format!("{}/manifest", source.state()));
+        let mut written = 0;
+        let mut counts = vec![];
+        // Each round opens a new writer, which fences the previous one.
+        for _ in 0..2 {
+            let writer = writer(&state).await;
+            for n in 0..4 {
+                state
+                    .apply_etcd(state.applied + 1, &put("k", &n.to_string()))
+                    .await
+                    .unwrap();
+                flush(&state, &writer, &mut written).await;
+            }
+            writer.close().await.unwrap();
+            let before = source.store.list(Some(&prefix)).count().await;
+            state.admin.run_gc_once(gc.clone()).await.unwrap();
+            let after = source.store.list(Some(&prefix)).count().await;
+            counts.push((before, after));
+        }
+        assert!(
+            counts.iter().all(|(before, after)| after < before),
+            "{config:?}: manifest files before and after each GC run: {counts:?}"
+        );
+        state.close().await.unwrap();
+    }
 }

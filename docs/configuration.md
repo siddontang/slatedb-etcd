@@ -269,6 +269,20 @@ member of the new leader pins.
   lifetime, and follower reads across missed renewals.
 - `object::Config::SharedDirectory` lets members of one host share a local directory in tests.
   A member-local store serves one voter.
+- A local store in shared mode needs a POSIX filesystem with `flock` and atomic rename. SlateDB
+  advances its GC boundary files with conditional updates, and the store orders them with a
+  lock. NFS and other network filesystems are not supported.
+- A local store call fails after 30 s, like an S3 request. Each item of a list and each read
+  of an object body has its own 30 s. A hung filesystem then fails the SlateDB task and does
+  not block it forever.
+- At most 64 local store calls of the process run at once. Each holds a call slot until its
+  filesystem work ends, also after its deadline. A call waits for a slot within its own 30 s.
+  If late calls hold all 64 slots, a new call fails at once. At most 64 blocked calls can
+  finish after their deadline. `slatedb_etcd_local_store_calls_in_flight` reports the slots
+  in use.
+- An update moves the mtime of the object forward. On a filesystem with coarse timestamps,
+  such as HFS+, it moves it by up to 2 s. If the mtime cannot move, the update fails and the
+  object stays.
 
 ## Environment
 
