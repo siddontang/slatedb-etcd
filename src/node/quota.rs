@@ -17,7 +17,7 @@
 //!
 //! The same guard keeps such a state from an entry of an earlier binary before the first
 //! `SeedMembers` entry, in both state modes; see `state::cluster`. A local origin record in the
-//! data directory, kept in both modes, says whether this binary created the state empty.
+//! data directory, kept in both modes, says which guards apply. See `Origin`.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -34,10 +34,19 @@ const RECORD: &str = "quota-flag.json";
 /// keep it. Raft, snapshots, and backups do not carry it.
 const ORIGIN: &str = "state-origin.json";
 
+/// The guards that apply to a data directory, by the start that created it. See `Guards`.
+///
+/// The first start of this binary writes the record. Without an earlier record, a guard applies
+/// when that start found an empty Raft log and an empty state. #116 kept the quota mark in its
+/// flag record, so the quota guard keeps that mark. A directory with history at that start
+/// holds decisions of an earlier binary, which applied it without seeds. So the membership guard
+/// does not apply there, and replay applies the entries as that binary did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Origin {
-    /// This binary created the data directory empty. See `Guards`.
-    created_empty: bool,
+    /// The state was created empty by this binary, or by #116 before it.
+    quota_created_empty: bool,
+    /// The state was created empty by this binary.
+    members_created_empty: bool,
 }
 
 /// An operator request of this member: a flag value and the wall-clock time of the start that
@@ -91,16 +100,17 @@ impl Guards {
         }
     }
 
-    /// The guards of `state`.
-    pub(super) fn of(state: &StateMachine) -> Self {
+    /// The guards of `state` that apply to a directory with origin `origin`.
+    pub(super) fn of(state: &StateMachine, origin: Self) -> Self {
         Self::new(
             state.is_shared(),
             state.cluster_quota().is_some(),
             state.members_row.is_some(),
         )
+        .and(origin)
     }
 
-    fn any(self) -> bool {
+    pub(super) fn any(self) -> bool {
         self.quota || self.members
     }
 
@@ -157,16 +167,16 @@ pub(super) fn first_gate(entries: &[Entry], guards: &mut Guards) -> Result<Optio
     Ok(None)
 }
 
-/// Keep only the entries that a recovery replay can apply. A state that this binary created
-/// empty stops before a `Gate::Checked` entry. Return true when no entry is left: the member
+/// Keep only the entries that a recovery replay can apply. A state of a directory with origin
+/// `origin` stops before a `Gate::Checked` entry. Return true when no entry is left: the member
 /// then waits for a snapshot.
 pub(super) fn guard_replay(
     state: &StateMachine,
-    created_empty: bool,
+    origin: Guards,
     entries: &mut Vec<Entry>,
 ) -> Result<bool> {
-    let mut guards = Guards::of(state);
-    if !created_empty || !guards.any() {
+    let mut guards = Guards::of(state, origin);
+    if !guards.any() {
         return Ok(false);
     }
     if let Some(Gate::Checked(index)) = first_gate(entries, &mut guards)? {
@@ -181,8 +191,8 @@ pub(super) struct Quota {
     flag: i64,
     /// The record file and its content. `None` in shared mode, which never proposes.
     record: Option<(PathBuf, Record)>,
-    /// See `Origin`.
-    created_empty: bool,
+    /// The guards that apply to this directory. See `Origin`.
+    origin: Guards,
     /// The index and term of the last `SetQuota` proposal of this member.
     proposed: Option<(u64, u64)>,
     /// The cluster quota that `observe_quota` last handled.
@@ -249,7 +259,7 @@ impl Quota {
             member: startup.member,
             flag: startup.flag,
             record: None,
-            created_empty: open_origin(dir, startup.empty)?,
+            origin: open_origin(dir, startup.empty)?,
             proposed: None,
             observed: None,
             gate: None,
@@ -300,8 +310,14 @@ impl Quota {
     }
 
     /// This binary created the data directory empty.
+    #[cfg(test)]
     pub(super) fn created_empty(&self) -> bool {
-        self.created_empty
+        self.origin.any()
+    }
+
+    /// The guards that apply to this directory. See `Origin`.
+    pub(super) fn origin(&self) -> Guards {
+        self.origin
     }
 
     /// The quota-checked entry that waits for a snapshot, if any.
@@ -388,20 +404,37 @@ pub(super) fn without_vote(
 
 /// Read the origin record of `dir`. The first start writes it: `empty` is true when this start
 /// found an empty Raft log and an empty state.
-fn open_origin(dir: &Path, empty: bool) -> Result<bool> {
+fn open_origin(dir: &Path, empty: bool) -> Result<Guards> {
     let path = dir.join(ORIGIN);
-    let origin = match std::fs::read(&path) {
-        Ok(data) => serde_json::from_slice::<Origin>(&data).context("invalid origin record")?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let origin = match read_json::<Origin>(&path).context("invalid origin record")? {
+        Some(origin) => origin,
+        None => {
+            // #116 kept the quota mark in its flag record. A member that waits for a snapshot
+            // must keep waiting after the upgrade.
+            let earlier = read_json::<serde_json::Value>(&dir.join(RECORD))
+                .context("invalid quota record")?
+                .and_then(|record| record["created_empty"].as_bool());
             let origin = Origin {
-                created_empty: empty,
+                quota_created_empty: earlier.unwrap_or(empty),
+                members_created_empty: empty,
             };
             write_record(&path, &origin)?;
             origin
         }
-        Err(error) => return Err(error.into()),
     };
-    Ok(origin.created_empty)
+    Ok(Guards {
+        quota: origin.quota_created_empty,
+        members: origin.members_created_empty,
+    })
+}
+
+/// Read a JSON file, or `None` when it does not exist.
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    match std::fs::read(path) {
+        Ok(data) => Ok(Some(serde_json::from_slice(&data)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Replace the record file atomically.
@@ -504,19 +537,21 @@ impl Node {
         Ok(())
     }
 
-    /// The inputs that the applied state lacks. See `Guards`.
+    /// The inputs that the applied state lacks, for the guards of this directory. See `Guards`.
     fn guards(&self) -> Guards {
         Guards::new(
             !self.options.state_mode.is_replicated(),
             self.state.cluster_quota.is_some(),
             self.state.members_row.is_some(),
         )
+        .and(self.quota.origin())
     }
 
-    /// Return true while a state created empty lacks the cluster quota or the membership row.
-    /// Apply then runs one batch at a time and stops before a `Gate::Checked` entry.
+    /// Return true while a guard of this directory applies: a state created empty lacks the
+    /// cluster quota or the membership row. Apply then runs one batch at a time and stops before
+    /// a `Gate::Checked` entry.
     pub(super) fn quota_guarded(&self) -> bool {
-        self.quota.created_empty() && self.guards().any()
+        self.guards().any()
     }
 
     /// Find the first gate in the cached log above the applied index. `replaced` is the first
@@ -1287,6 +1322,74 @@ pub(super) mod tests {
             .await
             .quota
             .created_empty());
+    }
+
+    /// The flag record that #116 wrote when it first opened a member.
+    fn write_116_record(dir: &Path, created_empty: bool) {
+        let record =
+            format!(r#"{{"acknowledged":3000,"pending":null,"created_empty":{created_empty}}}"#);
+        std::fs::write(dir.join(RECORD), record).unwrap();
+    }
+
+    /// #116 created this member empty, and it waits to replace the Puts of an earlier binary.
+    /// After the upgrade, the quota guard keeps the member waiting: the origin record takes the
+    /// mark of #116, not the log that the member holds now.
+    #[tokio::test]
+    async fn an_upgrade_from_116_keeps_the_quota_guard_of_a_waiting_member() {
+        let dir = tempfile::tempdir().unwrap();
+        write_116_record(dir.path(), true);
+        let mut commands: Vec<_> = (0..40).map(quota_put).collect();
+        commands.push(set_quota(-1, 0, 2));
+        append_committed(dir.path(), 1, &commands);
+        let mut node = open_node(dir.path(), 3000, false).await;
+        drive(&mut node).await;
+        assert_eq!(
+            (
+                node.state.applied,
+                node.quota.blocked(),
+                node.state.revision
+            ),
+            (0, Some(1), 1),
+        );
+        assert!(!node.quota.origin().members);
+    }
+
+    /// #116 has no seeds. A #116 member with history before the first start of this binary
+    /// applied its membership entries without one, so the membership guard does not apply. It
+    /// replays its unflushed log as #116 did. A #116 member with an empty log and state has no
+    /// such history, so the membership guard applies to it.
+    #[tokio::test]
+    async fn an_upgrade_from_116_guards_the_membership_only_without_history() {
+        let dir = tempfile::tempdir().unwrap();
+        write_116_record(dir.path(), true);
+        let commands = [set_quota(1 << 20, 0, 2), publish(), quota_put(1)];
+        append_committed(dir.path(), 1, &commands);
+        let mut node = open_node(dir.path(), 3000, false).await;
+        assert_eq!(
+            node.quota.origin(),
+            Guards {
+                quota: true,
+                members: false
+            }
+        );
+        apply_committed(&mut node).await;
+        assert_eq!((node.quota.blocked(), node.state.revision), (None, 2));
+        assert!(node.state.members_row.is_some());
+
+        let dir = tempfile::tempdir().unwrap();
+        write_116_record(dir.path(), true);
+        drop(open_node(dir.path(), 3000, false).await);
+        append_committed(dir.path(), 1, &[publish()]);
+        let mut node = open_node(dir.path(), 3000, false).await;
+        assert_eq!(
+            node.quota.origin(),
+            Guards {
+                quota: true,
+                members: true
+            }
+        );
+        drive(&mut node).await;
+        assert_eq!((node.state.applied, node.quota.blocked()), (0, Some(1)));
     }
 
     /// An earlier binary stored the flags of the publishing member before this entry.

@@ -298,9 +298,10 @@ change the stored row, and a rejected command writes nothing. Raft snapshots car
 row and nothing else. A log of an earlier binary has other entries before any seed. Such an
 entry that finds no row stores the in-memory membership with its batch, as that binary did. A
 state that this binary created empty stops before such an entry and requests a snapshot, as for
-the quota. This guard works in both state modes. A local origin record says whether this binary
-created the state empty. Each seed also carries a digest of the row of the leader. See
-[membership row](operations.md#membership-row).
+the quota. This guard works in both state modes. A local origin record says, for each guard,
+whether the state was created empty. It keeps the quota mark of #116, and a directory with
+history at the first start replays its membership entries as before. Each seed also carries a
+digest of the row of the leader. See [membership row](operations.md#membership-row).
 
 Each member flushes SlateDB outside ordered apply when a step finishes a physical boundary.
 Writes can apply during this flush. One flush can run at a time.

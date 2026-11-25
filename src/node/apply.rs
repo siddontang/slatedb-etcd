@@ -839,7 +839,7 @@ pub(super) async fn recover(
     state: &mut StateMachine,
     storage: &RaftStorage,
     header: Header,
-    created_empty: bool,
+    origin: super::quota::Guards,
 ) -> Result<()> {
     let mut physical = false;
     while state.applied < storage.commit_index() {
@@ -852,7 +852,7 @@ pub(super) async fn recover(
         )?;
         ensure!(!entries.is_empty(), "empty recovery batch");
         // A guarded member stops here and waits for a snapshot. See `node::quota`.
-        if super::quota::guard_replay(state, created_empty, &mut entries)? {
+        if super::quota::guard_replay(state, origin, &mut entries)? {
             break;
         }
         let replies = apply_entries(state, entries, header).await?;

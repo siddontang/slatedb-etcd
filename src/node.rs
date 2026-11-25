@@ -479,15 +479,15 @@ impl Node {
                             member: options.id,
                             term: storage.initial_state()?.hard_state.term,
                         },
-                        quota.created_empty(),
+                        quota.origin(),
                     )
                     .await?;
                     log::Cache::load(&storage, state.applied, options.log_memory)
                 }
                 loaded => loaded,
             };
-            let guards = quota::Guards::of(&state);
-            if quota.created_empty() && (guards.quota || guards.members) {
+            let guards = quota::Guards::of(&state, quota.origin());
+            if guards.any() {
                 let (gate, scanned, open) = quota::scan_storage(&storage, state.applied, guards)?;
                 quota.set_scan(gate, scanned, open);
             }
