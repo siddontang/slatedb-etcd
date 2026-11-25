@@ -222,7 +222,8 @@ Rules and limits:
 - A member reports whether it installs a base above its checkpoint row, with the ID of its
   process. The leader extends coverage only while every member reported it. An earlier binary
   gets only a snapshot at its checkpoint row: the leader publishes a new checkpoint for it when
-  its record is above the row.
+  its record is above the row. A snapshot above its row uses its own route, which an earlier
+  binary refuses before Raft.
 - A restart opens the newest checkpoint. It adopts the checkpoint when the log ends below it. A
   Raft snapshot record above the newest checkpoint row names its checkpoint, and the restart
   opens that one at the record index. If retention deleted it, the restart takes the newest

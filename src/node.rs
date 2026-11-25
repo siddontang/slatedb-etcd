@@ -1454,7 +1454,16 @@ impl Node {
     }
 
     fn send(&mut self, messages: Vec<Message>) {
-        for message in messages {
+        for mut message in messages {
+            // A view snapshot above its row names the receiver process that can install it, or
+            // zero, which no process has. The transport sends it on its own route. See
+            // `peer::post_snapshot`.
+            if message.get_msg_type() == MessageType::MsgSnapshot
+                && crate::state::transfer::above_row(message.get_snapshot())
+            {
+                let process = self.raw.store().capable_process(message.to).unwrap_or(0);
+                message.context = process.to_le_bytes().to_vec();
+            }
             if self.raw.raft.state == StateRole::Leader {
                 crate::failpoint::hit("raft-before-leader-send");
             } else {

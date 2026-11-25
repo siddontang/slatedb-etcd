@@ -43,6 +43,7 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/kv", post(propose))
         .route("/raft", post(raft_message))
+        .route(crate::peer::COVERED_ROUTE, post(covered_snapshot))
         .route("/raft/view-ack", post(view_ack))
         .route(crate::state::transfer::FILE_ROUTE, get(snapshot_file))
         .route("/status", get(status))
@@ -103,6 +104,51 @@ async fn raft_message(State(state): State<ApiState>, headers: HeaderMap, body: B
     let Ok(message) = crate::peer::decode_message(body) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    step_message(state, headers, message, size).await
+}
+
+/// Receive a view snapshot above its checkpoint row. Only this binary has the route, so an
+/// earlier binary answers 404 before its Raft sees the snapshot. The sender names the process
+/// that advertised the capability, and another process of this member refuses with 409.
+async fn covered_snapshot(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if headers
+        .get("x-cluster-id")
+        .and_then(|value| value.to_str().ok())
+        != Some(&state.cluster_id)
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let target = crate::peer::process_of(
+        headers
+            .get(crate::peer::TARGET_PROCESS)
+            .map(|value| value.as_bytes()),
+    );
+    if target != Some(crate::peer::process_id()) {
+        return (StatusCode::CONFLICT, "the snapshot names another process").into_response();
+    }
+    let size = body.len();
+    let Ok(mut message) = crate::peer::decode_message(body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if message.get_msg_type() != raft::eraftpb::MessageType::MsgSnapshot
+        || !crate::state::transfer::above_row(message.get_snapshot())
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    message.context.clear();
+    step_message(state, headers, message, size).await
+}
+
+async fn step_message(
+    state: ApiState,
+    headers: HeaderMap,
+    message: raft::eraftpb::Message,
+    size: usize,
+) -> Response {
     let process = crate::peer::process_of(
         headers
             .get(crate::peer::PROCESS)

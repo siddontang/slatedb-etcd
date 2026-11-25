@@ -99,6 +99,11 @@ struct Simulation {
     old: BTreeSet<u64>,
     /// View snapshots that an earlier binary received, each checked at its row.
     old_installs: u64,
+    /// View snapshots above their row that the receiver refused before Raft saw them.
+    refused_snapshots: u64,
+    /// The checkpoints of the view snapshots that Raft received. IDs are random, so they stay
+    /// out of the trace.
+    delivered_views: Vec<uuid::Uuid>,
     /// Opens and installs of stopped members that raised a base above its row.
     extended: u64,
 }
@@ -236,6 +241,8 @@ impl Simulation {
             processes: BTreeMap::new(),
             old: BTreeSet::new(),
             old_installs: 0,
+            refused_snapshots: 0,
+            delivered_views: vec![],
             extended: 0,
         };
         for id in 1..=sim.members {
@@ -635,7 +642,7 @@ impl Simulation {
             return;
         }
         let index = self.choose(self.messages.len());
-        let message = self.messages.remove(index);
+        let mut message = self.messages.remove(index);
         self.trace.push(format!(
             "message {} {} {:?} {} {}",
             message.from,
@@ -653,8 +660,11 @@ impl Simulation {
         if faults && self.choose(40) == 0 {
             self.messages.push(message.clone());
         }
-        if message.get_msg_type() == MessageType::MsgSnapshot && self.old.contains(&message.to) {
-            self.check_old_install(&message).await;
+        if message.get_msg_type() == MessageType::MsgSnapshot {
+            let Some(accepted) = self.receive_snapshot(message.clone()).await else {
+                return;
+            };
+            message = accepted;
         }
         let process = self.process(message.from);
         let mut saved = None;

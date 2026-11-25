@@ -53,9 +53,44 @@ impl Simulation {
             .view_ack(id, pins, None, coverage);
     }
 
+    /// The HTTP routes of a snapshot. A view snapshot above its row goes to its own route with
+    /// the receiver process that the leader named. An earlier binary has no such route, and
+    /// another process refuses it. Then the transport tells the leader that the member is not
+    /// capable, and reports the snapshot as failed. Return the message that Raft gets, if any.
+    pub(super) async fn receive_snapshot(&mut self, mut message: Message) -> Option<Message> {
+        let (from, to) = (message.from, message.to);
+        if crate::state::transfer::above_row(message.get_snapshot()) {
+            let target = <[u8; 8]>::try_from(message.context.as_slice())
+                .ok()
+                .map(u64::from_le_bytes);
+            let receiver = self.process(to);
+            if receiver.is_none() || target != receiver {
+                // The node names a target for every snapshot above its row.
+                assert!(target.is_some());
+                self.refused_snapshots += 1;
+                self.trace.push(format!("refuse snapshot {from} {to}"));
+                if let Some(sender) = self.nodes.get_mut(&from) {
+                    sender.raw.store().note_process(to, None);
+                    sender.raw.report_snapshot(to, SnapshotStatus::Failure);
+                }
+                return None;
+            }
+            message.context.clear();
+        }
+        if let Ok(Some(view)) =
+            crate::state::transfer::ViewDescriptor::decode(message.get_snapshot().get_data())
+        {
+            self.delivered_views.push(view.checkpoint().unwrap());
+        }
+        if self.old.contains(&to) {
+            self.check_old_install(&message).await;
+        }
+        Some(message)
+    }
+
     /// An earlier binary installs a view snapshot only when the checkpoint row equals the
     /// snapshot index. Check every view snapshot that such a member receives.
-    pub(super) async fn check_old_install(&mut self, message: &Message) {
+    async fn check_old_install(&mut self, message: &Message) {
         let snapshot = message.get_snapshot();
         let Ok(Some(view)) = crate::state::transfer::ViewDescriptor::decode(snapshot.get_data())
         else {
@@ -915,4 +950,72 @@ async fn a_member_replaced_by_an_earlier_binary_gets_a_snapshot_at_its_row() {
 #[tokio::test]
 async fn a_restarted_leader_sends_an_earlier_binary_a_snapshot_at_its_row() {
     replaced_by_an_earlier_binary(true).await;
+}
+
+impl Simulation {
+    /// Deliver messages until a view snapshot above its row waits for member `to`. Return false
+    /// when none comes.
+    async fn until_covered_snapshot(&mut self, to: u64) -> bool {
+        for _ in 0..3000 {
+            let waiting = self.messages.iter().any(|message| {
+                message.to == to
+                    && message.get_msg_type() == MessageType::MsgSnapshot
+                    && crate::state::transfer::above_row(message.get_snapshot())
+            });
+            if waiting {
+                return true;
+            }
+            if self.messages.is_empty() {
+                let leader = self.leader().unwrap();
+                self.tick(leader).await;
+            }
+            self.deliver(false).await;
+        }
+        false
+    }
+}
+
+/// Critic's send race. The leader builds a snapshot above its row for the process that
+/// advertised the capability. Before it arrives, the member restarts on an earlier binary. The
+/// earlier binary has no route for it and refuses it before Raft, so it never stores it. The
+/// leader then treats the member as an earlier binary, and the member catches up.
+#[tokio::test]
+async fn a_snapshot_above_its_row_to_a_restarted_earlier_binary_is_refused() {
+    let mut sim = Simulation::with_mode(53, true).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(10).await;
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(10).await;
+    let leader = sim.leader().unwrap();
+    let member = sim.follower(0);
+    // The member falls behind, then asks for a snapshot above the base.
+    sim.propose_noop().await;
+    sim.settle(4).await;
+    sim.nodes
+        .get_mut(&member)
+        .unwrap()
+        .raw
+        .request_snapshot()
+        .unwrap();
+    assert!(sim.until_covered_snapshot(member).await);
+    // The same member starts again on an earlier binary before the snapshot arrives.
+    sim.stop(member);
+    sim.old.insert(member);
+    sim.start(member).await;
+    let refused = sim.refused_snapshots;
+    sim.settle(20).await;
+    assert!(sim.refused_snapshots > refused);
+    assert!(!sim.nodes[&leader].raw.store().coverage_capable(member));
+    sim.publish_view(&mut writers).await;
+    sim.settle(30).await;
+    assert_eq!(sim.leader(), Some(leader));
+    let record = Record::of(sim.nodes[&member].raw.store().recovery_snapshot()).unwrap();
+    assert!(record.is_none_or(|record| record.row.is_none()));
+    assert_eq!(
+        sim.nodes[&member].state.applied,
+        sim.nodes[&leader].state.applied
+    );
+    sim.assert_acknowledged(member).await;
 }

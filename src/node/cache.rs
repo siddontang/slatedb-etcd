@@ -492,6 +492,12 @@ impl Cache {
             .get(&peer)
             .is_some_and(|entry| entry.process.is_some() && entry.advertised == entry.process)
     }
+    /// The process of `peer` that advertised the coverage capability, while it runs.
+    pub fn capable_process(&self, peer: u64) -> Option<u64> {
+        self.coverage_capable(peer)
+            .then(|| self.peers.borrow()[&peer].process)
+            .flatten()
+    }
     /// Return true after a member without the capability needed a record at its row.
     pub fn exact_wanted(&self) -> bool {
         self.exact_wanted.get()
