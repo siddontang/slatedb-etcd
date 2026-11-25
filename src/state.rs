@@ -254,18 +254,20 @@ pub(crate) fn slatedb_settings() -> Settings {
 /// member-local directory.
 ///
 /// Compaction rewrites the sorted runs several times while a large data set loads. Each replaced
-/// SST stays until its compactor checkpoint expires and the next GC run, which took 15 to 25
-/// minutes with SlateDB's defaults: 2-3 times the live data on disk. A local directory frees them
-/// within minutes. Any other store, including one a caller passes to `open_store`, keeps the
-/// defaults: a cold scan that fetches one block at a time, such as the index rebuild at open or a
-/// large DeleteRange, can run for minutes on a remote store. GC keeps its default minimum age.
+/// SST stays until its compactor checkpoint expires and the next GC run. With SlateDB's defaults
+/// (a 15-minute checkpoint and GC every 10 minutes) that took 15 to 25 minutes. On a local
+/// directory GC runs every minute, so a replaced SST leaves 15-16 minutes after the compaction.
+/// Any other store, including one a caller passes to `open_store`, keeps the defaults, because
+/// each GC run lists the SSTs of the store.
+///
+/// The checkpoint lifetime stays at SlateDB's default on every store. A read fails if it still
+/// iterates an input SST after the checkpoint expires and GC deletes it. Several reads scan once
+/// with one iterator: the index rebuild at open, a committed DeleteRange, HashKV, export and the
+/// usage count of an older directory. On a cold, busy volume such a scan can run for minutes.
 pub(crate) fn member_settings(local_disk: bool) -> Settings {
     let mut settings = slatedb_settings();
     if !local_disk {
         return settings;
-    }
-    if let Some(compactor) = settings.compactor_options.as_mut() {
-        compactor.checkpoint_lifetime = COMPACTOR_CHECKPOINT_LIFETIME;
     }
     if let Some(gc) = settings.garbage_collector_options.as_mut() {
         if let Some(compacted) = gc.compacted_options.as_mut() {
@@ -277,16 +279,6 @@ pub(crate) fn member_settings(local_disk: bool) -> Settings {
 
 /// How often SlateDB deletes compacted SSTs that no manifest or checkpoint references.
 const COMPACTED_GC_INTERVAL: Duration = Duration::from_secs(60);
-
-/// How long a compaction keeps its input SSTs for iterators that started before it. SlateDB
-/// defaults to 15 minutes.
-///
-/// A read fails if it still iterates an input SST after this time. On a local store the
-/// iterators of this server are short: client reads stop at a 5 s deadline, and Watch catch-up
-/// and MVCC compaction scan in pages. The index rebuild at open, a DeleteRange, HashKV, export
-/// and the usage count of an older directory scan once, which takes seconds per GiB. A state
-/// transfer copies a named checkpoint, so it does not depend on this lifetime.
-const COMPACTOR_CHECKPOINT_LIFETIME: Duration = Duration::from_secs(5 * 60);
 
 /// Read the stored logical size, or count it when the counter does not match the apply marker.
 ///

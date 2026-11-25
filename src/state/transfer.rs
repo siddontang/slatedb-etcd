@@ -217,8 +217,8 @@ pub struct Location {
     store: Arc<dyn ObjectStore>,
     base: String,
     backend: Backend,
-    /// The caller built the store on a member-local directory. Only such a store gets short
-    /// SlateDB GC retention; a replacement database of this namespace keeps the choice.
+    /// The caller built the store on a member-local directory. Only such a store runs compacted-SST
+    /// GC every minute; a replacement database of this namespace keeps the choice.
     pub(crate) local_disk: bool,
     namespace: String,
     /// The name of the first database. Later databases are `<first>-N`.

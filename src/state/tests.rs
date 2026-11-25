@@ -1082,9 +1082,9 @@ fn slatedb_settings_bound_compaction_buffers() {
     );
 }
 
-/// Only a member-local directory gets short GC retention. A remote store keeps SlateDB's
-/// retention: a cold scan there can outlive a short compactor checkpoint, and GC would delete an
-/// SST that the scan still needs.
+/// Only a member-local directory runs compacted-SST GC every minute. Every store keeps SlateDB's
+/// compactor checkpoint lifetime: a cold scan can run for minutes, and GC would delete an SST
+/// that the scan still needs.
 #[test]
 fn member_settings_shorten_gc_only_on_local_disk() {
     let defaults = Settings::default();
@@ -1096,9 +1096,9 @@ fn member_settings_shorten_gc_only_on_local_disk() {
     local.validate().unwrap();
     assert_eq!(
         gc_retention(&local),
-        (COMPACTOR_CHECKPOINT_LIFETIME, Some(COMPACTED_GC_INTERVAL))
+        (gc_retention(&defaults).0, Some(COMPACTED_GC_INTERVAL))
     );
-    assert!(gc_retention(&local).0 < gc_retention(&defaults).0);
+    assert!(Some(COMPACTED_GC_INTERVAL) < gc_retention(&defaults).1);
 }
 
 /// The compactor checkpoint lifetime and the compacted-SST GC interval of `settings`.
@@ -1112,8 +1112,102 @@ fn gc_retention(settings: &Settings) -> (Duration, Option<Duration>) {
     (lifetime, gc.compacted_options.as_ref().unwrap().interval)
 }
 
+/// A cold scan of a member-local directory reads every row although a compaction replaces its
+/// SST and GC runs 7 minutes later, as when the index rebuild at open or a DeleteRange reads a
+/// large data set from a busy disk. A 5-minute checkpoint lifetime lost the SST: `NotFound`.
+#[tokio::test]
+async fn cold_scan_survives_compaction_and_gc_on_local_disk() {
+    use slatedb_common::clock::{DefaultSystemClock, SystemClock, SystemClockTicker};
+
+    /// The default clock plus an offset that the test moves forward.
+    #[derive(Debug, Default)]
+    struct Ahead {
+        clock: DefaultSystemClock,
+        offset: std::sync::Mutex<Duration>,
+    }
+    impl SystemClock for Ahead {
+        fn now(&self) -> chrono::DateTime<chrono::Utc> {
+            self.clock.now() + *self.offset.lock().unwrap()
+        }
+        fn sleep<'a>(
+            &'a self,
+            duration: Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            self.clock.sleep(duration)
+        }
+        fn ticker<'a>(&'a self, duration: Duration) -> SystemClockTicker<'a> {
+            SystemClockTicker::new(self, duration)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(
+        slatedb::object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap(),
+    );
+    let settings = member_settings(true);
+    let gc = settings.garbage_collector_options.clone().unwrap();
+    // The embedded compactor uses the real clock for its checkpoint; only GC runs ahead.
+    let db = Db::builder("db", store.clone())
+        .with_settings(Settings {
+            garbage_collector_options: None,
+            ..settings
+        })
+        .with_db_cache_disabled()
+        .build()
+        .await
+        .unwrap();
+    let rows = 4096;
+    let value = vec![7u8; 1024];
+    let key = |i: usize, batch: usize| format!("k{batch}-{i:05}").into_bytes();
+    let write = |batch: usize| {
+        let (db, value) = (&db, &value);
+        async move {
+            for i in 0..rows {
+                db.put(key(i, batch), value).await.unwrap();
+            }
+            db.flush().await.unwrap();
+        }
+    };
+    // The scan starts on the first L0 SST and reads only its first block.
+    write(0).await;
+    let mut scan = db.scan(key(0, 0)..key(0, 1)).await.unwrap();
+    let first = scan.next().await.unwrap().unwrap();
+    assert_eq!(first.key.as_ref(), key(0, 0).as_slice());
+    // GC keeps the newest L0 SST that a compaction replaced, so later L0 SSTs must be newer.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    // Four L0 SSTs make the size-tiered scheduler compact them.
+    for batch in 1..4 {
+        write(batch).await;
+    }
+
+    let clock = Arc::new(Ahead::default());
+    let admin = slatedb::admin::Admin::builder("db", store.clone())
+        .with_system_clock(clock.clone())
+        .build();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let manifest = admin.read_manifest(None).await.unwrap().unwrap();
+        if manifest.l0().is_empty() && !manifest.compacted().is_empty() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "no compaction");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    *clock.offset.lock().unwrap() = Duration::from_secs(7 * 60);
+    admin.run_gc_once(gc).await.unwrap();
+
+    let mut read = 1;
+    while let Some(row) = scan.next().await.unwrap() {
+        assert_eq!(row.key.as_ref(), key(read, 0).as_slice());
+        assert_eq!(row.value.as_ref(), value.as_slice());
+        read += 1;
+    }
+    assert_eq!(read, rows);
+    db.close().await.unwrap();
+}
+
 /// The directory constructor marks its store as local disk. A store that a caller passes to
-/// `open_store` is opaque, even when it is a local filesystem, so it keeps the default retention,
+/// `open_store` is opaque, even when it is a local filesystem, so it keeps the default GC interval,
 /// and so does the database that replaces it.
 #[tokio::test]
 async fn open_store_keeps_default_gc_retention() {
