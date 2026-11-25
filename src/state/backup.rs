@@ -488,39 +488,41 @@ pub(super) fn check(path: &Path) -> Result<Checked> {
     })
 }
 
-/// Send the copied rows of an image in batches of about `RESTORE_BATCH_BYTES`, then return
-/// its digest. Stop without reading the rest when the receiver goes away.
-fn read_batches(
-    path: &Path,
-    tx: &mpsc::Sender<Vec<(Bytes, Bytes)>>,
-) -> Result<[u8; DIGEST as usize]> {
-    let mut image = ImageFile::open(path)?;
-    let mut stopped = false;
-    let rows = (|| {
-        image.header()?;
-        let mut rows = vec![];
-        let mut bytes = 0;
-        while let Some((key, value)) = image.next()? {
+/// The rows of one restore batch, with the image to read on or, at its end, its digest.
+type Batch = (
+    Vec<(Bytes, Bytes)>,
+    std::result::Result<ImageFile, [u8; DIGEST as usize]>,
+);
+
+/// Read the next copied rows of an image, about `RESTORE_BATCH_BYTES` of them. Each call
+/// holds a blocking thread only while it reads, never while the writer catches up: a SlateDB
+/// flush can need the same blocking pool, as the local object store does.
+fn read_batch(mut image: ImageFile) -> Result<Batch> {
+    let mut rows = vec![];
+    let mut bytes = 0;
+    let end = (|| {
+        // The first batch reads the header, which sets a readable version.
+        if image.version == 0 {
+            image.header()?;
+        }
+        while bytes < RESTORE_BATCH_BYTES {
+            let Some((key, value)) = image.next()? else {
+                return Ok(true);
+            };
             if replaced(&key) {
                 continue;
             }
             bytes += key.len() + value.len();
             rows.push((key, value));
-            if bytes >= RESTORE_BATCH_BYTES {
-                bytes = 0;
-                if tx.blocking_send(std::mem::take(&mut rows)).is_err() {
-                    stopped = true;
-                    break;
-                }
-            }
         }
-        if !rows.is_empty() && tx.blocking_send(rows).is_err() {
-            stopped = true;
-        }
-        Ok(())
+        Ok(false)
     })();
-    ensure!(!stopped, "the restore stopped");
-    image.finish(rows)
+    // At a read error, `finish` prefers the checksum error, as `check` does.
+    if let Ok(false) = end {
+        return Ok((rows, Ok(image)));
+    }
+    let digest = image.finish(end.map(|_| ()))?;
+    Ok((rows, Err(digest)))
 }
 
 /// The value that a restored cluster stores for `key`.
@@ -641,38 +643,42 @@ impl StateMachine {
         members: &crate::cluster::Store,
     ) -> Result<u64> {
         let member = *members.members.keys().next().unwrap();
-        // Read the image in the blocking pool, as `check` does, and write its batches here. A
-        // failed write drops the receiver, which stops the reader.
-        let (tx, mut rx) = mpsc::channel::<Vec<(Bytes, Bytes)>>(1);
-        let path = checked.path.clone();
-        let reader = tokio::task::spawn_blocking(move || read_batches(&path, &tx));
+        // Read the image in the blocking pool, as `check` does, one batch ahead of the writes.
+        // A failed write drops the read in flight, which stops the reader.
+        let image = ImageFile::open(&checked.path)?;
+        let mut next = Some(tokio::task::spawn_blocking(move || read_batch(image)));
+        let mut digest = None;
         let mut written = 0;
-        let copied = async {
-            let mut unflushed = 0;
-            while let Some(rows) = rx.recv().await {
-                let mut batch = WriteBatch::new();
-                for (key, value) in rows {
-                    let value = restored(&key, value, member)?;
-                    unflushed += key.len() + value.len();
-                    // The database starts empty, and the check rules out duplicate keys.
-                    batch.put_new(key, value);
-                    written += 1;
-                }
-                self.store_restored(batch, written).await?;
-                if unflushed >= RESTORE_FLUSH_BYTES {
-                    self.metrics.flush_db(self.db()).await?;
-                    unflushed = 0;
-                }
+        let mut unflushed = 0;
+        while let Some(read) = next.take() {
+            let (rows, rest) = read.await??;
+            match rest {
+                Ok(image) => next = Some(tokio::task::spawn_blocking(move || read_batch(image))),
+                Err(end) => digest = Some(end),
             }
-            anyhow::Ok(())
+            if rows.is_empty() {
+                continue;
+            }
+            let mut batch = WriteBatch::new();
+            for (key, value) in rows {
+                let value = restored(&key, value, member)?;
+                unflushed += key.len() + value.len();
+                // The database starts empty, and the check rules out duplicate keys.
+                batch.put_new(key, value);
+                written += 1;
+            }
+            self.store_restored(batch, written).await?;
+            if unflushed >= RESTORE_FLUSH_BYTES {
+                self.metrics.flush_db(self.db()).await?;
+                unflushed = 0;
+            }
         }
-        .await;
-        drop(rx);
-        let digest = reader.await?;
-        copied?;
         // The file can change after the check. Its digest must match the checked one before
         // the marker goes away.
-        ensure!(digest? == checked.digest, "snapshot changed during restore");
+        ensure!(
+            digest == Some(checked.digest),
+            "snapshot changed during restore"
+        );
         let index = written + 1;
         let mut batch = WriteBatch::new();
         batch.put(crate::cluster::KEY, serde_json::to_vec(members)?);

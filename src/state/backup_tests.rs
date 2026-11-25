@@ -736,3 +736,31 @@ async fn an_interrupted_s3_restore_retries_after_its_namespace_is_cleared() {
         .unwrap();
     assert!(!target.join(RESTORE_MARKER).exists());
 }
+
+/// An embedded member restores on a runtime whose blocking pool it shares. The local object
+/// store writes each SST in that pool, so the image reader must not hold a blocking thread
+/// while it waits for the writer, or a flush with one blocking thread never runs.
+#[test]
+fn a_restore_flushes_with_a_single_blocking_thread() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("native.snapshot");
+    // More than the flush interval, plus a batch beyond what the reader holds ahead.
+    let rows = (0..72)
+        .map(|n| (format!("etcd/{n:04}").into_bytes(), vec![b'v'; 1024 * 1024]))
+        .collect();
+    write_image(&path, rows);
+    let target = dir.path().join("member");
+    let result = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(120), restore(&path, &target)).await
+    });
+    // A stuck reader would keep the runtime from shutting down.
+    runtime.shutdown_background();
+    result.expect("the restore stalled").unwrap();
+    assert!(!target.join(RESTORE_MARKER).exists());
+}

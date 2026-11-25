@@ -1443,7 +1443,10 @@ async fn queued_ready_jobs_share_sync_and_keep_the_final_log_suffix() {
 
 #[tokio::test]
 async fn maintenance_flushes_update_durable_apply_metadata() {
-    for command in [crate::maintenance::Command::Defragment] {
+    for command in [
+        crate::maintenance::Command::Snapshot,
+        crate::maintenance::Command::Defragment,
+    ] {
         let dir = tempfile::tempdir().unwrap();
         seed_log(dir.path(), 1);
         let (events, _) = mpsc::channel(256);
