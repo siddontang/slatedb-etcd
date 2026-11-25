@@ -26,6 +26,17 @@ use slatedb::object_store::{
 
 /// The limit of one call. A synced SST write takes far less on a working disk.
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// The mtime steps after the previous version. A coarse filesystem can round a small step back
+/// to the previous mtime. HFS+ keeps whole seconds, and FAT keeps two seconds.
+const MTIME_STEPS: [Duration; 4] = [
+    Duration::from_micros(1),
+    Duration::from_millis(1),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
+
+/// Set the mtime of a file.
+type SetMtime = fn(&File, SystemTime) -> std::io::Result<()>;
 
 /// A synced `LocalFileSystem` that also accepts `PutMode::Update`.
 ///
@@ -39,6 +50,8 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) struct LocalStore {
     inner: LocalFileSystem,
     timeout: Duration,
+    /// Tests replace it to model a filesystem with coarse timestamps.
+    set_mtime: SetMtime,
 }
 
 impl LocalStore {
@@ -49,6 +62,7 @@ impl LocalStore {
         Ok(Self {
             inner,
             timeout: TIMEOUT,
+            set_mtime: File::set_modified,
         })
     }
 }
@@ -79,19 +93,19 @@ impl ObjectStore for LocalStore {
         let target = self.inner.path_to_filesystem(location)?;
         let location = location.to_string();
         let deadline = Instant::now() + self.timeout;
+        let set_mtime = self.set_mtime;
         // The blocking task owns the lock, so a dropped future cannot release it early.
         let update = tokio::task::spawn_blocking(move || {
-            update(&target, &payload, version.e_tag.as_deref(), deadline).map_err(|error| {
-                match error {
-                    Update::Changed(reason) => Error::Precondition {
-                        path: location,
-                        source: reason.into(),
-                    },
-                    Update::Io(source) => Error::Generic {
-                        store: "LocalStore",
-                        source: Box::new(source),
-                    },
-                }
+            let expected = version.e_tag.as_deref();
+            update(&target, &payload, expected, deadline, set_mtime).map_err(|error| match error {
+                Update::Changed(reason) => Error::Precondition {
+                    path: location,
+                    source: reason.into(),
+                },
+                Update::Io(source) => Error::Generic {
+                    store: "LocalStore",
+                    source: Box::new(source),
+                },
             })
         });
         bound(self.timeout, async { update.await? }).await
@@ -223,6 +237,7 @@ fn update(
     payload: &PutPayload,
     expected: Option<&str>,
     deadline: Instant,
+    set_mtime: SetMtime,
 ) -> std::result::Result<PutResult, Update> {
     let _lock = match lock(target, deadline) {
         Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -243,12 +258,10 @@ fn update(
         )));
     }
     let (file, staged) = stage(target)?;
-    // A later version gets a later mtime. A stale e-tag then cannot match again, even when a new
-    // file reuses an old inode within one clock tick.
-    let e_tag =
-        publish(file, &staged, target, payload, micros(&current) + 1).inspect_err(|_| {
-            let _ = std::fs::remove_file(&staged);
-        })?;
+    let previous = micros(&current);
+    let e_tag = publish(file, &staged, target, payload, previous, set_mtime).inspect_err(|_| {
+        let _ = std::fs::remove_file(&staged);
+    })?;
     Ok(PutResult {
         e_tag: Some(e_tag),
         version: None,
@@ -256,22 +269,20 @@ fn update(
     })
 }
 
-/// Write `payload` to the staging file, give it an mtime of at least `floor` microseconds,
-/// sync it, and rename it over `target`. Return its e-tag.
+/// Write `payload` to the staging file, give it an mtime after `previous` microseconds, sync
+/// it, and rename it over `target`. Return its e-tag.
 fn publish(
     mut file: File,
     staged: &std::path::Path,
     target: &std::path::Path,
     payload: &PutPayload,
-    floor: u128,
+    previous: u128,
+    set_mtime: SetMtime,
 ) -> std::io::Result<String> {
     for chunk in payload.iter() {
         file.write_all(chunk)?;
     }
-    if micros(&file.metadata()?) < floor {
-        let floor = u64::try_from(floor).unwrap_or(u64::MAX);
-        file.set_modified(UNIX_EPOCH + Duration::from_micros(floor))?;
-    }
+    follow(&file, previous, set_mtime)?;
     file.sync_all()?;
     let e_tag = e_tag(&file.metadata()?);
     std::fs::rename(staged, target)?;
@@ -279,6 +290,25 @@ fn publish(
         File::open(parent)?.sync_all()?;
     }
     Ok(e_tag)
+}
+
+/// Give `file` an mtime after `previous`, in microseconds. A stale e-tag then cannot match a
+/// later version, even when the new file reuses an old inode. Fail if every step of
+/// `MTIME_STEPS` reads back at or before `previous`. The old object then stays.
+fn follow(file: &File, previous: u128, set_mtime: SetMtime) -> std::io::Result<()> {
+    if micros(&file.metadata()?) > previous {
+        return Ok(());
+    }
+    let base = UNIX_EPOCH + Duration::from_micros(u64::try_from(previous).unwrap_or(u64::MAX));
+    for step in MTIME_STEPS {
+        set_mtime(file, base + step)?;
+        if micros(&file.metadata()?) > previous {
+            return Ok(());
+        }
+    }
+    Err(std::io::Error::other(
+        "the filesystem keeps the mtime of the previous version",
+    ))
 }
 
 /// Take the exclusive lock of `target`, or fail at `deadline`. The lock file name ends in `#0`.
@@ -448,6 +478,140 @@ mod tests {
             .put_opts(&path, "2".into(), update_to(created.e_tag))
             .await
             .unwrap();
+    }
+
+    /// The names of the staging files in `dir`. The lock file `#0` is not one.
+    fn staged(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains('#') && !name.ends_with("#0"))
+            .collect()
+    }
+
+    /// Set the mtime rounded down to a whole second, like HFS+.
+    fn whole_seconds(file: &File, time: SystemTime) -> std::io::Result<()> {
+        let seconds = time.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(seconds))
+    }
+
+    /// Set nothing, like a filesystem that keeps one mtime.
+    fn ignore_mtime(_: &File, _: SystemTime) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_coarse_mtime_gets_a_larger_step_or_fails_the_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = LocalStore::open(dir.path()).unwrap();
+        let path = Path::from("boundary");
+        let file = dir.path().join("boundary");
+        store
+            .put_opts(&path, "1".into(), PutMode::Create.into())
+            .await
+            .unwrap();
+        // The current version has a whole-second mtime after the clock. A new file gets an
+        // earlier mtime, and a 1 µs or 1 ms step rounds back to the current one.
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let ahead = UNIX_EPOCH + Duration::from_secs(now.as_secs() + 5);
+        File::open(&file).unwrap().set_modified(ahead).unwrap();
+        let current = store.head(&path).await.unwrap();
+
+        store.set_mtime = ignore_mtime;
+        let kept = store
+            .put_opts(&path, "2".into(), update_to(current.e_tag.clone()))
+            .await;
+        let kept = kept.unwrap_err().to_string();
+        assert!(kept.contains("keeps the mtime"), "{kept}");
+        assert_eq!(store.head(&path).await.unwrap().e_tag, current.e_tag);
+        let bytes = store.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"1");
+        assert!(staged(dir.path()).is_empty(), "{:?}", staged(dir.path()));
+
+        store.set_mtime = whole_seconds;
+        let updated = store
+            .put_opts(&path, "2".into(), update_to(current.e_tag.clone()))
+            .await
+            .unwrap();
+        let meta = store.head(&path).await.unwrap();
+        assert_eq!(meta.e_tag, updated.e_tag);
+        assert_ne!(meta.e_tag, current.e_tag);
+        let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+        assert_eq!(mtime, ahead + Duration::from_secs(1));
+    }
+
+    /// Equal-size updates on an HFS+ disk image, a filesystem with whole-second mtimes. The test
+    /// does nothing where `hdiutil` cannot make and attach the image.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn equal_size_updates_on_hfs_plus_get_new_e_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("hfs.dmg");
+        let mount = dir.path().join("mount");
+        let hdiutil = |args: &[&std::ffi::OsStr]| {
+            std::process::Command::new("hdiutil")
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        let made = hdiutil(&[
+            "create".as_ref(),
+            "-size".as_ref(),
+            "4m".as_ref(),
+            "-fs".as_ref(),
+            "HFS+".as_ref(),
+            "-volname".as_ref(),
+            "boundary".as_ref(),
+            image.as_os_str(),
+        ]);
+        std::fs::create_dir(&mount).unwrap();
+        if !made
+            || !hdiutil(&[
+                "attach".as_ref(),
+                "-nobrowse".as_ref(),
+                "-mountpoint".as_ref(),
+                mount.as_os_str(),
+                image.as_os_str(),
+            ])
+        {
+            eprintln!("skipped: hdiutil cannot make an HFS+ image here");
+            return;
+        }
+        let result = async {
+            let store = LocalStore::open(&mount.join("objects")).unwrap();
+            let path = Path::from("boundary");
+            let created = store
+                .put_opts(&path, "0".into(), PutMode::Create.into())
+                .await
+                .unwrap();
+            let mut e_tags = vec![created.e_tag.unwrap()];
+            let mut mtime = store.head(&path).await.unwrap().last_modified;
+            for n in 1..4 {
+                let previous = e_tags.last().cloned();
+                let updated = store
+                    .put_opts(&path, n.to_string().into(), update_to(previous))
+                    .await
+                    .unwrap();
+                let meta = store.head(&path).await.unwrap();
+                assert_eq!(meta.e_tag, updated.e_tag);
+                assert!(!e_tags.contains(updated.e_tag.as_ref().unwrap()));
+                // Each version has a later mtime, so a reused inode cannot repeat an e-tag.
+                assert!(meta.last_modified > mtime, "{} {mtime}", meta.last_modified);
+                mtime = meta.last_modified;
+                e_tags.push(updated.e_tag.unwrap());
+            }
+        };
+        let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(result)).await;
+        assert!(hdiutil(&[
+            "detach".as_ref(),
+            "-force".as_ref(),
+            mount.as_os_str()
+        ]));
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     /// The environment variables of a racing child process.
