@@ -648,6 +648,9 @@ pub(crate) async fn retain(
 }
 
 /// Open the newest `view-` checkpoint at or below index `limit` that holds the membership.
+///
+/// A checkpoint that retention deleted after the listing is skipped. An older base can then need
+/// log entries that the member truncated, and the replay of the rebase fails on them.
 async fn newest_base_through(
     admin: &slatedb::admin::Admin,
     source: &Source,
@@ -658,12 +661,40 @@ async fn newest_base_through(
         if seq > limit {
             continue;
         }
-        let base = source.open_base(checkpoint.id).await?;
+        let Some(base) = open_present(source, checkpoint.id).await? else {
+            continue;
+        };
         if base.applied <= limit && base.get(crate::cluster::KEY).await?.is_some() {
             return Ok(Some(base));
         }
     }
     Ok(None)
+}
+
+/// Open checkpoint `id`, or return `None` when it is gone: retention deleted it, or deletes it
+/// now, or one of its objects is missing. Every other error stops the caller, so a transient
+/// error never selects another base.
+pub(crate) async fn open_present(source: &Source, id: uuid::Uuid) -> Result<Option<Arc<Base>>> {
+    match source.open_base(id).await {
+        Ok(base) => Ok(Some(base)),
+        Err(error) if gone(&error) => {
+            tracing::warn!(%error, %id, "skip a view checkpoint that is gone");
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Return true when `error` says that a checkpoint or one of its objects is gone: the checkpoint
+/// left the manifest, its manifest or an SST was deleted, or retention deletes it now.
+pub(crate) fn gone(error: &anyhow::Error) -> bool {
+    missing_object(error)
+        || error.chain().any(|cause| {
+            let text = cause.to_string();
+            text.contains("checkpoint missing")
+                || text.contains("failed to find manifest")
+                || text.contains("is being deleted")
+        })
 }
 
 /// Open the newest `view-` checkpoint whose row is in `[low, high]` and that holds the
@@ -683,7 +714,9 @@ async fn newest_base_between(
         if seq > high {
             continue;
         }
-        let base = source.open_base(checkpoint.id).await?;
+        let Some(base) = open_present(source, checkpoint.id).await? else {
+            continue;
+        };
         if (low..=high).contains(&base.applied) && base.get(crate::cluster::KEY).await?.is_some() {
             return Ok(Some(base));
         }
@@ -693,7 +726,7 @@ async fn newest_base_between(
 
 /// Open checkpoint `checkpoint` of a base above its row `row` at `index`. If it is gone, take
 /// the newest checkpoint with its row in `[row, index]`. A missing row means the record names no
-/// range, so only the checkpoint itself can serve.
+/// range, so only the checkpoint itself can serve. Another error stops the open.
 async fn reopen_above_row(
     admin: &slatedb::admin::Admin,
     source: &Source,
@@ -703,7 +736,8 @@ async fn reopen_above_row(
 ) -> Result<Arc<Base>> {
     let error = match source.open_base(checkpoint).await {
         Ok(base) => return Ok(base),
-        Err(error) => error,
+        Err(error) if gone(&error) => error,
+        Err(error) => return Err(error),
     };
     let replacement = match row {
         Some(row) => newest_base_between(admin, source, row, index).await?,
@@ -786,7 +820,11 @@ pub(crate) async fn convert_mode(store: &dyn ObjectStore, root: &str, cluster: &
 
 async fn newest_base(admin: &slatedb::admin::Admin, source: &Source) -> Result<Option<Arc<Base>>> {
     for (_, checkpoint) in view_checkpoints(admin).await?.into_iter().rev() {
-        let base = source.open_base(checkpoint.id).await?;
+        // A checkpoint that retention deleted after the listing is skipped. An older base below
+        // the Raft record or the log fails the start later.
+        let Some(base) = open_present(source, checkpoint.id).await? else {
+            continue;
+        };
         if base.get(crate::cluster::KEY).await?.is_some() {
             return Ok(Some(base));
         }

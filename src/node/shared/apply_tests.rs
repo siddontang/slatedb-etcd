@@ -10,7 +10,7 @@ use crate::proto::etcdserverpb::*;
 /// the local log, and applies the job again with the same results.
 #[tokio::test]
 async fn a_lost_checkpoint_object_rebases_apply() {
-    lose_a_checkpoint_object(false).await;
+    lose_a_checkpoint_object(Lose::AtRow).await;
 }
 
 /// The base row is 19, and an announcement certified the checkpoint through the empty
@@ -18,10 +18,30 @@ async fn a_lost_checkpoint_object_rebases_apply() {
 /// at 20 with the record term, and the job reads the log from 21.
 #[tokio::test]
 async fn a_lost_checkpoint_object_rebases_apply_above_a_truncated_row() {
-    lose_a_checkpoint_object(true).await;
+    lose_a_checkpoint_object(Lose::AboveRow).await;
 }
 
-async fn lose_a_checkpoint_object(truncated: bool) {
+/// Retention deleted the base at row 20, and the member truncated its log through 20. A rebase
+/// skips the deleted checkpoint and takes the older one at row 10. Its replay needs entries
+/// that the log no longer has, so the job fails, and no view of the older state goes out.
+#[tokio::test]
+async fn a_rebase_onto_an_older_base_below_the_log_fails_closed() {
+    lose_a_checkpoint_object(Lose::Deleted).await;
+}
+
+/// The base of `lose_a_checkpoint_object`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lose {
+    /// The base has row 20.
+    AtRow,
+    /// The base has row 19, and an announcement certified it through the empty entry 20.
+    AboveRow,
+    /// The base has row 20 and is deleted. An older checkpoint has row 10.
+    Deleted,
+}
+
+async fn lose_a_checkpoint_object(lose: Lose) {
+    let truncated = lose != Lose::AtRow;
     use crate::object::faults::{FaultStore, LOSE_SST_TWICE};
     use slatedb::config::{CheckpointOptions, CheckpointScope, WriteOptions};
     use slatedb::object_store::ObjectStore;
@@ -75,7 +95,7 @@ async fn lose_a_checkpoint_object(truncated: bool) {
     .encode()
     .unwrap();
     // Entry 20 changes no state, so the base row is 19.
-    if truncated {
+    if lose == Lose::AboveRow {
         entries[19].data.clear();
     }
     // Entry 21 is a physical Compact, and entry 22 adds a learner. Their completions come
@@ -155,9 +175,12 @@ async fn lose_a_checkpoint_object(truncated: bool) {
         member: 1,
         term: 1,
     };
-    apply_entries(&mut state, entries[..20].to_vec(), header)
-        .await
-        .unwrap();
+    // Two jobs, so a batch ends at 10 for the older checkpoint of `Lose::Deleted`.
+    for range in [0..10, 10..20] {
+        apply_entries(&mut state, entries[range].to_vec(), header)
+            .await
+            .unwrap();
+    }
     // The leader writer checkpoints entry 20 with its own cache. The member switches to it.
     let handles = state.shared_handles().unwrap();
     let writer = slatedb::Db::builder(handles.source.state(), store)
@@ -165,14 +188,27 @@ async fn lose_a_checkpoint_object(truncated: bool) {
         .build()
         .await
         .unwrap();
+    let mut older = None;
     for (seq, batch) in handles.queue.after(0, usize::MAX) {
         writer
             .write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
             .await
             .unwrap();
+        if seq == 10 && lose == Lose::Deleted {
+            writer.flush().await.unwrap();
+            let options = CheckpointOptions {
+                name: Some(crate::state::shared::view_name(seq)),
+                ..Default::default()
+            };
+            let checkpoint = writer
+                .create_checkpoint(CheckpointScope::Durable, &options)
+                .await
+                .unwrap();
+            older = Some(checkpoint.id);
+        }
     }
     writer.flush().await.unwrap();
-    let row = if truncated { 19 } else { 20 };
+    let row = if lose == Lose::AboveRow { 19 } else { 20 };
     let options = CheckpointOptions {
         name: Some(crate::state::shared::view_name(row)),
         ..Default::default()
@@ -204,16 +240,32 @@ async fn lose_a_checkpoint_object(truncated: bool) {
         inline_checkpoints: true,
         log: Some(storage.reader()),
     };
+    if lose == Lose::Deleted {
+        executor.state.admin.delete_checkpoint(id).await.unwrap();
+    }
     // The block cache load and its direct read both lose the object, so the job fails.
     faults.set(LOSE_SST_TWICE);
-    let completion = executor
+    let result = executor
         .execute(Work {
             job: Job::Entries(entries[20..].to_vec()),
             header,
             delay: Duration::ZERO,
         })
-        .await
-        .unwrap();
+        .await;
+    if lose == Lose::Deleted {
+        // The engine reports the truncated prefix. `LogReader::entries` also refuses a short
+        // read.
+        assert!(older.is_some());
+        let error = format!("{:#}", result.err().unwrap());
+        assert!(
+            error.contains("Compacted") || error.contains("the log has no entries"),
+            "{error}"
+        );
+        executor.state.close().await.unwrap();
+        writer.close().await.unwrap();
+        return;
+    }
+    let completion = result.unwrap();
     // The read lost its object. The rebase restarted the job, and every entry of the job
     // completes exactly once, with the Compact notice and the membership change.
     assert_eq!(faults.entered.available_permits(), 2);

@@ -177,12 +177,14 @@ async fn a_restart_opens_the_record_checkpoint_above_its_row() {
 }
 
 /// The shared state of `retired`: checkpoint Z at row 1, then X and Y at row 2, and a leader
-/// that applied no-op entries 3 to 5 in term 2.
+/// that applied no-op entries 3 to 5 in term 2. W has row 3: the leader stored the apply marker
+/// at 3, as it does for an earlier binary, and published it.
 struct Retired {
     store: Arc<dyn ObjectStore>,
     leader: StateMachine,
     x: uuid::Uuid,
     y: uuid::Uuid,
+    w: uuid::Uuid,
 }
 
 async fn open_at(
@@ -210,7 +212,10 @@ async fn open_at(
 }
 
 async fn retired() -> Retired {
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    retired_in(Arc::new(InMemory::new())).await
+}
+
+async fn retired_in(store: Arc<dyn ObjectStore>) -> Retired {
     let mut leader = open_at(&store, None).await.unwrap();
     leader.members = Arc::new(crate::cluster::Store::initial(
         &[(1, "127.0.0.1:1".to_owned())].into(),
@@ -264,9 +269,17 @@ async fn retired() -> Retired {
         .await
         .unwrap()
         .id;
-    db.close().await.unwrap();
     leader.entry_term = 2;
-    for index in 3..=5 {
+    leader.apply(3, None).await.unwrap();
+    leader.mark_row().unwrap();
+    materialize(&leader).await;
+    let w = db
+        .create_checkpoint(CheckpointScope::Durable, &checkpoint(3))
+        .await
+        .unwrap()
+        .id;
+    db.close().await.unwrap();
+    for index in 4..=5 {
         leader.apply(index, None).await.unwrap();
     }
     Retired {
@@ -274,6 +287,7 @@ async fn retired() -> Retired {
         leader,
         x,
         y,
+        w,
     }
 }
 
@@ -287,10 +301,32 @@ fn record_of(x: uuid::Uuid) -> crate::state::shared::Record {
     }
 }
 
-/// Retention deleted X, the checkpoint of a record at 5 above its row 2. A restart loads Y, a
-/// checkpoint of the same shared state with its row in [2, 5], and raises it to 5. If only Z at
-/// row 1 is left, below the row of X, the restart fails closed with an error that says how to
-/// recover. A record that names no row needs X itself.
+/// Delete the manifest of checkpoint `id`. The checkpoint stays listed, but it cannot open, as
+/// when retention deletes it after the listing.
+async fn lose_manifest(
+    store: &Arc<dyn ObjectStore>,
+    admin: &slatedb::admin::Admin,
+    id: uuid::Uuid,
+) {
+    let views = crate::state::shared::view_checkpoints(admin).await.unwrap();
+    let manifest = views
+        .iter()
+        .find(|(_, c)| c.id == id)
+        .unwrap()
+        .1
+        .manifest_id;
+    let path = format!("root/shared/state/manifest/{manifest:020}.manifest");
+    let path = slatedb::object_store::path::Path::from(path);
+    slatedb::object_store::ObjectStoreExt::delete(store.as_ref(), &path)
+        .await
+        .unwrap();
+}
+
+/// Retention deleted X, the checkpoint of a record at 5 above its row 2. A restart loads W, the
+/// newest checkpoint of the same shared state with its row in [2, 5], at row 3, and raises it
+/// to 5. If W is gone too, the restart skips it and loads Y at row 2. If only Z at row 1 is
+/// left, below the row of X, the restart fails closed with an error that says how to recover.
+/// A record that names no row needs X itself.
 #[tokio::test]
 async fn a_restart_without_the_record_checkpoint_uses_one_in_its_range() {
     let Retired {
@@ -298,16 +334,24 @@ async fn a_restart_without_the_record_checkpoint_uses_one_in_its_range() {
         leader,
         x,
         y,
+        w,
     } = retired().await;
     let admin = leader.admin.clone();
     admin.delete_checkpoint(x).await.unwrap();
     let mut member = open_at(&store, Some(record_of(x))).await.unwrap();
-    assert_eq!(member.base_checkpoint(), Some(y));
+    assert_eq!(member.base_checkpoint(), Some(w));
+    assert_eq!(member.shared_handles().unwrap().opened.newest(), None);
     assert_eq!((member.applied, member.applied_term), (5, 2));
     assert_eq!(member.extensions(), 1);
     assert_eq!(member.loaded_fields(), leader.loaded_fields());
     member.apply_etcd(6, &put_b()).await.unwrap();
     assert_eq!(member.revision, 3);
+    member.close().await.unwrap();
+    lose_manifest(&store, &admin, w).await;
+    let member = open_at(&store, Some(record_of(x))).await.unwrap();
+    assert_eq!(member.base_checkpoint(), Some(y));
+    assert_eq!((member.applied, member.applied_term), (5, 2));
+    assert_eq!(member.loaded_fields(), leader.loaded_fields());
     member.close().await.unwrap();
     let exact = crate::state::shared::Record {
         row: None,
@@ -327,8 +371,9 @@ async fn a_restart_without_the_record_checkpoint_uses_one_in_its_range() {
 }
 
 /// The same for a rebase: the member's base X at 5 above its row 2 lost an object, and
-/// retention deleted X. The rebase loads Y in [2, 5] and raises it to 5 with the log term. With
-/// only Z at row 1 left, it fails closed.
+/// retention deleted X. The rebase loads W in [2, 5] and raises it to 5 with the log term. Then
+/// W is gone too. The base row is now 3, and Y at row 2 is below it, so the rebase fails
+/// closed.
 #[tokio::test]
 async fn a_rebase_without_its_base_checkpoint_uses_one_in_its_range() {
     let Retired {
@@ -336,21 +381,59 @@ async fn a_rebase_without_its_base_checkpoint_uses_one_in_its_range() {
         leader,
         x,
         y,
+        w,
     } = retired().await;
     let admin = leader.admin.clone();
     let mut member = open_at(&store, Some(record_of(x))).await.unwrap();
     assert_eq!((member.base_checkpoint(), member.applied), (Some(x), 5));
     admin.delete_checkpoint(x).await.unwrap();
     member.rebase(5, |index| Ok(index - 3)).await.unwrap();
-    assert_eq!(member.base_checkpoint(), Some(y));
+    assert_eq!(member.base_checkpoint(), Some(w));
     assert_eq!((member.applied, member.applied_term), (5, 2));
     assert_eq!(member.loaded_fields(), leader.loaded_fields());
-    admin.delete_checkpoint(y).await.unwrap();
+    lose_manifest(&store, &admin, w).await;
     let error = member.rebase(5, |index| Ok(index - 3)).await.err().unwrap();
     assert!(
-        format!("{error:#}").contains("has a row from 2 to 5"),
+        format!("{error:#}").contains("has a row from 3 to 5"),
         "{error:#}"
     );
+    assert_ne!(member.base_checkpoint(), Some(y));
+    leader.close().await.unwrap();
+}
+
+/// Only a checkpoint that is gone is skipped. Another storage error stops the search, so a
+/// transient error never selects another base.
+#[tokio::test]
+async fn only_a_gone_checkpoint_is_skipped() {
+    use crate::object::faults::{FaultStore, FAIL_GET};
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let Retired {
+        store,
+        leader,
+        x,
+        w,
+        ..
+    } = retired_in(faults.clone()).await;
+    let source = leader.shared_handles().unwrap().source;
+    let admin = leader.admin.clone();
+    admin.delete_checkpoint(x).await.unwrap();
+    assert!(crate::state::shared::open_present(&source, x)
+        .await
+        .unwrap()
+        .is_none());
+    lose_manifest(&store, &admin, w).await;
+    assert!(crate::state::shared::open_present(&source, w)
+        .await
+        .unwrap()
+        .is_none());
+    let y = crate::state::shared::view_checkpoints(&admin)
+        .await
+        .unwrap();
+    let y = y.iter().rev().find(|(seq, _)| *seq == 2).unwrap().1.id;
+    faults.set(FAIL_GET);
+    let error = crate::state::shared::open_present(&source, y).await.err();
+    assert!(error.is_some_and(|error| !crate::state::shared::gone(&error)));
+    faults.set(0);
     leader.close().await.unwrap();
 }
 

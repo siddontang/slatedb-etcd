@@ -568,7 +568,9 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
    If retention deleted that checkpoint, the member takes the newest checkpoint whose own row,
    read from the checkpoint, is between the record row and the record index. No entry in that
    range changed state, so that checkpoint holds the same state. A record without a row, or no
-   such checkpoint, stops the start with an error that says how to recover.
+   such checkpoint, stops the start with an error that says how to recover. Each search skips
+   a checkpoint only when it is gone: deleted, its manifest or an SST missing, or deleted now
+   by retention. Any other error stops the start.
 2. [Install](#install) the base. If the local log ends below `F` or its term at `F` differs,
    this is an adopt. Otherwise it is a local rebuild with nothing to replay yet.
 3. Replay committed log entries above `F` into the overlay. This is the current replay path with
