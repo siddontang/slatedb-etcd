@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -63,15 +64,21 @@ def install(directory):
     return binary
 
 
-def create_bucket(endpoint, bucket, access, secret):
-    """Sign the bucket creation request with AWS Signature Version 4."""
+def signed_request(endpoint, method, path, access, secret, query=None, body=b"", timeout=10):
+    """Send one request signed with AWS Signature Version 4, and return the response.
+
+    Raise `urllib.error.HTTPError` for an error status, as `urllib.request.urlopen` does.
+    """
     now = datetime.now(timezone.utc)
     date, timestamp = now.strftime("%Y%m%d"), now.strftime("%Y%m%dT%H%M%SZ")
     host = endpoint.split("://", 1)[1]
-    digest = hashlib.sha256(b"").hexdigest()
+    quote = lambda value, safe="": urllib.parse.quote(str(value), safe="-_.~" + safe)
+    path = quote(path, "/")
+    params = "&".join(f"{quote(k)}={quote(v)}" for k, v in sorted((query or {}).items()))
+    digest = hashlib.sha256(body).hexdigest()
     headers = f"host:{host}\nx-amz-content-sha256:{digest}\nx-amz-date:{timestamp}\n"
     names = "host;x-amz-content-sha256;x-amz-date"
-    canonical = f"PUT\n/{bucket}\n\n{headers}\n{names}\n{digest}"
+    canonical = f"{method}\n{path}\n{params}\n{headers}\n{names}\n{digest}"
     scope = f"{date}/us-east-1/s3/aws4_request"
     string = f"AWS4-HMAC-SHA256\n{timestamp}\n{scope}\n"
     string += hashlib.sha256(canonical.encode()).hexdigest()
@@ -79,12 +86,19 @@ def create_bucket(endpoint, bucket, access, secret):
     for part in [date, "us-east-1", "s3", "aws4_request"]:
         key = hmac.new(key, part.encode(), hashlib.sha256).digest()
     signature = hmac.new(key, string.encode(), hashlib.sha256).hexdigest()
-    request = urllib.request.Request(endpoint + "/" + bucket, data=b"", method="PUT", headers={
+    url = endpoint + path + (f"?{params}" if params else "")
+    request = urllib.request.Request(url, data=body if method in ("PUT", "POST") else None,
+                                     method=method, headers={
         "x-amz-date": timestamp, "x-amz-content-sha256": digest,
         "Authorization": f"AWS4-HMAC-SHA256 Credential={access}/{scope}, "
                          f"SignedHeaders={names}, Signature={signature}",
     })
-    with urllib.request.urlopen(request, timeout=10) as response:
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
+def create_bucket(endpoint, bucket, access, secret):
+    """Create `bucket` with a signed request."""
+    with signed_request(endpoint, "PUT", "/" + bucket, access, secret) as response:
         assert response.status == 200
 
 
