@@ -1558,7 +1558,8 @@ impl StateMachine {
             .await?
         };
         let location =
-            transfer::Location::open(store.clone(), &join(root, STATE), backend, cache).await?;
+            transfer::Location::open(store.clone(), &join(root, STATE), backend, false, cache)
+                .await?;
         let state_root = location.root();
         let source = Arc::new(Source {
             store: store.clone(),

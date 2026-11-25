@@ -1082,36 +1082,68 @@ fn slatedb_settings_bound_compaction_buffers() {
     );
 }
 
-/// A remote store keeps SlateDB's GC retention: a cold scan there can outlive a short
-/// compactor checkpoint, and GC would delete an SST that the scan still needs.
+/// Only a member-local directory gets short GC retention. A remote store keeps SlateDB's
+/// retention: a cold scan there can outlive a short compactor checkpoint, and GC would delete an
+/// SST that the scan still needs.
 #[test]
 fn member_settings_shorten_gc_only_on_local_disk() {
     let defaults = Settings::default();
-    let lifetime = |settings: &Settings| {
-        settings
-            .compactor_options
-            .as_ref()
-            .unwrap()
-            .checkpoint_lifetime
-    };
-    let interval = |settings: &Settings| {
-        let gc = settings.garbage_collector_options.as_ref().unwrap();
-        gc.compacted_options.as_ref().unwrap().interval
-    };
-    let s3 = member_settings(&transfer::Backend::S3 {
-        bucket: "bucket".into(),
-        endpoint: None,
-        region: "us-east-1".into(),
-    });
-    s3.validate().unwrap();
-    assert_eq!(lifetime(&s3), lifetime(&defaults));
-    assert_eq!(interval(&s3), interval(&defaults));
-    assert_eq!(lifetime(&slatedb_settings()), lifetime(&defaults));
-    let local = member_settings(&transfer::Backend::Local);
+    let remote = member_settings(false);
+    remote.validate().unwrap();
+    assert_eq!(gc_retention(&remote), gc_retention(&defaults));
+    assert_eq!(gc_retention(&slatedb_settings()), gc_retention(&defaults));
+    let local = member_settings(true);
     local.validate().unwrap();
-    assert_eq!(lifetime(&local), COMPACTOR_CHECKPOINT_LIFETIME);
-    assert_eq!(interval(&local), Some(COMPACTED_GC_INTERVAL));
-    assert!(lifetime(&local) < lifetime(&defaults));
+    assert_eq!(
+        gc_retention(&local),
+        (COMPACTOR_CHECKPOINT_LIFETIME, Some(COMPACTED_GC_INTERVAL))
+    );
+    assert!(gc_retention(&local).0 < gc_retention(&defaults).0);
+}
+
+/// The compactor checkpoint lifetime and the compacted-SST GC interval of `settings`.
+fn gc_retention(settings: &Settings) -> (Duration, Option<Duration>) {
+    let lifetime = settings
+        .compactor_options
+        .as_ref()
+        .unwrap()
+        .checkpoint_lifetime;
+    let gc = settings.garbage_collector_options.as_ref().unwrap();
+    (lifetime, gc.compacted_options.as_ref().unwrap().interval)
+}
+
+/// The directory constructor marks its store as local disk. A store that a caller passes to
+/// `open_store` is opaque, even when it is a local filesystem, so it keeps the default retention,
+/// and so does the database that replaces it.
+#[tokio::test]
+async fn open_store_keeps_default_gc_retention() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = StateMachine::open(&dir.path().join("dir")).await.unwrap();
+    assert!(state.location.local_disk);
+    state.close().await.unwrap();
+
+    let memory: Arc<dyn slatedb::object_store::ObjectStore> =
+        Arc::new(slatedb::object_store::memory::InMemory::new());
+    let state = StateMachine::open_store(memory, "state").await.unwrap();
+    assert!(!state.location.local_disk);
+    let replacement = state.location.path("state-1");
+    let next = StateMachine::open_at(state.location.clone(), &replacement)
+        .await
+        .unwrap();
+    assert!(!next.location.local_disk);
+    next.close().await.unwrap();
+    state.close().await.unwrap();
+
+    std::fs::create_dir_all(dir.path().join("store")).unwrap();
+    let local =
+        slatedb::object_store::local::LocalFileSystem::new_with_prefix(dir.path().join("store"))
+            .unwrap();
+    let state =
+        StateMachine::open_store_with_cache(Arc::new(local), "state", StateCache::default())
+            .await
+            .unwrap();
+    assert!(!state.location.local_disk);
+    state.close().await.unwrap();
 }
 
 /// The directory gets the row marker before its first hash or Watch journal row, on both the

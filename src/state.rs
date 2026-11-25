@@ -248,17 +248,18 @@ pub(crate) fn slatedb_settings() -> Settings {
     settings
 }
 
-/// SlateDB settings for the state machine of one member in `backend`.
+/// SlateDB settings for the state machine of one member; `local_disk` when its store is a
+/// member-local directory.
 ///
 /// Compaction rewrites the sorted runs several times while a large data set loads. Each replaced
 /// SST stays until its compactor checkpoint expires and the next GC run, which took 15 to 25
-/// minutes with SlateDB's defaults: 2-3 times the live data on disk. A local store frees them
-/// within minutes. A remote store keeps the defaults: a cold scan that fetches one block at a
-/// time, such as the index rebuild at open or a large DeleteRange, can run for minutes there.
-/// GC keeps its default minimum age.
-pub(crate) fn member_settings(backend: &transfer::Backend) -> Settings {
+/// minutes with SlateDB's defaults: 2-3 times the live data on disk. A local directory frees them
+/// within minutes. Any other store, including one a caller passes to `open_store`, keeps the
+/// defaults: a cold scan that fetches one block at a time, such as the index rebuild at open or a
+/// large DeleteRange, can run for minutes on a remote store. GC keeps its default minimum age.
+pub(crate) fn member_settings(local_disk: bool) -> Settings {
     let mut settings = slatedb_settings();
-    if *backend != transfer::Backend::Local {
+    if !local_disk {
         return settings;
     }
     if let Some(compactor) = settings.compactor_options.as_mut() {
@@ -374,7 +375,7 @@ impl StateMachine {
         let object_store = Arc::new(crate::object::paced::PacedStore::new(local));
         #[cfg(not(target_os = "linux"))]
         let object_store = Arc::new(local);
-        Self::open_store_with_cache(object_store, "state", cache).await
+        Self::open_location(object_store, "state", cache, transfer::Backend::Local, true).await
     }
 
     pub async fn open_store(
@@ -398,8 +399,21 @@ impl StateMachine {
         cache: StateCache,
         backend: transfer::Backend,
     ) -> Result<Self> {
+        Self::open_location(object_store, prefix, cache, backend, false).await
+    }
+
+    /// Open the state in `object_store`. `local_disk` is true only when this server built the
+    /// store on a member-local directory.
+    async fn open_location(
+        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+        prefix: &str,
+        cache: StateCache,
+        backend: transfer::Backend,
+        local_disk: bool,
+    ) -> Result<Self> {
         cache.validate()?;
-        let location = transfer::Location::open(object_store, prefix, backend, cache).await?;
+        let location =
+            transfer::Location::open(object_store, prefix, backend, local_disk, cache).await?;
         let state = Self::open_at(location.clone(), &location.root()).await?;
         if let Err(error) = location.remove_orphans().await {
             tracing::warn!(%error, "cannot delete unused state databases");
@@ -413,7 +427,7 @@ impl StateMachine {
         let object_store = location.store();
         let rows = Arc::new(rows::RowCache::new(cache.row_bytes));
         let cache = cache.build();
-        let settings = member_settings(&location.backend);
+        let settings = member_settings(location.local_disk);
         let admin = slatedb::admin::Admin::builder(root, object_store.clone()).build();
         let db = Db::builder(root, object_store)
             .with_db_cache(cache, 0)

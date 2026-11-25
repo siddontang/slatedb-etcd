@@ -216,7 +216,10 @@ static SOURCES: LazyLock<Mutex<HashMap<String, Weak<Location>>>> =
 pub struct Location {
     store: Arc<dyn ObjectStore>,
     base: String,
-    pub(crate) backend: Backend,
+    backend: Backend,
+    /// The caller built the store on a member-local directory. Only such a store gets short
+    /// SlateDB GC retention; a replacement database of this namespace keeps the choice.
+    pub(crate) local_disk: bool,
     namespace: String,
     /// The name of the first database. Later databases are `<first>-N`.
     first: String,
@@ -238,6 +241,7 @@ impl Location {
         store: Arc<dyn ObjectStore>,
         prefix: &str,
         backend: Backend,
+        local_disk: bool,
         cache: super::StateCache,
     ) -> Result<Arc<Self>> {
         let (base, first) = match prefix.rsplit_once('/') {
@@ -269,6 +273,7 @@ impl Location {
             store,
             base,
             backend,
+            local_disk,
             namespace,
             first,
             cache,
