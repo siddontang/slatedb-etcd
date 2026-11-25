@@ -600,18 +600,9 @@ pub(super) async fn leader_node_with(
         vote.term = node.raw.raft.term + u64::from(kind == MessageType::MsgRequestPreVoteResponse);
         node.raw.step(vote).unwrap();
     }
-    node.drive_ready().await.unwrap();
-    node.drain_log().await.unwrap();
-    let mut ack = Message::default();
-    ack.set_msg_type(MessageType::MsgAppendResponse);
-    ack.from = 2;
-    ack.to = 1;
-    ack.term = node.raw.raft.term;
-    ack.index = node.raw.store().last_index().unwrap();
-    node.raw.step(ack).unwrap();
-    node.drive_ready().await.unwrap();
-    node.drain_log().await.unwrap();
-    node.drain_apply().await.unwrap();
+    // The seed of the first term, and then the digest of the new row. See `propose_members`.
+    commit_with_peer(&mut node).await;
+    commit_with_peer(&mut node).await;
     assert_eq!(node.raw.raft.state, StateRole::Leader);
     node
 }
@@ -1234,8 +1225,8 @@ async fn read_index_retries_after_the_first_commit_in_a_new_term() {
     confirm_read(&mut node, &id).await;
     node.drain_apply().await.unwrap();
     assert!(reply.await.unwrap().is_ok());
-    // The empty entry and the `SetQuota` entry of the new leader. The retries append nothing.
-    assert_eq!(node.raw.store().durable.last_index, 2);
+    // The empty entry, `SeedMembers`, and `SetQuota` of the new leader. Retries append none.
+    assert_eq!(node.raw.store().durable.last_index, 3);
     assert_eq!(node.raw.store().durable.sync_writes, syncs);
     assert!(node.reads.is_empty());
 }
@@ -1650,7 +1641,7 @@ async fn applied_state_enforces_the_effective_etcd_quota() {
     }
 }
 
-async fn commit_with_peer(node: &mut Node) {
+pub(super) async fn commit_with_peer(node: &mut Node) {
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
     let ack = Message {

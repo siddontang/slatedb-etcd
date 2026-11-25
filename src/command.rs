@@ -96,6 +96,7 @@ mod tests {
                 requested_at: 0,
                 member: 2,
             },
+            seed_members(Some("0123456789abcdef".into())),
             RaftCommand::CompactStep { id: "step".into() },
             RaftCommand::Lease {
                 id: "lease".into(),
@@ -120,6 +121,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn seed_members(digest: Option<String>) -> RaftCommand {
+        let peers = (1..=3).map(|id| (id, format!("127.0.0.1:{id}"))).collect();
+        RaftCommand::SeedMembers(crate::cluster::Seed {
+            id: "members".into(),
+            origin: 2,
+            members: serde_json::to_string(&crate::cluster::Store::initial(&peers)).unwrap(),
+            digest,
+            applied: 7,
+        })
+    }
+
+    /// `CompactStep` matches any `id`, so `SeedMembers` must decode before it. An older binary
+    /// fails to decode it.
+    #[test]
+    fn seed_members_does_not_decode_as_a_compaction_step() {
+        for digest in [None, Some("0123456789abcdef".to_owned())] {
+            let command = seed_members(digest.clone());
+            let decoded = RaftCommand::decode(&command.encode().unwrap()).unwrap();
+            let RaftCommand::SeedMembers(crate::cluster::Seed {
+                id,
+                origin,
+                members,
+                digest: decoded_digest,
+                applied,
+            }) = decoded
+            else {
+                panic!("{decoded:?}");
+            };
+            assert_eq!((id.as_str(), origin, applied), ("members", 2, 7));
+            assert_eq!(decoded_digest, digest);
+            let members: crate::cluster::Store = serde_json::from_str(&members).unwrap();
+            assert_eq!(members.members.len(), 3);
+        }
+        #[derive(serde::Deserialize)]
+        struct OlderCompactStep {
+            #[allow(dead_code)]
+            id: String,
+        }
+        let json = serde_json::to_vec(&seed_members(None)).unwrap();
+        assert!(serde_json::from_slice::<OlderCompactStep>(&json).is_err());
     }
 
     /// `CompactStep` matches any `id`, so `SetQuota` must decode before it.

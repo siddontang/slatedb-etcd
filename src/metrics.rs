@@ -82,6 +82,8 @@ pub struct Sample {
     pub(crate) warning_bytes: Option<u64>,
     /// The flag of this member differs from `quota`.
     pub(crate) quota_mismatch: bool,
+    /// The members row differed from the row of the leader at the last check.
+    pub(crate) members_mismatch: bool,
     pub(crate) revision: i64,
     pub(crate) compact: i64,
     pub(crate) auth_revision: u64,

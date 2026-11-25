@@ -281,12 +281,7 @@ impl Server {
         }
         let mut restore = None;
         if let Some(backup) = config.restore_snapshot.take() {
-            let mut members = crate::cluster::Store::initial(&config.peers);
-            for (&id, address) in &config.client_peers {
-                if let Some(member) = members.members.get_mut(&id) {
-                    member.client_ur_ls = vec![crate::cluster::url(address)];
-                }
-            }
+            let members = crate::cluster::Store::bootstrap(&config.peers, &config.client_peers);
             if config.state_mode.is_replicated() {
                 crate::state::StateMachine::restore_backup(
                     &backup,

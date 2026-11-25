@@ -81,6 +81,8 @@ struct Simulation {
     quotas: BTreeMap<u64, i64>,
     /// Started members are directories of an earlier binary that propose no `SetQuota`.
     upgraded: bool,
+    /// Started members propose no `SeedMembers`, like an earlier binary.
+    hold_members: bool,
 }
 
 impl Drop for Simulation {
@@ -93,6 +95,19 @@ impl Drop for Simulation {
             }
         }
     }
+}
+
+/// The `--client-peer` flags of member `id`. Each member writes other URL text for the same
+/// peers, so a member-local membership row would differ from the reference.
+fn client_urls(id: u64) -> BTreeMap<u64, String> {
+    let host = match id {
+        1 => "127.0.0.1".to_owned(),
+        2 => "localhost".to_owned(),
+        _ => format!("{}example", "a.".repeat(100)),
+    };
+    (1..=3)
+        .map(|n| (n, format!("http://{host}:{}", 2379 + n)))
+        .collect()
 }
 
 impl Simulation {
@@ -117,14 +132,26 @@ impl Simulation {
         reference: bool,
         upgraded: bool,
     ) -> Self {
+        Self::with_holds(seed, shared, quotas, reference, upgraded, false).await
+    }
+
+    /// Like `with_options`. `hold_members` also starts the members without `SeedMembers`, so
+    /// each one stores its own flags, like an earlier binary.
+    async fn with_holds(
+        seed: u64,
+        shared: bool,
+        quotas: BTreeMap<u64, i64>,
+        reference: bool,
+        upgraded: bool,
+        hold_members: bool,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let reference = if reference {
-            let mut reference = StateMachine::open(&root.path().join("reference"))
+            // The reference has no flags. The seed entry of the first leader gives it the
+            // membership row.
+            let reference = StateMachine::open(&root.path().join("reference"))
                 .await
                 .unwrap();
-            let peers = (1..=3).map(|n| (n, format!("127.0.0.1:{n}"))).collect();
-            reference.members = std::sync::Arc::new(crate::cluster::Store::initial(&peers));
-            reference.members_unsaved = true;
             Some(reference)
         } else {
             None
@@ -168,6 +195,7 @@ impl Simulation {
             view_checks: 0,
             quotas,
             upgraded,
+            hold_members,
         };
         for id in 1..=3 {
             sim.start(id).await;
@@ -231,7 +259,7 @@ impl Simulation {
         // Box the large open future, so the schedule future fits the test thread stack.
         let mut node = Box::pin(Node::open_with_transport(
             NodeOptions {
-                client_peers: BTreeMap::new(),
+                client_peers: client_urls(id),
                 transport: crate::tls::Transport::default(),
                 require_peer_tls: false,
                 state_mode: if shared {
@@ -275,6 +303,7 @@ impl Simulation {
         .await
         .unwrap();
         node.quota.hold = self.upgraded;
+        node.hold_members = self.hold_members;
         self.nodes.insert(id, node);
         self.trace.push(format!("start {id}"));
     }
@@ -2089,6 +2118,12 @@ impl Simulation {
             assert_eq!(state.usage.total(), first.usage.total(), "member {id}");
             assert_eq!(state.cluster_quota, first.cluster_quota, "member {id}");
             assert_eq!(
+                state.members_row.as_ref().map(|row| &row.digest),
+                first.members_row.as_ref().map(|row| &row.digest),
+                "member {id}"
+            );
+            assert_eq!(state.members_mismatch, None, "member {id}");
+            assert_eq!(
                 node.worker.state().alarms.len(),
                 self.nodes[&1].worker.state().alarms.len(),
                 "member {id}"
@@ -2146,18 +2181,69 @@ impl Simulation {
         panic!("member {id} does not wait for a snapshot");
     }
 
-    /// Settle `rounds` times. Member `id` must never lead.
+    /// Settle `rounds` times. Member `id` must not lead while it waits for a snapshot.
     async fn settle_without(&mut self, id: u64, rounds: usize) {
         for _ in 0..rounds {
             for member in 1..=3 {
                 self.tick(member).await;
-                assert_ne!(self.leader(), Some(id), "member {id} leads");
+                self.assert_not_leading(id);
             }
             for _ in 0..30 {
                 self.deliver(false).await;
-                assert_ne!(self.leader(), Some(id), "member {id} leads");
+                self.assert_not_leading(id);
             }
         }
+    }
+
+    /// Member `id` does not lead while it waits for a snapshot. After the install it may lead,
+    /// for example when a transfer to it arrives after the snapshot.
+    fn assert_not_leading(&self, id: u64) {
+        if self.leader() == Some(id) {
+            let node = &self.nodes[&id];
+            assert_eq!(node.quota.blocked(), None, "member {id} leads");
+            // An independent check: `replace` starts the member with no install.
+            assert!(
+                node.installed_snapshots > 0,
+                "member {id} leads before an install"
+            );
+        }
+    }
+
+    /// Transfer leadership from `leader` to member `id`, which waits for a snapshot. Hold the
+    /// snapshots for the member until the transfer reaches it, so the transfer arrives while it
+    /// waits. It stays a follower.
+    async fn transfer_while_waiting(&mut self, leader: u64, id: u64) {
+        let is = |message: &Message, kind| message.to == id && message.get_msg_type() == kind;
+        self.nodes.get_mut(&leader).unwrap().raw.transfer_leader(id);
+        let mut held = vec![];
+        for _ in 0..2000 {
+            let (snapshots, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.messages)
+                .into_iter()
+                .partition(|message| is(message, MessageType::MsgSnapshot));
+            held.extend(snapshots);
+            self.messages = rest;
+            let transfer = self
+                .messages
+                .iter()
+                .position(|message| is(message, MessageType::MsgTimeoutNow));
+            if let Some(position) = transfer {
+                let message = self.messages.remove(position);
+                assert!(self.nodes[&id].quota.blocked().is_some());
+                self.trace.push(format!("transfer to waiting member {id}"));
+                let node = self.nodes.get_mut(&id).unwrap();
+                node.step_peer(message).unwrap();
+                node.drive_ready().await.unwrap();
+                self.drive().await;
+                assert_eq!(self.nodes[&id].raw.raft.state, StateRole::Follower);
+                self.messages.extend(held);
+                return;
+            }
+            if self.messages.is_empty() {
+                self.tick(leader).await;
+            }
+            self.deliver(false).await;
+        }
+        panic!("the transfer did not reach member {id}");
     }
 
     /// A follower, not `except`.
@@ -2181,8 +2267,9 @@ impl Simulation {
     }
 }
 
-/// Members with different quota flags apply one cluster quota. Each member state at each applied
-/// index equals a reference state that applies the committed entries in order.
+/// Members with different quota flags apply one cluster quota. They also have other client URL
+/// text, but store one membership row. Each member state at each applied index equals a
+/// reference state that applies the committed entries in order.
 #[tokio::test]
 async fn members_with_different_quota_flags_switch_quota_at_one_index() {
     let quotas = BTreeMap::from([(1, 1 << 20), (2, 3000), (3, 1 << 20)]);
@@ -2195,6 +2282,11 @@ async fn members_with_different_quota_flags_switch_quota_at_one_index() {
     sim.write(40).await;
     assert_eq!(sim.cluster_quota(), Some(1 << 20));
     assert_eq!(sim.acknowledged.len(), 40);
+    // The first leader seeded the row with its own client URL text.
+    assert_eq!(
+        sim.nodes[&3].state.members.members[&3].client_ur_ls,
+        ["http://127.0.0.1:2382"]
+    );
     assert!(sim.nodes[&2].state.usage.total() > 3000);
     assert!(sim.nodes[&2].state.quota_mismatch);
     assert!(!sim.nodes[&1].state.quota_mismatch);
@@ -2299,8 +2391,7 @@ async fn a_waiting_member_does_not_lead_in_an_election_or_a_transfer() {
         sim.replace(waiting, 3000).await;
         sim.until_waiting(waiting).await;
         if transfer {
-            let node = sim.nodes.get_mut(&leader).unwrap();
-            node.raw.transfer_leader(waiting);
+            sim.transfer_while_waiting(leader, waiting).await;
         } else {
             sim.stop(leader);
             sim.messages
@@ -2319,15 +2410,21 @@ async fn a_waiting_member_does_not_lead_in_an_election_or_a_transfer() {
             sim.nodes[&now].state.applied
         );
         assert!(sim.nodes[&waiting].worker.state().alarms.is_empty());
-        if !transfer {
+        if transfer {
+            // After its install, the member can lead.
+            sim.lead(waiting).await;
+            sim.assert_not_leading(waiting);
+        } else {
             sim.start(leader).await;
             sim.settle(3).await;
         }
+        // The leader seeds the cluster quota with its flag.
+        let seeder = sim.leader().unwrap();
         sim.release_quota();
         sim.settle(2).await;
         sim.write(2).await;
         sim.settle(2).await;
-        assert_eq!(sim.cluster_quota(), Some(1 << 20));
+        assert_eq!(sim.cluster_quota(), Some(sim.quotas[&seeder]));
     }
 }
 
@@ -2377,6 +2474,179 @@ async fn a_waiting_member_with_the_only_latest_log_lets_the_group_progress() {
     sim.write(1).await;
     sim.settle(5).await;
     assert!(sim.acknowledged.len() > acknowledged);
+}
+
+/// Members of an earlier binary stored their own flags, so their rows differ. They flushed at
+/// different indexes. After a full restart, the member with the lowest applied index leads. Its
+/// first seed is behind the indexes of the other members, so they skip that check. Its second
+/// seed follows the seed of its term, so every member with another row reports it.
+#[tokio::test]
+async fn every_member_with_another_row_reports_it_after_a_full_restart() {
+    let mut sim = Simulation::with_holds(13, false, BTreeMap::new(), false, true, true).await;
+    sim.settle(3).await;
+    assert_eq!(sim.leader(), Some(1));
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    let mut flushed = vec![];
+    for id in 1..=3 {
+        sim.write(3).await;
+        let node = sim.nodes.get_mut(&id).unwrap();
+        node.worker.state_mut().db().flush().await.unwrap();
+        flushed.push(node.state.applied);
+    }
+    assert!(
+        flushed[0] < flushed[1] && flushed[1] < flushed[2],
+        "{flushed:?}"
+    );
+    let digests: BTreeSet<_> = sim
+        .nodes
+        .values()
+        .map(|node| node.state.members_row.clone().unwrap().digest)
+        .collect();
+    assert_eq!(digests.len(), 3);
+    for id in 1..=3 {
+        sim.stop(id);
+    }
+    sim.hold_members = false;
+    // Member 1 leads before it replays its log.
+    sim.paused_apply = Some(1);
+    for id in 1..=3 {
+        sim.start(id).await;
+    }
+    sim.nodes.get_mut(&1).unwrap().raw.campaign().unwrap();
+    sim.settle(2).await;
+    assert_eq!(sim.leader(), Some(1));
+    assert_eq!(sim.nodes[&1].state.applied, flushed[0]);
+    for id in [2, 3] {
+        let state = &sim.nodes[&id].state;
+        assert_eq!(
+            (state.members_checked, state.members_mismatch),
+            (None, None)
+        );
+    }
+    sim.paused_apply = None;
+    sim.settle(3).await;
+    let term = sim.nodes[&1].raw.raft.term;
+    for (&id, node) in &sim.nodes {
+        let expected = (id != 1).then_some(1);
+        assert_eq!(node.state.members_mismatch, expected, "member {id}");
+        assert_eq!(node.state.members_checked.unwrap().0, term, "member {id}");
+        assert_eq!(
+            node.members_status()["checked"]["term"],
+            term,
+            "member {id}"
+        );
+    }
+}
+
+/// An earlier binary wrote only membership entries. A new member that waits on one does not
+/// lead, in an election or a transfer. In an election, the next leader proposes `SeedMembers`
+/// and `SetQuota` before any other entry of its term, and the member catches up by snapshot.
+#[tokio::test]
+async fn a_member_waiting_on_a_membership_entry_does_not_lead() {
+    for transfer in [false, true] {
+        let mut sim = Simulation::with_holds(17, false, BTreeMap::new(), false, true, true).await;
+        sim.settle(3).await;
+        let leader = sim.leader().unwrap();
+        let publish = RaftCommand::Cluster {
+            id: "publish-2".into(),
+            request: crate::cluster::Command::Publish {
+                id: 2,
+                client_urls: vec!["http://localhost:2381".into()],
+            },
+            credentials: Default::default(),
+        };
+        sim.admin_command(publish).await.result.unwrap();
+        sim.settle(2).await;
+        let waiting = sim.follower(0);
+        sim.replace(waiting, 0).await;
+        sim.until_waiting(waiting).await;
+        assert!(sim.nodes[&waiting].state.members_row.is_none());
+        // Members of this binary lead from here.
+        sim.hold_members = false;
+        for node in sim.nodes.values_mut() {
+            node.hold_members = false;
+        }
+        sim.release_quota();
+        if transfer {
+            sim.transfer_while_waiting(leader, waiting).await;
+        } else {
+            sim.stop(leader);
+            sim.messages
+                .retain(|message| message.to != leader && message.from != leader);
+        }
+        sim.settle_without(waiting, 30).await;
+        let now = sim.leader().unwrap();
+        assert_ne!(now, waiting);
+        assert_eq!(
+            sim.nodes[&waiting].quota.blocked(),
+            None,
+            "transfer {transfer}"
+        );
+        assert_eq!(
+            sim.nodes[&waiting].state.applied,
+            sim.nodes[&now].state.applied
+        );
+        assert!(sim.nodes[&waiting].state.members_row.is_some());
+        if !transfer {
+            let term = sim.nodes[&now].raw.raft.term;
+            let commands: Vec<_> = sim
+                .committed_entries
+                .values()
+                .map(|data| Entry::decode(data.as_slice()).unwrap())
+                .filter(|entry| entry.term == term && !entry.data.is_empty())
+                .map(|entry| RaftCommand::decode(&entry.data).unwrap())
+                .collect();
+            assert!(
+                matches!(
+                    commands.as_slice(),
+                    [
+                        RaftCommand::SeedMembers(_),
+                        RaftCommand::SetQuota { .. },
+                        ..
+                    ]
+                ),
+                "{commands:?}"
+            );
+        }
+    }
+}
+
+/// Members of an earlier binary stored their own flags. Member 1 never flushed, so after a full
+/// restart it leads with no row, and its first seed carries no digest. Once its replay stores
+/// its row, it sends the digest in the same term, and the members with other rows report it.
+#[tokio::test]
+async fn a_leader_without_a_row_sends_its_digest_once_it_has_one() {
+    let mut sim = Simulation::with_holds(19, false, BTreeMap::new(), false, true, true).await;
+    sim.settle(3).await;
+    assert_eq!(sim.leader(), Some(1));
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(3).await;
+    for id in [2, 3] {
+        let node = sim.nodes.get_mut(&id).unwrap();
+        node.worker.state_mut().db().flush().await.unwrap();
+    }
+    for id in 1..=3 {
+        sim.stop(id);
+    }
+    sim.hold_members = false;
+    sim.paused_apply = Some(1);
+    for id in 1..=3 {
+        sim.start(id).await;
+    }
+    assert!(sim.nodes[&1].state.members_row.is_none());
+    sim.nodes.get_mut(&1).unwrap().raw.campaign().unwrap();
+    sim.settle(2).await;
+    assert_eq!(sim.leader(), Some(1));
+    let term = sim.nodes[&1].raw.raft.term;
+    assert!(sim.nodes[&1].state.members_row.is_none());
+    sim.paused_apply = None;
+    sim.settle(3).await;
+    assert_eq!(sim.nodes[&1].raw.raft.term, term);
+    for (&id, node) in &sim.nodes {
+        let expected = (id != 1).then_some(1);
+        assert_eq!(node.state.members_mismatch, expected, "member {id}");
+        assert_eq!(node.state.members_checked.unwrap().0, term, "member {id}");
+    }
 }
 
 #[tokio::test]

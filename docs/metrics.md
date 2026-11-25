@@ -87,16 +87,19 @@ Each member permits two concurrent scrapes and returns HTTP 503 on overload or t
 A scrape can read one remote manifest when the member uses an object store.
 If this read fails or takes more than one second, the scrape omits only the physical size gauge.
 
-## Quota gauge
+## Quota and membership gauges
 
-Every member also exports this gauge.
+Every member also exports these gauges.
 
 | Gauge | Meaning |
 | --- | --- |
 | `slatedb_etcd_quota_flag_mismatch` | 1 while the member flag differs from the cluster quota |
+| `slatedb_etcd_members_mismatch` | 1 after the members row differed from the row of the leader |
 
 The gauge is 1 during a rolling quota change. A member whose flag did not change since the
 cluster took another value also keeps it at 1. See [quota changes](operations.md#change-the-quota).
+The membership gauge changes when a leader starts a term. See
+[membership row](operations.md#membership-row).
 
 ## Shared state gauges
 

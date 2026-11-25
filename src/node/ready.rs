@@ -2,8 +2,8 @@ use super::*;
 
 impl Node {
     pub(super) async fn drive_ready(&mut self) -> Result<()> {
-        // Queued client writes enter Raft below, after a `SetQuota` entry of this term.
-        self.propose_quota()?;
+        // Queued client writes enter Raft below, after the term-start entries of this term.
+        self.propose_term_start()?;
         self.resume_proposals();
         self.flush_puts();
         self.drive_compaction()?;

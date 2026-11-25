@@ -2193,7 +2193,7 @@ mod tests {
         state.members = Arc::new(crate::cluster::Store::initial(
             &[(1, "127.0.0.1:1".to_owned())].into(),
         ));
-        state.apply(1, None).await.unwrap();
+        state.seed_for_test(1).await.unwrap();
         let handles = state.shared_handles().unwrap();
         let (events, mut announced) = mpsc::channel(64);
         let clock = Clock::system(Duration::from_secs(5), None);
@@ -2310,7 +2310,7 @@ mod tests {
         state.members = Arc::new(crate::cluster::Store::initial(
             &[(1, "127.0.0.1:1".to_owned())].into(),
         ));
-        state.apply(1, None).await.unwrap();
+        state.seed_for_test(1).await.unwrap();
         let handles = state.shared_handles().unwrap();
         let (events, received) = mpsc::channel(64);
         let mut announcements = Announcements(received);
@@ -2429,7 +2429,7 @@ mod tests {
         state.members = Arc::new(crate::cluster::Store::initial(
             &[(1, "127.0.0.1:1".to_owned())].into(),
         ));
-        state.apply(1, None).await.unwrap();
+        state.seed_for_test(1).await.unwrap();
         let handles = state.shared_handles().unwrap();
         let (events, received) = mpsc::channel(64);
         let mut announcements = Announcements(received);
@@ -2503,7 +2503,7 @@ mod tests {
         state.members = Arc::new(crate::cluster::Store::initial(
             &[(1, "127.0.0.1:1".to_owned())].into(),
         ));
-        state.apply(1, None).await.unwrap();
+        state.seed_for_test(1).await.unwrap();
         let handles = state.shared_handles().unwrap();
         let (events, received) = mpsc::channel(64);
         let mut announcements = Announcements(received);
@@ -2752,7 +2752,7 @@ mod tests {
     async fn a_restore_after_an_ordinary_bootstrap_fails() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let (mut state, handles) = ordinary(store.clone()).await;
-        state.apply(1, None).await.unwrap();
+        state.seed_for_test(1).await.unwrap();
         let (events, received) = mpsc::channel(64);
         let mut announcements = Announcements(received);
         let mut writer = Writer::new(&handles, STRANDED_AGE, clock());

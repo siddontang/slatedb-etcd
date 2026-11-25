@@ -159,14 +159,11 @@ async fn a_backup_streams_its_applied_boundary_while_writes_continue() {
         restored.local_value("key-300").await.unwrap().as_deref(),
         Some(value.as_str())
     );
-    assert_eq!(restored.members.members.len(), 1);
-    // The restored size is the source size at the boundary plus the new membership row, which
-    // the source keeps only in memory.
-    let members = crate::cluster::KEY.len() + serde_json::to_vec(&members()).unwrap().len();
-    assert_eq!(
-        restored.logical_bytes.total(),
-        size.total() + members as u64
-    );
+    // A replicated restore stores no membership row. The member starts with the membership of
+    // its flags, and the first leader seeds the row. The restored size is the source size.
+    assert_eq!(restored.members_row, None);
+    assert!(restored.members.members.is_empty());
+    assert_eq!(restored.logical_bytes.total(), size.total());
     restored.close().await.unwrap();
     state.close().await.unwrap();
 }

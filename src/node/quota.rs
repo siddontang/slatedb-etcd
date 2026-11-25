@@ -14,6 +14,10 @@
 //! leader is live, ignores leadership transfers, and hands over leadership if it wins. It still
 //! votes. A member also checkpoints through a first cluster quota that follows such entries, so
 //! the leader sends later members a snapshot. See `StateMachine::quota_boundary`.
+//!
+//! The same guard keeps such a state from an entry of an earlier binary before the first
+//! `SeedMembers` entry, in both state modes; see `state::cluster`. A local origin record in the
+//! data directory, kept in both modes, says which guards apply. See `Origin`.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -25,6 +29,25 @@ use crate::state::quota::ClusterQuota;
 
 /// The file of the local flag record in the data directory.
 const RECORD: &str = "quota-flag.json";
+
+/// The file of the local record of the start that created the data directory. Both state modes
+/// keep it. Raft, snapshots, and backups do not carry it.
+const ORIGIN: &str = "state-origin.json";
+
+/// The guards that apply to a data directory, by the start that created it. See `Guards`.
+///
+/// The first start of this binary writes the record. Without an earlier record, a guard applies
+/// when that start found an empty Raft log and an empty state. #116 kept the quota mark in its
+/// flag record, so the quota guard keeps that mark. A directory with history at that start
+/// holds decisions of an earlier binary, which applied it without seeds. So the membership guard
+/// does not apply there, and replay applies the entries as that binary did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Origin {
+    /// The state was created empty by this binary, or by #116 before it.
+    quota_created_empty: bool,
+    /// The state was created empty by this binary.
+    members_created_empty: bool,
+}
 
 /// An operator request of this member: a flag value and the wall-clock time of the start that
 /// saw it, in milliseconds.
@@ -41,8 +64,6 @@ struct Record {
     acknowledged: i64,
     /// A request that this member must propose.
     pending: Option<Request>,
-    /// This binary created the data directory empty. See `guard_quota`.
-    created_empty: bool,
 }
 
 /// The options of `Quota::open`.
@@ -60,45 +81,105 @@ pub(super) struct Startup {
     pub now: u64,
 }
 
-/// The first entry that decides whether a state without a cluster quota can apply its log.
+/// The cluster state that a state created empty still lacks. While it lacks an input, an
+/// entry of an earlier binary can need it. A `SetQuota` entry gives the cluster quota, and a
+/// `SeedMembers` entry gives the membership row. See `state::cluster`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Guards {
+    /// A replicated state has no cluster quota. Shared mode takes it from the cluster claim.
+    pub quota: bool,
+    /// The state has no membership row.
+    pub members: bool,
+}
+
+impl Guards {
+    fn new(shared: bool, cluster_quota: bool, members_row: bool) -> Self {
+        Self {
+            quota: !shared && !cluster_quota,
+            members: !members_row,
+        }
+    }
+
+    /// The guards of `state` that apply to a directory with origin `origin`.
+    pub(super) fn of(state: &StateMachine, origin: Self) -> Self {
+        Self::new(
+            state.is_shared(),
+            state.cluster_quota().is_some(),
+            state.members_row.is_some(),
+        )
+        .and(origin)
+    }
+
+    pub(super) fn any(self) -> bool {
+        self.quota || self.members
+    }
+
+    /// The guards that both `self` and `other` still hold.
+    fn and(self, other: Self) -> Self {
+        Self {
+            quota: self.quota && other.quota,
+            members: self.members && other.members,
+        }
+    }
+}
+
+/// The first entry that decides whether a state created empty can apply its log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Gate {
-    /// A `SetQuota` entry. The entries after it apply under the cluster quota.
-    SetQuota(u64),
-    /// A quota-checked entry before any `SetQuota` entry. An earlier binary wrote it, and other
-    /// members applied it under their own flags.
+    /// The `SetQuota` or `SeedMembers` entry that gives the last missing input. The entries
+    /// after it apply under cluster state.
+    Passed(u64),
+    /// An entry of an earlier binary that needs a missing input: a quota-checked entry before
+    /// any `SetQuota` entry, or another entry than these two before any `SeedMembers` entry.
+    /// Other members applied it under their own flags.
     Checked(u64),
 }
 
-/// Return the first gate in `entries`, by Raft index.
-pub(super) fn first_gate(entries: &[Entry]) -> Result<Option<Gate>> {
+/// Return the first gate in `entries`, by Raft index. `guards` holds the inputs that the state
+/// lacks before `entries`, and the inputs that it still lacks after them.
+pub(super) fn first_gate(entries: &[Entry], guards: &mut Guards) -> Result<Option<Gate>> {
     for entry in entries {
-        if entry.entry_type != EntryType::EntryNormal as i32 || entry.data.is_empty() {
+        if entry.data.is_empty() {
             continue;
         }
-        let command = RaftCommand::decode(&entry.data)?;
-        if matches!(command, RaftCommand::SetQuota { .. }) {
-            return Ok(Some(Gate::SetQuota(entry.index)));
+        let command = match EntryType::try_from(entry.entry_type)? {
+            EntryType::EntryNormal => RaftCommand::decode(&entry.data)?,
+            // A configuration change of an earlier binary changes the membership row.
+            EntryType::EntryConfChange if guards.members => {
+                return Ok(Some(Gate::Checked(entry.index)))
+            }
+            _ => continue,
+        };
+        let passed = match command {
+            RaftCommand::SetQuota { .. } => std::mem::take(&mut guards.quota),
+            RaftCommand::SeedMembers(_) => std::mem::take(&mut guards.members),
+            _ => false,
+        };
+        if passed && !guards.any() {
+            return Ok(Some(Gate::Passed(entry.index)));
         }
-        if crate::state::quota::checks_quota(&command) {
+        if (guards.quota && crate::state::quota::checks_quota(&command))
+            || (guards.members && crate::state::cluster::needs_members(&command))
+        {
             return Ok(Some(Gate::Checked(entry.index)));
         }
     }
     Ok(None)
 }
 
-/// Keep only the entries that a recovery replay can apply. A state that this binary created
-/// empty stops before a `Gate::Checked` entry while it has no cluster quota. Return true when
-/// no entry is left: the member then waits for a snapshot.
+/// Keep only the entries that a recovery replay can apply. A state of a directory with origin
+/// `origin` stops before a `Gate::Checked` entry. Return true when no entry is left: the member
+/// then waits for a snapshot.
 pub(super) fn guard_replay(
     state: &StateMachine,
-    created_empty: bool,
+    origin: Guards,
     entries: &mut Vec<Entry>,
 ) -> Result<bool> {
-    if !created_empty || state.cluster_quota().is_some() {
+    let mut guards = Guards::of(state, origin);
+    if !guards.any() {
         return Ok(false);
     }
-    if let Some(Gate::Checked(index)) = first_gate(entries)? {
+    if let Some(Gate::Checked(index)) = first_gate(entries, &mut guards)? {
         entries.retain(|entry| entry.index < index);
     }
     Ok(entries.is_empty())
@@ -110,6 +191,8 @@ pub(super) struct Quota {
     flag: i64,
     /// The record file and its content. `None` in shared mode, which never proposes.
     record: Option<(PathBuf, Record)>,
+    /// The guards that apply to this directory. See `Origin`.
+    origin: Guards,
     /// The index and term of the last `SetQuota` proposal of this member.
     proposed: Option<(u64, u64)>,
     /// The cluster quota that `observe_quota` last handled.
@@ -119,6 +202,9 @@ pub(super) struct Quota {
     gate: Option<Gate>,
     /// The last log index that the gate scan covered.
     scanned: u64,
+    /// The inputs that the state still lacks after `scanned`, when it is above the applied
+    /// index.
+    open: Guards,
     /// Ticks since the last message of the current leader. Raft keeps the ID of a lost leader
     /// while the timer cap of `tick_raft` holds, so the ID is not a liveness signal.
     silent: usize,
@@ -173,10 +259,15 @@ impl Quota {
             member: startup.member,
             flag: startup.flag,
             record: None,
+            origin: open_origin(dir, startup.empty)?,
             proposed: None,
             observed: None,
             gate: None,
             scanned: 0,
+            open: Guards {
+                quota: true,
+                members: true,
+            },
             silent: 0,
             #[cfg(test)]
             hold: false,
@@ -206,7 +297,6 @@ impl Quota {
         let record = Record {
             acknowledged,
             pending,
-            created_empty: stored.map_or(startup.empty, |record| record.created_empty),
         };
         if stored != Some(record) {
             write_record(&path, &record)?;
@@ -220,10 +310,14 @@ impl Quota {
     }
 
     /// This binary created the data directory empty.
+    #[cfg(test)]
     pub(super) fn created_empty(&self) -> bool {
-        self.record
-            .as_ref()
-            .is_some_and(|(_, record)| record.created_empty)
+        self.origin.any()
+    }
+
+    /// The guards that apply to this directory. See `Origin`.
+    pub(super) fn origin(&self) -> Guards {
+        self.origin
     }
 
     /// The quota-checked entry that waits for a snapshot, if any.
@@ -238,6 +332,12 @@ impl Quota {
     pub(super) fn set_gate(&mut self, gate: Option<Gate>, scanned: u64) {
         self.gate = gate;
         self.scanned = scanned;
+    }
+
+    /// Record a scan through `scanned` that found `gate`, and the inputs that remain open.
+    pub(super) fn set_scan(&mut self, gate: Option<Gate>, scanned: u64, open: Guards) {
+        self.set_gate(gate, scanned);
+        self.open = open;
     }
 
     /// Clear the pending request once the cluster quota holds it or a newer request. This needs
@@ -256,7 +356,6 @@ impl Quota {
             *record = Record {
                 acknowledged: self.flag,
                 pending: None,
-                created_empty: record.created_empty,
             };
             write_record(path, record)?;
         }
@@ -265,8 +364,12 @@ impl Quota {
 }
 
 /// Find the first gate in the durable log above `applied`, in bounded batches, so the scan
-/// holds no backlog. Return the gate and the last index of the log.
-pub(super) fn scan_storage(storage: &RaftStorage, applied: u64) -> Result<(Option<Gate>, u64)> {
+/// holds no backlog. Return the gate, the last index of the log, and the open guards.
+pub(super) fn scan_storage(
+    storage: &RaftStorage,
+    applied: u64,
+    mut guards: Guards,
+) -> Result<(Option<Gate>, u64, Guards)> {
     let last = storage.last_index()?;
     let mut low = applied.max(storage.first_index()? - 1) + 1;
     while low <= last {
@@ -279,12 +382,12 @@ pub(super) fn scan_storage(storage: &RaftStorage, applied: u64) -> Result<(Optio
         let Some(end) = entries.last().map(|entry| entry.index) else {
             anyhow::bail!("empty quota scan batch");
         };
-        if let Some(gate) = first_gate(&entries)? {
-            return Ok((Some(gate), last));
+        if let Some(gate) = first_gate(&entries, &mut guards)? {
+            return Ok((Some(gate), last, guards));
         }
         low = end + 1;
     }
-    Ok((None, last))
+    Ok((None, last, guards))
 }
 
 /// Return `conf` with `id` as a learner, not a voter.
@@ -299,8 +402,43 @@ pub(super) fn without_vote(
     conf
 }
 
+/// Read the origin record of `dir`. The first start writes it: `empty` is true when this start
+/// found an empty Raft log and an empty state.
+fn open_origin(dir: &Path, empty: bool) -> Result<Guards> {
+    let path = dir.join(ORIGIN);
+    let origin = match read_json::<Origin>(&path).context("invalid origin record")? {
+        Some(origin) => origin,
+        None => {
+            // #116 kept the quota mark in its flag record. A member that waits for a snapshot
+            // must keep waiting after the upgrade.
+            let earlier = read_json::<serde_json::Value>(&dir.join(RECORD))
+                .context("invalid quota record")?
+                .and_then(|record| record["created_empty"].as_bool());
+            let origin = Origin {
+                quota_created_empty: earlier.unwrap_or(empty),
+                members_created_empty: empty,
+            };
+            write_record(&path, &origin)?;
+            origin
+        }
+    };
+    Ok(Guards {
+        quota: origin.quota_created_empty,
+        members: origin.members_created_empty,
+    })
+}
+
+/// Read a JSON file, or `None` when it does not exist.
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    match std::fs::read(path) {
+        Ok(data) => Ok(Some(serde_json::from_slice(&data)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Replace the record file atomically.
-fn write_record(path: &Path, record: &Record) -> Result<()> {
+fn write_record(path: &Path, record: &impl Serialize) -> Result<()> {
     let dir = path.parent().context("quota record has no directory")?;
     let temporary = path.with_extension("json.pending");
     let mut file = std::fs::File::create(&temporary)?;
@@ -326,10 +464,6 @@ impl Node {
     /// One proposal of a term stays in the log, so the next one waits until it applies.
     pub(super) fn propose_quota(&mut self) -> Result<()> {
         if self.raw.raft.state != StateRole::Leader || self.quota.record.is_none() {
-            return Ok(());
-        }
-        if self.quota.blocked().is_some() {
-            self.yield_leadership();
             return Ok(());
         }
         #[cfg(test)]
@@ -403,10 +537,21 @@ impl Node {
         Ok(())
     }
 
-    /// Return true while a state created empty has no cluster quota. Apply then runs one batch
-    /// at a time and stops before a `Gate::Checked` entry.
+    /// The inputs that the applied state lacks, for the guards of this directory. See `Guards`.
+    fn guards(&self) -> Guards {
+        Guards::new(
+            !self.options.state_mode.is_replicated(),
+            self.state.cluster_quota.is_some(),
+            self.state.members_row.is_some(),
+        )
+        .and(self.quota.origin())
+    }
+
+    /// Return true while a guard of this directory applies: a state created empty lacks the
+    /// cluster quota or the membership row. Apply then runs one batch at a time and stops before
+    /// a `Gate::Checked` entry.
     pub(super) fn quota_guarded(&self) -> bool {
-        self.quota.created_empty() && self.state.cluster_quota.is_none()
+        self.guards().any()
     }
 
     /// Find the first gate in the cached log above the applied index. `replaced` is the first
@@ -421,11 +566,17 @@ impl Node {
         // an earlier entry stays. A snapshot keeps it too, until the install passes it.
         if let Some(first) = replaced {
             let index = match self.quota.gate {
-                Some(Gate::SetQuota(index) | Gate::Checked(index)) => index,
+                Some(Gate::Passed(index) | Gate::Checked(index)) => index,
                 None => u64::MAX,
             };
+            // A guard on an earlier entry stays. Without one, scan again from the applied
+            // index: the replaced suffix may have given an input that `open` holds.
             let gate = self.quota.gate.filter(|_| index < first);
-            self.quota.set_gate(gate, self.quota.scanned.min(first - 1));
+            let scanned = match gate {
+                Some(_) => self.quota.scanned.min(first - 1),
+                None => 0,
+            };
+            self.quota.set_gate(gate, scanned);
         }
         if self.quota.gate.is_some() {
             return Ok(());
@@ -441,14 +592,19 @@ impl Node {
             self.raw
                 .store()
                 .entries(low, last + 1, None, raft::GetEntriesContext::empty(false))?;
-        let gate = first_gate(&entries)?;
+        let mut guards = self.guards();
+        if self.quota.scanned > self.state.applied {
+            guards = guards.and(self.quota.open);
+        }
+        let gate = first_gate(&entries, &mut guards)?;
         if let Some(Gate::Checked(index)) = gate {
             tracing::error!(
                 index,
-                "entry needs the cluster quota; apply waits for a snapshot from the leader"
+                "entry needs the cluster quota or membership; apply waits for a snapshot from the \
+                 leader"
             );
         }
-        self.quota.set_gate(gate, last);
+        self.quota.set_scan(gate, last, guards);
         Ok(())
     }
 
@@ -466,7 +622,8 @@ impl Node {
 
     /// Ask the leader for a snapshot that replaces the entries before the cluster quota. Raft
     /// drops the request on a leader, without a leader, or with a request in flight. The next
-    /// tick asks again.
+    /// tick asks again. In shared mode an idle leader cannot yet offer a base above its last
+    /// batch, so the recovery of an idle cluster depends on #96.
     fn request_quota_snapshot(&mut self) {
         if self.quota.blocked() == Some(self.state.applied + 1) {
             let _ = self.raw.request_snapshot();
@@ -477,7 +634,7 @@ impl Node {
     /// leader is live, so the group does not elect a member that cannot apply.
     ///
     /// After three election timeouts without a message of the leader, it may campaign, so it
-    /// never holds up the group. If it wins, `propose_quota` hands leadership over at once. Raft
+    /// never holds up the group. If it wins, `acts_as_leader` hands leadership over at once. Raft
     /// itself refuses the campaign while a committed configuration change is not applied, and
     /// apply stops before the waiting entry, so such a change stays unapplied. A member that
     /// skipped its backlog at open is a learner until the snapshot, so it never campaigns.
@@ -497,7 +654,7 @@ impl Node {
             self.quota.silent = 0;
         }
         self.raw.tick();
-        self.propose_quota()
+        self.propose_term_start()
     }
 
     /// Step a peer message. A member that waits for a snapshot ignores a leadership transfer.
@@ -519,14 +676,26 @@ impl Node {
         if leader_message && from == self.raw.raft.leader_id {
             self.quota.silent = 0;
         }
-        if let Err(error) = self.propose_quota() {
-            tracing::warn!(%error, "cannot propose the cluster quota");
+        if let Err(error) = self.propose_term_start() {
+            tracing::warn!(%error, "cannot propose the term-start entries");
         }
         Ok(())
     }
 
-    /// A leader that waits for a snapshot cannot apply, so it hands leadership to the voter
-    /// with the longest matched log.
+    /// Return true when this member leads and acts as leader. A leader that waits for a
+    /// snapshot cannot apply, so it proposes nothing and hands leadership over.
+    pub(super) fn acts_as_leader(&mut self) -> bool {
+        if self.raw.raft.state != StateRole::Leader {
+            return false;
+        }
+        if self.quota.blocked().is_some() {
+            self.yield_leadership();
+            return false;
+        }
+        true
+    }
+
+    /// Hand leadership to the voter with the longest matched log.
     fn yield_leadership(&mut self) {
         if self.raw.raft.lead_transferee.is_some() {
             return;
@@ -680,15 +849,14 @@ pub(super) mod tests {
         // Back to the acknowledged value: nothing is pending.
         assert_eq!(open(100, 70, false, false).pending(), request(100, 70));
         assert_eq!(open(300, 80, false, false).pending(), None);
-        // Shared mode keeps no record.
+        // Shared mode keeps no flag record. It keeps the origin record.
         let shared = tempfile::tempdir().unwrap();
         let mut startup = startup(1, 1, true, false);
         startup.shared = true;
-        assert!(Quota::open(shared.path(), startup)
-            .unwrap()
-            .record
-            .is_none());
+        let quota = Quota::open(shared.path(), startup).unwrap();
+        assert!(quota.record.is_none() && quota.created_empty());
         assert!(!shared.path().join(RECORD).exists());
+        assert!(shared.path().join(ORIGIN).exists());
     }
 
     fn quota_put(n: u64) -> RaftCommand {
@@ -766,11 +934,15 @@ pub(super) mod tests {
             let dir = tempfile::tempdir().unwrap();
             append_committed(dir.path(), 1, &commands);
             if flushed {
-                // The earlier binary applied and flushed every entry under its flag.
+                // The earlier binary applied and flushed every entry under its flag. It stored
+                // its bootstrap membership with its first batch.
                 let mut state = StateMachine::open(&dir.path().join("objects"))
                     .await
                     .unwrap();
                 state.quota = 3000;
+                let peers = options(dir.path()).peers;
+                state.members = std::sync::Arc::new(crate::cluster::Store::initial(&peers));
+                state.members_unsaved = true;
                 for (index, command) in (1..).zip(&commands) {
                     let RaftCommand::Etcd { etcd, origin, .. } = command else {
                         unreachable!()
@@ -895,19 +1067,21 @@ pub(super) mod tests {
             .filter(|entry| !entry.data.is_empty())
             .map(|entry| RaftCommand::decode(&entry.data).unwrap())
             .collect();
-        assert_eq!(last, 3);
+        // The empty entry, `SeedMembers`, `SetQuota`, and the Put.
+        assert_eq!(last, 4);
+        assert!(matches!(commands[0], RaftCommand::SeedMembers(_)));
         assert!(matches!(
-            commands[0],
+            commands[1],
             RaftCommand::SetQuota {
                 bytes: -1,
                 seed: true,
                 ..
             }
         ));
-        assert!(matches!(commands[1], RaftCommand::Etcd { .. }));
+        assert!(matches!(commands[2], RaftCommand::Etcd { .. }));
         // One proposal of a term is enough until it applies.
         node.propose_quota().unwrap();
-        assert_eq!(node.raw.raft.raft_log.last_index(), 3);
+        assert_eq!(node.raw.raft.raft_log.last_index(), 4);
     }
 
     async fn open_node(dir: &Path, flag: i64, reassert: bool) -> Node {
@@ -1160,6 +1334,110 @@ pub(super) mod tests {
         assert_eq!(node.quota.blocked(), None);
     }
 
+    /// The first start with this binary records whether the Raft log was empty and nothing had
+    /// applied. An upgraded member that never flushed still has its log, so it is not new.
+    #[tokio::test]
+    async fn only_a_start_with_an_empty_log_and_state_creates_the_state_empty() {
+        let upgraded = tempfile::tempdir().unwrap();
+        append_committed(upgraded.path(), 1, &[publish(), quota_put(1)]);
+        let node = open_node(upgraded.path(), 3000, false).await;
+        assert_eq!(node.state.applied, 0);
+        assert!(!node.quota.created_empty());
+        drop(node);
+        assert!(!open_node(upgraded.path(), 3000, false)
+            .await
+            .quota
+            .created_empty());
+        let fresh = tempfile::tempdir().unwrap();
+        drop(open_node(fresh.path(), 3000, false).await);
+        // Later entries do not change the record of the first start.
+        append_committed(fresh.path(), 1, &[publish()]);
+        assert!(open_node(fresh.path(), 3000, false)
+            .await
+            .quota
+            .created_empty());
+    }
+
+    /// The flag record that #116 wrote when it first opened a member.
+    fn write_116_record(dir: &Path, created_empty: bool) {
+        let record =
+            format!(r#"{{"acknowledged":3000,"pending":null,"created_empty":{created_empty}}}"#);
+        std::fs::write(dir.join(RECORD), record).unwrap();
+    }
+
+    /// #116 created this member empty, and it waits to replace the Puts of an earlier binary.
+    /// After the upgrade, the quota guard keeps the member waiting: the origin record takes the
+    /// mark of #116, not the log that the member holds now.
+    #[tokio::test]
+    async fn an_upgrade_from_116_keeps_the_quota_guard_of_a_waiting_member() {
+        let dir = tempfile::tempdir().unwrap();
+        write_116_record(dir.path(), true);
+        let mut commands: Vec<_> = (0..40).map(quota_put).collect();
+        commands.push(set_quota(-1, 0, 2));
+        append_committed(dir.path(), 1, &commands);
+        let mut node = open_node(dir.path(), 3000, false).await;
+        drive(&mut node).await;
+        assert_eq!(
+            (
+                node.state.applied,
+                node.quota.blocked(),
+                node.state.revision
+            ),
+            (0, Some(1), 1),
+        );
+        assert!(!node.quota.origin().members);
+    }
+
+    /// #116 has no seeds. A #116 member with history before the first start of this binary
+    /// applied its membership entries without one, so the membership guard does not apply. It
+    /// replays its unflushed log as #116 did. A #116 member with an empty log and state has no
+    /// such history, so the membership guard applies to it.
+    #[tokio::test]
+    async fn an_upgrade_from_116_guards_the_membership_only_without_history() {
+        let dir = tempfile::tempdir().unwrap();
+        write_116_record(dir.path(), true);
+        let commands = [set_quota(1 << 20, 0, 2), publish(), quota_put(1)];
+        append_committed(dir.path(), 1, &commands);
+        let mut node = open_node(dir.path(), 3000, false).await;
+        assert_eq!(
+            node.quota.origin(),
+            Guards {
+                quota: true,
+                members: false
+            }
+        );
+        apply_committed(&mut node).await;
+        assert_eq!((node.quota.blocked(), node.state.revision), (None, 2));
+        assert!(node.state.members_row.is_some());
+
+        let dir = tempfile::tempdir().unwrap();
+        write_116_record(dir.path(), true);
+        drop(open_node(dir.path(), 3000, false).await);
+        append_committed(dir.path(), 1, &[publish()]);
+        let mut node = open_node(dir.path(), 3000, false).await;
+        assert_eq!(
+            node.quota.origin(),
+            Guards {
+                quota: true,
+                members: true
+            }
+        );
+        drive(&mut node).await;
+        assert_eq!((node.state.applied, node.quota.blocked()), (0, Some(1)));
+    }
+
+    /// An earlier binary stored the flags of the publishing member before this entry.
+    fn publish() -> RaftCommand {
+        RaftCommand::Cluster {
+            id: "publish-2".into(),
+            request: crate::cluster::Command::Publish {
+                id: 2,
+                client_urls: vec!["http://127.0.0.1:2382".into()],
+            },
+            credentials: Default::default(),
+        }
+    }
+
     /// Entries of an earlier binary: `first`, 39 Puts, and the seed at index 41.
     fn earlier_entries(first: RaftCommand) -> Vec<RaftCommand> {
         let mut entries = vec![first];
@@ -1169,11 +1447,12 @@ pub(super) mod tests {
     }
 
     /// A state that this binary created empty must not apply the entries of an earlier binary
-    /// under its own flag: a Put, a transaction with a Put, or a lease grant. It knows the
-    /// waiting entry at open, waits for a snapshot, and catches up after the install.
+    /// under its own flag: a Put, a transaction with a Put, or a lease grant. Nor may it store
+    /// its own membership before a cluster command. It knows the waiting entry at open, waits
+    /// for a snapshot, and catches up after the install.
     #[tokio::test]
     async fn a_new_member_waits_for_a_snapshot_before_entries_of_an_earlier_binary() {
-        for first in [quota_put(1), txn_put(1), lease_grant(1)] {
+        for first in [quota_put(1), txn_put(1), lease_grant(1), publish()] {
             let dir = tempfile::tempdir().unwrap();
             let entries = earlier_entries(first);
             let mut node = waiting_member(dir.path(), &entries, 32 << 20).await;
@@ -1261,6 +1540,40 @@ pub(super) mod tests {
         drive(&mut node).await;
         assert_eq!(node.raw.raft.state, StateRole::Leader);
         assert!(matches!(node.raw.raft.lead_transferee, Some(2 | 3)));
+    }
+
+    /// A member that waits on an earlier binary's membership entry and still wins hands
+    /// leadership over. It appends neither `SeedMembers` nor `SetQuota` in its term.
+    #[tokio::test]
+    async fn a_member_waiting_on_a_membership_entry_hands_over_without_seeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = waiting_member(dir.path(), &[publish()], 32 << 20).await;
+        drive(&mut node).await;
+        assert_eq!(node.quota.blocked(), Some(1));
+        node.raw.campaign().unwrap();
+        for kind in [
+            MessageType::MsgRequestPreVoteResponse,
+            MessageType::MsgRequestVoteResponse,
+        ] {
+            let term =
+                node.raw.raft.term + u64::from(kind == MessageType::MsgRequestPreVoteResponse);
+            let (tx, _) = oneshot::channel();
+            node.handle(Event::Step(message(kind, 2, term), tx), &mut vec![])
+                .await
+                .unwrap();
+        }
+        drive(&mut node).await;
+        node.tick().unwrap();
+        assert_eq!(node.raw.raft.state, StateRole::Leader);
+        assert!(matches!(node.raw.raft.lead_transferee, Some(2 | 3)));
+        let entries = node
+            .raw
+            .raft
+            .raft_log
+            .entries(2, u64::MAX, raft::GetEntriesContext::empty(false))
+            .unwrap();
+        assert!(!entries.is_empty());
+        assert!(entries.iter().all(|entry| entry.data.is_empty()));
     }
 
     /// The row keeps the index of a first cluster quota after an earlier binary. A restart
@@ -1446,6 +1759,100 @@ pub(super) mod tests {
         // The snapshot passes the guard.
         install_requested(&mut node, snapshot).await;
         assert_eq!(node.state.revision, revision);
+    }
+
+    /// The membership row of a seed with the default peers.
+    fn seed_members() -> RaftCommand {
+        let members = crate::cluster::Store::initial(&options(Path::new("")).peers);
+        RaftCommand::SeedMembers(crate::cluster::Seed {
+            id: "seed".into(),
+            origin: 2,
+            members: serde_json::to_string(&members).unwrap(),
+            digest: None,
+            applied: 0,
+        })
+    }
+
+    /// Persist `committed` from index 1, and `uncommitted` after it, on a member that started
+    /// empty.
+    fn persist_log(dir: &Path, committed: &[Entry], uncommitted: &[Entry]) {
+        let mut storage =
+            RaftStorage::open(&dir.join("raft"), 1, "worker-test", vec![1, 2, 3]).unwrap();
+        let log: Vec<_> = committed.iter().chain(uncommitted).cloned().collect();
+        let state = HardState {
+            term: 1,
+            vote: 1,
+            commit: committed.len() as u64,
+        };
+        storage.persist(&log, Some(&state), None).unwrap();
+    }
+
+    fn entry(index: u64, term: u64, command: Option<&RaftCommand>) -> Entry {
+        Entry {
+            index,
+            term,
+            data: command.map_or(vec![], |command| command.encode().unwrap()),
+            ..Default::default()
+        }
+    }
+
+    /// The rules of the quota guard also hold for an index of the membership guard. The log of
+    /// an earlier binary holds only membership entries. A new leader replaces only the uncommitted
+    /// entry 4 with its seed, and the guard at 1 stays until a snapshot passes it. A replacement
+    /// at the guard computes the gate again.
+    #[tokio::test]
+    async fn a_membership_guard_keeps_the_rules_of_the_quota_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(open_node(dir.path(), 3000, false).await);
+        let committed: Vec<_> = (1..=3)
+            .map(|index| entry(index, 1, Some(&publish())))
+            .collect();
+        persist_log(dir.path(), &committed, &[entry(4, 1, Some(&publish()))]);
+        let mut node = open_node(dir.path(), 3000, false).await;
+        assert_eq!(node.quota.blocked(), Some(1));
+        let mut append = message(MessageType::MsgAppend, 2, 2);
+        append.index = 3;
+        append.log_term = 1;
+        append.commit = 4;
+        append.entries.push(entry(4, 2, Some(&seed_members())));
+        node.step_peer(append).unwrap();
+        drive(&mut node).await;
+        assert_eq!((node.state.applied, node.quota.blocked()), (0, Some(1)));
+        let commands = [publish(), publish(), publish(), seed_members()];
+        let (snapshot, revision) = covering_snapshot(dir.path(), &commands).await;
+        install_requested(&mut node, snapshot).await;
+        assert_eq!(node.state.revision, revision);
+        assert!(node.state.members_row.is_some());
+
+        let dir = tempfile::tempdir().unwrap();
+        drop(open_node(dir.path(), 3000, false).await);
+        let committed: Vec<_> = (1..=3).map(|index| entry(index, 1, None)).collect();
+        persist_log(dir.path(), &committed, &[entry(4, 1, Some(&publish()))]);
+        let mut node = open_node(dir.path(), 3000, false).await;
+        assert_eq!(node.quota.blocked(), Some(4));
+        let mut append = message(MessageType::MsgAppend, 2, 2);
+        append.index = 3;
+        append.log_term = 1;
+        append.commit = 4;
+        append.entries.push(entry(4, 2, Some(&seed_members())));
+        node.step_peer(append).unwrap();
+        drive(&mut node).await;
+        assert_eq!((node.state.applied, node.quota.blocked()), (4, None));
+        assert!(node.state.members_row.is_some());
+    }
+
+    /// A member that waits on a membership entry before a backlog above its pending limit
+    /// starts as a learner, like a member that waits on a quota-checked entry.
+    #[tokio::test]
+    async fn a_member_waiting_on_a_membership_entry_skips_its_backlog_as_a_learner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut entries = vec![publish()];
+        entries.extend(large_entries(12, 1 << 20));
+        let node = waiting_member(dir.path(), &entries, 9 << 20).await;
+        assert_eq!(node.quota.blocked(), Some(1));
+        assert_eq!(node.state.applied, 0);
+        assert_eq!(node.raw.raft.raft_log.applied, 14);
+        assert!(!node.raw.raft.prs().conf().voters().contains(1));
     }
 
     /// A replacement at or before the guard computes the gate again.
