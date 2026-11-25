@@ -670,4 +670,139 @@ mod tests {
         flushed.close().await.unwrap();
         replayed.close().await.unwrap();
     }
+
+    /// Shared mode: open a member of a new cluster, which starts from an empty base. Then give
+    /// it `commands` as committed entries from index 2, after the empty entry of the leader, and
+    /// open it again with the pending log limit `pending`.
+    async fn open_new_shared_member(
+        dir: &std::path::Path,
+        commands: &[RaftCommand],
+        pending: usize,
+    ) -> Result<Node> {
+        let store = std::sync::Arc::new(slatedb::object_store::memory::InMemory::new());
+        let config = || {
+            let mut config = options(dir);
+            config.state_mode = crate::state::StateMode::Shared;
+            config.object_store = crate::object::Config::Test(store.clone(), "root".into());
+            config.client_peers.insert(2, "local-only:8888".into());
+            config.log_memory.pending_bytes = pending;
+            config
+        };
+        let open = |config| async move {
+            let (events, _) = mpsc::channel(256);
+            Node::open_with_transport(config, events, Some(BTreeMap::new())).await
+        };
+        drop(open(config()).await?);
+        let mut storage = RaftStorage::open(&dir.join("raft"), 1, "worker-test", vec![1, 2, 3])?;
+        let entries: Vec<_> = std::iter::once(Entry {
+            index: 1,
+            term: 1,
+            ..Default::default()
+        })
+        .chain((2..).zip(commands).map(|(index, command)| Entry {
+            index,
+            term: 1,
+            data: command.encode().unwrap(),
+            ..Default::default()
+        }))
+        .collect();
+        let hs = HardState {
+            term: 1,
+            vote: 2,
+            commit: entries.len() as u64,
+        };
+        storage.persist(&entries, Some(&hs), None)?;
+        drop(storage);
+        open(config()).await
+    }
+
+    /// Like `open_new_shared_member` with the default pending limit. Then drive apply.
+    async fn new_shared_member(dir: &std::path::Path, commands: &[RaftCommand]) -> Node {
+        let pending = LogMemory::default().pending_bytes;
+        let mut node = open_new_shared_member(dir, commands, pending)
+            .await
+            .unwrap();
+        assert!(node.quota.created_empty());
+        for _ in 0..5 {
+            node.drive_ready().await.unwrap();
+            node.drain_log().await.unwrap();
+            node.drain_apply().await.unwrap();
+        }
+        node
+    }
+
+    /// Shared mode never starts a waiting member as a learner that skips its backlog. A base
+    /// adoption would make it a voter again while Raft counts the skipped entries as applied.
+    /// A backlog above the pending limit stops the start with an error instead.
+    #[tokio::test]
+    async fn a_waiting_shared_member_does_not_skip_its_backlog() {
+        let publish = RaftCommand::Cluster {
+            id: "legacy-publish".into(),
+            request: C::Publish {
+                id: 1,
+                client_urls: vec!["http://leader:2379".into()],
+            },
+            credentials: Default::default(),
+        };
+        let large = |n: usize| {
+            let mut command = put(n);
+            if let RaftCommand::Etcd { etcd, .. } = &mut command {
+                if let Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(put)) =
+                    &mut etcd.request
+                {
+                    put.value = vec![1; 1 << 20];
+                }
+            }
+            command
+        };
+        let commands: Vec<_> = std::iter::once(publish).chain((0..12).map(large)).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let error = open_new_shared_member(dir.path(), &commands, 9 << 20)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("waiting shared member"),
+            "{error:#}"
+        );
+    }
+
+    /// Shared mode: a new member gets an earlier binary's `Publish` at index 2. It applies index
+    /// 1 and stops there, without storing its own membership. Its recovery by snapshot in an idle
+    /// cluster depends on #96: the leader cannot yet offer a base above its last batch.
+    #[tokio::test]
+    async fn a_new_shared_member_stops_at_an_earlier_binary_publish() {
+        let publish = RaftCommand::Cluster {
+            id: "legacy-publish".into(),
+            request: C::Publish {
+                id: 1,
+                client_urls: vec!["http://leader:2379".into()],
+            },
+            credentials: Default::default(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let node = new_shared_member(dir.path(), &[publish]).await;
+        assert_eq!(node.state.applied, 1);
+        assert!(node.state.members_row.is_none());
+        assert_eq!(node.quota_status()["blocked_index"], 2);
+    }
+
+    /// Shared mode guards only the membership. A new member applies the seed and then a Put. The
+    /// cluster claim sets the quota, so no `SetQuota` entry is needed.
+    #[tokio::test]
+    async fn a_new_shared_member_applies_a_put_after_the_seed() {
+        let peers = options(std::path::Path::new("")).peers;
+        let seed = RaftCommand::SeedMembers(crate::cluster::Seed {
+            id: "seed".into(),
+            origin: 2,
+            members: serde_json::to_string(&crate::cluster::Store::initial(&peers)).unwrap(),
+            digest: None,
+            applied: 1,
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let node = new_shared_member(dir.path(), &[seed, put(1)]).await;
+        assert_eq!((node.state.applied, node.state.revision), (3, 2));
+        assert!(node.state.members_row.is_some());
+        assert!(!node.quota_guarded());
+    }
 }

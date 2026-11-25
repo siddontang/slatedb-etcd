@@ -14,6 +14,10 @@
 //! leader is live, ignores leadership transfers, and hands over leadership if it wins. It still
 //! votes. A member also checkpoints through a first cluster quota that follows such entries, so
 //! the leader sends later members a snapshot. See `StateMachine::quota_boundary`.
+//!
+//! The same guard keeps such a state from an entry of an earlier binary before the first
+//! `SeedMembers` entry, in both state modes; see `state::cluster`. A local origin record in the
+//! data directory, kept in both modes, says whether this binary created the state empty.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -25,6 +29,16 @@ use crate::state::quota::ClusterQuota;
 
 /// The file of the local flag record in the data directory.
 const RECORD: &str = "quota-flag.json";
+
+/// The file of the local record of the start that created the data directory. Both state modes
+/// keep it. Raft, snapshots, and backups do not carry it.
+const ORIGIN: &str = "state-origin.json";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Origin {
+    /// This binary created the data directory empty. See `Guards`.
+    created_empty: bool,
+}
 
 /// An operator request of this member: a flag value and the wall-clock time of the start that
 /// saw it, in milliseconds.
@@ -41,8 +55,6 @@ struct Record {
     acknowledged: i64,
     /// A request that this member must propose.
     pending: Option<Request>,
-    /// This binary created the data directory empty. See `guard_quota`.
-    created_empty: bool,
 }
 
 /// The options of `Quota::open`.
@@ -169,6 +181,8 @@ pub(super) struct Quota {
     flag: i64,
     /// The record file and its content. `None` in shared mode, which never proposes.
     record: Option<(PathBuf, Record)>,
+    /// See `Origin`.
+    created_empty: bool,
     /// The index and term of the last `SetQuota` proposal of this member.
     proposed: Option<(u64, u64)>,
     /// The cluster quota that `observe_quota` last handled.
@@ -235,6 +249,7 @@ impl Quota {
             member: startup.member,
             flag: startup.flag,
             record: None,
+            created_empty: open_origin(dir, startup.empty)?,
             proposed: None,
             observed: None,
             gate: None,
@@ -272,7 +287,6 @@ impl Quota {
         let record = Record {
             acknowledged,
             pending,
-            created_empty: stored.map_or(startup.empty, |record| record.created_empty),
         };
         if stored != Some(record) {
             write_record(&path, &record)?;
@@ -287,9 +301,7 @@ impl Quota {
 
     /// This binary created the data directory empty.
     pub(super) fn created_empty(&self) -> bool {
-        self.record
-            .as_ref()
-            .is_some_and(|(_, record)| record.created_empty)
+        self.created_empty
     }
 
     /// The quota-checked entry that waits for a snapshot, if any.
@@ -328,7 +340,6 @@ impl Quota {
             *record = Record {
                 acknowledged: self.flag,
                 pending: None,
-                created_empty: record.created_empty,
             };
             write_record(path, record)?;
         }
@@ -375,8 +386,26 @@ pub(super) fn without_vote(
     conf
 }
 
+/// Read the origin record of `dir`. The first start writes it: `empty` is true when this start
+/// found an empty Raft log and an empty state.
+fn open_origin(dir: &Path, empty: bool) -> Result<bool> {
+    let path = dir.join(ORIGIN);
+    let origin = match std::fs::read(&path) {
+        Ok(data) => serde_json::from_slice::<Origin>(&data).context("invalid origin record")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let origin = Origin {
+                created_empty: empty,
+            };
+            write_record(&path, &origin)?;
+            origin
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(origin.created_empty)
+}
+
 /// Replace the record file atomically.
-fn write_record(path: &Path, record: &Record) -> Result<()> {
+fn write_record(path: &Path, record: &impl Serialize) -> Result<()> {
     let dir = path.parent().context("quota record has no directory")?;
     let temporary = path.with_extension("json.pending");
     let mut file = std::fs::File::create(&temporary)?;
@@ -558,7 +587,8 @@ impl Node {
 
     /// Ask the leader for a snapshot that replaces the entries before the cluster quota. Raft
     /// drops the request on a leader, without a leader, or with a request in flight. The next
-    /// tick asks again.
+    /// tick asks again. In shared mode an idle leader cannot yet offer a base above its last
+    /// batch, so the recovery of an idle cluster depends on #96.
     fn request_quota_snapshot(&mut self) {
         if self.quota.blocked() == Some(self.state.applied + 1) {
             let _ = self.raw.request_snapshot();
@@ -784,15 +814,14 @@ pub(super) mod tests {
         // Back to the acknowledged value: nothing is pending.
         assert_eq!(open(100, 70, false, false).pending(), request(100, 70));
         assert_eq!(open(300, 80, false, false).pending(), None);
-        // Shared mode keeps no record.
+        // Shared mode keeps no flag record. It keeps the origin record.
         let shared = tempfile::tempdir().unwrap();
         let mut startup = startup(1, 1, true, false);
         startup.shared = true;
-        assert!(Quota::open(shared.path(), startup)
-            .unwrap()
-            .record
-            .is_none());
+        let quota = Quota::open(shared.path(), startup).unwrap();
+        assert!(quota.record.is_none() && quota.created_empty());
         assert!(!shared.path().join(RECORD).exists());
+        assert!(shared.path().join(ORIGIN).exists());
     }
 
     fn quota_put(n: u64) -> RaftCommand {
@@ -1230,6 +1259,30 @@ pub(super) mod tests {
         apply_committed(node).await;
         assert_eq!(node.state.applied, index);
         assert_eq!(node.quota.blocked(), None);
+    }
+
+    /// The first start with this binary records whether the Raft log was empty and nothing had
+    /// applied. An upgraded member that never flushed still has its log, so it is not new.
+    #[tokio::test]
+    async fn only_a_start_with_an_empty_log_and_state_creates_the_state_empty() {
+        let upgraded = tempfile::tempdir().unwrap();
+        append_committed(upgraded.path(), 1, &[publish(), quota_put(1)]);
+        let node = open_node(upgraded.path(), 3000, false).await;
+        assert_eq!(node.state.applied, 0);
+        assert!(!node.quota.created_empty());
+        drop(node);
+        assert!(!open_node(upgraded.path(), 3000, false)
+            .await
+            .quota
+            .created_empty());
+        let fresh = tempfile::tempdir().unwrap();
+        drop(open_node(fresh.path(), 3000, false).await);
+        // Later entries do not change the record of the first start.
+        append_committed(fresh.path(), 1, &[publish()]);
+        assert!(open_node(fresh.path(), 3000, false)
+            .await
+            .quota
+            .created_empty());
     }
 
     /// An earlier binary stored the flags of the publishing member before this entry.

@@ -496,6 +496,16 @@ impl Node {
                     if error.is::<cache::PendingQuota>()
                         && quota.blocked() == Some(state.applied + 1) =>
                 {
+                    // Shared mode does not take this start. An in-process base adoption would
+                    // make the member a voter again while Raft counts the skipped entries above
+                    // the base as applied. A shared member truncates its log at each checkpoint,
+                    // so such a backlog needs a log of an earlier binary that the leader never
+                    // truncated.
+                    ensure!(
+                        !state.is_shared(),
+                        "a waiting shared member cannot skip a log backlog above the pending log \
+                         memory; raise the pending log memory for this start"
+                    );
                     raft_applied = storage.commit_index();
                     tracing::warn!(
                         applied = state.applied,
