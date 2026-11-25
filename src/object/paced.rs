@@ -10,9 +10,13 @@
 //! compactions run concurrently. Pacing each writer alone still left dozens of windows in
 //! writeback at once. The block layer's writeback throttling then blocked SST writers and the
 //! Raft log thread alike, and every Raft `fdatasync` waited behind SST pages. So all SST writers
-//! in the process share one [`Lane`] of `MAX_WINDOWS` windows. Compaction output holds at most
-//! `MAX_COMPACTION_WINDOWS` of them and yields to waiting memtable flushes, which writers wait
-//! on when memory fills up.
+//! in the process share one [`Lane`] of `MAX_WINDOWS` windows. Compaction output yields to
+//! waiting flushes, which writers wait on when memory fills up. Its share is an admission rule:
+//! while a memtable flush runs, a compaction window is granted only while compaction holds
+//! fewer than `MAX_COMPACTION_WINDOWS`, and with no flush running, fewer than
+//! `MAX_IDLE_COMPACTION_WINDOWS`. Windows already held are not taken back when a flush starts;
+//! each is released after one `PACE_BYTES` window of writeback. SlateDB stops L0 flushes when
+//! L0 is full, and only compaction frees L0 then.
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -38,11 +42,24 @@ const MAX_WINDOWS: usize = 4;
 /// the rest; with two, flush fell behind under 4 KiB-value writes and immutable memtables piled
 /// up in memory.
 const MAX_COMPACTION_WINDOWS: usize = 1;
+/// Windows compaction output may hold while no memtable flush runs.
+///
+/// A full L0 stops every flush until compaction frees L0. With one window, compaction wrote
+/// about 20-40 MB/s after a bulk load. Immutable memtables then filled `max_unflushed_bytes`,
+/// and SlateDB held the apply pipeline for seconds. One window stays free, so the first window
+/// a flush asks for on an idle lane comes without a wait. Further concurrent windows of that
+/// flush may wait for compaction windows to finish their writeback.
+const MAX_IDLE_COMPACTION_WINDOWS: usize = MAX_WINDOWS - 1;
+const _: () = assert!(
+    MAX_COMPACTION_WINDOWS < MAX_IDLE_COMPACTION_WINDOWS
+        && MAX_IDLE_COMPACTION_WINDOWS < MAX_WINDOWS
+);
 
 #[derive(Debug)]
 pub(crate) struct PacedStore {
     inner: Arc<LocalFileSystem>,
     reads: Arc<SstReads>,
+    lane: &'static Lane,
 }
 
 impl PacedStore {
@@ -51,6 +68,16 @@ impl PacedStore {
         Self {
             inner: Arc::new(inner),
             reads: Arc::default(),
+            lane: &LANE,
+        }
+    }
+
+    /// A store that writes SSTs through its own lane, so a test can watch the lane alone.
+    #[cfg(test)]
+    fn with_lane(inner: LocalFileSystem, lane: &'static Lane) -> Self {
+        Self {
+            lane,
+            ..Self::new(inner)
         }
     }
 
@@ -156,16 +183,19 @@ impl Writer {
 /// Process-wide budget of SST windows in writeback.
 ///
 /// A writer holds at most one window at a time, so waiting for one never blocks a holder.
+#[derive(Debug)]
 struct Lane {
     state: Mutex<LaneState>,
     freed: Condvar,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct LaneState {
     used: usize,
     compaction: usize,
     flush_waiting: usize,
+    /// Memtable flush SSTs that are being written.
+    flushes: usize,
     #[cfg(test)]
     max_used: usize,
     #[cfg(test)]
@@ -181,6 +211,7 @@ impl Lane {
                 used: 0,
                 compaction: 0,
                 flush_waiting: 0,
+                flushes: 0,
                 #[cfg(test)]
                 max_used: 0,
                 #[cfg(test)]
@@ -202,7 +233,7 @@ impl Lane {
             }
             Writer::Compaction => {
                 while st.used >= MAX_WINDOWS
-                    || st.compaction >= MAX_COMPACTION_WINDOWS
+                    || st.compaction >= st.compaction_windows()
                     || st.flush_waiting > 0
                 {
                     st = self.freed.wait(st).unwrap_or_else(|e| e.into_inner());
@@ -217,6 +248,76 @@ impl Lane {
             st.max_compaction = st.max_compaction.max(st.compaction);
         }
         Window { lane: self, writer }
+    }
+
+    /// [`Lane::acquire`] that gives up after `timeout`, so a test cannot hang on a wrong policy.
+    #[cfg(test)]
+    fn try_acquire(&self, writer: Writer, timeout: std::time::Duration) -> Option<Window<'_>> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut st = self.state.lock().unwrap();
+        loop {
+            let admitted = match writer {
+                Writer::Flush => st.used < MAX_WINDOWS,
+                Writer::Compaction => {
+                    st.used < MAX_WINDOWS
+                        && st.compaction < st.compaction_windows()
+                        && st.flush_waiting == 0
+                }
+            };
+            if admitted {
+                drop(st);
+                return Some(self.acquire(writer));
+            }
+            let left = deadline.checked_duration_since(std::time::Instant::now())?;
+            st = self.freed.wait_timeout(st, left).unwrap().0;
+        }
+    }
+
+    /// Mark one SST of `writer` as being written until the guard drops.
+    fn start(&self, writer: Writer) -> Active<'_> {
+        if writer == Writer::Flush {
+            self.state.lock().unwrap_or_else(|e| e.into_inner()).flushes += 1;
+        }
+        Active { lane: self, writer }
+    }
+}
+
+impl LaneState {
+    fn compaction_windows(&self) -> usize {
+        if self.flushes > 0 {
+            MAX_COMPACTION_WINDOWS
+        } else {
+            MAX_IDLE_COMPACTION_WINDOWS
+        }
+    }
+}
+
+/// One SST that is being written. A flush lowers the compaction share until it drops.
+struct Active<'a> {
+    lane: &'a Lane,
+    writer: Writer,
+}
+
+impl fmt::Debug for Active<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Active")
+            .field("writer", &self.writer)
+            .finish()
+    }
+}
+
+impl Drop for Active<'_> {
+    fn drop(&mut self) {
+        if self.writer != Writer::Flush {
+            return;
+        }
+        self.lane
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .flushes -= 1;
+        // A waiting compaction may now take a larger share.
+        self.lane.freed.notify_all();
     }
 }
 
@@ -247,6 +348,7 @@ fn write_paced(
     mut offset: u64,
     data: &PutPayload,
     path: &FsPath,
+    lane: &Lane,
     writer: Writer,
 ) -> Result<()> {
     let mut previous: Option<(u64, u64, Window<'_>)> = None;
@@ -271,7 +373,7 @@ fn write_paced(
             file.write_all_at(&chunk[..len], offset)
                 .map_err(|e| io_error(e, path))?;
             wait(&mut previous)?;
-            let window = LANE.acquire(writer);
+            let window = lane.acquire(writer);
             sync_range(file, offset, len as u64, libc::SYNC_FILE_RANGE_WRITE)
                 .map_err(|e| io_error(e, path))?;
             previous = Some((offset, len as u64, window));
@@ -375,9 +477,12 @@ impl PacedStore {
         }
         let dest = self.inner.path_to_filesystem(location)?;
         let writer = Writer::of(&opts.extensions);
+        let lane = self.lane;
+        let active = lane.start(writer);
         tokio::task::spawn_blocking(move || {
+            let _active = active;
             let (file, staged) = stage(&dest)?;
-            let result = write_paced(&file, 0, &payload, &staged, writer)
+            let result = write_paced(&file, 0, &payload, &staged, lane, writer)
                 .and_then(|_| publish(file, &staged, &dest));
             if result.is_err() {
                 let _ = std::fs::remove_file(&staged);
@@ -406,6 +511,8 @@ impl PacedStore {
                 .map_err(join_error)??
         };
         Ok(Box::new(PacedUpload {
+            active: Some(Arc::new(self.lane.start(writer))),
+            lane: self.lane,
             store: self.inner.clone(),
             reads: self.reads.clone(),
             location: location.clone(),
@@ -420,6 +527,10 @@ impl PacedStore {
 
 #[derive(Debug)]
 struct PacedUpload {
+    /// Held until the upload completes, aborts, or drops, and by each part until its blocking
+    /// write exits. A cancelled part's write keeps running after its task is gone.
+    active: Option<Arc<Active<'static>>>,
+    lane: &'static Lane,
     store: Arc<LocalFileSystem>,
     reads: Arc<SstReads>,
     location: Path,
@@ -451,12 +562,16 @@ impl MultipartUpload for PacedUpload {
         self.offset += data.content_length() as u64;
         let file = self.file();
         let staged = self.staged.clone();
-        let writer = self.writer;
+        let (lane, writer) = (self.lane, self.writer);
+        let active = self.active.clone();
         Box::pin(async move {
             let file = file?;
-            tokio::task::spawn_blocking(move || write_paced(&file, offset, &data, &staged, writer))
-                .await
-                .map_err(join_error)?
+            tokio::task::spawn_blocking(move || {
+                let _active = active;
+                write_paced(&file, offset, &data, &staged, lane, writer)
+            })
+            .await
+            .map_err(join_error)?
         })
     }
 
@@ -475,6 +590,7 @@ impl MultipartUpload for PacedUpload {
             .await
             .map_err(join_error)
             .and_then(|r| r);
+        self.active = None;
         self.reads.evict(&self.location);
         published?;
         let meta = self.store.head(&self.location).await?;
@@ -487,6 +603,7 @@ impl MultipartUpload for PacedUpload {
 
     async fn abort(&mut self) -> Result<()> {
         self.file.lock().unwrap().take();
+        self.active = None;
         let staged = self.staged.clone();
         tokio::task::spawn_blocking(move || match std::fs::remove_file(&staged) {
             Ok(()) => Ok(()),
@@ -591,6 +708,56 @@ mod tests {
             .filter(|name| name.contains('#'))
             .collect();
         assert!(staged.is_empty(), "{staged:?}");
+    }
+
+    /// A part keeps its flush marked as running until its blocking write exits, even after its
+    /// task is cancelled and the upload aborted. Otherwise compaction could take the window
+    /// that a new flush needs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_flush_part_keeps_the_flush_active_until_it_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let lane: &'static Lane = Box::leak(Box::new(Lane::new()));
+        let store =
+            PacedStore::with_lane(LocalFileSystem::new_with_prefix(dir.path()).unwrap(), lane);
+        // Every window is taken, so the part waits in the lane.
+        let held: Vec<_> = (0..MAX_WINDOWS)
+            .map(|_| lane.acquire(Writer::Flush))
+            .collect();
+        let path = Path::from("state/compacted/f.sst");
+        let mut upload = store.put_multipart(&path).await.unwrap();
+        let part = tokio::spawn(upload.put_part(vec![7; 10 << 20].into()));
+        let started = std::time::Instant::now();
+        while lane.state.lock().unwrap().flush_waiting == 0 {
+            assert!(
+                started.elapsed().as_secs() < 30,
+                "part never reached the lane"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        part.abort();
+        assert!(part.await.unwrap_err().is_cancelled());
+        upload.abort().await.unwrap();
+        drop(upload);
+        // The detached write still runs, so the flush still counts.
+        assert_eq!(lane.state.lock().unwrap().flushes, 1);
+        assert_eq!(
+            lane.state.lock().unwrap().compaction_windows(),
+            MAX_COMPACTION_WINDOWS
+        );
+
+        drop(held);
+        let started = std::time::Instant::now();
+        loop {
+            let counts = {
+                let st = lane.state.lock().unwrap();
+                (st.used, st.flush_waiting, st.flushes)
+            };
+            if counts == (0, 0, 0) {
+                break;
+            }
+            assert!(started.elapsed().as_secs() < 30, "the part never finished");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
     }
 
     /// Cached SST descriptors serve the bytes the path holds now, through overwrites, renames,
@@ -700,7 +867,8 @@ mod tests {
         use std::time::Duration;
 
         let lane = Lane::new();
-        // Compaction alone gets only its share.
+        // While a flush runs, compaction gets only its share.
+        let flush = lane.start(Writer::Flush);
         let mut compactions: Vec<_> = (0..MAX_COMPACTION_WINDOWS)
             .map(|_| lane.acquire(Writer::Compaction))
             .collect();
@@ -757,12 +925,17 @@ mod tests {
             release.store(1, Ordering::SeqCst);
             drop((compactions, flushes));
         });
+        drop(flush);
         let st = lane.state.lock().unwrap();
-        assert_eq!((st.used, st.compaction, st.flush_waiting), (0, 0, 0));
+        assert_eq!(
+            (st.used, st.compaction, st.flush_waiting, st.flushes),
+            (0, 0, 0, 0)
+        );
         drop(st);
 
         // Many writers of both kinds never exceed the caps and all finish.
         let lane = Lane::new();
+        let flush = lane.start(Writer::Flush);
         std::thread::scope(|s| {
             for i in 0..16 {
                 let writer = if i % 2 == 0 {
@@ -779,6 +952,7 @@ mod tests {
                 });
             }
         });
+        drop(flush);
         let st = lane.state.lock().unwrap();
         assert_eq!((st.used, st.compaction, st.flush_waiting), (0, 0, 0));
         assert!(st.max_used <= MAX_WINDOWS, "{}", st.max_used);
@@ -787,6 +961,63 @@ mod tests {
             "{}",
             st.max_compaction
         );
+    }
+
+    /// A full L0 stops every flush. Compaction then gets a larger share, and a flush that starts
+    /// still gets a window without a wait.
+    #[test]
+    fn compaction_takes_the_idle_lane_and_a_new_flush_gets_a_window() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let lane = Lane::new();
+        let mut compactions: Vec<_> = (0..MAX_IDLE_COMPACTION_WINDOWS)
+            .map(|_| {
+                lane.try_acquire(Writer::Compaction, Duration::from_secs(30))
+                    .expect("idle compaction share")
+            })
+            .collect();
+        // Even with no flush running, compaction leaves one window free.
+        assert!(lane
+            .try_acquire(Writer::Compaction, Duration::from_millis(50))
+            .is_none());
+        let flush = lane.start(Writer::Flush);
+        // The flush gets the free window at once.
+        let window = lane
+            .try_acquire(Writer::Flush, Duration::from_millis(50))
+            .expect("the reserved window");
+        let extra_compaction = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _w = lane.acquire(Writer::Compaction);
+                extra_compaction.store(1, Ordering::SeqCst);
+            });
+            // Released compaction windows do not go back to compaction while the flush runs.
+            while compactions.len() > MAX_COMPACTION_WINDOWS {
+                drop(compactions.pop());
+            }
+            drop(window);
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(
+                extra_compaction.load(Ordering::SeqCst),
+                0,
+                "compaction exceeded its share during a flush"
+            );
+            // When the flush ends, the waiting compaction gets the idle share.
+            drop(flush);
+            let started = std::time::Instant::now();
+            while extra_compaction.load(Ordering::SeqCst) == 0 {
+                assert!(started.elapsed().as_secs() < 30, "compaction never resumed");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        drop(compactions);
+        let st = lane.state.lock().unwrap();
+        assert_eq!(
+            (st.used, st.compaction, st.flush_waiting, st.flushes),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(st.max_compaction, MAX_IDLE_COMPACTION_WINDOWS);
     }
 
     #[test]
