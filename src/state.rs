@@ -129,6 +129,8 @@ pub struct StateMachine {
     pub(crate) members_row: Option<cluster::MembersRow>,
     /// The leader of the last `SeedMembers` entry whose row digest differed from this row.
     pub(crate) members_mismatch: Option<u64>,
+    /// The term and index of the last `SeedMembers` entry that compared the row.
+    pub(crate) members_checked: Option<(u64, u64)>,
     /// The state that apply reads: the live database, or the shared-mode overlay and base.
     reads: StateView,
     /// The overlay and base of shared state mode. `None` in replicated mode.
@@ -479,6 +481,7 @@ impl StateMachine {
             members_counted: None,
             members_row,
             members_mismatch: None,
+            members_checked: None,
             reads,
             shared,
         })

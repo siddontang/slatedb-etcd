@@ -128,9 +128,10 @@ The `etcd/members` row is cluster state, and the quota counts its bytes.
   first leader stores its own membership before the first client write. Joining members and
   restores take the row from the cluster.
 - A member whose flags differ from the stored row logs a warning at startup. The row applies.
-- Each leader proposes a digest of its row when it starts its term. A member whose row differs
-  logs a warning and sets the `slatedb_etcd_members_mismatch` gauge. The `members_row` field of
-  `/status` shows the digest and the last index that can have changed the row.
+- Each leader proposes a digest of its row when it starts its term, and again after the first
+  entry of its term applies. A member whose row differs logs a warning and sets the
+  `slatedb_etcd_members_mismatch` gauge. The `members_row` field of `/status` shows the digest,
+  the last index that can have changed the row, and the term and index of the last comparison.
 - An earlier binary stored the flags of each member. Members with other URL text then hold other
   rows. Repair such a member as for a quota difference above.
 - A new member does not apply an earlier binary's entries before the first seed. It asks the

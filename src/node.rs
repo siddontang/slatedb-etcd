@@ -319,8 +319,13 @@ pub struct Node {
     hold_compact_steps: bool,
     /// The quota flag of this member and its `SetQuota` proposals.
     quota: quota::Quota,
-    /// The last term in which this member proposed `SeedMembers`.
-    members_proposed: u64,
+    /// The term and index of the first `SeedMembers` proposal of this member in its last term.
+    members_proposed: Option<(u64, u64)>,
+    /// The last term in which this member proposed its digest again. See `propose_members`.
+    members_rechecked: u64,
+    /// Simulation: the member proposes no `SeedMembers`, like an earlier binary.
+    #[cfg(test)]
+    pub(super) hold_members: bool,
     /// The node compared the flags with the stored membership row.
     members_observed: bool,
 }
@@ -713,7 +718,10 @@ impl Node {
             renewals: lease::Renewals::default(),
             writer,
             quota,
-            members_proposed: 0,
+            members_proposed: None,
+            members_rechecked: 0,
+            #[cfg(test)]
+            hold_members: false,
             members_observed: false,
         };
         node.sync_members();

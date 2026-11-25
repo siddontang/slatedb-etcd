@@ -4,14 +4,34 @@ use crate::mvcc::{KvError, Outcome};
 use tonic::Code;
 
 impl Node {
-    /// Propose `SeedMembers` once in each term of this leader. It seeds a state without the
-    /// membership row. Otherwise it lets every member compare its row with the row of this leader.
+    /// Propose `SeedMembers` at the start of each term of this leader. It seeds a state without
+    /// the membership row. Otherwise it lets every member compare its row with the row of this
+    /// leader.
+    ///
+    /// A member compares only when its row did not change after the applied index of the
+    /// leader. After a restart, a member knows only that its row changed at or before its index
+    /// at the start. That index is at most the last entry of an earlier term. A new leader with a
+    /// row that has not applied that entry yet proposes its digest once more after the first
+    /// seed of its term applies.
     pub(super) fn propose_members(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if self.hold_members {
+            return Ok(());
+        }
         let term = self.raw.raft.term;
-        if self.raw.raft.state != StateRole::Leader || self.members_proposed == term {
+        if self.raw.raft.state != StateRole::Leader || self.members_rechecked == term {
             return Ok(());
         }
         let row = self.state.members_row.as_ref();
+        let recheck = match self.members_proposed {
+            Some((proposed, index)) if proposed == term => {
+                if self.state.applied < index || row.is_none() {
+                    return Ok(());
+                }
+                true
+            }
+            _ => false,
+        };
         // A joining member has no bootstrap membership. It gets the row from the cluster.
         if row.is_none() && (self.options.join || self.state.members.members.is_empty()) {
             return Ok(());
@@ -26,8 +46,15 @@ impl Node {
         .encode()?;
         // Like `SetQuota`, the small entry skips the memory admission check. Raft drops it only
         // during a leadership transfer, with every other proposal. The next call tries again.
+        // The entries of this term start at the empty entry of the leader. A seed without a
+        // digest stores the row of this leader, so it needs no second comparison.
+        let covered =
+            row.is_none() || self.state.applied + 1 >= self.raw.raft.raft_log.last_index();
         if self.raw.propose(vec![], data).is_ok() {
-            self.members_proposed = term;
+            if recheck || covered {
+                self.members_rechecked = term;
+            }
+            self.members_proposed = Some((term, self.raw.raft.raft_log.last_index()));
         }
         Ok(())
     }
@@ -61,6 +88,10 @@ impl Node {
             "digest": row.map(|row| row.digest.clone()),
             "written": row.map(|row| row.written),
             "mismatch_leader": self.state.members_mismatch,
+            "checked": self.state.members_checked.map(|(term, index)| json!({
+                "term": term,
+                "index": index,
+            })),
         })
     }
 

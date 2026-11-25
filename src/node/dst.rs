@@ -81,6 +81,8 @@ struct Simulation {
     quotas: BTreeMap<u64, i64>,
     /// Started members are directories of an earlier binary that propose no `SetQuota`.
     upgraded: bool,
+    /// Started members propose no `SeedMembers`, like an earlier binary.
+    hold_members: bool,
 }
 
 impl Drop for Simulation {
@@ -129,6 +131,19 @@ impl Simulation {
         quotas: BTreeMap<u64, i64>,
         reference: bool,
         upgraded: bool,
+    ) -> Self {
+        Self::with_holds(seed, shared, quotas, reference, upgraded, false).await
+    }
+
+    /// Like `with_options`. `hold_members` also starts the members without `SeedMembers`, so
+    /// each one stores its own flags, like an earlier binary.
+    async fn with_holds(
+        seed: u64,
+        shared: bool,
+        quotas: BTreeMap<u64, i64>,
+        reference: bool,
+        upgraded: bool,
+        hold_members: bool,
     ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let reference = if reference {
@@ -180,6 +195,7 @@ impl Simulation {
             view_checks: 0,
             quotas,
             upgraded,
+            hold_members,
         };
         for id in 1..=3 {
             sim.start(id).await;
@@ -287,6 +303,7 @@ impl Simulation {
         .await
         .unwrap();
         node.quota.hold = self.upgraded;
+        node.hold_members = self.hold_members;
         self.nodes.insert(id, node);
         self.trace.push(format!("start {id}"));
     }
@@ -2401,6 +2418,68 @@ async fn a_waiting_member_with_the_only_latest_log_lets_the_group_progress() {
     sim.write(1).await;
     sim.settle(5).await;
     assert!(sim.acknowledged.len() > acknowledged);
+}
+
+/// Members of an earlier binary stored their own flags, so their rows differ. They flushed at
+/// different indexes. After a full restart, the member with the lowest applied index leads. Its
+/// first seed is behind the indexes of the other members, so they skip that check. Its second
+/// seed follows the seed of its term, so every member with another row reports it.
+#[tokio::test]
+async fn every_member_with_another_row_reports_it_after_a_full_restart() {
+    let mut sim = Simulation::with_holds(13, false, BTreeMap::new(), false, true, true).await;
+    sim.settle(3).await;
+    assert_eq!(sim.leader(), Some(1));
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    let mut flushed = vec![];
+    for id in 1..=3 {
+        sim.write(3).await;
+        let node = sim.nodes.get_mut(&id).unwrap();
+        node.worker.state_mut().db().flush().await.unwrap();
+        flushed.push(node.state.applied);
+    }
+    assert!(
+        flushed[0] < flushed[1] && flushed[1] < flushed[2],
+        "{flushed:?}"
+    );
+    let digests: BTreeSet<_> = sim
+        .nodes
+        .values()
+        .map(|node| node.state.members_row.clone().unwrap().digest)
+        .collect();
+    assert_eq!(digests.len(), 3);
+    for id in 1..=3 {
+        sim.stop(id);
+    }
+    sim.hold_members = false;
+    // Member 1 leads before it replays its log.
+    sim.paused_apply = Some(1);
+    for id in 1..=3 {
+        sim.start(id).await;
+    }
+    sim.nodes.get_mut(&1).unwrap().raw.campaign().unwrap();
+    sim.settle(2).await;
+    assert_eq!(sim.leader(), Some(1));
+    assert_eq!(sim.nodes[&1].state.applied, flushed[0]);
+    for id in [2, 3] {
+        let state = &sim.nodes[&id].state;
+        assert_eq!(
+            (state.members_checked, state.members_mismatch),
+            (None, None)
+        );
+    }
+    sim.paused_apply = None;
+    sim.settle(3).await;
+    let term = sim.nodes[&1].raw.raft.term;
+    for (&id, node) in &sim.nodes {
+        let expected = (id != 1).then_some(1);
+        assert_eq!(node.state.members_mismatch, expected, "member {id}");
+        assert_eq!(node.state.members_checked.unwrap().0, term, "member {id}");
+        assert_eq!(
+            node.members_status()["checked"]["term"],
+            term,
+            "member {id}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -143,6 +143,7 @@ impl StateMachine {
             Some(row) => {
                 // A row that changed after `applied` can differ from the row of the leader.
                 if let Some(digest) = digest.as_deref().filter(|_| row.written <= applied) {
+                    self.members_checked = Some((self.entry_term, index));
                     if row.digest == digest {
                         self.members_mismatch = None;
                     } else {

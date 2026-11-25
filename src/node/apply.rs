@@ -41,6 +41,8 @@ pub(super) struct AppliedState {
     pub members_row: Option<crate::state::cluster::MembersRow>,
     /// The leader whose row differed from this row at the last check.
     pub members_mismatch: Option<u64>,
+    /// The term and index of the last `SeedMembers` entry that compared the row.
+    pub members_checked: Option<(u64, u64)>,
 }
 
 impl std::ops::Deref for AppliedState {
@@ -71,6 +73,7 @@ impl AppliedState {
             quota_boundary: state.quota_boundary,
             members_row: state.members_row.clone(),
             members_mismatch: state.members_mismatch,
+            members_checked: state.members_checked,
         })
     }
 }
