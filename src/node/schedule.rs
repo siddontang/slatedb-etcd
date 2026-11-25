@@ -49,7 +49,11 @@ impl Node {
 
     /// The checkpoint to start once `applied` entries have been applied, if one is due.
     /// `Some(true)` builds a complete image; `Some(false)` only flushes state and truncates.
-    fn checkpoint_due(&self, applied: u64) -> Option<bool> {
+    pub(super) fn checkpoint_due(&self, applied: u64) -> Option<bool> {
+        // No checkpoint below the record can replace it. `certify_base` raises the base first.
+        if self.base_below_record() {
+            return None;
+        }
         // Shared mode records its base `F`. The log stays above the base, so the record needs
         // no flush, and any member can send it.
         let applied = self.checkpointable(applied);
@@ -133,6 +137,30 @@ impl Node {
         Ok(())
     }
 
+    /// Keep the election timer past the leader lease, so the member still votes, but below the
+    /// largest randomized timeout, so it does not campaign. See `tick_raft`.
+    pub(super) fn hold_campaign(&mut self) {
+        let raft = &mut self.raw.raft;
+        let timeout = 2 * raft.election_timeout() - 1;
+        raft.set_randomized_election_timeout(timeout);
+        raft.election_elapsed = raft.election_elapsed.min(timeout - 2);
+    }
+
+    /// Return true from the time Raft accepts a snapshot until apply installs it: while Raft
+    /// holds it as unstable, while the log cache stages it, and while it waits for apply. The
+    /// log cache moves its first index at staging, and Raft drops its unstable snapshot before
+    /// the write ends, so each step needs its own index.
+    pub(super) fn installing(&self) -> bool {
+        let store = self.raw.store();
+        let unstable = self.raw.raft.raft_log.unstable.snapshot.as_ref();
+        let accepted = unstable.map_or(0, |snapshot| snapshot.get_metadata().index);
+        let stored = store.staged_snapshot_index().max(store.snapshot_index());
+        // Raft scans from its own applied index. `complete_apply` keeps that index at or above
+        // `state.applied`, also for a waiting member that starts with Raft ahead. So Raft's
+        // index is below a snapshot only when this one is, and the guard holds then.
+        accepted.max(stored) > self.state.applied
+    }
+
     pub(super) fn schedule_apply(&mut self) -> Result<()> {
         if self.apply_busy {
             return self.pipeline_apply();
@@ -151,9 +179,16 @@ impl Node {
                 snapshot_index,
             );
         }
+        if self.take_raise() {
+            let record = self.raw.store().recovery_snapshot().clone();
+            return self.submit_apply(Job::RaiseBase(record), self.state.applied);
+        }
         // A switch frees overlay memory, so it goes before other work.
         if self.prepared_puts.is_none() && self.take_switch() {
             return self.submit_apply(Job::SwitchBase, self.state.applied);
+        }
+        if self.prepared_puts.is_none() && self.take_mark_row() {
+            return self.submit_apply(Job::MarkRow, self.state.applied);
         }
         if let Some((base, term)) = self.adoptable() {
             let index = base.applied;
@@ -253,6 +288,7 @@ impl Node {
             self.raw.advance_apply_to(self.state.applied);
         }
         self.raw.mut_store().applied_to(self.state.applied);
+        self.note_base();
         if membership_changed {
             self.sync_members();
             // Each checkpoint must hold the membership that Raft uses.

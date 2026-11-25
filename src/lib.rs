@@ -130,6 +130,10 @@ pub enum RaftCommand {
     ViewCheckpoint {
         id: String,
         checkpoint: String,
+        /// The index through which the checkpoint holds the whole state: no entry after its row
+        /// changed state. An entry of an earlier binary has no value, and zero means the row.
+        #[serde(default)]
+        covers: u64,
     },
     /// A replicated-mode leader sets the logical quota of the cluster. A non-positive `bytes`
     /// disables the check. A `seed` entry applies only when the state has no cluster quota.

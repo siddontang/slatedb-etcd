@@ -130,18 +130,35 @@ fn newest(versions: &Versions, seq: u64) -> Option<Option<Bytes>> {
         .map(|(_, value)| value.clone())
 }
 
+/// The apply position of an overlay.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Position {
+    /// The sequence of the newest batch. Before any batch it is the base index.
+    pub pushed: u64,
+    /// The applied index through which the stored batches are the whole state. Entries after
+    /// the newest batch that change no state advance it. It equals `applied` after each entry.
+    pub covered: u64,
+}
+
 /// Whole batches in sequence order for the materializer.
 pub(crate) struct Queue {
     batches: Mutex<VecDeque<(u64, Arc<WriteBatch>)>>,
-    /// The sequence of the newest batch that apply added.
-    pushed: tokio::sync::watch::Sender<u64>,
+    /// One channel sends both values, so a reader gets them from the same applied state.
+    position: tokio::sync::watch::Sender<Position>,
+    /// The base index of the last release. The base holds every batch at or below it.
+    released: AtomicU64,
 }
 
 impl Queue {
     fn new(base: u64) -> Self {
         Self {
             batches: Mutex::new(VecDeque::new()),
-            pushed: tokio::sync::watch::channel(base).0,
+            position: tokio::sync::watch::channel(Position {
+                pushed: base,
+                covered: base,
+            })
+            .0,
+            released: AtomicU64::new(base),
         }
     }
 
@@ -154,22 +171,49 @@ impl Queue {
 
     /// The sequence of the newest batch. Before any batch it is the base index.
     pub(crate) fn pushed(&self) -> u64 {
-        *self.pushed.borrow()
+        self.position.borrow().pushed
     }
 
-    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.pushed.subscribe()
+    /// The applied index through which the stored batches are the whole state.
+    pub(crate) fn covered(&self) -> u64 {
+        self.position.borrow().covered
+    }
+
+    /// The newest batch and the covered index, from one applied state.
+    pub(crate) fn position(&self) -> Position {
+        *self.position.borrow()
+    }
+
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<Position> {
+        self.position.subscribe()
     }
 
     fn push(&self, seq: u64, batch: Arc<WriteBatch>) {
         self.batches.lock().unwrap().push_back((seq, batch));
-        self.pushed.send_replace(seq);
+        self.position.send_modify(|position| {
+            position.pushed = seq;
+            position.covered = position.covered.max(seq);
+        });
+    }
+
+    fn cover(&self, index: u64) {
+        self.position.send_if_modified(|position| {
+            let advanced = index > position.covered;
+            position.covered = position.covered.max(index);
+            advanced
+        });
     }
 
     /// Drop every batch and start again after `base`.
     fn reset(&self, base: u64) {
-        self.batches.lock().unwrap().clear();
-        self.pushed.send_replace(base);
+        let mut batches = self.batches.lock().unwrap();
+        batches.clear();
+        self.released.store(base, Ordering::Release);
+        drop(batches);
+        self.position.send_replace(Position {
+            pushed: base,
+            covered: base,
+        });
     }
 
     fn release(&self, through: u64) {
@@ -177,6 +221,13 @@ impl Queue {
         while batches.front().is_some_and(|(seq, _)| *seq <= through) {
             batches.pop_front();
         }
+        self.released.fetch_max(through, Ordering::AcqRel);
+    }
+
+    /// The base index of the last release. A base holds every batch at or below it, so the
+    /// materializer has nothing to write there, even above the physical sequence of the `Db`.
+    pub(crate) fn released(&self) -> u64 {
+        self.released.load(Ordering::Acquire)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -209,6 +260,12 @@ impl Overlay {
         debug_assert!(seq > self.queue.pushed(), "overlay batches must be ordered");
         self.segments.last().unwrap().insert(seq, &batch);
         self.queue.push(seq, batch);
+    }
+
+    /// Record that the entry at `index` stored no batch. The state at `index` is the state after
+    /// the newest batch.
+    pub(crate) fn cover(&mut self, index: u64) {
+        self.queue.cover(index);
     }
 
     /// Close the open segment and open a new one. An empty open segment stays open.
@@ -296,6 +353,25 @@ mod tests {
         assert_eq!(segment.first_after(after_b, &end, 5, None), None);
         assert_eq!(overlay.queue().after(2, 10).len(), 2);
         assert_eq!(overlay.queue().pushed(), 7);
+    }
+
+    #[test]
+    fn entries_without_a_batch_advance_only_the_covered_index() {
+        let mut overlay = Overlay::new(3);
+        let position = |overlay: &Overlay| {
+            let position = overlay.queue().position();
+            (position.pushed, position.covered)
+        };
+        assert_eq!(position(&overlay), (3, 3));
+        overlay.cover(5);
+        assert_eq!(position(&overlay), (3, 5));
+        overlay.push(6, batch(&[("a", Some("one"))]));
+        assert_eq!(position(&overlay), (6, 6));
+        overlay.cover(8);
+        overlay.cover(7);
+        assert_eq!(position(&overlay), (6, 8));
+        overlay.reset(10);
+        assert_eq!(position(&overlay), (10, 10));
     }
 
     #[test]

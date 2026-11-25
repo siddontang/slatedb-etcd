@@ -40,7 +40,15 @@ impl Node {
             }
             #[cfg(feature = "write-profile")]
             crate::write_profile::Stage::Raft.batch(ready.entries().len());
-            let snapshot = (!ready.snapshot().is_empty()).then(|| ready.snapshot().clone());
+            // Raft can restore a requested snapshot at the follower's commit index. When a record
+            // is already at that index, the log ends there too: Raft asks only at the last
+            // index, and its own snapshot is not below its commit. Storing the same boundary
+            // again changes nothing, and the stores reject it, so it is skipped. Raft still
+            // clears the pending request.
+            let staged = self.raw.store().staged_snapshot_index();
+            let snapshot = (!ready.snapshot().is_empty()
+                && ready.snapshot().get_metadata().index > staged)
+                .then(|| ready.snapshot().clone());
             // A requested snapshot can arrive when the commit index already covers it. Raft then
             // has no HardState change, but the snapshot record needs one.
             let hs = ready

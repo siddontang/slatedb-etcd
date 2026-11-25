@@ -59,7 +59,10 @@ flowchart LR
 | Term | Meaning |
 | --- | --- |
 | `F(C)` | The Raft index that checkpoint `C` covers: its `meta/applied` row |
+| Covered index | The applied index through which a member's stored batches are the whole state |
+| Coverage | The index through which an announcement certifies that `C` is the whole state |
 | Base | The checkpoint under a member's current views |
+| Base index | The index through which the base is the member's whole state, `F(C)` or more |
 | Overlay | Per-member memory that holds the applied batches above the base |
 | View `(C, S)` | Base `C` plus overlay batches in `(F(C), S]`: the state at `S` |
 | Materializer | The leader task that writes overlay batches into the shared `Db` |
@@ -80,9 +83,9 @@ The design depends on these rules. Later sections refer to them by number.
    removes the two per-member inputs to apply (see [Determinism](#determinism)).
 4. **Overlay cover.** A member keeps every overlay batch above `F(C)` for each checkpoint `C`
    that a live view uses.
-5. **Log cover.** A member truncates its log only through `F(C)` of its base. That checkpoint is
+5. **Log cover.** A member truncates its log only through its base index. That checkpoint is
    durable in S3.
-6. **Monotonic base.** A member's base `F` never goes down.
+6. **Monotonic base.** A member's base index never goes down.
 7. **Fail closed.** A read that cannot find an object fails. No path substitutes other data.
 
 ## Storage layout and mode
@@ -199,15 +202,33 @@ Step 3 replaces `db.write_with_options` in `store_batch` (`state.rs:369`). The e
 (`PublishPuts`, `apply.rs:264-274`) uses the same steps. Replies no longer wait for a SlateDB
 memtable insert.
 
-`ViewCheckpoint { checkpoint }` is a new entry type. It closes the open segment and starts a
-background open of `reader(checkpoint)`. It changes no etcd state and does not advance the KV
-revision. The checkpoint covers only entries below this entry, so the member has applied them.
+`ViewCheckpoint { checkpoint, covers }` is a new entry type. It closes the open segment and
+starts a background open of `reader(checkpoint)`. It changes no etcd state and does not advance
+the KV revision. The checkpoint covers only entries below this entry, so the member has applied
+them.
+
+`covers` is the **coverage**: the leader certifies that the checkpoint is the whole state at each
+index from `F` through `covers`. The leader reads `pushed` and the covered index from one
+applied state. It sets `covers` to its covered index only when no batch of its own is above
+`F`, materialized or not. Otherwise `covers` is `F`. An entry of an earlier binary has no
+`covers`, which means `F`. An announcement of the current base only raises its coverage, so it
+opens nothing and creates no checkpoint. The coverage belongs to the checkpoint ID. Another
+checkpoint at the same `F`, such as a Defragment output, does not get it.
 
 In shared mode an entry that changes no state writes **no batch**. This covers empty entries and
 `ViewCheckpoint`. Today such entries still write `meta/applied`. Here that write would make the
 memtable dirty, and the age flush would then publish a checkpoint for it. Each announcement
 would cause the next one on an idle cluster. `applied` still advances in memory, and `F` stays
 the index of the last state change.
+
+The overlay therefore keeps two positions. `pushed` is the index of the newest batch. The
+**covered index** is the applied index through which the stored batches are the whole state.
+An entry without a batch advances only the covered index. A view and a base switch use the
+covered index. The materializer and the publication targets use `pushed`.
+
+Members group entries in different ways. One member can store a batch at 2 for a Put at 1 and a
+failed update at 2. Another member stores a batch at 1 and none at 2. Both states at 2 are
+equal, so either member can use a checkpoint of the other.
 
 ## Determinism
 
@@ -232,6 +253,11 @@ The materializer runs only on the leader that holds the writer epoch.
    seqnum = seq)`. A batch that spans `last` is written whole. Its values are final, so the
    result is correct (invariant 1).
 4. Repeat step 3 as apply adds batches.
+
+The task waits past its own position, the higher of `last` and the last released index, not
+past `last_l0_seq`. A released batch is in the base, so the task skips it and sleeps until a
+later batch arrives. The physical sequence stays where the writes left it, and publications
+take their checkpoint row from it.
 
 The materializer may lag apply. The overlay keeps the lagging batches (invariant 4).
 A materializer error closes the writer and starts the recovery in
@@ -296,12 +322,20 @@ cluster with no leader therefore keep their checkpoints.
 
 1. Apply `ViewCheckpoint(C)`. Close the segment. Start `DbReader::open(Checkpoint(C))` in the
    background. Apply continues.
-2. When the reader is open, read `F(C)`. If `F(C)` is not above the current base, close the
-   reader and stop (invariant 6). Opens can finish out of order. Then warm the cache for at
-   most 500 ms. See [Base cache warm](#base-cache-warm).
-3. Publish later views as `(reader(C), segments above F(C))`. Report `C` in `ViewAck`.
-4. When no view uses the old reader, close it and release the segments at or below `F(C)`.
-5. Write a Raft snapshot record for `C` and allow log truncation through `F(C)` (invariant 5).
+2. When the reader is open, read `F(C)`. Then warm the cache for at most 500 ms. See
+   [Base cache warm](#base-cache-warm).
+3. The switch waits until the covered index reaches `F(C)`. The new base index is
+   `min(covers, covered)`. If it is not above the current base index, close the reader and stop
+   (invariant 6). Opens can finish out of order.
+4. Publish later views as `(reader(C), segments above the base index)`. Report `C` in `ViewAck`.
+5. When no view uses the old reader, close it and release the segments at or below the base
+   index.
+6. Write a Raft snapshot record for `C` at the base index, with the Raft term there, and allow
+   log truncation through it (invariant 5).
+
+A member can release a batch above `F(C)`. The batch holds only rows that `C` already holds, so
+a new leader's materializer can skip it. `last_l0_seq` is at or above `F(C)`, but it can be
+below the released batch.
 
 A failed open does not change the current base. The member keeps its view and overlay, and it
 waits for the next checkpoint.
@@ -352,7 +386,10 @@ mode a missing SST rebases the member instead. Every other storage error still s
 3. [Install](#install) `C`: a local rebuild if `F(C) <= applied`, otherwise an adopt.
 4. Resume apply above the new `applied`.
 
-A rebase rescans the live data. It is the cost of losing a base, not of a leader change.
+A rebase rescans the live data. It is the cost of losing a base, not of a leader change. The
+log can start above the newest checkpoint row. If no newer checkpoint reaches the base index,
+the rebase opens the current base again at its base index, with the log term there. If the base
+checkpoint is gone, it takes a checkpoint in the same range as a restart does.
 
 ## Log truncation and Raft snapshots
 
@@ -366,6 +403,84 @@ A rebase rescans the live data. It is the cost of losing a base, not of a leader
   today's handler copies objects first (`api.rs:103-117`). A failed open fails the request, and
   Raft retries. The handler keeps the reader until the install finishes, and the member reports
   `C` in `ViewAck`.
+- The record index can be above `F(C)`. The record keeps the two apart: the checkpoint gives `F`
+  and its term, and the record metadata gives the index and the term there. Install loads the
+  state at `F`, so the counter and term rows match. It then raises the applied index, the
+  covered index, and the term to the record values.
+- **Demand:** Raft can ask the leader for a snapshot at a follower's last index. A guarded member
+  does this, and on an idle cluster no batch follows the leader's base. A follower's manual
+  checkpoint can also need a base above the leader's base index, because the follower grouped
+  its entries in another way. At each tick the leader serves the highest such index that no
+  durable record reaches:
+  1. If its base index reaches the demand, it does nothing. The snapshot record follows the base.
+  2. It reads the base, then the position. If an unreleased batch is above the base row, it asks
+     for a publication and waits for that checkpoint. A batch that a base released holds no
+     change above that base row, so it does not count.
+  3. Otherwise it announces the same checkpoint again with its covered index. This needs no new
+     checkpoint. The entry raises the base index of every member, and the leader records the
+     base there with the Raft term at that index.
+  One announcement serves a demand at a time, and the leader sends it again only after 20 ticks
+  without an apply. The announcement entry does not raise the demand, so an idle cluster stops
+  appending.
+- **Stale requests:** raft-rs keeps a follower's pending request across a term change, and the
+  follower sends the same index to each leader. That index can name a suffix that the new
+  leader replaced. So the leader serves `min(request, last)`, with its last log index, and it
+  pins that target for the peer at its first request. Raft repeats the original index at each
+  retry, and the pin holds, so the announcement entries do not move the target. Raft accepts a
+  snapshot at or above the follower's commit index, which the leader's log holds, and that
+  clears the follower's request. The pin ends when the peer gets a snapshot, or at a term
+  change. Replicated mode uses the same rule. A follower can get a snapshot at its own record
+  index. It then stores nothing, because its log ends there.
+- **Earlier binaries:** a record above its checkpoint row holds the row after its encoded
+  fields. An earlier binary ignores those bytes, but it installs a view snapshot only at its
+  row. Each member sends a random ID of its process with its peer frames and its `ViewAck`, and
+  the report also advertises the coverage capability. The capability holds only for the
+  process that advertised it, so a restart on an earlier binary loses it at its first frame. A
+  member that did not report yet counts as an earlier binary.
+  - The leader certifies above a row only while every other member of the configuration has
+    the capability. Otherwise it announces at the row and serves no demand above its base.
+  - The log cache sends a record above its row only to a capable peer. For another peer, the
+    leader publishes a checkpoint at its applied index: if no batch is there, apply first stores
+    a batch with only the apply marker and the counters. The leader then records that base at
+    its row and sends it. This costs one flush and one checkpoint.
+  - The same publication serves every demand above the record that no certification can
+    serve: a request of a member without the capability, and any request or follower's manual
+    checkpoint while some member lacks it. The leader publishes at or above the highest of
+    these demands.
+  - A snapshot above its row goes to its own route, `/raft/covered`, with the process that
+    advertised the capability. An earlier binary has no such route and answers 404, and
+    another process answers 409, before Raft sees the snapshot. Either answer ends the
+    capability of the process that the snapshot named. A late answer for an earlier process
+    does not change the capability of the current one. So a member that restarts on an earlier
+    binary while the snapshot travels never stores it.
+- **Record checkpoint:** only a live base pins its checkpoint. After the base moves, retention
+  can delete the checkpoint that the record names, and a restart or a rebase then uses another
+  checkpoint. The log cache does not send a record that names a checkpoint other than the base,
+  at any index. A member with an empty base, such as a new member before its install, sends no
+  view record. The leader records the base instead, so a peer never gets a checkpoint that it
+  cannot open. The log cache knows the base when the node opens, so a request before the first
+  tick also follows this rule.
+- **Base below the record:** Raft can store a received record at or below the applied index.
+  Apply then installs nothing, so the base can stay below the record. Apply offers the received
+  checkpoint as the base, as an install that applied past it does. That offer can fail, for
+  example when the checkpoint cannot open. While the base is below the record, no checkpoint
+  job starts, because no record at the base can replace the record. The leader takes the
+  record index as a demand: it certifies its base through it, or publishes first. The next
+  image then records the base. This costs one announcement, or one publication when a batch is
+  above the row, also when no peer wants a snapshot.
+  - A leader with an empty base gets a base from its writer at open, with no client write. The
+    writer publishes a first checkpoint when the shared database has writes above the newest
+    checkpoint. Otherwise it announces the newest checkpoint, which this member did not open.
+  - A member does not campaign or take a leadership transfer from the time Raft accepts a
+    snapshot until apply installs it, but it still votes. At a campaign Raft scans the
+    unapplied entries from its applied index, which is below the start of the log, and that
+    scan stops the process. The window covers the snapshot that Raft holds, the one that the
+    log cache staged, and the stored one that waits for apply.
+  - Unlike the guard of a member that waits for a snapshot, this guard has no time limit,
+    because a campaign in the window stops the process. If the only live member with a current
+    log is in the window, the cluster has no leader until its install ends: a checkpoint open
+    in shared mode, or the image copy in replicated mode. Before this guard, that member
+    stopped at its first campaign.
 
 ## Install
 
@@ -472,6 +587,16 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
 
 1. Read the base from the local Raft snapshot record. If that checkpoint was deleted, take the
    newest `view-` checkpoint. If none exists and `bootstrap.json` exists, stop with an error.
+   A record above the newest checkpoint row names a checkpoint with certified coverage. The
+   member opens that checkpoint by its ID, because a Defragment can add a newer one at the same
+   row. It loads the state at `F` and starts at the record index with the record term. This
+   runs before the log check, because the log starts after the record index.
+   If retention deleted that checkpoint, the member takes the newest checkpoint whose own row,
+   read from the checkpoint, is between the record row and the record index. No entry in that
+   range changed state, so that checkpoint holds the same state. A record without a row, or no
+   such checkpoint, stops the start with an error that says how to recover. Each search skips
+   a checkpoint only when it is gone: deleted, its manifest or an SST missing, or deleted now
+   by retention. Any other error stops the start.
 2. [Install](#install) the base. If the local log ends below `F` or its term at `F` differs,
    this is an adopt. Otherwise it is a local rebuild with nothing to replay yet.
 3. Replay committed log entries above `F` into the overlay. This is the current replay path with
