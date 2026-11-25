@@ -181,6 +181,17 @@ const COMPACTION_FETCH_BYTES: usize = 512 * 1024;
 /// subcompactions this held about 185 MiB in put-v4096 on a server with 4 CPU threads.
 const SUBCOMPACTIONS: usize = 2;
 
+/// L0 SSTs before SlateDB stops memtable flushes. SlateDB defaults to 8.
+///
+/// SlateDB compacts L0 one job at a time, and a job takes up to `max_compaction_sources` (8) L0
+/// SSTs. After a bulk load, compaction wrote about 35 MB/s, and a parallel sorted-run merge
+/// halved that. With 8 slots, L0 filled during the load and after it. Immutable memtables then
+/// reached `max_unflushed_bytes`, and the apply write waited 4-8 s, so proposals timed out.
+/// With 16 slots the load backlog fits in L0 while compaction drains it. This does not change
+/// memory or durability: unflushed bytes keep their bound, and each L0 SST is synced. A read can
+/// consult up to 16 L0 SSTs while a backlog exists.
+const L0_MAX_SSTS: usize = 16;
+
 /// The SST entries that a memtable flush caches: indexes, filters, and current-row data blocks.
 ///
 /// SlateDB inserts every data block of a flushed L0 SST by default. Each flush then filled the
@@ -208,6 +219,8 @@ pub(crate) fn slatedb_settings() -> Settings {
         flush_interval: None,
         object_store_max_retries: Some(3),
         manifest_poll_interval: Duration::from_millis(100),
+        l0_max_ssts: L0_MAX_SSTS,
+        l0_max_ssts_per_key: L0_MAX_SSTS,
         ..Settings::default()
     };
     // Frequent checkpoints need prompt L0 compaction and manifest refreshes.

@@ -110,6 +110,8 @@ These flags do not bound process RSS, SlateDB, state scans, or snapshot buffers.
 A memtable flush caches the SST index, filters, and current-row blocks; reads cache the rest.
 Compaction reads ahead 2 x 512 KiB per input SST. Each compaction job runs at most two
 subcompactions, because each one buffers SST data until the disk takes it.
+SlateDB stops memtable flushes at 16 L0 SSTs, twice its default. A bulk load then does not stall
+apply while compaction drains L0. Unflushed memory keeps its 1 GiB bound.
 On Linux, jemalloc background threads return freed pages to the OS after 200 ms.
 `_RJEM_MALLOC_CONF` overrides that default.
 The quota can be exceeded by one operation and does not reserve free disk space.
