@@ -536,29 +536,34 @@ mod tests {
             .await
             .unwrap();
         let mut expected = KeyIndex::default();
-        let write = |batch: &mut slatedb::WriteBatch, index: &mut KeyIndex, i: u32| {
+        // `step` makes an overwrite differ from the flushed row in its revisions and lease.
+        let write = |batch: &mut slatedb::WriteBatch, index: &mut KeyIndex, i: u32, step: i64| {
             let key = format!("key/{i:05}").into_bytes();
             let kv = KeyValue {
                 key: key.clone(),
                 create_revision: i64::from(i) + 1,
-                mod_revision: i64::from(i) + 2,
-                version: 1,
-                lease: i64::from(i % 7),
+                mod_revision: i64::from(i) + 2 + step,
+                version: 1 + step,
+                lease: (i64::from(i) + step) % 7,
                 value: vec![1; 2048],
             };
             let (row_key, value) = ([CURRENT, &key].concat(), kv.encode_to_vec().into());
             batch.put(&row_key, &value);
             index.publish(&row_key, Some(&value)).unwrap();
         };
-        // Two flushed SSTs of about 4 MiB each, larger than one read-ahead request.
+        // Two L0 SSTs of about 4 MiB each, larger than one read-ahead request.
+        let memtable = slatedb::config::FlushOptions {
+            flush_type: slatedb::config::FlushType::MemTable,
+        };
         for part in 0..2 {
             let mut batch = slatedb::WriteBatch::new();
             for i in (part..4000).step_by(2) {
-                write(&mut batch, &mut expected, i);
+                write(&mut batch, &mut expected, i, 0);
             }
             db.write(batch).await.unwrap();
-            db.flush().await.unwrap();
+            db.flush_with_options(memtable.clone()).await.unwrap();
         }
+        assert_eq!(db.manifest().l0().len(), 2);
         // Unflushed changes: deletes, overwrites, and rows next to the prefix.
         let mut batch = slatedb::WriteBatch::new();
         for i in (0..4000).step_by(3) {
@@ -567,7 +572,7 @@ mod tests {
             expected.publish(&row_key, None).unwrap();
         }
         for i in (1..4000).step_by(9) {
-            write(&mut batch, &mut expected, i);
+            write(&mut batch, &mut expected, i, 1);
         }
         batch.put(b"etcd/curren", b"x");
         batch.put(b"etcd/current0", b"x");

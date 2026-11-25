@@ -555,16 +555,16 @@ async fn embedded_auto_compaction_retention_is_validated() {
     server.shutdown().await.unwrap();
 }
 
-/// A lone voter campaigns when it opens. The first randomized election timeout is at least 10
-/// ticks of 100 ms, so readiness within 900 ms shows that the node did not wait for it.
+/// A lone voter that campaigns when it opens becomes ready and serves writes, on first start
+/// and on restart. `only_a_lone_voter_leads_before_its_first_event` checks the campaign itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_single_member_leads_without_an_election_timeout() {
+async fn a_single_member_serves_writes_after_each_start() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = ServerConfig::single_node(dir.path());
     for restart in [false, true] {
         let server = Server::start(config.clone()).await.unwrap();
         server
-            .wait_ready(Duration::from_millis(900))
+            .wait_ready(Duration::from_secs(10))
             .await
             .unwrap_or_else(|error| panic!("not ready, restart {restart}: {error}"));
         put(&server, b"key", b"value").await;
