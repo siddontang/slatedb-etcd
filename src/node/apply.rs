@@ -35,8 +35,8 @@ pub(super) struct AppliedState {
     pub quota_bytes: i64,
     /// The flag of this member differs from `quota_bytes`.
     pub quota_mismatch: bool,
-    /// The first cluster quota followed quota-checked entries of an earlier binary.
-    pub seeded_late: bool,
+    /// The checkpoint that must cover a first cluster quota. See `StateMachine::quota_boundary`.
+    pub quota_boundary: u64,
 }
 
 impl std::ops::Deref for AppliedState {
@@ -64,7 +64,7 @@ impl AppliedState {
             cluster_quota: state.cluster_quota(),
             quota_bytes: state.quota_bytes(),
             quota_mismatch: state.quota_mismatch(),
-            seeded_late: state.seeded_late,
+            quota_boundary: state.quota_boundary,
         })
     }
 }
@@ -837,7 +837,10 @@ pub(super) async fn recover(
             raft::GetEntriesContext::empty(false),
         )?;
         ensure!(!entries.is_empty(), "empty recovery batch");
-        state.guard_replay(created_empty, &mut entries)?;
+        // A guarded member stops here and waits for a snapshot. See `node::quota`.
+        if super::quota::guard_replay(state, created_empty, &mut entries)? {
+            break;
+        }
         let replies = apply_entries(state, entries, header).await?;
         physical |= replies.iter().any(|r| {
             matches!(

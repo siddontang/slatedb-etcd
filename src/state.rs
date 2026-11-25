@@ -86,8 +86,10 @@ pub struct StateMachine {
     quota_flag: i64,
     /// The quota of the last applied `SetQuota` entry. `None` in shared mode.
     cluster_quota: Option<quota::ClusterQuota>,
-    /// The first `SetQuota` entry applied after quota-checked entries. See `quota`.
-    pub(crate) seeded_late: bool,
+    /// The index of a first `SetQuota` entry that followed quota-checked entries, or zero.
+    /// Members checkpoint through it, so no log still holds those entries. The row keeps it, so
+    /// a restart can retry the checkpoint.
+    pub(crate) quota_boundary: u64,
     logical_bytes: crate::batch::Usage,
     pub(crate) current: current::CurrentRows,
     pub(crate) key_index: key_index::KeyIndex,
@@ -437,8 +439,8 @@ impl StateMachine {
         // A shared base from an older binary has only the total in `shared::LOGICAL_BYTES`, and
         // its apply marker is past any counter row, so the open counts the split again.
         let logical_bytes = load_logical_size(&reads, applied).await?;
-        let cluster_quota = match &shared {
-            Some(_) => None,
+        let (cluster_quota, quota_boundary) = match &shared {
+            Some(_) => (None, 0),
             None => quota::load(&reads).await?,
         };
         Ok(Self {
@@ -448,7 +450,7 @@ impl StateMachine {
             quota: cluster_quota.map_or(0, |quota| quota.bytes.max(0) as u64),
             quota_flag: 0,
             cluster_quota,
-            seeded_late: false,
+            quota_boundary,
             current: current::CurrentRows::default(),
             key_index: key_index::KeyIndex::load(&reads).await?,
             rows,

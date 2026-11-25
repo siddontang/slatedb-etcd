@@ -65,8 +65,9 @@ impl Node {
                     .iter()
                     .any(|(index, _)| *index <= applied));
         // Automatic checkpoints only flush state and truncate the local log.
-        // A membership change and the first cluster quota need a checkpoint at their index.
-        let forced = self.membership_checkpoint.max(self.quota.checkpoint());
+        // A membership change needs a checkpoint at its index. So does a first cluster quota
+        // after entries of an earlier binary; its row keeps that index across restarts.
+        let forced = self.membership_checkpoint.max(self.state.quota_boundary);
         let truncate_due = ((forced > snapshot_index && applied >= forced)
             || (self.next_checkpoint.is_some_and(|index| applied >= index)
                 && self.appended_bytes >= self.options.snapshot_min_bytes))
@@ -89,17 +90,17 @@ impl Node {
     fn submit_entries(&mut self, applied: u64, committed: u64) -> Result<()> {
         let low = applied + 1;
         let high = (low + apply::APPLY_ENTRIES).min(committed + 1);
-        let mut entries = self.raw.store().entries(
+        let high = self.quota_apply_limit(low, high);
+        if high <= low {
+            return Ok(());
+        }
+        let entries = self.raw.store().entries(
             low,
             high,
             Some(apply::BATCH_BYTES),
             raft::GetEntriesContext::empty(false),
         )?;
-        self.guard_quota(&mut entries)?;
-        let Some(last) = entries.last() else {
-            return Ok(());
-        };
-        let target = last.index;
+        let target = entries.last().context("empty apply batch")?.index;
         ensure!(
             target <= self.committed_ready,
             "apply exceeds delivered commit"
@@ -245,7 +246,11 @@ impl Node {
         self.sync_lease_deadlines();
         self.expire_pending();
         self.finish_output(completed.output)?;
-        self.raw.advance_apply_to(self.state.applied);
+        // A member that waits for a snapshot can start with Raft ahead of its state. See
+        // `node::quota`.
+        if self.state.applied >= self.raw.raft.raft_log.applied {
+            self.raw.advance_apply_to(self.state.applied);
+        }
         self.raw.mut_store().applied_to(self.state.applied);
         if membership_changed {
             self.sync_members();

@@ -413,7 +413,7 @@ impl Node {
                 now: quota::now_millis(),
             },
         );
-        let quota = match quota {
+        let mut quota = match quota {
             Ok(quota) => quota,
             Err(error) => {
                 let _ = state.close().await;
@@ -463,8 +463,7 @@ impl Node {
                     }
                 }
             }
-            let mut cache = match log::Cache::load(&storage, state.applied, options.log_memory) {
-                Ok(cache) => cache,
+            let loaded = match log::Cache::load(&storage, state.applied, options.log_memory) {
                 Err(error) if error.is::<cache::PendingQuota>() => {
                     apply::recover(
                         &mut state,
@@ -477,16 +476,39 @@ impl Node {
                         quota.created_empty(),
                     )
                     .await?;
-                    log::Cache::load(&storage, state.applied, options.log_memory)?
+                    log::Cache::load(&storage, state.applied, options.log_memory)
                 }
-                Err(error) => return Err(error),
+                loaded => loaded,
+            };
+            if quota.created_empty() && state.cluster_quota().is_none() {
+                let (gate, scanned) = quota::scan_storage(&storage, state.applied)?;
+                quota.set_gate(gate, scanned);
+            }
+            // A member that waits for a snapshot before its next entry does not hold its
+            // backlog. Raft treats the committed log as applied, and the cache keeps it only
+            // as evictable history. The snapshot install replaces it.
+            let mut raft_applied = state.applied;
+            let mut cache = match loaded {
+                Err(error)
+                    if error.is::<cache::PendingQuota>()
+                        && quota.blocked() == Some(state.applied + 1) =>
+                {
+                    raft_applied = storage.commit_index();
+                    tracing::warn!(
+                        applied = state.applied,
+                        commit = raft_applied,
+                        "the log backlog waits for a snapshot"
+                    );
+                    log::Cache::load(&storage, raft_applied, options.log_memory)?
+                }
+                loaded => loaded?,
             };
             cache.initial_conf = Some(state.members.conf());
             let config = Config {
                 id: options.id,
                 election_tick: 10,
                 heartbeat_tick: 1,
-                applied: state.applied,
+                applied: raft_applied,
                 check_quorum: true,
                 pre_vote: true,
                 read_only_option: raft::ReadOnlyOption::Safe,
@@ -735,8 +757,7 @@ impl Node {
                     self.compact_ready_at.unwrap_or_else(Instant::now).into()
                 ), if self.compact_ready_at.is_some() => { self.compact_ready_at = None; }
                 _ = ticks.tick() => {
-                    self.raw.tick();
-                    self.propose_quota()?;
+                    self.tick_raft()?;
                     self.retry_reads();
                     self.expire_leases()?;
                     self.publish_member()?;
@@ -1029,9 +1050,7 @@ impl Node {
                     let _ = response.send(Err(self.error("peer message rejected")));
                 } else if let Some(reserved) = self.snapshot_objects_ready(&message) {
                     let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
-                    let stepped = self.raw.step(message);
-                    // A new leader proposes the cluster quota before the next client write.
-                    self.propose_quota()?;
+                    let stepped = self.step_peer(message);
                     if let Some(checkpoint) = reserved {
                         // Raft can skip a snapshot: an older commit, or a log that already
                         // matches. Then no install releases the staging copy.

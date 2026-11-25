@@ -585,7 +585,7 @@ impl Simulation {
             let from = message.from;
             let to = message.to;
             let index = message.get_snapshot().get_metadata().index;
-            node.raw.step(message).unwrap();
+            node.step_peer(message).unwrap();
             node.drive_ready().await.unwrap();
             if snapshot
                 && node.raw.store().snapshot_index() > 0
@@ -619,7 +619,7 @@ impl Simulation {
             node.raw
                 .raft
                 .set_randomized_election_timeout(10 + id as usize * 2);
-            node.raw.tick();
+            node.tick_raft().unwrap();
             node.retry_reads();
             self.trace.push(format!("tick {id}"));
         }
@@ -2129,7 +2129,35 @@ impl Simulation {
         if let Some(node) = self.nodes.get_mut(&id) {
             node.quota.hold = upgraded;
         }
-        self.settle(4).await;
+    }
+
+    /// Deliver messages until member `id` waits for a snapshot.
+    async fn until_waiting(&mut self, id: u64) {
+        for _ in 0..2000 {
+            if self.nodes[&id].quota.blocked().is_some() {
+                return;
+            }
+            if self.messages.is_empty() {
+                let leader = self.leader().unwrap();
+                self.tick(leader).await;
+            }
+            self.deliver(false).await;
+        }
+        panic!("member {id} does not wait for a snapshot");
+    }
+
+    /// Settle `rounds` times. Member `id` must never lead.
+    async fn settle_without(&mut self, id: u64, rounds: usize) {
+        for _ in 0..rounds {
+            for member in 1..=3 {
+                self.tick(member).await;
+                assert_ne!(self.leader(), Some(id), "member {id} leads");
+            }
+            for _ in 0..30 {
+                self.deliver(false).await;
+                assert_ne!(self.leader(), Some(id), "member {id} leads");
+            }
+        }
     }
 
     /// A follower, not `except`.
@@ -2225,6 +2253,7 @@ async fn a_new_member_does_not_replay_the_entries_of_an_earlier_binary() {
     let installed = sim.nodes[&first].installed_snapshots;
     sim.replace(first, 3000).await;
     sim.settle(4).await;
+    sim.settle(4).await;
     let leader = sim.leader().unwrap();
     assert_eq!(
         sim.nodes[&first].state.applied,
@@ -2246,11 +2275,60 @@ async fn a_new_member_does_not_replay_the_entries_of_an_earlier_binary() {
     let second = sim.follower(first);
     sim.replace(second, 3000).await;
     sim.settle(4).await;
+    sim.settle(4).await;
     sim.write(3).await;
     assert_eq!(sim.acknowledged.len(), 46);
     assert_eq!(sim.cluster_quota(), Some(1 << 20));
     assert!(sim.nodes[&second].raw.store().snapshot_index() >= seed);
     assert!(sim.view_checks > 100, "{} view checks", sim.view_checks);
+}
+
+/// A member that waits for a snapshot does not lead. The old leader stops, or transfers its
+/// leadership to the member. Another member leads, sends the snapshot, and the member catches up.
+#[tokio::test]
+async fn a_waiting_member_does_not_lead_in_an_election_or_a_transfer() {
+    for transfer in [false, true] {
+        let quotas = BTreeMap::from([(1, 1 << 20), (2, 1 << 20), (3, 1 << 20)]);
+        let mut sim = Simulation::with_options(13, false, quotas, true, true).await;
+        sim.settle(3).await;
+        sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+        sim.write(20).await;
+        sim.settle(2).await;
+        let leader = sim.leader().unwrap();
+        let waiting = sim.follower(0);
+        sim.replace(waiting, 3000).await;
+        sim.until_waiting(waiting).await;
+        if transfer {
+            let node = sim.nodes.get_mut(&leader).unwrap();
+            node.raw.transfer_leader(waiting);
+        } else {
+            sim.stop(leader);
+            sim.messages
+                .retain(|message| message.to != leader && message.from != leader);
+        }
+        sim.settle_without(waiting, 30).await;
+        let now = sim.leader().unwrap();
+        assert_ne!(now, waiting);
+        assert_eq!(
+            sim.nodes[&waiting].quota.blocked(),
+            None,
+            "transfer {transfer}"
+        );
+        assert_eq!(
+            sim.nodes[&waiting].state.applied,
+            sim.nodes[&now].state.applied
+        );
+        assert!(sim.nodes[&waiting].worker.state().alarms.is_empty());
+        if !transfer {
+            sim.start(leader).await;
+            sim.settle(3).await;
+        }
+        sim.release_quota();
+        sim.settle(2).await;
+        sim.write(2).await;
+        sim.settle(2).await;
+        assert_eq!(sim.cluster_quota(), Some(1 << 20));
+    }
 }
 
 #[tokio::test]

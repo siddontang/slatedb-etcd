@@ -8,9 +8,12 @@
 //! unchanged old flag does not revert the cluster quota when it leads.
 //!
 //! A state that this binary created empty never applies a quota-checked entry under its flag.
-//! Such an entry before the first `SetQuota` entry comes from an earlier binary. The member then
-//! stops apply and asks the leader for a snapshot. A member also checkpoints through a first
-//! cluster quota that follows such entries, so the leader sends later members a snapshot.
+//! Such an entry before the first `SetQuota` entry comes from an earlier binary. The member
+//! finds it in its log at open and as entries arrive. Apply then stops before it, and the member
+//! asks the leader for a snapshot. Until then it does not lead: it skips elections while it
+//! knows a leader, ignores leadership transfers, and hands over leadership if it wins. It still
+//! votes. A member also checkpoints through a first cluster quota that follows such entries, so
+//! the leader sends later members a snapshot. See `StateMachine::quota_boundary`.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -57,6 +60,50 @@ pub(super) struct Startup {
     pub now: u64,
 }
 
+/// The first entry that decides whether a state without a cluster quota can apply its log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Gate {
+    /// A `SetQuota` entry. The entries after it apply under the cluster quota.
+    SetQuota(u64),
+    /// A quota-checked entry before any `SetQuota` entry. An earlier binary wrote it, and other
+    /// members applied it under their own flags.
+    Checked(u64),
+}
+
+/// Return the first gate in `entries`, by Raft index.
+pub(super) fn first_gate(entries: &[Entry]) -> Result<Option<Gate>> {
+    for entry in entries {
+        if entry.entry_type != EntryType::EntryNormal as i32 || entry.data.is_empty() {
+            continue;
+        }
+        let command = RaftCommand::decode(&entry.data)?;
+        if matches!(command, RaftCommand::SetQuota { .. }) {
+            return Ok(Some(Gate::SetQuota(entry.index)));
+        }
+        if crate::state::quota::checks_quota(&command) {
+            return Ok(Some(Gate::Checked(entry.index)));
+        }
+    }
+    Ok(None)
+}
+
+/// Keep only the entries that a recovery replay can apply. A state that this binary created
+/// empty stops before a `Gate::Checked` entry while it has no cluster quota. Return true when
+/// no entry is left: the member then waits for a snapshot.
+pub(super) fn guard_replay(
+    state: &StateMachine,
+    created_empty: bool,
+    entries: &mut Vec<Entry>,
+) -> Result<bool> {
+    if !created_empty || state.cluster_quota().is_some() {
+        return Ok(false);
+    }
+    if let Some(Gate::Checked(index)) = first_gate(entries)? {
+        entries.retain(|entry| entry.index < index);
+    }
+    Ok(entries.is_empty())
+}
+
 /// The quota flag of this member and its proposal state.
 pub(super) struct Quota {
     member: u64,
@@ -67,11 +114,13 @@ pub(super) struct Quota {
     proposed: Option<(u64, u64)>,
     /// The cluster quota that `observe_quota` last handled.
     observed: Option<Option<ClusterQuota>>,
-    /// The applied index when the first cluster quota appeared. A checkpoint through it removes
-    /// the entries of earlier binaries from the log.
-    checkpoint: u64,
-    /// The entry that waits for a snapshot. See `guard_quota`.
-    blocked: Option<u64>,
+    /// The first gate in the log above the applied index, while a state created empty has no
+    /// cluster quota. A `Gate::Checked` entry waits for a snapshot.
+    gate: Option<Gate>,
+    /// The last log index that the gate scan covered.
+    scanned: u64,
+    /// Ticks without a known leader while the member waits for a snapshot.
+    leaderless: usize,
     /// Simulation: the member proposes no `SetQuota`, like an earlier binary.
     #[cfg(test)]
     pub(super) hold: bool,
@@ -81,7 +130,7 @@ pub(super) struct Quota {
 ///
 /// This is the "operator-change detection" policy. Without a cluster quota, a leader seeds it
 /// from its flag, or sets its pending request. Otherwise it proposes only its own pending
-/// request, and only when that request is newer than the cluster quota.
+/// request, and only when that request is newer than the request of the cluster quota.
 fn proposal(
     cluster: Option<ClusterQuota>,
     flag: i64,
@@ -103,9 +152,10 @@ fn proposal(
             true,
         )),
         (None, Some(pending)) => Some((request(pending), false)),
+        // A newer request with the same value still moves the order of the row forward.
         (Some(row), Some(pending)) => {
             let request = request(pending);
-            (row.bytes != request.bytes && request.key() > row.key()).then_some((request, false))
+            (request.key() > row.key()).then_some((request, false))
         }
         (Some(_), None) => None,
     }
@@ -124,8 +174,9 @@ impl Quota {
             record: None,
             proposed: None,
             observed: None,
-            checkpoint: 0,
-            blocked: None,
+            gate: None,
+            scanned: 0,
+            leaderless: 0,
             #[cfg(test)]
             hold: false,
         };
@@ -174,14 +225,24 @@ impl Quota {
             .is_some_and(|(_, record)| record.created_empty)
     }
 
-    /// The index that a checkpoint must cover, or zero.
-    pub(super) fn checkpoint(&self) -> u64 {
-        self.checkpoint
+    /// The quota-checked entry that waits for a snapshot, if any.
+    pub(super) fn blocked(&self) -> Option<u64> {
+        match self.gate {
+            Some(Gate::Checked(index)) => Some(index),
+            _ => None,
+        }
     }
 
-    /// Clear the pending request once the cluster quota equals it or holds a newer request.
-    /// This needs only the current cluster quota, so batched apply and snapshot installs do not
-    /// lose an acknowledgment.
+    /// Record the gate that an open scan of the durable log found. See `scan_storage`.
+    pub(super) fn set_gate(&mut self, gate: Option<Gate>, scanned: u64) {
+        self.gate = gate;
+        self.scanned = scanned;
+    }
+
+    /// Clear the pending request once the cluster quota holds it or a newer request. This needs
+    /// only the order of the current row, so batched apply, restarts, and snapshot installs do
+    /// not lose an acknowledgment. An equal value does not clear it: an older request with that
+    /// value can precede newer requests in the log that is not applied yet.
     fn acknowledge(&mut self, cluster: Option<ClusterQuota>) -> Result<()> {
         let member = self.member;
         let Some((path, record)) = &mut self.record else {
@@ -190,8 +251,7 @@ impl Quota {
         let (Some(pending), Some(row)) = (record.pending, cluster) else {
             return Ok(());
         };
-        let request = (pending.requested_at, member, pending.bytes);
-        if row.bytes == pending.bytes || row.key() >= request {
+        if (row.requested_at, row.member) >= (pending.requested_at, member) {
             *record = Record {
                 acknowledged: self.flag,
                 pending: None,
@@ -201,6 +261,29 @@ impl Quota {
         }
         Ok(())
     }
+}
+
+/// Find the first gate in the durable log above `applied`, in bounded batches, so the scan
+/// holds no backlog. Return the gate and the last index of the log.
+pub(super) fn scan_storage(storage: &RaftStorage, applied: u64) -> Result<(Option<Gate>, u64)> {
+    let last = storage.last_index()?;
+    let mut low = applied.max(storage.first_index()? - 1) + 1;
+    while low <= last {
+        let entries = storage.entries(
+            low,
+            (low + 256).min(last + 1),
+            Some(1 << 20),
+            raft::GetEntriesContext::empty(false),
+        )?;
+        let Some(end) = entries.last().map(|entry| entry.index) else {
+            anyhow::bail!("empty quota scan batch");
+        };
+        if let Some(gate) = first_gate(&entries)? {
+            return Ok((Some(gate), last));
+        }
+        low = end + 1;
+    }
+    Ok((None, last))
 }
 
 /// Replace the record file atomically.
@@ -230,6 +313,10 @@ impl Node {
     /// One proposal of a term stays in the log, so the next one waits until it applies.
     pub(super) fn propose_quota(&mut self) -> Result<()> {
         if self.raw.raft.state != StateRole::Leader || self.quota.record.is_none() {
+            return Ok(());
+        }
+        if self.quota.blocked().is_some() {
+            self.yield_leadership();
             return Ok(());
         }
         #[cfg(test)]
@@ -273,25 +360,24 @@ impl Node {
         Ok(())
     }
 
-    /// Update the local record after the applied cluster quota changed, and warn when the flag
-    /// differs from the quota that apply uses.
+    /// Update the local record and the gate after apply, and warn when the flag differs from
+    /// the quota that apply uses.
     pub(super) fn observe_quota(&mut self) -> Result<()> {
+        // A snapshot install moved the state past the waiting entry. Scan the rest again.
+        if self
+            .quota
+            .blocked()
+            .is_some_and(|index| self.state.applied >= index)
+        {
+            self.quota.set_gate(None, self.state.applied);
+        }
+        self.scan_quota_log(None)?;
         let cluster = self.state.cluster_quota;
         if self.quota.observed == Some(cluster) {
             return Ok(());
         }
-        // The first cluster quota follows entries of an earlier binary. Truncate them.
-        if self.quota.observed == Some(None) && cluster.is_some() && self.state.seeded_late {
-            self.quota.checkpoint = self.state.applied;
-        }
         self.quota.observed = Some(cluster);
         self.quota.acknowledge(cluster)?;
-        if cluster.is_some() && self.quota.blocked.take().is_some() {
-            tracing::info!(
-                applied = self.state.applied,
-                "apply resumes with the cluster quota"
-            );
-        }
         // Shared mode warns when it reads the cluster claim.
         if self.state.quota_mismatch && self.quota.record.is_some() {
             tracing::warn!(
@@ -304,41 +390,141 @@ impl Node {
         Ok(())
     }
 
-    /// Return true while a state created empty has no cluster quota. Apply then checks each
-    /// batch with `guard_quota`, and runs one batch at a time.
+    /// Return true while a state created empty has no cluster quota. Apply then runs one batch
+    /// at a time and stops before a `Gate::Checked` entry.
     pub(super) fn quota_guarded(&self) -> bool {
         self.quota.created_empty() && self.state.cluster_quota.is_none()
     }
 
-    /// Keep only the entries before the first quota-checked entry that precedes a `SetQuota`
-    /// entry. A state created empty must not apply it under its own flag: an earlier binary
-    /// wrote it, and other members applied it under their flags. Then ask the leader for a
-    /// snapshot. The installed state replaces the decisions of that prefix.
-    pub(super) fn guard_quota(&mut self, entries: &mut Vec<Entry>) -> Result<()> {
-        let position = match self.quota_guarded() {
-            true => crate::state::quota::unguarded(entries)?,
-            false => None,
-        };
-        let Some(position) = position.filter(|&position| position == 0) else {
-            if let Some(position) = position {
-                entries.truncate(position);
-            }
-            self.quota.blocked = None;
+    /// Find the first gate in the cached log above the applied index. `replaced` is the first
+    /// index of entries that replace a log suffix. Run after Raft entries are staged and after
+    /// apply.
+    pub(super) fn scan_quota_log(&mut self, replaced: Option<u64>) -> Result<()> {
+        if !self.quota_guarded() {
+            self.quota.set_gate(None, 0);
             return Ok(());
-        };
-        let index = entries[position].index;
-        entries.clear();
-        if self.quota.blocked != Some(index) {
-            self.quota.blocked = Some(index);
+        }
+        if let Some(first) = replaced {
+            let index = match self.quota.gate {
+                Some(Gate::SetQuota(index) | Gate::Checked(index)) => index,
+                None => u64::MAX,
+            };
+            if index >= first || self.quota.scanned >= first {
+                self.quota.set_gate(None, self.quota.scanned.min(first - 1));
+            }
+        }
+        if self.quota.gate.is_some() {
+            return Ok(());
+        }
+        let first = self.raw.store().first_index()?;
+        let low = self.quota.scanned.max(self.state.applied).max(first - 1) + 1;
+        let last = self.raw.store().last_index()?;
+        if low > last {
+            return Ok(());
+        }
+        // Entries above the applied index are pending in the cache.
+        let entries =
+            self.raw
+                .store()
+                .entries(low, last + 1, None, raft::GetEntriesContext::empty(false))?;
+        let gate = first_gate(&entries)?;
+        if let Some(Gate::Checked(index)) = gate {
             tracing::error!(
                 index,
                 "entry needs the cluster quota; apply waits for a snapshot from the leader"
             );
         }
-        // Raft drops the request without a leader or with a request in flight. The next
-        // schedule asks again.
-        let _ = self.raw.request_snapshot();
+        self.quota.set_gate(gate, last);
         Ok(())
+    }
+
+    /// Limit an apply batch that ends before `high` to the entries before a waiting entry. Ask
+    /// the leader for a snapshot when no entry is left.
+    pub(super) fn quota_apply_limit(&mut self, low: u64, high: u64) -> u64 {
+        let Some(blocked) = self.quota.blocked() else {
+            return high;
+        };
+        if blocked <= low {
+            self.request_quota_snapshot();
+        }
+        high.min(blocked)
+    }
+
+    /// Ask the leader for a snapshot that replaces the entries before the cluster quota. Raft
+    /// drops the request on a leader, without a leader, or with a request in flight. The next
+    /// tick asks again.
+    fn request_quota_snapshot(&mut self) {
+        if self.quota.blocked() == Some(self.state.applied + 1) {
+            let _ = self.raw.request_snapshot();
+        }
+    }
+
+    /// Tick Raft. A member that waits for a snapshot does not start an election while it
+    /// knows a leader, so the group does not elect a member that cannot apply.
+    ///
+    /// Without a known leader for three election timeouts, it may campaign, so it never holds
+    /// up the group. If it wins, `propose_quota` hands leadership over at once.
+    pub(super) fn tick_raft(&mut self) -> Result<()> {
+        if self.quota.blocked().is_some() {
+            let raft = &mut self.raw.raft;
+            if raft.leader_id == raft::INVALID_ID {
+                self.quota.leaderless += 1;
+            } else {
+                self.quota.leaderless = 0;
+            }
+            if self.quota.leaderless < 3 * raft.election_timeout() {
+                // Keep the timer past the leader lease, so the member still votes, but below
+                // the largest randomized timeout, so it does not campaign.
+                let timeout = 2 * raft.election_timeout() - 1;
+                raft.set_randomized_election_timeout(timeout);
+                raft.election_elapsed = raft.election_elapsed.min(timeout - 2);
+            }
+            self.request_quota_snapshot();
+        }
+        self.raw.tick();
+        self.propose_quota()
+    }
+
+    /// Step a peer message. A member that waits for a snapshot ignores a leadership transfer.
+    /// A new leader proposes the cluster quota before the next client write.
+    pub(super) fn step_peer(&mut self, message: Message) -> raft::Result<()> {
+        if message.get_msg_type() == MessageType::MsgTimeoutNow && self.quota.blocked().is_some() {
+            tracing::info!(
+                from = message.from,
+                "ignore a leadership transfer before a snapshot"
+            );
+            return Ok(());
+        }
+        self.raw.step(message)?;
+        if let Err(error) = self.propose_quota() {
+            tracing::warn!(%error, "cannot propose the cluster quota");
+        }
+        Ok(())
+    }
+
+    /// A leader that waits for a snapshot cannot apply, so it hands leadership to the voter
+    /// with the longest matched log.
+    fn yield_leadership(&mut self) {
+        if self.raw.raft.lead_transferee.is_some() {
+            return;
+        }
+        let id = self.options.id;
+        let target = self
+            .raw
+            .raft
+            .prs()
+            .iter()
+            .filter(|(&peer, _)| peer != id)
+            .filter(|(&peer, _)| self.raw.raft.prs().conf().voters().contains(peer))
+            .max_by_key(|(_, progress)| progress.matched)
+            .map(|(&peer, _)| peer);
+        if let Some(target) = target {
+            tracing::warn!(
+                target,
+                "hand over leadership while apply waits for a snapshot"
+            );
+            self.raw.transfer_leader(target);
+        }
     }
 
     /// The quota fields of `/status`.
@@ -349,7 +535,7 @@ impl Node {
             "flag_bytes": self.quota.flag,
             "flag_mismatch": self.state.quota_mismatch,
             "flag_pending": self.quota.pending(),
-            "blocked_index": self.quota.blocked,
+            "blocked_index": self.quota.blocked(),
         })
     }
 
@@ -426,7 +612,11 @@ pub(super) mod tests {
             proposal(Some(row(9, 4, 2)), 5, pending(5, 4), 3),
             Some((row(5, 4, 3), false))
         );
-        assert_eq!(proposal(Some(row(5, 1, 2)), 5, pending(5, 4), 1), None);
+        // A newer request with the same value still moves the row forward.
+        assert_eq!(
+            proposal(Some(row(5, 1, 2)), 5, pending(5, 4), 1),
+            Some((row(5, 4, 1), false))
+        );
         // A disabled quota is a value like any other.
         assert_eq!(
             proposal(Some(row(9, 3, 2)), -1, pending(-1, 4), 1),
@@ -826,86 +1016,314 @@ pub(super) mod tests {
         }
     }
 
+    /// Open a member that starts empty and then holds `entries` of an earlier binary.
+    async fn waiting_member(dir: &Path, entries: &[RaftCommand], pending: usize) -> Node {
+        drop(open_node(dir, 3000, false).await);
+        append_committed(dir, 1, entries);
+        let mut config = options(dir);
+        config.quota_bytes = 3000;
+        config.log_memory.pending_bytes = pending;
+        let (events, _) = mpsc::channel(256);
+        Node::open_with_transport(config, events, Some(BTreeMap::new()))
+            .await
+            .unwrap()
+    }
+
+    async fn drive(node: &mut Node) {
+        for _ in 0..5 {
+            node.drive_ready().await.unwrap();
+            node.drain_log().await.unwrap();
+            node.drain_apply().await.unwrap();
+        }
+    }
+
+    /// A snapshot of another member that applied `entries` under the cluster decisions.
+    /// Return it and its revision.
+    async fn covering_snapshot(
+        dir: &Path,
+        entries: &[RaftCommand],
+    ) -> (raft::eraftpb::Snapshot, i64) {
+        let mut source = StateMachine::open(&dir.join("source")).await.unwrap();
+        source.set_quota_flag(1 << 20);
+        let members = crate::cluster::Store::initial(&options(dir).peers);
+        source.members = std::sync::Arc::new(members.clone());
+        source.members_unsaved = true;
+        let log: Vec<_> = (1..)
+            .zip(entries)
+            .map(|(index, command)| Entry {
+                index,
+                term: 1,
+                data: command.encode().unwrap(),
+                ..Default::default()
+            })
+            .collect();
+        let header = super::super::apply::Header {
+            cluster: 0,
+            member: 2,
+            term: 1,
+        };
+        super::super::apply::apply_entries(&mut source, log, header)
+            .await
+            .unwrap();
+        let mut snapshot = raft::eraftpb::Snapshot {
+            data: source.snapshot_data().await.unwrap(),
+            ..Default::default()
+        };
+        snapshot.mut_metadata().index = entries.len() as u64;
+        snapshot.mut_metadata().term = 1;
+        snapshot.mut_metadata().set_conf_state(members.conf());
+        let revision = source.revision;
+        source.close().await.unwrap();
+        (snapshot, revision)
+    }
+
+    fn message(kind: MessageType, from: u64, term: u64) -> Message {
+        let mut message = Message::default();
+        message.set_msg_type(kind);
+        message.from = from;
+        message.to = 1;
+        message.term = term;
+        message
+    }
+
+    /// Member 2 leads. Member 1 asks it for a snapshot and installs `snapshot`.
+    async fn install_requested(node: &mut Node, snapshot: raft::eraftpb::Snapshot) {
+        let index = snapshot.get_metadata().index;
+        node.step_peer(message(MessageType::MsgHeartbeat, 2, 1))
+            .unwrap();
+        node.tick_raft().unwrap();
+        drive(node).await;
+        assert_eq!(node.raw.raft.pending_request_snapshot, index);
+        let mut install = message(MessageType::MsgSnapshot, 2, 1);
+        install.set_snapshot(snapshot);
+        node.step_peer(install).unwrap();
+        apply_committed(node).await;
+        assert_eq!(node.state.applied, index);
+        assert_eq!(node.quota.blocked(), None);
+    }
+
+    /// Entries of an earlier binary: `first`, 39 Puts, and the seed at index 41.
+    fn earlier_entries(first: RaftCommand) -> Vec<RaftCommand> {
+        let mut entries = vec![first];
+        entries.extend((2..=40).map(quota_put));
+        entries.push(set_quota(1 << 20, 0, 2));
+        entries
+    }
+
     /// A state that this binary created empty must not apply the entries of an earlier binary
-    /// under its own flag: a Put, a transaction with a Put, or a lease grant. It waits for a
-    /// snapshot, and catches up after the install.
+    /// under its own flag: a Put, a transaction with a Put, or a lease grant. It knows the
+    /// waiting entry at open, waits for a snapshot, and catches up after the install.
     #[tokio::test]
     async fn a_new_member_waits_for_a_snapshot_before_entries_of_an_earlier_binary() {
         for first in [quota_put(1), txn_put(1), lease_grant(1)] {
             let dir = tempfile::tempdir().unwrap();
-            // The member starts empty, then receives entries from before the first seed.
-            drop(open_node(dir.path(), 3000, false).await);
-            let mut entries = vec![first];
-            entries.extend((2..=40).map(quota_put));
-            entries.push(set_quota(1 << 20, 0, 2));
-            append_committed(dir.path(), 1, &entries);
-            let mut node = open_node(dir.path(), 3000, false).await;
+            let entries = earlier_entries(first);
+            let mut node = waiting_member(dir.path(), &entries, 32 << 20).await;
             assert!(node.quota.created_empty());
-            for _ in 0..5 {
-                node.drive_ready().await.unwrap();
-                node.drain_log().await.unwrap();
-                node.drain_apply().await.unwrap();
-            }
+            assert_eq!(node.quota.blocked(), Some(1));
+            drive(&mut node).await;
             assert_eq!(node.state.applied, 0);
-            assert_eq!(node.quota.blocked, Some(1));
-
-            // Another member applied the same entries under the decisions of the cluster.
-            let mut source = StateMachine::open(&dir.path().join("source"))
-                .await
-                .unwrap();
-            source.set_quota_flag(1 << 20);
-            let members = crate::cluster::Store::initial(&options(dir.path()).peers);
-            source.members = std::sync::Arc::new(members.clone());
-            source.members_unsaved = true;
-            let log: Vec<_> = (1..)
-                .zip(&entries)
-                .map(|(index, command)| Entry {
-                    index,
-                    term: 1,
-                    data: command.encode().unwrap(),
-                    ..Default::default()
-                })
-                .collect();
-            let header = super::super::apply::Header {
-                cluster: 0,
-                member: 2,
-                term: 1,
-            };
-            super::super::apply::apply_entries(&mut source, log, header)
-                .await
-                .unwrap();
-            let mut snapshot = raft::eraftpb::Snapshot {
-                data: source.snapshot_data().await.unwrap(),
-                ..Default::default()
-            };
-            snapshot.mut_metadata().index = 41;
-            snapshot.mut_metadata().term = 1;
-            snapshot.mut_metadata().set_conf_state(members.conf());
-            let revision = source.revision;
-            source.close().await.unwrap();
-
-            // The leader appears. The member asks it for a snapshot and installs it.
-            let mut heartbeat = Message::default();
-            heartbeat.set_msg_type(MessageType::MsgHeartbeat);
-            heartbeat.from = 2;
-            heartbeat.to = 1;
-            heartbeat.term = 1;
-            node.raw.step(heartbeat).unwrap();
-            node.drive_ready().await.unwrap();
-            assert_eq!(node.raw.raft.pending_request_snapshot, 41);
-            let mut message = Message::default();
-            message.set_msg_type(MessageType::MsgSnapshot);
-            message.from = 2;
-            message.to = 1;
-            message.term = 1;
-            message.set_snapshot(snapshot);
-            node.raw.step(message).unwrap();
-            apply_committed(&mut node).await;
-            assert_eq!(node.state.applied, 41);
+            let (snapshot, revision) = covering_snapshot(dir.path(), &entries).await;
+            install_requested(&mut node, snapshot).await;
             assert_eq!(node.state.cluster_quota, Some(row(1 << 20, 0, 2)));
             assert_eq!(node.state.revision, revision);
             assert!(node.worker.state().alarms.is_empty());
-            assert_eq!(node.quota.blocked, None);
         }
+    }
+
+    /// A waiting member knows its waiting entry before apply reaches it. It does not start an
+    /// election while it knows a leader, ignores a leadership transfer, and still votes.
+    #[tokio::test]
+    async fn a_waiting_member_does_not_campaign_but_votes() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = earlier_entries(quota_put(1));
+        let mut node = waiting_member(dir.path(), &entries, 32 << 20).await;
+        assert_eq!(node.quota.blocked(), Some(1));
+        node.step_peer(message(MessageType::MsgHeartbeat, 2, 1))
+            .unwrap();
+        for _ in 0..60 {
+            node.tick_raft().unwrap();
+        }
+        assert_eq!(node.raw.raft.state, StateRole::Follower);
+        assert_eq!(node.raw.raft.term, 1);
+        node.step_peer(message(MessageType::MsgTimeoutNow, 2, 1))
+            .unwrap();
+        assert_eq!(node.raw.raft.state, StateRole::Follower);
+        assert_eq!(node.raw.raft.term, 1);
+        let mut vote = message(MessageType::MsgRequestVote, 3, 2);
+        vote.index = 41;
+        vote.log_term = 1;
+        node.step_peer(vote).unwrap();
+        assert_eq!(node.raw.raft.vote, 3);
+    }
+
+    /// A member of a new empty cluster has no waiting entry, so it campaigns as usual.
+    #[tokio::test]
+    async fn a_member_of_a_new_cluster_campaigns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = open_node(dir.path(), 3000, false).await;
+        assert!(node.quota.created_empty());
+        assert_eq!(node.quota.blocked(), None);
+        for _ in 0..30 {
+            node.tick_raft().unwrap();
+        }
+        assert_ne!(node.raw.raft.state, StateRole::Follower);
+    }
+
+    /// A waiting member that still wins an election hands leadership to another voter.
+    #[tokio::test]
+    async fn a_waiting_member_that_wins_hands_over_leadership() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = waiting_member(
+            dir.path(),
+            &[quota_put(1), set_quota(10000, 0, 2)],
+            32 << 20,
+        )
+        .await;
+        drive(&mut node).await;
+        assert_eq!(node.quota.blocked(), Some(1));
+        node.raw.campaign().unwrap();
+        for kind in [
+            MessageType::MsgRequestPreVoteResponse,
+            MessageType::MsgRequestVoteResponse,
+        ] {
+            let term =
+                node.raw.raft.term + u64::from(kind == MessageType::MsgRequestPreVoteResponse);
+            let (tx, _) = oneshot::channel();
+            node.handle(Event::Step(message(kind, 2, term), tx), &mut vec![])
+                .await
+                .unwrap();
+        }
+        drive(&mut node).await;
+        assert_eq!(node.raw.raft.state, StateRole::Leader);
+        assert!(matches!(node.raw.raft.lead_transferee, Some(2 | 3)));
+    }
+
+    /// The row keeps the index of a first cluster quota after an earlier binary. A restart
+    /// before the Raft checkpoint still truncates the log through it.
+    #[tokio::test]
+    async fn a_restart_retries_the_checkpoint_through_the_first_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let commands = [quota_put(1), set_quota(10000, 0, 2)];
+        append_committed(dir.path(), 1, &commands);
+        let mut state = StateMachine::open(&dir.path().join("objects"))
+            .await
+            .unwrap();
+        let log = (1..)
+            .zip(&commands)
+            .map(|(index, command)| Entry {
+                index,
+                term: 1,
+                data: command.encode().unwrap(),
+                ..Default::default()
+            })
+            .collect();
+        let header = super::super::apply::Header {
+            cluster: 0,
+            member: 1,
+            term: 1,
+        };
+        super::super::apply::apply_entries(&mut state, log, header)
+            .await
+            .unwrap();
+        assert_eq!(state.quota_boundary, 2);
+        state.snapshot_data().await.unwrap();
+        state.close().await.unwrap();
+        let mut node = open_node(dir.path(), 10000, false).await;
+        apply_committed(&mut node).await;
+        assert_eq!(node.state.applied, 2);
+        assert!(node.raw.store().snapshot_index() >= 2);
+    }
+
+    /// Puts of `size` bytes, then the seed.
+    fn large_entries(count: u64, size: usize) -> Vec<RaftCommand> {
+        let mut entries: Vec<_> = (1..=count)
+            .map(|n| {
+                let mut command = quota_put(n);
+                if let RaftCommand::Etcd { etcd, .. } = &mut command {
+                    if let Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(put)) =
+                        &mut etcd.request
+                    {
+                        put.value = vec![1; size];
+                    }
+                }
+                command
+            })
+            .collect();
+        entries.push(set_quota(1 << 20, 0, 2));
+        entries
+    }
+
+    /// A waiting member with a backlog above its pending limit starts, and does not hold the
+    /// backlog.
+    #[tokio::test]
+    async fn a_waiting_member_starts_with_a_large_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = large_entries(36, 1 << 20);
+        let node = waiting_member(dir.path(), &entries, 32 << 20).await;
+        assert_eq!(node.quota.blocked(), Some(1));
+        assert_eq!(node.state.applied, 0);
+        assert_eq!(node.raw.raft.raft_log.applied, 37);
+    }
+
+    /// A restart lowers the pending limit below the backlog of a waiting member. The member
+    /// installs the snapshot within the limit and catches up.
+    #[tokio::test]
+    async fn a_waiting_member_recovers_within_a_lower_pending_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = large_entries(12, 1 << 20);
+        let mut node = waiting_member(dir.path(), &entries, 9 << 20).await;
+        assert_eq!(node.raw.raft.raft_log.applied, 13);
+        drive(&mut node).await;
+        assert_eq!(node.state.applied, 0);
+        let (snapshot, revision) = covering_snapshot(dir.path(), &entries).await;
+        install_requested(&mut node, snapshot).await;
+        assert_eq!(node.state.revision, revision);
+        assert_eq!(node.state.cluster_quota, Some(row(1 << 20, 0, 2)));
+        assert!(node.raw.store().stats()["pending_bytes"].as_u64().unwrap() <= 9 << 20);
+    }
+
+    /// The durable row holds 200 at time 10, the committed tail 300 at time 30, and the member a
+    /// request for 200 at time 40. The request is newer than both, so it survives the replay,
+    /// and its proposal sets 200 at time 40.
+    #[tokio::test]
+    async fn a_newer_request_with_an_older_value_survives_the_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("member");
+        restore_with(temp.path(), &dir, row(200, 10, 2)).await;
+        append_committed(&dir, 2, &[set_quota(300, 30, 2)]);
+        Quota::open(&dir, startup(100, 10, false, false)).unwrap();
+        Quota::open(&dir, startup(200, 40, false, false)).unwrap();
+        let mut node = open_node(&dir, 200, false).await;
+        apply_committed(&mut node).await;
+        assert_eq!(node.state.cluster_quota, Some(row(300, 30, 2)));
+        let (request, seed) = leader_request(&node).unwrap();
+        assert_eq!((request, seed), (row(200, 40, 1), false));
+        drop(node);
+        append_committed(&dir, 3, &[set_quota(200, 40, 1)]);
+        let mut node = open_node(&dir, 200, false).await;
+        apply_committed(&mut node).await;
+        assert_eq!(node.state.cluster_quota, Some(row(200, 40, 1)));
+        assert_eq!(node.quota.pending(), None);
+        assert_eq!(leader_request(&node), None);
+    }
+
+    /// A newer request with the value of the row still moves the order of the row forward, once.
+    #[tokio::test]
+    async fn a_newer_request_with_the_same_value_advances_the_row_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("member");
+        restore_with(temp.path(), &dir, row(200, 10, 2)).await;
+        Quota::open(&dir, startup(100, 5, false, false)).unwrap();
+        Quota::open(&dir, startup(200, 40, false, false)).unwrap();
+        let mut node = open_node(&dir, 200, false).await;
+        apply_committed(&mut node).await;
+        assert_eq!(leader_request(&node), Some((row(200, 40, 1), false)));
+        drop(node);
+        append_committed(&dir, 2, &[set_quota(200, 40, 1)]);
+        let mut node = open_node(&dir, 200, false).await;
+        apply_committed(&mut node).await;
+        assert_eq!(node.state.cluster_quota, Some(row(200, 40, 1)));
+        assert_eq!(leader_request(&node), None);
     }
 }

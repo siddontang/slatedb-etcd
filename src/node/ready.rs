@@ -50,6 +50,15 @@ impl Node {
             self.raw
                 .mut_store()
                 .stage(ready.entries(), hs.as_ref(), snapshot.as_ref())?;
+            // New entries can hold a quota-checked entry of an earlier binary. Find it before a
+            // vote or apply reaches it. A snapshot or a conflict replaces the scanned suffix.
+            let replaced = match &snapshot {
+                Some(snapshot) => Some(snapshot.get_metadata().index + 1),
+                None => ready.entries().first().map(|entry| entry.index),
+            };
+            if replaced.is_some() {
+                self.scan_quota_log(replaced)?;
+            }
             self.appended_bytes = ready
                 .entries()
                 .iter()

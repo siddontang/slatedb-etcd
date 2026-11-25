@@ -284,9 +284,9 @@ did, so replicas of such a state can differ. The leader proposes `SetQuota` righ
 election, before its client writes. An entry applies only when its request is newer than the
 row: `(requested_at, member, bytes)` orders requests on every replica.
 
-A replica checkpoints through a first `SetQuota` entry that follows quota-checked entries. So
-the log of a leader no longer holds such entries of earlier binaries. A new member installs a
-snapshot instead.
+A replica checkpoints through a first `SetQuota` entry that follows quota-checked entries. The
+row keeps that index, so a restart retries the checkpoint. So the log of a leader no longer
+holds such entries of earlier binaries. A new member installs a snapshot instead.
 A state that this binary created empty also stops before such an entry and requests a snapshot.
 See [quota changes](operations.md#change-the-quota).
 Each member flushes SlateDB outside ordered apply when a step finishes a physical boundary.

@@ -87,7 +87,7 @@ Shared mode keeps the quota of its cluster claim instead; see [shared state](sha
   flag makes a request with the wall-clock time of that start. The member proposes the request
   each time it leads, until the cluster quota equals it or holds a newer request.
 - The newest request wins, on every member and in every order of apply. Equal times compare the
-  member ID, then the value.
+  member ID. A newer request with the current value still replaces the older request.
 - A member with an unchanged flag does not change the cluster quota when it leads. So a rolling
   restart with a new flag takes effect when the first updated member leads. Use
   `etcdctl move-leader` to select it.
@@ -105,7 +105,10 @@ option from later restart commands.
 
 A member with a new data directory never applies a Put, a transaction with a Put, or a lease
 grant that an earlier binary wrote before the first cluster quota. Apply stops at that entry,
-logs an error, and asks the leader for a snapshot. It resumes after the install.
+logs an error, and asks the leader for a snapshot. It resumes after the install. Until then
+the member does not start an election while it knows a leader, ignores leadership transfers,
+and hands over leadership if it wins. It still votes. A backlog above `--log-pending-bytes`
+does not stop its start.
 
 Equal flags do not repair members that already applied entries under different quotas.
 Compare revisions, alarms, and HashKV. Remove a member that differs, and add it again as a new

@@ -38,32 +38,38 @@ impl ClusterQuota {
         (self.requested_at, self.member, self.bytes)
     }
 
-    /// Three big-endian values: `bytes`, `requested_at`, and `member`.
-    fn encode(&self) -> [u8; 24] {
-        let mut row = [0; 24];
+    /// Four big-endian values: `bytes`, `requested_at`, `member`, and the boundary of
+    /// `StateMachine::quota_boundary`.
+    fn encode(&self, boundary: u64) -> [u8; 32] {
+        let mut row = [0; 32];
         row[..8].copy_from_slice(&self.bytes.to_be_bytes());
         row[8..16].copy_from_slice(&self.requested_at.to_be_bytes());
-        row[16..].copy_from_slice(&self.member.to_be_bytes());
+        row[16..24].copy_from_slice(&self.member.to_be_bytes());
+        row[24..].copy_from_slice(&boundary.to_be_bytes());
         row
     }
 
-    fn decode(row: &[u8]) -> Result<Self> {
-        let row: &[u8; 24] = row.try_into().context("invalid cluster quota")?;
-        Ok(Self {
+    fn decode(row: &[u8]) -> Result<(Self, u64)> {
+        let row: &[u8; 32] = row.try_into().context("invalid cluster quota")?;
+        let quota = Self {
             bytes: i64::from_be_bytes(row[..8].try_into()?),
             requested_at: u64::from_be_bytes(row[8..16].try_into()?),
-            member: u64::from_be_bytes(row[16..].try_into()?),
-        })
+            member: u64::from_be_bytes(row[16..24].try_into()?),
+        };
+        Ok((quota, u64::from_be_bytes(row[24..].try_into()?)))
     }
 }
 
-/// Read the cluster quota of a replicated state. `None` means that no `SetQuota` entry applied.
-pub(super) async fn load(reads: &impl StateRead) -> Result<Option<ClusterQuota>> {
-    reads
-        .get(KEY)
-        .await?
-        .map(|row| ClusterQuota::decode(&row))
-        .transpose()
+/// Read the cluster quota of a replicated state and its boundary. `None` means that no
+/// `SetQuota` entry applied.
+pub(super) async fn load(reads: &impl StateRead) -> Result<(Option<ClusterQuota>, u64)> {
+    Ok(match reads.get(KEY).await? {
+        Some(row) => {
+            let (quota, boundary) = ClusterQuota::decode(&row)?;
+            (Some(quota), boundary)
+        }
+        None => (None, 0),
+    })
 }
 
 /// Return true when apply checks the quota for `command`: a Put, a transaction with a Put, or a
@@ -78,48 +84,7 @@ pub(crate) fn checks_quota(command: &crate::RaftCommand) -> bool {
     }
 }
 
-/// Return the position of the first entry that a state without a cluster quota must not apply
-/// under a member flag: a quota-checked entry before any `SetQuota` entry.
-pub(crate) fn unguarded(entries: &[raft::eraftpb::Entry]) -> Result<Option<usize>> {
-    use raft::eraftpb::EntryType;
-    for (position, entry) in entries.iter().enumerate() {
-        if entry.entry_type != EntryType::EntryNormal as i32 || entry.data.is_empty() {
-            continue;
-        }
-        let command = crate::RaftCommand::decode(&entry.data)?;
-        if matches!(command, crate::RaftCommand::SetQuota { .. }) {
-            return Ok(None);
-        }
-        if checks_quota(&command) {
-            return Ok(Some(position));
-        }
-    }
-    Ok(None)
-}
-
 impl StateMachine {
-    /// Keep only the entries before the first unguarded one, for a recovery replay of a state
-    /// that this binary created empty. Fail when the first entry is unguarded: the member then
-    /// needs a snapshot.
-    pub(crate) fn guard_replay(
-        &self,
-        created_empty: bool,
-        entries: &mut Vec<raft::eraftpb::Entry>,
-    ) -> Result<()> {
-        if !created_empty || self.cluster_quota.is_some() {
-            return Ok(());
-        }
-        if let Some(position) = unguarded(entries)? {
-            ensure!(
-                position > 0,
-                "entry {} needs the cluster quota; replace this member to install a snapshot",
-                entries[position].index
-            );
-            entries.truncate(position);
-        }
-        Ok(())
-    }
-
     /// Set the effective `--quota-backend-bytes` value of this member. Replicated apply uses it
     /// only while the state has no cluster quota. A non-positive value disables the check.
     pub(crate) fn set_quota_flag(&mut self, flag: i64) {
@@ -176,13 +141,14 @@ impl StateMachine {
             index == self.applied + 1,
             "non-contiguous state machine apply"
         );
-        if self.cluster_quota.is_none() {
+        if self.cluster_quota.is_none()
+            && (self.revision > 1 || !self.leases.is_empty() || !self.alarms.is_empty())
+        {
             // Entries before this one applied under member flags. A fresh cluster has none.
-            self.seeded_late =
-                self.revision > 1 || !self.leases.is_empty() || !self.alarms.is_empty();
+            self.quota_boundary = index;
         }
         let mut batch = WriteBatch::new();
-        batch.put(KEY, request.encode());
+        batch.put(KEY, request.encode(self.quota_boundary));
         self.mark_applied(&mut batch, index);
         self.write_batch(batch, index).await?;
         self.applied = index;
@@ -193,7 +159,7 @@ impl StateMachine {
 
     /// Read the cluster quota again after the rows of the state changed.
     pub(super) async fn reload_quota(&mut self) -> Result<()> {
-        self.cluster_quota = load(self.applied_state()).await?;
+        (self.cluster_quota, self.quota_boundary) = load(self.applied_state()).await?;
         self.refresh_quota();
         Ok(())
     }
