@@ -1148,3 +1148,282 @@ async fn defragment_replaces_every_input_sorted_run() {
         .any(|view| input.contains(&view.id)));
     db.close().await.unwrap();
 }
+
+/// A writer that caches nothing at a flush, so the member cache holds no block of a new SST.
+async fn cold_writer(state: &StateMachine) -> slatedb::Db {
+    let source = state.shared.as_ref().unwrap().source.clone();
+    slatedb::Db::builder(source.state(), source.store.clone())
+        .with_db_cache(source.cache.clone(), 0)
+        .with_settings(slatedb_settings())
+        .with_block_cache_policy(slatedb::BlockCachePolicy::default().with_flush_targets(&[]))
+        .build()
+        .await
+        .unwrap()
+}
+
+/// Write the overlay into `writer`, flush, and create a view checkpoint. A read of the apply
+/// marker caches what a base open reads, but no current-row block.
+async fn cold_checkpoint(
+    state: &StateMachine,
+    writer: &slatedb::Db,
+    written: &mut u64,
+) -> uuid::Uuid {
+    cold_flush(state, writer, written).await;
+    writer
+        .create_checkpoint(
+            CheckpointScope::Durable,
+            &CheckpointOptions {
+                name: Some(shared::view_name(*written)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .id
+}
+
+/// Write the overlay into `writer` and flush it to a new L0 SST. A read of the apply marker
+/// caches what a base open reads, but no current-row block.
+async fn cold_flush(state: &StateMachine, writer: &slatedb::Db, written: &mut u64) {
+    let queue = state.shared.as_ref().unwrap().overlay.queue();
+    for (seq, batch) in queue.after(*written, usize::MAX) {
+        writer
+            .write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
+            .await
+            .unwrap();
+        *written = seq;
+    }
+    writer.flush().await.unwrap();
+    writer.get(APPLIED).await.unwrap();
+}
+
+/// Put `count` keys from `first` with 200 B values, so the rows fill many blocks.
+async fn put_rows(state: &mut StateMachine, first: usize, count: usize) {
+    for n in first..first + count {
+        state
+            .apply_etcd(
+                state.applied + 1,
+                &put(&format!("k{n:04}"), &"v".repeat(200)),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+fn current(key: &str) -> Vec<u8> {
+    [crate::mvcc::CURRENT, key.as_bytes()].concat()
+}
+
+/// Apply the announcement of `id` and switch to its base once the background open offers it.
+async fn adopt(state: &mut StateMachine, id: uuid::Uuid) {
+    state
+        .apply_view_checkpoint(state.applied + 1, &id.to_string())
+        .await
+        .unwrap();
+    state.settle_opens().await;
+    state.switch_base();
+    assert_eq!(state.base_checkpoint(), Some(id));
+}
+
+async fn fault_state() -> (Arc<crate::object::faults::FaultStore>, StateMachine) {
+    let faults = Arc::new(crate::object::faults::FaultStore::new(Arc::new(
+        InMemory::new(),
+    )));
+    let state = open_shared(faults.clone()).await;
+    (faults, state)
+}
+
+/// A publication, a snapshot receipt, and a restart open a base without a cache warm. Slow SST
+/// reads do not delay them.
+#[tokio::test]
+async fn slow_sst_reads_do_not_delay_metadata_opens() {
+    use crate::object::faults::DELAY_SST_GET;
+    let (faults, mut state) = fault_state().await;
+    put_rows(&mut state, 0, 300).await;
+    let writer = cold_writer(&state).await;
+    let id = cold_checkpoint(&state, &writer, &mut 0).await;
+    let source = state.shared.as_ref().unwrap().source.clone();
+    faults.set_delay(Duration::from_secs(3));
+    faults.set(DELAY_SST_GET);
+    let limit = Duration::from_secs(1);
+    let base = tokio::time::timeout(limit, source.open_base(id))
+        .await
+        .expect("an open waited for SST reads")
+        .unwrap();
+    tokio::time::timeout(limit, source.receive(id))
+        .await
+        .expect("a receipt waited for SST reads")
+        .unwrap();
+    assert!(source.pinned().contains(&id));
+    assert!(source.warmed().0.is_empty());
+    drop(base);
+    faults.set(0);
+    writer.close().await.unwrap();
+    state.close().await.unwrap();
+}
+
+/// A follower adoption warms for at most `WARM_MAX`, then switches to the base.
+#[tokio::test]
+async fn an_adoption_switches_within_the_warm_limit() {
+    use crate::object::faults::DELAY_SST_GET;
+    let (faults, mut state) = fault_state().await;
+    put_rows(&mut state, 0, 300).await;
+    let writer = cold_writer(&state).await;
+    let id = cold_checkpoint(&state, &writer, &mut 0).await;
+    faults.set_delay(Duration::from_secs(3));
+    faults.set(DELAY_SST_GET);
+    let started = std::time::Instant::now();
+    state
+        .apply_view_checkpoint(state.applied + 1, &id.to_string())
+        .await
+        .unwrap();
+    while state.base_checkpoint() != Some(id) && started.elapsed() < Duration::from_secs(3) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        state.switch_base();
+    }
+    assert_eq!(state.base_checkpoint(), Some(id));
+    let elapsed = started.elapsed();
+    assert!(elapsed >= shared::WARM_MAX, "{elapsed:?}");
+    assert!(elapsed < shared::WARM_MAX * 3, "{elapsed:?}");
+    faults.set(0);
+    writer.close().await.unwrap();
+    state.close().await.unwrap();
+}
+
+/// An SST whose warm failed stays cold in the warm set, and the next adoption loads it.
+#[tokio::test]
+async fn a_failed_warm_is_retried_on_a_later_base() {
+    use crate::object::faults::FAIL_SST_GET;
+    let (faults, mut state) = fault_state().await;
+    put_rows(&mut state, 0, 300).await;
+    let writer = cold_writer(&state).await;
+    let mut written = 0;
+    let first = cold_checkpoint(&state, &writer, &mut written).await;
+    faults.set(FAIL_SST_GET);
+    adopt(&mut state, first).await;
+    faults.set(0);
+    let source = state.shared.as_ref().unwrap().source.clone();
+    assert!(source.warmed().0.is_empty());
+    put_rows(&mut state, 300, 10).await;
+    let second = cold_checkpoint(&state, &writer, &mut written).await;
+    adopt(&mut state, second).await;
+    faults.set(FAIL_SST_GET);
+    let base = state.shared.as_ref().unwrap().base.clone();
+    assert!(base.get(&current("k0001")).await.unwrap().is_some());
+    faults.set(0);
+    writer.close().await.unwrap();
+    state.close().await.unwrap();
+}
+
+/// Two warms at the same time both add their SSTs.
+#[tokio::test]
+async fn concurrent_warms_keep_both_results() {
+    let (_faults, mut state) = fault_state().await;
+    put_rows(&mut state, 0, 50).await;
+    let writer = cold_writer(&state).await;
+    let mut written = 0;
+    let first = cold_checkpoint(&state, &writer, &mut written).await;
+    put_rows(&mut state, 50, 50).await;
+    let second = cold_checkpoint(&state, &writer, &mut written).await;
+    let source = state.shared.as_ref().unwrap().source.clone();
+    let (a, b) = (
+        source.open_base(first).await.unwrap(),
+        source.open_base(second).await.unwrap(),
+    );
+    tokio::join!(source.warm(&b), source.warm(&a));
+    let all: std::collections::HashSet<_> =
+        a.ssts().iter().chain(b.ssts()).map(|(id, _)| *id).collect();
+    assert_eq!(all.len(), 2);
+    assert_eq!(source.warmed().0, all);
+    writer.close().await.unwrap();
+    state.close().await.unwrap();
+}
+
+/// The warm set keeps only SSTs of live bases, so it does not grow with each compaction.
+#[tokio::test]
+async fn the_warm_set_stays_bounded_across_base_switches() {
+    let (_faults, mut state) = fault_state().await;
+    let writer = cold_writer(&state).await;
+    let source = state.shared.as_ref().unwrap().source.clone();
+    let admin = slatedb::admin::Admin::builder(source.state(), source.store.clone()).build();
+    let mut written = 0;
+    let mut seen = std::collections::HashSet::new();
+    for round in 0..6 {
+        put_rows(&mut state, round * 20, 20).await;
+        let id = cold_checkpoint(&state, &writer, &mut written).await;
+        adopt(&mut state, id).await;
+        let base = state.shared.as_ref().unwrap().base.clone();
+        let current: Vec<_> = base.ssts().iter().map(|(id, _)| *id).collect();
+        // Only SSTs of live bases stay. Another task, such as a read, can still hold an older
+        // base, so the bound is the set of live bases, not the last two.
+        let (warmed, live) = source.warmed();
+        assert!(
+            warmed.is_subset(&live),
+            "round {round}: {} warm SSTs, {} retired",
+            warmed.len(),
+            warmed.difference(&live).count()
+        );
+        seen.extend(current.iter().copied());
+        crate::state::maintenance::compact_all(&admin)
+            .await
+            .unwrap();
+    }
+    // Each round adds an L0 SST and new compacted SSTs. Without the pruning, all would stay.
+    let warmed = source.warmed().0.len();
+    assert!(seen.len() >= 12, "{warmed} of {}", seen.len());
+    writer.close().await.unwrap();
+    state.close().await.unwrap();
+}
+
+/// Adoptions on a slow store each warm some SSTs and then reach the time limit. The warm set
+/// still keeps only SSTs of live bases across compactions.
+#[tokio::test]
+async fn timed_out_warms_keep_the_warm_set_bounded() {
+    use crate::object::faults::DELAY_SST_GET;
+    let (faults, mut state) = fault_state().await;
+    let writer = cold_writer(&state).await;
+    let source = state.shared.as_ref().unwrap().source.clone();
+    let admin = slatedb::admin::Admin::builder(source.state(), source.store.clone()).build();
+    faults.set_delay(Duration::from_millis(150));
+    let mut written = 0;
+    let mut partial = 0;
+    for round in 0..6 {
+        // Four cold L0 SSTs. Each data read takes 150 ms, so a warm loads about three of them.
+        for flush in 0..4 {
+            put_rows(&mut state, (round * 4 + flush) * 20, 20).await;
+            cold_flush(&state, &writer, &mut written).await;
+        }
+        let id = cold_checkpoint(&state, &writer, &mut written).await;
+        faults.set(DELAY_SST_GET);
+        adopt(&mut state, id).await;
+        faults.set(0);
+        let base = state.shared.as_ref().unwrap().base.clone();
+        let current: Vec<_> = base.ssts().iter().map(|(id, _)| *id).collect();
+        // Only SSTs of live bases stay. Another task, such as a read, can still hold an older
+        // base, so the bound is the set of live bases, not the last two.
+        let (warmed, live) = source.warmed();
+        assert!(
+            warmed.is_subset(&live),
+            "round {round}: {} warm SSTs, {} retired",
+            warmed.len(),
+            warmed.difference(&live).count()
+        );
+        let cold = base
+            .ssts()
+            .iter()
+            .filter(|(id, l0)| *l0 && !warmed.contains(id))
+            .count();
+        if cold > 0 && warmed.iter().any(|id| current.contains(id)) {
+            partial += 1;
+        }
+        crate::state::maintenance::compact_all(&admin)
+            .await
+            .unwrap();
+    }
+    assert!(
+        partial >= 3,
+        "only {partial} warms loaded some SSTs and then stopped"
+    );
+    writer.close().await.unwrap();
+    state.close().await.unwrap();
+}

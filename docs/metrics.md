@@ -104,6 +104,21 @@ after each publication. The clock gauge changes at each writer open.
 - A growing checkpoint count with `--view-retention off` means growing storage. See the manual
   cleanup in the guide.
 
+## Read path counters
+
+Every member also exports these counters. They count the reads of the whole process, so embedded
+members of one process share them.
+
+| Family | Meaning |
+| --- | --- |
+| `slatedb_etcd_state_cache_lookups_total` | SlateDB cache lookups, by `kind` and `result` |
+| `slatedb_etcd_row_cache_lookups_total` | Current-row cache lookups of point reads, by `result` |
+| `slatedb_etcd_row_read_duration_seconds` | Storage reads of rows that the row cache missed |
+| `slatedb_etcd_shared_point_reads_total` | Shared-mode point reads by `source`: `overlay`, `base` |
+
+The `kind` label is `data`, `index`, `filter`, or `stats`. Each data, index, or filter miss is
+one object store read. A low data hit ratio with a slow row read time means cold SST blocks.
+
 ## Upstream alerts and dashboard
 
 The v3.6.5 [alerts] contain 15 rules. The [dashboard] defines 16 query targets.

@@ -231,4 +231,5 @@ place. Delete them after you check the converted cluster.
 
 ## Metrics
 
-See [shared state gauges](metrics.md#shared-state-gauges).
+See [shared state gauges](metrics.md#shared-state-gauges) and the
+[read path counters](metrics.md#read-path-counters).

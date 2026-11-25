@@ -2,6 +2,7 @@
 
 mod peer;
 pub(crate) use peer::PeerTraffic;
+pub(crate) mod reads;
 mod rpc;
 pub(crate) use rpc::{Observation as RpcObservation, ObservedBody, Observer as RpcObserver};
 mod sample;
