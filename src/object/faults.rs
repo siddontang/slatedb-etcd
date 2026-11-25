@@ -38,6 +38,8 @@ pub(crate) const STALL_STATE_PUT: u8 = 8;
 pub(crate) const DELAY_SST_GET: u8 = 9;
 /// Report the next SST read as missing, like an SST that GC deleted.
 pub(crate) const LOSE_SST_ONCE: u8 = 7;
+/// Fail every SST read with a retryable error, like a local file with a persistent I/O error.
+pub(crate) const RETRYABLE_SST_GET: u8 = 10;
 
 impl FaultStore {
     pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
@@ -148,6 +150,12 @@ impl ObjectStore for FaultStore {
         if mode == DELAY_SST_GET && path.as_ref().ends_with(".sst") {
             let delay = self.delay_ms.load(Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        if mode == RETRYABLE_SST_GET && path.as_ref().ends_with(".sst") {
+            return Err(Error::Generic {
+                store: "injected",
+                source: std::io::Error::other("injected I/O error").into(),
+            });
         }
         if mode == FAIL_GET || (mode == FAIL_SST_GET && path.as_ref().ends_with(".sst")) {
             self.entered.add_permits(1);

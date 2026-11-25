@@ -217,6 +217,9 @@ impl Source {
             .with_reader_mode(DbReaderMode::Checkpoint(checkpoint))
             .with_options(DbReaderOptions {
                 skip_wal_replay: true,
+                // Like the member's reads, end the stream on a persistent read error. The
+                // default retries forever while the checkpoint stays pinned.
+                object_store_max_retries: slatedb_settings().object_store_max_retries,
                 ..Default::default()
             })
             // One sequential pass does not reuse blocks. Keep the member caches for its reads.

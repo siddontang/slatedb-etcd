@@ -222,6 +222,36 @@ async fn a_backup_stalled_in_an_object_read_ends_when_its_client_goes_away() {
     state.close().await.unwrap();
 }
 
+/// A persistent retryable read error ends the stream for a client that still waits.
+#[tokio::test]
+async fn a_backup_with_a_failing_object_read_ends_for_a_connected_client() {
+    use crate::object::faults::{FaultStore, RETRYABLE_SST_GET};
+    let store = Arc::new(FaultStore::new(Arc::new(
+        slatedb::object_store::memory::InMemory::new(),
+    )));
+    let mut state = StateMachine::open_store(store.clone(), "failing")
+        .await
+        .unwrap();
+    let value = "v".repeat(16 * 1024);
+    for index in 1..=50 {
+        put(&mut state, index, &format!("key-{index}"), &value).await;
+    }
+    state.db().flush().await.unwrap();
+    store.set(RETRYABLE_SST_GET);
+    let mut stream = state.backup().await.unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(30), stream.chunks.recv())
+        .await
+        .expect("the stream kept retrying")
+        .expect("the stream ended without an error")
+        .err()
+        .expect("the stream sent a chunk");
+    let error = super::backup::backup_error(error);
+    assert_eq!(error.code, tonic::Code::Unavailable as i32, "{error:?}");
+    released(&state).await;
+    store.set(0);
+    state.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_restore_reads_legacy_images_and_rejects_unordered_rows() {
     let dir = tempfile::tempdir().unwrap();

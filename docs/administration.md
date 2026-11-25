@@ -135,6 +135,8 @@ When they differ, or the directory is already gone, restore all members with a n
 In [shared state mode](shared-state.md) the member still builds the image of its pinned view
 in memory and sends it in the same messages. That image, with its padding and digest, is limited
 to 64 MiB. A larger one returns ResourceExhausted.
+A restore into shared mode also reads the whole file in memory, so it accepts at most 64 MiB.
+That limit applies to every file it restores, including one saved from a replicated member.
 
 Downgrade authenticates the administrator and returns Unimplemented.
 The SlateDB format cannot run an older etcd binary. No rolling binary downgrade is claimed.
