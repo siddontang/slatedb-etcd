@@ -254,6 +254,9 @@ pub(crate) struct Source {
     /// DST: every open fails, as for a checkpoint that cannot open.
     #[cfg(test)]
     pub(crate) fail_opens: std::sync::atomic::AtomicBool,
+    /// Tests: the next writer open fails with this error.
+    #[cfg(test)]
+    pub(crate) fail_writer: Mutex<Option<anyhow::Error>>,
 }
 
 /// The checkpoints that this member uses, and the ones that retention deletes.
@@ -485,6 +488,10 @@ impl Source {
     }
 
     pub async fn open_writer_with(&self, settings: Settings) -> Result<Db> {
+        #[cfg(test)]
+        if let Some(error) = self.fail_writer.lock().unwrap().take() {
+            return Err(error);
+        }
         Ok(Db::builder(self.state(), self.store.clone())
             .with_db_cache(self.cache.clone(), 0)
             .with_settings(settings)
@@ -788,6 +795,8 @@ pub(crate) fn offline_source(
         received: Mutex::default(),
         #[cfg(test)]
         fail_opens: Default::default(),
+        #[cfg(test)]
+        fail_writer: Default::default(),
     }))
 }
 
@@ -1590,6 +1599,8 @@ impl StateMachine {
             received: Mutex::default(),
             #[cfg(test)]
             fail_opens: Default::default(),
+            #[cfg(test)]
+            fail_writer: Default::default(),
         });
         ensure!(
             state_root == source.state(),

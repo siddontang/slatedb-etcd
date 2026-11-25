@@ -38,6 +38,11 @@ pub(crate) const STALL_STATE_PUT: u8 = 8;
 pub(crate) const DELAY_SST_GET: u8 = 9;
 /// Report the next SST read as missing, like an SST that GC deleted.
 pub(crate) const LOSE_SST_ONCE: u8 = 7;
+/// Fail every put of the shared database, like a bucket that denies writes. Claims beside it
+/// still succeed.
+pub(crate) const FAIL_STATE_PUT: u8 = 11;
+/// Return manifests of the shared database that do not decode, like a newer manifest format.
+pub(crate) const CORRUPT_MANIFEST: u8 = 12;
 /// Report the next two SST reads as missing. A failed cache load in SlateDB falls back to one
 /// direct read, so only this mode fails a read that goes through the block cache.
 pub(crate) const LOSE_SST_TWICE: u8 = 10;
@@ -73,12 +78,17 @@ impl FaultStore {
             let resumed = self.resumed.notified();
             match self.mode.load(Ordering::SeqCst) {
                 STALL_PUT => {}
-                STALL_STATE_PUT if path.as_ref().contains("shared/state/") => {}
+                STALL_STATE_PUT if state(path) => {}
                 _ => return,
             }
             resumed.await;
         }
     }
+}
+
+/// Return true for an object of the shared database.
+fn state(path: &Path) -> bool {
+    path.as_ref().contains("shared/state/")
 }
 
 fn error() -> Error {
@@ -103,6 +113,10 @@ impl ObjectStore for FaultStore {
     ) -> Result<PutResult> {
         self.written.lock().unwrap().insert(path.to_string());
         self.stall(path).await;
+        if self.mode.load(Ordering::SeqCst) == FAIL_STATE_PUT && state(path) {
+            self.entered.add_permits(1);
+            return Err(error());
+        }
         if path.as_ref().ends_with(".sst") {
             match self.mode.load(Ordering::SeqCst) {
                 FAIL_PUT => {
@@ -168,6 +182,15 @@ impl ObjectStore for FaultStore {
         if mode == FAIL_GET || (mode == FAIL_SST_GET && path.as_ref().ends_with(".sst")) {
             self.entered.add_permits(1);
             return Err(error());
+        }
+        if mode == CORRUPT_MANIFEST && state(path) && path.as_ref().ends_with(".manifest") {
+            let mut result = self.inner.get_opts(path, options).await?;
+            let garbage = bytes::Bytes::from_static(b"not a manifest");
+            result.range = 0..garbage.len() as u64;
+            result.meta.size = garbage.len() as u64;
+            result.payload =
+                GetResultPayload::Stream(Box::pin(futures::stream::once(async { Ok(garbage) })));
+            return Ok(result);
         }
         self.inner.get_opts(path, options).await
     }
