@@ -236,10 +236,13 @@ and a key-ordered Range with a positive limit and no filters.
 A key that no later journal event names has the same current row now as at the revision.
 The Range merges those current rows with the versions at the revision of the named keys.
 It stops after `limit + 1` rows. Its count starts from the current-key count of the pinned view.
-Each named key then adds or removes one.
+Each named key then adds or removes one. The first later event of a key shows whether the key
+was live at the revision: a delete removes a live key, and a Put of a live key keeps its create
+revision. The count therefore reads no history. Only named keys inside the page read a version.
 The journal row of a revision shares its batch, and compaction keeps rows after the boundary.
-The journal scan decodes only the event keys, and the Range keeps at most `limit + 1` old values.
-A page then costs about `limit` current rows plus the writes after its revision.
+The journal scan decodes only the event keys, types, and revisions, and the Range keeps at most
+`limit + 1` old values.
+A page then costs about `limit` rows plus a key decode of the writes after its revision.
 It does not depend on the history size.
 The count also walks the in-memory key order of the interval, as a current-revision count does.
 Debug builds also read the history rows and check the result against them.
