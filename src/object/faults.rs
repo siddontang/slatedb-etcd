@@ -43,6 +43,8 @@ pub(crate) const LOSE_SST_ONCE: u8 = 7;
 pub(crate) const FAIL_STATE_PUT: u8 = 11;
 /// Return manifests of the shared database that do not decode, like a newer manifest format.
 pub(crate) const CORRUPT_MANIFEST: u8 = 12;
+/// Hold every read of the bootstrap marker and claim until the mode changes.
+pub(crate) const STALL_BOOTSTRAP_READ: u8 = 13;
 /// Report the next two SST reads as missing. A failed cache load in SlateDB falls back to one
 /// direct read, so only this mode fails a read that goes through the block cache.
 pub(crate) const LOSE_SST_TWICE: u8 = 10;
@@ -71,6 +73,17 @@ impl FaultStore {
     pub fn set_delay(&self, delay: std::time::Duration) {
         self.delay_ms
             .store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    /// Wait while the mode is `mode`.
+    async fn hold(&self, mode: u8) {
+        loop {
+            let resumed = self.resumed.notified();
+            if self.mode.load(Ordering::SeqCst) != mode {
+                return;
+            }
+            resumed.await;
+        }
     }
 
     async fn stall(&self, path: &Path) {
@@ -155,6 +168,9 @@ impl ObjectStore for FaultStore {
 
     async fn get_opts(&self, path: &Path, options: GetOptions) -> Result<GetResult> {
         self.read.lock().unwrap().insert(path.to_string());
+        if path.as_ref().contains("shared/bootstrap") {
+            self.hold(STALL_BOOTSTRAP_READ).await;
+        }
         let mode = self.mode.load(Ordering::SeqCst);
         if (mode == LOSE_SST_ONCE || mode == LOSE_SST_TWICE) && path.as_ref().ends_with(".sst") {
             let next = if mode == LOSE_SST_TWICE {

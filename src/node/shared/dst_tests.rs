@@ -48,10 +48,12 @@ impl Simulation {
         let pins = self.nodes[&id].dst_pins();
         let coverage = self.process(id);
         // An earlier binary sends no writer report.
-        let health = self.nodes[&id]
+        let node = &self.nodes[&id];
+        let term = node.raw.raft.term;
+        let health = node
             .writer
             .as_ref()
-            .map(|writer| writer.health.report());
+            .map(|writer| writer.health.report(term));
         let health = coverage.and(health);
         self.nodes
             .get_mut(&leader)

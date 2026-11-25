@@ -232,6 +232,25 @@ pub(crate) async fn claim(
     }
 }
 
+/// A stored object of the shared state that does not decode, or that contradicts another one.
+/// Each writer reads the same objects, so the error describes the shared store, not the applied
+/// state of one member. A writer task halts on it instead of stopping the member.
+#[derive(Debug)]
+pub(crate) struct StoredData(String);
+
+impl std::fmt::Display for StoredData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StoredData {}
+
+/// A `StoredData` error with `message`.
+pub(crate) fn stored(message: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::Error::new(StoredData(message.to_string()))
+}
+
 fn join(root: &str, name: &str) -> String {
     if root.is_empty() {
         name.to_owned()
@@ -533,7 +552,8 @@ impl Source {
             .await?
             .bytes()
             .await?;
-        let marker: serde_json::Value = serde_json::from_slice(&data)?;
+        let marker: serde_json::Value = serde_json::from_slice(&data)
+            .map_err(|error| stored(format!("invalid bootstrap marker: {error}")))?;
         Ok(marker["restore"].as_str().map(str::to_owned))
     }
 
@@ -560,10 +580,9 @@ impl Source {
             // Another member wrote the marker first. It must name the same bootstrap.
             Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
                 let existing = self.restored_snapshot().await?;
-                ensure!(
-                    existing.as_deref() == restore,
-                    "the bootstrap marker records another bootstrap"
-                );
+                if existing.as_deref() != restore {
+                    return Err(stored("the bootstrap marker records another bootstrap"));
+                }
                 Ok(())
             }
             Err(error) => Err(error.into()),
@@ -1052,7 +1071,8 @@ async fn bootstrap_op(source: &Source) -> Result<Option<BootstrapOp>> {
         .await
     {
         Ok(result) => Ok(Some(
-            serde_json::from_slice(&result.bytes().await?).context("invalid bootstrap claim")?,
+            serde_json::from_slice(&result.bytes().await?)
+                .map_err(|error| stored(format!("invalid bootstrap claim: {error}")))?,
         )),
         Err(slatedb::object_store::Error::NotFound { .. }) => Ok(None),
         Err(error) => Err(error.into()),

@@ -4,7 +4,8 @@
 use super::super::tests::{eventually, status};
 use super::*;
 use crate::object::faults::{
-    FaultStore, CORRUPT_MANIFEST, FAIL_PUT, FAIL_STATE_PUT, STALL_STATE_PUT,
+    FaultStore, CORRUPT_MANIFEST, FAIL_PUT, FAIL_STATE_PUT, PAUSE_PUT, STALL_BOOTSTRAP_READ,
+    STALL_STATE_PUT,
 };
 use crate::proto::etcdserverpb::{
     kv_client::KvClient, maintenance_client::MaintenanceClient, MoveLeaderRequest, PutRequest,
@@ -34,6 +35,8 @@ fn the_outer_slatedb_kind_classifies_an_error() {
     assert_eq!(classify(&panic.into()), Fault::Data);
     let fence = slatedb::Error::closed("fenced".into(), slatedb::CloseReason::Fenced);
     assert_eq!(classify(&fence.into()), Fault::Fenced);
+    let stored = crate::state::shared::stored("invalid bootstrap claim").context("publish");
+    assert_eq!(classify(&stored), Fault::Data);
     let invariant = anyhow::anyhow!("the base checkpoint has no applied term");
     assert_eq!(classify(&invariant), Fault::Invariant);
 }
@@ -41,31 +44,57 @@ fn the_outer_slatedb_kind_classifies_an_error() {
 #[test]
 fn the_backoff_doubles_to_its_cap_and_a_publication_ends_the_mark() {
     let health = Health::default();
+    let task = health.begin();
     let delays: Vec<_> = (0..7)
-        .map(|_| health.failed(Fault::Unavailable, "throttled"))
+        .map(|_| task.failed(Fault::Unavailable, "throttled"))
         .collect();
     assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30].map(Duration::from_secs));
     assert!(health.handoff_due());
-    // A writer that opens again is not down. The count stays until a healthy run.
-    health.opened();
+    // A writer that opens again is not down. The count stays until a publication.
+    task.opened();
     assert!(!health.handoff_due());
     assert_eq!(health.consecutive(), 7);
-    assert!(health.report().failed_secs.is_some());
-    health.published();
-    assert_eq!(health.report(), WriterReport::default());
+    assert!(health.report(3).failed_secs.is_some());
+    task.published();
+    assert_eq!(
+        health.report(3),
+        WriterReport {
+            failed_secs: None,
+            term: 3
+        }
+    );
+    assert_eq!(health.consecutive(), 0);
     // One data error makes a handoff due, and it waits longer.
     let data = Health::default();
+    let task = data.begin();
     assert_eq!(
-        data.failed(Fault::Data, "bad manifest"),
+        task.failed(Fault::Data, "bad manifest"),
         Duration::from_secs(30)
     );
     assert!(data.handoff_due());
     assert_eq!(data.status()["last_error_class"], "data");
 }
 
+/// Item 9 of the review: a writer that stays open longer than a minute between failed flushes
+/// is still down. Only a publication starts a new count, so the third failure hands over.
+#[test]
+fn a_long_open_between_failed_flushes_keeps_the_count() {
+    let health = Health::default();
+    let task = health.begin();
+    for _ in 0..3 {
+        task.opened();
+        // The writer waited a long age limit before its flush failed.
+        health.record().running = Some(Instant::now() - Duration::from_secs(90));
+        task.failed(Fault::Unavailable, "the flush failed");
+    }
+    assert_eq!(health.consecutive(), 3);
+    assert!(health.handoff_due());
+}
+
 #[test]
 fn the_watchdog_counts_only_due_storage_work() {
     let health = Health::default();
+    let task = health.begin();
     // A buffered write under a long age limit is not due yet.
     assert!(!health.check(Some(Instant::now() + Duration::from_secs(30))));
     assert!(!health.handoff_due());
@@ -74,10 +103,51 @@ fn the_watchdog_counts_only_due_storage_work() {
     assert!(health.check(Some(overdue)));
     assert!(!health.check(Some(overdue)));
     assert!(health.handoff_due());
-    assert!(health.report().failed_secs.is_some());
+    assert!(health.report(1).failed_secs.is_some());
     assert_eq!(health.total(), 1);
-    health.done();
+    task.done();
     assert!(!health.handoff_due());
+}
+
+/// Each durable step of a slow publication restarts the watchdog. A 20 s flush and 11 s of
+/// checkpoint work are no fault. One step over `STALL` is.
+#[test]
+fn each_durable_step_restarts_the_watchdog() {
+    let health = Health::default();
+    let task = health.begin();
+    let ago = |secs| Some(Instant::now() - Duration::from_secs(secs));
+    task.due();
+    // The flush took 20 s.
+    health.record().due = ago(20);
+    task.progressed();
+    task.due();
+    // The checkpoint work took 11 s more.
+    let stepped = health.record().due.unwrap();
+    health.record().due = Some(stepped - Duration::from_secs(11));
+    assert!(!health.check(None));
+    assert!(health.report(1).failed_secs.is_none());
+    // The next step hangs past the limit.
+    health.record().due = ago(31);
+    assert!(health.check(None));
+}
+
+/// A task of an earlier term changes nothing, also with a late error.
+#[test]
+fn a_late_result_of_an_earlier_term_changes_nothing() {
+    let health = Health::default();
+    let old = health.begin();
+    old.due();
+    health.end();
+    let new = health.begin();
+    old.failed(Fault::Unavailable, "a late error");
+    old.due();
+    old.published();
+    assert_eq!(health.consecutive(), 0);
+    assert_eq!(health.total(), 0);
+    assert!(health.record().due.is_none());
+    assert!(health.record().published.is_none());
+    new.failed(Fault::Unavailable, "a current error");
+    assert_eq!(health.consecutive(), 1);
 }
 
 fn candidate(id: u64, matched: u64, process: Option<u64>) -> Candidate {
@@ -92,7 +162,23 @@ fn received(process: u64, at: Instant, failed_secs: Option<u64>) -> Received {
     Received {
         process,
         at,
-        report: WriterReport { failed_secs },
+        report: WriterReport {
+            failed_secs,
+            term: 7,
+        },
+    }
+}
+
+fn tick<'a>(candidates: &'a [Candidate], published: Option<Instant>) -> Tick<'a> {
+    Tick {
+        due: true,
+        stalled: false,
+        transferee: None,
+        wait: Duration::from_secs(2),
+        candidates,
+        published,
+        incident: None,
+        term: 7,
     }
 }
 
@@ -123,14 +209,39 @@ fn a_fault_handoff_skips_marks_earlier_binaries_and_old_reports() {
     handoff.reports.insert(5, received(50, early, None));
     // Member 6 runs an earlier binary and sends no writer report.
     handoff.note(6, Some(60), None);
-    assert_eq!(handoff.pick(&candidates, None), Some(2));
+    assert_eq!(handoff.pick(&tick(&candidates, None)), Some(2));
     // An unreachable target is tried once.
     handoff.tried.insert(2);
-    assert_eq!(handoff.pick(&candidates, None), None);
+    assert_eq!(handoff.pick(&tick(&candidates, None)), None);
     // Another handoff only orders the voters. It excludes none.
     assert_eq!(rank(Some(&handoff), None, &candidates), Some(2));
     assert_eq!(rank(Some(&handoff), None, &candidates[1..]), Some(6));
     assert_eq!(rank(None, None, &candidates), Some(6));
+}
+
+/// Items 5 and 8 of the review: the report of a target comes from after the start of the
+/// incident and from the current term. A voter that stopped after its last report, or that led
+/// and faulted in a term between, is not a target.
+#[test]
+fn a_fault_handoff_needs_a_report_from_this_incident_and_term() {
+    let now = Instant::now();
+    let mut handoff = Handoff {
+        led: Some(now - Duration::from_secs(600)),
+        ..Default::default()
+    };
+    let candidates = [candidate(2, 90, Some(2)), candidate(3, 10, Some(3))];
+    let incident = now - Duration::from_secs(10);
+    // Member 2 is the most caught up, but it last reported long before the fault.
+    handoff
+        .reports
+        .insert(2, received(2, now - Duration::from_secs(300), None));
+    handoff.reports.insert(3, received(3, now, None));
+    let mut current = tick(&candidates, None);
+    current.incident = Some(incident);
+    assert_eq!(handoff.pick(&current), Some(3));
+    // A report of term 5 arrives in term 7, after member 3 led and faulted in term 6.
+    handoff.reports.get_mut(&3).unwrap().report.term = 5;
+    assert_eq!(handoff.pick(&current), None);
 }
 
 /// A mark that is older than this leader's last publication is a last resort. A late report
@@ -153,15 +264,70 @@ fn a_mark_from_before_the_last_publication_is_a_last_resort() {
     handoff.reports.insert(2, received(2, now, Some(40)));
     handoff.reports.insert(3, received(3, now, Some(5)));
     handoff.reports.insert(4, received(4, now, None));
-    assert_eq!(handoff.pick(&candidates, published), Some(4));
+    assert_eq!(handoff.pick(&tick(&candidates, published)), Some(4));
     handoff.tried.insert(4);
-    assert_eq!(handoff.pick(&candidates, published), Some(2));
+    assert_eq!(handoff.pick(&tick(&candidates, published)), Some(2));
     handoff.tried.insert(2);
-    assert_eq!(handoff.pick(&candidates, published), None);
+    assert_eq!(handoff.pick(&tick(&candidates, published)), None);
     // This incident had no publication, so no mark of it is stale.
     handoff.tried.clear();
     handoff.reports.remove(&4);
-    assert_eq!(handoff.pick(&candidates, None), None);
+    assert_eq!(handoff.pick(&tick(&candidates, None)), None);
+}
+
+/// Item 2 of the review: a writer that opens and fails again stays in its incident, so no
+/// voter is tried twice. A transfer that does not complete is aborted, so Raft takes
+/// proposals again. With no target left, a stall restarts the writer. Only a publication ends
+/// the incident.
+#[test]
+fn an_incident_tries_each_voter_once_until_a_publication() {
+    let now = Instant::now();
+    let mut handoff = Handoff {
+        led: Some(now - Duration::from_secs(60)),
+        ..Default::default()
+    };
+    let candidates = [candidate(2, 20, Some(2)), candidate(3, 30, Some(3))];
+    handoff.reports.insert(2, received(2, now, None));
+    handoff.reports.insert(3, received(3, now, None));
+    let transfer = |target| Decision {
+        transfer: Some(target),
+        ..Default::default()
+    };
+    assert_eq!(handoff.step(&tick(&candidates, None)), transfer(3));
+    // The writer opens again for a moment. The transfer is still in flight.
+    let reopened = Tick {
+        due: false,
+        transferee: Some(3),
+        ..tick(&candidates, None)
+    };
+    assert_eq!(handoff.step(&reopened), Decision::default());
+    // The transfer does not complete in time. The leader aborts it.
+    handoff.pending = Some((3, now - Duration::from_secs(3)));
+    let aborted = handoff.step(&reopened);
+    assert_eq!(
+        aborted,
+        Decision {
+            abort: true,
+            ..Default::default()
+        }
+    );
+    // The writer stalls again in the same incident. Member 3 is not tried again.
+    assert_eq!(handoff.step(&tick(&candidates, None)), transfer(2));
+    handoff.pending = Some((2, now - Duration::from_secs(3)));
+    let stalled = Tick {
+        stalled: true,
+        transferee: Some(2),
+        ..tick(&candidates, None)
+    };
+    let last = Decision {
+        abort: true,
+        transfer: None,
+        restart: true,
+    };
+    assert_eq!(handoff.step(&stalled), last);
+    // A publication of this writer ends the incident.
+    let published = tick(&candidates, Some(Instant::now()));
+    assert_eq!(handoff.step(&published), transfer(3));
 }
 
 /// A shared state with the membership seed, and the writer of its leader.
@@ -277,6 +443,162 @@ fn clock() -> Clock {
     Clock::system(Duration::from_secs(5), None)
 }
 
+/// Item 1 of the review: the publication of a Defragment fails, and the writer opens again.
+/// The republish request survives the open, so the Defragment completes with no new write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_defragment_survives_a_failed_publication() {
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let mut leader = Leader::open(faults.clone(), Duration::from_millis(100), clock()).await;
+    leader.lead(2);
+    leader.covered(1, Duration::from_secs(10)).await;
+    for n in 0..3 {
+        leader.put(&format!("k{n}")).await;
+    }
+    let index = leader.state.applied;
+    leader.covered(index, Duration::from_secs(10)).await;
+    let writer = leader.writer.as_ref().unwrap();
+    let (reached, resume) = (Arc::default(), Arc::<tokio::sync::Notify>::default());
+    let defragment = Defragment {
+        db: writer.open.lock().unwrap().clone().unwrap(),
+        admin: leader.handles.admin.clone(),
+        progress: writer.progress.clone(),
+        announced: leader.handles.announced.clone(),
+        leadership: writer.leadership.subscribe(),
+        term: 2,
+        pause: Some((
+            DefragmentStep::Publish,
+            Arc::clone(&reached),
+            resume.clone(),
+        )),
+    };
+    let health = writer.health.clone();
+    let running = tokio::spawn(defragment.run());
+    reached.notified().await;
+    faults.set(FAIL_STATE_PUT);
+    resume.notify_one();
+    eventually("the failed publication", async || health.consecutive() > 0).await;
+    faults.set(0);
+    // Apply each announcement, as the members do, until the Defragment completes.
+    let completed = tokio::time::timeout(Duration::from_secs(10), async {
+        while !running.is_finished() {
+            let next = tokio::time::timeout(Duration::from_millis(200), leader.announced.recv());
+            if let Ok(Some(Event::ViewCheckpoint(id, _, reply))) = next.await {
+                if let Some(reply) = reply {
+                    let _ = reply.send(true);
+                }
+                let index = leader.state.applied + 1;
+                let id = id.to_string();
+                leader
+                    .state
+                    .apply_view_checkpoint(index, &id, 0)
+                    .await
+                    .unwrap();
+            }
+        }
+        running.await.unwrap()
+    });
+    let result = completed.await.expect("the Defragment did not complete");
+    assert!(result.is_ok(), "{result:?}");
+    leader.close().await;
+}
+
+/// Item 3 of the review: a read of the bootstrap marker hangs. The watchdog runs during the
+/// read, and a step down ends the writer task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hung_bootstrap_read_starts_the_watchdog_and_ends_at_a_step_down() {
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let mut leader = Leader::open(faults.clone(), Duration::from_millis(100), clock()).await;
+    faults.set(STALL_BOOTSTRAP_READ);
+    leader.lead(2);
+    let health = leader.writer().health.clone();
+    eventually("the watchdog", async || health.record().due.is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(health.record().due.is_some());
+    let events = leader.events.clone();
+    leader.writer().sync(false, 2, &events);
+    let ended = tokio::time::timeout(Duration::from_secs(2), leader.writer().tasks.join_next());
+    let (term, result) = ended.await.expect("the task did not end").unwrap().unwrap();
+    assert_eq!(term, 2);
+    result.unwrap();
+    assert!(health.record().due.is_none());
+    faults.set(0);
+    leader.close().await;
+}
+
+/// A database whose memtable flush hangs in an SST put that never returns.
+async fn hung_writer(faults: &Arc<FaultStore>, path: &str) -> Arc<slatedb::Db> {
+    let store: Arc<dyn ObjectStore> = faults.clone();
+    let db = slatedb::Db::builder(path, store)
+        .with_settings(crate::state::slatedb_settings())
+        .build()
+        .await
+        .unwrap();
+    let db = Arc::new(db);
+    db.put(b"key", b"value").await.unwrap();
+    faults.set(PAUSE_PUT);
+    let flushing = db.clone();
+    tokio::spawn(async move { flushing.flush().await });
+    faults.entered.acquire().await.unwrap().forget();
+    db
+}
+
+/// Item 6 of the review: closes of failed writers whose I/O hangs forever. At most one close
+/// stays pending, and a shutdown waits for it no longer than its limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_most_one_hung_close_stays_and_a_shutdown_does_not_wait_for_it() {
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let mut leader = Leader::open(faults.clone(), Duration::from_millis(100), clock()).await;
+    let task = leader.writer().health.begin();
+    let mut writers = vec![];
+    for n in 0..3 {
+        let writer = hung_writer(&faults, &format!("hung-{n}")).await;
+        task.abandon(writer.clone());
+        writers.push(writer);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let health = &leader.writer().health;
+    assert_eq!(health.pending_closes(), 1);
+    assert_eq!(health.aborted_closes(), 2);
+    // The test and the hung flush hold each writer. Only the newest close holds one more.
+    let held: Vec<_> = writers.iter().map(Arc::strong_count).collect();
+    assert_eq!(held, [2, 2, 3]);
+    let started = Instant::now();
+    leader.writer().stop().await;
+    assert!(
+        started.elapsed() < Duration::from_secs(7),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(leader.writer().health.pending_closes(), 0);
+    leader.close().await;
+}
+
+/// Item 11 of the review: the publisher reads back an applied row that does not decode. The
+/// row is in the shared store, so the writer halts and a handoff is due. The member stays up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stored_row_that_does_not_decode_halts_the_writer() {
+    let store = Arc::new(InMemory::new());
+    let mut leader = Leader::open(store, Duration::from_millis(100), clock()).await;
+    leader.lead(2);
+    leader.covered(1, Duration::from_secs(10)).await;
+    let writer = leader.writer();
+    let db = writer.open.lock().unwrap().clone().unwrap();
+    let mut batch = slatedb::WriteBatch::new();
+    batch.put(crate::state::APPLIED, b"bad");
+    db.write_with_options(batch, &WriteOptions { seqnum: 2 })
+        .await
+        .unwrap();
+    writer.progress.request(1);
+    let health = writer.health.clone();
+    eventually("the data fault", async || {
+        health.status()["last_error_class"] == "data"
+    })
+    .await;
+    leader.no_failure(Duration::from_secs(2)).await;
+    assert!(health.handoff_due());
+    leader.close().await;
+}
+
 /// A flush outside the publisher fails and SlateDB closes the idle writer. No write follows.
 /// The publisher sees the closure, the task opens the writer again, and a publication request
 /// that waited before the fault still completes long before the age limit.
@@ -299,7 +621,7 @@ async fn an_idle_writer_that_slatedb_closes_opens_again() {
     leader.covered(index, Duration::from_secs(20)).await;
     let open = leader.writer().open.lock().unwrap().clone().unwrap();
     assert!(!Arc::ptr_eq(&open, &failed));
-    assert_eq!(health.report(), WriterReport::default());
+    assert!(health.report(2).failed_secs.is_none());
     leader.close().await;
 }
 
@@ -336,7 +658,7 @@ async fn a_buffered_write_under_a_long_age_limit_is_not_due() {
     assert!(deadline > Instant::now() + STALL);
     assert!(!writer.health.check(Some(deadline)));
     assert!(!writer.health.handoff_due());
-    assert_eq!(writer.health.report(), WriterReport::default());
+    assert!(writer.health.report(2).failed_secs.is_none());
     leader.close().await;
 }
 
@@ -876,7 +1198,8 @@ async fn a_stuck_due_flush_is_a_fault_while_writes_continue() {
     let mut kv = KvClient::new(channel(&server).await);
     let started = Instant::now();
     let mut n = 0;
-    while health(&status(&server).await)["stalled"] != true {
+    // One voter has no target, so the node restarts the stalled writer. Its new open hangs too.
+    while health(&status(&server).await)["last_error_class"] != "stalled" {
         assert!(
             started.elapsed() < STALL + Duration::from_secs(10),
             "no stall"
@@ -890,9 +1213,66 @@ async fn a_stuck_due_flush_is_a_fault_while_writes_continue() {
     assert!(written > Some(2), "{written:?}");
     assert_eq!(health(&status(&server).await)["marked"], true);
     faults.set(0);
-    eventually("the recovered writer", async || {
+    until("the recovered writer", STALL, async || {
         let status = status(&server).await;
         health(&status)["stalled"] == false && health(&status)["marked"] == false
+    })
+    .await;
+    server.shutdown().await.unwrap();
+}
+
+/// Items 4 and 6 of the review: an SST put of the writer hangs. One voter has no handoff
+/// target, so the node drops the stalled step after `STALL`, and the writer opens again without
+/// waiting for the old close. The new writer publishes while the old put still waits. When the
+/// old put returns late, the old writer's close ends, and the new writer stays healthy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hung_upload_restarts_the_writer_within_the_bound() {
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(shared_config(dir.path(), &faults))
+        .await
+        .unwrap();
+    server.wait_ready(Duration::from_secs(15)).await.unwrap();
+    let checkpoints = async || {
+        status(&server).await["shared_state"]["applied_view_checkpoints"]
+            .as_u64()
+            .unwrap()
+    };
+    eventually("the first checkpoint", async || checkpoints().await > 0).await;
+    let before = checkpoints().await;
+    faults.set(PAUSE_PUT);
+    let mut kv = KvClient::new(channel(&server).await);
+    kv.put(put("k-hung", "v")).await.unwrap();
+    let entered = tokio::time::timeout(Duration::from_secs(10), faults.entered.acquire());
+    entered.await.unwrap().unwrap().forget();
+    let started = Instant::now();
+    kv.put(put("k-later", "v")).await.unwrap();
+    until(
+        "a publication after the hang",
+        STALL + Duration::from_secs(20),
+        async || {
+            let status = status(&server).await;
+            checkpoints().await > before && status["shared_state"]["overlay_bytes"] == 0
+        },
+    )
+    .await;
+    assert!(started.elapsed() >= STALL - Duration::from_secs(1));
+    let restarted = status(&server).await;
+    assert_eq!(health(&restarted)["last_error_class"], "stalled");
+    // The old put still waits, so the old close does too.
+    assert_eq!(health(&restarted)["pending_closes"], 1);
+    let expected = ["k-hung", "k-later"].map(|key| (key.to_owned(), "v".to_owned()));
+    assert_eq!(keys(&server, true).await, expected);
+    // The put returns late. The old writer is fenced, and its close ends.
+    faults.release.add_permits(1);
+    eventually("the old close", async || {
+        health(&status(&server).await)["pending_closes"] == 0
+    })
+    .await;
+    kv.put(put("k-after", "v")).await.unwrap();
+    eventually("a later publication", async || {
+        let status = status(&server).await;
+        status["shared_state"]["overlay_bytes"] == 0 && health(&status)["marked"] == false
     })
     .await;
     server.shutdown().await.unwrap();

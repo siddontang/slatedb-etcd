@@ -20,12 +20,12 @@ const RETRY_CAP: Duration = Duration::from_secs(30);
 /// The first wait after a data error. It doubles up to `DATA_RETRY_CAP`.
 const DATA_RETRY_FIRST: Duration = Duration::from_secs(30);
 const DATA_RETRY_CAP: Duration = Duration::from_secs(5 * 60);
-/// A writer that runs this long without a failure starts a new count of failures.
-const HEALTHY_RUN: Duration = Duration::from_secs(60);
 /// Failures in a row after which the leader hands over its leadership.
 const HANDOFF_FAILURES: u32 = 3;
 /// Due storage work that makes no durable progress for this time is a fault.
 pub(super) const STALL: Duration = Duration::from_secs(30);
+/// A failed writer that takes this long to close logs a warning.
+const SLOW_CLOSE: Duration = Duration::from_secs(30);
 /// Election timeouts that a handoff can take before the leader tries another voter.
 const HANDOFF_TIMEOUTS: u32 = 2;
 
@@ -61,11 +61,18 @@ impl Fault {
 }
 
 /// Classify a writer error. The outermost SlateDB error decides, so a missing object that
-/// SlateDB reports as a data error is not a storage error. An object store error with no
-/// SlateDB error around it comes from this crate's own storage calls.
+/// SlateDB reports as a data error is not a storage error. A stored object that does not decode
+/// is a data error too. An object store error with no SlateDB error around it comes from this
+/// crate's own storage calls.
 pub(in crate::node) fn classify(error: &anyhow::Error) -> Fault {
     if fenced(error) || open_conflict(error) {
         return Fault::Fenced;
+    }
+    if error
+        .chain()
+        .any(|cause| cause.is::<crate::state::shared::StoredData>())
+    {
+        return Fault::Data;
     }
     if let Some(error) = error
         .chain()
@@ -128,7 +135,7 @@ pub(super) async fn closed(
 pub(super) fn recover(
     error: anyhow::Error,
     term: u64,
-    health: &Health,
+    health: &TaskHealth,
     reopens: &std::sync::atomic::AtomicU64,
 ) -> Result<Duration> {
     match classify(&error) {
@@ -146,7 +153,7 @@ pub(super) fn recover(
 /// Record a bootstrap claim that the writer task cannot read, and return the wait before the
 /// next try. The claim describes the shared store, not this member's state, so the member
 /// stays up also when the claim does not decode.
-pub(super) fn unreadable_claim(error: &anyhow::Error, health: &Health) -> Duration {
+pub(super) fn unreadable_claim(error: &anyhow::Error, health: &TaskHealth) -> Duration {
     let fault = match classify(error) {
         Fault::Unavailable => Fault::Unavailable,
         Fault::Fenced | Fault::Data | Fault::Clock | Fault::Stalled | Fault::Invariant => {
@@ -159,12 +166,36 @@ pub(super) fn unreadable_claim(error: &anyhow::Error, health: &Health) -> Durati
     )
 }
 
-/// The health of this member's writer. The writer task and the node share it.
-#[derive(Clone, Default)]
-pub(in crate::node) struct Health(Arc<Mutex<Record>>);
+/// The health of this member's writer. The node keeps it, and each writer task updates it
+/// through a `TaskHealth`.
+#[derive(Clone)]
+pub(in crate::node) struct Health(Arc<Shared>);
+
+struct Shared {
+    record: Mutex<Record>,
+    /// The close of a failed writer. See `TaskHealth::abandon`.
+    close: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Closes of failed writers that a newer one aborted.
+    aborted_closes: std::sync::atomic::AtomicU64,
+    /// The node asks the running attempt of the writer task to stop. See `TaskHealth::restart`.
+    restart: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for Health {
+    fn default() -> Self {
+        Self(Arc::new(Shared {
+            record: Mutex::default(),
+            close: Mutex::default(),
+            aborted_closes: Default::default(),
+            restart: tokio::sync::watch::channel(0).0,
+        }))
+    }
+}
 
 #[derive(Default)]
 struct Record {
+    /// The writer task that may change this record. A start or a stop of a task changes it.
+    generation: u64,
     /// Failures since the writer last ran for `HEALTHY_RUN`.
     consecutive: u32,
     /// The first failure of those.
@@ -175,113 +206,94 @@ struct Record {
     total: u64,
     /// The writer is open and did not fail since this time.
     running: Option<Instant>,
-    /// Storage work is due and made no durable progress since this time.
+    /// Storage work is due, and its last durable step ended at this time.
     due: Option<Instant>,
-    /// The due work above made no progress for `STALL`.
-    stalled: bool,
+    /// The time when the due work above passed `STALL`, until it ends.
+    stalled: Option<Instant>,
+    /// The start of the first due work that stalled since the last publication.
+    stall_began: Option<Instant>,
     /// The time of the newest fault, until this member's writer publishes again.
     mark: Option<Instant>,
     /// The time when this member's writer last created and announced a checkpoint.
     published: Option<Instant>,
 }
 
-impl Health {
-    fn record(&self) -> std::sync::MutexGuard<'_, Record> {
-        self.0.lock().unwrap()
+impl Record {
+    /// The due storage work ended, or no work is due.
+    fn done(&mut self) {
+        self.due = None;
+        self.stalled = None;
     }
 
-    /// Record a failure and return the wait before the next open.
-    pub(super) fn failed(&self, fault: Fault, error: &str) -> Duration {
-        let mut record = self.record();
-        let now = Instant::now();
-        if record
-            .running
-            .take()
-            .is_some_and(|at| at.elapsed() >= HEALTHY_RUN)
-        {
-            record.consecutive = 0;
-            record.since = None;
-        }
-        record.consecutive += 1;
-        record.since.get_or_insert(now);
-        record.last = Some((now, fault, error.to_owned()));
-        record.total += 1;
-        record.mark = Some(now);
+    /// Count a failure and return the wait before the next try. Only a publication starts a
+    /// new count: a writer that opens and then fails each flush is still down.
+    fn fail(&mut self, fault: Fault) -> Duration {
+        self.running = None;
+        self.consecutive += 1;
+        self.since.get_or_insert_with(Instant::now);
         let (first, cap) = match fault {
             Fault::Data => (DATA_RETRY_FIRST, DATA_RETRY_CAP),
             _ => (RETRY_FIRST, RETRY_CAP),
         };
-        let delay = first
-            .saturating_mul(1 << (record.consecutive - 1).min(16))
-            .min(cap);
-        let (class, failures) = (fault.name(), record.consecutive);
-        if failures == 1 {
-            tracing::error!(
-                class,
-                error,
-                ?delay,
-                "the shared writer failed; open it again"
-            );
-        } else {
-            tracing::warn!(
-                class,
-                failures,
-                error,
-                ?delay,
-                "the shared writer failed again"
-            );
+        first
+            .saturating_mul(1 << (self.consecutive - 1).min(16))
+            .min(cap)
+    }
+}
+
+impl Health {
+    fn record(&self) -> std::sync::MutexGuard<'_, Record> {
+        self.0.record.lock().unwrap()
+    }
+
+    /// Start a writer task. The count starts again, so an earlier term's failures do not hand
+    /// over this one before its writer tries. The mark stays until a publication.
+    pub(super) fn begin(&self) -> TaskHealth {
+        let mut record = self.record();
+        record.generation += 1;
+        record.consecutive = 0;
+        record.since = None;
+        record.stall_began = None;
+        record.done();
+        TaskHealth {
+            health: self.clone(),
+            generation: record.generation,
+            restart: self.0.restart.subscribe(),
         }
-        delay
     }
 
-    /// The writer opened. The publisher ends the due work after its first reads.
-    pub(super) fn opened(&self) {
-        self.record().running = Some(Instant::now());
-    }
-
-    /// Storage work is due: an open, a flush, or a checkpoint. The watchdog starts.
-    pub(super) fn due(&self) {
-        self.record().due.get_or_insert_with(Instant::now);
-    }
-
-    /// The due storage work ended, or no work is due.
-    pub(super) fn done(&self) {
+    /// Stop the writer task. A late result of it changes nothing.
+    pub(super) fn end(&self) {
         let mut record = self.record();
-        record.due = None;
-        record.stalled = false;
+        record.generation += 1;
+        record.running = None;
+        record.done();
     }
 
-    /// The writer created and announced a checkpoint. Its mark ends.
-    pub(super) fn published(&self) {
-        let mut record = self.record();
-        record.published = Some(Instant::now());
-        record.mark = None;
-        drop(record);
-        self.done();
+    /// Ask the writer task to drop its stalled attempt and open the writer again.
+    pub(super) fn restart(&self) {
+        self.0.restart.send_modify(|restarts| *restarts += 1);
     }
 
-    /// Start a new count after a healthy run. Return true when due work just passed `STALL`.
+    /// Return true when due work just passed `STALL`.
     ///
     /// `overdue` is the time when the oldest unflushed write of the open writer reached its age
     /// limit. It covers a publisher that waits elsewhere and has not started the flush.
     pub(super) fn check(&self, overdue: Option<Instant>) -> bool {
         let mut record = self.record();
-        if record.running.is_some_and(|at| at.elapsed() >= HEALTHY_RUN) {
-            record.consecutive = 0;
-            record.since = None;
-        }
         let overdue = overdue.filter(|at| *at <= Instant::now());
         let Some(due) = record.due.into_iter().chain(overdue).min() else {
             return false;
         };
-        if record.stalled || due.elapsed() < STALL {
+        if record.stalled.is_some() || due.elapsed() < STALL {
             return false;
         }
         let now = Instant::now();
-        record.stalled = true;
+        record.stalled = Some(now);
+        record.stall_began.get_or_insert(due);
         record.total += 1;
         record.mark = Some(now);
-        let error = format!("due storage work made no progress for {STALL:?}");
+        let error = format!("due storage work made no durable progress for {STALL:?}");
         tracing::error!(%error, "the shared writer stalled");
         record.last = Some((now, Fault::Stalled, error));
         true
@@ -291,35 +303,54 @@ impl Health {
     /// `HANDOFF_FAILURES` failures in a row or after a data error, or due work stalled.
     pub(super) fn handoff_due(&self) -> bool {
         let record = self.record();
+        let data = record
+            .last
+            .as_ref()
+            .is_some_and(|(_, fault, _)| *fault == Fault::Data);
         let down = record.running.is_none()
-            && (record.consecutive >= HANDOFF_FAILURES
-                || record
-                    .last
-                    .as_ref()
-                    .is_some_and(|(_, fault, _)| *fault == Fault::Data && record.consecutive > 0));
-        down || record.stalled
+            && (record.consecutive >= HANDOFF_FAILURES || data && record.consecutive > 0);
+        down || record.stalled.is_some()
     }
 
-    /// The report of this member in `ViewAck`.
-    pub(in crate::node) fn report(&self) -> WriterReport {
+    /// Return true while due work is past `STALL`.
+    pub(super) fn stalled(&self) -> bool {
+        self.record().stalled.is_some()
+    }
+
+    /// The start of the current incident: the first failure since the last publication, or
+    /// the start of the first work that stalled. A voter that reported after it was alive while
+    /// this writer failed.
+    fn incident(&self) -> Option<Instant> {
+        let record = self.record();
+        record.since.into_iter().chain(record.stall_began).min()
+    }
+
+    /// The report of this member in `ViewAck`, in Raft term `term`.
+    pub(in crate::node) fn report(&self, term: u64) -> WriterReport {
         WriterReport {
             failed_secs: self.record().mark.map(|at| at.elapsed().as_secs()),
+            term,
         }
     }
 
-    /// Clear the watchdog when this member stops leading.
-    pub(super) fn reset_watch(&self) {
-        self.done();
+    /// 1 while the close of a failed writer is pending.
+    pub(super) fn pending_closes(&self) -> u64 {
+        let close = self.0.close.lock().unwrap();
+        close
+            .as_ref()
+            .is_some_and(|close| !close.is_finished())
+            .into()
     }
 
-    /// Start the count of a new term. An earlier term's failures do not hand over this one
-    /// before its writer tries. The mark stays until a publication.
-    pub(super) fn new_term(&self) {
-        let mut record = self.record();
-        record.consecutive = 0;
-        record.since = None;
-        drop(record);
-        self.done();
+    pub(super) fn aborted_closes(&self) -> u64 {
+        self.0
+            .aborted_closes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Take the pending close of a failed writer, for a shutdown.
+    pub(super) fn take_close(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.0.close.lock().unwrap().take()
     }
 
     pub(super) fn consecutive(&self) -> u32 {
@@ -344,9 +375,158 @@ impl Health {
             "last_error": last.map(|(_, _, error)| error.clone()),
             "last_failure_ms_ago": last.map(|(at, _, _)| at.elapsed().as_millis() as u64),
             "faults": record.total,
-            "stalled": record.stalled,
+            "stalled": record.stalled.is_some(),
             "marked": record.mark.is_some(),
+            "pending_closes": self.pending_closes(),
+            "aborted_closes": self.aborted_closes(),
         })
+    }
+}
+
+/// The health record as one writer task sees it. After the task's term ends, its updates
+/// change nothing, so a late result cannot touch a newer term.
+#[derive(Clone)]
+pub(super) struct TaskHealth {
+    health: Health,
+    generation: u64,
+    restart: tokio::sync::watch::Receiver<u64>,
+}
+
+impl TaskHealth {
+    /// Change the record if this task still owns it.
+    fn update<T>(&self, change: impl FnOnce(&mut Record) -> T) -> Option<T> {
+        let mut record = self.health.record();
+        (record.generation == self.generation).then(|| change(&mut record))
+    }
+
+    /// Record a failure and return the wait before the next open.
+    pub(super) fn failed(&self, fault: Fault, error: &str) -> Duration {
+        let failed = self.update(|record| {
+            let delay = record.fail(fault);
+            let now = Instant::now();
+            record.last = Some((now, fault, error.to_owned()));
+            record.total += 1;
+            record.mark = Some(now);
+            (delay, record.consecutive)
+        });
+        let Some((delay, failures)) = failed else {
+            return RETRY_FIRST;
+        };
+        let class = fault.name();
+        if failures == 1 {
+            tracing::error!(
+                class,
+                error,
+                ?delay,
+                "the shared writer failed; open it again"
+            );
+        } else {
+            tracing::warn!(
+                class,
+                failures,
+                error,
+                ?delay,
+                "the shared writer failed again"
+            );
+        }
+        delay
+    }
+
+    /// The node dropped a stalled attempt. The stall is already a fault. Return the wait
+    /// before the next open. The due work stays, so the watchdog watches the next attempt.
+    pub(super) fn restarted(&self) -> Duration {
+        let delay = self.update(|record| {
+            let delay = record.fail(Fault::Stalled);
+            record.due = Some(Instant::now());
+            record.stalled = None;
+            delay
+        });
+        tracing::warn!(
+            ?delay,
+            "drop the stalled shared writer attempt and open it again"
+        );
+        delay.unwrap_or(RETRY_FIRST)
+    }
+
+    /// The writer opened. The publisher ends the due work after its first reads.
+    pub(super) fn opened(&self) {
+        self.update(|record| record.running = Some(Instant::now()));
+    }
+
+    /// Close a writer that failed or stalled, without waiting. A close joins the SST uploads,
+    /// and a stuck upload can hold it for a long time. The next open fences this writer, so its
+    /// late writes cannot change the manifest.
+    ///
+    /// At most one such close is pending. A newer one aborts the older close, whose writer
+    /// later epochs fenced. `Writer::stop` waits for the pending close within its limit.
+    pub(super) fn abandon(&self, db: Arc<slatedb::Db>) {
+        let close = tokio::spawn(async move {
+            let options = slatedb::config::CloseOptions { flush_type: None };
+            let close = db.close_with_options(options);
+            tokio::pin!(close);
+            let closed = tokio::select! {
+                closed = &mut close => closed,
+                _ = tokio::time::sleep(SLOW_CLOSE) => {
+                    tracing::warn!("a failed shared writer still closes; its I/O waits");
+                    close.await
+                }
+            };
+            if let Err(error) = closed {
+                tracing::info!(%error, "a failed shared writer closed with an error");
+            }
+        });
+        let older = self.health.0.close.lock().unwrap().replace(close);
+        if let Some(older) = older.filter(|older| !older.is_finished()) {
+            tracing::warn!("abort the close of an older failed shared writer");
+            older.abort();
+            self.health
+                .0
+                .aborted_closes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Storage work is due: an open, a flush, or a checkpoint. The watchdog starts, unless due
+    /// work already runs.
+    pub(super) fn due(&self) {
+        self.update(|record| {
+            record.due.get_or_insert_with(Instant::now);
+        });
+    }
+
+    /// A durable step of the due work ended. The watchdog starts again for the next step.
+    pub(super) fn progressed(&self) {
+        self.update(|record| {
+            record.due = Some(Instant::now());
+            record.stalled = None;
+        });
+    }
+
+    /// The due storage work ended, or no work is due.
+    pub(super) fn done(&self) {
+        self.update(Record::done);
+    }
+
+    /// The writer created a checkpoint and sent its announcement. This proves the storage path,
+    /// also when Raft drops the proposal, so the mark ends and a new count starts.
+    pub(super) fn published(&self) {
+        self.update(|record| {
+            record.published = Some(Instant::now());
+            record.mark = None;
+            record.consecutive = 0;
+            record.since = None;
+            record.stall_began = None;
+            record.done();
+        });
+    }
+
+    /// Wait until the node asks this task to drop its stalled attempt. A request from before
+    /// the call does not count.
+    pub(super) async fn restart_requested(&mut self) {
+        self.restart.borrow_and_update();
+        if self.restart.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -355,6 +535,9 @@ impl Health {
 pub struct WriterReport {
     /// Seconds since the newest fault of the member's writer, while its mark holds.
     pub failed_secs: Option<u64>,
+    /// The Raft term that the member saw when it sent the report.
+    #[serde(default)]
+    pub term: u64,
 }
 
 /// A writer report as the leader received it.
@@ -398,6 +581,37 @@ pub(in crate::node) struct Handoff {
     pending: Option<(u64, Instant)>,
     /// This incident found no target, and the leader logged it.
     exhausted: bool,
+    /// The last publication of this member's writer that the handoff saw. A new one ends the
+    /// incident.
+    published: Option<Instant>,
+}
+
+/// The state of one tick that a writer fault handoff uses.
+pub(super) struct Tick<'a> {
+    /// The writer is down or stalled. See `Health::handoff_due`.
+    pub due: bool,
+    pub stalled: bool,
+    /// The target of the Raft leader transfer in flight.
+    pub transferee: Option<u64>,
+    /// The longest time that a handoff can take.
+    pub wait: Duration,
+    pub candidates: &'a [Candidate],
+    /// The last publication of this member's writer.
+    pub published: Option<Instant>,
+    /// The start of the incident. Only a report from after it counts.
+    pub incident: Option<Instant>,
+    pub term: u64,
+}
+
+/// What the node does after a tick of a writer fault handoff.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Decision {
+    /// Abort the Raft leader transfer that did not complete.
+    pub abort: bool,
+    /// Transfer the leadership to this voter.
+    pub transfer: Option<u64>,
+    /// Drop the stalled writer attempt and open the writer again.
+    pub restart: bool,
 }
 
 impl Handoff {
@@ -422,19 +636,17 @@ impl Handoff {
         }
     }
 
-    /// This member starts or stops leading. A new term starts a new incident.
+    /// This member starts or stops leading. Raft drops a transfer at a role change, so the
+    /// incident ends.
     pub(super) fn lead(&mut self, leading: bool) {
         self.led = leading.then(Instant::now);
-        self.end();
-    }
-
-    /// The incident ended.
-    fn end(&mut self) {
         self.tried.clear();
         self.pending = None;
         self.exhausted = false;
     }
 
+    /// How a voter suits a handoff: its report came in this leadership, from its current
+    /// process, and holds no mark from after this member's last publication.
     fn suit(&self, candidate: &Candidate, published: Option<Instant>) -> Suit {
         let Some(received) = self.reports.get(&candidate.id) else {
             return Suit::No;
@@ -455,15 +667,71 @@ impl Handoff {
     }
 
     /// Pick the target of a writer fault handoff: a healthy voter before a stale mark, and then
-    /// the longest matched log. A voter that this incident tried is not a target.
-    fn pick(&self, candidates: &[Candidate], published: Option<Instant>) -> Option<u64> {
-        candidates
+    /// the longest matched log. The voter's report must come from after the start of the
+    /// incident and from the current Raft term, so a voter that stopped or faulted since its
+    /// last report is not a target. A voter that this incident tried is not a target either.
+    fn pick(&self, tick: &Tick) -> Option<u64> {
+        let fresh = |id: &u64| {
+            self.reports.get(id).is_some_and(|received| {
+                received.report.term == tick.term
+                    && tick.incident.is_none_or(|incident| received.at >= incident)
+            })
+        };
+        tick.candidates
             .iter()
-            .filter(|candidate| !self.tried.contains(&candidate.id))
-            .map(|candidate| (self.suit(candidate, published), candidate))
+            .filter(|candidate| !self.tried.contains(&candidate.id) && fresh(&candidate.id))
+            .map(|candidate| (self.suit(candidate, tick.published), candidate))
             .filter(|(suit, _)| *suit != Suit::No)
             .max_by_key(|(suit, candidate)| (*suit, candidate.matched))
             .map(|(_, candidate)| candidate.id)
+    }
+
+    /// Decide the handoff of one tick on the leader.
+    ///
+    /// Only a publication of this member's writer ends an incident, so a writer that opens and
+    /// fails again does not try a voter twice. A transfer that does not complete within
+    /// `tick.wait` is aborted, so Raft takes proposals again. With no target left, a stalled
+    /// writer drops its attempt and opens again.
+    pub(super) fn step(&mut self, tick: &Tick) -> Decision {
+        let mut decision = Decision::default();
+        if self.published != tick.published {
+            self.published = tick.published;
+            self.tried.clear();
+            self.exhausted = false;
+        }
+        if let Some((target, started)) = self.pending {
+            if started.elapsed() < tick.wait {
+                return decision;
+            }
+            tracing::warn!(target, "the writer handoff did not complete");
+            decision.abort = tick.transferee == Some(target);
+            self.pending = None;
+        }
+        if !tick.due {
+            return decision;
+        }
+        // A MoveLeader or a snapshot wait can hand over first.
+        if tick.transferee.is_some() && !decision.abort {
+            return decision;
+        }
+        match self.pick(tick) {
+            Some(target) => {
+                tracing::warn!(target, "hand over leadership after a shared writer fault");
+                self.tried.insert(target);
+                self.pending = Some((target, Instant::now()));
+                decision.transfer = Some(target);
+            }
+            None => {
+                if !self.exhausted {
+                    self.exhausted = true;
+                    tracing::error!(
+                        "no healthy voter can take over the shared writer; keep the lead and retry"
+                    );
+                }
+                decision.restart = tick.stalled;
+            }
+        }
+        decision
     }
 
     pub(super) fn status(&self) -> Value {
@@ -522,7 +790,7 @@ impl Node {
 
     /// Check the writer health on each tick. A leader whose writer is down hands over its
     /// leadership to a healthy voter, once per voter and incident. With no target left, it stays
-    /// leader and its writer keeps retrying.
+    /// leader and its writer keeps retrying. See `Handoff::step`.
     pub(super) fn tick_writer_health(&mut self) {
         let leader = self.raw.raft.state == StateRole::Leader;
         let candidates = if leader {
@@ -531,6 +799,7 @@ impl Node {
             vec![]
         };
         let wait = TICK * HANDOFF_TIMEOUTS * self.raw.raft.election_timeout() as u32;
+        let (term, transferee) = (self.raw.raft.term, self.raw.raft.lead_transferee);
         let Some(writer) = &mut self.writer else {
             return;
         };
@@ -539,53 +808,43 @@ impl Node {
         let overdue = open
             .then(|| writer.progress.deadline(writer.max_age))
             .flatten();
-        let stalled = leader && writer.health.check(overdue);
+        if leader {
+            writer.health.check(overdue);
+        }
         if let Some(gauges) = &writer.gauges {
-            gauges.failures.set(writer.health.consecutive().into());
-            let total = writer.health.total();
-            gauges
-                .faults
-                .inc_by(total.saturating_sub(gauges.faults.get()));
+            let health = &writer.health;
+            gauges.failures.set(health.consecutive().into());
+            gauges.pending_closes.set(health.pending_closes() as i64);
+            let counters = [
+                (&gauges.faults, health.total()),
+                (&gauges.aborted_closes, health.aborted_closes()),
+            ];
+            for (counter, total) in counters {
+                counter.inc_by(total.saturating_sub(counter.get()));
+            }
         }
         if !leader {
             return;
         }
-        let handoff = &mut writer.handoff;
-        if !stalled && !writer.health.handoff_due() {
-            handoff.end();
-            return;
+        let health = &writer.health;
+        let decision = writer.handoff.step(&Tick {
+            due: health.handoff_due(),
+            stalled: health.stalled(),
+            transferee,
+            wait,
+            candidates: &candidates,
+            published: health.published_at(),
+            incident: health.incident(),
+            term,
+        });
+        if decision.restart {
+            health.restart();
         }
-        if let Some((target, started)) = handoff.pending {
-            if started.elapsed() < wait {
-                return;
-            }
-            tracing::warn!(
-                target,
-                "the writer handoff did not complete; try another voter"
-            );
-            if self.raw.raft.lead_transferee == Some(target) {
-                self.raw.raft.abort_leader_transfer();
-            }
-            handoff.pending = None;
+        if decision.abort {
+            self.raw.raft.abort_leader_transfer();
         }
-        // A MoveLeader or a snapshot wait can hand over first.
-        if self.raw.raft.lead_transferee.is_some() {
-            return;
-        }
-        match handoff.pick(&candidates, writer.health.published_at()) {
-            Some(target) => {
-                tracing::warn!(target, "hand over leadership after a shared writer fault");
-                handoff.tried.insert(target);
-                handoff.pending = Some((target, Instant::now()));
-                self.raw.transfer_leader(target);
-            }
-            None if !handoff.exhausted => {
-                handoff.exhausted = true;
-                tracing::error!(
-                    "no healthy voter can take over the shared writer; keep the lead and retry"
-                );
-            }
-            None => {}
+        if let Some(target) = decision.transfer {
+            self.raw.transfer_leader(target);
         }
     }
 }

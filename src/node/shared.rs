@@ -65,13 +65,12 @@ impl Progress {
         }
     }
 
-    /// Start again after a writer open at `written`. A publication request stays: a manual
-    /// checkpoint can ask for it before the new writer opens.
+    /// Start again after a writer open at `written`. The writes that the age limit tracked
+    /// were in the old writer. A publication request and a republish stay: a manual checkpoint
+    /// or a Defragment can ask before the new writer opens, or a failed pass gives them back.
     fn reset(&self, written: u64) {
         self.written.send_replace(written);
-        let mut inner = self.inner.lock().unwrap();
-        inner.dirty_since = None;
-        inner.republish = false;
+        self.inner.lock().unwrap().dirty_since = None;
     }
 
     /// Publish a new checkpoint at the current sequence, for a changed layout.
@@ -243,6 +242,8 @@ pub(super) struct Gauges {
     clock_alarm: prometheus::IntGauge,
     pub(super) failures: prometheus::IntGauge,
     pub(super) faults: prometheus::IntCounter,
+    pub(super) pending_closes: prometheus::IntGauge,
+    pub(super) aborted_closes: prometheus::IntCounter,
 }
 
 impl Gauges {
@@ -251,6 +252,11 @@ impl Gauges {
             let gauge = prometheus::IntGauge::new(name, help)?;
             registry.register(Box::new(gauge.clone()))?;
             Ok(gauge)
+        };
+        let counter = |name: &str, help: &str| -> Result<prometheus::IntCounter> {
+            let counter = prometheus::IntCounter::new(name, help)?;
+            registry.register(Box::new(counter.clone()))?;
+            Ok(counter)
         };
         Ok(Self {
             base: gauge(
@@ -281,14 +287,18 @@ impl Gauges {
                 "slatedb_etcd_shared_writer_consecutive_failures",
                 "Shared writer failures in a row on this member, other than fences.",
             )?,
-            faults: {
-                let counter = prometheus::IntCounter::new(
-                    "slatedb_etcd_shared_writer_faults_total",
-                    "Shared writer faults on this member: errors, clock refusals, and stalls.",
-                )?;
-                registry.register(Box::new(counter.clone()))?;
-                counter
-            },
+            faults: counter(
+                "slatedb_etcd_shared_writer_faults_total",
+                "Shared writer faults on this member: errors, clock refusals, and stalls.",
+            )?,
+            pending_closes: gauge(
+                "slatedb_etcd_shared_writer_pending_closes",
+                "1 while the close of a failed shared writer waits for its I/O.",
+            )?,
+            aborted_closes: counter(
+                "slatedb_etcd_shared_writer_aborted_closes_total",
+                "Closes of failed shared writers that the close of a newer one aborted.",
+            )?,
         })
     }
 }
@@ -357,7 +367,7 @@ impl Writer {
             if let Some(stop) = self.stop.take() {
                 stop.send_replace(true);
             }
-            self.health.reset_watch();
+            self.health.end();
             self.handoff.lead(false);
             self.transfer = None;
             self.demand = 0;
@@ -368,7 +378,7 @@ impl Writer {
             return;
         }
         self.term = term;
-        self.health.new_term();
+        let health = self.health.begin();
         self.handoff.lead(true);
         let (stop, stopped) = tokio::sync::watch::channel(false);
         self.stop = Some(stop);
@@ -383,7 +393,7 @@ impl Writer {
                 retention: self.retention,
                 retained: self.retained.clone(),
                 applied: self.applied.clone(),
-                health: self.health.clone(),
+                health: health.clone(),
             },
             Leading {
                 queue: self.queue.clone(),
@@ -394,7 +404,7 @@ impl Writer {
                 clock: self.clock.clone(),
                 reopens: self.reopens.clone(),
                 open: self.open.clone(),
-                health: self.health.clone(),
+                health,
             },
         );
         self.tasks.spawn(async move { (term, task.await) });
@@ -404,13 +414,23 @@ impl Writer {
         if let Some(stop) = self.stop.take() {
             stop.send_replace(true);
         }
-        // A clean stop closes the writer. A stuck close must not hold the shutdown.
-        let closing = async { while self.tasks.join_next().await.is_some() {} };
+        // A clean stop closes the writer. A stuck close must not hold the shutdown, also not
+        // the close of a failed writer.
+        let mut failed = self.health.take_close();
+        let closing = async {
+            while self.tasks.join_next().await.is_some() {}
+            if let Some(failed) = &mut failed {
+                let _ = failed.await;
+            }
+        };
         if tokio::time::timeout(Duration::from_secs(5), closing)
             .await
             .is_err()
         {
             self.tasks.shutdown().await;
+            if let Some(failed) = failed {
+                failed.abort();
+            }
         }
     }
 
@@ -599,7 +619,7 @@ struct Leading {
     clock: Clock,
     reopens: Arc<std::sync::atomic::AtomicU64>,
     open: OpenWriter,
-    health: fault::Health,
+    health: fault::TaskHealth,
 }
 
 /// The writer `Db` while the writer task runs. Defragment flushes and compacts it.
@@ -611,6 +631,29 @@ async fn stop_requested(stopped: &mut tokio::sync::watch::Receiver<bool>) {
     let _ = stopped.wait_for(|stop| *stop).await;
 }
 
+/// The end of one step of the writer task.
+enum Attempt<T> {
+    Done(T),
+    /// The member asked the writer task to stop.
+    Stopped,
+    /// The node dropped the step after a stall with no handoff target.
+    Restarted,
+}
+
+/// Run `work` until it ends, the member stops the writer task, or the node restarts the stalled
+/// step. A dropped step can leave I/O in flight. The next open fences it.
+async fn attempt<T>(
+    work: impl std::future::Future<Output = T>,
+    stopped: &mut tokio::sync::watch::Receiver<bool>,
+    health: &mut fault::TaskHealth,
+) -> Attempt<T> {
+    tokio::select! {
+        value = work => Attempt::Done(value),
+        _ = stop_requested(stopped) => Attempt::Stopped,
+        _ = health.restart_requested() => Attempt::Restarted,
+    }
+}
+
 /// Open the writer, then materialize and publish until the member steps down.
 ///
 /// 1. The open increments the writer epoch, which fences an older writer.
@@ -619,9 +662,13 @@ async fn stop_requested(stopped: &mut tokio::sync::watch::Receiver<bool>) {
 ///    writer does not start, and the task tries again after a backoff.
 /// 4. The materializer and the publisher start. After an error while this member still leads,
 ///    `fault::recover` decides. A fence opens the writer again at once. A storage or data error
-///    closes the writer, and the task opens it again after a backoff. The overlay keeps every
+///    abandons the writer, and the task opens it again after a backoff. The overlay keeps every
 ///    batch, so the new writer writes them again. Apply, replies, and reads continue. Only an
 ///    error of this member's own invariants stops the member.
+///
+/// Each step that reads or writes storage also ends when the node restarts a stalled writer.
+/// The writer then opens again after `fault::STALL` and the backoff, also when the stalled I/O
+/// never returns.
 async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
     let Leading {
         queue,
@@ -632,7 +679,7 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         clock,
         reopens,
         open,
-        health,
+        mut health,
     } = leading;
     let current = || *leadership.borrow() == (true, term);
     let mut delay = Duration::ZERO;
@@ -645,36 +692,43 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         }
         // An ordinary start bootstraps an empty state only after it claims the one bootstrap
         // operation. A pending snapshot restore holds the claim, so the leader waits for it.
-        // Each member meets the same wait, so it is not a writer fault.
-        match bootstrap_wait(&publisher.source).await {
-            Ok(None) => {}
-            Ok(Some(wait)) => {
+        // Each member meets the same wait, so it is not a writer fault. The reads are.
+        health.due();
+        let checked = attempt(bootstrap_wait(&publisher.source), &mut stopped, &mut health);
+        match checked.await {
+            Attempt::Done(Ok(None)) => {}
+            Attempt::Done(Ok(Some(wait))) => {
                 health.done();
                 tracing::warn!(reason = %wait, "the shared writer waits for the bootstrap");
                 delay = Duration::from_secs(1);
                 continue;
             }
-            Err(error) => {
-                health.due();
+            Attempt::Done(Err(error)) => {
                 delay = fault::unreadable_claim(&error, &health);
                 continue;
             }
+            Attempt::Stopped => return Ok(()),
+            Attempt::Restarted => {
+                delay = health.restarted();
+                continue;
+            }
         }
-        health.due();
-        let opened = tokio::select! {
-            opened = publisher.source.open_writer() => opened,
-            _ = stop_requested(&mut stopped) => return Ok(()),
-        };
-        let db = match opened {
-            Ok(db) => Arc::new(db),
+        let opened = attempt(publisher.source.open_writer(), &mut stopped, &mut health);
+        let db = match opened.await {
+            Attempt::Done(Ok(db)) => Arc::new(db),
             // A newer open fenced this one while the member still leads the same term.
             // Two opens can also race for the same manifest version. The open that loses must
             // read the new manifest and try again.
-            Err(error) if current() && !*stopped.borrow() => {
+            Attempt::Done(Err(error)) if current() && !*stopped.borrow() => {
                 delay = fault::recover(error, term, &health, &reopens)?;
                 continue;
             }
-            Err(error) => return Err(error),
+            Attempt::Done(Err(error)) => return Err(error),
+            Attempt::Stopped => return Ok(()),
+            Attempt::Restarted => {
+                delay = health.restarted();
+                continue;
+            }
         };
         let close = |db: Arc<slatedb::Db>| async move {
             // A writer that a newer writer fenced cannot close cleanly. GC closes with it.
@@ -690,11 +744,17 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
             close(db).await;
             return Ok(());
         }
-        let passed = tokio::select! {
-            passed = clock.pass(db.manifest().last_l0_clock_tick()) => passed,
-            _ = stop_requested(&mut stopped) => {
+        let tick = db.manifest().last_l0_clock_tick();
+        let passed = match attempt(clock.pass(tick), &mut stopped, &mut health).await {
+            Attempt::Done(passed) => passed,
+            Attempt::Stopped => {
                 close(db).await;
                 return Ok(());
+            }
+            Attempt::Restarted => {
+                health.abandon(db);
+                delay = health.restarted();
+                continue;
             }
         };
         if !passed {
@@ -712,11 +772,14 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         publisher.progress.reset(db.manifest().last_l0_seq());
         publisher.db = Some(db.clone());
         *open.lock().unwrap() = Some(db.clone());
-        let result = tokio::select! {
-            result = materialize(db.clone(), queue.clone(), publisher.progress.clone()) => result,
-            result = publish(publisher, events.clone()) => result,
-            _ = stop_requested(&mut stopped) => Ok(()),
+        let progress = publisher.progress.clone();
+        let running = async {
+            tokio::select! {
+                result = materialize(db.clone(), queue.clone(), progress) => result,
+                result = publish(publisher, events.clone()) => result,
+            }
         };
+        let outcome = attempt(running, &mut stopped, &mut health).await;
         // A later task can own the slot already. Clear only this task's writer.
         {
             let mut slot = open.lock().unwrap();
@@ -724,12 +787,23 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
                 *slot = None;
             }
         }
-        close(db).await;
-        match result {
-            Err(error) if current() && !*stopped.borrow() => {
+        match outcome {
+            Attempt::Done(Err(error)) if current() && !*stopped.borrow() => {
+                health.abandon(db);
                 delay = fault::recover(error, term, &health, &reopens)?;
             }
-            result => return result,
+            Attempt::Done(result) => {
+                close(db).await;
+                return result;
+            }
+            Attempt::Stopped => {
+                close(db).await;
+                return Ok(());
+            }
+            Attempt::Restarted => {
+                health.abandon(db);
+                delay = health.restarted();
+            }
         }
     }
 }
@@ -798,7 +872,7 @@ struct Publisher {
     /// The number of `view-` checkpoints after the last publication.
     retained: Option<prometheus::IntGauge>,
     applied: Applied,
-    health: fault::Health,
+    health: fault::TaskHealth,
 }
 
 /// The applied state that a publisher checks before it announces a checkpoint again.
@@ -993,6 +1067,7 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
         if flush {
             health.due();
             db.flush().await?;
+            health.progressed();
         }
         // SlateDB also flushes a full memtable by itself. Each advance gets one checkpoint.
         let last = db.manifest().last_l0_seq();
@@ -1027,9 +1102,11 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
         let checkpoint = db
             .create_checkpoint(CheckpointScope::Durable, &options)
             .await?;
+        health.progressed();
         published = last;
         // A pending L0 commit can land first, so `F` comes from the checkpoint itself.
         let base = source.open_base(checkpoint.id).await?;
+        health.progressed();
         if base.get(crate::cluster::KEY).await?.is_none() {
             tracing::error!(checkpoint = %checkpoint.id, "a view checkpoint has no membership");
             admin.delete_checkpoint(checkpoint.id).await?;
@@ -1042,6 +1119,7 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
         // restart after the marker still finds a base.
         if !bootstrapped {
             source.mark_bootstrapped(checkpoint.id).await?;
+            health.progressed();
             bootstrapped = true;
         }
         let Some(accepted) = announce(&events, (checkpoint.id, row)).await else {
@@ -1452,7 +1530,11 @@ impl Node {
         let url = format!("{}/raft/view-ack", crate::cluster::url(address));
         // The member installs a base above its checkpoint row. See `node::shared::demand`.
         // The writer report tells the leader whether this member can take over the writer.
-        let health = self.writer.as_ref().map(|writer| writer.health.report());
+        let term = self.raw.raft.term;
+        let health = self
+            .writer
+            .as_ref()
+            .map(|writer| writer.health.report(term));
         let body = json!({"member": self.options.id, "checkpoints": pinned, "publish": publish,
             "coverage": crate::peer::process_id(), "writer": health});
         let client = self.options.transport.http.clone();
