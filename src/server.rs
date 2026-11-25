@@ -159,6 +159,12 @@ impl Server {
             (0.0..=1.0).contains(&config.quota_warning_fraction),
             "the quota warning fraction must be from 0 to 1"
         );
+        // A directly built retention gets the same zero and sign rules as the flags.
+        config.auto_compaction = config
+            .auto_compaction
+            .map(crate::compactor::Retention::validate)
+            .transpose()?
+            .flatten();
         ensure!(
             !config.join || config.restore_snapshot.is_none(),
             "join cannot restore a snapshot"

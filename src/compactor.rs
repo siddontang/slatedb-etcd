@@ -53,19 +53,28 @@ impl Retention {
                 }
             },
             Err(_) => {
-                let duration = parse_go_duration(retention)
+                let nanos = parse_go_duration(retention)
                     .with_context(|| format!("invalid auto compaction retention {retention:?}"))?;
                 match mode {
-                    Mode::Periodic => Self::Periodic(duration),
-                    Mode::Revision => Self::Revision(
-                        i64::try_from(duration.as_nanos()).context("retention is too large")?,
-                    ),
+                    Mode::Periodic => Self::Periodic(Duration::from_nanos(nanos)),
+                    Mode::Revision => {
+                        Self::Revision(i64::try_from(nanos).context("retention is too large")?)
+                    }
                 }
             }
         };
-        Ok(match parsed {
+        parsed.validate()
+    }
+
+    /// Check a retention that a caller built directly. Zero disables automatic compaction, as
+    /// it does for the flags. A negative revision count is an error.
+    pub fn validate(self) -> Result<Option<Self>> {
+        Ok(match self {
             Self::Periodic(d) if d.is_zero() => None,
             Self::Revision(0) => None,
+            Self::Revision(count) if count < 0 => {
+                bail!("the auto compaction revision retention must not be negative")
+            }
             retention => Some(retention),
         })
     }
@@ -79,47 +88,107 @@ impl Retention {
     }
 }
 
-/// Parse a non-negative Go `time.ParseDuration` value.
-fn parse_go_duration(text: &str) -> Result<Duration> {
-    ensure!(!text.is_empty(), "empty duration");
-    if text == "0" {
-        return Ok(Duration::ZERO);
+/// Parse a non-negative Go `time.ParseDuration` value into nanoseconds.
+///
+/// This follows Go's integer algorithm: each component is truncated to whole nanoseconds, and
+/// the total must fit in an `int64`. A negative nonzero duration is an error.
+fn parse_go_duration(text: &str) -> Result<u64> {
+    const MAX: u64 = i64::MAX as u64;
+    let mut s = text.as_bytes();
+    let mut negative = false;
+    if let Some((&sign @ (b'-' | b'+'), rest)) = s.split_first() {
+        negative = sign == b'-';
+        s = rest;
     }
-    let mut rest = text.strip_prefix('+').unwrap_or(text);
-    ensure!(!rest.starts_with('-'), "negative duration");
-    let mut total = 0_f64;
-    while !rest.is_empty() {
-        let number = rest
-            .find(|c: char| !c.is_ascii_digit() && c != '.')
-            .unwrap_or(rest.len());
-        ensure!(number > 0, "missing number");
-        let value: f64 = rest[..number].parse().context("invalid number")?;
-        rest = &rest[number..];
-        let unit = rest
-            .find(|c: char| c.is_ascii_digit() || c == '.')
-            .unwrap_or(rest.len());
-        let scale = match &rest[..unit] {
-            "ns" => 1e-9,
-            "us" | "µs" | "μs" => 1e-6,
-            "ms" => 1e-3,
-            "s" => 1.0,
-            "m" => 60.0,
-            "h" => 3600.0,
-            "" => bail!("missing unit"),
-            other => bail!("unknown unit {other:?}"),
+    // Go reads a bare "0" after the sign as zero.
+    if s == b"0" {
+        return Ok(0);
+    }
+    ensure!(!s.is_empty(), "empty duration");
+    let mut total: u64 = 0;
+    while !s.is_empty() {
+        ensure!(s[0] == b'.' || s[0].is_ascii_digit(), "missing number");
+        // The integer part. Go rejects a value above 1 << 63.
+        let digits = s.iter().take_while(|c| c.is_ascii_digit()).count();
+        let mut whole: u64 = 0;
+        for &c in &s[..digits] {
+            whole = whole
+                .checked_mul(10)
+                .and_then(|v| v.checked_add(u64::from(c - b'0')))
+                .filter(|&v| v <= 1 << 63)
+                .context("duration is out of range")?;
+        }
+        s = &s[digits..];
+        // The fraction. Go keeps digits while they fit and ignores the rest.
+        let mut fraction: u64 = 0;
+        let mut scale = 1_f64;
+        let mut fraction_digits = 0;
+        if let Some((b'.', rest)) = s.split_first() {
+            s = rest;
+            fraction_digits = s.iter().take_while(|c| c.is_ascii_digit()).count();
+            let mut overflow = false;
+            for &c in &s[..fraction_digits] {
+                if overflow {
+                    continue;
+                }
+                match fraction
+                    .checked_mul(10)
+                    .and_then(|v| v.checked_add(u64::from(c - b'0')))
+                    .filter(|&v| fraction <= MAX / 10 && v <= 1 << 63)
+                {
+                    Some(v) => {
+                        fraction = v;
+                        scale *= 10.0;
+                    }
+                    None => overflow = true,
+                }
+            }
+            s = &s[fraction_digits..];
+        }
+        ensure!(digits > 0 || fraction_digits > 0, "missing number");
+        let unit_len = s
+            .iter()
+            .take_while(|&&c| c != b'.' && !c.is_ascii_digit())
+            .count();
+        let unit: u64 = match &s[..unit_len] {
+            b"ns" => 1,
+            b"us" => 1_000,
+            u if u == "µs".as_bytes() || u == "μs".as_bytes() => 1_000,
+            b"ms" => 1_000_000,
+            b"s" => 1_000_000_000,
+            b"m" => 60_000_000_000,
+            b"h" => 3_600_000_000_000,
+            b"" => bail!("missing unit"),
+            other => bail!("unknown unit {:?}", String::from_utf8_lossy(other)),
         };
-        rest = &rest[unit..];
-        total += value * scale;
+        s = &s[unit_len..];
+        ensure!(whole <= (1 << 63) / unit, "duration is out of range");
+        let mut value = whole * unit;
+        if fraction > 0 {
+            // Go also uses a float here and truncates the product.
+            value += (fraction as f64 * (unit as f64 / scale)) as u64;
+            ensure!(value <= 1 << 63, "duration is out of range");
+        }
+        total = total
+            .checked_add(value)
+            .filter(|&v| v <= 1 << 63)
+            .context("duration is out of range")?;
     }
-    Duration::try_from_secs_f64(total).context("duration is out of range")
+    if negative {
+        ensure!(total == 0, "negative duration");
+        return Ok(0);
+    }
+    ensure!(total <= MAX, "duration is out of range");
+    Ok(total)
 }
 
 /// One member's automatic compaction schedule. It follows etcd's `Periodic` and `Revision`
 /// loops, with a caller-supplied clock so simulation can drive it.
 pub(crate) struct Compactor {
     retention: Retention,
-    /// Periodic samples, oldest first. The first is the revision one period ago.
-    samples: VecDeque<i64>,
+    /// Periodic samples with their times, oldest first. The first is the newest sample that is
+    /// at least one period old, once one exists.
+    samples: VecDeque<(Instant, i64)>,
     /// The end of the current wait.
     wait_until: Instant,
     last_revision: i64,
@@ -150,20 +219,29 @@ impl Compactor {
 
     /// Start the next wait. Periodic mode first samples the revision, as etcd does.
     fn restart(&mut self, now: Instant, revision: i64) {
-        if let Retention::Periodic(period) = self.retention {
-            self.samples.push_back(revision);
-            let interval = self.retention.retry_interval();
-            // etcd keeps period / interval + 1 samples, so the first is one period old.
-            let keep = if interval.is_zero() {
-                1
-            } else {
-                (period.as_nanos() / interval.as_nanos()) as usize + 1
-            };
-            while self.samples.len() > keep {
-                self.samples.pop_front();
-            }
+        if let Retention::Periodic(_) = self.retention {
+            self.samples.push_back((now, revision));
+            self.trim(now);
         }
         self.wait_until = now + self.retention.retry_interval();
+    }
+
+    /// Drop the samples before the newest one that is at least one period old.
+    ///
+    /// etcd keeps `period / interval + 1` samples, which assumes one sample per interval. The
+    /// Raft owner polls on its tick, so a sample can come later than the interval. The sample
+    /// times keep the chosen revision one period old, plus at most the delay of one poll.
+    fn trim(&mut self, now: Instant) {
+        let Retention::Periodic(period) = self.retention else {
+            return;
+        };
+        while self
+            .samples
+            .get(1)
+            .is_some_and(|&(time, _)| now.duration_since(time) >= period)
+        {
+            self.samples.pop_front();
+        }
     }
 
     /// Return the revision to compact now, if any. Only the leader compacts. A follower keeps
@@ -175,7 +253,13 @@ impl Compactor {
         let target = match self.retention {
             _ if !leader => None,
             Retention::Periodic(period) => {
-                let target = self.samples.front().copied().unwrap_or(0);
+                self.trim(now);
+                // Never compact a revision that was current less than one period ago.
+                let target = self
+                    .samples
+                    .front()
+                    .filter(|&&(time, _)| now.duration_since(time) >= period)
+                    .map_or(0, |&(_, revision)| revision);
                 if now.duration_since(self.last_success) < self.base_interval
                     || target == self.last_revision
                 {
@@ -270,6 +354,96 @@ mod tests {
         }
     }
 
+    /// Go's `time.ParseDuration` truncates each component to whole nanoseconds and accepts any
+    /// total up to `i64::MAX`. The expected values come from Go.
+    #[test]
+    fn durations_parse_like_go() {
+        let cases: &[(&str, Option<u64>)] = &[
+            ("0", Some(0)),
+            ("+0", Some(0)),
+            ("-0", Some(0)),
+            ("0s", Some(0)),
+            ("0.9ns", Some(0)),
+            ("1.9ns", Some(1)),
+            ("1.5h", Some(5_400_000_000_000)),
+            (".5s", Some(500_000_000)),
+            ("5.s", Some(5_000_000_000)),
+            ("1h30m", Some(5_400_000_000_000)),
+            ("1.0000000001s", Some(1_000_000_000)),
+            ("0.3333333333333333333h", Some(1_200_000_000_000)),
+            ("1µs", Some(1_000)),
+            ("1μs", Some(1_000)),
+            ("9223372036854775807ns", Some(i64::MAX as u64)),
+            ("2562047h47m16.854775807s", Some(i64::MAX as u64)),
+            ("9223372036854775808ns", None),
+            ("2562048h", None),
+            ("+", None),
+            ("-", None),
+            ("", None),
+            (".s", None),
+            ("1", None),
+            ("1s-1ns", None),
+            // Go accepts negative durations. Retention rejects them.
+            ("-1ns", None),
+            ("1d", None),
+        ];
+        for &(text, nanos) in cases {
+            assert_eq!(parse_go_duration(text).ok(), nanos, "{text:?}");
+        }
+        let p = |mode, text| Retention::parse(mode, text);
+        // A sub-nanosecond retention is zero, so it disables compaction as in etcd.
+        assert_eq!(p(Mode::Revision, "0.9ns").unwrap(), None);
+        assert_eq!(p(Mode::Periodic, "0.9ns").unwrap(), None);
+        assert!(p(Mode::Periodic, "+").is_err());
+        assert_eq!(
+            p(Mode::Revision, "9223372036854775807ns").unwrap(),
+            Some(Retention::Revision(i64::MAX))
+        );
+    }
+
+    #[test]
+    fn direct_retention_is_validated_like_the_flags() {
+        assert_eq!(Retention::Revision(0).validate().unwrap(), None);
+        assert_eq!(
+            Retention::Periodic(Duration::ZERO).validate().unwrap(),
+            None
+        );
+        assert!(Retention::Revision(-2).validate().is_err());
+        assert_eq!(
+            Retention::Revision(5).validate().unwrap(),
+            Some(Retention::Revision(5))
+        );
+    }
+
+    /// The Raft owner polls once per tick, which is longer than the sampling interval of a
+    /// short period. The chosen revision must still be about one period old.
+    #[test]
+    fn periodic_targets_stay_one_period_old_with_the_raft_tick() {
+        let tick = crate::node::TICK;
+        let period = Duration::from_millis(100);
+        assert!(period / RETRY_DIVISOR < tick);
+        let start = Instant::now();
+        // The revision is the elapsed time in milliseconds.
+        let revision = |now: Instant| now.duration_since(start).as_millis() as i64 + 1;
+        let mut compactor = Compactor::new(Retention::Periodic(period), start, 1);
+        let mut ages = vec![];
+        for n in 1..=50_u32 {
+            let now = start + tick * n;
+            if let Some(target) = compactor.poll(now, revision(now), true) {
+                ages.push(revision(now) - target);
+                compactor.finish(now, revision(now), true);
+            }
+        }
+        assert!(ages.len() >= 20, "{ages:?}");
+        let (low, high) = (
+            period.as_millis() as i64,
+            (period + tick).as_millis() as i64,
+        );
+        for age in ages {
+            assert!((low..=high).contains(&age), "age {age} ms");
+        }
+    }
+
     #[test]
     fn periodic_compacts_the_revision_from_one_period_ago() {
         let start = Instant::now();
@@ -287,8 +461,8 @@ mod tests {
             }
         }
         // The first compaction waits one period and uses the sample from the start.
-        // Later ones follow once per period.
-        assert_eq!(proposed, [(10, 1), (20, 91), (30, 191), (40, 291)]);
+        // Later ones follow once per period, each with the revision from one period before.
+        assert_eq!(proposed, [(10, 1), (20, 101), (30, 201), (40, 301)]);
     }
 
     #[test]
@@ -335,9 +509,9 @@ mod tests {
                 compactor.finish(now, i64::from(tick) + 1, true);
             }
         }
-        // etcd keeps 31 samples, so the oldest is about three hours old. After the first period,
-        // it compacts every hour.
-        assert_eq!(proposed, [(30, 1), (40, 10), (50, 20)]);
+        // The target is the revision from three hours before. After the first period, it
+        // compacts every hour.
+        assert_eq!(proposed, [(30, 1), (40, 11), (50, 21)]);
     }
 
     #[test]

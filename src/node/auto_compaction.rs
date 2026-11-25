@@ -61,7 +61,11 @@ impl Node {
     /// Run one automatic compaction turn with the clock value `now`.
     pub(super) fn drive_auto_compaction(&mut self, now: Instant) -> Result<()> {
         let revision = self.state.revision;
-        let leader = self.raw.raft.state == StateRole::Leader;
+        // A new Compact appends a target, which changes the input of the planned step and
+        // restarts its read. While removal is pending, keep sampling but do not propose another
+        // target, so a step read slower than the interval cannot be cancelled again and again.
+        // A client Compact can still advance the boundary.
+        let leader = self.raw.raft.state == StateRole::Leader && !self.state.compaction_pending;
         let node = self.options.id;
         let Some(auto) = &mut self.auto_compaction else {
             return Ok(());

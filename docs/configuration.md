@@ -126,15 +126,20 @@ The two `--auto-compaction-*` flags use the names, values, and schedule of etcd 
 Periodic mode reads an integer retention as hours, or a Go duration such as `30m` or `1.5h`.
 It samples the revision ten times per retention period, capped at one sample per six minutes.
 The first Compact waits one period. Later ones run once per period, or hourly for longer periods.
-Each uses the revision sampled about one period earlier.
+Each uses the newest sample that is at least one period old. The member checks once per 100 ms
+Raft tick, so a short period can keep up to one extra tick of history.
 Revision mode reads a revision count. Every five minutes it compacts to the current revision
 minus that count. Like etcd, it reads a duration as its nanosecond count.
+A duration is parsed like Go's `time.ParseDuration`, so each part truncates to whole nanoseconds.
 A negative retention is an error. etcd accepts a negative duration but cannot use it.
+An embedding host that sets `ServerConfig.auto_compaction` gets the same rules: zero disables it.
 
 Only the leader proposes. Each Compact goes through Raft with a fixed revision, like a client
 Compact without Physical. Followers keep sampling, so a new leader compacts on its own schedule.
 A Compact that loses leadership fails and retries later. A revision that is already compacted
 counts as done. A restart drops the samples, so the member waits one full period again.
+While compacted rows are still being removed, the leader keeps sampling but proposes no new
+automatic Compact. A new boundary would restart the removal step that is being read.
 Compaction runs as an internal request, so Auth does not apply to it.
 
 ## S3 objects

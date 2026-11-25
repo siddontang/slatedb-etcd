@@ -2578,3 +2578,107 @@ async fn auto_compaction_survives_leader_changes_mid_compaction() {
         sim.assert_acknowledged(id).await;
     }
 }
+
+impl Simulation {
+    /// Write a few entries, then run one automatic compaction turn at `now`.
+    async fn write_and_auto_compact(&mut self, now: Instant) {
+        for _ in 0..3 {
+            self.propose().await;
+            for _ in 0..30 {
+                self.deliver(false).await;
+            }
+        }
+        self.auto_compaction_turn(now).await;
+        self.settle(1).await;
+    }
+}
+
+fn next(clock: &mut u32) -> u32 {
+    *clock += 1;
+    *clock
+}
+
+/// A step read that stays unfinished across several sampling intervals must not be restarted by
+/// new automatic targets. The leader keeps the boundary until removal finishes, then compacts
+/// again.
+#[tokio::test]
+async fn auto_compaction_waits_for_pending_removal() {
+    let mut sim = Simulation::new(31).await;
+    for _ in 0..100 {
+        sim.deliver(false).await;
+    }
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    let start = Instant::now();
+    let period = Duration::from_secs(10);
+    let step = period / 10;
+    sim.enable_auto_compaction(period, start);
+    // Every leader holds its steps, as if each background read were slow.
+    for node in sim.nodes.values_mut() {
+        node.hold_compact_steps = true;
+    }
+    let mut clock = 0;
+    let leader = loop {
+        sim.write_and_auto_compact(start + step * next(&mut clock))
+            .await;
+        assert!(clock < 100, "no automatic Compact was applied");
+        let leader = sim.leader().unwrap();
+        if sim.nodes[&leader].state.compact_revision > 0 {
+            break leader;
+        }
+    };
+    let first = sim.nodes[&leader].state.compact_revision;
+    assert!(sim.nodes[&leader].state.compaction_pending);
+    // Four more periods while the revision grows. The removal stays pending, so no new target
+    // replaces its step.
+    for _ in 0..40 {
+        sim.write_and_auto_compact(start + step * next(&mut clock))
+            .await;
+        assert_eq!(sim.leader(), Some(leader), "leadership must not move");
+        let node = &sim.nodes[&leader];
+        assert!(node.state.compaction_pending);
+        assert_eq!(
+            node.state.compact_revision, first,
+            "a new automatic target was proposed during pending removal"
+        );
+        assert!(!sim.auto_running(leader));
+    }
+    assert!(sim.nodes[&leader].state.revision > first + 100);
+    // Release the steps. Removal finishes, and the schedule moves the boundary again.
+    for node in sim.nodes.values_mut() {
+        node.hold_compact_steps = false;
+    }
+    let mut finished = false;
+    for _ in 0..40 {
+        sim.write_and_auto_compact(start + step * next(&mut clock))
+            .await;
+        finished |= !sim.nodes[&leader].state.compaction_pending;
+        if finished && sim.nodes[&leader].state.compact_revision > first {
+            break;
+        }
+    }
+    assert!(finished, "removal did not finish after the release");
+    let boundary = sim.nodes[&leader].state.compact_revision;
+    assert!(boundary > first, "automatic compaction did not resume");
+    sim.settle(25).await;
+    for id in 1..=3 {
+        let node = &sim.nodes[&id];
+        assert_eq!(node.state.compact_revision, boundary);
+        assert!(
+            !node.state.compaction_pending,
+            "member {id} did not finish removal"
+        );
+        let state = node.worker.state();
+        let mut journal = state
+            .db()
+            .scan_prefix(crate::watch::EVENTS, ..)
+            .await
+            .unwrap();
+        while let Some(row) = journal.next().await.unwrap() {
+            assert!(
+                row.key.as_ref() >= crate::watch::key(boundary).as_slice(),
+                "member {id} kept a compacted journal row"
+            );
+        }
+        sim.assert_acknowledged(id).await;
+    }
+}

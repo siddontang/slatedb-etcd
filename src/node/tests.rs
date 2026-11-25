@@ -2119,3 +2119,27 @@ async fn a_snapshot_that_raft_skips_releases_its_staging_reservation() {
     );
     state.close().await.unwrap();
 }
+
+/// The warning threshold is the first whole byte count at or above `quota * fraction`. The
+/// gauge and the log both compare usage with it.
+#[test]
+fn quota_warning_threshold_rounds_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = options(dir.path());
+    options.quota_bytes = 1001;
+    options.quota_warning_fraction = 0.8;
+    // 1001 * 0.8 is 800.8, so 800 bytes is below the threshold and 801 reaches it.
+    let threshold = options.warning_bytes().unwrap();
+    assert_eq!(threshold, 801);
+    assert!(800 < threshold && 801 >= threshold);
+    // A positive threshold below one byte still warns.
+    options.quota_warning_fraction = 1e-9;
+    assert_eq!(options.warning_bytes(), Some(1));
+    options.quota_warning_fraction = 1.0;
+    assert_eq!(options.warning_bytes(), Some(1001));
+    options.quota_warning_fraction = 0.0;
+    assert_eq!(options.warning_bytes(), None);
+    options.quota_warning_fraction = 0.5;
+    options.quota_bytes = -1;
+    assert_eq!(options.warning_bytes(), None);
+}

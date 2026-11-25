@@ -273,7 +273,7 @@ fn stored_usage(
         other,
     };
     ensure!(
-        size.total() == counter.bytes,
+        size.checked_total() == Some(counter.bytes),
         "logical size split {size:?} does not add up to {}",
         counter.bytes
     );

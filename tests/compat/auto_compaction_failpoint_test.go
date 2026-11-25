@@ -33,6 +33,10 @@ func TestFailpointAutoCompaction(t *testing.T) {
 			first = reply.Header.Revision
 		}
 	}
+	// The removed versions and Watch journal rows that the interrupted target must reclaim.
+	before := logicalSizes(t, c.addresses[leader-1])
+	require.Greater(t, before["history"], float64(0))
+	require.Greater(t, before["watch_journal"], float64(0))
 	trigger := filepath.Join(c.root, fmt.Sprintf("fault-%d", leader))
 	require.NoError(t, os.WriteFile(trigger, []byte("compact-step-before-apply"), 0600))
 	require.Eventually(t, func() bool {
@@ -89,6 +93,17 @@ func TestFailpointAutoCompaction(t *testing.T) {
 		}
 		return boundaries[0] >= first
 	}, 30*time.Second, 200*time.Millisecond, "members did not converge")
+	// HashKV skips rows below the boundary, so equal hashes and boundaries also hold when
+	// removal stalls. With writes stopped, the boundary reaches the last writes, so every member
+	// must physically drop nearly all old versions and journal rows.
+	for _, endpoint := range c.addresses {
+		require.Eventually(t, func() bool {
+			after := logicalSizes(t, endpoint)
+			return after["history"] < before["history"]/4 &&
+				after["watch_journal"] < before["watch_journal"]/4
+		}, 30*time.Second, 200*time.Millisecond, "%s did not remove compacted rows: before %v",
+			endpoint, before)
+	}
 	for _, endpoint := range c.addresses {
 		member := client(t, []string{endpoint})
 		_, err := member.Get(ctx, "auto/0", clientv3.WithRev(first), clientv3.WithSerializable())
@@ -98,4 +113,14 @@ func TestFailpointAutoCompaction(t *testing.T) {
 		require.Len(t, got.Kvs, 1)
 		require.Equal(t, last.Header.Revision, got.Kvs[0].ModRevision)
 	}
+}
+
+// The logical size gauges of one member by row kind.
+func logicalSizes(t *testing.T, address string) map[string]float64 {
+	t.Helper()
+	kinds := map[string]float64{}
+	for _, metric := range scrapeMetrics(t, address)["slatedb_etcd_logical_size_bytes"].GetMetric() {
+		kinds[metric.GetLabel()[0].GetValue()] = metric.GetGauge().GetValue()
+	}
+	return kinds
 }

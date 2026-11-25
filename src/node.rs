@@ -178,10 +178,15 @@ impl NodeOptions {
     }
 
     /// The quota usage that raises the early warning, or `None` when it is off.
+    ///
+    /// This is the first whole byte count at or above `quota * fraction`, so a fractional
+    /// threshold does not warn early and a tiny one still warns at one byte.
     fn warning_bytes(&self) -> Option<u64> {
         let quota = self.effective_quota();
-        (quota > 0 && self.quota_warning_fraction > 0.0)
-            .then_some((quota as f64 * self.quota_warning_fraction) as u64)
+        (quota > 0 && self.quota_warning_fraction > 0.0).then(|| {
+            let threshold = (quota as f64 * self.quota_warning_fraction).ceil() as u64;
+            threshold.clamp(1, quota as u64)
+        })
     }
 }
 
@@ -308,6 +313,9 @@ pub struct Node {
     auto_compaction: Option<auto_compaction::AutoCompaction>,
     /// Quota usage has reached the warning threshold and the warning is logged.
     quota_warned: bool,
+    /// Simulation: the leader does not propose compaction steps, as if their reads were slow.
+    #[cfg(test)]
+    hold_compact_steps: bool,
 }
 
 impl Node {
@@ -550,6 +558,8 @@ impl Node {
         let mut node = Self {
             auto_compaction,
             quota_warned: false,
+            #[cfg(test)]
+            hold_compact_steps: false,
             location,
             metrics,
             last_observed_leader: 0,

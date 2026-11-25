@@ -208,6 +208,14 @@ impl Usage {
         self.current + self.history + self.journal + self.other
     }
 
+    /// The total, or `None` when a corrupt split does not fit in a `u64`.
+    pub fn checked_total(&self) -> Option<u64> {
+        self.current
+            .checked_add(self.history)?
+            .checked_add(self.journal)?
+            .checked_add(self.other)
+    }
+
     fn kind(&mut self, key: &[u8]) -> &mut u64 {
         if key.starts_with(crate::mvcc::CURRENT) {
             &mut self.current

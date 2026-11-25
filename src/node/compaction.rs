@@ -215,6 +215,11 @@ impl Node {
             return Ok(());
         }
         self.compact_ready_at = None;
+        // Simulation holds steps here, as an unfinished background read does.
+        #[cfg(test)]
+        if self.hold_compact_steps {
+            return Ok(());
+        }
         // The step reads storage in the background. Proposing it earlier makes apply wait.
         if self.backlogged() || !self.compact_plan.ready(self.state.compaction_plan) {
             return Ok(());
