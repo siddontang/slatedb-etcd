@@ -658,14 +658,58 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
 | Leader crashes with unflushed batches | The new leader materializes them from its overlay |
 | Old leader is partitioned | It cannot commit L0 changes. Its uploads are orphans |
 | S3 is slow or down | New proposals fail at the soft limit. Apply pauses at the hard limit |
+| The leader's own path to S3 fails | Leadership moves once to a healthy voter, which publishes |
+| Writes fail for all members | The writer retries with a capped backoff. Reads continue |
+| Writes fail for a long time | Proposals fail at the soft limit. Apply pauses at the hard limit |
+| The writer finds data that it cannot use | The writer halts, and leadership moves once |
+| An invariant of the member fails | The member stops |
 | A member stops reporting its base | Its base can be deleted. It rebases on a missing SST |
 | A checkpoint open fails | The member keeps its base and tries the next checkpoint |
 | No writes for a long time | Checkpoints have no lifetime, so all bases stay valid |
 | No leader for a long time | No process deletes anything |
 | All members restart | Each member installs its base and replays its log |
 | Writer opens in reverse term order | The current leader is fenced, then it opens again |
-| New leader's clock is behind | The writer waits, or refuses over the skew limit |
+| New leader's clock is behind | The writer waits, or refuses and then hands over the lead |
 | The shared `Db` is lost or corrupted | All members lose state together. Restore from a backup |
+
+### Writer faults
+
+The leader classifies each writer error. The outer SlateDB error kind decides.
+
+- **Fence or lost manifest race:** the writer opens again at once.
+- **Storage fault:** SlateDB `Unavailable`, or an object store error from a call outside SlateDB.
+  The writer closes and opens again after 1 s. The wait doubles up to 30 s. A writer that runs
+  for 60 s starts a new count.
+- **Data fault:** any other SlateDB kind, also a `Data` error with a missing object below it.
+  Each later leader can meet it. The writer halts, and the wait starts at 30 s and doubles up to
+  5 minutes.
+- **Invariant error:** an error with no SlateDB or object store cause. The member's applied
+  state is in doubt, so the member stops.
+
+A new writer fences the failed one. It starts at `last_l0_seq` and writes the overlay batches
+again, as after a leader change. A publication request stays until a checkpoint serves it. A
+`Db` that SlateDB closes after a failed background flush ends the writer also on an idle
+member. Apply, replies, and reads continue during the fault. A retention error only skips that
+round of retention.
+
+A clock over `--max-clock-skew` counts as a storage fault. Due storage work that makes no
+durable progress for 30 s also counts: a writer open, a flush at its age limit, or a requested
+publication. A buffered write before its age limit is not due. A pending snapshot restore is not
+a fault, because each member meets it.
+
+The leader hands its lead to another voter after three faults in a row, after one data fault,
+or after 30 s without durable progress. The target is the voter with the longest matched log
+that reported in this term, from its current process, without a writer fault mark. A member
+sets its mark at each fault and clears it only when its own writer publishes again. It sends
+the age of the mark in each `ViewAck`. An earlier binary sends none and is never a target. A
+mark older than the leader's last publication is a last resort, because another writer
+published after it. The leader tries each voter once per incident. A handoff that does not end
+within two election timeouts is aborted, and the leader tries the next voter. With no target
+left the leader keeps the lead, and its writer keeps retrying.
+
+So a fault on one member's path moves the lead once. A fault of the whole backend moves it at
+most once per member. A marked member stays out of automatic handoffs until it leads again and
+its writer publishes. MoveLeader can still move the lead to it.
 
 ## Costs and trade-offs
 

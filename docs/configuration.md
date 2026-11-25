@@ -200,7 +200,10 @@ Rules and limits:
   clock. A fence while it still leads opens the writer again.
 - Over `--max-clock-skew`, the writer does not start. The member logs an error, sets
   `clock_alarm` in `/status`, exports `slatedb_etcd_shared_clock_skew_milliseconds`, and tries
-  again each second.
+  again with a backoff. After three refusals the leader hands over the lead.
+- A storage error of the writer keeps the member up. The writer opens again with a backoff, and
+  a member whose path fails hands over the lead. See
+  [writer faults](shared-state.md#writer-faults).
 - MoveLeader first requests a checkpoint of the applied state. It transfers the lead when the
   applied base covers the applied index of the request, or 3 s after the newest pending
   MoveLeader request even if the base still trails that index. The new leader then materializes

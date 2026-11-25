@@ -114,12 +114,14 @@ A member in shared state mode also exports these gauges. Replicated members omit
 | `slatedb_etcd_shared_writer_running` | 1 while the writer database of this member is open |
 | `slatedb_etcd_shared_writer_clock_alarm` | 1 while the clock check keeps the writer closed |
 | `slatedb_etcd_shared_writer_reopens` | Writer opens after a fence or a lost manifest race |
+| `slatedb_etcd_shared_writer_consecutive_failures` | Writer faults in a row, other than fences |
+| `slatedb_etcd_shared_writer_faults_total` | Counter of writer faults, clock refusals, and stalls |
 | `slatedb_etcd_shared_view_checkpoints` | `view-` checkpoints after the last publication |
 | `slatedb_etcd_shared_clock_skew_milliseconds` | Local clock lag behind the writer clock |
 | `slatedb_etcd_shared_backup_streams` | Native backups that stream a pinned view |
 | `slatedb_etcd_shared_backup_retained_bytes` | Released overlay bytes that backups still keep |
 
-The member sets the first six gauges on each Raft tick. The leader sets the checkpoint count
+The member sets the first eight gauges on each Raft tick. The leader sets the checkpoint count
 after each publication. The clock gauge changes at each writer open. The backup gauges change
 when a backup starts or ends, and every 100 ms while one streams.
 
