@@ -1168,3 +1168,70 @@ async fn a_restart_on_another_checkpoint_sends_that_checkpoint() {
         assert_ne!(record.unwrap().unwrap().checkpoint, x);
     }
 }
+
+/// Sig-Codex: the reverse grouping case beside a voter of an earlier binary. No certification
+/// can serve the follower's manual checkpoint, and the leader's base is at its row below the
+/// demand. The leader publishes a checkpoint at its applied index, and the manual checkpoint
+/// completes. Automatic truncation is off, so only that publication can serve it.
+#[tokio::test]
+async fn a_follower_manual_checkpoint_beside_an_earlier_binary_gets_a_row_checkpoint() {
+    let mut sim = Simulation::with_mode(31, true).await;
+    for node in sim.nodes.values_mut() {
+        node.options.snapshot_every = 0;
+        node.next_checkpoint = None;
+    }
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(10).await;
+    let leader = sim.leader().unwrap();
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(10).await;
+    let grouped = sim.follower(0);
+    let old = sim.follower(grouped);
+    sim.old.insert(old);
+    sim.isolated = Some(grouped);
+    sim.propose().await;
+    sim.settle(1).await;
+    let j = sim.nodes[&leader].state.applied;
+    sim.propose_noop().await;
+    for step in [
+        WriterStep::Materialize,
+        WriterStep::Checkpoint,
+        WriterStep::Announce,
+    ] {
+        sim.writer_step(&mut writers, leader, step).await;
+    }
+    sim.settle(1).await;
+    sim.isolated = None;
+    sim.settle(4).await;
+    assert!(!sim.nodes[&leader].extension_allowed());
+    assert_eq!(sim.pushed(grouped), j + 1);
+    assert_eq!(sim.base(grouped).0, j);
+    let (tx, mut rx) = oneshot::channel();
+    let node = sim.nodes.get_mut(&grouped).unwrap();
+    node.handle(Event::Checkpoint(tx), &mut vec![])
+        .await
+        .unwrap();
+    let index = *node
+        .checkpoint_waiters
+        .iter()
+        .map(|(i, _)| i)
+        .max()
+        .unwrap();
+    let pins = sim.nodes[&grouped].dst_pins();
+    let coverage = sim.process(grouped);
+    let node = sim.nodes.get_mut(&leader).unwrap();
+    node.view_ack(grouped, pins, Some(index), coverage);
+    sim.settle(4).await;
+    sim.finish_checkpoints(grouped);
+    assert!(rx.try_recv().is_err());
+    sim.publish_view(&mut writers).await;
+    sim.settle(10).await;
+    sim.finish_checkpoints(grouped);
+    assert!(rx.try_recv().unwrap().is_ok());
+    let (base, checkpoint, _) = sim.base(grouped);
+    let source = sim.nodes[&leader].shared_source().unwrap();
+    let row = source.open_base(checkpoint.unwrap()).await.unwrap().applied;
+    assert!(base >= index && row >= index, "base {base}, row {row}");
+}

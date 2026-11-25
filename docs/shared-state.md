@@ -443,9 +443,10 @@ checkpoint is gone, it takes a checkpoint in the same range as a restart does.
     leader publishes a checkpoint at its applied index: if no batch is there, apply first stores
     a batch with only the apply marker and the counters. The leader then records that base at
     its row and sends it. This costs one flush and one checkpoint.
-  - The same publication serves every request above the record that no certification can
-    serve: a request of a member without the capability, and any request while some member
-    lacks it.
+  - The same publication serves every demand above the record that no certification can
+    serve: a request of a member without the capability, and any request or follower's manual
+    checkpoint while some member lacks it. The leader publishes at or above the highest of
+    these demands.
   - A snapshot above its row goes to its own route, `/raft/covered`, with the process that
     advertised the capability. An earlier binary has no such route and answers 404, and
     another process answers 409, before Raft sees the snapshot. The leader then counts the

@@ -52,7 +52,7 @@ impl Node {
         let demand = writer.demand.max(wanted);
         let unmet = demand > *writer.applied.based.borrow();
         // Without the capability on every member, a demand gets a checkpoint at its row.
-        self.serve_exact(!extend && unmet);
+        self.serve_exact((!extend && unmet).then_some(demand));
         let Some(writer) = &mut self.writer else {
             return Ok(());
         };
@@ -108,17 +108,18 @@ impl Node {
 
     /// An earlier binary installs a view snapshot only at its checkpoint row. The log cache does
     /// not send it a record above the row, and asks here for a record at a row instead. `unmet`
-    /// asks too: a demand while some member lacks the capability, so no certification serves it.
+    /// asks too: the demand of a snapshot request or a follower's manual checkpoint while some
+    /// member lacks the capability, so no certification serves it.
     ///
     /// If the base is at its own row, above the record and at or above the demand, the next
     /// record is at that row. Otherwise the leader publishes a checkpoint whose row is its applied
     /// index. When no batch is at that index, apply first stores one that holds only the apply
     /// marker, so the checkpoint row is there. That costs one flush and one checkpoint.
-    fn serve_exact(&mut self, unmet: bool) {
-        if !unmet && !self.raw.store().exact_wanted() {
+    fn serve_exact(&mut self, unmet: Option<u64>) {
+        if unmet.is_none() && !self.raw.store().exact_wanted() {
             return;
         }
-        let wanted = self.raw.store().wanted_index();
+        let wanted = unmet.unwrap_or(0).max(self.raw.store().wanted_index());
         let record = self.raw.store().snapshot_index();
         let applied = self.state.applied;
         let Some(writer) = &mut self.writer else {
