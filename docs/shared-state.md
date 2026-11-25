@@ -678,34 +678,54 @@ The leader classifies each writer error. The outer SlateDB error kind decides.
 
 - **Fence or lost manifest race:** the writer opens again at once.
 - **Storage fault:** SlateDB `Unavailable`, or an object store error from a call outside SlateDB.
-  The writer closes and opens again after 1 s. The wait doubles up to 30 s. A writer that runs
-  for 60 s starts a new count.
-- **Data fault:** any other SlateDB kind, also a `Data` error with a missing object below it.
-  Each later leader can meet it. The writer halts, and the wait starts at 30 s and doubles up to
-  5 minutes.
-- **Invariant error:** an error with no SlateDB or object store cause. The member's applied
-  state is in doubt, so the member stops.
+  The writer opens again after 1 s. The wait doubles up to 30 s.
+- **Data fault:** any other SlateDB kind, also a `Data` error with a missing object below it. A
+  stored object of the shared state that does not decode is a data fault too: an applied row, a
+  bootstrap claim, or a bootstrap marker. Each later leader can meet it. The writer halts, and
+  the wait starts at 30 s and doubles up to 5 minutes.
+- **Invariant error:** an error with no SlateDB or object store cause, about this member's own
+  state. The member's applied state is in doubt, so the member stops.
+
+Only a checkpoint that the writer creates and announces starts a new count of faults. It counts
+also when Raft drops the announcement, because the checkpoint proves the storage path. An idle
+cluster keeps its count until its next write publishes.
 
 A new writer fences the failed one. It starts at `last_l0_seq` and writes the overlay batches
-again, as after a leader change. A publication request stays until a checkpoint serves it. A
-`Db` that SlateDB closes after a failed background flush ends the writer also on an idle
-member. Apply, replies, and reads continue during the fault. A retention error only skips that
-round of retention.
+again, as after a leader change. A publication request and a Defragment republish stay until a
+checkpoint serves them. A `Db` that SlateDB closes after a failed background flush ends the
+writer also on an idle member. Apply, replies, and reads continue during the fault. A retention
+error only skips that round of retention.
+
+The task does not wait for the close of a failed writer. A close joins the SST uploads, so it
+runs in the background until its I/O ends. At most one such close is pending: a newer one
+aborts the older one, whose writer later epochs fenced. A shutdown waits for it at most 5 s. A
+backend whose calls hang forever with no error can keep old SlateDB workers, because the fence
+cannot end a pending put. Only a timeout at the object store call bounds them. S3 calls time out
+after 10 s.
 
 A clock over `--max-clock-skew` counts as a storage fault. Due storage work that makes no
-durable progress for 30 s also counts: a writer open, a flush at its age limit, or a requested
-publication. A buffered write before its age limit is not due. A pending snapshot restore is not
-a fault, because each member meets it.
+durable progress for 30 s also counts: a read of the bootstrap marker and claim, a writer open,
+a flush at its age limit, or a requested publication. Each durable step restarts the timer: an
+open, a flush, a checkpoint, its read back, and the bootstrap marker. A buffered write before
+its age limit is not due. A pending snapshot restore is not a fault, because each member meets
+it.
 
 The leader hands its lead to another voter after three faults in a row, after one data fault,
 or after 30 s without durable progress. The target is the voter with the longest matched log
-that reported in this term, from its current process, without a writer fault mark. A member
-sets its mark at each fault and clears it only when its own writer publishes again. It sends
-the age of the mark in each `ViewAck`. An earlier binary sends none and is never a target. A
-mark older than the leader's last publication is a last resort, because another writer
-published after it. The leader tries each voter once per incident. A handoff that does not end
-within two election timeouts is aborted, and the leader tries the next voter. With no target
-left the leader keeps the lead, and its writer keeps retrying.
+and no writer fault mark. Its report must come from its current process, arrive after the start
+of the incident, and carry the leader's current Raft term. So a voter that stopped, or that led
+and failed in a term between, is not a target.
+
+A member sets its mark at each fault and clears it only when its own writer publishes again. It
+sends the age of the mark in each `ViewAck`. An earlier binary sends none and is never a target.
+A mark older than the leader's last publication is a last resort, because another writer
+published after it. The leader tries each voter once per incident, and only its own
+publication ends the incident. A handoff that does not end within two election timeouts is
+aborted, so Raft takes proposals again, and the leader tries the next voter.
+
+With no target left the leader keeps the lead. After a stall it drops the stalled step and
+opens the writer again, so the writer recovers within 30 s plus the backoff, also when the
+stalled I/O never returns. Other faults retry with the backoff.
 
 So a fault on one member's path moves the lead once. A fault of the whole backend moves it at
 most once per member. A marked member stays out of automatic handoffs until it leads again and

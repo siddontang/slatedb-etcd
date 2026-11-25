@@ -227,6 +227,7 @@ place. Delete them after you check the converted cluster.
 | One member cannot write to S3 | Its writer retries. The lead moves once to a healthy voter |
 | No member can write to S3 | Each writer retries after at most 30 s. Reads continue |
 | The writer cannot use the data | The writer halts and retries after at most 5 minutes |
+| A writer step hangs for 30 s | The lead moves, or the writer drops the step and opens again |
 | A checkpoint open fails | The member tries again with a backoff from 100 ms to 2 s |
 | An announcement is lost | The writer announces the checkpoint again with the same backoff |
 | A member reads a deleted SST | The read fails and can retry. Apply rebuilds from a newer base |
@@ -235,10 +236,11 @@ place. Delete them after you check the converted cluster.
 | The shared database is lost | All members lose state together. Restore from a backup |
 
 `/status` reports the writer health under `shared_state.writer.health`: the failures in a row,
-the time since the first one, the class and text of the last error, and the fault mark. A
-marked member is not an automatic handoff target until it leads again and its writer publishes.
-Use MoveLeader to move the lead to it before that. `shared_state.writer.handoff` names the
-target of a handoff in flight and the voters that the incident tried.
+the time since the first one, the class and text of the last error, the fault mark, and the
+pending close of a failed writer. A marked member is not an automatic handoff target until it
+leads again and its writer publishes. Use MoveLeader to move the lead to it before that.
+`shared_state.writer.handoff` names the target of a handoff in flight and the voters that the
+incident tried.
 
 ## Metrics
 
