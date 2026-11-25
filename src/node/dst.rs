@@ -2181,17 +2181,25 @@ impl Simulation {
         panic!("member {id} does not wait for a snapshot");
     }
 
-    /// Settle `rounds` times. Member `id` must never lead.
+    /// Settle `rounds` times. Member `id` must not lead while it waits for a snapshot.
     async fn settle_without(&mut self, id: u64, rounds: usize) {
         for _ in 0..rounds {
             for member in 1..=3 {
                 self.tick(member).await;
-                assert_ne!(self.leader(), Some(id), "member {id} leads");
+                self.assert_not_leading(id);
             }
             for _ in 0..30 {
                 self.deliver(false).await;
-                assert_ne!(self.leader(), Some(id), "member {id} leads");
+                self.assert_not_leading(id);
             }
+        }
+    }
+
+    /// Member `id` does not lead while it waits for a snapshot. After the install it may lead,
+    /// for example when a transfer to it arrives after the snapshot.
+    fn assert_not_leading(&self, id: u64) {
+        if self.leader() == Some(id) {
+            assert_eq!(self.nodes[&id].quota.blocked(), None, "member {id} leads");
         }
     }
 
@@ -2349,7 +2357,7 @@ async fn a_waiting_member_does_not_lead_in_an_election_or_a_transfer() {
         }
         sim.settle_without(waiting, 30).await;
         let now = sim.leader().unwrap();
-        assert_ne!(now, waiting);
+        assert!(transfer || now != waiting);
         assert_eq!(
             sim.nodes[&waiting].quota.blocked(),
             None,
@@ -2364,11 +2372,14 @@ async fn a_waiting_member_does_not_lead_in_an_election_or_a_transfer() {
             sim.start(leader).await;
             sim.settle(3).await;
         }
+        // The leader seeds the cluster quota with its flag. After its install, the member can
+        // be that leader.
+        let seeder = sim.leader().unwrap();
         sim.release_quota();
         sim.settle(2).await;
         sim.write(2).await;
         sim.settle(2).await;
-        assert_eq!(sim.cluster_quota(), Some(1 << 20));
+        assert_eq!(sim.cluster_quota(), Some(sim.quotas[&seeder]));
     }
 }
 
@@ -2524,7 +2535,7 @@ async fn a_member_waiting_on_a_membership_entry_does_not_lead() {
         }
         sim.settle_without(waiting, 30).await;
         let now = sim.leader().unwrap();
-        assert_ne!(now, waiting);
+        assert!(transfer || now != waiting);
         assert_eq!(
             sim.nodes[&waiting].quota.blocked(),
             None,
@@ -2556,6 +2567,44 @@ async fn a_member_waiting_on_a_membership_entry_does_not_lead() {
                 "{commands:?}"
             );
         }
+    }
+}
+
+/// Members of an earlier binary stored their own flags. Member 1 never flushed, so after a full
+/// restart it leads with no row, and its first seed carries no digest. Once its replay stores
+/// its row, it sends the digest in the same term, and the members with other rows report it.
+#[tokio::test]
+async fn a_leader_without_a_row_sends_its_digest_once_it_has_one() {
+    let mut sim = Simulation::with_holds(19, false, BTreeMap::new(), false, true, true).await;
+    sim.settle(3).await;
+    assert_eq!(sim.leader(), Some(1));
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(3).await;
+    for id in [2, 3] {
+        let node = sim.nodes.get_mut(&id).unwrap();
+        node.worker.state_mut().db().flush().await.unwrap();
+    }
+    for id in 1..=3 {
+        sim.stop(id);
+    }
+    sim.hold_members = false;
+    sim.paused_apply = Some(1);
+    for id in 1..=3 {
+        sim.start(id).await;
+    }
+    assert!(sim.nodes[&1].state.members_row.is_none());
+    sim.nodes.get_mut(&1).unwrap().raw.campaign().unwrap();
+    sim.settle(2).await;
+    assert_eq!(sim.leader(), Some(1));
+    let term = sim.nodes[&1].raw.raft.term;
+    assert!(sim.nodes[&1].state.members_row.is_none());
+    sim.paused_apply = None;
+    sim.settle(3).await;
+    assert_eq!(sim.nodes[&1].raw.raft.term, term);
+    for (&id, node) in &sim.nodes {
+        let expected = (id != 1).then_some(1);
+        assert_eq!(node.state.members_mismatch, expected, "member {id}");
+        assert_eq!(node.state.members_checked.unwrap().0, term, "member {id}");
     }
 }
 

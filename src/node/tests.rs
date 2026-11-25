@@ -600,18 +600,9 @@ pub(super) async fn leader_node_with(
         vote.term = node.raw.raft.term + u64::from(kind == MessageType::MsgRequestPreVoteResponse);
         node.raw.step(vote).unwrap();
     }
-    node.drive_ready().await.unwrap();
-    node.drain_log().await.unwrap();
-    let mut ack = Message::default();
-    ack.set_msg_type(MessageType::MsgAppendResponse);
-    ack.from = 2;
-    ack.to = 1;
-    ack.term = node.raw.raft.term;
-    ack.index = node.raw.store().last_index().unwrap();
-    node.raw.step(ack).unwrap();
-    node.drive_ready().await.unwrap();
-    node.drain_log().await.unwrap();
-    node.drain_apply().await.unwrap();
+    // The seed of the first term, and then the digest of the new row. See `propose_members`.
+    commit_with_peer(&mut node).await;
+    commit_with_peer(&mut node).await;
     assert_eq!(node.raw.raft.state, StateRole::Leader);
     node
 }

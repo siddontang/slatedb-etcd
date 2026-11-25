@@ -10,9 +10,9 @@ impl Node {
     ///
     /// A member compares only when its row did not change after the applied index of the
     /// leader. After a restart, a member knows only that its row changed at or before its index
-    /// at the start. That index is at most the last entry of an earlier term. A new leader with a
-    /// row that has not applied that entry yet proposes its digest once more after the first
-    /// seed of its term applies.
+    /// at the start. That index is at most the last entry of an earlier term. A new leader that
+    /// has not applied that entry yet, or has no row, proposes its digest once more after the
+    /// first seed of its term applies. A new cluster pays one small entry for this.
     pub(super) fn propose_members(&mut self) -> Result<()> {
         #[cfg(test)]
         if self.hold_members {
@@ -47,9 +47,9 @@ impl Node {
         // Like `SetQuota`, the small entry skips the memory admission check. Raft drops it only
         // during a leadership transfer, with every other proposal. The next call tries again.
         // The entries of this term start at the empty entry of the leader. A seed without a
-        // digest stores the row of this leader, so it needs no second comparison.
+        // digest compares nothing, so the leader sends its digest once it has a row.
         let covered =
-            row.is_none() || self.state.applied + 1 >= self.raw.raft.raft_log.last_index();
+            row.is_some() && self.state.applied + 1 >= self.raw.raft.raft_log.last_index();
         if self.raw.propose(vec![], data).is_ok() {
             if recheck || covered {
                 self.members_rechecked = term;
