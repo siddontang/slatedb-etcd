@@ -44,6 +44,8 @@ pub use shared::{StateMode, ViewRetention};
 pub use source::{Row, StateRead, StateScan};
 use view::StateView;
 #[cfg(test)]
+mod history_tests;
+#[cfg(test)]
 mod key_index_tests;
 #[cfg(test)]
 mod lease_index_tests;

@@ -95,6 +95,31 @@ impl Segment {
         }
         None
     }
+
+    /// Return the last key in `[start, upper)` within `end` that has a version at or below
+    /// `seq`, with that version. Keys at or before `limit` are not useful to the caller.
+    pub(crate) fn last_before(
+        &self,
+        start: &[u8],
+        upper: Bound<&[u8]>,
+        end: &End<'_>,
+        seq: u64,
+        limit: Option<&[u8]>,
+    ) -> Option<(Bytes, Option<Bytes>)> {
+        let rows = self.rows.read().unwrap();
+        for (key, versions) in rows.range::<[u8], _>((Bound::Included(start), upper)).rev() {
+            if limit.is_some_and(|limit| key.as_ref() <= limit) {
+                return None;
+            }
+            if !end.contains(key) {
+                continue;
+            }
+            if let Some(value) = newest(versions, seq) {
+                return Some((key.clone(), value));
+            }
+        }
+        None
+    }
 }
 
 fn newest(versions: &Versions, seq: u64) -> Option<Option<Bytes>> {
