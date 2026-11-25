@@ -216,6 +216,9 @@ Rules and limits:
   then announces its base checkpoint again with its covered index, if it stored no batch above
   the checkpoint row. Otherwise it publishes a new checkpoint first. One announcement serves
   each demand, and an idle cluster then appends nothing more.
+- A request of an earlier term can name a suffix that the leader replaced. The leader serves
+  each peer at most its last log index, pinned at the first request, so the follower takes a
+  snapshot and then appends. Both state modes do this.
 - A restart opens the newest checkpoint. It adopts the checkpoint when the log ends below it. A
   Raft snapshot record above the newest checkpoint row names its checkpoint, and the restart
   opens that one at the record index.

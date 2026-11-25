@@ -26,6 +26,17 @@ impl Node {
         if self.raw.raft.state != StateRole::Leader {
             return Ok(());
         }
+        // A request of an earlier term can name a suffix that this leader replaced.
+        let term = self.raw.raft.term;
+        self.raw.store().lead_term(term);
+        if let Some(writer) = &mut self.writer {
+            if writer.demand_term != term {
+                writer.demand_term = term;
+                writer.demand = 0;
+                writer.certified = None;
+                writer.demand_publication = 0;
+            }
+        }
         let wanted = self.raw.store().wanted_index();
         let Some(writer) = &mut self.writer else {
             return Ok(());

@@ -169,6 +169,18 @@ async fn an_idle_shared_leader_serves_a_snapshot_request_at_the_last_index() {
 /// cluster the leader's announcement covers that index, and the member recovers by snapshot.
 #[tokio::test]
 async fn a_guarded_shared_member_recovers_in_an_idle_cluster() {
+    guarded_member(false).await;
+}
+
+/// The same with the leader's apply behind when the member first asks. The target is the request
+/// itself, so the leader serves it once its apply reaches it. The member never applies the
+/// blocked entry.
+#[tokio::test]
+async fn a_guarded_shared_member_recovers_from_a_clamped_target() {
+    guarded_member(true).await;
+}
+
+async fn guarded_member(lagging: bool) {
     let mut sim = Simulation::with_holds(23, true, BTreeMap::new(), false, true, true).await;
     sim.settle(3).await;
     let publish = RaftCommand::Cluster {
@@ -186,10 +198,20 @@ async fn a_guarded_shared_member_recovers_in_an_idle_cluster() {
     sim.replace(waiting, 0).await;
     sim.until_waiting(waiting).await;
     assert!(sim.nodes[&waiting].state.members_row.is_none());
+    let blocked = sim.nodes[&waiting].quota.blocked().unwrap();
     let mut writers = BTreeMap::new();
     sim.publish_view(&mut writers).await;
-    sim.settle(30).await;
     let leader = sim.leader().unwrap();
+    if lagging {
+        sim.paused_apply = Some(leader);
+        sim.propose_noop().await;
+        for _ in 0..3 {
+            sim.settle(1).await;
+            assert!(sim.nodes[&waiting].state.applied < blocked);
+        }
+        sim.paused_apply = None;
+    }
+    sim.settle(30).await;
     let node = &sim.nodes[&waiting];
     assert_eq!(node.quota.blocked(), None);
     assert!(node.installed_snapshots > 0);
@@ -558,4 +580,132 @@ async fn a_member_restarts_at_a_record_above_its_checkpoint_row() {
     assert_eq!(node.state.applied, sim.nodes[&leader].state.applied);
     assert_eq!(node.state.revision, sim.nodes[&leader].state.revision);
     sim.assert_acknowledged(member).await;
+}
+
+impl Simulation {
+    /// Deliver messages inside the groups `{1, 2}` and `{3, 4, 5}` only. Member 2 also loses
+    /// its acceptances to member 1, so member 1 cannot commit the suffix that member 2 holds,
+    /// and it loses the snapshots of member 1, so its request outlives the term.
+    async fn pump_partition(&mut self) {
+        self.drive().await;
+        for _ in 0..150 {
+            self.messages.retain(|m| {
+                (m.from <= 2) == (m.to <= 2)
+                    && !(m.from == 2
+                        && m.to == 1
+                        && m.get_msg_type() == MessageType::MsgAppendResponse
+                        && !m.reject)
+                    && !(m.from == 1 && m.get_msg_type() == MessageType::MsgSnapshot)
+            });
+            if self.messages.is_empty() {
+                break;
+            }
+            self.deliver(false).await;
+        }
+    }
+}
+
+/// Sig-Codex's five-voter probe. Member 2 gets an uncommitted suffix through `high` from member
+/// 1 and asks for a snapshot there. Members 3 to 5 elect a leader that replaces the suffix.
+///
+/// raft-rs keeps the pending request across the term change, and member 2 sends `high` again to
+/// each leader. A leader serves `min(high, last)` and pins that target, so member 2 restores a
+/// snapshot below `high`, which clears its request, and then takes appends. With `restart`,
+/// member 2 restarts instead, and the old request of the earlier term must not hold back
+/// member 4's request after leadership goes back to member 1. Both state modes use this rule.
+async fn stale_request(shared: bool, restart: bool) {
+    let mut sim = Simulation::with_size(9, shared, 5).await;
+    sim.settle(5).await;
+    let first = sim.leader().unwrap();
+    assert_eq!(first, 1);
+    let mut writers = BTreeMap::new();
+    if shared {
+        sim.publish_view(&mut writers).await;
+    }
+    sim.settle(10).await;
+    for _ in 0..30 {
+        sim.propose_noop().await;
+    }
+    let high = sim.nodes[&first].raw.raft.raft_log.last_index();
+    assert!(high > sim.nodes[&first].raw.raft.raft_log.committed + 20);
+    sim.pump_partition().await;
+    assert_eq!(sim.nodes[&2].raw.raft.raft_log.last_index(), high);
+    sim.nodes
+        .get_mut(&2)
+        .unwrap()
+        .raw
+        .request_snapshot()
+        .unwrap();
+    sim.pump_partition().await;
+    // Member 1 holds the suffix, so the request is within its log.
+    assert_eq!(sim.nodes[&first].raw.store().wanted_index(), high);
+    if restart {
+        sim.stop(2);
+    }
+    for _ in 0..65 {
+        for id in 1..=5 {
+            sim.tick(id).await;
+        }
+        sim.pump_partition().await;
+    }
+    let next = sim.leader().unwrap();
+    assert!(next > 2);
+    if restart {
+        sim.start(2).await;
+    } else {
+        assert_eq!(sim.nodes[&2].raw.raft.pending_request_snapshot, high);
+    }
+    sim.settle(20).await;
+    if !restart {
+        // Member 2 restored a snapshot below `high` and then took the appends of `next`.
+        let node = &sim.nodes[&2];
+        assert_eq!(node.raw.raft.pending_request_snapshot, 0);
+        assert!(node.raw.store().snapshot_index() < high);
+        let leader = &sim.nodes[&next];
+        assert_eq!(node.state.applied, leader.state.applied);
+        assert_eq!(leader.raw.store().wanted_index(), 0);
+        // No target chases the announcements: the log of the idle cluster stays put.
+        let last = leader.raw.raft.raft_log.last_index();
+        sim.settle(60).await;
+        assert_eq!(sim.nodes[&next].raw.raft.raft_log.last_index(), last);
+    }
+    assert!(sim.nodes[&first].raw.raft.raft_log.last_index() < high);
+    sim.nodes.get_mut(&next).unwrap().raw.transfer_leader(first);
+    sim.settle(35).await;
+    assert_eq!(sim.leader(), Some(first));
+    assert!(sim.nodes[&first].raw.store().wanted_index() < high);
+    let follower = 4;
+    sim.nodes
+        .get_mut(&follower)
+        .unwrap()
+        .raw
+        .request_snapshot()
+        .unwrap();
+    let current = sim.nodes[&follower].raw.raft.pending_request_snapshot;
+    assert!(current < high);
+    sim.settle(60).await;
+    assert_eq!(sim.nodes[&follower].raw.raft.pending_request_snapshot, 0);
+    for id in 1..=5 {
+        let node = &sim.nodes[&id];
+        assert_eq!(node.raw.raft.pending_request_snapshot, 0, "member {id}");
+        assert_eq!(
+            node.state.applied, sim.nodes[&first].state.applied,
+            "member {id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_earlier_term_request_does_not_hold_back_a_current_one() {
+    stale_request(true, true).await;
+}
+
+#[tokio::test]
+async fn a_requester_of_an_earlier_term_takes_a_snapshot_below_its_request() {
+    stale_request(true, false).await;
+}
+
+#[tokio::test]
+async fn a_replicated_requester_of_an_earlier_term_recovers() {
+    stale_request(false, false).await;
 }

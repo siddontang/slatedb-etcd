@@ -127,8 +127,11 @@ pub(super) struct Cache {
     hard_state: HardState,
     // Raft asked for a transferable image that the durable snapshot does not contain.
     image_wanted: Cell<bool>,
-    // The highest index that a follower's snapshot request needs and no durable image reaches.
-    wanted_index: Cell<u64>,
+    // The snapshot index that each requesting follower needs, pinned at its first request. See
+    // `Storage::snapshot`.
+    wanted: RefCell<BTreeMap<u64, u64>>,
+    // The leader term of the requests in `wanted`.
+    wanted_term: Cell<u64>,
     member: u64,
     pub durable: log::Durable,
 }
@@ -150,7 +153,8 @@ impl Cache {
             initial_conf: None,
             hard_state: durable.hard_state,
             image_wanted: Cell::new(false),
-            wanted_index: Cell::new(0),
+            wanted: RefCell::default(),
+            wanted_term: Cell::new(0),
             member: storage.member(),
             durable,
         };
@@ -264,9 +268,6 @@ impl Cache {
                 || durable.snapshot.data != self.durable.snapshot.data);
         if new_image {
             self.image_wanted.set(false);
-            if durable.snapshot.get_metadata().index >= self.wanted_index.get() {
-                self.wanted_index.set(0);
-            }
         }
         if durable.snapshot.get_metadata().index > self.snapshot.get_metadata().index {
             let end = durable.snapshot.get_metadata().index + 1;
@@ -417,6 +418,10 @@ impl Cache {
             "read_limit": self.limits.read_bytes, "hits": h.hits, "misses": h.misses,
             "evictions": h.evictions, "disk_reads": h.reads, "stale_reads": h.stale})
     }
+    /// The index of the newest staged snapshot record, durable or not.
+    pub fn staged_snapshot_index(&self) -> u64 {
+        self.snapshot.get_metadata().index
+    }
     pub fn snapshot_pending(&self) -> bool {
         self.snapshot.get_metadata().index > self.snapshot_index()
     }
@@ -433,10 +438,28 @@ impl Cache {
     pub fn image_wanted(&self) -> bool {
         self.image_wanted.get()
     }
-    /// The highest index that a follower's snapshot request needs, until a durable image
-    /// reaches it. Zero when no request waits.
+    /// The highest snapshot index that a requesting follower needs above the durable record.
+    /// Zero when the record serves every request. A peer keeps its pinned target until it gets
+    /// the snapshot, but a record that reaches the target ends the demand.
     pub fn wanted_index(&self) -> u64 {
-        self.wanted_index.get()
+        let record = self.snapshot_index();
+        self.wanted
+            .borrow()
+            .values()
+            .copied()
+            .filter(|target| *target > record)
+            .max()
+            .unwrap_or(0)
+    }
+    /// Drop the requests at a term change. Raft sends a current request again.
+    pub fn clear_wanted(&self) {
+        self.wanted.borrow_mut().clear();
+    }
+    /// Note the term of this leader. A new term drops the requests of the old one.
+    pub fn lead_term(&self, term: u64) {
+        if self.wanted_term.replace(term) != term {
+            self.clear_wanted();
+        }
     }
     /// Return true when the durable snapshot holds an image that this member can send.
     pub fn has_image(&self) -> bool {
@@ -531,19 +554,31 @@ impl Storage for Cache {
     fn last_index(&self) -> raft::Result<u64> {
         Ok(self.last)
     }
-    fn snapshot(&self, request_index: u64, _: u64) -> raft::Result<Snapshot> {
+    /// Return the durable record for a follower, or ask the owner for one.
+    ///
+    /// A follower's request can name an index that this leader never has: raft-rs keeps a
+    /// pending request across a term change, and the follower sends it again to each leader. The
+    /// leader therefore serves `min(request, last)`, with its last log index, and pins that
+    /// target at the first request of the peer. Raft repeats the original index at each retry,
+    /// and the pinned target does not follow the log, so the entries that serve it do not move
+    /// it. The target ends when the peer gets a snapshot, or at a term change.
+    ///
+    /// Raft accepts any snapshot at or above the follower's commit index, and that clears the
+    /// follower's pending request. The leader's log holds every committed entry, so the target
+    /// is at or above that index. Both state modes use this rule.
+    fn snapshot(&self, request_index: u64, to: u64) -> raft::Result<Snapshot> {
+        let pinned = self.wanted.borrow().get(&to).copied();
+        let target = pinned.unwrap_or_else(|| request_index.min(self.last));
         // A record without an image only truncates the local log. Raft retries after the owner
         // builds and publishes a complete image.
-        if self.snapshot_index() == 0 || self.snapshot_index() < request_index || !self.has_image()
-        {
+        if self.snapshot_index() == 0 || self.snapshot_index() < target || !self.has_image() {
             self.image_wanted.set(true);
-            // Keep the requested index. Shared mode serves it with a base at that index.
-            if request_index > self.snapshot_index() {
-                self.wanted_index
-                    .set(self.wanted_index.get().max(request_index));
+            if target > self.snapshot_index() {
+                self.wanted.borrow_mut().insert(to, target);
             }
             return Err(StorageError::SnapshotTemporarilyUnavailable.into());
         }
+        self.wanted.borrow_mut().remove(&to);
         Ok(self.durable.snapshot.clone())
     }
 }
@@ -683,6 +718,41 @@ mod tests {
         assert_eq!(cache.stats()["stale_reads"], 3);
         assert_eq!(cache.last_index().unwrap(), 10);
         assert!(cache.snapshot_pending());
+    }
+
+    /// A request above the last log index pins `min(request, last)` at its first call. Raft
+    /// repeats the original index, and the pin holds while the log grows. A record at the target
+    /// ends the demand but not the pin, so the next retry gets that record. A term change drops
+    /// the requests.
+    #[test]
+    fn a_snapshot_request_pins_its_target_until_the_peer_gets_it() {
+        let (_dir, mut storage, mut cache) = stored();
+        assert_eq!(cache.last_index().unwrap(), 8);
+        assert!(cache.snapshot(34, 2).is_err());
+        assert_eq!(cache.wanted_index(), 8);
+        // The log grows, and Raft asks again with the same index.
+        cache.stage(&[entry(9, 1)], None, None).unwrap();
+        assert!(cache.snapshot(34, 2).is_err());
+        assert_eq!(cache.wanted_index(), 8);
+        // The record at 8 ends the demand. The retry then gets it.
+        let data = crate::state::transfer::ViewDescriptor::new(uuid::Uuid::new_v4())
+            .encode()
+            .unwrap();
+        storage.checkpoint(8, data).unwrap();
+        cache
+            .complete(log::Durable::read(&storage).unwrap())
+            .unwrap();
+        assert_eq!(cache.wanted_index(), 0);
+        assert_eq!(cache.snapshot(34, 2).unwrap().get_metadata().index, 8);
+        // The next request starts again at the last index.
+        cache.lead_term(5);
+        assert!(cache.snapshot(34, 2).is_err());
+        assert_eq!(cache.wanted_index(), 9);
+        cache.lead_term(5);
+        assert_eq!(cache.wanted_index(), 9);
+        // A new term of this leader drops the request.
+        cache.lead_term(6);
+        assert_eq!(cache.wanted_index(), 0);
     }
 
     #[test]

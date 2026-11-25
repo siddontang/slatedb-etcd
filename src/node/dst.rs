@@ -90,6 +90,8 @@ struct Simulation {
     upgraded: bool,
     /// Started members propose no `SeedMembers`, like an earlier binary.
     hold_members: bool,
+    /// The number of voters.
+    members: u64,
 }
 
 impl Drop for Simulation {
@@ -106,13 +108,13 @@ impl Drop for Simulation {
 
 /// The `--client-peer` flags of member `id`. Each member writes other URL text for the same
 /// peers, so a member-local membership row would differ from the reference.
-fn client_urls(id: u64) -> BTreeMap<u64, String> {
+fn client_urls(id: u64, members: u64) -> BTreeMap<u64, String> {
     let host = match id {
         1 => "127.0.0.1".to_owned(),
         2 => "localhost".to_owned(),
         _ => format!("{}example", "a.".repeat(100)),
     };
-    (1..=3)
+    (1..=members)
         .map(|n| (n, format!("http://{host}:{}", 2379 + n)))
         .collect()
 }
@@ -151,6 +153,23 @@ impl Simulation {
         reference: bool,
         upgraded: bool,
         hold_members: bool,
+    ) -> Self {
+        Self::build(seed, shared, quotas, reference, upgraded, hold_members, 3).await
+    }
+
+    /// Start a simulation with `members` voters. Shared mode has a reference state.
+    async fn with_size(seed: u64, shared: bool, members: u64) -> Self {
+        Self::build(seed, shared, BTreeMap::new(), shared, false, false, members).await
+    }
+
+    async fn build(
+        seed: u64,
+        shared: bool,
+        quotas: BTreeMap<u64, i64>,
+        reference: bool,
+        upgraded: bool,
+        hold_members: bool,
+        members: u64,
     ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let reference = if reference {
@@ -204,8 +223,9 @@ impl Simulation {
             quotas,
             upgraded,
             hold_members,
+            members,
         };
-        for id in 1..=3 {
+        for id in 1..=sim.members {
             sim.start(id).await;
         }
         sim.nodes.get_mut(&1).unwrap().raw.campaign().unwrap();
@@ -223,7 +243,7 @@ impl Simulation {
     async fn start(&mut self, id: u64) {
         let (events, _) = mpsc::channel(256);
         let mut senders = BTreeMap::new();
-        for peer in 1..=3 {
+        for peer in 1..=self.members {
             if peer == id {
                 continue;
             }
@@ -267,7 +287,7 @@ impl Simulation {
         // Box the large open future, so the schedule future fits the test thread stack.
         let mut node = Box::pin(Node::open_with_transport(
             NodeOptions {
-                client_peers: client_urls(id),
+                client_peers: client_urls(id, self.members),
                 transport: crate::tls::Transport::default(),
                 require_peer_tls: false,
                 state_mode: if shared {
@@ -294,7 +314,9 @@ impl Simulation {
                 id,
                 cluster_id: "dst".into(),
                 dir: self.root.path().join(id.to_string()),
-                peers: (1..=3).map(|n| (n, format!("127.0.0.1:{n}"))).collect(),
+                peers: (1..=self.members)
+                    .map(|n| (n, format!("127.0.0.1:{n}")))
+                    .collect(),
                 // Shared members truncate often, so a lagging member needs a format 6 snapshot.
                 snapshot_every: if shared { 8 } else { 0 },
                 snapshot_min_bytes: 0,
@@ -652,9 +674,11 @@ impl Simulation {
     async fn tick(&mut self, id: u64) {
         if let Some(node) = self.nodes.get_mut(&id) {
             // Fix the timeout before every logical tick, including after a Raft role change.
+            // Five members need timeouts below twice the election tick.
+            let step = if self.members > 3 { 1 } else { 2 };
             node.raw
                 .raft
-                .set_randomized_election_timeout(10 + id as usize * 2);
+                .set_randomized_election_timeout(10 + id as usize * step);
             node.tick_raft().unwrap();
             // The shared leader serves a demand for a base at each tick, as `tick_shared` does.
             node.certify_base().unwrap();
@@ -839,11 +863,12 @@ impl Simulation {
     /// Tick every member `rounds` times and deliver the resulting messages.
     /// 25 rounds pass an election timeout.
     async fn settle(&mut self, rounds: usize) {
+        let deliveries = if self.members > 3 { 60 } else { 30 };
         for _ in 0..rounds {
-            for id in 1..=3 {
+            for id in 1..=self.members {
                 self.tick(id).await;
             }
-            for _ in 0..30 {
+            for _ in 0..deliveries {
                 self.deliver(false).await;
             }
         }
@@ -2258,7 +2283,9 @@ impl Simulation {
     /// A follower, not `except`.
     fn follower(&self, except: u64) -> u64 {
         let leader = self.leader().unwrap();
-        (1..=3).find(|&id| id != leader && id != except).unwrap()
+        (1..=self.members)
+            .find(|&id| id != leader && id != except)
+            .unwrap()
     }
 
     /// The indexes of the committed `SetQuota` entries that set `bytes`.

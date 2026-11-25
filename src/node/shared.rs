@@ -191,6 +191,8 @@ pub(super) struct Writer {
     demand_publication: u64,
     /// Ticks of `certify_base`.
     certify_ticks: u64,
+    /// The leader term of the demand above. A new term drops the demand of the old one.
+    demand_term: u64,
 }
 
 /// The shared-mode gauges of one member. The node sets them on each tick.
@@ -257,6 +259,7 @@ impl Writer {
             certified: None,
             demand_publication: 0,
             certify_ticks: 0,
+            demand_term: 0,
             progress: Arc::new(Progress::new(0)),
             admin: handles.admin.clone(),
             queue: handles.queue.clone(),

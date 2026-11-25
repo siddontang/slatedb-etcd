@@ -421,6 +421,15 @@ the rebase opens the current base again at its base index, with the log term the
   One announcement serves a demand at a time, and the leader sends it again only after 20 ticks
   without an apply. The announcement entry does not raise the demand, so an idle cluster stops
   appending.
+- **Stale requests:** raft-rs keeps a follower's pending request across a term change, and the
+  follower sends the same index to each leader. That index can name a suffix that the new
+  leader replaced. So the leader serves `min(request, last)`, with its last log index, and it
+  pins that target for the peer at its first request. Raft repeats the original index at each
+  retry, and the pin holds, so the announcement entries do not move the target. Raft accepts a
+  snapshot at or above the follower's commit index, which the leader's log holds, and that
+  clears the follower's request. The pin ends when the peer gets a snapshot, or at a term
+  change. Replicated mode uses the same rule. A follower can get a snapshot at its own record
+  index. It then stores nothing, because its log ends there.
 
 ## Install
 
