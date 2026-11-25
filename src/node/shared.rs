@@ -197,6 +197,11 @@ pub(super) struct Writer {
     exact_through: u64,
     /// Apply stores the apply marker at the applied index, for a checkpoint at its row.
     mark_row_due: bool,
+    /// The highest record index whose checkpoint apply offered as the base. See `take_raise`.
+    raised_record: u64,
+    /// DST: skip that offer, as when the checkpoint cannot open.
+    #[cfg(test)]
+    pub(super) skip_raise: bool,
 }
 
 /// The shared-mode gauges of one member. The node sets them on each tick.
@@ -266,6 +271,9 @@ impl Writer {
             demand_term: 0,
             exact_through: 0,
             mark_row_due: false,
+            raised_record: 0,
+            #[cfg(test)]
+            skip_raise: false,
             progress: Arc::new(Progress::new(0)),
             admin: handles.admin.clone(),
             queue: handles.queue.clone(),
@@ -369,6 +377,13 @@ impl Writer {
     /// Publish a checkpoint that holds the applied state through `index`.
     pub fn request_publication(&self, index: u64) {
         self.progress.request(self.covering(index));
+    }
+
+    /// DST: take the batch through which a publication is due. The DST writer steps publish
+    /// without it.
+    #[cfg(test)]
+    pub(super) fn take_publish_through(&self) -> Option<u64> {
+        self.progress.inner.lock().unwrap().publish_through.take()
     }
 
     /// The batch sequence that holds the state through `index`. A later no-op entry has no batch,

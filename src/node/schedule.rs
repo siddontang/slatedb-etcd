@@ -49,7 +49,11 @@ impl Node {
 
     /// The checkpoint to start once `applied` entries have been applied, if one is due.
     /// `Some(true)` builds a complete image; `Some(false)` only flushes state and truncates.
-    fn checkpoint_due(&self, applied: u64) -> Option<bool> {
+    pub(super) fn checkpoint_due(&self, applied: u64) -> Option<bool> {
+        // No checkpoint below the record can replace it. `certify_base` raises the base first.
+        if self.base_below_record() {
+            return None;
+        }
         // Shared mode records its base `F`. The log stays above the base, so the record needs
         // no flush, and any member can send it.
         let applied = self.checkpointable(applied);
@@ -150,6 +154,10 @@ impl Node {
                 Job::Snapshot(self.raw.store().recovery_snapshot().clone()),
                 snapshot_index,
             );
+        }
+        if self.take_raise() {
+            let record = self.raw.store().recovery_snapshot().clone();
+            return self.submit_apply(Job::RaiseBase(record), self.state.applied);
         }
         // A switch frees overlay memory, so it goes before other work.
         if self.prepared_puts.is_none() && self.take_switch() {

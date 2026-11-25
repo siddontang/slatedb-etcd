@@ -1532,6 +1532,10 @@ impl Node {
         if self.checkpoint_running || self.apply_busy || self.prepared_puts.is_some() {
             return Ok(());
         }
+        // A record built at a base below the record could not replace it. See `certify_base`.
+        if self.base_below_record() {
+            return Ok(());
+        }
         let store = self.raw.store();
         let advances = self.checkpointable(self.state.applied) > store.snapshot_index();
         // An image can replace a record without an image at the same index.

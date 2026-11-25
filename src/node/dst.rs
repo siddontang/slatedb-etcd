@@ -3094,7 +3094,7 @@ impl Simulation {
             }
         }
         sim.restart_above_rows().await;
-        sim.assert_base_at_record();
+        sim.assert_records_open().await;
         // Every member reaches the last commit with the reference state.
         let commit = sim
             .nodes

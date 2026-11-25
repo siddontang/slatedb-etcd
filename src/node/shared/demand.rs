@@ -10,7 +10,8 @@ const CERTIFY_TICKS: u64 = 20;
 
 impl Node {
     /// Serve a demand for a base above the base index of this leader: a follower's snapshot
-    /// request at its last index, or a follower's manual checkpoint.
+    /// request at its last index, a follower's manual checkpoint, or the leader's own Raft
+    /// snapshot record above its base. See `base_below_record`.
     ///
     /// The base holds every batch through its row. If no unreleased batch of this leader is
     /// above the row, the leader announces the same checkpoint again with its covered index.
@@ -45,11 +46,16 @@ impl Node {
         }
         let extend = self.extension_allowed();
         let wanted = self.raw.store().wanted_index();
+        // A base below the record cannot replace the record, so the record index is a demand.
+        let record = match self.base_below_record() {
+            true => self.raw.store().snapshot_index(),
+            false => 0,
+        };
         let Some(writer) = &mut self.writer else {
             return Ok(());
         };
         writer.certify_ticks += 1;
-        let demand = writer.demand.max(wanted);
+        let demand = writer.demand.max(wanted).max(record);
         let unmet = demand > *writer.applied.based.borrow();
         // Without the capability on every member, a demand gets a checkpoint at its row.
         self.serve_exact((!extend && unmet).then_some(demand));
@@ -156,6 +162,40 @@ impl Node {
                 .map(|base| (base.checkpoint, base.index));
             self.raw.store().note_base(base);
         }
+    }
+
+    /// Return true while the base index of this shared member is below its Raft snapshot record.
+    /// That happens after Raft persists a received snapshot that apply had already passed. No
+    /// checkpoint at the base can replace the record then, so the checkpoint jobs wait, and
+    /// `certify_base` raises the base through the record index.
+    pub(in crate::node) fn base_below_record(&self) -> bool {
+        self.writer.is_some()
+            && self
+                .state
+                .view
+                .is_some_and(|(base, _, _)| base < self.raw.store().snapshot_index())
+    }
+
+    /// Take a due job that offers the checkpoint of a record that apply passed as the base, once
+    /// for each record. This is the fast path. If the offer fails, `certify_base` still raises
+    /// the base.
+    pub(in crate::node) fn take_raise(&mut self) -> bool {
+        let record = self.raw.store().snapshot_index();
+        if !self.base_below_record() || record > self.state.applied {
+            return false;
+        }
+        let Some(writer) = &mut self.writer else {
+            return false;
+        };
+        if writer.raised_record >= record {
+            return false;
+        }
+        writer.raised_record = record;
+        #[cfg(test)]
+        if writer.skip_raise {
+            return false;
+        }
+        true
     }
 
     /// Take a due job that stores the apply marker at the applied index.

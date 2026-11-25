@@ -231,7 +231,8 @@ Rules and limits:
   opens that one at the record index. If retention deleted it, the restart takes the newest
   checkpoint whose row is between the record row and the record index, and the leader then
   records and sends that checkpoint. A record that names a checkpoint other than the base is not
-  sent. The leader records the base instead.
+  sent. The leader records the base instead. A leader whose base is below its record takes the
+  record index as a demand.
 - A missing checkpoint object fails a read with a retryable error. In apply it rebuilds the
   state from the newest checkpoint and replays the local log.
 - A member that waits on its overlay limit adopts a newer checkpoint in process when its log

@@ -170,6 +170,9 @@ pub(super) enum Job {
     },
     PublishPuts(crate::state::put_batch::PreparedPuts),
     Snapshot(Snapshot),
+    /// Shared mode: offer the checkpoint of a record at or below the applied index as the base.
+    /// The state does not change, so a later `SwitchBase` job switches.
+    RaiseBase(Snapshot),
     /// Shared mode: switch to a base that finished opening, and publish the new view.
     SwitchBase,
     /// Shared mode: store the apply marker at the applied index, so the next checkpoint has its
@@ -381,6 +384,10 @@ impl Executor {
             Job::AdoptBase { base, term } => {
                 self.state.adopt_opened(base, term).await?;
                 Output::Adopted(self.state.members.conf())
+            }
+            Job::RaiseBase(snapshot) => {
+                self.state.raise_to_record(&snapshot).await?;
+                Output::Entries(Vec::new())
             }
             Job::Snapshot(snapshot) => {
                 self.state.install_snapshot(&snapshot).await?;

@@ -456,11 +456,16 @@ checkpoint is gone, it takes a checkpoint in the same range as a restart does.
 - **Record checkpoint:** only a live base pins its checkpoint. After the base moves, retention
   can delete the checkpoint that the record names, and a restart or a rebase then uses another
   checkpoint. The log cache does not send a record that names a checkpoint other than the base,
-  at any index at or below the base index. The leader records the base instead, so a peer never
-  gets a checkpoint that it cannot open. The log cache knows the base when the node opens, so
-  a request before the first tick also follows this rule. The base index is never below the
-  record index: a member that skips a received snapshot, because it applied past it, raises
-  its base to that checkpoint.
+  at any index. The leader records the base instead, so a peer never gets a checkpoint that it
+  cannot open. The log cache knows the base when the node opens, so a request before the first
+  tick also follows this rule.
+- **Base below the record:** Raft can store a received record at or below the applied index.
+  Apply then installs nothing, so the base can stay below the record. Apply offers the received
+  checkpoint as the base, as an install that applied past it does. That offer can fail, for
+  example when the checkpoint cannot open. While the base is below the record, no checkpoint
+  job starts, because no record at the base can replace the record. The leader takes the
+  record index as a demand: it certifies its base through it, or publishes first. The next
+  image then records the base.
 
 ## Install
 

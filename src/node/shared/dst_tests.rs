@@ -108,23 +108,32 @@ impl Simulation {
         self.old_installs += 1;
     }
 
-    /// The base index of each member is at or above the index of its view record, once the
-    /// state reached the record. A record that names another checkpoint is then rebuilt from the
-    /// base. See `Cache::has_image`.
-    pub(super) fn assert_base_at_record(&self) {
+    /// A member sends only a record whose checkpoint exists. A sendable record names the live
+    /// base, which pins its checkpoint. The base index itself can stay below a received record
+    /// when an open fails, so this checks the record that a member can send, not the base.
+    pub(super) async fn assert_records_open(&self) {
+        let Some(admin) = self
+            .nodes
+            .values()
+            .find_map(|node| node.writer.as_ref().map(|writer| writer.admin.clone()))
+        else {
+            return;
+        };
+        let views = crate::state::shared::view_checkpoints(&admin)
+            .await
+            .unwrap();
         for (&id, node) in &self.nodes {
-            let state = node.worker.state();
             let record = node.raw.store().recovery_snapshot();
-            let view = crate::state::transfer::ViewDescriptor::decode(record.get_data());
-            let (Ok(Some(_)), Some((index, _, _))) = (view, state.view_status()) else {
+            let Ok(Some(view)) = crate::state::transfer::ViewDescriptor::decode(record.get_data())
+            else {
                 continue;
             };
-            if state.base_checkpoint().is_some() && state.applied >= record.get_metadata().index {
+            let checkpoint = view.checkpoint().unwrap();
+            if node.raw.store().has_image() {
                 assert!(
-                    index >= record.get_metadata().index,
-                    "seed {}: member {id} has its base at {index}, below its record at {}",
-                    self.seed,
-                    record.get_metadata().index
+                    views.iter().any(|(_, view)| view.id == checkpoint),
+                    "seed {}: member {id} can send a record of {checkpoint}, which is gone",
+                    self.seed
                 );
             }
         }
@@ -288,7 +297,7 @@ async fn an_idle_shared_leader_serves_a_snapshot_request_at_the_last_index() {
     sim.settle(60).await;
     assert_eq!(sim.nodes[&leader].raw.raft.raft_log.last_index(), last);
     assert_eq!(sim.announcements().len(), announced + 1);
-    sim.assert_base_at_record();
+    sim.assert_records_open().await;
 }
 
 /// #117 stops a new member at an earlier binary's `Publish` until a snapshot arrives. A failed
@@ -1409,5 +1418,158 @@ async fn a_restart_above_its_record_does_not_send_a_deleted_checkpoint() {
         sim.nodes[&lagging].state.applied,
         sim.nodes[&member].state.applied
     );
-    sim.assert_base_at_record();
+    sim.assert_records_open().await;
+}
+
+impl Simulation {
+    /// Member `requester` asks for a snapshot at its applied index, which is its commit index,
+    /// above its base. Deliver until Raft stores the record. The leader's announcement of the
+    /// record checkpoint has not applied there yet. Return the record.
+    async fn record_at_applied(&mut self, requester: u64) -> crate::state::shared::Record {
+        let node = &self.nodes[&requester];
+        assert_eq!(node.state.applied, node.raw.raft.raft_log.committed);
+        assert!(self.base(requester).0 < node.state.applied);
+        let node = self.nodes.get_mut(&requester).unwrap();
+        node.raw.request_snapshot().unwrap();
+        let mut writers = BTreeMap::new();
+        for round in 0..30 {
+            self.settle(1).await;
+            if round % 5 == 4 {
+                self.publish_view(&mut writers).await;
+            }
+            let node = &self.nodes[&requester];
+            if node.raw.raft.pending_request_snapshot == 0 {
+                let record = Record::of(node.raw.store().recovery_snapshot());
+                return record.unwrap().unwrap();
+            }
+        }
+        panic!("no record for member {requester}");
+    }
+}
+
+/// Critic's gap, through the Raft and apply schedulers. A member asks for a snapshot at its
+/// applied index, and Raft stores the record there, so apply installs nothing. Retention then
+/// deletes the record checkpoint, so the announcement of it cannot open. The member still
+/// raises its base to the record from the received checkpoint, and records nothing below it.
+#[tokio::test]
+async fn a_record_at_the_applied_index_raises_the_base() {
+    let mut sim = Simulation::with_mode(83, true).await;
+    for node in sim.nodes.values_mut() {
+        node.options.snapshot_every = 0;
+        node.next_checkpoint = None;
+    }
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(10).await;
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(10).await;
+    let leader = sim.leader().unwrap();
+    let member = sim.follower(0);
+    sim.write(2).await;
+    sim.settle(4).await;
+    let images = sim.nodes[&member].snapshot_images;
+    let record = sim.record_at_applied(member).await;
+    let admin = sim.nodes[&leader].writer.as_ref().unwrap().admin.clone();
+    admin.delete_checkpoint(record.checkpoint).await.unwrap();
+    sim.settle(10).await;
+    let (index, base, _) = sim.base(member);
+    assert!(
+        index >= record.index,
+        "base {index}, record {}",
+        record.index
+    );
+    assert_eq!(base, Some(record.checkpoint));
+    assert_eq!(sim.nodes[&member].snapshot_images, images);
+}
+
+/// Architecture: correctness does not depend on that raise. The raise fails, as when the
+/// checkpoint cannot open, and retention deletes the record checkpoint. While the base is
+/// below the record, no checkpoint job starts and the flush counter keeps its bytes. The
+/// member then leads, and its record index is a demand: it certifies or publishes through it.
+/// The next image replaces the record, and the lagging member never gets the deleted
+/// checkpoint. With an earlier binary present, the exact path publishes at a row.
+async fn a_failed_raise(old: bool) {
+    let mut sim = Simulation::with_mode(83, true).await;
+    for node in sim.nodes.values_mut() {
+        node.options.snapshot_every = 0;
+        node.next_checkpoint = None;
+    }
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(10).await;
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(10).await;
+    let leader = sim.leader().unwrap();
+    let member = sim.follower(0);
+    let other = sim.follower(member);
+    if old {
+        sim.old.insert(other);
+    }
+    sim.write(2).await;
+    sim.settle(4).await;
+    let node = sim.nodes.get_mut(&member).unwrap();
+    node.writer.as_mut().unwrap().skip_raise = true;
+    let record = sim.record_at_applied(member).await;
+    let admin = sim.nodes[&leader].writer.as_ref().unwrap().admin.clone();
+    admin.delete_checkpoint(record.checkpoint).await.unwrap();
+    sim.settle(10).await;
+    let (index, base, _) = sim.base(member);
+    assert!(index < record.index && base != Some(record.checkpoint));
+    let node = sim.nodes.get_mut(&member).unwrap();
+    assert!(!node.raw.store().has_image());
+    // No checkpoint job starts below the record, and none resets the flush counter.
+    node.appended_bytes = 7;
+    let images = node.snapshot_images;
+    assert_eq!(node.checkpoint_due(node.state.applied), None);
+    node.start_checkpoint(true).unwrap();
+    assert!(!node.checkpoint_running);
+    assert_eq!((node.appended_bytes, node.snapshot_images), (7, images));
+    if let Some(mut writer) = writers.remove(&leader) {
+        writer.close().await;
+    }
+    let writer = sim.nodes[&member].writer.as_ref().unwrap();
+    writer.take_publish_through();
+    sim.lead(member).await;
+    // No peer asks for a snapshot yet. The record index alone asks for a publication: the
+    // batches above the base row, or a checkpoint at a row for the earlier binary.
+    sim.settle(2).await;
+    let writer = sim.nodes[&member].writer.as_ref().unwrap();
+    assert!(writer.take_publish_through().is_some());
+    let delivered = sim.delivered_views.len();
+    let node = sim.nodes.get_mut(&other).unwrap();
+    node.raw.request_snapshot().unwrap();
+    for round in 0..40 {
+        sim.settle(1).await;
+        if round % 5 == 4 {
+            sim.publish_view(&mut writers).await;
+        }
+    }
+    assert_eq!(sim.nodes[&other].raw.raft.pending_request_snapshot, 0);
+    let views = &sim.delivered_views[delivered..];
+    assert!(
+        !views.is_empty() && !views.contains(&record.checkpoint),
+        "{views:?}"
+    );
+    let (index, base, _) = sim.base(member);
+    assert!(index >= record.index);
+    let kept = Record::of(sim.nodes[&member].raw.store().recovery_snapshot());
+    assert_eq!(kept.unwrap().map(|record| record.checkpoint), base);
+    assert!(sim.nodes[&member].snapshot_images <= images + 2);
+    assert_eq!(
+        sim.nodes[&other].state.applied,
+        sim.nodes[&member].state.applied
+    );
+    sim.assert_records_open().await;
+}
+
+#[tokio::test]
+async fn a_failed_raise_is_served_by_a_demand_at_the_record() {
+    a_failed_raise(false).await;
+}
+
+#[tokio::test]
+async fn a_failed_raise_beside_an_earlier_binary_is_served_at_a_row() {
+    a_failed_raise(true).await;
 }
