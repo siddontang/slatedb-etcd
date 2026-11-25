@@ -535,10 +535,10 @@ def run_policy(s3, args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--binary", type=Path, required=True)
+    ap.add_argument("--binary", type=str, required=True)
     ap.add_argument("--go", default="go", help="Go toolchain that builds scripts/s3-counter")
-    ap.add_argument("--benchmark", type=Path, required=True, help="etcd benchmark tool")
-    ap.add_argument("--etcdctl", type=Path, required=True)
+    ap.add_argument("--benchmark", type=str, required=True, help="etcd benchmark tool")
+    ap.add_argument("--etcdctl", type=str, required=True)
     ap.add_argument("--work", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--cases", nargs="*", default=list(CASES))
@@ -550,8 +550,17 @@ def main():
     ap.add_argument("--policy", action="store_true")
     args = ap.parse_args()
     # RustFS runs in the work directory, so relative paths would resolve from there.
-    for name in ["binary", "benchmark", "etcdctl", "work", "out"]:
+    for name in ["work", "out"]:
         setattr(args, name, getattr(args, name).resolve())
+    # A bare executable name, such as `etcdctl`, is found through PATH.
+    for name in ["binary", "benchmark", "etcdctl"]:
+        value = getattr(args, name)
+        if os.sep not in value:
+            found = shutil.which(value)
+            if found is None:
+                ap.error(f"--{name}: {value} is not on PATH")
+            value = found
+        setattr(args, name, Path(value).resolve())
     args.work.mkdir(parents=True, exist_ok=True)
     s3 = S3(args.work, args.go)
     args.s3_url = s3.url

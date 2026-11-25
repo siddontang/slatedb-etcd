@@ -11,7 +11,7 @@ records are in `shared-state.jsonl`. `scripts/bench-shared-state.py` produced th
 - **Writes:** throughput is equal for small loads and about 20% higher in shared mode for large
   loads. The p99 latency of put-c256 is half, because only the leader flushes and compacts.
 - **Reads:** shared mode reads are about 5% to 7% faster, with a lower p99. Each follower warms
-  its cache for the SSTs of a new base, so reads do not wait for S3.
+  its cache for the SSTs of a new base. In these runs, reads caused almost no S3 traffic.
 - **Follower downloads:** each follower downloads the current rows of the writes once, for that
   warm. In put-c256, the cluster-wide S3 response bytes were 70.4 MiB in shared mode, and less
   than 1 MiB in replicated mode.
@@ -152,9 +152,10 @@ learner policy and read a key. Then:
 - Shared mode removes the copy of each SST on two members. The stored bytes and the uploaded
   bytes drop to about one third. The GET-class requests drop to about one third, because only
   the leader compacts.
-- Shared reads no longer wait for S3. A follower warms the index, filters, and current-row blocks
-  of each new L0 SST before it switches its base. In each read case, the cluster-wide S3
-  response bytes were only 0.2 MiB, and shared mode was about 5% to 7% faster.
+- A follower warms the index, filters, and current-row blocks of each new L0 SST before it switches
+  its base. In each read case, the cluster-wide S3 response bytes were only 0.2 MiB, and shared
+  mode was about 5% to 7% faster. A cold read can still go to S3 when a warm fails or reaches its
+  500 ms limit.
 - The warm costs downloads. Each follower reads about the current-row bytes of the writes once.
   Each warm reads a contiguous range of blocks with one GET, so it adds few requests.
 - The shared leader uses more memory than a replicated leader in put-c256: it holds the overlay
