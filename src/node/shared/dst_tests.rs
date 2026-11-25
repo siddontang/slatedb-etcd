@@ -4,6 +4,27 @@
 use super::*;
 
 impl Simulation {
+    /// The end of a shared schedule. A follower asks for a snapshot at its last index, above the
+    /// leader's base. The leader certifies its base and records it above the row. Then each
+    /// member restarts once. A record above its checkpoint row opens that checkpoint at its row
+    /// and raises it.
+    pub(super) async fn restart_above_rows(&mut self) {
+        if self.leader().is_some() {
+            let follower = self.follower(0);
+            let node = self.nodes.get_mut(&follower).unwrap();
+            if node.raw.request_snapshot().is_ok() {
+                self.trace.push(format!("request snapshot {follower}"));
+            }
+            self.settle(10).await;
+        }
+        for id in 1..=3 {
+            self.stop(id);
+            self.start(id).await;
+            self.settle(4).await;
+        }
+        self.settle(10).await;
+    }
+
     /// The process ID that member `id` sends with its traffic. An earlier binary sends none.
     pub(super) fn process(&self, id: u64) -> Option<u64> {
         match self.old.contains(&id) {
@@ -71,7 +92,7 @@ impl Simulation {
 
     /// Propose a Put on the leader that no client waits for. With `ignore_value` on a missing
     /// key it fails, so it changes no state and stores no batch.
-    async fn propose_put(&mut self, put: PutRequest) {
+    pub(super) async fn propose_put(&mut self, put: PutRequest) {
         let Some(leader) = self.leader() else {
             return;
         };
@@ -98,7 +119,7 @@ impl Simulation {
     }
 
     /// Propose a Put that fails and changes no state.
-    async fn propose_noop(&mut self) {
+    pub(super) async fn propose_noop(&mut self) {
         self.propose_put(PutRequest {
             key: b"missing".to_vec(),
             ignore_value: true,

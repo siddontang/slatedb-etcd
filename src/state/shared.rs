@@ -1212,6 +1212,9 @@ pub(crate) struct Shared {
     base_id: Arc<tokio::sync::watch::Sender<Option<BaseRef>>>,
     /// Background opens of announced checkpoints. DST waits for them to keep schedules exact.
     opening: Vec<tokio::task::JoinHandle<()>>,
+    /// Opens and installs that loaded a base at its row and then raised it above. DST counts
+    /// them.
+    extensions: u64,
     /// A failed open tries again until the base opens or a newer announcement replaces it.
     /// DST turns this off, because a retry would run at a time that the schedule does not fix.
     retry_opens: bool,
@@ -1329,6 +1332,7 @@ impl Shared {
             announcements: 0,
             announced: Arc::new(tokio::sync::watch::channel(None).0),
             opening: vec![],
+            extensions: 0,
             retry_opens: true,
             pending: Arc::default(),
             pin_max,
@@ -1441,6 +1445,7 @@ impl Shared {
     /// Raise the index of a base with an empty overlay to `index`. The caller knows that the
     /// base holds the whole state there.
     fn extend(&mut self, index: u64) {
+        self.extensions += 1;
         self.overlay.cover(index);
         self.base_index = index;
         self.based.send_replace(index);
@@ -1861,6 +1866,12 @@ impl StateMachine {
             descriptor.encode()?,
             members.conf(),
         )))
+    }
+
+    /// Opens and installs that raised a base above its row.
+    #[cfg(test)]
+    pub(crate) fn extensions(&self) -> u64 {
+        self.shared.as_ref().map_or(0, |shared| shared.extensions)
     }
 
     /// The checkpoint of the base, if any.

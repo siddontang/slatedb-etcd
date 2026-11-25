@@ -304,6 +304,7 @@ async fn a_restart_without_the_record_checkpoint_uses_one_in_its_range() {
     let mut member = open_at(&store, Some(record_of(x))).await.unwrap();
     assert_eq!(member.base_checkpoint(), Some(y));
     assert_eq!((member.applied, member.applied_term), (5, 2));
+    assert_eq!(member.extensions(), 1);
     assert_eq!(member.loaded_fields(), leader.loaded_fields());
     member.apply_etcd(6, &put_b()).await.unwrap();
     assert_eq!(member.revision, 3);

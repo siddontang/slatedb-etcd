@@ -99,6 +99,8 @@ struct Simulation {
     old: BTreeSet<u64>,
     /// View snapshots that an earlier binary received, each checked at its row.
     old_installs: u64,
+    /// Opens and installs of stopped members that raised a base above its row.
+    extended: u64,
 }
 
 impl Drop for Simulation {
@@ -234,6 +236,7 @@ impl Simulation {
             processes: BTreeMap::new(),
             old: BTreeSet::new(),
             old_installs: 0,
+            extended: 0,
         };
         for id in 1..=sim.members {
             sim.start(id).await;
@@ -353,6 +356,7 @@ impl Simulation {
     fn stop(&mut self, id: u64) {
         if let Some(node) = self.nodes.remove(&id) {
             self.installed_snapshots += node.installed_snapshots;
+            self.extended += node.worker.state().extensions();
             drop(node);
         }
         self.trace.push(format!("stop {id}"));
@@ -2936,7 +2940,9 @@ impl Simulation {
                         }
                     }
                 }
-                13..=17 => sim.propose().await,
+                // A failed update changes no state, so an announcement can cover it.
+                13..=14 => sim.propose_noop().await,
+                15..=17 => sim.propose().await,
                 18 => sim.view_read().await,
                 31..=33 => {
                     if let Some(leader) = leader {
@@ -3051,6 +3057,10 @@ impl Simulation {
             }
             if round < 40 {
                 sim.propose().await;
+                // A failed update after the Put lets the next announcement cover it.
+                if round % 2 == 0 {
+                    sim.propose_noop().await;
+                }
                 sim.view_read().await;
             }
             for _ in 0..30 {
@@ -3073,6 +3083,7 @@ impl Simulation {
                 }
             }
         }
+        sim.restart_above_rows().await;
         // Every member reaches the last commit with the reference state.
         let commit = sim
             .nodes
@@ -3105,8 +3116,14 @@ impl Simulation {
         for (_, mut writer) in writers {
             writer.close().await;
         }
+        let extended = sim.extended
+            + sim
+                .nodes
+                .values()
+                .map(|node| node.worker.state().extensions())
+                .sum::<u64>();
         sim.trace.push(format!(
-            "acknowledged {} views checked {}",
+            "acknowledged {} views checked {} extended {extended}",
             sim.acknowledged.len(),
             sim.view_checks
         ));
@@ -3117,6 +3134,9 @@ impl Simulation {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shared_store_schedules_replay_identically() {
     let seeds = std::env::var("SLATEDB_DST_SHARED_SEEDS").unwrap_or_else(|_| "1,2,3".into());
+    // Opens and installs above a checkpoint row, over all seeds. The loaded-field check covers
+    // that path only when it runs.
+    let mut extended = 0;
     for seed in seeds.split(',').map(|s| s.parse::<u64>().unwrap()) {
         eprintln!("shared DST seed {seed}: starting");
         let first = Simulation::run_shared(seed).await;
@@ -3133,8 +3153,21 @@ async fn shared_store_schedules_replay_identically() {
             first, second,
             "shared seed {seed}: simulation schedule changed"
         );
-        eprintln!("shared DST seed {seed}: {} events replayed", first.len());
+        let count = first
+            .last()
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|count| count.parse::<u64>().ok())
+            .unwrap();
+        extended += count;
+        eprintln!(
+            "shared DST seed {seed}: {} events replayed, {count} bases above their row",
+            first.len()
+        );
     }
+    assert!(
+        extended > 0,
+        "no member opened or installed a base above its row"
+    );
 }
 
 impl Simulation {
