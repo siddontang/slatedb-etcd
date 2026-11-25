@@ -3,7 +3,7 @@
 use super::*;
 
 /// The shared-mode options of one test voter.
-fn voter_options(empty_log: bool) -> crate::state::shared::Options {
+pub(super) fn voter_options(empty_log: bool) -> crate::state::shared::Options {
     crate::state::shared::Options {
         quota: 0,
         voters: vec![1],
@@ -84,29 +84,29 @@ fn flushes_follow_the_oldest_write_and_publication_requests() {
     let long = Duration::from_secs(60);
     // An idle writer has no deadline and no flush.
     assert_eq!(progress.deadline(long), None);
-    assert_eq!(progress.take_flush(Duration::ZERO), (false, false));
+    assert_eq!(progress.take_flush(Duration::ZERO), (false, None));
     progress.wrote(1);
     let deadline = progress.deadline(long).unwrap();
     progress.wrote(2);
     // A later write keeps the deadline of the oldest unflushed write.
     assert_eq!(progress.deadline(long), Some(deadline));
-    assert_eq!(progress.take_flush(long), (false, false));
-    assert_eq!(progress.take_flush(Duration::ZERO), (true, false));
-    assert_eq!(progress.take_flush(Duration::ZERO), (false, false));
+    assert_eq!(progress.take_flush(long), (false, None));
+    assert_eq!(progress.take_flush(Duration::ZERO), (true, None));
+    assert_eq!(progress.take_flush(Duration::ZERO), (false, None));
     assert_eq!(progress.deadline(long), None);
     // A request waits until the materializer writes its sequence.
     progress.request(3);
-    assert_eq!(progress.take_flush(long), (false, false));
+    assert_eq!(progress.take_flush(long), (false, None));
     progress.wrote(3);
-    assert_eq!(progress.take_flush(long), (true, true));
-    assert_eq!(progress.take_flush(long), (false, false));
+    assert_eq!(progress.take_flush(long), (true, Some(3)));
+    assert_eq!(progress.take_flush(long), (false, None));
     // A request that the written sequence already covers is due at once.
     progress.request(2);
-    assert_eq!(progress.take_flush(long), (true, true));
+    assert_eq!(progress.take_flush(long), (true, Some(2)));
 }
 
 /// Read `/status` from the client listener.
-async fn status(server: &crate::server::Server) -> Value {
+pub(super) async fn status(server: &crate::server::Server) -> Value {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = tokio::net::TcpStream::connect(server.client_addr())
         .await
@@ -121,7 +121,7 @@ async fn status(server: &crate::server::Server) -> Value {
     serde_json::from_str(body).unwrap()
 }
 
-async fn eventually(what: &str, mut check: impl std::ops::AsyncFnMut() -> bool) {
+pub(super) async fn eventually(what: &str, mut check: impl std::ops::AsyncFnMut() -> bool) {
     for _ in 0..600 {
         if check().await {
             return;

@@ -33,6 +33,7 @@ mod maintenance;
 mod proposal;
 pub use forwarding::ForwardView;
 pub(crate) use forwarding::LocalRead;
+pub(crate) use shared::WriterReport;
 mod quorum_put;
 mod quota;
 mod read;
@@ -122,6 +123,8 @@ pub enum Event {
         publish: Option<u64>,
         /// The process of a member that installs a base above its checkpoint row.
         coverage: Option<u64>,
+        /// The health of the member's writer. An earlier binary sends none.
+        writer: Option<shared::WriterReport>,
     },
     /// The first peer frame of a stream or request came from this process of `member`. An
     /// earlier binary sends no process.
@@ -1273,7 +1276,8 @@ impl Node {
                 checkpoints,
                 publish,
                 coverage,
-            } => self.view_ack(member, checkpoints, publish, coverage),
+                writer,
+            } => self.view_ack(member, checkpoints, publish, coverage, writer),
             Event::PeerProcess { member, process } => {
                 self.raw.store().note_process(member, process);
             }
