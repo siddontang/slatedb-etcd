@@ -78,7 +78,7 @@ pub struct StateMachine {
     pub members: Arc<crate::cluster::Store>,
     pub(crate) admin: Arc<slatedb::admin::Admin>,
     pub quota: u64,
-    logical_bytes: u64,
+    logical_bytes: crate::batch::Usage,
     pub(crate) current: current::CurrentRows,
     pub(crate) key_index: key_index::KeyIndex,
     /// Current rows shared by pinned point reads.
@@ -230,28 +230,73 @@ pub(crate) fn slatedb_settings() -> Settings {
 /// Read the stored logical size, or count it when the counter does not match the apply marker.
 ///
 /// Directories from older binaries have no counter. An older binary that writes to a directory
-/// moves the apply marker past the counter, so the next open counts again.
-async fn load_logical_size(db: &impl StateRead, applied: u64) -> Result<u64> {
+/// moves the apply marker past the counter, so the next open counts again. A counter without the
+/// split by row kind also comes from an older binary, so it is counted again too.
+async fn load_logical_size(db: &impl StateRead, applied: u64) -> Result<crate::batch::Usage> {
     use prost::Message;
     let stored = match db.get(LOGICAL_SIZE).await? {
         Some(row) => {
             let counter =
                 crate::proto::state::LogicalSize::decode(row).context("invalid size counter")?;
-            (counter.applied == applied).then_some(counter.bytes)
+            stored_usage(&counter, applied)?
         }
         None => None,
     };
-    let Some(bytes) = stored else {
-        return maintenance::count_logical_size(db).await;
+    let Some(size) = stored else {
+        return maintenance::count_logical_usage(db).await;
     };
     if cfg!(debug_assertions) {
-        let counted = maintenance::count_logical_size(db).await?;
+        let counted = maintenance::count_logical_usage(db).await?;
         ensure!(
-            counted == bytes,
-            "stored logical size {bytes} differs from the counted size {counted}"
+            counted == size,
+            "stored logical size {size:?} differs from the counted size {counted:?}"
         );
     }
-    Ok(bytes)
+    Ok(size)
+}
+
+/// The usage in `counter` if it belongs to `applied` and carries the split by row kind.
+fn stored_usage(
+    counter: &crate::proto::state::LogicalSize,
+    applied: u64,
+) -> Result<Option<crate::batch::Usage>> {
+    if counter.applied != applied {
+        return Ok(None);
+    }
+    let (Some(current), Some(history), Some(journal), Some(other)) = (
+        counter.current,
+        counter.history,
+        counter.journal,
+        counter.other,
+    ) else {
+        return Ok(None);
+    };
+    let size = crate::batch::Usage {
+        current,
+        history,
+        journal,
+        other,
+    };
+    ensure!(
+        size.checked_total() == Some(counter.bytes),
+        "logical size split {size:?} does not add up to {}",
+        counter.bytes
+    );
+    Ok(Some(size))
+}
+
+/// Encode the logical size row for `size` after `applied`.
+fn logical_size_row(applied: u64, size: crate::batch::Usage) -> Vec<u8> {
+    use prost::Message;
+    crate::proto::state::LogicalSize {
+        applied,
+        bytes: size.total(),
+        current: Some(size.current),
+        history: Some(size.history),
+        journal: Some(size.journal),
+        other: Some(size.other),
+    }
+    .encode_to_vec()
 }
 
 /// The first key after every `etcd/current/` key.
@@ -378,14 +423,10 @@ impl StateMachine {
             Some(data) => serde_json::from_slice(&data)?,
             None => crate::cluster::Store::default(),
         };
-        // Shared mode stores the counter in each batch, so a base needs no full scan.
-        let logical_bytes = match (&shared, reads.get(shared::LOGICAL_BYTES).await?) {
-            (Some(_), Some(bytes)) => {
-                u64::from_be_bytes(bytes.as_ref().try_into().context("invalid logical size")?)
-            }
-            (Some(_), None) => maintenance::count_logical_size(&reads).await?,
-            (None, _) => load_logical_size(&reads, applied).await?,
-        };
+        // Both modes store the counter row with the apply marker, so a base needs no full scan.
+        // A shared base from an older binary has only the total in `shared::LOGICAL_BYTES`, and
+        // its apply marker is past any counter row, so the open counts the split again.
+        let logical_bytes = load_logical_size(&reads, applied).await?;
         Ok(Self {
             members: Arc::new(members),
             admin,
@@ -463,7 +504,12 @@ impl StateMachine {
     }
 
     /// Store `batch` and return `size` with the added membership row, if any.
-    async fn store_batch(&mut self, mut batch: WriteBatch, index: u64, size: u64) -> Result<u64> {
+    async fn store_batch(
+        &mut self,
+        mut batch: WriteBatch,
+        index: u64,
+        size: crate::batch::Usage,
+    ) -> Result<crate::batch::Usage> {
         let members_saved = self.members_unsaved;
         // Shared mode stores the bootstrap membership in the first applied entry on every
         // member, so the row does not depend on member-local events.
@@ -486,12 +532,7 @@ impl StateMachine {
                 .get(crate::cluster::KEY)
                 .await?
                 .map(|v| v.len());
-            size = crate::batch::row_size_after(
-                size,
-                crate::cluster::KEY.len(),
-                old,
-                Some(value.len()),
-            )?;
+            size.replace_row(crate::cluster::KEY, old, Some(value.len()))?;
             batch.put(crate::cluster::KEY, value);
         }
         // Format 4 rows are hash digests and Watch journals without Put values. Mark the
@@ -511,20 +552,12 @@ impl StateMachine {
                 self.rows.invalidate(key, index);
             }
         }
-        // The counters are outside `etcd/`, so they do not count themselves.
+        // The counters are outside `etcd/`, so they do not count themselves. Shared mode also
+        // keeps the eight-byte total, which older readers of the shared base load.
         if self.is_shared() {
-            batch.put(shared::LOGICAL_BYTES, size.to_be_bytes());
-        } else {
-            use prost::Message;
-            batch.put(
-                LOGICAL_SIZE,
-                crate::proto::state::LogicalSize {
-                    applied: index,
-                    bytes: size,
-                }
-                .encode_to_vec(),
-            );
+            batch.put(shared::LOGICAL_BYTES, size.total().to_be_bytes());
         }
+        batch.put(LOGICAL_SIZE, logical_size_row(index, size));
         let batch = Arc::new(batch);
         match &mut self.shared {
             None => {

@@ -355,7 +355,7 @@ jobs:
       - name: Check native crash boundaries
         run: |
           python3 scripts/check-compat.py --binary target/release/slatedb-etcd-fault \
-            --tags failpoints --run '^TestFailpointRecovery$' --output results/ci/failpoints.json
+            --tags failpoints --run '^TestFailpoint(Recovery|AutoCompaction)$' --output results/ci/failpoints.json
       - name: Run bounded API fuzzing
         run: |
           cd tests/compat

@@ -1413,8 +1413,8 @@ async fn the_applied_term_changes_no_quota_or_hash() {
         }
         assert_eq!(stored_term(&state).await, Some(term));
         assert_eq!(
-            state.logical_size(),
-            maintenance::count_logical_size(state.db().as_ref())
+            state.logical_usage(),
+            maintenance::count_logical_usage(state.db().as_ref())
                 .await
                 .unwrap()
         );
@@ -1441,4 +1441,28 @@ async fn the_applied_term_changes_no_quota_or_hash() {
     for state in states {
         state.close().await.unwrap();
     }
+}
+
+/// A counter row whose split overflows must not pass the total check by wrapping.
+#[test]
+fn logical_size_split_that_overflows_is_rejected() {
+    let counter = crate::proto::state::LogicalSize {
+        applied: 7,
+        bytes: 0,
+        current: Some(u64::MAX),
+        history: Some(1),
+        journal: Some(0),
+        other: Some(0),
+    };
+    assert!(stored_usage(&counter, 7).is_err());
+    let valid = crate::proto::state::LogicalSize {
+        bytes: 3,
+        current: Some(1),
+        history: Some(2),
+        ..counter
+    };
+    assert_eq!(
+        stored_usage(&valid, 7).unwrap().map(|usage| usage.total()),
+        Some(3)
+    );
 }

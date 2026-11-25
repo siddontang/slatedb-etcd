@@ -752,6 +752,8 @@ mod tests {
                 restore: None,
                 object_store: crate::object::Config::Local,
                 quota_bytes: 0,
+                quota_warning_fraction: 0.0,
+                auto_compaction: None,
                 strict_reconfiguration: false,
                 join: false,
                 id: 1,

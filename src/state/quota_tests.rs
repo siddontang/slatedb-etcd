@@ -6,8 +6,8 @@ use crate::proto::etcdserverpb::*;
 
 async fn check(state: &StateMachine) {
     assert_eq!(
-        state.logical_size(),
-        maintenance::count_logical_size(state.db().as_ref())
+        state.logical_usage(),
+        maintenance::count_logical_usage(state.db().as_ref())
             .await
             .unwrap()
     );
@@ -34,7 +34,7 @@ async fn quota_tracks_final_mutations_and_failed_storage() {
     batch.put(b"data/excluded", b"not counted");
     state.write_batch(batch, 1).await.unwrap();
     check(&state).await;
-    assert_eq!(state.logical_bytes, 18);
+    assert_eq!(state.logical_bytes.total(), 18);
     let mut batch = WriteBatch::new();
     batch.put(b"etcd/test", b"temporary value");
     batch.delete(b"etcd/test");
@@ -43,17 +43,17 @@ async fn quota_tracks_final_mutations_and_failed_storage() {
     batch.delete(b"etcd/absent");
     state.write_batch(batch, 2).await.unwrap();
     check(&state).await;
-    assert_eq!(state.logical_bytes, 10);
+    assert_eq!(state.logical_bytes.total(), 10);
     let mut batch = WriteBatch::new();
     batch.delete(b"etcd/test");
     state.write_batch(batch, 3).await.unwrap();
     check(&state).await;
-    assert_eq!(state.logical_bytes, 0);
+    assert_eq!(state.logical_bytes.total(), 0);
     state.close().await.unwrap();
     let mut batch = WriteBatch::new();
     batch.put(b"etcd/test", b"must fail");
     assert!(state.write_batch(batch, 4).await.is_err());
-    assert_eq!(state.logical_bytes, 0);
+    assert_eq!(state.logical_bytes.total(), 0);
 }
 
 #[tokio::test]
@@ -453,12 +453,12 @@ async fn append_accounting_keeps_original_absence_through_batch_rewrites() {
     batch.delete(b"etcd/deleted");
     state.write_batch(batch, 1).await.unwrap();
     check(&state).await;
-    assert_eq!(state.logical_bytes, 13);
+    assert_eq!(state.logical_bytes.total(), 13);
     let mut batch = WriteBatch::new();
     batch.put(b"etcd/new", b"replace");
     batch.delete(b"etcd/new");
     state.write_batch(batch, 2).await.unwrap();
     check(&state).await;
-    assert_eq!(state.logical_bytes, 0);
+    assert_eq!(state.logical_bytes.total(), 0);
     state.close().await.unwrap();
 }

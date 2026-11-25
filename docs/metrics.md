@@ -68,6 +68,14 @@ It predefines all standard gRPC status codes. An abandoned response body counts 
 Client version labels accept one or two digits after `3.`. Other values use `other`.
 An absent version uses `unknown`.
 The version gauges match the version reported by Maintenance Status.
+`slatedb_etcd_logical_size_bytes` splits the in-use bytes by row kind. The `kind` label is
+`current`, `history` (versions and their hash digests), `watch_journal`, or `other`.
+The four values add up to `etcd_mvcc_db_total_size_in_use_in_bytes`.
+`slatedb_etcd_quota_warning_bytes` is the early-warning threshold: the quota times
+`--quota-warning-fraction`. `slatedb_etcd_quota_warning` is one at or above it.
+The member also logs one warning when usage reaches the threshold.
+The log clears when usage falls below 95% of the threshold. Both gauges are absent when the
+quota or the warning is off.
 The quota gauge reports 2 GiB for zero, the configured capacity for a positive number,
 and the configured negative number when quota enforcement is off.
 Maintenance Status returns the configured value, as etcd does.

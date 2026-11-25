@@ -16,7 +16,7 @@ pub(crate) struct PreparedPuts {
     term: u64,
     writes: WriteBatch,
     revision: i64,
-    size: u64,
+    size: crate::batch::Usage,
     alarms: Vec<crate::proto::etcdserverpb::AlarmMember>,
 }
 
@@ -64,7 +64,7 @@ impl StateMachine {
                 let corrupt = alarms.iter().any(|a| a.alarm == 2);
                 let full = crate::maintenance::has_put(put.request)
                     && (alarms.iter().any(|a| a.alarm == 1)
-                        || (self.quota > 0 && size >= self.quota));
+                        || (self.quota > 0 && size.total() >= self.quota));
                 if corrupt || full {
                     if full && !alarms.iter().any(|a| a.alarm == 1) {
                         alarms.push(crate::proto::etcdserverpb::AlarmMember {
@@ -302,7 +302,7 @@ mod tests {
             assert_eq!(grouped.logical_bytes, separate.logical_bytes);
             assert_eq!(
                 grouped.logical_bytes,
-                maintenance::count_logical_size(grouped.db().as_ref())
+                maintenance::count_logical_usage(grouped.db().as_ref())
                     .await
                     .unwrap()
             );
@@ -340,7 +340,7 @@ mod tests {
             (
                 state.applied,
                 state.revision,
-                state.logical_bytes,
+                state.logical_bytes.total(),
                 state.write_batches
             ),
             (0, 1, 0, 0)

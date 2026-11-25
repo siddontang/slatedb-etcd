@@ -297,7 +297,7 @@ pub(crate) async fn prepare_put(
     revision: i64,
     request: &RequestOp,
     batch: &mut WriteBatch,
-    size: &mut u64,
+    size: &mut crate::batch::Usage,
 ) -> KvResult<(ResponseOp, i64)> {
     let Some(Op::RequestPut(p)) = &request.request else {
         return Err(KvError::invalid("expected an ordinary put"));
@@ -361,7 +361,7 @@ pub(crate) async fn prepare_txn_puts(
     request: &RequestOp,
     leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
     batch: &mut WriteBatch,
-    size: &mut u64,
+    size: &mut crate::batch::Usage,
     counts: &mut crate::metrics::Writes,
 ) -> KvResult<Option<(ResponseOp, i64)>> {
     validate(request)?;
@@ -479,7 +479,7 @@ async fn put_rows(
     values_in_history: bool,
     p: &PutRequest,
     batch: &mut WriteBatch,
-    size: &mut u64,
+    size: &mut crate::batch::Usage,
 ) -> KvResult<(PutResponse, EventRow, i64)> {
     let key = current_key(&p.key);
     // An earlier put in this batch may have replaced the applied row.
@@ -567,7 +567,7 @@ async fn put_revision_row(
     view: &CurrentView<'_, impl StateRead>,
     revision: i64,
     batch: &mut WriteBatch,
-    size: &mut u64,
+    size: &mut crate::batch::Usage,
 ) -> KvResult<()> {
     if revision != 1 {
         return Ok(());
@@ -613,9 +613,15 @@ mod tests {
             index: &state.key_index,
         };
         let mut batch = WriteBatch::new();
-        let (_, revision) = prepare_put(&view, state.revision, &request, &mut batch, &mut 0)
-            .await
-            .unwrap();
+        let (_, revision) = prepare_put(
+            &view,
+            state.revision,
+            &request,
+            &mut batch,
+            &mut Default::default(),
+        )
+        .await
+        .unwrap();
         let current = batch.get(&current_key(b"key")).unwrap().unwrap();
         let history = batch.get(&history_key(b"key", revision)).unwrap().unwrap();
         assert!(history.as_ptr_range().contains(&current.as_ptr()));

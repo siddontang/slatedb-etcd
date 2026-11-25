@@ -16,6 +16,7 @@ use crate::storage::{PreparedCheckpoint, RaftStorage};
 use crate::{ApiError, Command, RaftCommand, Request};
 
 mod apply;
+mod auto_compaction;
 /// ReadIndex reads that may wait in the Raft owner's table. One quorum round confirms
 /// every read in a batch, so a larger table lets one round cover more clients.
 pub(crate) const MAX_PENDING_READS: usize = 256;
@@ -123,6 +124,10 @@ pub struct NodeOptions {
     pub log_memory: LogMemory,
     pub state_cache: crate::state::StateCache,
     pub quota_bytes: i64,
+    /// Quota usage fraction that raises the early warning. Zero disables the warning.
+    pub quota_warning_fraction: f64,
+    /// Automatic compaction retention. `None` disables automatic compaction.
+    pub auto_compaction: Option<crate::compactor::Retention>,
     pub strict_reconfiguration: bool,
     pub join: bool,
     pub client_peers: BTreeMap<u64, String>,
@@ -171,6 +176,15 @@ impl NodeOptions {
             limit => limit,
         }
     }
+}
+
+/// The usage of `quota` that raises the early warning, or `None` when it is off. Zero
+/// disables the quota.
+///
+/// This is the first whole byte count at or above `quota * fraction`, so a fractional
+/// threshold does not warn early and a tiny one still warns at one byte.
+fn warning_bytes(quota: u64, fraction: f64) -> Option<u64> {
+    (quota > 0 && fraction > 0.0).then(|| ((quota as f64 * fraction).ceil() as u64).clamp(1, quota))
 }
 
 struct Pending {
@@ -292,6 +306,15 @@ pub struct Node {
     renewals: lease::Renewals,
     /// The shared-mode leader writer. `None` in replicated mode.
     writer: Option<shared::Writer>,
+    /// The leader's automatic Compact schedule. `None` when automatic compaction is off.
+    auto_compaction: Option<auto_compaction::AutoCompaction>,
+    /// Quota usage has reached the warning threshold and the warning is logged.
+    quota_warned: bool,
+    /// The enforced quota. Shared mode takes it from the cluster claim. Zero disables it.
+    quota: u64,
+    /// Simulation: the leader does not propose compaction steps, as if their reads were slow.
+    #[cfg(test)]
+    hold_compact_steps: bool,
 }
 
 impl Node {
@@ -313,6 +336,12 @@ impl Node {
             !options.peers.contains_key(&0),
             "zero is not a valid voter id"
         );
+        // A directly built retention gets the same zero and sign rules as the flags.
+        let auto_compaction = options
+            .auto_compaction
+            .map(crate::compactor::Retention::validate)
+            .transpose()?
+            .flatten();
         if options.state_mode == crate::state::StateMode::Shared {
             ensure!(
                 !options.view_max_age.is_zero() && !options.view_pin_max.is_zero(),
@@ -526,10 +555,19 @@ impl Node {
         }
         let compact_plan = compaction::PlanReady::new(&state, manual_apply);
         let log_reader = state.is_shared().then(|| storage.reader());
+        let quota = state.quota;
         let worker = Worker::start(state, events.clone(), manual_apply, log_reader);
         let log_worker = log::Worker::start(storage, manual_apply)?;
         let next_checkpoint = options.next_checkpoint(raw.store().snapshot_index());
+        let auto_compaction = auto_compaction.map(|retention| {
+            auto_compaction::AutoCompaction::new(retention, Instant::now(), applied.revision)
+        });
         let mut node = Self {
+            auto_compaction,
+            quota_warned: false,
+            quota,
+            #[cfg(test)]
+            hold_compact_steps: false,
             location,
             metrics,
             last_observed_leader: 0,
@@ -678,6 +716,8 @@ impl Node {
                     self.expire_leases()?;
                     self.publish_member()?;
                     self.tick_shared();
+                    self.drive_auto_compaction(Instant::now())?;
+                    self.check_quota_warning();
                 }
                 persisted = self.log_worker.next() => { self.complete_log(persisted?)?; }
                 _ = self.compact_plan.changed() => {}
@@ -1016,7 +1056,8 @@ impl Node {
                     applied: self.state.applied,
                     pending: self.pending.len(),
                     quota: self.options.effective_quota(),
-                    used: self.state.logical_size,
+                    usage: self.state.usage,
+                    warning_bytes: self.warning_bytes(),
                     revision: self.state.revision,
                     compact: if self.state.compact_revision == 0 {
                         -1

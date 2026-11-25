@@ -48,7 +48,8 @@ impl StateMode {
     }
 }
 
-/// The logical size after each shared-mode batch. Install reads it instead of a full scan.
+/// The eight-byte logical size total after each shared-mode batch, for older readers. The
+/// split by row kind is in the counter row with the apply marker.
 pub(crate) const LOGICAL_BYTES: &[u8] = b"meta/logical-bytes";
 /// The name prefix of the checkpoints that the publisher creates.
 const VIEW: &str = "view-";

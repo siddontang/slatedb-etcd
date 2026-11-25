@@ -524,3 +524,33 @@ async fn follower_behind_an_imageless_truncation_catches_up_from_an_on_demand_im
         server.shutdown().await.unwrap();
     }
 }
+
+/// A host that sets the retention directly gets the flag rules: zero disables automatic
+/// compaction in both modes, and a negative revision count fails before storage is created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn embedded_auto_compaction_retention_is_validated() {
+    use slatedb_etcd::compactor::Retention;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = ServerConfig::single_node(dir.path().join("negative"));
+    config.auto_compaction = Some(Retention::Revision(-2));
+    assert!(Server::start(config.clone()).await.is_err());
+    assert!(!config.dir.exists());
+    for (name, retention) in [
+        ("revision", Retention::Revision(0)),
+        ("periodic", Retention::Periodic(Duration::ZERO)),
+    ] {
+        let mut config = ServerConfig::single_node(dir.path().join(name));
+        config.auto_compaction = Some(retention);
+        let server = Server::start(config).await.unwrap();
+        assert_eq!(server.config().auto_compaction, None, "{name}");
+        server.shutdown().await.unwrap();
+    }
+    let mut config = ServerConfig::single_node(dir.path().join("kept"));
+    config.auto_compaction = Some(Retention::Revision(5));
+    let server = Server::start(config).await.unwrap();
+    assert_eq!(
+        server.config().auto_compaction,
+        Some(Retention::Revision(5))
+    );
+    server.shutdown().await.unwrap();
+}
