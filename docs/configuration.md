@@ -264,6 +264,11 @@ member of the new leader pins.
   lifetime, and follower reads across missed renewals.
 - `object::Config::SharedDirectory` lets members of one host share a local directory in tests.
   A member-local store serves one voter.
+- A local store in shared mode needs a POSIX filesystem with `flock` and atomic rename. SlateDB
+  advances its GC boundary files with conditional updates, and the store orders them with a
+  lock. NFS and other network filesystems are not supported.
+- Each local store call fails after 30 s, like an S3 request. A hung filesystem then fails the
+  SlateDB task and does not block it forever. The blocked filesystem call can still finish.
 
 ## Environment
 

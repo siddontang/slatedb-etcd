@@ -16,6 +16,7 @@ use crate::state::{StateMachine, StateMode};
 
 #[cfg(test)]
 pub(crate) mod faults;
+pub(crate) mod local;
 #[cfg(target_os = "linux")]
 pub(crate) mod paced;
 #[cfg(target_os = "linux")]
@@ -224,9 +225,7 @@ impl Config {
                 "a shared directory needs shared state mode"
             );
             let binding = bind(dir, cluster, member, None, mode)?;
-            std::fs::create_dir_all(objects)?;
-            let store = slatedb::object_store::local::LocalFileSystem::new_with_prefix(objects)?;
-            let store: Arc<dyn ObjectStore> = Arc::new(store.with_fsync(true));
+            let store: Arc<dyn ObjectStore> = Arc::new(local::LocalStore::open(objects)?);
             let prefix = format!("member-{member}");
             let quota =
                 claim_shared(store.as_ref(), "", &prefix, cluster, &binding, shared).await?;
@@ -257,10 +256,7 @@ impl Config {
                         shared.voters.len() == 1 && !shared.join,
                         "several shared-mode members need a shared object store"
                     );
-                    std::fs::create_dir_all(&objects)?;
-                    let store =
-                        slatedb::object_store::local::LocalFileSystem::new_with_prefix(&objects)?;
-                    let store = Arc::new(store.with_fsync(true));
+                    let store = Arc::new(local::LocalStore::open(&objects)?);
                     StateMachine::open_shared(store, "", cluster, cache, shared, local).await
                 }
             };
