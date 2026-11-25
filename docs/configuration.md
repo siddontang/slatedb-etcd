@@ -207,9 +207,18 @@ Rules and limits:
   when the member is idle, unless a newer checkpoint waits.
 - Two writer opens can race for the same manifest version. A leader that loses the race opens
   the writer again, as after a fence.
-- Each member truncates its log through the index of its base checkpoint. Its Raft snapshot names
-  that checkpoint. A member that receives the snapshot opens the checkpoint and adopts it.
-- A restart opens the newest checkpoint. It adopts the checkpoint when the log ends below it.
+- Each member truncates its log through its base index. Its Raft snapshot names the base
+  checkpoint at that index. A member that receives the snapshot opens the checkpoint and adopts
+  it. The base index can be above the checkpoint row when an announcement certified that no
+  entry in between changed state.
+- A follower can ask for a snapshot at its last index, for example after the guard below. A
+  follower's manual checkpoint can also need a base above the leader's base index. The leader
+  then announces its base checkpoint again with its covered index, if it stored no batch above
+  the checkpoint row. Otherwise it publishes a new checkpoint first. One announcement serves
+  each demand, and an idle cluster then appends nothing more.
+- A restart opens the newest checkpoint. It adopts the checkpoint when the log ends below it. A
+  Raft snapshot record above the newest checkpoint row names its checkpoint, and the restart
+  opens that one at the record index.
 - A missing checkpoint object fails a read with a retryable error. In apply it rebuilds the
   state from the newest checkpoint and replays the local log.
 - A member that waits on its overlay limit adopts a newer checkpoint in process when its log

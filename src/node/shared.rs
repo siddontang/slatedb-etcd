@@ -183,6 +183,14 @@ pub(super) struct Writer {
     checkpoint_requested: u64,
     /// A follower's manual checkpoint index that waits for apply on this leader.
     remote_checkpoint: u64,
+    /// The highest index that a follower's manual checkpoint needs a base to cover.
+    demand: u64,
+    /// The coverage and the tick of the last certification that this leader proposed.
+    certified: Option<(u64, u64)>,
+    /// The batch through which this leader last asked for a publication to serve a demand.
+    demand_publication: u64,
+    /// Ticks of `certify_base`.
+    certify_ticks: u64,
 }
 
 /// The shared-mode gauges of one member. The node sets them on each tick.
@@ -245,6 +253,10 @@ impl Writer {
             gauges: None,
             checkpoint_requested: 0,
             remote_checkpoint: 0,
+            demand: 0,
+            certified: None,
+            demand_publication: 0,
+            certify_ticks: 0,
             progress: Arc::new(Progress::new(0)),
             admin: handles.admin.clone(),
             queue: handles.queue.clone(),
@@ -255,6 +267,7 @@ impl Writer {
             reports: Reports::default(),
             announced: 0,
             applied: Applied {
+                based: handles.based.clone(),
                 announced: handles.announced.clone(),
                 base_id: handles.base_id.clone(),
                 #[cfg(test)]
@@ -283,6 +296,9 @@ impl Writer {
                 stop.send_replace(true);
             }
             self.transfer = None;
+            self.demand = 0;
+            self.certified = None;
+            self.demand_publication = 0;
         }
         if !leader || self.running() {
             return;
@@ -833,6 +849,8 @@ async fn checkpoint_covers_compaction(
 /// The applied state that a publisher checks before it announces a checkpoint again.
 #[derive(Clone)]
 struct Applied {
+    /// The index through which the current base holds the whole state.
+    based: tokio::sync::watch::Receiver<u64>,
     /// The checkpoint of the newest applied `ViewCheckpoint` entry.
     announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
     /// The checkpoint of the current base and its row `F`.
@@ -1174,7 +1192,6 @@ const REPORT_TICKS: u64 = 50;
 const RETRY_TICKS: u64 = 5;
 /// Ticks between two checkpoint polls of a paused member.
 const POLL_TICKS: u64 = 10;
-
 impl Node {
     /// Align the Raft log with the base that the state opened at restart.
     ///
@@ -1343,16 +1360,20 @@ impl Node {
         if let Some(writer) = &mut self.writer {
             writer.report(member, checkpoints);
             // A follower's manual checkpoint. The publication is due once apply reaches it.
+            // The follower can group entries in other ways, so its base must reach the index.
             if let Some(index) = publish {
                 writer.remote_checkpoint = writer.remote_checkpoint.max(index);
+                writer.demand = writer.demand.max(index);
             }
         }
     }
 
-    /// Run the periodic shared-mode work: `ViewAck` reports and the paused checkpoint poll.
-    pub(super) fn tick_shared(&mut self) {
+    /// Run the periodic shared-mode work: `ViewAck` reports, the paused checkpoint poll, and the
+    /// leader's demand for a base.
+    pub(super) fn tick_shared(&mut self) -> Result<()> {
+        self.certify_base()?;
         let Some(writer) = &mut self.writer else {
-            return;
+            return Ok(());
         };
         writer.ticks += 1;
         let ticks = writer.ticks;
@@ -1397,9 +1418,10 @@ impl Node {
             }
         }
         if ticks % REPORT_TICKS != 0 {
-            return;
+            return Ok(());
         }
         self.send_view_ack(None);
+        Ok(())
     }
 
     /// Report the pinned checkpoints to the leader. `publish` asks the leader to publish through
@@ -1531,6 +1553,18 @@ impl Node {
             None => {
                 writer.opened_slot.offer(base, covers);
                 None
+            }
+        }
+    }
+
+    /// Mark a switch due when a base was offered since the last call. A manual apply, such as
+    /// DST, has no event loop that watches the slot.
+    #[cfg(test)]
+    pub(super) fn note_offers(&mut self) {
+        if let Some(writer) = &mut self.writer {
+            if writer.opened.has_changed().unwrap_or(false) {
+                writer.opened.borrow_and_update();
+                writer.switch_due = true;
             }
         }
     }

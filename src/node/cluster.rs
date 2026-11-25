@@ -800,8 +800,8 @@ mod tests {
     }
 
     /// Shared mode: a new member gets an earlier binary's `Publish` at index 2. It applies index
-    /// 1 and stops there, without storing its own membership. Its recovery by snapshot in an idle
-    /// cluster depends on #96: the leader cannot yet offer a base above its last batch.
+    /// 1 and stops there, without storing its own membership. It then recovers by snapshot, also
+    /// in an idle cluster. See `a_guarded_shared_member_recovers_in_an_idle_cluster` in DST.
     #[tokio::test]
     async fn a_new_shared_member_stops_at_an_earlier_binary_publish() {
         let publish = RaftCommand::Cluster {

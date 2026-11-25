@@ -6,6 +6,7 @@ use crate::mvcc::Outcome;
 use crate::proto::etcdserverpb::request_op::Request as Op;
 use crate::proto::etcdserverpb::response_op::Response as Resp;
 use crate::proto::etcdserverpb::{PutRequest, RangeRequest, WatchCreateRequest};
+use crate::state::shared::Record;
 use crate::state::{StateRead, StateScan};
 
 /// A digest of every `etcd/` row of a state.
@@ -18,6 +19,9 @@ async fn rows_digest(state: &impl StateRead) -> std::result::Result<u32, slatedb
     }
     Ok(digest)
 }
+
+#[path = "shared/dst_tests.rs"]
+mod coverage;
 
 struct ClientRequest {
     key: String,
@@ -538,11 +542,9 @@ impl Simulation {
     /// stays exact.
     async fn settle_opens(&mut self) {
         for node in self.nodes.values_mut() {
-            if node.worker.state_mut().settle_opens().await {
-                if let Some(writer) = &mut node.writer {
-                    writer.switch_due = true;
-                }
-            }
+            node.worker.state_mut().settle_opens().await;
+            // An announcement of the current base offers it at once, with no open.
+            node.note_offers();
         }
     }
 
@@ -649,6 +651,8 @@ impl Simulation {
                 .raft
                 .set_randomized_election_timeout(10 + id as usize * 2);
             node.tick_raft().unwrap();
+            // The shared leader serves a demand for a base at each tick, as `tick_shared` does.
+            node.certify_base().unwrap();
             node.retry_reads();
             self.trace.push(format!("tick {id}"));
         }

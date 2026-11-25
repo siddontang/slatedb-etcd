@@ -127,6 +127,8 @@ pub(super) struct Cache {
     hard_state: HardState,
     // Raft asked for a transferable image that the durable snapshot does not contain.
     image_wanted: Cell<bool>,
+    // The highest index that a follower's snapshot request needs and no durable image reaches.
+    wanted_index: Cell<u64>,
     member: u64,
     pub durable: log::Durable,
 }
@@ -148,6 +150,7 @@ impl Cache {
             initial_conf: None,
             hard_state: durable.hard_state,
             image_wanted: Cell::new(false),
+            wanted_index: Cell::new(0),
             member: storage.member(),
             durable,
         };
@@ -261,6 +264,9 @@ impl Cache {
                 || durable.snapshot.data != self.durable.snapshot.data);
         if new_image {
             self.image_wanted.set(false);
+            if durable.snapshot.get_metadata().index >= self.wanted_index.get() {
+                self.wanted_index.set(0);
+            }
         }
         if durable.snapshot.get_metadata().index > self.snapshot.get_metadata().index {
             let end = durable.snapshot.get_metadata().index + 1;
@@ -427,6 +433,11 @@ impl Cache {
     pub fn image_wanted(&self) -> bool {
         self.image_wanted.get()
     }
+    /// The highest index that a follower's snapshot request needs, until a durable image
+    /// reaches it. Zero when no request waits.
+    pub fn wanted_index(&self) -> u64 {
+        self.wanted_index.get()
+    }
     /// Return true when the durable snapshot holds an image that this member can send.
     pub fn has_image(&self) -> bool {
         crate::state::transfer::sendable(&self.durable.snapshot.data, self.member)
@@ -526,6 +537,11 @@ impl Storage for Cache {
         if self.snapshot_index() == 0 || self.snapshot_index() < request_index || !self.has_image()
         {
             self.image_wanted.set(true);
+            // Keep the requested index. Shared mode serves it with a base at that index.
+            if request_index > self.snapshot_index() {
+                self.wanted_index
+                    .set(self.wanted_index.get().max(request_index));
+            }
             return Err(StorageError::SnapshotTemporarilyUnavailable.into());
         }
         Ok(self.durable.snapshot.clone())

@@ -622,8 +622,8 @@ impl Node {
 
     /// Ask the leader for a snapshot that replaces the entries before the cluster quota. Raft
     /// drops the request on a leader, without a leader, or with a request in flight. The next
-    /// tick asks again. In shared mode an idle leader cannot yet offer a base above its last
-    /// batch, so the recovery of an idle cluster depends on #96.
+    /// tick asks again. The request is for the last index of this member. In shared mode an idle
+    /// leader serves it with its base, certified through that index. See `certify_base`.
     fn request_quota_snapshot(&mut self) {
         if self.quota.blocked() == Some(self.state.applied + 1) {
             let _ = self.raw.request_snapshot();

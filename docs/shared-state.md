@@ -400,6 +400,20 @@ the rebase opens the current base again at its base index, with the log term the
   and its term, and the record metadata gives the index and the term there. Install loads the
   state at `F`, so the counter and term rows match. It then raises the applied index, the
   covered index, and the term to the record values.
+- **Demand:** Raft can ask the leader for a snapshot at a follower's last index. A guarded member
+  does this, and on an idle cluster no batch follows the leader's base. A follower's manual
+  checkpoint can also need a base above the leader's base index, because the follower grouped
+  its entries in another way. The leader keeps the highest such index until a durable record
+  reaches it. At each tick it serves the demand:
+  1. If its base index reaches the demand, it does nothing. The snapshot record follows the base.
+  2. It reads the base row, then the position. If a batch is above the row, it asks for a
+     publication and waits for that checkpoint.
+  3. Otherwise it announces the same checkpoint again with its covered index. This needs no new
+     checkpoint. The entry raises the base index of every member, and the leader records the
+     base there with the Raft term at that index.
+  One announcement serves a demand at a time, and the leader sends it again only after 20 ticks
+  without an apply. The announcement entry does not raise the demand, so an idle cluster stops
+  appending.
 
 ## Install
 

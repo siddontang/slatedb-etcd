@@ -752,7 +752,7 @@ impl Node {
         self.retry_reads();
         self.expire_leases()?;
         self.publish_member()?;
-        self.tick_shared();
+        self.tick_shared()?;
         self.drive_auto_compaction(Instant::now())?;
         self.check_quota_warning();
         Ok(())
