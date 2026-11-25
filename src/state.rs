@@ -312,7 +312,13 @@ impl StateMachine {
         let cache = cache.build();
         let settings = slatedb_settings();
         let admin = slatedb::admin::Admin::builder(root, object_store.clone()).build();
-        let db = Db::builder(root, object_store)
+        let builder = Db::builder(root, object_store);
+        // Local SSTs write faster while unflushed memtables pile up.
+        #[cfg(target_os = "linux")]
+        let builder = builder.with_metrics_recorder(crate::object::paced::backlog_recorder(
+            settings.max_unflushed_bytes,
+        ));
+        let db = builder
             .with_db_cache(cache, 0)
             .with_settings(settings)
             .with_block_cache_policy(block_cache_policy())
