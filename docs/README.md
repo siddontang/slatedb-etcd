@@ -17,6 +17,7 @@ Commands use the repository root unless a guide states otherwise.
 | Compare gRPC and local write latency | [Benchmarks](benchmarks.md) |
 | Compare Raft optimization techniques | [etcd and TiKV notes](raft-performance-notes.md) |
 | Configure S3 and remote hosts | [Remote storage](remote-storage.md) |
+| Run one shared SlateDB for a cluster | [Shared state guide](shared-state-guide.md) |
 | Understand Raft snapshot transfer | [Object storage snapshots](object-snapshots.md) |
 | Review the shared-state design proposal | [Shared state](shared-state.md) |
 | Assess etcd compatibility | [Compatibility report](../COMPATIBILITY.md) |

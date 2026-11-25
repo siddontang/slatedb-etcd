@@ -53,7 +53,7 @@ mod quota_tests;
 #[cfg(test)]
 mod shared_tests;
 
-const APPLIED: &[u8] = b"meta/applied";
+pub(crate) const APPLIED: &[u8] = b"meta/applied";
 /// The apply position with its Raft term: `(index, term)`, two big-endian `u64` values.
 /// Every state batch writes it with `meta/applied`. Binaries before this row advance
 /// `meta/applied` alone, so the term is valid only while its index equals `meta/applied`.

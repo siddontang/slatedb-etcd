@@ -85,6 +85,7 @@ For example, use `--watch-progress-notify-interval=200ms` for the upstream clien
 | --- | ---: | --- |
 | `--snapshot-every` | 10000 | Applied entries between checkpoint opportunities; zero disables it. |
 | `--snapshot-min-bytes` | 67108864 | Log bytes needed before auto truncation; zero disables it. |
+| `--log-file-bytes` | 67108864 | Log file size, at least 65536. Truncation frees whole files. |
 | `--quota-backend-bytes` | 0 | Zero selects 2 GiB. A negative value disables the quota. |
 | `--quota-warning-fraction` | 0.8 | Quota share that raises the early warning; zero disables it. |
 | `--auto-compaction-mode` | periodic | `periodic` keeps a duration; `revision` keeps a count. |
@@ -154,7 +155,8 @@ The local Raft log remains necessary. S3 does not replace quorum log durability.
 `--state-mode shared` selects the prototype of the shared state design, `docs/shared-state.md`,
 for a new cluster. The leader writes one SlateDB for the whole cluster. Each member reads a
 checkpoint of it, its base, under an in-memory overlay of the newer applied batches.
-`replicated` is the default and keeps the per-member layout.
+`replicated` is the default and keeps the per-member layout. The
+[shared state guide](shared-state-guide.md) covers operation, access, cost, and conversion.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -204,7 +206,9 @@ Rules and limits:
   state from the newest checkpoint and replays the local log.
 - A member that waits on its overlay limit adopts a newer checkpoint in process when its log
   commits the checkpoint index.
-- Manual checkpoints, Defragment, and snapshot restore are unavailable.
+- Defragment runs on the leader. A manual checkpoint returns when the member's base covers the
+  commit index. `--restore-snapshot` seeds a new cluster. See the
+  [shared state guide](shared-state-guide.md#operations).
 
 ### View checkpoint retention
 

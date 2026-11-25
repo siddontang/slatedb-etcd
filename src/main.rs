@@ -162,6 +162,9 @@ struct Args {
     /// a known race against a new leader.
     #[arg(long, value_enum, default_value = "off")]
     view_retention: slatedb_etcd::state::ViewRetention,
+    /// Size of one Raft log file. Truncation frees disk space one whole file at a time.
+    #[arg(long, default_value_t = slatedb_etcd::storage::DEFAULT_LOG_FILE_BYTES)]
+    log_file_bytes: u64,
     /// Log entry cache budget in bytes.
     #[arg(long, default_value_t = 8 * 1024 * 1024)]
     log_cache_bytes: usize,
@@ -210,7 +213,48 @@ struct Args {
     log_term_bytes: usize,
 }
 
+/// Convert a stopped replicated S3 member to shared state mode. Run it on every member.
+#[derive(Parser)]
+#[command(name = "slatedb-etcd convert-to-shared")]
+struct ConvertArgs {
+    /// Persistent member ID of the data directory.
+    #[arg(long)]
+    id: u64,
+    /// Data directory of the stopped member.
+    #[arg(long)]
+    dir: PathBuf,
+    /// Shared cluster identity.
+    #[arg(long, default_value = "slatedb-raft-poc")]
+    cluster_id: String,
+    /// Logical quota of the shared cluster claim in bytes. Zero selects 2 GiB. A negative value
+    /// disables the quota.
+    #[arg(long, default_value = "0", allow_negative_numbers = true)]
+    quota_backend_bytes: i64,
+}
+
+/// Print the Raft snapshot record of a stopped member and the view checkpoint that it names.
+#[derive(Parser)]
+#[command(name = "slatedb-etcd shared-status")]
+struct StatusArgs {
+    /// Data directory of the stopped member.
+    #[arg(long)]
+    dir: PathBuf,
+}
+
 fn main() -> Result<()> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("shared-status")) {
+        let args = StatusArgs::parse_from(std::env::args_os().skip(1));
+        let record = slatedb_etcd::convert::member_record(&args.dir)?;
+        println!("{}", serde_json::to_string_pretty(&record)?);
+        return Ok(());
+    }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("convert-to-shared")) {
+        let args = ConvertArgs::parse_from(std::env::args_os().skip(1));
+        return tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(convert(args));
+    }
     let args = Args::parse();
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(args.runtime_workers.unwrap_or_else(default_workers).get())
@@ -222,6 +266,36 @@ fn main() -> Result<()> {
 /// Linux derives this from `sched_getaffinity` and the cgroup CPU quota. Two remains the fallback.
 fn default_workers() -> std::num::NonZeroUsize {
     std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::new(2).unwrap())
+}
+
+async fn convert(args: ConvertArgs) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+    let quota = match args.quota_backend_bytes {
+        0 => 2 * 1024 * 1024 * 1024,
+        quota => quota.max(0) as u64,
+    };
+    let converted =
+        slatedb_etcd::convert::Conversion::new(args.id, args.dir, args.cluster_id, quota)
+            .run()
+            .await?;
+    println!(
+        "member {} converted: base index {}, term {}, source member {}{}",
+        args.id,
+        converted.index,
+        converted.term,
+        converted.source,
+        if converted.planned {
+            ", planned here"
+        } else {
+            ""
+        }
+    );
+    Ok(())
 }
 
 async fn run(args: Args) -> Result<()> {
@@ -260,6 +334,7 @@ async fn run(args: Args) -> Result<()> {
         snapshot_every: args.snapshot_every,
         watch_progress_notify_interval: args.watch_progress_notify_interval,
         snapshot_min_bytes: args.snapshot_min_bytes,
+        log_file_bytes: args.log_file_bytes,
         log_memory: LogMemory {
             cache_bytes: args.log_cache_bytes,
             pending_bytes: args.log_pending_bytes,

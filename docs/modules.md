@@ -35,6 +35,7 @@ The CLI and embedded API share the same lifecycle and runtime paths.
 | `state/overlay` | Keep shared-mode batches above the base for views and the materializer |
 | `state/shared` | Claim the shared state, open, switch, adopt, and rebase checkpoint bases |
 | `node/shared` | Run the leader writer with its fence and clock checks, and the overlay limits |
+| `convert` | Convert a stopped replicated S3 cluster to shared state mode offline |
 | `state/auth`, `state/cluster`, and `state/lease` | Apply their replicated domain changes |
 | `state/snapshot` and `state/backup` | Build, install, export, and restore complete state |
 | `state/maintenance` | Execute hashes, alarms, and physical storage work |

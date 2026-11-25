@@ -293,6 +293,18 @@ impl Cache {
         }
     }
 
+    /// Return true when unapplied entries, with unstable entries not staged yet and
+    /// `proposal_bytes`, use half or more of the pending quota. Writers wait then, so the
+    /// quota does not fail a write that is held until a quorum or apply returns.
+    pub fn pending_half_full(&self, unstable: &[Entry], proposal_bytes: usize) -> bool {
+        let unstaged: usize = unstable
+            .iter()
+            .filter(|entry| entry.index > self.last)
+            .map(charge)
+            .sum();
+        self.pending_bytes + unstaged + proposal_bytes >= self.limits.pending_bytes / 2
+    }
+
     pub fn admits(&self, unstable: &[Entry], incoming: &[Entry], proposal_bytes: usize) -> bool {
         if incoming
             .iter()
@@ -737,6 +749,7 @@ mod tests {
                 overlay_max_bytes: 1 << 30,
                 max_clock_skew: std::time::Duration::from_secs(5),
                 view_retention: Default::default(),
+                restore: None,
                 object_store: crate::object::Config::Local,
                 quota_bytes: 0,
                 quota_warning_fraction: 0.0,
@@ -749,6 +762,7 @@ mod tests {
                 peers: (1..=3).map(|id| (id, format!("127.0.0.1:{id}"))).collect(),
                 snapshot_every: 0,
                 snapshot_min_bytes: 0,
+                log_file_bytes: 256 * 1024,
                 log_memory: LogMemory::default(),
                 state_cache: Default::default(),
             },

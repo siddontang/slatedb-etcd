@@ -1,6 +1,7 @@
 mod batch;
 mod codec;
 mod command;
+pub mod convert;
 mod crc;
 pub use batch::WriteBatch;
 

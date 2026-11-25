@@ -115,7 +115,7 @@ impl Descriptor {
         Ok(Some(descriptor))
     }
 
-    fn manifest_path(&self) -> String {
+    pub(crate) fn manifest_path(&self) -> String {
         format!("manifest/{:020}.manifest", self.manifest)
     }
 }
@@ -403,7 +403,7 @@ impl Location {
         })
     }
 
-    async fn describe(
+    pub(crate) async fn describe(
         &self,
         root: String,
         checkpoint: uuid::Uuid,

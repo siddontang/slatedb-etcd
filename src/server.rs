@@ -55,6 +55,8 @@ pub struct ServerConfig {
     pub watch_progress_notify_interval: Duration,
     /// Automatic log truncation waits for this many appended log bytes.
     pub snapshot_min_bytes: u64,
+    /// Size of one Raft log file.
+    pub log_file_bytes: u64,
     pub log_memory: LogMemory,
     /// Weight budgets for cached SST blocks and SST metadata.
     pub state_cache: crate::state::StateCache,
@@ -107,6 +109,7 @@ impl ServerConfig {
             watch_progress_notify_interval: crate::grpc::DEFAULT_WATCH_PROGRESS_INTERVAL,
             snapshot_every: 10_000,
             snapshot_min_bytes: crate::node::DEFAULT_SNAPSHOT_MIN_BYTES,
+            log_file_bytes: crate::storage::DEFAULT_LOG_FILE_BYTES,
             log_memory: LogMemory::default(),
             state_cache: crate::state::StateCache::default(),
             quota_bytes: 0,
@@ -159,10 +162,6 @@ impl Server {
         ensure!(
             !config.join || config.restore_snapshot.is_none(),
             "join cannot restore a snapshot"
-        );
-        ensure!(
-            config.state_mode.is_replicated() || config.restore_snapshot.is_none(),
-            "shared state mode cannot restore a snapshot until phase 4"
         );
         ensure!(
             config.id != 0 && !config.peers.contains_key(&0),
@@ -271,6 +270,7 @@ impl Server {
         if let Some(address) = config.client_peers.get_mut(&config.id) {
             resolve_port(address, config.listen)?;
         }
+        let mut restore = None;
         if let Some(backup) = config.restore_snapshot.take() {
             let mut members = crate::cluster::Store::initial(&config.peers);
             for (&id, address) in &config.client_peers {
@@ -278,13 +278,23 @@ impl Server {
                     member.client_ur_ls = vec![crate::cluster::url(address)];
                 }
             }
-            crate::state::StateMachine::restore_backup(
-                &backup,
-                &config.dir,
-                config.id,
-                &config.cluster_id,
-                &members,
-            )?;
+            if config.state_mode.is_replicated() {
+                crate::state::StateMachine::restore_backup(
+                    &backup,
+                    &config.dir,
+                    config.id,
+                    &config.cluster_id,
+                    &members,
+                )?;
+            } else {
+                // A new shared cluster gets the rows in its shared database when it opens.
+                restore = Some(crate::state::StateMachine::restore_shared(
+                    &backup,
+                    &config.dir,
+                    config.id,
+                    &members,
+                )?);
+            }
         }
         // Snapshot restore must see the original data directory before AutoTLS creates fixtures.
         if client_auto {
@@ -314,6 +324,7 @@ impl Server {
                 client_peers: config.client_peers.clone(),
                 snapshot_every: config.snapshot_every,
                 snapshot_min_bytes: config.snapshot_min_bytes,
+                log_file_bytes: config.log_file_bytes,
                 log_memory: config.log_memory,
                 state_cache: config.state_cache,
                 quota_bytes: config.quota_bytes,
@@ -329,6 +340,7 @@ impl Server {
                 overlay_max_bytes: config.overlay_max_bytes,
                 max_clock_skew: config.max_clock_skew,
                 view_retention: config.view_retention,
+                restore,
                 transport,
             },
             events.clone(),
