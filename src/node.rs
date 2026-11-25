@@ -48,6 +48,19 @@ pub use response::KvReply;
 
 #[cfg(test)]
 mod dst;
+
+/// Reject a data directory that holds an interrupted snapshot restore.
+fn ensure_no_restore_marker(dir: &std::path::Path) -> Result<()> {
+    ensure!(
+        !dir.join(crate::state::backup::RESTORE_MARKER).exists(),
+        "the data directory holds an interrupted snapshot restore; remove it and restore again. \
+         With S3, delete the member namespace first only if its owner.json matches the \
+         object-store.json of this directory; otherwise restore with a new cluster ID or \
+         --s3-prefix"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -63,6 +76,8 @@ pub enum Event {
     Auth(crate::auth::Command, Response),
     AuthLookup(String, Response),
     Maintenance(crate::maintenance::Command, Response),
+    /// Stream a native backup of the applied state. See `state::backup`.
+    Snapshot(oneshot::Sender<Result<crate::state::backup::Stream, crate::mvcc::KvError>>),
     Cluster(crate::cluster::Command, Response),
     SubscribeForwarding(oneshot::Sender<ForwardView>),
     Propose(Request, Response),
@@ -378,6 +393,12 @@ impl Node {
                 "the overlay limit must be positive"
             );
         }
+        // Check before any change to the directory, and again under the lock below.
+        ensure_no_restore_marker(&options.dir)?;
+        #[cfg(test)]
+        if let Some(hook) = tests::BEFORE_RAFT_LOCK.with(|hook| hook.take()) {
+            hook(&options.dir);
+        }
         std::fs::create_dir_all(&options.dir)?;
         // Open Raft first. Its exclusive file lock also protects this node's SlateDB directory.
         let mut storage = RaftStorage::open_with_file_bytes(
@@ -391,6 +412,9 @@ impl Node {
             },
             options.log_file_bytes,
         )?;
+        // A restore creates its marker only under this lock, so a restore that started after
+        // the first check is visible now.
+        ensure_no_restore_marker(&options.dir)?;
         let empty_log = storage.last_index()? == 0;
         let empty_raft = empty_log && storage.snapshot_index() == 0;
         let shared = crate::state::shared::Options {
@@ -774,6 +798,24 @@ impl Node {
         Ok(())
     }
 
+    /// Like etcd's election tick advance: a lone voter cannot lose an election, so it
+    /// campaigns at once instead of after a randomized timeout. Raft safety does not depend
+    /// on when a node campaigns. The new leader proposes its term-start entries before any
+    /// client write of the first event. The run loop then sees the role change. A member with
+    /// an accepted snapshot that apply did not install waits, as in `tick_raft`. So does a
+    /// member whose committed backlog leaves no room for the term-start entries: they would
+    /// exceed the pending log quota before replay frees it.
+    fn campaign_alone(&mut self) -> Result<()> {
+        if self.raw.raft.prs().is_singleton()
+            && self.raw.raft.promotable()
+            && !self.installing()
+            && self.raw.store().has_control_room()
+        {
+            self.raw.campaign()?;
+        }
+        self.propose_term_start()
+    }
+
     /// The shared-mode objects that the snapshot receive path opens.
     pub(crate) fn shared_source(&self) -> Option<std::sync::Arc<crate::state::shared::Source>> {
         self.writer.as_ref().map(|writer| writer.source.clone())
@@ -823,6 +865,7 @@ impl Node {
             self.raw.raft.term,
             self.raw.raft.leader_id,
         );
+        self.campaign_alone()?;
         loop {
             let mut step_responses = vec![];
             tokio::select! {
@@ -996,6 +1039,9 @@ impl Node {
             }
             Event::AuthLookup(name, response) => {
                 self.enqueue_query(Query::AuthLookup(name, response))
+            }
+            Event::Snapshot(response) => {
+                self.enqueue_query(Query::Snapshot(credentials.unwrap_or_default(), response))
             }
             Event::Propose(request, response) => {
                 self.propose(

@@ -114,13 +114,22 @@ These flags do not bound process RSS, SlateDB, state scans, or snapshot buffers.
 A memtable flush caches the SST index, filters, and current-row blocks; reads cache the rest.
 Compaction reads ahead 2 x 512 KiB per input SST. Each compaction job runs at most two
 subcompactions, because each one buffers SST data until the disk takes it.
+On Linux, SST writes of replicated state on local storage start disk writeback one SST block at
+a time, so Raft log syncs wait behind only a few blocks. Shared state mode and S3 do not pace SST
+writes. While SlateDB's latest write-side sample of unflushed memtable bytes is at least 85 % of
+its `max_unflushed_bytes`, writeback of that member starts 1 MiB at a time, so flushes and
+compaction catch up. A background flush alone does not update the sample.
 On Linux, jemalloc background threads return freed pages to the OS after 200 ms.
 `_RJEM_MALLOC_CONF` overrides that default.
 A negative quota value disables the quota. The quota is cluster state, so a flag change takes
 effect only when that member leads; see [quota changes](operations.md#change-the-quota).
 The quota can be exceeded by one operation and does not reserve free disk space.
-Native backups and `Maintenance.Snapshot` have a 64 MiB limit. Peer snapshots copy SlateDB
-checkpoint objects and have no size limit; see [object storage Raft snapshots](object-snapshots.md).
+Native backups and `Maintenance.Snapshot` stream from a pinned checkpoint with bounded memory.
+The image has no size limit, but each row has a 64 MiB limit. In shared state mode, the image
+is built in memory and limited to 64 MiB; see
+[administration](administration.md#maintenance-and-storage).
+Peer snapshots copy SlateDB checkpoint objects and have no size limit; see
+[object storage Raft snapshots](object-snapshots.md).
 See [log pool accounting](architecture.md#bounded-log-pools) for admission and recovery rules.
 
 ## Automatic compaction

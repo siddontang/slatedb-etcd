@@ -233,6 +233,36 @@ impl RaftStorage {
         voters: Vec<u64>,
         file_bytes: u64,
     ) -> Result<Self> {
+        Self::open_inner(dir, node_id, cluster_id, voters, file_bytes, true)
+    }
+
+    /// Open the log for a snapshot restore. The engine lock reserves the directory, but a new
+    /// directory gets its identity only from `restore` or a row marker. The caller creates its
+    /// restore marker first, so a crash never leaves a published identity without the marker.
+    pub(crate) fn open_for_restore(
+        dir: &Path,
+        node_id: u64,
+        cluster_id: &str,
+        voters: Vec<u64>,
+    ) -> Result<Self> {
+        Self::open_inner(
+            dir,
+            node_id,
+            cluster_id,
+            voters,
+            DEFAULT_LOG_FILE_BYTES,
+            false,
+        )
+    }
+
+    fn open_inner(
+        dir: &Path,
+        node_id: u64,
+        cluster_id: &str,
+        voters: Vec<u64>,
+        file_bytes: u64,
+        write_identity: bool,
+    ) -> Result<Self> {
         ensure!(
             file_bytes >= MIN_LOG_FILE_BYTES,
             "log file size must be at least {MIN_LOG_FILE_BYTES} bytes"
@@ -281,10 +311,12 @@ impl RaftStorage {
             snapshot
                 .mut_metadata()
                 .set_conf_state(ConfState::from((voters, vec![])));
-            let mut batch = LogBatch::default();
-            batch.put(GROUP, IDENTITY.to_vec(), unmarked.clone())?;
-            batch.put_value::<ProstCodec, _>(GROUP, SNAPSHOT.to_vec(), &snapshot)?;
-            engine.write(&mut batch, true)?;
+            if write_identity {
+                let mut batch = LogBatch::default();
+                batch.put(GROUP, IDENTITY.to_vec(), unmarked.clone())?;
+                batch.put_value::<ProstCodec, _>(GROUP, SNAPSHOT.to_vec(), &snapshot)?;
+                engine.write(&mut batch, true)?;
+            }
         }
         let referenced = checkpoint::load(dir, &engine, &mut snapshot)?;
         let hard_state = engine
@@ -600,6 +632,43 @@ impl RaftStorage {
         self.snapshot = snapshot;
         self.purge()?;
         crate::failpoint::hit("checkpoint-after-gc");
+        Ok(())
+    }
+
+    /// Return true for a directory without a snapshot, a vote, or log entries.
+    pub(crate) fn is_new(&self) -> bool {
+        self.snapshot_index() == 0
+            && self.hard_state == HardState::default()
+            && self.engine.last_index(GROUP).is_none()
+    }
+
+    /// Record a restored state at `index` in a new directory, with a snapshot without an image.
+    ///
+    /// The caller must first flush the restored SlateDB state with its apply marker at `index`.
+    /// That state covers the log before `index`, as after `publish_checkpoint` without an image.
+    pub(crate) fn restore(&mut self, index: u64, conf: ConfState) -> Result<()> {
+        ensure!(self.is_new(), "restore requires a new Raft directory");
+        let mut snapshot = Snapshot::default();
+        snapshot.mut_metadata().index = index;
+        snapshot.mut_metadata().term = 1;
+        snapshot.mut_metadata().set_conf_state(conf);
+        let hard_state = HardState {
+            term: 1,
+            commit: index,
+            ..Default::default()
+        };
+        // The restored rows are format 4 rows. `open_for_restore` can leave the identity unset.
+        let rows = Arc::clone(&self.rows);
+        let mut stored = rows.lock();
+        let mut batch = LogBatch::default();
+        batch.put(GROUP, IDENTITY.to_vec(), rows.marked.clone())?;
+        checkpoint::publish_metadata(&snapshot, &mut batch)?;
+        batch.put_value::<ProstCodec, _>(GROUP, HARD_STATE.to_vec(), &hard_state)?;
+        self.engine.write(&mut batch, true)?;
+        rows.set(&mut stored);
+        self.sync_writes += 1;
+        self.hard_state = hard_state;
+        self.snapshot = snapshot;
         Ok(())
     }
 

@@ -224,6 +224,8 @@ pub struct Location {
     /// The name of the first database. Later databases are `<first>-N`.
     first: String,
     pub(crate) cache: super::StateCache,
+    /// The recorder of each database here, such as the backlog gauge of a paced local store.
+    pub(crate) metrics: Option<Arc<dyn slatedb_common::metrics::MetricsRecorder>>,
     current: Mutex<String>,
     /// Staging state. One lock covers admission and reuse, so they cannot interleave.
     staging: Mutex<Staging>,
@@ -243,6 +245,7 @@ impl Location {
         backend: Backend,
         local_disk: bool,
         cache: super::StateCache,
+        metrics: Option<Arc<dyn slatedb_common::metrics::MetricsRecorder>>,
     ) -> Result<Arc<Self>> {
         let (base, first) = match prefix.rsplit_once('/') {
             Some((base, first)) => (base.to_owned(), first.to_owned()),
@@ -277,6 +280,7 @@ impl Location {
             namespace,
             first,
             cache,
+            metrics,
             current: Mutex::new(current),
             staging: Mutex::new(Staging::default()),
             peer: Mutex::new(Peer {

@@ -879,6 +879,14 @@ pub(super) mod tests {
     }
 
     /// Append committed entries `first..` with `commands` to the Raft log of `dir`.
+    /// The Raft index of a restored member. A restore records its snapshot at the row count of
+    /// the backup plus one, so later entries start after it.
+    pub(in crate::node) fn restored_index(dir: &std::path::Path) -> u64 {
+        RaftStorage::open(&dir.join("raft"), 1, "worker-test", vec![1, 2, 3])
+            .unwrap()
+            .snapshot_index()
+    }
+
     pub(in crate::node) fn append_committed(
         dir: &std::path::Path,
         first: u64,
@@ -987,10 +995,20 @@ pub(super) mod tests {
         let target = dir.path().join("member");
         let config = options(&target);
         let members = crate::cluster::Store::initial(&config.peers);
-        StateMachine::restore_backup(&path, &target, 1, "worker-test", &members).unwrap();
-        // The restored log starts at index 1. Later entries follow it.
+        StateMachine::restore_backup(
+            &path,
+            &target,
+            1,
+            "worker-test",
+            &members,
+            &config.object_store,
+            config.state_cache,
+        )
+        .await
+        .unwrap();
+        // Later entries follow the restored snapshot.
         let commands: Vec<_> = (1..=40).map(quota_put).collect();
-        append_committed(&target, 2, &commands);
+        append_committed(&target, restored_index(&target) + 1, &commands);
         let mut config = options(&target);
         config.quota_bytes = 1 << 20;
         let (events, _) = mpsc::channel(256);
@@ -1069,6 +1087,115 @@ pub(super) mod tests {
         assert_eq!(node.raw.raft.raft_log.last_index(), 4);
     }
 
+    /// A lone voter on an empty directory campaigns before its first event. A write of that
+    /// event follows the term-start entries in the log, so the member can apply it.
+    #[tokio::test]
+    async fn a_lone_voter_seeds_its_log_before_the_first_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = options(dir.path());
+        config.peers = BTreeMap::from([(1, "127.0.0.1:1".to_string())]);
+        let (events, _) = mpsc::channel(256);
+        let mut node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
+            .await
+            .unwrap();
+        node.campaign_alone().unwrap();
+        assert_eq!(node.raw.raft.state, StateRole::Leader);
+        let (tx, _reply) = oneshot::channel();
+        node.propose(quota_put(1), ClientResponse::Kv(tx)).unwrap();
+        apply_committed(&mut node).await;
+        let entries = node
+            .raw
+            .raft
+            .raft_log
+            .entries(1, u64::MAX, raft::GetEntriesContext::empty(false))
+            .unwrap();
+        let commands: Vec<_> = entries
+            .iter()
+            .filter(|entry| !entry.data.is_empty())
+            .map(|entry| RaftCommand::decode(&entry.data).unwrap())
+            .collect();
+        assert!(matches!(commands[0], RaftCommand::SeedMembers(_)));
+        assert!(matches!(commands[1], RaftCommand::SetQuota { .. }));
+        assert!(matches!(commands[2], RaftCommand::Etcd { .. }));
+        assert!(node.quota.blocked().is_none());
+        assert_eq!(node.state.revision, 2);
+    }
+
+    /// A lone voter restarts with a committed backlog that leaves the pending log less room
+    /// than an entry. It does not campaign at run-loop start, as the empty entry of its term
+    /// would exceed the pending quota. Once replay frees the room, it leads and takes writes.
+    #[tokio::test]
+    async fn a_lone_voter_waits_for_replay_room_before_it_campaigns() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |pending: usize| {
+            let mut config = options(dir.path());
+            config.peers = BTreeMap::from([(1, "127.0.0.1:1".to_string())]);
+            config.log_memory.pending_bytes = pending;
+            async move {
+                let (events, _) = mpsc::channel(256);
+                Node::open_with_transport(config, events, Some(BTreeMap::new()))
+                    .await
+                    .unwrap()
+            }
+        };
+        let mut node = open(256 << 20).await;
+        node.campaign_alone().unwrap();
+        for command in &large_entries(9, 1 << 20)[..9] {
+            let (tx, _reply) = oneshot::channel();
+            node.propose(command.clone(), ClientResponse::Kv(tx))
+                .unwrap();
+        }
+        apply_committed(&mut node).await;
+        drop(node);
+        let used = open(256 << 20).await.raw.store().stats()["pending_bytes"]
+            .as_u64()
+            .unwrap() as usize;
+        assert!(used > 9 << 20, "replayed {used} bytes");
+        let mut node = open(used + 32).await;
+        node.drive_ready().await.unwrap();
+        node.campaign_alone().unwrap();
+        assert_eq!(node.raw.raft.state, StateRole::Follower);
+        apply_committed(&mut node).await;
+        node.campaign_alone().unwrap();
+        assert_eq!(node.raw.raft.state, StateRole::Leader);
+        let (tx, _reply) = oneshot::channel();
+        node.propose(quota_put(100), ClientResponse::Kv(tx))
+            .unwrap();
+        apply_committed(&mut node).await;
+        assert_eq!(node.state.revision, 11);
+    }
+
+    /// A lone voter that holds an accepted snapshot that apply did not install does not
+    /// campaign at run-loop start: Raft would scan unapplied entries below the first log index.
+    /// The tick hold of `tick_raft` covers it until the install.
+    #[tokio::test]
+    async fn a_lone_voter_does_not_campaign_before_its_snapshot_installs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = options(dir.path());
+        config.peers = BTreeMap::from([(1, "127.0.0.1:1".to_string())]);
+        let (events, _) = mpsc::channel(256);
+        let mut node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
+            .await
+            .unwrap();
+        let mut message = Message {
+            msg_type: MessageType::MsgSnapshot as i32,
+            from: 2,
+            to: 1,
+            term: 2,
+            ..Default::default()
+        };
+        let metadata = message.mut_snapshot().mut_metadata();
+        metadata.index = 20;
+        metadata.term = 2;
+        metadata.mut_conf_state().voters = vec![1];
+        node.step_peer(message).unwrap();
+        assert!(node.raw.raft.prs().is_singleton());
+        assert!(node.installing());
+        node.campaign_alone().unwrap();
+        assert_eq!(node.raw.raft.state, StateRole::Follower);
+        assert_eq!(node.raw.raft.term, 2);
+    }
+
     async fn open_node(dir: &Path, flag: i64, reassert: bool) -> Node {
         let mut config = options(dir);
         config.quota_bytes = flag;
@@ -1129,7 +1256,12 @@ pub(super) mod tests {
     }
 
     /// Restore a native backup of a state with the cluster quota `quota` into `target`.
-    pub(in crate::node) async fn restore_with(dir: &Path, target: &Path, quota: ClusterQuota) {
+    /// Restore a backup that holds `quota` into `target`. Return the restored Raft index.
+    pub(in crate::node) async fn restore_with(
+        dir: &Path,
+        target: &Path,
+        quota: ClusterQuota,
+    ) -> u64 {
         let mut source = StateMachine::open(&dir.join("source")).await.unwrap();
         source.apply_set_quota(1, quota, false).await.unwrap();
         let image = source.snapshot_data().await.unwrap();
@@ -1140,7 +1272,18 @@ pub(super) mod tests {
         let path = dir.join("backup");
         std::fs::write(&path, backup).unwrap();
         let members = crate::cluster::Store::initial(&options(target).peers);
-        StateMachine::restore_backup(&path, target, 1, "worker-test", &members).unwrap();
+        StateMachine::restore_backup(
+            &path,
+            target,
+            1,
+            "worker-test",
+            &members,
+            &crate::object::Config::Local,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        restored_index(target)
     }
 
     /// A snapshot install moves a member past its pending request. A newer quota in the snapshot
@@ -1636,8 +1779,8 @@ pub(super) mod tests {
     async fn a_newer_request_with_an_older_value_survives_the_replay() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("member");
-        restore_with(temp.path(), &dir, row(200, 10, 2)).await;
-        append_committed(&dir, 2, &[set_quota(300, 30, 2)]);
+        let index = restore_with(temp.path(), &dir, row(200, 10, 2)).await;
+        append_committed(&dir, index + 1, &[set_quota(300, 30, 2)]);
         Quota::open(&dir, startup(100, 10, false, false)).unwrap();
         Quota::open(&dir, startup(200, 40, false, false)).unwrap();
         let mut node = open_node(&dir, 200, false).await;
@@ -1646,7 +1789,7 @@ pub(super) mod tests {
         let (request, seed) = leader_request(&node).unwrap();
         assert_eq!((request, seed), (row(200, 40, 1), false));
         drop(node);
-        append_committed(&dir, 3, &[set_quota(200, 40, 1)]);
+        append_committed(&dir, index + 2, &[set_quota(200, 40, 1)]);
         let mut node = open_node(&dir, 200, false).await;
         apply_committed(&mut node).await;
         assert_eq!(node.state.cluster_quota, Some(row(200, 40, 1)));
@@ -1659,14 +1802,14 @@ pub(super) mod tests {
     async fn a_newer_request_with_the_same_value_advances_the_row_once() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("member");
-        restore_with(temp.path(), &dir, row(200, 10, 2)).await;
+        let index = restore_with(temp.path(), &dir, row(200, 10, 2)).await;
         Quota::open(&dir, startup(100, 5, false, false)).unwrap();
         Quota::open(&dir, startup(200, 40, false, false)).unwrap();
         let mut node = open_node(&dir, 200, false).await;
         apply_committed(&mut node).await;
         assert_eq!(leader_request(&node), Some((row(200, 40, 1), false)));
         drop(node);
-        append_committed(&dir, 2, &[set_quota(200, 40, 1)]);
+        append_committed(&dir, index + 1, &[set_quota(200, 40, 1)]);
         let mut node = open_node(&dir, 200, false).await;
         apply_committed(&mut node).await;
         assert_eq!(node.state.cluster_quota, Some(row(200, 40, 1)));

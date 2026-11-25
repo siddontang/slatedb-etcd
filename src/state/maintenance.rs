@@ -64,6 +64,8 @@ impl StateMachine {
                 .await
                 .map_err(KvError::storage)
                 .map(|()| json!({"header": mvcc::header(self.revision)})),
+            // gRPC Snapshot streams a backup through `Event::Snapshot`. This command keeps the
+            // bounded in-memory image for Rust callers of the maintenance interface.
             Command::Snapshot => {
                 let _timer = self.metrics.snapshot.start_timer();
                 let bytes = self.snapshot_data().await?;

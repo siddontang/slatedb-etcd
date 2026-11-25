@@ -1,8 +1,8 @@
 use super::*;
 use crate::maintenance::Command;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 
 impl Service {
     async fn maintenance_call<T, R>(
@@ -121,40 +121,42 @@ impl maintenance_server::Maintenance for Service {
         self.maintenance_call(request, command, "/etcdserverpb.Maintenance/MoveLeader")
             .await
     }
-    type SnapshotStream = ReceiverStream<Result<SnapshotResponse, Status>>;
+    type SnapshotStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<SnapshotResponse, Status>> + Send + 'static>,
+    >;
+    /// Stream a native backup of this member's applied state. See `state::backup`.
     async fn snapshot(
         &self,
         request: Request<SnapshotRequest>,
     ) -> Result<Response<Self::SnapshotStream>, Status> {
-        let response: Response<SnapshotResponse> = self
-            .maintenance_call(
-                request,
-                Command::Snapshot,
-                "/etcdserverpb.Maintenance/Snapshot",
-            )
-            .await?;
-        let response = response.into_inner();
-        let mut bytes = response.blob;
-        bytes.extend_from_slice(&Sha256::digest(&bytes));
-        let (tx, rx) = mpsc::channel(2);
-        tokio::spawn(async move {
-            let mut remaining = bytes.len();
-            for chunk in bytes.chunks(64 * 1024) {
-                remaining -= chunk.len();
-                if tx
-                    .send(Ok(SnapshotResponse {
-                        header: response.header,
-                        remaining_bytes: remaining as u64,
-                        blob: chunk.to_vec(),
-                        version: crate::ETCD_API_VERSION.into(),
-                    }))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
+        let credentials = credentials(&request);
+        self.local_barrier().await?;
+        let (tx, rx) = oneshot::channel();
+        self.events
+            .send(Event::Authenticated(
+                credentials,
+                Box::new(Event::Snapshot(tx)),
+            ))
+            .await
+            .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?;
+        let backup = tokio::time::timeout(Duration::from_secs(10), rx)
+            .await
+            .map_err(|_| Status::deadline_exceeded("etcdserver: maintenance timed out"))?
+            .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?
+            .map_err(|error| error.status())?;
+        let header = backup.header;
+        let stream = ReceiverStream::new(backup.chunks).map(move |chunk| match chunk {
+            Ok(chunk) => Ok(SnapshotResponse {
+                header,
+                remaining_bytes: chunk.remaining,
+                blob: chunk.blob,
+                version: crate::ETCD_API_VERSION.into(),
+            }),
+            Err(error) => {
+                tracing::warn!(%error, "native backup stream failed");
+                Err(crate::state::backup::backup_error(error).status())
             }
         });
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(Box::pin(stream)))
     }
 }

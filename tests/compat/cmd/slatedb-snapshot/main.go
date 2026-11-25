@@ -32,10 +32,11 @@ func run() error {
 	ca := flag.String("cacert", "", "Trusted CA certificate file")
 	cert := flag.String("cert", "", "TLS client certificate file")
 	key := flag.String("key", "", "TLS client private key file")
-	timeout := flag.Duration("timeout", 30*time.Second, "Snapshot stream timeout")
+	timeout := flag.Duration("timeout", time.Hour, "Snapshot stream timeout")
+	limit := flag.Int64("max-bytes", 0, "Reject a snapshot larger than this; 0 accepts any size")
 	flag.Parse()
-	if *output == "" || flag.NArg() != 0 || *timeout <= 0 {
-		return errors.New("provide --output, a positive --timeout, and no positional arguments")
+	if *output == "" || flag.NArg() != 0 || *timeout <= 0 || *limit < 0 {
+		return errors.New("provide --output, a positive --timeout, a non-negative --max-bytes, and no positional arguments")
 	}
 	cfg := clientv3.Config{Endpoints: strings.Split(*endpoints, ","), DialTimeout: 5 * time.Second,
 		Username: *user, Password: os.Getenv("SLATEDB_SNAPSHOT_PASSWORD")}
@@ -58,13 +59,14 @@ func run() error {
 		return err
 	}
 	defer stream.Close()
-	if err := saveSnapshot(stream, *output, 64*1024*1024); err != nil {
+	if err := saveSnapshot(stream, *output, *limit); err != nil {
 		return err
 	}
 	fmt.Println("Saved checked native snapshot:", *output)
 	return nil
 }
 
+// saveSnapshot copies the stream into a new file. A positive limit caps its size.
 func saveSnapshot(stream io.Reader, output string, limit int64) error {
 	file, err := os.CreateTemp(filepath.Dir(output), ".native-snapshot-*")
 	if err != nil {
@@ -72,11 +74,15 @@ func saveSnapshot(stream io.Reader, output string, limit int64) error {
 	}
 	defer os.Remove(file.Name())
 	defer file.Close()
-	count, err := io.Copy(file, io.LimitReader(stream, limit+1))
+	source := stream
+	if limit > 0 {
+		source = io.LimitReader(stream, limit+1)
+	}
+	count, err := io.Copy(file, source)
 	if err != nil {
 		return err
 	}
-	if count > limit || count <= sha256.Size {
+	if (limit > 0 && count > limit) || count <= sha256.Size {
 		return errors.New("native snapshot is too large or lacks its checksum")
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {

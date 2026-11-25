@@ -94,8 +94,9 @@ The deprecated Hash RPC hashes native records. Its result cannot be compared wit
 hash.
 
 Snapshot streams the native state image with a trailing SHA-256 digest.
-Use the [native export tool](operations.md#backups-and-restoration) to save it.
-`etcdctl snapshot save` expects bbolt page alignment and can reject this native image.
+Save it with `etcdctl snapshot save` or the
+[native export tool](operations.md#backups-and-restoration).
+The server pads the membership row with JSON spaces, so the file length passes the etcdctl check.
 It includes auth, membership, alarms, leases, and MVCC metadata.
 Earlier Raft recovery snapshots used this format. Current ones use checkpoint descriptors.
 It is not an etcd bbolt backup and cannot be restored with `etcdutl`.
@@ -107,8 +108,37 @@ The restore path verifies the checksum, replaces membership, and invalidates old
 It retains KV revisions, compaction, leases, users, roles, and alarm types.
 Remove `--restore-snapshot` when restarting the restored cluster. Existing directories are never
 replaced. A damaged checksum stops restoration before any data directory is created.
-The server builds the complete snapshot in memory. Native backups have a 64 MiB limit.
-Peer snapshots copy SlateDB objects and have no such limit.
+The member pins its applied state in a SlateDB checkpoint and streams the image from it.
+Writes continue while the stream runs and do not reach the image.
+The server holds a few 64 KiB messages, not the image, so the image has no size limit.
+Restore decodes one row at a time, so one encoded row can have at most 64 MiB.
+The auth row holds all users and roles and is the row that can grow this large.
+A backup checks every row before it sends the first message. It returns ResourceExhausted for a
+larger row, so it never publishes an image that restore rejects.
+The server reads the checkpoint twice: first to count the rows, then to send them.
+The checkpoint lives 10 minutes. While the stream runs, even with a client that stops reading,
+the member renews it every minute, and it deletes it at the end.
+Restore checks the file in one pass and writes the rows in 4 MiB batches in a second pass.
+The second pass must read a file with the checked digest.
+It also holds only a few rows in memory. The restored Raft index is the copied row count plus one.
+A restore holds the Raft directory lock while it writes, and a starting member takes the same lock.
+A restore that loses the lock, or finds the directory in use, leaves the directory unchanged.
+An interrupted restore leaves a `restore-incomplete` file, and startup rejects that directory.
+Remove the directory and restore again.
+With S3 state objects, the restore can have claimed the member namespace
+`<s3-prefix>/<SHA-256 of the cluster ID>/member-<id>/` and written objects there.
+The claim in its `owner.json` names the random owner in the directory's `object-store.json`,
+so a retry with the same settings fails with `S3 namespace belongs to another data directory`.
+Before you remove the directory, compare the two files. Delete the objects under that member
+namespace only when they name the same owner. A different owner means that another data
+directory, possibly a running member, uses the namespace: the restore wrote nothing there.
+When they differ, or the directory is already gone, restore all members with a new cluster ID or
+`--s3-prefix`.
+In [shared state mode](shared-state.md) the member still builds the image of its pinned view
+in memory and sends it in the same messages. That image, with its padding and digest, is limited
+to 64 MiB. A larger one returns ResourceExhausted.
+A restore into shared mode also reads the whole file in memory, so it accepts at most 64 MiB.
+That limit applies to every file it restores, including one saved from a replicated member.
 
 Downgrade authenticates the administrator and returns Unimplemented.
 The SlateDB format cannot run an older etcd binary. No rolling binary downgrade is claimed.

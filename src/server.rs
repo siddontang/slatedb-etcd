@@ -289,7 +289,10 @@ impl Server {
                     config.id,
                     &config.cluster_id,
                     &members,
-                )?;
+                    &config.object_store,
+                    config.state_cache,
+                )
+                .await?;
             } else {
                 // A new shared cluster gets the rows in its shared database when it opens.
                 restore = Some(crate::state::StateMachine::restore_shared(

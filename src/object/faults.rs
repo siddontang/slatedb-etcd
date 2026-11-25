@@ -41,6 +41,8 @@ pub(crate) const LOSE_SST_ONCE: u8 = 7;
 /// Report the next two SST reads as missing. A failed cache load in SlateDB falls back to one
 /// direct read, so only this mode fails a read that goes through the block cache.
 pub(crate) const LOSE_SST_TWICE: u8 = 10;
+/// Fail every SST read with a retryable error, like a local file with a persistent I/O error.
+pub(crate) const RETRYABLE_SST_GET: u8 = 11;
 
 impl FaultStore {
     pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
@@ -156,6 +158,12 @@ impl ObjectStore for FaultStore {
         if mode == DELAY_SST_GET && path.as_ref().ends_with(".sst") {
             let delay = self.delay_ms.load(Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        if mode == RETRYABLE_SST_GET && path.as_ref().ends_with(".sst") {
+            return Err(Error::Generic {
+                store: "injected",
+                source: std::io::Error::other("injected I/O error").into(),
+            });
         }
         if mode == FAIL_GET || (mode == FAIL_SST_GET && path.as_ref().ends_with(".sst")) {
             self.entered.add_permits(1);

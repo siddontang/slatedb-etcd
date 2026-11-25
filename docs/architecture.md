@@ -93,7 +93,8 @@ advance `meta/applied` alone, so a different index or a missing row means an unk
 next state batch stores the term again. A copied checkpoint with a known term must match the
 Raft snapshot term. At startup, a durable Raft snapshot at the applied index fills an unknown
 term in memory and must match a known term. Logical images and native backups omit the row.
-Install takes the term from the Raft snapshot metadata, and restore starts at index 1 in term 1.
+Install takes the term from the Raft snapshot metadata. A replicated restore starts in term 1 at
+the copied row count plus one, and a shared restore at index 1 in term 1.
 
 ## Durability and ordering contract
 
@@ -350,6 +351,9 @@ If recovery exceeds the pending quota, startup replays committed entries in boun
 It then loads only the remaining uncommitted tail into the pending pool.
 An oversized uncommitted tail fails startup with an explicit quota error.
 Startup disk reads run before the Raft event loop begins.
+A member that is the only voter campaigns when the loop starts, like etcd's election tick advance.
+It waits for its election timeout instead when its committed backlog leaves the pending log no
+room for the term-start entries.
 
 Status separates `raft_commit_index` from durable `commit_index`.
 It also exposes `cached_last_log_index`, `log_busy`, queued log jobs and bytes, and pending reads.
@@ -373,7 +377,8 @@ The HashKV row stores their CRC and length, and the Watch journal omits the valu
 
 The apply owner keeps an in-memory index of every current etcd key, like etcd's `treeIndex`.
 Each entry holds the create revision, modification revision, version, lease, and row length.
-Startup builds it with one scan of `etcd/current/`.
+Startup builds it with one scan of `etcd/current/`. The scan reads several SST blocks per
+request, and the ordered key set is built in bulk from the sorted rows.
 Every state write updates it after SlateDB accepts the batch.
 Snapshot installation, compaction, deletes, transactions, and lease revocation use this path.
 
@@ -538,7 +543,8 @@ The leader and any forwarding member wait for their local flush before they retu
 Defragment rewrites SSTs through the SlateDB compactor.
 Both operations run on the apply worker. Slow state work cannot stop Raft heartbeats.
 Compactor failures return RPC errors; they do not stop the Raft owner.
-Native snapshot export includes SHA-256 and uses bounded response chunks, but builds a full buffer.
+Native snapshot export includes SHA-256 and uses bounded response chunks. Replicated mode streams
+it from a pinned checkpoint; shared mode builds the image of its pinned view in one buffer.
 Snapshots contain authentication, membership, alarms, leases, and revision metadata together.
 
 ## Monitoring

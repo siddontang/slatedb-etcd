@@ -17,7 +17,9 @@ use crate::proto::etcdserverpb::{CompactionRequest, CompactionResponse, RequestO
 use crate::{Command, Operation, Reply};
 
 mod auth;
-mod backup;
+pub(crate) mod backup;
+#[cfg(test)]
+mod backup_tests;
 mod checkpoint;
 pub(crate) mod cluster;
 pub(crate) mod compaction;
@@ -372,10 +374,16 @@ impl StateMachine {
         // and pace SST writeback so a large flush does not stall Raft log syncs.
         let local = LocalFileSystem::new_with_prefix(dir)?.with_fsync(true);
         #[cfg(target_os = "linux")]
-        let object_store = Arc::new(crate::object::paced::PacedStore::new(local));
+        let (object_store, metrics) = {
+            let store = crate::object::paced::PacedStore::new(local);
+            // Local SSTs write faster while unflushed memtables pile up.
+            let metrics = store.backlog_recorder(slatedb_settings().max_unflushed_bytes);
+            (Arc::new(store), Some(metrics))
+        };
         #[cfg(not(target_os = "linux"))]
-        let object_store = Arc::new(local);
-        Self::open_location(object_store, "state", cache, transfer::Backend::Local, true).await
+        let (object_store, metrics) = (Arc::new(local), None);
+        let local = transfer::Backend::Local;
+        Self::open_location(object_store, "state", cache, local, true, metrics).await
     }
 
     pub async fn open_store(
@@ -390,7 +398,7 @@ impl StateMachine {
         prefix: &str,
         cache: StateCache,
     ) -> Result<Self> {
-        Self::open_backend(object_store, prefix, cache, transfer::Backend::Local).await
+        Self::open_backend(object_store, prefix, cache, transfer::Backend::Local, None).await
     }
 
     pub(crate) async fn open_backend(
@@ -398,8 +406,9 @@ impl StateMachine {
         prefix: &str,
         cache: StateCache,
         backend: transfer::Backend,
+        metrics: Option<Arc<dyn slatedb_common::metrics::MetricsRecorder>>,
     ) -> Result<Self> {
-        Self::open_location(object_store, prefix, cache, backend, false).await
+        Self::open_location(object_store, prefix, cache, backend, false, metrics).await
     }
 
     /// Open the state in `object_store`. `local_disk` is true only when this server built the
@@ -410,10 +419,12 @@ impl StateMachine {
         cache: StateCache,
         backend: transfer::Backend,
         local_disk: bool,
+        metrics: Option<Arc<dyn slatedb_common::metrics::MetricsRecorder>>,
     ) -> Result<Self> {
         cache.validate()?;
         let location =
-            transfer::Location::open(object_store, prefix, backend, local_disk, cache).await?;
+            transfer::Location::open(object_store, prefix, backend, local_disk, cache, metrics)
+                .await?;
         let state = Self::open_at(location.clone(), &location.root()).await?;
         if let Err(error) = location.remove_orphans().await {
             tracing::warn!(%error, "cannot delete unused state databases");
@@ -429,7 +440,11 @@ impl StateMachine {
         let cache = cache.build();
         let settings = member_settings(location.local_disk);
         let admin = slatedb::admin::Admin::builder(root, object_store.clone()).build();
-        let db = Db::builder(root, object_store)
+        let mut builder = Db::builder(root, object_store);
+        if let Some(metrics) = &location.metrics {
+            builder = builder.with_metrics_recorder(metrics.clone());
+        }
+        let db = builder
             .with_db_cache(cache, 0)
             .with_settings(settings)
             .with_block_cache_policy(block_cache_policy())
@@ -643,29 +658,14 @@ impl StateMachine {
             self.members_row = Some(cluster::MembersRow::new(&value, index));
             batch.put(crate::cluster::KEY, value);
         }
-        // Format 4 rows are hash digests and Watch journals without Put values. Mark the
-        // directory durably before SlateDB can hold the first of them. Earlier batches, such as
-        // empty entries and membership changes, leave the directory readable by older binaries.
-        if let Some(marker) = &self.row_marker {
-            if !marker.is_marked()
-                && (batch.puts_under(crate::maintenance::HASH)
-                    || batch.puts_under(crate::watch::EVENTS))
-            {
-                marker.mark()?;
-            }
-        }
+        self.mark_format_4(&batch)?;
         // Drop shared rows before SlateDB may expose the change. See `rows`.
         for key in batch.keys() {
             if let Some(key) = key.strip_prefix(mvcc::CURRENT) {
                 self.rows.invalidate(key, index);
             }
         }
-        // The counters are outside `etcd/`, so they do not count themselves. Shared mode also
-        // keeps the eight-byte total, which older readers of the shared base load.
-        if self.is_shared() {
-            batch.put(shared::LOGICAL_BYTES, size.total().to_be_bytes());
-        }
-        batch.put(LOGICAL_SIZE, logical_size_row(index, size));
+        self.put_logical_size(&mut batch, index, size);
         let batch = Arc::new(batch);
         match &mut self.shared {
             None => {
@@ -689,6 +689,31 @@ impl StateMachine {
         }
         self.key_index.commit(index);
         Ok(size)
+    }
+
+    /// Format 4 rows are hash digests and Watch journals without Put values. Mark the
+    /// directory durably before SlateDB can hold the first of them. Earlier batches, such as
+    /// empty entries and membership changes, leave the directory readable by older binaries.
+    fn mark_format_4(&self, batch: &WriteBatch) -> Result<()> {
+        if let Some(marker) = &self.row_marker {
+            if !marker.is_marked()
+                && (batch.puts_under(crate::maintenance::HASH)
+                    || batch.puts_under(crate::watch::EVENTS))
+            {
+                marker.mark()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Store the logical size `size` at `index` in `batch`.
+    fn put_logical_size(&self, batch: &mut WriteBatch, index: u64, size: crate::batch::Usage) {
+        // The counters are outside `etcd/`, so they do not count themselves. Shared mode also
+        // keeps the eight-byte total, which older readers of the shared base load.
+        if self.is_shared() {
+            batch.put(shared::LOGICAL_BYTES, size.total().to_be_bytes());
+        }
+        batch.put(LOGICAL_SIZE, logical_size_row(index, size));
     }
 
     /// Return the Watch events of the work since `previous`, if capture is enabled.

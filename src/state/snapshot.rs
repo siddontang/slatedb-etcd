@@ -1,6 +1,7 @@
 use super::*;
 
 impl StateMachine {
+    /// Build a legacy row image in memory. Tests install it to check the legacy format.
     pub async fn snapshot_data(&mut self) -> Result<Vec<u8>> {
         let data = self.snapshot_job()?.await?;
         // Only a replicated export flushes the database. A shared view scan makes nothing durable.
@@ -14,6 +15,15 @@ impl StateMachine {
     pub fn snapshot_job(
         &self,
     ) -> Result<impl std::future::Future<Output = Result<Vec<u8>>> + Send + 'static> {
+        self.image_job(false)
+    }
+
+    /// Like `snapshot_job`. With `align`, pad the membership row for `etcdctl snapshot save`.
+    /// See `backup::pad_members`.
+    pub(super) fn image_job(
+        &self,
+        align: bool,
+    ) -> Result<impl std::future::Future<Output = Result<Vec<u8>>> + Send + 'static> {
         // A shared-mode view needs no flush. Its rows are in a checkpoint or in memory.
         let snapshot = self.pinned_state()?;
         let db = self.database.clone();
@@ -22,6 +32,13 @@ impl StateMachine {
         // Shared mode ignores a cluster quota row from a converted state. A replicated restore
         // of this image must not use that old value.
         let shared = self.is_shared();
+        // A backup carries the membership in memory as its last row, padded for etcdctl. A
+        // restore replaces it. A Raft image sends the stored row as it is. See `install_object`.
+        let members = if align {
+            Some(serde_json::to_vec(self.members.as_ref())?)
+        } else {
+            None
+        };
         Ok(async move {
             if let Some(db) = db {
                 metrics.flush_db(&db).await?;
@@ -37,10 +54,16 @@ impl StateMachine {
                 // membership row goes as it is. A state without it sends none, so the install
                 // stores no member-local row.
                 let quota_row = shared && row.key.as_ref() == quota::KEY;
-                if !derived_key(&row.key) && !quota_row {
+                let members_row = members.is_some() && row.key.as_ref() == crate::cluster::KEY;
+                if !derived_key(&row.key) && !quota_row && !members_row {
                     crate::codec::write(&mut data, &(row.key, row.value))?;
                     count += 1;
                 }
+            }
+            if let Some(mut members) = members {
+                backup::pad_members(&mut members, data.len() as u64)?;
+                crate::codec::write(&mut data, &(crate::cluster::KEY, members))?;
+                count += 1;
             }
             // Replace the vector length after streaming its rows in the same binary format.
             crate::codec::write(&mut &mut data[count_offset..], &count)?;

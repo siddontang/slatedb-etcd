@@ -112,6 +112,11 @@ pub(super) enum Query {
     Read(RequestOp, Option<crate::auth::Credentials>, ClientResponse),
     Linear(RequestOp, Option<crate::auth::Credentials>, u64),
     Local(String, Response),
+    /// Start a native backup at the applied boundary. The image streams outside the worker.
+    Snapshot(
+        crate::auth::Credentials,
+        tokio::sync::oneshot::Sender<Result<crate::state::backup::Stream, crate::mvcc::KvError>>,
+    ),
 }
 
 impl Query {
@@ -149,6 +154,11 @@ impl Query {
             Self::Linear(..) => unreachable!("linear reads wait for queue capacity"),
             Self::Read(_, _, response) => {
                 response.error(error);
+                return;
+            }
+            Self::Snapshot(_, response) => {
+                let error = crate::mvcc::KvError::new(tonic::Code::Unavailable, &error.error);
+                let _ = response.send(Err(error));
                 return;
             }
             Self::Maintenance(_, _, _, response)
@@ -426,6 +436,24 @@ impl Executor {
                         value: serde_json::to_value(outcome)?,
                         require_leader: false,
                     }
+                }
+                Query::Snapshot(credentials, response) => {
+                    let result = match self.state.auth.admin(&credentials) {
+                        Ok(()) => match self.state.backup().await {
+                            Ok(mut stream) => {
+                                work.header.fill(stream.header.as_mut());
+                                Ok(stream)
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "a native backup failed to start");
+                                Err(crate::state::backup::backup_error(error))
+                            }
+                        },
+                        Err(error) => Err(error),
+                    };
+                    let _ = response.send(result);
+                    // The reply went out above, so the node has nothing to finish.
+                    Output::Reads(Vec::new())
                 }
                 Query::AuthLookup(name, response) => Output::Query {
                     response,
