@@ -352,6 +352,8 @@ It then loads only the remaining uncommitted tail into the pending pool.
 An oversized uncommitted tail fails startup with an explicit quota error.
 Startup disk reads run before the Raft event loop begins.
 A member that is the only voter campaigns when the loop starts, like etcd's election tick advance.
+It waits for its election timeout instead when its committed backlog leaves the pending log no
+room for the term-start entries.
 
 Status separates `raft_commit_index` from durable `commit_index`.
 It also exposes `cached_last_log_index`, `log_busy`, queued log jobs and bytes, and pending reads.

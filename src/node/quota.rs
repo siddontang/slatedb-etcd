@@ -1121,6 +1121,50 @@ pub(super) mod tests {
         assert_eq!(node.state.revision, 2);
     }
 
+    /// A lone voter restarts with a committed backlog that leaves the pending log less room
+    /// than an entry. It does not campaign at run-loop start, as the empty entry of its term
+    /// would exceed the pending quota. Once replay frees the room, it leads and takes writes.
+    #[tokio::test]
+    async fn a_lone_voter_waits_for_replay_room_before_it_campaigns() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |pending: usize| {
+            let mut config = options(dir.path());
+            config.peers = BTreeMap::from([(1, "127.0.0.1:1".to_string())]);
+            config.log_memory.pending_bytes = pending;
+            async move {
+                let (events, _) = mpsc::channel(256);
+                Node::open_with_transport(config, events, Some(BTreeMap::new()))
+                    .await
+                    .unwrap()
+            }
+        };
+        let mut node = open(256 << 20).await;
+        node.campaign_alone().unwrap();
+        for command in &large_entries(9, 1 << 20)[..9] {
+            let (tx, _reply) = oneshot::channel();
+            node.propose(command.clone(), ClientResponse::Kv(tx))
+                .unwrap();
+        }
+        apply_committed(&mut node).await;
+        drop(node);
+        let used = open(256 << 20).await.raw.store().stats()["pending_bytes"]
+            .as_u64()
+            .unwrap() as usize;
+        assert!(used > 9 << 20, "replayed {used} bytes");
+        let mut node = open(used + 32).await;
+        node.drive_ready().await.unwrap();
+        node.campaign_alone().unwrap();
+        assert_eq!(node.raw.raft.state, StateRole::Follower);
+        apply_committed(&mut node).await;
+        node.campaign_alone().unwrap();
+        assert_eq!(node.raw.raft.state, StateRole::Leader);
+        let (tx, _reply) = oneshot::channel();
+        node.propose(quota_put(100), ClientResponse::Kv(tx))
+            .unwrap();
+        apply_committed(&mut node).await;
+        assert_eq!(node.state.revision, 11);
+    }
+
     /// A lone voter that holds an accepted snapshot that apply did not install does not
     /// campaign at run-loop start: Raft would scan unapplied entries below the first log index.
     /// The tick hold of `tick_raft` covers it until the install.

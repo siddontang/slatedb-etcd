@@ -802,9 +802,15 @@ impl Node {
     /// campaigns at once instead of after a randomized timeout. Raft safety does not depend
     /// on when a node campaigns. The new leader proposes its term-start entries before any
     /// client write of the first event. The run loop then sees the role change. A member with
-    /// an accepted snapshot that apply did not install waits, as in `tick_raft`.
+    /// an accepted snapshot that apply did not install waits, as in `tick_raft`. So does a
+    /// member whose committed backlog leaves no room for the term-start entries: they would
+    /// exceed the pending log quota before replay frees it.
     fn campaign_alone(&mut self) -> Result<()> {
-        if self.raw.raft.prs().is_singleton() && self.raw.raft.promotable() && !self.installing() {
+        if self.raw.raft.prs().is_singleton()
+            && self.raw.raft.promotable()
+            && !self.installing()
+            && self.raw.store().has_control_room()
+        {
             self.raw.campaign()?;
         }
         self.propose_term_start()

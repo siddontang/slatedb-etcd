@@ -531,7 +531,9 @@ mod tests {
     #[tokio::test]
     async fn load_matches_incremental_publish() {
         use slatedb::object_store::memory::InMemory;
+        // Without the block cache, the load reads the flushed blocks from the object store.
         let db = slatedb::Db::builder("db", Arc::new(InMemory::new()))
+            .with_db_cache_disabled()
             .build()
             .await
             .unwrap();
