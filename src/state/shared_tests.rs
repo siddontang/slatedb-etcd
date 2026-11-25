@@ -420,6 +420,34 @@ async fn the_cluster_claim_fixes_the_mode_and_the_quota() {
     );
 }
 
+/// Shared mode keeps the claim quota. A `SetQuota` entry stores only the apply position, so the
+/// overlay gets no batch and the next checkpoint holds no quota row.
+#[tokio::test]
+async fn shared_mode_ignores_a_set_quota_entry() {
+    let mut state = open_shared(Arc::new(InMemory::new())).await;
+    state.quota = 500;
+    state.set_quota_flag(1 << 20);
+    state.apply(1, None).await.unwrap();
+    let batches = state.write_batches;
+    let request = quota::ClusterQuota {
+        bytes: 7,
+        requested_at: 1,
+        member: 1,
+    };
+    state.apply_set_quota(2, request, false).await.unwrap();
+    assert_eq!(state.applied, 2);
+    assert_eq!(state.write_batches, batches);
+    assert_eq!((state.quota, state.quota_bytes()), (500, 500));
+    assert_eq!(state.cluster_quota(), None);
+    assert!(state.quota_mismatch());
+    assert!(state
+        .applied_state()
+        .get(quota::KEY)
+        .await
+        .unwrap()
+        .is_none());
+}
+
 #[tokio::test]
 async fn a_restart_writes_a_missing_bootstrap_marker() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

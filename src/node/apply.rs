@@ -29,6 +29,14 @@ pub(super) struct AppliedState {
     pub view: Option<(u64, u64, u64)>,
     /// Shared mode: the checkpoint of the base.
     pub base_checkpoint: Option<uuid::Uuid>,
+    /// The quota of the last applied `SetQuota` entry. See `StateMachine::cluster_quota`.
+    pub cluster_quota: Option<crate::state::quota::ClusterQuota>,
+    /// The quota that apply uses. A non-positive value means no limit.
+    pub quota_bytes: i64,
+    /// The flag of this member differs from `quota_bytes`.
+    pub quota_mismatch: bool,
+    /// The checkpoint that must cover a first cluster quota. See `StateMachine::quota_boundary`.
+    pub quota_boundary: u64,
 }
 
 impl std::ops::Deref for AppliedState {
@@ -53,6 +61,10 @@ impl AppliedState {
             physical_revision: state.physical_revision(),
             view: state.view_status(),
             base_checkpoint: state.base_checkpoint(),
+            cluster_quota: state.cluster_quota(),
+            quota_bytes: state.quota_bytes(),
+            quota_mismatch: state.quota_mismatch(),
+            quota_boundary: state.quota_boundary,
         })
     }
 }
@@ -800,6 +812,21 @@ pub(super) async fn apply_entries(
                 state.apply_view_checkpoint(entry.index, checkpoint).await?;
                 Reply::Encoded(Value::Null)
             }
+            RaftCommand::SetQuota {
+                bytes,
+                seed,
+                requested_at,
+                member,
+                ..
+            } => {
+                let request = crate::state::quota::ClusterQuota {
+                    bytes: *bytes,
+                    requested_at: *requested_at,
+                    member: *member,
+                };
+                state.apply_set_quota(entry.index, request, *seed).await?;
+                Reply::Encoded(Value::Null)
+            }
             RaftCommand::CompactStep { .. } => {
                 match state.apply_compaction_step(entry.index).await? {
                     Some(revision) => Reply::CompactFlush {
@@ -826,17 +853,22 @@ pub(super) async fn recover(
     state: &mut StateMachine,
     storage: &RaftStorage,
     header: Header,
+    created_empty: bool,
 ) -> Result<()> {
     let mut physical = false;
     while state.applied < storage.commit_index() {
         let low = state.applied + 1;
-        let entries = storage.entries(
+        let mut entries = storage.entries(
             low,
             (low + BATCH_ENTRIES).min(storage.commit_index() + 1),
             Some(BATCH_BYTES),
             raft::GetEntriesContext::empty(false),
         )?;
         ensure!(!entries.is_empty(), "empty recovery batch");
+        // A guarded member stops here and waits for a snapshot. See `node::quota`.
+        if super::quota::guard_replay(state, created_empty, &mut entries)? {
+            break;
+        }
         let replies = apply_entries(state, entries, header).await?;
         physical |= replies.iter().any(|r| {
             matches!(

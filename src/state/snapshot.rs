@@ -29,6 +29,9 @@ impl StateMachine {
         let db = self.database.clone();
         let metrics = self.metrics.clone();
         let applied = self.applied;
+        // Shared mode ignores a cluster quota row from a converted state. A replicated restore
+        // of this image must not use that old value.
+        let shared = self.is_shared();
         let mut members = serde_json::to_vec(self.members.as_ref())?;
         Ok(async move {
             if let Some(db) = db {
@@ -42,7 +45,10 @@ impl StateMachine {
             while let Some(row) = iterator.next().await? {
                 // Format 4 readers reject the derived meta rows. Install takes the term from the
                 // Raft snapshot metadata and counts the logical size from the rows.
-                if row.key.as_ref() != crate::cluster::KEY && !derived_key(&row.key) {
+                if row.key.as_ref() != crate::cluster::KEY
+                    && !derived_key(&row.key)
+                    && !(shared && row.key.as_ref() == quota::KEY)
+                {
                     crate::codec::write(&mut data, &(row.key, row.value))?;
                     count += 1;
                 }
@@ -140,6 +146,8 @@ impl StateMachine {
             Some(data) => serde_json::from_slice(&data)?,
             None => crate::auth::Store::default(),
         });
+        // The installed cluster quota replaces the current one. Without it, the flag applies.
+        self.reload_quota().await?;
         ensure!(
             self.compact_revision <= self.revision,
             "compaction exceeds current revision"
@@ -209,7 +217,8 @@ impl StateMachine {
         let old_name = location.switch(&staging, index).await?;
         crate::failpoint::hit("snapshot-after-install-write");
         next.metrics = self.metrics.clone();
-        next.quota = self.quota;
+        // The copied state supplies the cluster quota, if any.
+        next.set_quota_flag(self.quota_flag());
         next.write_batches = self.write_batches;
         next.row_marker = self.row_marker.take();
         next.watch_capture = self.watch_capture.take();

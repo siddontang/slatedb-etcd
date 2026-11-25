@@ -212,12 +212,11 @@ the index of the last state change.
 
 ## Determinism
 
-Today two inputs to apply differ by member. Each member keeps its own state, so the difference
-stays local. With a shared base, a member's view would change when its base switches. Shared
-mode removes both inputs:
+Two inputs to apply could differ by member. With a shared base, a member's view would change
+when its base switches. Shared mode removes both inputs:
 
-- **Quota.** `self.quota` is a member flag (`state/put_batch.rs:63-64`). Shared mode stores the
-  quota in the cluster claim, and every member reads it from there.
+- **Quota.** Shared mode stores the quota in the cluster claim, and every member reads it from
+  there. It ignores the replicated `etcd/quota` row and `SetQuota` entries.
 - **`members_unsaved`.** One member sets it after an install or at bootstrap
   (`state/snapshot.rs:120,145`, `node.rs:328-336`). Its next batch then adds `etcd/members`.
   Shared mode writes `etcd/members` only when a configuration change applies.

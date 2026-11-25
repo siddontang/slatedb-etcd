@@ -32,6 +32,7 @@ mod kv;
 mod lease;
 pub(crate) mod overlay;
 pub(crate) mod put_batch;
+pub(crate) mod quota;
 mod read;
 pub(crate) mod rows;
 #[cfg(test)]
@@ -81,7 +82,16 @@ pub struct StateMachine {
     pub auth: Arc<crate::auth::Store>,
     pub members: Arc<crate::cluster::Store>,
     pub(crate) admin: Arc<slatedb::admin::Admin>,
+    /// The quota that apply uses. Zero disables it. See `quota`.
     pub quota: u64,
+    /// The effective flag value of this member. Replicated apply uses it without a cluster quota.
+    quota_flag: i64,
+    /// The quota of the last applied `SetQuota` entry. `None` in shared mode.
+    cluster_quota: Option<quota::ClusterQuota>,
+    /// The index of a first `SetQuota` entry that followed quota-checked entries, or zero.
+    /// Members checkpoint through it, so no log still holds those entries. The row keeps it, so
+    /// a restart can retry the checkpoint.
+    pub(crate) quota_boundary: u64,
     logical_bytes: crate::batch::Usage,
     pub(crate) current: current::CurrentRows,
     pub(crate) key_index: key_index::KeyIndex,
@@ -431,11 +441,18 @@ impl StateMachine {
         // A shared base from an older binary has only the total in `shared::LOGICAL_BYTES`, and
         // its apply marker is past any counter row, so the open counts the split again.
         let logical_bytes = load_logical_size(&reads, applied).await?;
+        let (cluster_quota, quota_boundary) = match &shared {
+            Some(_) => (None, 0),
+            None => quota::load(&reads).await?,
+        };
         Ok(Self {
             members: Arc::new(members),
             admin,
             metrics: Arc::new(crate::metrics::StateMeters::new()?),
-            quota: 0,
+            quota: cluster_quota.map_or(0, |quota| quota.bytes.max(0) as u64),
+            quota_flag: 0,
+            cluster_quota,
+            quota_boundary,
             current: current::CurrentRows::default(),
             key_index: key_index::KeyIndex::load(&reads).await?,
             rows,
