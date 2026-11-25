@@ -122,6 +122,8 @@ Neither operation promises immediate filesystem shrinkage. SlateDB checkpoints c
 Quota uses logical bytes and can be exceeded by one request. It is not a free-space reservation.
 
 State scans and full snapshot buffers do not have independent memory quotas.
+KV responses use etcd's send limit of `math.MaxInt32` bytes.
+An unpaginated Range holds its whole response in memory, as on etcd.
 Native backups and peer snapshots have a 64 MiB limit.
 Lease remaining TTL is not checkpointed. A new leader resets surviving leases to their full TTL.
 DST does not control wall-clock lease expiry, operating system threads, or partial sector writes.
