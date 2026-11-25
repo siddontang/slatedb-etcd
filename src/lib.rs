@@ -149,6 +149,13 @@ pub enum RaftCommand {
         requested_at: u64,
         member: u64,
     },
+    /// A leader proposes this entry at the start of each term, in both state modes. A state
+    /// without the `etcd/members` row stores `members`, so every member stores the same row. A
+    /// state with the row keeps it, and compares it with `digest`. See `state::cluster`.
+    ///
+    /// Like `SetQuota`, this variant precedes `CompactStep`, and the JSON names its id
+    /// `members_id`. An older binary then stops on the entry.
+    SeedMembers(cluster::Seed),
     /// The leader proposes bounded physical compaction work after a Compact entry.
     CompactStep {
         id: String,
@@ -180,6 +187,7 @@ impl RaftCommand {
             | Self::ViewCheckpoint { id, .. }
             | Self::SetQuota { id, .. }
             | Self::Lease { id, .. } => id,
+            Self::SeedMembers(seed) => &seed.id,
         }
     }
 }

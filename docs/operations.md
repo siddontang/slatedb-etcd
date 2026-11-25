@@ -120,6 +120,23 @@ Compare revisions, alarms, and HashKV. Remove a member that differs, and add it 
 learner with an empty data directory. It then installs a snapshot of the leader. Move the
 leadership to the chosen member first.
 
+### Membership row
+
+The `etcd/members` row is cluster state, and the quota counts its bytes.
+
+- The `--peer` and `--client-peer` flags build the membership of a new member in memory. The
+  first leader stores its own membership before the first client write. Joining members and
+  restores take the row from the cluster.
+- A member whose flags differ from the stored row logs a warning at startup. The row applies.
+- Each leader proposes a digest of its row when it starts its term, and again after the first
+  entry of its term applies. A member whose row differs logs a warning and sets the
+  `slatedb_etcd_members_mismatch` gauge. The `members_row` field of `/status` shows the digest,
+  the last index that can have changed the row, and the term and index of the last comparison.
+- An earlier binary stored the flags of each member. Members with other URL text then hold other
+  rows. Repair such a member as for a quota difference above.
+- A new member does not apply an earlier binary's entries before the first seed. It asks the
+  leader for a snapshot and does not lead until it installs one, as for the quota.
+
 Keep the entire Raft directory, including its checkpoint data file, when moving a member.
 Older binaries reject the Raft identity after the first checkpoint in the new layout.
 Do not delete Raft log files, manifests, or individual SST objects by hand.
@@ -147,8 +164,8 @@ The Raft identity and native snapshot header require this format.
 Use fresh data directories and object prefixes for this version.
 Old directories and old native backups are not upgrade inputs. There is no format migration.
 Mixed binary versions and rolling upgrades are unsupported.
-An older binary stops at the first `SetQuota` entry, because it cannot decode it. Upgrade that
-member. The new binary applies the entry on restart.
+An older binary stops at the first `SetQuota` or `SeedMembers` entry, because it cannot decode
+it. Upgrade that member. The new binary applies the entry on restart.
 Binaries that write `meta/applied-term` keep native snapshot and backup format 4. Upgrade the
 followers first, as for format 5, so that no older member installs a checkpoint with the row.
 The etcd client protocol remains separate from this internal storage format.

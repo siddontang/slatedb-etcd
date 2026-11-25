@@ -13,6 +13,22 @@ pub struct Store {
     pub removed: BTreeSet<u64>,
 }
 
+/// The payload of a `SeedMembers` entry. See `state::cluster`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Seed {
+    /// The JSON names it `members_id`, so an older binary does not decode it as a `CompactStep`.
+    #[serde(rename = "members_id")]
+    pub id: String,
+    /// The leader that proposed the entry.
+    pub origin: u64,
+    /// The membership of the leader as row JSON. An untagged enum cannot decode the integer map
+    /// keys of `Store`.
+    pub members: String,
+    /// The digest of the row of the leader at index `applied`. `None` if it had no row.
+    pub digest: Option<String>,
+    pub applied: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Command {
     List(MemberListRequest),
@@ -43,6 +59,37 @@ impl Store {
                 .collect(),
             removed: BTreeSet::new(),
         }
+    }
+
+    /// The bootstrap membership of a member: its `--peer` flags and its client URL overrides.
+    /// It is member-local input. Only apply of a `SeedMembers` entry stores it. See
+    /// `state::cluster`.
+    pub fn bootstrap(peers: &BTreeMap<u64, String>, clients: &BTreeMap<u64, String>) -> Self {
+        let mut members = Self::initial(peers);
+        for (&id, address) in clients {
+            if let Some(member) = members.members.get_mut(&id) {
+                member.client_ur_ls = vec![url(address)];
+            }
+        }
+        members
+    }
+
+    /// The IDs of the members whose ID, peer URLs, or client URLs differ between the two stores.
+    pub fn differences(&self, other: &Self) -> Vec<u64> {
+        let ids: BTreeSet<u64> = self
+            .members
+            .keys()
+            .chain(other.members.keys())
+            .copied()
+            .collect();
+        ids.into_iter()
+            .filter(|id| match (self.members.get(id), other.members.get(id)) {
+                (Some(left), Some(right)) => {
+                    left.peer_ur_ls != right.peer_ur_ls || left.client_ur_ls != right.client_ur_ls
+                }
+                _ => true,
+            })
+            .collect()
     }
 
     pub fn conf(&self) -> ConfState {
@@ -190,6 +237,15 @@ impl Command {
             ..Default::default()
         }
     }
+}
+
+/// A short digest of the bytes of a stored `etcd/members` row: 16 hexadecimal digits.
+pub fn digest(row: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(row)[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub fn url(address: &str) -> String {

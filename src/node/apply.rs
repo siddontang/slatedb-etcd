@@ -37,6 +37,12 @@ pub(super) struct AppliedState {
     pub quota_mismatch: bool,
     /// The checkpoint that must cover a first cluster quota. See `StateMachine::quota_boundary`.
     pub quota_boundary: u64,
+    /// The stored membership row, if any. See `state::cluster`.
+    pub members_row: Option<crate::state::cluster::MembersRow>,
+    /// The leader whose row differed from this row at the last check.
+    pub members_mismatch: Option<u64>,
+    /// The term and index of the last `SeedMembers` entry that compared the row.
+    pub members_checked: Option<(u64, u64)>,
 }
 
 impl std::ops::Deref for AppliedState {
@@ -65,6 +71,9 @@ impl AppliedState {
             quota_bytes: state.quota_bytes(),
             quota_mismatch: state.quota_mismatch(),
             quota_boundary: state.quota_boundary,
+            members_row: state.members_row.clone(),
+            members_mismatch: state.members_mismatch,
+            members_checked: state.members_checked,
         })
     }
 }
@@ -659,6 +668,7 @@ pub(super) async fn apply_entries(
                 .as_ref()
                 .map_or(entry.data.as_ref(), |change| change.context.as_ref()),
         )?;
+        state.before_entry(&command)?;
         if change.is_none() && super::quorum_put::kv_command(&command).is_some() {
             let mut commands = vec![(entry.index, command)];
             let mut term = entry.term;
@@ -799,6 +809,10 @@ pub(super) async fn apply_entries(
                 state.apply_set_quota(entry.index, request, *seed).await?;
                 Reply::Encoded(Value::Null)
             }
+            RaftCommand::SeedMembers(seed) => {
+                state.apply_seed_members(entry.index, seed).await?;
+                Reply::Encoded(Value::Null)
+            }
             RaftCommand::CompactStep { .. } => {
                 match state.apply_compaction_step(entry.index).await? {
                     Some(revision) => Reply::CompactFlush {
@@ -825,7 +839,7 @@ pub(super) async fn recover(
     state: &mut StateMachine,
     storage: &RaftStorage,
     header: Header,
-    created_empty: bool,
+    origin: super::quota::Guards,
 ) -> Result<()> {
     let mut physical = false;
     while state.applied < storage.commit_index() {
@@ -838,7 +852,7 @@ pub(super) async fn recover(
         )?;
         ensure!(!entries.is_empty(), "empty recovery batch");
         // A guarded member stops here and waits for a snapshot. See `node::quota`.
-        if super::quota::guard_replay(state, created_empty, &mut entries)? {
+        if super::quota::guard_replay(state, origin, &mut entries)? {
             break;
         }
         let replies = apply_entries(state, entries, header).await?;

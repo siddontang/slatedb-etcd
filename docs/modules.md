@@ -29,6 +29,8 @@ The CLI and embedded API share the same lifecycle and runtime paths.
 | `node/lease` | Schedule leader lease expiry from replicated generations |
 | `node/quota` | Keep the local quota flag record and propose the replicated cluster quota |
 | `state/quota` | Store the cluster quota row and select the quota that apply uses |
+| `node/cluster` | Propose the term-start entries, publish client URLs, and serve member requests |
+| `state/cluster` | Seed, change, and check the replicated membership row |
 | `state` | Open storage and own mutable applied metadata |
 | `state/kv` and `state/put_batch` | Commit MVCC changes and maintain quota accounting |
 | `state/read` | Pin data, revision, Auth, and Lease metadata together |
@@ -38,7 +40,7 @@ The CLI and embedded API share the same lifecycle and runtime paths.
 | `state/shared` | Claim the shared state, open, switch, adopt, and rebase checkpoint bases |
 | `node/shared` | Run the leader writer with its fence and clock checks, and the overlay limits |
 | `convert` | Convert a stopped replicated S3 cluster to shared state mode offline |
-| `state/auth`, `state/cluster`, and `state/lease` | Apply their replicated domain changes |
+| `state/auth` and `state/lease` | Apply their replicated domain changes |
 | `state/snapshot` and `state/backup` | Build, install, export, and restore complete state |
 | `state/maintenance` | Execute hashes, alarms, and physical storage work |
 | `state/diagnostic` | Execute the separate diagnostic keyspace API |

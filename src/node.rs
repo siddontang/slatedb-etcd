@@ -319,6 +319,15 @@ pub struct Node {
     hold_compact_steps: bool,
     /// The quota flag of this member and its `SetQuota` proposals.
     quota: quota::Quota,
+    /// The term and index of the first `SeedMembers` proposal of this member in its last term.
+    members_proposed: Option<(u64, u64)>,
+    /// The last term in which this member proposed its digest again. See `propose_members`.
+    members_rechecked: u64,
+    /// Simulation: the member proposes no `SeedMembers`, like an earlier binary.
+    #[cfg(test)]
+    pub(super) hold_members: bool,
+    /// The node compared the flags with the stored membership row.
+    members_observed: bool,
 }
 
 impl Node {
@@ -441,16 +450,13 @@ impl Node {
                     .protect(recovery.get_metadata().index, &descriptor.checkpoint);
             }
             state.install_snapshot(storage.recovery_snapshot()).await?;
+            // The bootstrap membership stays in memory. The seed of the first leader stores the
+            // row. See `state::cluster`.
             if state.members.members.is_empty() && !options.join {
-                let mut members = crate::cluster::Store::initial(&options.peers);
-                for (&id, address) in &options.client_peers {
-                    if let Some(member) = members.members.get_mut(&id) {
-                        member.client_ur_ls = vec![crate::cluster::url(address)];
-                    }
-                }
-                state.members = std::sync::Arc::new(members);
-                // Shared mode stores the bootstrap membership with the first applied entry.
-                state.members_unsaved = !state.is_shared();
+                state.members = std::sync::Arc::new(crate::cluster::Store::bootstrap(
+                    &options.peers,
+                    &options.client_peers,
+                ));
             }
             if options.require_peer_tls {
                 ensure!(
@@ -473,16 +479,17 @@ impl Node {
                             member: options.id,
                             term: storage.initial_state()?.hard_state.term,
                         },
-                        quota.created_empty(),
+                        quota.origin(),
                     )
                     .await?;
                     log::Cache::load(&storage, state.applied, options.log_memory)
                 }
                 loaded => loaded,
             };
-            if quota.created_empty() && state.cluster_quota().is_none() {
-                let (gate, scanned) = quota::scan_storage(&storage, state.applied)?;
-                quota.set_gate(gate, scanned);
+            let guards = quota::Guards::of(&state, quota.origin());
+            if guards.any() {
+                let (gate, scanned, open) = quota::scan_storage(&storage, state.applied, guards)?;
+                quota.set_scan(gate, scanned, open);
             }
             // A member that waits for a snapshot before its next entry does not hold its
             // backlog. Raft treats the committed log as applied, and the cache keeps it only
@@ -494,6 +501,16 @@ impl Node {
                     if error.is::<cache::PendingQuota>()
                         && quota.blocked() == Some(state.applied + 1) =>
                 {
+                    // Shared mode does not take this start. An in-process base adoption would
+                    // make the member a voter again while Raft counts the skipped entries above
+                    // the base as applied. A shared member truncates its log at each checkpoint,
+                    // so such a backlog needs a log of an earlier binary that the leader never
+                    // truncated.
+                    ensure!(
+                        !state.is_shared(),
+                        "a waiting shared member cannot skip a log backlog above the pending log \
+                         memory; raise the pending log memory for this start"
+                    );
                     raft_applied = storage.commit_index();
                     tracing::warn!(
                         applied = state.applied,
@@ -701,10 +718,43 @@ impl Node {
             renewals: lease::Renewals::default(),
             writer,
             quota,
+            members_proposed: None,
+            members_rechecked: 0,
+            #[cfg(test)]
+            hold_members: false,
+            members_observed: false,
         };
         node.sync_members();
         node.observe_quota()?;
+        node.observe_members();
         Ok(node)
+    }
+
+    /// Propose the entries that a leader puts first in its term: `SeedMembers`, then `SetQuota`.
+    /// A leader that waits for a snapshot proposes neither, and hands leadership over.
+    ///
+    /// The node calls this right after each Raft step and tick, before it takes other work. So
+    /// these entries follow the empty entry of a new leader, before every client write, cluster
+    /// command, and `Publish` of the term. See `state::cluster`.
+    fn propose_term_start(&mut self) -> Result<()> {
+        if !self.acts_as_leader() {
+            return Ok(());
+        }
+        self.propose_members()?;
+        self.propose_quota()
+    }
+
+    /// One logical tick. A leader that this tick elects proposes its term-start entries before
+    /// the `Publish` of this member.
+    fn tick(&mut self) -> Result<()> {
+        self.tick_raft()?;
+        self.retry_reads();
+        self.expire_leases()?;
+        self.publish_member()?;
+        self.tick_shared();
+        self.drive_auto_compaction(Instant::now())?;
+        self.check_quota_warning();
+        Ok(())
     }
 
     /// The shared-mode objects that the snapshot receive path opens.
@@ -762,15 +812,7 @@ impl Node {
                 _ = tokio::time::sleep_until(
                     self.compact_ready_at.unwrap_or_else(Instant::now).into()
                 ), if self.compact_ready_at.is_some() => { self.compact_ready_at = None; }
-                _ = ticks.tick() => {
-                    self.tick_raft()?;
-                    self.retry_reads();
-                    self.expire_leases()?;
-                    self.publish_member()?;
-                    self.tick_shared();
-                    self.drive_auto_compaction(Instant::now())?;
-                    self.check_quota_warning();
-                }
+                _ = ticks.tick() => self.tick()?,
                 persisted = self.log_worker.next() => { self.complete_log(persisted?)?; }
                 _ = self.compact_plan.changed() => {}
                 target = self.compaction.next(), if self.compaction.active() => {
@@ -1111,6 +1153,7 @@ impl Node {
                     quota_mismatch: self.state.quota_mismatch,
                     usage: self.state.usage,
                     warning_bytes: self.warning_bytes(),
+                    members_mismatch: self.state.members_mismatch.is_some(),
                     revision: self.state.revision,
                     compact: if self.state.compact_revision == 0 {
                         -1
@@ -1610,6 +1653,7 @@ impl Node {
         }
         status["quorum_reply_index"] = self.quorum_reply_index.into();
         status["quota"] = self.quota_status();
+        status["members_row"] = self.members_status();
         if let (Some(writer), Some((base, applied, bytes))) = (&self.writer, self.state.view) {
             let record = crate::state::transfer::ViewDescriptor::decode(
                 self.raw.store().recovery_snapshot().get_data(),
