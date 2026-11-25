@@ -194,6 +194,32 @@ async fn an_interrupted_backup_releases_its_checkpoint() {
 }
 
 #[tokio::test]
+async fn a_backup_stalled_in_an_object_read_ends_when_its_client_goes_away() {
+    use crate::object::faults::{FaultStore, DELAY_SST_GET};
+    let store = Arc::new(FaultStore::new(Arc::new(
+        slatedb::object_store::memory::InMemory::new(),
+    )));
+    let mut state = StateMachine::open_store(store.clone(), "stalled")
+        .await
+        .unwrap();
+    let value = "v".repeat(16 * 1024);
+    for index in 1..=50 {
+        put(&mut state, index, &format!("key-{index}"), &value).await;
+    }
+    state.db().flush().await.unwrap();
+    // Every SST read of the stream now waits, like a read that keeps retrying.
+    store.set_delay(Duration::from_secs(3600));
+    store.set(DELAY_SST_GET);
+    let mut stream = state.backup().await.unwrap();
+    let stalled = tokio::time::timeout(Duration::from_millis(500), stream.chunks.recv()).await;
+    assert!(stalled.is_err(), "the stream did not stall");
+    drop(stream);
+    released(&state).await;
+    store.set(0);
+    state.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_restore_reads_legacy_images_and_rejects_unordered_rows() {
     let dir = tempfile::tempdir().unwrap();
     let mut state = StateMachine::open(&dir.path().join("state")).await.unwrap();

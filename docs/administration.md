@@ -123,12 +123,15 @@ A restore holds the Raft directory lock while it writes, and a starting member t
 A restore that loses the lock, or finds the directory in use, leaves the directory unchanged.
 An interrupted restore leaves a `restore-incomplete` file, and startup rejects that directory.
 Remove the directory and restore again.
-With S3 state objects, the restore has also claimed the member namespace
-`<s3-prefix>/<SHA-256 of the cluster ID>/member-<id>/` and can have written objects there.
-The claim names the random owner in the removed directory, so a retry with the same settings
-fails with `S3 namespace belongs to another data directory`.
-Before the retry, delete every object under that member namespace, or restore all members with a
-new cluster ID or `--s3-prefix`.
+With S3 state objects, the restore can have claimed the member namespace
+`<s3-prefix>/<SHA-256 of the cluster ID>/member-<id>/` and written objects there.
+The claim in its `owner.json` names the random owner in the directory's `object-store.json`,
+so a retry with the same settings fails with `S3 namespace belongs to another data directory`.
+Before you remove the directory, compare the two files. Delete the objects under that member
+namespace only when they name the same owner. A different owner means that another data
+directory, possibly a running member, uses the namespace: the restore wrote nothing there.
+When they differ, or the directory is already gone, restore all members with a new cluster ID or
+`--s3-prefix`.
 In [shared state mode](shared-state.md) the member still builds the image of its pinned view
 in memory and sends it in the same messages. That image, with its padding and digest, is limited
 to 64 MiB. A larger one returns ResourceExhausted.

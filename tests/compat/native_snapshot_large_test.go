@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,7 +23,8 @@ import (
 	"go.uber.org/zap"
 )
 
-// processMemory returns the current and peak resident set size of a process in bytes.
+// processMemory returns the current and peak resident set size of a process in bytes. It reads
+// /proc, so callers check memory on Linux only.
 func processMemory(t *testing.T, pid int) (rss, peak int64) {
 	file, err := os.Open(fmt.Sprintf("/proc/%d/status", pid))
 	require.NoError(t, err)
@@ -102,16 +104,22 @@ func TestNativeSnapshotStreamsLargeState(t *testing.T) {
 	}
 
 	// Without other writes, the save adds a few response messages and checkpoint reads to RSS.
-	baseline, _ := processMemory(t, pid)
-	require.NoError(t, os.WriteFile(fmt.Sprintf("/proc/%d/clear_refs", pid), []byte("5"), 0))
+	linux := runtime.GOOS == "linux"
+	var baseline int64
+	if linux {
+		baseline, _ = processMemory(t, pid)
+		require.NoError(t, os.WriteFile(fmt.Sprintf("/proc/%d/clear_refs", pid), []byte("5"), 0))
+	}
 	file, elapsed := save("idle.snapshot")
-	_, peak := processMemory(t, pid)
 	info, err := os.Stat(file)
 	require.NoError(t, err)
-	t.Logf("saved %d MiB in %s: server RSS %d MiB before, peak %d MiB during the save",
-		info.Size()>>20, elapsed, baseline>>20, peak>>20)
+	t.Logf("saved %d MiB in %s", info.Size()>>20, elapsed)
 	require.Greater(t, info.Size(), int64(mib)<<20)
-	require.Less(t, peak-baseline, int64(64)<<20)
+	if linux {
+		_, peak := processMemory(t, pid)
+		t.Logf("server RSS %d MiB before, peak %d MiB during the save", baseline>>20, peak>>20)
+		require.Less(t, peak-baseline, int64(64)<<20)
+	}
 
 	// Writes continue during this save. The image holds the applied state at one boundary.
 	var revisions sync.Map
@@ -141,8 +149,10 @@ func TestNativeSnapshotStreamsLargeState(t *testing.T) {
 	restored := newClusterConfigured(t, 1, func(c *cluster) { c.readyTimeout = 10 * time.Minute },
 		"--restore-snapshot", file)
 	t.Logf("restored %d MiB and elected a leader in %s", info.Size()>>20, time.Since(started))
-	_, restorePeak := processMemory(t, restored.processes[1].Process.Pid)
-	t.Logf("restored member peak RSS %d MiB", restorePeak>>20)
+	if linux {
+		_, restorePeak := processMemory(t, restored.processes[1].Process.Pid)
+		t.Logf("restored member peak RSS %d MiB", restorePeak>>20)
+	}
 	check := client(t, restored.addresses)
 	result, err := check.Get(ctx, fmt.Sprintf("large/%06d", mib-1))
 	require.NoError(t, err)

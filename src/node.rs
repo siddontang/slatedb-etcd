@@ -46,6 +46,19 @@ pub use response::KvReply;
 
 #[cfg(test)]
 mod dst;
+
+/// Reject a data directory that holds an interrupted snapshot restore.
+fn ensure_no_restore_marker(dir: &std::path::Path) -> Result<()> {
+    ensure!(
+        !dir.join(crate::state::backup::RESTORE_MARKER).exists(),
+        "the data directory holds an interrupted snapshot restore; remove it and restore again. \
+         With S3, delete the member namespace first only if its owner.json matches the \
+         object-store.json of this directory; otherwise restore with a new cluster ID or \
+         --s3-prefix"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -325,14 +338,12 @@ impl Node {
                 "the overlay limit must be positive"
             );
         }
-        ensure!(
-            !options
-                .dir
-                .join(crate::state::backup::RESTORE_MARKER)
-                .exists(),
-            "the data directory holds an interrupted snapshot restore; remove it, and with S3 its member \
-             namespace, and restore again"
-        );
+        // Check before any change to the directory, and again under the lock below.
+        ensure_no_restore_marker(&options.dir)?;
+        #[cfg(test)]
+        if let Some(hook) = tests::BEFORE_RAFT_LOCK.with(|hook| hook.take()) {
+            hook(&options.dir);
+        }
         std::fs::create_dir_all(&options.dir)?;
         // Open Raft first. Its exclusive file lock also protects this node's SlateDB directory.
         let mut storage = RaftStorage::open_with_file_bytes(
@@ -346,6 +357,9 @@ impl Node {
             },
             options.log_file_bytes,
         )?;
+        // A restore creates its marker only under this lock, so a restore that started after
+        // the first check is visible now.
+        ensure_no_restore_marker(&options.dir)?;
         let shared = crate::state::shared::Options {
             quota: options.effective_quota().max(0) as u64,
             voters: options.peers.keys().copied().collect(),

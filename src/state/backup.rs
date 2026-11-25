@@ -125,28 +125,37 @@ impl StateMachine {
         };
         let (tx, rx) = mpsc::channel(CHUNKS_AHEAD);
         tokio::spawn(async move {
-            let result = async {
-                let checkpoint = handle.wait().await?.id;
-                // A client that stops reading blocks the stream, so refresh the checkpoint
-                // apart from it until the stream ends.
-                let result = tokio::select! {
-                    result = source.stream(checkpoint, &tx) => result,
-                    error = keep(&source.admin, checkpoint, lifetime) => Err(error),
-                };
-                // Like etcd, the backend snapshot duration counts completed streams only.
-                if result.is_ok() {
-                    timer.observe_duration();
-                } else {
-                    timer.stop_and_discard();
+            let checkpoint = match handle.wait().await {
+                Ok(checkpoint) => checkpoint.id,
+                Err(error) => {
+                    let _ = tx.send(Err(error.into())).await;
+                    return;
                 }
-                if let Err(error) = source.admin.delete_checkpoint(checkpoint).await {
-                    tracing::warn!(%error, "cannot delete a backup checkpoint");
-                }
-                result
+            };
+            // A client that stops reading blocks the stream, so refresh the checkpoint apart
+            // from it until the stream ends. A client that goes away ends the stream, even
+            // while an object read retries.
+            let result = tokio::select! {
+                result = source.stream(checkpoint, &tx) => result,
+                error = keep(&source.admin, checkpoint, lifetime) => Err(error),
+                () = tx.closed() => Err(anyhow::anyhow!("the snapshot client went away")),
+            };
+            // Like etcd, the backend snapshot duration counts completed streams only.
+            if result.is_ok() {
+                timer.observe_duration();
+            } else {
+                timer.stop_and_discard();
             }
-            .await;
             if let Err(error) = result {
                 let _ = tx.send(Err(error)).await;
+            }
+            // End the response before the cleanup. The checkpoint expires by itself after
+            // `lifetime`, so the deletion stops retrying then.
+            drop(tx);
+            match tokio::time::timeout(lifetime, source.admin.delete_checkpoint(checkpoint)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "cannot delete a backup checkpoint"),
+                Err(_) => tracing::warn!("timed out deleting a backup checkpoint"),
             }
         });
         Ok(Stream {
@@ -224,7 +233,6 @@ impl Source {
         let mut size = encoded_size(&header)? + encoded_size(&0_u64)?;
         let mut scan = rows_of(reader).await?;
         while let Some(row) = scan.next().await? {
-            ensure!(!tx.is_closed(), "the snapshot client went away");
             if !omitted(&row.key) {
                 rows += 1;
                 size += row_size(&row.key, &row.value)?;
