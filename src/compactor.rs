@@ -35,13 +35,16 @@ const RETRY_DIVISOR: u32 = 10;
 const HOUR: Duration = Duration::from_secs(3600);
 
 impl Retention {
-    /// Parse the etcd flag pair. Zero retention disables automatic compaction.
+    /// Parse the etcd flag pair. Zero or empty retention disables automatic compaction.
     ///
     /// An integer means hours in periodic mode and a revision count in revision mode. Another
     /// value is a Go duration, such as `30m` or `1.5h`. Revision mode then uses its nanosecond
-    /// count, as etcd does.
+    /// count, as etcd does. Like etcd, this does not trim spaces.
     pub fn parse(mode: Mode, retention: &str) -> Result<Option<Self>> {
-        let retention = retention.trim();
+        // etcd reads an empty retention as "0".
+        if retention.is_empty() {
+            return Ok(None);
+        }
         let parsed = match retention.parse::<u64>() {
             Ok(count) => match mode {
                 Mode::Periodic => Self::Periodic(
@@ -349,9 +352,12 @@ mod tests {
             p(Mode::Revision, "1us").unwrap(),
             Some(Retention::Revision(1000))
         );
-        for bad in ["", "-1", "-1h", "1x", "h", "1h-1m", "abc"] {
+        for bad in ["-1", "-1h", "1x", "h", "1h-1m", "abc", " 1s ", " 1"] {
             assert!(p(Mode::Periodic, bad).is_err(), "{bad:?}");
         }
+        // etcd reads an empty retention as zero in both modes.
+        assert_eq!(p(Mode::Periodic, "").unwrap(), None);
+        assert_eq!(p(Mode::Revision, "").unwrap(), None);
     }
 
     /// Go's `time.ParseDuration` truncates each component to whole nanoseconds and accepts any

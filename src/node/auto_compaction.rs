@@ -99,9 +99,15 @@ impl Node {
         )
     }
 
+    /// The warning threshold of the enforced quota. Shared mode takes the quota from the
+    /// cluster claim, which can differ from the local flag.
+    pub(super) fn warning_bytes(&self) -> Option<u64> {
+        super::warning_bytes(self.quota, self.options.quota_warning_fraction)
+    }
+
     /// Log once when quota usage reaches the warning threshold, and once when it falls back.
     pub(super) fn check_quota_warning(&mut self) {
-        let Some(threshold) = self.options.warning_bytes() else {
+        let Some(threshold) = self.warning_bytes() else {
             return;
         };
         let usage = self.state.usage;
@@ -112,7 +118,7 @@ impl Node {
                 node = self.options.id,
                 used,
                 threshold,
-                quota = self.options.effective_quota(),
+                quota = self.quota,
                 current = usage.current,
                 history = usage.history,
                 watch_journal = usage.journal,

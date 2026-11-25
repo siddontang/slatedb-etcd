@@ -56,6 +56,8 @@ func TestAutoCompactionFlagsMatchEtcd(t *testing.T) {
 		{"periodic", "abc"},
 		{"periodic", "1x"},
 		{"periodic", "h"},
+		{"periodic", ""},
+		{"periodic", " 1s "},
 		{"revision", "0"},
 		{"revision", "1000"},
 		{"revision", "1us"},

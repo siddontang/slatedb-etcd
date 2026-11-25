@@ -2124,22 +2124,60 @@ async fn a_snapshot_that_raft_skips_releases_its_staging_reservation() {
 /// gauge and the log both compare usage with it.
 #[test]
 fn quota_warning_threshold_rounds_up() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut options = options(dir.path());
-    options.quota_bytes = 1001;
-    options.quota_warning_fraction = 0.8;
     // 1001 * 0.8 is 800.8, so 800 bytes is below the threshold and 801 reaches it.
-    let threshold = options.warning_bytes().unwrap();
-    assert_eq!(threshold, 801);
-    assert!(800 < threshold && 801 >= threshold);
+    assert_eq!(warning_bytes(1001, 0.8), Some(801));
     // A positive threshold below one byte still warns.
-    options.quota_warning_fraction = 1e-9;
-    assert_eq!(options.warning_bytes(), Some(1));
-    options.quota_warning_fraction = 1.0;
-    assert_eq!(options.warning_bytes(), Some(1001));
-    options.quota_warning_fraction = 0.0;
-    assert_eq!(options.warning_bytes(), None);
-    options.quota_warning_fraction = 0.5;
-    options.quota_bytes = -1;
-    assert_eq!(options.warning_bytes(), None);
+    assert_eq!(warning_bytes(1001, 1e-9), Some(1));
+    assert_eq!(warning_bytes(1001, 1.0), Some(1001));
+    assert_eq!(warning_bytes(1001, 0.0), None);
+    // Zero disables the quota, and so the warning.
+    assert_eq!(warning_bytes(0, 0.5), None);
+}
+
+/// `Node::open` applies the flag rules to a directly built retention: zero disables automatic
+/// compaction, and a negative revision count fails before storage is created.
+#[tokio::test]
+async fn node_open_validates_the_auto_compaction_retention() {
+    use crate::compactor::Retention;
+    let dir = tempfile::tempdir().unwrap();
+    let negative = dir.path().join("negative");
+    let mut config = options(&negative);
+    config.auto_compaction = Some(Retention::Revision(-1));
+    let (events, _receiver) = mpsc::channel(256);
+    assert!(Node::open(config, events).await.is_err());
+    assert!(!negative.exists());
+    for (name, retention) in [
+        ("revision", Retention::Revision(0)),
+        ("periodic", Retention::Periodic(Duration::ZERO)),
+    ] {
+        let mut config = options(&dir.path().join(name));
+        config.auto_compaction = Some(retention);
+        let (events, _receiver) = mpsc::channel(256);
+        let node = Node::open(config, events).await.unwrap();
+        assert!(node.auto_compaction.is_none(), "{name}");
+    }
+}
+
+/// A shared member warns at the fraction of the claimed cluster quota, not of its local flag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_quota_warning_uses_the_claimed_quota() {
+    let store: std::sync::Arc<dyn slatedb::object_store::ObjectStore> =
+        std::sync::Arc::new(slatedb::object_store::memory::InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let mut nodes = vec![];
+    for (id, quota) in [(1, 10_240), (2, 0)] {
+        let mut config = options(&dir.path().join(id.to_string()));
+        config.id = id;
+        config.state_mode = crate::state::StateMode::Shared;
+        config.object_store = crate::object::Config::Test(store.clone(), "root".into());
+        config.quota_bytes = quota;
+        config.quota_warning_fraction = 0.8;
+        let (events, receiver) = mpsc::channel(256);
+        let node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(node.quota, 10_240, "member {id}");
+        assert_eq!(node.warning_bytes(), Some(8_192), "member {id}");
+        nodes.push((node, receiver));
+    }
 }
