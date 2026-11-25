@@ -251,6 +251,9 @@ pub(crate) struct Source {
     /// Bases of received snapshots, with their receive time. Install takes the base. Raft can
     /// also drop a snapshot, so a receipt expires after `RECEIPT_LIFETIME`.
     received: Mutex<std::collections::HashMap<uuid::Uuid, (std::time::Instant, Arc<Base>)>>,
+    /// DST: every open fails, as for a checkpoint that cannot open.
+    #[cfg(test)]
+    pub(crate) fail_opens: std::sync::atomic::AtomicBool,
 }
 
 /// The checkpoints that this member uses, and the ones that retention deletes.
@@ -328,6 +331,11 @@ impl Source {
     }
 
     pub async fn open_base(&self, id: uuid::Uuid) -> Result<Arc<Base>> {
+        #[cfg(test)]
+        ensure!(
+            !self.fail_opens.load(std::sync::atomic::Ordering::Relaxed),
+            "an injected open failure"
+        );
         let opening = self.reserve_open(id)?;
         let base = Base::open(self.store.clone(), &self.state(), id, self.cache.clone()).await?;
         let base = Arc::new(base);
@@ -768,6 +776,8 @@ pub(crate) fn offline_source(
         cache: cache.build(),
         pins: Mutex::default(),
         received: Mutex::default(),
+        #[cfg(test)]
+        fail_opens: Default::default(),
     }))
 }
 
@@ -1556,6 +1566,8 @@ impl StateMachine {
             cache: cache.build(),
             pins: Mutex::default(),
             received: Mutex::default(),
+            #[cfg(test)]
+            fail_opens: Default::default(),
         });
         ensure!(
             state_root == source.state(),

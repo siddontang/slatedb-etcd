@@ -44,11 +44,17 @@ impl Node {
                 writer.exact_through = 0;
             }
         }
+        // A member does not lead before its install. See `tick_raft`. If it did, the install
+        // would raise the base, and the state below the record could serve nothing.
+        if self.installing() {
+            return Ok(());
+        }
+        let record = self.raw.store().snapshot_index();
         let extend = self.extension_allowed();
         let wanted = self.raw.store().wanted_index();
         // A base below the record cannot replace the record, so the record index is a demand.
         let record = match self.base_below_record() {
-            true => self.raw.store().snapshot_index(),
+            true => record,
             false => 0,
         };
         let Some(writer) = &mut self.writer else {
@@ -66,6 +72,10 @@ impl Node {
             writer.certified = None;
             return Ok(());
         }
+        // A leader with no base checkpoint, such as one that applied the log from its start,
+        // gets one from its writer at open: the writer publishes a first checkpoint when it has
+        // writes above the newest one, and otherwise announces the newest one if this member
+        // did not apply its announcement. The demand is served after that base switch.
         let Some(base) = *writer.applied.base_id.borrow() else {
             return Ok(());
         };

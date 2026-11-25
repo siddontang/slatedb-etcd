@@ -137,6 +137,20 @@ impl Node {
         Ok(())
     }
 
+    /// Keep the election timer past the leader lease, so the member still votes, but below the
+    /// largest randomized timeout, so it does not campaign. See `tick_raft`.
+    pub(super) fn hold_campaign(&mut self) {
+        let raft = &mut self.raw.raft;
+        let timeout = 2 * raft.election_timeout() - 1;
+        raft.set_randomized_election_timeout(timeout);
+        raft.election_elapsed = raft.election_elapsed.min(timeout - 2);
+    }
+
+    /// Return true while Raft stored a snapshot that apply did not install yet.
+    pub(super) fn installing(&self) -> bool {
+        self.raw.store().snapshot_index() > self.state.applied
+    }
+
     pub(super) fn schedule_apply(&mut self) -> Result<()> {
         if self.apply_busy {
             return self.pipeline_apply();

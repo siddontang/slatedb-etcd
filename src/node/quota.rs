@@ -641,17 +641,18 @@ impl Node {
     pub(super) fn tick_raft(&mut self) -> Result<()> {
         if self.quota.blocked().is_some() {
             self.quota.silent += 1;
-            let raft = &mut self.raw.raft;
-            if self.quota.silent < 3 * raft.election_timeout() {
-                // Keep the timer past the leader lease, so the member still votes, but below
-                // the largest randomized timeout, so it does not campaign.
-                let timeout = 2 * raft.election_timeout() - 1;
-                raft.set_randomized_election_timeout(timeout);
-                raft.election_elapsed = raft.election_elapsed.min(timeout - 2);
+            if self.quota.silent < 3 * self.raw.raft.election_timeout() {
+                self.hold_campaign();
             }
             self.request_quota_snapshot();
         } else {
             self.quota.silent = 0;
+        }
+        // Between a stored snapshot and its install, Raft scans the unapplied entries from its
+        // applied index at a campaign. The log starts above that index, so the scan fails and
+        // Raft stops the process. The install is local, so the member waits for it.
+        if self.installing() {
+            self.hold_campaign();
         }
         self.raw.tick();
         self.propose_term_start()
@@ -660,7 +661,9 @@ impl Node {
     /// Step a peer message. A member that waits for a snapshot ignores a leadership transfer.
     /// A new leader proposes the cluster quota before the next client write.
     pub(super) fn step_peer(&mut self, message: Message) -> raft::Result<()> {
-        if message.get_msg_type() == MessageType::MsgTimeoutNow && self.quota.blocked().is_some() {
+        if message.get_msg_type() == MessageType::MsgTimeoutNow
+            && (self.quota.blocked().is_some() || self.installing())
+        {
             tracing::info!(
                 from = message.from,
                 "ignore a leadership transfer before a snapshot"

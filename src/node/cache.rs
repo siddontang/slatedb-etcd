@@ -523,18 +523,19 @@ impl Cache {
     }
     /// Return true when the durable snapshot holds an image that this member can send.
     ///
-    /// A view record that names another checkpoint than the base is not sendable, at any index.
+    /// A view record is sendable only while it names the checkpoint of the base, at any index.
     /// Only a live base pins its checkpoint, so retention can delete the checkpoint of the record
     /// after a base switch, and a restart or a rebase can use another checkpoint for that
-    /// reason. A received record can also be above the base. The owner records the base once
+    /// reason. A member with no base checkpoint yet, such as a new member before its install,
+    /// pins none. A received record can also be above the base. The owner records the base once
     /// the base index reaches the record. See `Node::certify_base`.
     pub fn has_image(&self) -> bool {
         let data = &self.durable.snapshot.data;
-        let stale = match (
-            crate::state::transfer::ViewDescriptor::decode(data),
-            self.base.get(),
-        ) {
-            (Ok(Some(view)), Some((checkpoint, _))) => view.checkpoint().ok() != Some(checkpoint),
+        let stale = match crate::state::transfer::ViewDescriptor::decode(data) {
+            Ok(Some(view)) => self
+                .base
+                .get()
+                .is_none_or(|(checkpoint, _)| view.checkpoint().ok() != Some(checkpoint)),
             _ => false,
         };
         crate::state::transfer::sendable(data, self.member) && !stale
@@ -839,11 +840,13 @@ mod tests {
         cache.stage(&[entry(9, 1)], None, None).unwrap();
         assert!(cache.snapshot(34, 2).is_err());
         assert_eq!(cache.wanted_index(), 8);
-        // The record at 8 ends the demand. The retry then gets it.
-        let data = crate::state::transfer::ViewDescriptor::new(uuid::Uuid::new_v4())
+        // The record at 8 of the base ends the demand. The retry then gets it.
+        let id = uuid::Uuid::new_v4();
+        let data = crate::state::transfer::ViewDescriptor::new(id)
             .encode()
             .unwrap();
         storage.checkpoint(8, data).unwrap();
+        cache.note_base(Some((id, 8)));
         cache
             .complete(log::Durable::read(&storage).unwrap())
             .unwrap();
@@ -874,13 +877,20 @@ mod tests {
     fn a_record_above_its_row_needs_a_capable_process() {
         let (_dir, mut storage, mut cache) = stored();
         cache.applied_to(8);
-        let data = crate::state::transfer::ViewDescriptor::above_row(uuid::Uuid::new_v4(), 3)
+        let id = uuid::Uuid::new_v4();
+        let data = crate::state::transfer::ViewDescriptor::above_row(id, 3)
             .encode()
             .unwrap();
         storage.checkpoint(6, data).unwrap();
         cache
             .complete(log::Durable::read(&storage).unwrap())
             .unwrap();
+        // Before a matching base opens, the record pins nothing, so it is not sendable.
+        assert!(!cache.has_image());
+        cache.note_base(Some((uuid::Uuid::new_v4(), 6)));
+        assert!(!cache.has_image());
+        cache.note_base(Some((id, 6)));
+        assert!(cache.has_image());
         assert!(cache.snapshot(6, 2).is_err());
         assert!(cache.exact_wanted());
         cache.note_process(2, Some(7));

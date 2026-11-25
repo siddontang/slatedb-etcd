@@ -1573,3 +1573,164 @@ async fn a_failed_raise_is_served_by_a_demand_at_the_record() {
 async fn a_failed_raise_beside_an_earlier_binary_is_served_at_a_row() {
     a_failed_raise(true).await;
 }
+
+/// Architecture: a follower stores a received record above its applied index, and a leadership
+/// transfer or an election timeout comes before its install job runs. Raft would scan the
+/// unapplied entries from its applied index, below the start of its log, and stop the process.
+/// The member does not campaign before its install, but it still votes. After the install it
+/// leads, and certifies or announces nothing above its applied index.
+#[tokio::test]
+async fn a_member_does_not_lead_before_its_install() {
+    let mut sim = Simulation::with_mode(89, true).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(10).await;
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(20).await;
+    let leader = sim.leader().unwrap();
+    let member = sim.follower(0);
+    sim.paused_apply = Some(member);
+    sim.paused_reads = Some(member);
+    sim.write(2).await;
+    sim.settle(4).await;
+    let node = sim.nodes.get_mut(&member).unwrap();
+    node.raw.request_snapshot().unwrap();
+    for round in 0..30 {
+        sim.settle(1).await;
+        if round % 5 == 4 {
+            sim.publish_view(&mut writers).await;
+        }
+        if sim.nodes[&member].raw.raft.pending_request_snapshot == 0 {
+            break;
+        }
+    }
+    let node = &sim.nodes[&member];
+    let record = Record::of(node.raw.store().recovery_snapshot());
+    let record = record.unwrap().unwrap();
+    assert!(node.state.applied < record.index);
+    // Transfers are ignored, and election timeouts start no campaign.
+    for _ in 0..40 {
+        let node = sim.nodes.get_mut(&leader).unwrap();
+        node.raw.transfer_leader(member);
+        for _ in 0..30 {
+            sim.deliver(false).await;
+        }
+        for id in 1..=3 {
+            sim.tick(id).await;
+        }
+    }
+    assert_eq!(sim.leader(), Some(leader));
+    // The leader goes silent. The member votes for the other member, but does not campaign.
+    if let Some(mut writer) = writers.remove(&leader) {
+        writer.close().await;
+    }
+    let other = sim.follower(member);
+    sim.isolated = Some(leader);
+    for _ in 0..60 {
+        for id in 1..=3 {
+            sim.tick(id).await;
+        }
+        for _ in 0..30 {
+            sim.deliver(false).await;
+        }
+    }
+    assert_eq!(sim.nodes[&other].raw.raft.state, StateRole::Leader);
+    assert_ne!(sim.nodes[&member].raw.raft.state, StateRole::Leader);
+    sim.isolated = None;
+    // The install raises the base, and the member then leads.
+    sim.paused_apply = None;
+    sim.paused_reads = None;
+    sim.settle(10).await;
+    assert!(sim.base(member).0 >= record.index);
+    sim.lead(member).await;
+    sim.settle(10).await;
+    let announced = sim.announcements();
+    let applied = sim.nodes[&member].state.applied;
+    assert!(announced.iter().all(|(_, _, covers)| *covers <= applied));
+    sim.assert_records_open().await;
+}
+
+/// Sig-Codex and Architecture: a new member applies the log from index 1, and no announced
+/// checkpoint opens there, so its base stays empty. It asks for a snapshot at its applied index,
+/// and the raise to the received checkpoint fails too. Retention deletes that checkpoint, and
+/// the member leads. (1) While its base is empty, a lagging member gets nothing. (2) The new
+/// writer announces the newest checkpoint at its open, as a writer does with no client write.
+/// The record index is then a demand above that base, so the leader publishes, and the lagging
+/// member gets a record of the base.
+#[tokio::test]
+async fn an_empty_base_sends_a_record_only_after_its_first_base() {
+    let mut sim = Simulation::with_mode(89, true).await;
+    for node in sim.nodes.values_mut() {
+        node.options.snapshot_every = 0;
+        node.next_checkpoint = None;
+    }
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(10).await;
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(20).await;
+    let leader = sim.leader().unwrap();
+    let joining = sim.follower(0);
+    let other = sim.follower(joining);
+    sim.joining = Some(joining);
+    sim.replace(joining, 0).await;
+    let source = sim.nodes[&joining].shared_source().unwrap();
+    source
+        .fail_opens
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    sim.settle(20).await;
+    let node = &sim.nodes[&joining];
+    assert_eq!(node.state.applied, sim.nodes[&leader].state.applied);
+    assert_eq!(sim.base(joining).1, None);
+    source
+        .fail_opens
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    sim.write(2).await;
+    sim.settle(4).await;
+    let node = sim.nodes.get_mut(&joining).unwrap();
+    node.writer.as_mut().unwrap().skip_raise = true;
+    let record = sim.record_at_applied(joining).await;
+    let admin = sim.nodes[&leader].writer.as_ref().unwrap().admin.clone();
+    admin.delete_checkpoint(record.checkpoint).await.unwrap();
+    sim.settle(10).await;
+    assert_eq!(sim.base(joining).1, None);
+    assert!(!sim.nodes[&joining].raw.store().has_image());
+    if let Some(mut writer) = writers.remove(&leader) {
+        writer.close().await;
+    }
+    sim.lead(joining).await;
+    let delivered = sim.delivered_views.len();
+    let node = sim.nodes.get_mut(&other).unwrap();
+    node.raw.request_snapshot().unwrap();
+    sim.settle(20).await;
+    // (1) The base is empty, so nothing goes out.
+    assert_eq!(sim.leader(), Some(joining));
+    assert_eq!(sim.base(joining).1, None);
+    assert_eq!(sim.delivered_views.len(), delivered);
+    // (2) The writer opens, as at a new lead, and publishes only on request after that.
+    sim.publish_view(&mut writers).await;
+    for _ in 0..40 {
+        sim.settle(1).await;
+        let writer = sim.nodes[&joining].writer.as_ref().unwrap();
+        if writer.take_publish_through().is_some() {
+            sim.publish_view(&mut writers).await;
+        }
+    }
+    assert_eq!(sim.nodes[&other].raw.raft.pending_request_snapshot, 0);
+    let views = &sim.delivered_views[delivered..];
+    assert!(
+        !views.is_empty() && !views.contains(&record.checkpoint),
+        "{views:?}"
+    );
+    let (index, base, _) = sim.base(joining);
+    assert!(index >= record.index);
+    let kept = Record::of(sim.nodes[&joining].raw.store().recovery_snapshot());
+    assert_eq!(kept.unwrap().map(|record| record.checkpoint), base);
+    assert_eq!(
+        sim.nodes[&other].state.applied,
+        sim.nodes[&joining].state.applied
+    );
+    sim.assert_records_open().await;
+}
