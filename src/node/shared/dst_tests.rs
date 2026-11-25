@@ -4,6 +4,53 @@
 use super::*;
 
 impl Simulation {
+    /// The process ID that member `id` sends with its traffic. An earlier binary sends none.
+    pub(super) fn process(&self, id: u64) -> Option<u64> {
+        match self.old.contains(&id) {
+            true => None,
+            false => self.processes.get(&id).copied(),
+        }
+    }
+
+    /// Member `id` sends its `ViewAck` to the leader, as the peer stream does. DST has no peer
+    /// stream, so each tick of a follower delivers one.
+    pub(super) fn report_view(&mut self, id: u64) {
+        if self.shared.is_none() || Some(id) == self.isolated {
+            return;
+        }
+        let Some(leader) = self.leader() else {
+            return;
+        };
+        if leader == id || !self.nodes.contains_key(&id) {
+            return;
+        }
+        let pins = self.nodes[&id].dst_pins();
+        let coverage = self.process(id);
+        self.nodes
+            .get_mut(&leader)
+            .unwrap()
+            .view_ack(id, pins, None, coverage);
+    }
+
+    /// An earlier binary installs a view snapshot only when the checkpoint row equals the
+    /// snapshot index. Check every view snapshot that such a member receives.
+    pub(super) async fn check_old_install(&mut self, message: &Message) {
+        let snapshot = message.get_snapshot();
+        let Ok(Some(view)) = crate::state::transfer::ViewDescriptor::decode(snapshot.get_data())
+        else {
+            return;
+        };
+        let source = self.nodes[&message.from].shared_source().unwrap();
+        let base = source.open_base(view.checkpoint().unwrap()).await.unwrap();
+        assert_eq!(
+            base.applied,
+            snapshot.get_metadata().index,
+            "seed {}: an earlier binary got a view snapshot above its row",
+            self.seed
+        );
+        self.old_installs += 1;
+    }
+
     /// Shared mode: compare the loaded fields of each member with the first member seen at its
     /// index. A member that opens or installs a base above its row must equal one that applied.
     pub(super) fn check_loaded(&mut self) {
@@ -339,8 +386,9 @@ async fn a_follower_manual_checkpoint_completes_with_a_certified_base() {
     assert!(rx.try_recv().is_err());
     // DST has no peer stream, so the test delivers the follower's report.
     let pins = sim.nodes[&grouped].dst_pins();
+    let coverage = sim.process(grouped);
     let node = sim.nodes.get_mut(&leader).unwrap();
-    node.view_ack(grouped, pins, Some(index));
+    node.view_ack(grouped, pins, Some(index), coverage);
     sim.settle(4).await;
     sim.finish_checkpoints(grouped);
     assert!(rx.try_recv().unwrap().is_ok());
@@ -708,4 +756,142 @@ async fn a_requester_of_an_earlier_term_takes_a_snapshot_below_its_request() {
 #[tokio::test]
 async fn a_replicated_requester_of_an_earlier_term_recovers() {
     stale_request(false, false).await;
+}
+
+/// Rolling upgrade: member `old` runs an earlier binary. It installs a view snapshot only at its
+/// checkpoint row, and it does not advertise the coverage capability. The leader then never
+/// certifies above a row, and every snapshot of the old member is at its row. After the member
+/// runs this binary and reports, announcements cover the no-op entries again.
+#[tokio::test]
+async fn a_leader_with_an_earlier_binary_follower_announces_at_the_row() {
+    let mut sim = Simulation::with_mode(43, true).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    let leader = sim.leader().unwrap();
+    let old = sim.follower(0);
+    sim.old.insert(old);
+    sim.settle(2).await;
+    assert!(!sim.nodes[&leader].extension_allowed());
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(4).await;
+    // The old member falls behind the truncated log.
+    sim.stop(old);
+    for _ in 0..3 {
+        sim.write(4).await;
+        sim.propose_noop().await;
+        sim.publish_view(&mut writers).await;
+        sim.settle(4).await;
+    }
+    // Each announcement covers exactly its checkpoint row.
+    let source = sim.nodes[&leader].shared_source().unwrap();
+    for (index, checkpoint, covers) in sim.announcements() {
+        let row = source.open_base(checkpoint).await.unwrap().applied;
+        assert_eq!(covers, row, "the announcement at {index}");
+    }
+    let record = sim.nodes[&leader].raw.store().recovery_snapshot().clone();
+    let record = Record::of(&record).unwrap().unwrap();
+    assert_eq!(record.row, None, "the leader recorded {record:?}");
+    sim.start(old).await;
+    sim.settle(20).await;
+    assert!(sim.old_installs > 0);
+    assert_eq!(
+        sim.nodes[&old].state.applied,
+        sim.nodes[&leader].state.applied
+    );
+    // The member upgrades: its next process reports the capability.
+    sim.old.remove(&old);
+    sim.stop(old);
+    sim.start(old).await;
+    sim.settle(2).await;
+    assert!(sim.nodes[&leader].extension_allowed());
+    sim.write(1).await;
+    for step in [WriterStep::Materialize, WriterStep::Checkpoint] {
+        sim.writer_step(&mut writers, leader, step).await;
+    }
+    sim.propose_noop().await;
+    sim.settle(1).await;
+    sim.writer_step(&mut writers, leader, WriterStep::Announce)
+        .await;
+    sim.settle(4).await;
+    let (_, _, covers) = *sim.announcements().last().unwrap();
+    let (base, checkpoint, _) = sim.base(leader);
+    let source = sim.nodes[&leader].shared_source().unwrap();
+    let row = source.open_base(checkpoint.unwrap()).await.unwrap().applied;
+    assert!(
+        covers > row && base > row,
+        "covers {covers}, base {base}, row {row}"
+    );
+}
+
+/// The leader recorded its base above the row while every member advertised the capability.
+/// Then a member is replaced by an earlier binary with the same ID, in the same term, or after
+/// the leader restarts. Its first frame names no process, so it loses the capability. The leader
+/// does not send the record above the row. It stores the apply marker at its applied index,
+/// publishes a checkpoint with its row there, and sends that one.
+async fn replaced_by_an_earlier_binary(restart_leader: bool) {
+    let mut sim = Simulation::with_mode(47, true).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(10).await;
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(10).await;
+    let leader = sim.leader().unwrap();
+    let requester = sim.follower(0);
+    sim.nodes
+        .get_mut(&requester)
+        .unwrap()
+        .raw
+        .request_snapshot()
+        .unwrap();
+    sim.settle(20).await;
+    let record = sim.nodes[&leader].raw.store().recovery_snapshot().clone();
+    let record = Record::of(&record).unwrap().unwrap();
+    assert!(
+        record.row.is_some_and(|row| row < record.index),
+        "{record:?}"
+    );
+    let term = sim.nodes[&leader].raw.raft.term;
+    let mut leader = leader;
+    if restart_leader {
+        if let Some(mut writer) = writers.remove(&leader) {
+            writer.close().await;
+        }
+        sim.stop(leader);
+        sim.start(leader).await;
+        sim.settle(30).await;
+        leader = sim.leader().unwrap();
+        let record = sim.nodes[&leader].raw.store().recovery_snapshot().clone();
+        let record = Record::of(&record).unwrap().unwrap();
+        assert!(record.row.is_some_and(|row| row < record.index));
+    }
+    let replaced = sim.follower(0);
+    let installs = sim.old_installs;
+    sim.old.insert(replaced);
+    sim.replace(replaced, 0).await;
+    sim.settle(10).await;
+    assert_eq!(sim.old_installs, installs);
+    assert!(sim.nodes[&leader].raw.store().exact_wanted());
+    sim.publish_view(&mut writers).await;
+    sim.settle(30).await;
+    if !restart_leader {
+        assert_eq!(sim.nodes[&leader].raw.raft.term, term);
+    }
+    assert!(sim.old_installs > installs);
+    assert_eq!(
+        sim.nodes[&replaced].state.applied,
+        sim.nodes[&leader].state.applied
+    );
+    sim.assert_acknowledged(replaced).await;
+}
+
+#[tokio::test]
+async fn a_member_replaced_by_an_earlier_binary_gets_a_snapshot_at_its_row() {
+    replaced_by_an_earlier_binary(false).await;
+}
+
+#[tokio::test]
+async fn a_restarted_leader_sends_an_earlier_binary_a_snapshot_at_its_row() {
+    replaced_by_an_earlier_binary(true).await;
 }

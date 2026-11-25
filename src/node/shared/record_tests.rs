@@ -131,6 +131,7 @@ async fn a_restart_opens_the_record_checkpoint_above_its_row() {
         checkpoint: x,
         index: 2,
         term: 1,
+        row: None,
     };
     let upgraded = open(Some(at_row)).await.unwrap();
     assert_eq!((upgraded.applied, upgraded.base_checkpoint()), (2, Some(y)));

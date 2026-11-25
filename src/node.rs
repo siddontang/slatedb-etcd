@@ -105,6 +105,14 @@ pub enum Event {
         checkpoints: std::collections::HashSet<uuid::Uuid>,
         /// A manual checkpoint on the member asks for a publication through this index.
         publish: Option<u64>,
+        /// The process of a member that installs a base above its checkpoint row.
+        coverage: Option<u64>,
+    },
+    /// The first peer frame of a stream or request came from this process of `member`. An
+    /// earlier binary sends no process.
+    PeerProcess {
+        member: u64,
+        process: Option<u64>,
     },
 }
 
@@ -1208,7 +1216,11 @@ impl Node {
                 member,
                 checkpoints,
                 publish,
-            } => self.view_ack(member, checkpoints, publish),
+                coverage,
+            } => self.view_ack(member, checkpoints, publish, coverage),
+            Event::PeerProcess { member, process } => {
+                self.raw.store().note_process(member, process);
+            }
             Event::SnapshotDelay(delay_ms, response) => {
                 self.snapshot_delay_ms = delay_ms.min(5000);
                 let _ = response.send(Ok(self.status()?));

@@ -46,10 +46,16 @@ pub(crate) const VIEW_SNAPSHOT_FORMAT: u32 = 6;
 
 /// The Raft snapshot data of format 6. The snapshot metadata holds the index, term, and
 /// ConfState from the checkpoint.
+///
+/// A record above the checkpoint row also holds that row `F` after the encoded fields. Earlier
+/// binaries ignore the trailing bytes, and they never get such a record. See `node::shared`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ViewDescriptor {
     pub version: u32,
     pub checkpoint: String,
+    /// The checkpoint row, when the record index is above it. `None` means the record index.
+    #[serde(skip)]
+    pub row: Option<u64>,
 }
 
 impl ViewDescriptor {
@@ -57,11 +63,24 @@ impl ViewDescriptor {
         Self {
             version: VIEW_SNAPSHOT_FORMAT,
             checkpoint: checkpoint.to_string(),
+            row: None,
+        }
+    }
+
+    /// A record of `checkpoint` at an index above its row `row`.
+    pub fn above_row(checkpoint: uuid::Uuid, row: u64) -> Self {
+        Self {
+            row: Some(row),
+            ..Self::new(checkpoint)
         }
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
-        Ok(crate::codec::encode(self)?)
+        let mut data = crate::codec::encode(self)?;
+        if let Some(row) = self.row {
+            data.extend(crate::codec::encode(&row)?);
+        }
+        Ok(data)
     }
 
     /// Decode format 6 data. Other formats return `None`.
@@ -69,7 +88,12 @@ impl ViewDescriptor {
         if format(data) != Some(VIEW_SNAPSHOT_FORMAT) {
             return Ok(None);
         }
-        let descriptor: Self = crate::codec::decode(data).context("invalid view descriptor")?;
+        let (mut descriptor, used): (Self, _) =
+            crate::codec::decode_prefix(data).context("invalid view descriptor")?;
+        if used < data.len() {
+            descriptor.row =
+                Some(crate::codec::decode(&data[used..]).context("invalid view descriptor row")?);
+        }
         descriptor.checkpoint()?;
         Ok(Some(descriptor))
     }

@@ -1,4 +1,5 @@
-//! Serve a demand for a base above the leader's base index. See `certify_base`.
+//! Serve a demand for a base above the leader's base index, and keep records above a checkpoint
+//! row away from members that cannot install them. See `certify_base`.
 
 use super::*;
 use crate::state::overlay::Position;
@@ -22,6 +23,9 @@ impl Node {
     /// index. A switch between the reads makes the check stricter, not weaker. One announcement
     /// serves the demand at a time. A lost proposal is sent again after `CERTIFY_TICKS`. The
     /// demand ends when the base index reaches it, so an idle cluster stops announcing.
+    ///
+    /// The leader certifies above a row only while every other member advertised that it
+    /// installs such a base. Otherwise it serves no demand, as an earlier binary does.
     pub(in crate::node) fn certify_base(&mut self) -> Result<()> {
         if self.raw.raft.state != StateRole::Leader {
             return Ok(());
@@ -35,15 +39,18 @@ impl Node {
                 writer.demand = 0;
                 writer.certified = None;
                 writer.demand_publication = 0;
+                writer.exact_through = 0;
             }
         }
+        self.serve_exact();
+        let extend = self.extension_allowed();
         let wanted = self.raw.store().wanted_index();
         let Some(writer) = &mut self.writer else {
             return Ok(());
         };
         writer.certify_ticks += 1;
         let demand = writer.demand.max(wanted);
-        if demand <= *writer.applied.based.borrow() {
+        if !extend || demand <= *writer.applied.based.borrow() {
             writer.certified = None;
             return Ok(());
         }
@@ -78,6 +85,63 @@ impl Node {
             }
         }
         Ok(())
+    }
+
+    /// Return true when every other member of the configuration advertised, on its current
+    /// process, that it installs a base above the checkpoint row. A member that did not report
+    /// yet counts as an earlier binary.
+    pub(in crate::node) fn extension_allowed(&self) -> bool {
+        let store = self.raw.store();
+        let conf = self.raw.raft.prs().conf().to_conf_state();
+        conf.voters
+            .iter()
+            .chain(&conf.learners)
+            .filter(|&&id| id != self.options.id)
+            .all(|&id| store.coverage_capable(id))
+    }
+
+    /// An earlier binary installs a view snapshot only at its checkpoint row. The log cache does
+    /// not send it a record above the row, and asks here for a record at a row instead.
+    ///
+    /// If the base is at its own row above the record, the next record is at that row. Otherwise
+    /// the leader publishes a checkpoint whose row is its applied index. When no batch is at that
+    /// index, apply first stores one that holds only the apply marker, so the checkpoint row is
+    /// there. That costs one flush and one checkpoint for each such member.
+    fn serve_exact(&mut self) {
+        if !self.raw.store().exact_wanted() {
+            return;
+        }
+        let record = self.raw.store().snapshot_index();
+        let applied = self.state.applied;
+        let Some(writer) = &mut self.writer else {
+            return;
+        };
+        let Some(base) = *writer.applied.base_id.borrow() else {
+            return;
+        };
+        if base.index == base.row && base.index > record {
+            return;
+        }
+        if writer.exact_through >= applied {
+            return;
+        }
+        writer.exact_through = applied;
+        if writer.queue.pushed() < applied {
+            writer.mark_row_due = true;
+        }
+        writer.progress.request(applied);
+        tracing::info!(
+            applied,
+            record,
+            "publish a checkpoint at its row for an earlier binary"
+        );
+    }
+
+    /// Take a due job that stores the apply marker at the applied index.
+    pub(in crate::node) fn take_mark_row(&mut self) -> bool {
+        self.writer
+            .as_mut()
+            .is_some_and(|writer| std::mem::take(&mut writer.mark_row_due))
     }
 }
 

@@ -172,6 +172,9 @@ pub(super) enum Job {
     Snapshot(Snapshot),
     /// Shared mode: switch to a base that finished opening, and publish the new view.
     SwitchBase,
+    /// Shared mode: store the apply marker at the applied index, so the next checkpoint has its
+    /// row there. An earlier binary installs a base only at its row.
+    MarkRow,
     /// Shared mode: adopt this opened base above the applied index. The node verified its index
     /// against the delivered commit, and `term` is the log term there. The job holds the base.
     AdoptBase {
@@ -340,6 +343,7 @@ impl Executor {
                 | Job::Snapshot(_)
                 | Job::PublishPuts(_)
                 | Job::SwitchBase
+                | Job::MarkRow
                 | Job::AdoptBase { .. }
         );
         let copy_state = changes_state || matches!(work.job, Job::Query(Query::Maintenance(..)));
@@ -370,6 +374,10 @@ impl Executor {
             }
             // The switch ran above. The new view goes out with the completion.
             Job::SwitchBase => Output::Entries(Vec::new()),
+            Job::MarkRow => {
+                self.state.mark_row()?;
+                Output::Entries(Vec::new())
+            }
             Job::AdoptBase { base, term } => {
                 self.state.adopt_opened(base, term).await?;
                 Output::Adopted(self.state.members.conf())

@@ -92,6 +92,13 @@ struct Simulation {
     hold_members: bool,
     /// The number of voters.
     members: u64,
+    /// The process ID of each started member, new at each start.
+    processes: BTreeMap<u64, u64>,
+    /// Shared mode: members that run an earlier binary. They send no process ID and do not
+    /// advertise the coverage capability, and they install a view snapshot only at its row.
+    old: BTreeSet<u64>,
+    /// View snapshots that an earlier binary received, each checked at its row.
+    old_installs: u64,
 }
 
 impl Drop for Simulation {
@@ -224,6 +231,9 @@ impl Simulation {
             upgraded,
             hold_members,
             members,
+            processes: BTreeMap::new(),
+            old: BTreeSet::new(),
+            old_installs: 0,
         };
         for id in 1..=sim.members {
             sim.start(id).await;
@@ -335,6 +345,8 @@ impl Simulation {
         node.quota.hold = self.upgraded;
         node.hold_members = self.hold_members;
         self.nodes.insert(id, node);
+        let process = self.processes.values().max().map_or(1, |last| last + 1);
+        self.processes.insert(id, process);
         self.trace.push(format!("start {id}"));
     }
 
@@ -637,8 +649,13 @@ impl Simulation {
         if faults && self.choose(40) == 0 {
             self.messages.push(message.clone());
         }
+        if message.get_msg_type() == MessageType::MsgSnapshot && self.old.contains(&message.to) {
+            self.check_old_install(&message).await;
+        }
+        let process = self.process(message.from);
         let mut saved = None;
         if let Some(node) = self.nodes.get_mut(&message.to) {
+            node.raw.store().note_process(message.from, process);
             let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
             let from = message.from;
             let to = message.to;
@@ -685,6 +702,7 @@ impl Simulation {
             node.retry_reads();
             self.trace.push(format!("tick {id}"));
         }
+        self.report_view(id);
         self.drive().await;
     }
 

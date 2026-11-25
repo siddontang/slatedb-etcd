@@ -193,6 +193,10 @@ pub(super) struct Writer {
     certify_ticks: u64,
     /// The leader term of the demand above. A new term drops the demand of the old one.
     demand_term: u64,
+    /// The applied index through which this leader asked for a checkpoint at its row.
+    exact_through: u64,
+    /// Apply stores the apply marker at the applied index, for a checkpoint at its row.
+    mark_row_due: bool,
 }
 
 /// The shared-mode gauges of one member. The node sets them on each tick.
@@ -260,6 +264,8 @@ impl Writer {
             demand_publication: 0,
             certify_ticks: 0,
             demand_term: 0,
+            exact_through: 0,
+            mark_row_due: false,
             progress: Arc::new(Progress::new(0)),
             admin: handles.admin.clone(),
             queue: handles.queue.clone(),
@@ -1313,12 +1319,18 @@ impl Node {
 
     /// Propose a checkpoint with row `row` that the publisher created. Only the leader
     /// announces. Return true when Raft took the proposal.
+    ///
+    /// The coverage stays at the row unless every other member installs a base above its row.
     pub(super) fn announce_view(&mut self, checkpoint: uuid::Uuid, row: u64) -> Result<bool> {
+        let extend = self.extension_allowed();
         let Some(writer) = &self.writer else {
             return Ok(false);
         };
         let base = *writer.applied.base_id.borrow();
-        let covers = demand::coverage(row, base, writer.queue.position());
+        let covers = match extend {
+            true => demand::coverage(row, base, writer.queue.position()),
+            false => row,
+        };
         self.propose_view(checkpoint, covers)
     }
 
@@ -1372,7 +1384,9 @@ impl Node {
         member: u64,
         checkpoints: HashSet<uuid::Uuid>,
         publish: Option<u64>,
+        coverage: Option<u64>,
     ) {
+        self.raw.store().note_coverage(member, coverage);
         if let Some(writer) = &mut self.writer {
             writer.report(member, checkpoints);
             // A follower's manual checkpoint. The publication is due once apply reaches it.
@@ -1464,7 +1478,9 @@ impl Node {
             return;
         };
         let url = format!("{}/raft/view-ack", crate::cluster::url(address));
-        let body = json!({"member": self.options.id, "checkpoints": pinned, "publish": publish});
+        // The member installs a base above its checkpoint row. See `node::shared::demand`.
+        let body = json!({"member": self.options.id, "checkpoints": pinned, "publish": publish,
+            "coverage": crate::peer::process_id()});
         let client = self.options.transport.http.clone();
         let cluster = self.options.cluster_id.clone();
         tokio::spawn(async move {

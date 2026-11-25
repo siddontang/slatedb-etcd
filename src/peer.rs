@@ -55,11 +55,17 @@ impl Transport for Service {
         {
             return Err(Status::permission_denied("peer cluster does not match"));
         }
+        let process = process_of(
+            request
+                .metadata()
+                .get(PROCESS)
+                .map(|value| value.as_bytes()),
+        );
         let incoming = request.into_inner();
         let events = self.0.events.clone();
         let (responses, stream) = mpsc::channel(WINDOW);
         tokio::spawn(async move {
-            if let Err(error) = receive::run(incoming, events, &responses).await {
+            if let Err(error) = receive::run(incoming, events, &responses, process).await {
                 let _ = responses.send(Err(error)).await;
             }
         });
@@ -98,6 +104,21 @@ async fn failed(
     if snapshot {
         report(events, peer, true, false).await;
     }
+}
+
+/// The header and metadata name of the sender's process ID on peer traffic.
+pub(crate) const PROCESS: &str = "x-member-process";
+
+/// A random ID of this OS process. A member sends it with its peer traffic and its `ViewAck`
+/// reports, so the leader knows when a member runs a new process, maybe of an earlier binary.
+pub(crate) fn process_id() -> u64 {
+    static ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| uuid::Uuid::new_v4().as_u64_pair().0)
+}
+
+/// Read a process ID from peer request headers. An earlier binary sends none.
+pub(crate) fn process_of(value: Option<&[u8]>) -> Option<u64> {
+    std::str::from_utf8(value?).ok()?.parse().ok()
 }
 
 /// Send to a fixed address. Tests use this form.
@@ -166,6 +187,9 @@ pub(crate) async fn transport_to(
             return;
         };
         request.metadata_mut().insert("x-cluster-id", cluster);
+        if let Ok(process) = process_id().to_string().parse() {
+            request.metadata_mut().insert(PROCESS, process);
+        }
         let result = tokio::time::timeout(PROGRESS_TIMEOUT, client.exchange(request)).await;
         let Ok(Ok(response)) = result else {
             failed(&events, peer, &mut messages, false, 1, &traffic).await;
@@ -297,6 +321,7 @@ async fn post_snapshot(
         let response = client
             .post(url)
             .header("x-cluster-id", cluster)
+            .header(PROCESS, process_id().to_string())
             // The follower copies the checkpoint objects before it replies. A retry continues
             // from the objects that it already copied.
             .timeout(Duration::from_secs(600))

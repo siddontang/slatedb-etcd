@@ -430,6 +430,18 @@ the rebase opens the current base again at its base index, with the log term the
   clears the follower's request. The pin ends when the peer gets a snapshot, or at a term
   change. Replicated mode uses the same rule. A follower can get a snapshot at its own record
   index. It then stores nothing, because its log ends there.
+- **Earlier binaries:** a record above its checkpoint row holds the row after its encoded
+  fields. An earlier binary ignores those bytes, but it installs a view snapshot only at its
+  row. Each member sends a random ID of its process with its peer frames and its `ViewAck`, and
+  the report also advertises the coverage capability. The capability holds only for the
+  process that advertised it, so a restart on an earlier binary loses it at its first frame. A
+  member that did not report yet counts as an earlier binary.
+  - The leader certifies above a row only while every other member of the configuration has
+    the capability. Otherwise it announces at the row and serves no demand above its base.
+  - The log cache sends a record above its row only to a capable peer. For another peer, the
+    leader publishes a checkpoint at its applied index: if no batch is there, apply first stores
+    a batch with only the apply marker and the counters. The leader then records that base at
+    its row and sends it. This costs one flush and one checkpoint.
 
 ## Install
 

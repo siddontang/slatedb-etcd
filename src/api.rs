@@ -103,6 +103,19 @@ async fn raft_message(State(state): State<ApiState>, headers: HeaderMap, body: B
     let Ok(message) = crate::peer::decode_message(body) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    let process = crate::peer::process_of(
+        headers
+            .get(crate::peer::PROCESS)
+            .map(|value| value.as_bytes()),
+    );
+    let member = message.from;
+    if state
+        .events
+        .try_send(Event::PeerProcess { member, process })
+        .is_err()
+    {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     if message.get_msg_type() == raft::eraftpb::MessageType::MsgSnapshot {
         // A format 6 snapshot names a shared checkpoint. Open it before Raft accepts the
         // snapshot, and keep it until the install. A failed open fails the request.
@@ -149,6 +162,10 @@ struct ViewAck {
     /// A manual checkpoint on the member asks the leader to publish through this index.
     #[serde(default)]
     publish: Option<u64>,
+    /// The process of a member that installs a base above its checkpoint row. An earlier
+    /// binary sends none.
+    #[serde(default)]
+    coverage: Option<u64>,
 }
 
 /// Receive the checkpoints that a shared-mode member pins. The leader keeps them for a time.
@@ -168,6 +185,7 @@ async fn view_ack(
         member: report.member,
         checkpoints: report.checkpoints,
         publish: report.publish,
+        coverage: report.coverage,
     };
     match state.events.try_send(event) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),

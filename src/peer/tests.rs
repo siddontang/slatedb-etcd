@@ -33,12 +33,25 @@ fn message(snapshot: bool) -> Message {
     }
 }
 
+/// The next event that is not the process notice of a stream or request. A sender of this
+/// binary names its process. A raw test stream, like an earlier binary, names none.
+async fn next_event(events: &mut mpsc::Receiver<Event>) -> Event {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Event::PeerProcess { process, .. } => {
+                assert!(process.is_none_or(|process| process == process_id()))
+            }
+            event => return event,
+        }
+    }
+}
+
 async fn step(events: &mut mpsc::Receiver<Event>, snapshot: bool) -> crate::node::Response {
-    match tokio::time::timeout(Duration::from_secs(3), events.recv())
-        .await
-        .unwrap()
-        .unwrap()
-    {
+    match next_event(events).await {
         Event::PeerFrame(message, _, response) => {
             assert_eq!(message.get_msg_type() == MessageType::MsgSnapshot, snapshot);
             response
@@ -96,11 +109,7 @@ async fn stream_window_and_snapshot_storage_ack_bound_the_sender() {
         let mut pending = None;
         let mut heartbeat = None;
         for _ in 0..2 {
-            match tokio::time::timeout(Duration::from_secs(3), received.recv())
-                .await
-                .unwrap()
-                .unwrap()
-            {
+            match next_event(&mut received).await {
                 Event::PeerFrame(message, _, response) => {
                     if message.get_msg_type() == MessageType::MsgSnapshot {
                         pending = Some(response);
@@ -409,7 +418,10 @@ async fn failed_stream_discards_its_backlog_and_rejects_a_queued_snapshot() {
         }
     }
     assert_eq!(messages.capacity(), 256);
-    while let Ok(Event::PeerFrame(_, _, response)) = received.try_recv() {
+    while let Ok(event) = received.try_recv() {
+        let Event::PeerFrame(_, _, response) = event else {
+            continue;
+        };
         assert!(
             response.is_closed(),
             "failed stream kept an accepted message waiter"

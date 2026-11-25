@@ -155,6 +155,9 @@ impl Node {
         if self.prepared_puts.is_none() && self.take_switch() {
             return self.submit_apply(Job::SwitchBase, self.state.applied);
         }
+        if self.prepared_puts.is_none() && self.take_mark_row() {
+            return self.submit_apply(Job::MarkRow, self.state.applied);
+        }
         if let Some((base, term)) = self.adoptable() {
             let index = base.applied;
             return self.submit_apply(Job::AdoptBase { base, term }, index);

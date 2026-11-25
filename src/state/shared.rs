@@ -858,13 +858,15 @@ pub(crate) struct Options {
 }
 
 /// A format 6 Raft snapshot record: a checkpoint, the record index, and the term there. The
-/// index can be above the checkpoint row, because a certified announcement extends it. The
-/// extension belongs to this checkpoint only.
+/// index can be above the checkpoint row, because a certified announcement extends it. Such a
+/// record also holds the row `F`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Record {
     pub checkpoint: uuid::Uuid,
     pub index: u64,
     pub term: u64,
+    /// The checkpoint row of a record above it. `None` for a record that does not say.
+    pub row: Option<u64>,
 }
 
 impl Record {
@@ -877,6 +879,7 @@ impl Record {
             checkpoint: view.checkpoint()?,
             index: snapshot.get_metadata().index,
             term: snapshot.get_metadata().term,
+            row: view.row,
         }))
     }
 }
@@ -1695,6 +1698,27 @@ impl StateMachine {
         Ok(())
     }
 
+    /// Store a batch that holds only the apply marker and the counters at the applied index.
+    /// The next checkpoint then has its row at that index. An earlier binary installs a view
+    /// snapshot only at its checkpoint row, and a leader uses this for such a member. The batch
+    /// changes no etcd state, so apply derives nothing from it.
+    pub(crate) fn mark_row(&mut self) -> Result<()> {
+        let size = self.logical_bytes;
+        let index = self.applied;
+        let term = self.applied_term;
+        let shared = self.shared.as_mut().context("not in shared state mode")?;
+        if shared.overlay.queue().pushed() >= index {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::new();
+        mark_applied(&mut batch, index, term);
+        batch.put(LOGICAL_BYTES, size.total().to_be_bytes());
+        batch.put(LOGICAL_SIZE, logical_size_row(index, size));
+        shared.overlay.push(index, Arc::new(batch));
+        self.write_batches += 1;
+        Ok(())
+    }
+
     /// Raise a base that has an empty overlay from its row `F` to `index`. The caller knows that
     /// no entry in `(F, index]` changed state: a certified announcement or a Raft snapshot record
     /// of this checkpoint says so. `term` is the Raft term at `index`. The derived state loaded
@@ -1774,8 +1798,16 @@ impl StateMachine {
             .await?
             .context("the base checkpoint has no membership")?;
         let members: crate::cluster::Store = serde_json::from_slice(&members)?;
-        let data = transfer::ViewDescriptor::new(id).encode()?;
-        Ok(Some((shared.base_index, data, members.conf())))
+        let descriptor = if shared.base_index > shared.base.applied {
+            transfer::ViewDescriptor::above_row(id, shared.base.applied)
+        } else {
+            transfer::ViewDescriptor::new(id)
+        };
+        Ok(Some((
+            shared.base_index,
+            descriptor.encode()?,
+            members.conf(),
+        )))
     }
 
     /// The checkpoint of the base, if any.

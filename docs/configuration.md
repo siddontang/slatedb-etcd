@@ -219,6 +219,10 @@ Rules and limits:
 - A request of an earlier term can name a suffix that the leader replaced. The leader serves
   each peer at most its last log index, pinned at the first request, so the follower takes a
   snapshot and then appends. Both state modes do this.
+- A member reports whether it installs a base above its checkpoint row, with the ID of its
+  process. The leader extends coverage only while every member reported it. An earlier binary
+  gets only a snapshot at its checkpoint row: the leader publishes a new checkpoint for it when
+  its record is above the row.
 - A restart opens the newest checkpoint. It adopts the checkpoint when the log ends below it. A
   Raft snapshot record above the newest checkpoint row names its checkpoint, and the restart
   opens that one at the record index.
