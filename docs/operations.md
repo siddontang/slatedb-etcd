@@ -106,9 +106,14 @@ option from later restart commands.
 A member with a new data directory never applies a Put, a transaction with a Put, or a lease
 grant that an earlier binary wrote before the first cluster quota. Apply stops at that entry,
 logs an error, and asks the leader for a snapshot. It resumes after the install. Until then
-the member does not start an election while it knows a leader, ignores leadership transfers,
-and hands over leadership if it wins. It still votes. A backlog above `--log-pending-bytes`
-does not stop its start.
+the member does not start an election while its leader is live, ignores leadership transfers,
+and hands over leadership if it wins. It still votes. After three election timeouts without its
+leader it may campaign, so it does not hold up the group.
+
+A backlog above `--log-pending-bytes` does not stop its start. That member then starts as a
+learner until the snapshot, so it never campaigns. If it holds the only latest log of the two
+live voters, the group waits for the third member. Bring that member back, or replace the
+waiting member.
 
 Equal flags do not repair members that already applied entries under different quotas.
 Compare revisions, alarms, and HashKV. Remove a member that differs, and add it again as a new

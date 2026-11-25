@@ -488,6 +488,7 @@ impl Node {
             // backlog. Raft treats the committed log as applied, and the cache keeps it only
             // as evictable history. The snapshot install replaces it.
             let mut raft_applied = state.applied;
+            let mut conf = state.members.conf();
             let mut cache = match loaded {
                 Err(error)
                     if error.is::<cache::PendingQuota>()
@@ -499,11 +500,16 @@ impl Node {
                         commit = raft_applied,
                         "the log backlog waits for a snapshot"
                     );
+                    // Raft would count the skipped configuration changes as applied without
+                    // seeing them. So this member starts as a learner in memory: Raft does not
+                    // let it campaign or take a transfer, but it still votes. The snapshot
+                    // configuration makes it a voter again. Nothing stores this configuration.
+                    conf = quota::without_vote(conf, options.id);
                     log::Cache::load(&storage, raft_applied, options.log_memory)?
                 }
                 loaded => loaded?,
             };
-            cache.initial_conf = Some(state.members.conf());
+            cache.initial_conf = Some(conf);
             let config = Config {
                 id: options.id,
                 election_tick: 10,

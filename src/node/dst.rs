@@ -2331,6 +2331,54 @@ async fn a_waiting_member_does_not_lead_in_an_election_or_a_transfer() {
     }
 }
 
+/// The leader replicated its last entry only to a member that waits for a snapshot, then
+/// stopped. Raft on that member still holds the ID of the lost leader. The other member cannot
+/// win without its vote. The waiting member campaigns after three election timeouts, wins, and
+/// hands over leadership, so the group makes progress.
+#[tokio::test]
+async fn a_waiting_member_with_the_only_latest_log_lets_the_group_progress() {
+    let quotas = BTreeMap::from([(1, 1 << 20), (2, 1 << 20), (3, 1 << 20)]);
+    let mut sim = Simulation::with_options(17, false, quotas, true, true).await;
+    sim.settle(3).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(20).await;
+    sim.settle(2).await;
+    let leader = sim.leader().unwrap();
+    let waiting = sim.follower(0);
+    let other = sim.follower(waiting);
+    // The leader cannot build the snapshot, and the other member misses the next entry.
+    sim.paused_apply = Some(leader);
+    sim.replace(waiting, 3000).await;
+    sim.isolated = Some(other);
+    sim.propose().await;
+    sim.until_waiting(waiting).await;
+    for _ in 0..50 {
+        sim.deliver(false).await;
+    }
+    let last = sim.nodes[&leader].raw.raft.raft_log.last_index();
+    assert_eq!(sim.nodes[&waiting].raw.raft.raft_log.last_index(), last);
+    assert!(sim.nodes[&other].raw.raft.raft_log.last_index() < last);
+    sim.stop(leader);
+    sim.messages
+        .retain(|message| message.to != leader && message.from != leader);
+    sim.isolated = None;
+    sim.paused_apply = None;
+    assert_eq!(sim.nodes[&waiting].raw.raft.leader_id, leader);
+    let acknowledged = sim.acknowledged.len();
+    for _ in 0..12 {
+        sim.settle(10).await;
+        if sim.leader().is_some_and(|id| id != waiting) {
+            break;
+        }
+    }
+    let now = sim.leader().expect("the group elects no leader");
+    assert_eq!(now, other);
+    sim.settle(10).await;
+    sim.write(1).await;
+    sim.settle(5).await;
+    assert!(sim.acknowledged.len() > acknowledged);
+}
+
 #[tokio::test]
 async fn truncation_without_an_image_recovers_and_serves_an_on_demand_snapshot() {
     let mut sim = Simulation::new(7).await;

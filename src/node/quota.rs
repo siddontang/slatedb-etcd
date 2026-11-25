@@ -10,8 +10,8 @@
 //! A state that this binary created empty never applies a quota-checked entry under its flag.
 //! Such an entry before the first `SetQuota` entry comes from an earlier binary. The member
 //! finds it in its log at open and as entries arrive. Apply then stops before it, and the member
-//! asks the leader for a snapshot. Until then it does not lead: it skips elections while it
-//! knows a leader, ignores leadership transfers, and hands over leadership if it wins. It still
+//! asks the leader for a snapshot. Until then it does not lead: it skips elections while its
+//! leader is live, ignores leadership transfers, and hands over leadership if it wins. It still
 //! votes. A member also checkpoints through a first cluster quota that follows such entries, so
 //! the leader sends later members a snapshot. See `StateMachine::quota_boundary`.
 
@@ -119,8 +119,9 @@ pub(super) struct Quota {
     gate: Option<Gate>,
     /// The last log index that the gate scan covered.
     scanned: u64,
-    /// Ticks without a known leader while the member waits for a snapshot.
-    leaderless: usize,
+    /// Ticks since the last message of the current leader. Raft keeps the ID of a lost leader
+    /// while the timer cap of `tick_raft` holds, so the ID is not a liveness signal.
+    silent: usize,
     /// Simulation: the member proposes no `SetQuota`, like an earlier binary.
     #[cfg(test)]
     pub(super) hold: bool,
@@ -176,7 +177,7 @@ impl Quota {
             observed: None,
             gate: None,
             scanned: 0,
-            leaderless: 0,
+            silent: 0,
             #[cfg(test)]
             hold: false,
         };
@@ -284,6 +285,18 @@ pub(super) fn scan_storage(storage: &RaftStorage, applied: u64) -> Result<(Optio
         low = end + 1;
     }
     Ok((None, last))
+}
+
+/// Return `conf` with `id` as a learner, not a voter.
+pub(super) fn without_vote(
+    mut conf: raft::eraftpb::ConfState,
+    id: u64,
+) -> raft::eraftpb::ConfState {
+    conf.voters.retain(|&voter| voter != id);
+    if !conf.learners.contains(&id) {
+        conf.learners.push(id);
+    }
+    conf
 }
 
 /// Replace the record file atomically.
@@ -404,14 +417,15 @@ impl Node {
             self.quota.set_gate(None, 0);
             return Ok(());
         }
+        // Replaced entries can change only the gate at or after their first index. A guard on
+        // an earlier entry stays. A snapshot keeps it too, until the install passes it.
         if let Some(first) = replaced {
             let index = match self.quota.gate {
                 Some(Gate::SetQuota(index) | Gate::Checked(index)) => index,
                 None => u64::MAX,
             };
-            if index >= first || self.quota.scanned >= first {
-                self.quota.set_gate(None, self.quota.scanned.min(first - 1));
-            }
+            let gate = self.quota.gate.filter(|_| index < first);
+            self.quota.set_gate(gate, self.quota.scanned.min(first - 1));
         }
         if self.quota.gate.is_some() {
             return Ok(());
@@ -459,20 +473,19 @@ impl Node {
         }
     }
 
-    /// Tick Raft. A member that waits for a snapshot does not start an election while it
-    /// knows a leader, so the group does not elect a member that cannot apply.
+    /// Tick Raft. A member that waits for a snapshot does not start an election while its
+    /// leader is live, so the group does not elect a member that cannot apply.
     ///
-    /// Without a known leader for three election timeouts, it may campaign, so it never holds
-    /// up the group. If it wins, `propose_quota` hands leadership over at once.
+    /// After three election timeouts without a message of the leader, it may campaign, so it
+    /// never holds up the group. If it wins, `propose_quota` hands leadership over at once. Raft
+    /// itself refuses the campaign while a committed configuration change is not applied, and
+    /// apply stops before the waiting entry, so such a change stays unapplied. A member that
+    /// skipped its backlog at open is a learner until the snapshot, so it never campaigns.
     pub(super) fn tick_raft(&mut self) -> Result<()> {
         if self.quota.blocked().is_some() {
+            self.quota.silent += 1;
             let raft = &mut self.raw.raft;
-            if raft.leader_id == raft::INVALID_ID {
-                self.quota.leaderless += 1;
-            } else {
-                self.quota.leaderless = 0;
-            }
-            if self.quota.leaderless < 3 * raft.election_timeout() {
+            if self.quota.silent < 3 * raft.election_timeout() {
                 // Keep the timer past the leader lease, so the member still votes, but below
                 // the largest randomized timeout, so it does not campaign.
                 let timeout = 2 * raft.election_timeout() - 1;
@@ -480,6 +493,8 @@ impl Node {
                 raft.election_elapsed = raft.election_elapsed.min(timeout - 2);
             }
             self.request_quota_snapshot();
+        } else {
+            self.quota.silent = 0;
         }
         self.raw.tick();
         self.propose_quota()
@@ -495,7 +510,15 @@ impl Node {
             );
             return Ok(());
         }
+        let from = message.from;
+        let leader_message = matches!(
+            message.get_msg_type(),
+            MessageType::MsgAppend | MessageType::MsgHeartbeat | MessageType::MsgSnapshot
+        );
         self.raw.step(message)?;
+        if leader_message && from == self.raw.raft.leader_id {
+            self.quota.silent = 0;
+        }
         if let Err(error) = self.propose_quota() {
             tracing::warn!(%error, "cannot propose the cluster quota");
         }
@@ -1089,12 +1112,13 @@ pub(super) mod tests {
     /// Member 2 leads. Member 1 asks it for a snapshot and installs `snapshot`.
     async fn install_requested(node: &mut Node, snapshot: raft::eraftpb::Snapshot) {
         let index = snapshot.get_metadata().index;
-        node.step_peer(message(MessageType::MsgHeartbeat, 2, 1))
+        let term = node.raw.raft.term.max(1);
+        node.step_peer(message(MessageType::MsgHeartbeat, 2, term))
             .unwrap();
         node.tick_raft().unwrap();
         drive(node).await;
         assert_eq!(node.raw.raft.pending_request_snapshot, index);
-        let mut install = message(MessageType::MsgSnapshot, 2, 1);
+        let mut install = message(MessageType::MsgSnapshot, 2, term);
         install.set_snapshot(snapshot);
         node.step_peer(install).unwrap();
         apply_committed(node).await;
@@ -1139,9 +1163,9 @@ pub(super) mod tests {
         let entries = earlier_entries(quota_put(1));
         let mut node = waiting_member(dir.path(), &entries, 32 << 20).await;
         assert_eq!(node.quota.blocked(), Some(1));
-        node.step_peer(message(MessageType::MsgHeartbeat, 2, 1))
-            .unwrap();
         for _ in 0..60 {
+            node.step_peer(message(MessageType::MsgHeartbeat, 2, 1))
+                .unwrap();
             node.tick_raft().unwrap();
         }
         assert_eq!(node.raw.raft.state, StateRole::Follower);
@@ -1150,6 +1174,12 @@ pub(super) mod tests {
             .unwrap();
         assert_eq!(node.raw.raft.state, StateRole::Follower);
         assert_eq!(node.raw.raft.term, 1);
+        // The leader stops. After the lease, but before three election timeouts, the member
+        // still does not campaign, and it votes for another candidate.
+        for _ in 0..15 {
+            node.tick_raft().unwrap();
+        }
+        assert_eq!(node.raw.raft.state, StateRole::Follower);
         let mut vote = message(MessageType::MsgRequestVote, 3, 2);
         vote.index = 41;
         vote.log_term = 1;
@@ -1325,5 +1355,229 @@ pub(super) mod tests {
         apply_committed(&mut node).await;
         assert_eq!(node.state.cluster_quota, Some(row(200, 40, 1)));
         assert_eq!(leader_request(&node), None);
+    }
+
+    /// A follower holds 40 committed Puts of an earlier binary and an uncommitted Put at 41. A
+    /// new leader replaces only entry 41 with its seed. The guard at 1 stays.
+    #[tokio::test]
+    async fn a_replaced_suffix_after_the_guard_keeps_the_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(open_node(dir.path(), 3000, false).await);
+        let mut commands: Vec<_> = (1..=40).map(quota_put).collect();
+        {
+            let mut storage =
+                RaftStorage::open(&dir.path().join("raft"), 1, "worker-test", vec![1, 2, 3])
+                    .unwrap();
+            let mut log: Vec<_> = (1..)
+                .zip(&commands)
+                .map(|(index, command)| Entry {
+                    index,
+                    term: 1,
+                    data: command.encode().unwrap(),
+                    ..Default::default()
+                })
+                .collect();
+            log.push(Entry {
+                index: 41,
+                term: 1,
+                data: quota_put(41).encode().unwrap(),
+                ..Default::default()
+            });
+            let state = HardState {
+                term: 1,
+                vote: 1,
+                commit: 40,
+            };
+            storage.persist(&log, Some(&state), None).unwrap();
+        }
+        let mut node = open_node(dir.path(), 3000, false).await;
+        assert_eq!(node.quota.blocked(), Some(1));
+        let seed = set_quota(1 << 20, 0, 2);
+        let mut append = message(MessageType::MsgAppend, 2, 2);
+        append.index = 40;
+        append.log_term = 1;
+        append.commit = 41;
+        append.entries.push(Entry {
+            index: 41,
+            term: 2,
+            data: seed.encode().unwrap(),
+            ..Default::default()
+        });
+        node.step_peer(append).unwrap();
+        drive(&mut node).await;
+        commands.push(seed);
+        let (snapshot, revision) = covering_snapshot(dir.path(), &commands).await;
+        assert_eq!(node.state.applied, 0);
+        assert_eq!(node.quota.blocked(), Some(1));
+        // The snapshot passes the guard.
+        install_requested(&mut node, snapshot).await;
+        assert_eq!(node.state.revision, revision);
+    }
+
+    /// A replacement at or before the guard computes the gate again.
+    #[tokio::test]
+    async fn a_replaced_guard_entry_is_scanned_again() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(open_node(dir.path(), 3000, false).await);
+        {
+            let mut storage =
+                RaftStorage::open(&dir.path().join("raft"), 1, "worker-test", vec![1, 2, 3])
+                    .unwrap();
+            let mut log: Vec<_> = (1..=3)
+                .map(|index| Entry {
+                    index,
+                    term: 1,
+                    ..Default::default()
+                })
+                .collect();
+            log.push(Entry {
+                index: 4,
+                term: 1,
+                data: quota_put(4).encode().unwrap(),
+                ..Default::default()
+            });
+            let state = HardState {
+                term: 1,
+                vote: 1,
+                commit: 3,
+            };
+            storage.persist(&log, Some(&state), None).unwrap();
+        }
+        let mut node = open_node(dir.path(), 3000, false).await;
+        assert_eq!(node.quota.blocked(), Some(4));
+        let mut append = message(MessageType::MsgAppend, 2, 2);
+        append.index = 3;
+        append.log_term = 1;
+        append.commit = 4;
+        append.entries.push(Entry {
+            index: 4,
+            term: 2,
+            data: set_quota(1 << 20, 0, 2).encode().unwrap(),
+            ..Default::default()
+        });
+        node.step_peer(append).unwrap();
+        drive(&mut node).await;
+        assert_eq!(node.quota.blocked(), None);
+        assert_eq!(node.state.applied, 4);
+        assert_eq!(node.state.cluster_quota, Some(row(1 << 20, 0, 2)));
+    }
+
+    /// The leader of a waiting member goes silent. Raft keeps its ID, but the member campaigns
+    /// after three election timeouts.
+    #[tokio::test]
+    async fn a_waiting_member_campaigns_after_its_leader_goes_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = earlier_entries(quota_put(1));
+        let mut node = waiting_member(dir.path(), &entries, 32 << 20).await;
+        node.step_peer(message(MessageType::MsgHeartbeat, 2, 1))
+            .unwrap();
+        for _ in 0..200 {
+            node.tick_raft().unwrap();
+        }
+        assert_ne!(node.raw.raft.state, StateRole::Follower);
+    }
+
+    /// A configuration change that adds voter `id`, as the log stores it.
+    fn add_voter(id: u64) -> raft::eraftpb::ConfChange {
+        raft::eraftpb::ConfChange {
+            change_type: raft::eraftpb::ConfChangeType::AddNode as i32,
+            node_id: id,
+            ..Default::default()
+        }
+    }
+
+    /// A member that skips a backlog above its pending limit starts as a learner in memory. The
+    /// backlog adds voters 4 and 5, which its start does not see. It never campaigns, ignores a
+    /// transfer, still votes, and is a voter again after the snapshot. Nothing stores the
+    /// learner configuration.
+    #[tokio::test]
+    async fn a_member_that_skips_its_backlog_cannot_campaign_until_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(open_node(dir.path(), 3000, false).await);
+        let commands = large_entries(12, 1 << 20);
+        {
+            let mut storage =
+                RaftStorage::open(&dir.path().join("raft"), 1, "worker-test", vec![1, 2, 3])
+                    .unwrap();
+            let mut log: Vec<_> = (1..)
+                .zip(&commands)
+                .map(|(index, command)| Entry {
+                    index,
+                    term: 1,
+                    data: command.encode().unwrap(),
+                    ..Default::default()
+                })
+                .collect();
+            for (index, id) in [(14, 4), (15, 5)] {
+                log.push(Entry {
+                    index,
+                    term: 1,
+                    entry_type: EntryType::EntryConfChange as i32,
+                    data: add_voter(id).encode_to_vec(),
+                    ..Default::default()
+                });
+            }
+            let state = HardState {
+                term: 1,
+                vote: 1,
+                commit: 15,
+            };
+            storage.persist(&log, Some(&state), None).unwrap();
+        }
+        let mut config = options(dir.path());
+        config.quota_bytes = 3000;
+        config.log_memory.pending_bytes = 9 << 20;
+        let (events, _) = mpsc::channel(256);
+        let mut node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(node.raw.raft.raft_log.applied, 15);
+        assert!(!node.raw.raft.promotable());
+        // No leader for many election timeouts: no campaign, so no win with two of three.
+        for _ in 0..500 {
+            node.tick_raft().unwrap();
+        }
+        assert_eq!(node.raw.raft.state, StateRole::Follower);
+        node.raw
+            .step(message(MessageType::MsgTimeoutNow, 2, 1))
+            .unwrap();
+        assert_eq!(node.raw.raft.state, StateRole::Follower);
+        assert_eq!(node.raw.raft.term, 1);
+        let mut vote = message(MessageType::MsgRequestVote, 3, 2);
+        vote.index = 15;
+        vote.log_term = 1;
+        node.step_peer(vote).unwrap();
+        assert_eq!(node.raw.raft.vote, 3);
+        // The durable Raft state keeps the bootstrap voters.
+        let stored = node
+            .log_worker
+            .storage()
+            .initial_state()
+            .unwrap()
+            .conf_state;
+        assert!(stored.voters.contains(&1));
+        drop(node);
+        assert!(
+            RaftStorage::open(&dir.path().join("raft"), 1, "worker-test", vec![1, 2, 3])
+                .unwrap()
+                .initial_state()
+                .unwrap()
+                .conf_state
+                .voters
+                .contains(&1)
+        );
+    }
+
+    /// After the snapshot install, a member that skipped its backlog is a voter again.
+    #[tokio::test]
+    async fn a_member_that_skipped_its_backlog_votes_again_after_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = large_entries(12, 1 << 20);
+        let mut node = waiting_member(dir.path(), &entries, 9 << 20).await;
+        assert!(!node.raw.raft.promotable());
+        let (snapshot, _) = covering_snapshot(dir.path(), &entries).await;
+        install_requested(&mut node, snapshot).await;
+        assert!(node.raw.raft.promotable());
+        assert!(node.raw.raft.prs().conf().voters().contains(1));
     }
 }
