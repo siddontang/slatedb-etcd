@@ -75,6 +75,68 @@ kind grows. Compaction frees `history` and `watch_journal` bytes, not `current` 
 Inspect alarms before retrying failed writes. A NOSPACE alarm rejects writes and lease grants.
 Deletion and compaction remain available for cleanup. Disarm the alarm after resolving the cause.
 The quota counts logical stored bytes; it does not reserve disk capacity.
+
+### Change the quota
+
+In replicated mode the quota is cluster state, so every member applies one value at each index.
+Shared mode keeps the quota of its cluster claim instead; see [shared state](shared-state.md).
+
+- `--quota-backend-bytes` seeds the cluster quota and requests changes to it. The first leader
+  of a new cluster stores its flag before the first client write.
+- A member records its flag in `quota-flag.json` in its data directory. A restart with another
+  flag makes a request with the wall-clock time of that start. The member proposes the request
+  each time it leads, until the cluster quota equals it or holds a newer request.
+- The newest request wins, on every member and in every order of apply. Equal times compare the
+  member ID. A newer request with the current value still replaces the older request.
+- A member with an unchanged flag does not change the cluster quota when it leads. So a rolling
+  restart with a new flag takes effect when the first updated member leads. Use
+  `etcdctl move-leader` to select it.
+- A member whose flag differs from the cluster quota logs a warning and sets the
+  `slatedb_etcd_quota_flag_mismatch` gauge. The `quota` field of `/status` shows both values.
+- A native backup carries the cluster quota. After a restore, it wins over the flag until an
+  operator makes a new request.
+- A directory from an earlier binary has no cluster quota. Its members use their own flags until
+  the first leader on this binary stores one. Then every member checkpoints through that entry.
+
+Set one value on every member. The order of requests uses member clocks. With clock skew, the
+later time can belong to the earlier operator action. The mismatch gauge shows a split. To make
+a request again with the same flag, restart that member once with `--quota-reassert`. Remove the
+option from later restart commands.
+
+A member with a new data directory never applies a Put, a transaction with a Put, or a lease
+grant that an earlier binary wrote before the first cluster quota. Apply stops at that entry,
+logs an error, and asks the leader for a snapshot. It resumes after the install. Until then
+the member does not start an election while its leader is live, ignores leadership transfers,
+and hands over leadership if it wins. It still votes. After three election timeouts without its
+leader it may campaign, so it does not hold up the group.
+
+A backlog above `--log-pending-bytes` does not stop its start. That member then starts as a
+learner until the snapshot, so it never campaigns. If it holds the only latest log of the two
+live voters, the group waits for the third member. Bring that member back, or replace the
+waiting member.
+
+Equal flags do not repair members that already applied entries under different quotas.
+Compare revisions, alarms, and HashKV. Remove a member that differs, and add it again as a new
+learner with an empty data directory. It then installs a snapshot of the leader. Move the
+leadership to the chosen member first.
+
+### Membership row
+
+The `etcd/members` row is cluster state, and the quota counts its bytes.
+
+- The `--peer` and `--client-peer` flags build the membership of a new member in memory. The
+  first leader stores its own membership before the first client write. Joining members and
+  restores take the row from the cluster.
+- A member whose flags differ from the stored row logs a warning at startup. The row applies.
+- Each leader proposes a digest of its row when it starts its term, and again after the first
+  entry of its term applies. A member whose row differs logs a warning and sets the
+  `slatedb_etcd_members_mismatch` gauge. The `members_row` field of `/status` shows the digest,
+  the last index that can have changed the row, and the term and index of the last comparison.
+- An earlier binary stored the flags of each member. Members with other URL text then hold other
+  rows. Repair such a member as for a quota difference above.
+- A new member does not apply an earlier binary's entries before the first seed. It asks the
+  leader for a snapshot and does not lead until it installs one, as for the quota.
+
 Keep the entire Raft directory, including its checkpoint data file, when moving a member.
 Older binaries reject the Raft identity after the first checkpoint in the new layout.
 Do not delete Raft log files, manifests, or individual SST objects by hand.
@@ -102,6 +164,8 @@ The Raft identity and native snapshot header require this format.
 Use fresh data directories and object prefixes for this version.
 Old directories and old native backups are not upgrade inputs. There is no format migration.
 Mixed binary versions and rolling upgrades are unsupported.
+An older binary stops at the first `SetQuota` or `SeedMembers` entry, because it cannot decode
+it. Upgrade that member. The new binary applies the entry on restart.
 Binaries that write `meta/applied-term` keep native snapshot and backup format 4. Upgrade the
 followers first, as for format 5, so that no older member installs a checkpoint with the row.
 The etcd client protocol remains separate from this internal storage format.

@@ -78,13 +78,8 @@ fn request(n: u64) -> RequestOp {
     }
 }
 
-/// Every row under `prefix` except the membership, which only shared mode stores at entry 1.
 async fn rows(state: &StateMachine, prefix: &[u8]) -> Vec<Row> {
-    source::rows(state.applied_state(), prefix)
-        .await
-        .into_iter()
-        .filter(|row| row.key.as_ref() != crate::cluster::KEY)
-        .collect()
+    source::rows(state.applied_state(), prefix).await
 }
 
 async fn compare(state: &StateMachine, reference: &StateMachine) {
@@ -108,8 +103,6 @@ async fn compare(state: &StateMachine, reference: &StateMachine) {
 /// Apply the same workload to `state` and `reference`. Before each compaction step, `inline`
 /// drops the background plan of `state`, so the step reads the state inline.
 async fn run(state: &mut StateMachine, reference: &mut StateMachine, inline: bool) {
-    // Shared mode stores the membership with the first entry. Let the reference do the same.
-    reference.members_unsaved = true;
     for n in 0..80_u64 {
         if n % 20 == 19 {
             let request = CompactionRequest {
@@ -220,37 +213,47 @@ async fn background_and_inline_compaction_steps_read_the_same_overlay_history() 
     }
 }
 
+/// The first entry writes no batch, and the bootstrap membership stays in memory. The seed is
+/// the first batch, so the first checkpoint holds the membership. Later no-op entries write no
+/// batch.
 #[tokio::test]
-async fn no_op_entries_write_no_batch_after_the_membership_entry() {
+async fn no_op_entries_write_no_batch_after_the_membership_seed() {
     let mut state = open_shared(Arc::new(InMemory::new())).await;
     state.members = Arc::new(crate::cluster::Store::initial(
         &[(1, "127.0.0.1:1".to_owned())].into(),
     ));
-    // The first entry stores the bootstrap membership on every member, even when it is empty.
     state.apply(1, None).await.unwrap();
-    assert_eq!(state.write_batches, 1);
+    let queue = state.shared.as_ref().unwrap().overlay.queue();
+    assert_eq!((state.write_batches, queue.pushed()), (0, 0));
+    let members = state.applied_state().get(crate::cluster::KEY).await;
+    assert!(members.unwrap().is_none());
+    state.seed_for_test(2).await.unwrap();
+    assert_eq!((state.write_batches, queue.pushed()), (1, 2));
     let members = state.applied_state().get(crate::cluster::KEY).await;
     assert!(members.unwrap().is_some());
-    let queue = state.shared.as_ref().unwrap().overlay.queue();
-    assert_eq!(queue.pushed(), 1);
-    state.apply(2, None).await.unwrap();
+    state.apply(3, None).await.unwrap();
     state
-        .apply_view_checkpoint(3, &uuid::Uuid::new_v4().to_string())
+        .apply_view_checkpoint(4, &uuid::Uuid::new_v4().to_string())
         .await
         .unwrap();
-    assert_eq!(state.applied, 3);
-    assert_eq!(state.write_batches, 1);
-    assert_eq!(queue.pushed(), 1);
+    assert_eq!(state.applied, 4);
+    assert_eq!((state.write_batches, queue.pushed()), (1, 2));
     // The view at the applied index equals the state of the last batch.
     let view = state.read_view().unwrap();
     assert_eq!(
         view.state().get(APPLIED).await.unwrap().unwrap().as_ref(),
-        1_u64.to_be_bytes()
+        2_u64.to_be_bytes()
     );
-    state.apply_etcd(4, &put("k", "v")).await.unwrap();
-    assert_eq!(state.write_batches, 2);
-    assert_eq!(queue.pushed(), 4);
-    // The view of index 3 does not see the later write.
+    // The first checkpoint covers the seed batch and holds the membership.
+    let mut written = 0;
+    let db = writer(&state).await;
+    let base = checkpoint(&state, &db, &mut written).await;
+    assert_eq!(base.applied, 2);
+    assert!(base.get(crate::cluster::KEY).await.unwrap().is_some());
+    db.close().await.unwrap();
+    state.apply_etcd(5, &put("k", "v")).await.unwrap();
+    assert_eq!((state.write_batches, queue.pushed()), (2, 5));
+    // The view of index 4 does not see the later write.
     assert_eq!(view.state().get(b"etcd/current/k").await.unwrap(), None);
     state.close().await.unwrap();
 }
@@ -297,7 +300,12 @@ async fn bases_switch_monotonically_and_release_covered_segments() {
     let mut state = open_shared(store.clone()).await;
     let mut written = 0;
     let writer = writer(&state).await;
-    for n in 0..10 {
+    // A reopen needs a checkpoint with the membership.
+    state.members = Arc::new(crate::cluster::Store::initial(
+        &[(1, "127.0.0.1:1".to_owned())].into(),
+    ));
+    state.seed_for_test(1).await.unwrap();
+    for n in 0..9 {
         state
             .apply_etcd(state.applied + 1, &put(&format!("k{n}"), "one"))
             .await
@@ -420,6 +428,34 @@ async fn the_cluster_claim_fixes_the_mode_and_the_quota() {
     );
 }
 
+/// Shared mode keeps the claim quota. A `SetQuota` entry stores only the apply position, so the
+/// overlay gets no batch and the next checkpoint holds no quota row.
+#[tokio::test]
+async fn shared_mode_ignores_a_set_quota_entry() {
+    let mut state = open_shared(Arc::new(InMemory::new())).await;
+    state.quota = 500;
+    state.set_quota_flag(1 << 20);
+    state.apply(1, None).await.unwrap();
+    let batches = state.write_batches;
+    let request = quota::ClusterQuota {
+        bytes: 7,
+        requested_at: 1,
+        member: 1,
+    };
+    state.apply_set_quota(2, request, false).await.unwrap();
+    assert_eq!(state.applied, 2);
+    assert_eq!(state.write_batches, batches);
+    assert_eq!((state.quota, state.quota_bytes()), (500, 500));
+    assert_eq!(state.cluster_quota(), None);
+    assert!(state.quota_mismatch());
+    assert!(state
+        .applied_state()
+        .get(quota::KEY)
+        .await
+        .unwrap()
+        .is_none());
+}
+
 #[tokio::test]
 async fn a_restart_writes_a_missing_bootstrap_marker() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -427,7 +463,7 @@ async fn a_restart_writes_a_missing_bootstrap_marker() {
     state.members = Arc::new(crate::cluster::Store::initial(
         &[(1, "127.0.0.1:1".to_owned())].into(),
     ));
-    state.apply(1, None).await.unwrap();
+    state.seed_for_test(1).await.unwrap();
     // The publisher stopped after its first checkpoint and before the marker.
     let mut written = 0;
     let writer = writer(&state).await;
@@ -533,7 +569,6 @@ async fn a_shared_backup_restores_into_a_replicated_cluster() {
         .await
         .unwrap();
     let mut state = open_shared(Arc::new(InMemory::new())).await;
-    reference.members_unsaved = true;
     // A small quota raises the space alarm, so the backups also hold an alarm row.
     for machine in [&mut state, &mut reference] {
         machine.quota = 400;
@@ -648,6 +683,11 @@ async fn stored_counter(state: &StateMachine) -> (u64, Option<crate::batch::Usag
 async fn a_checkpoint_with_an_eight_byte_total_reopens() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let mut state = open_shared(store.clone()).await;
+    // A reopen needs a checkpoint with the membership.
+    state.members = Arc::new(crate::cluster::Store::initial(
+        &[(1, "127.0.0.1:1".to_owned())].into(),
+    ));
+    state.seed_for_test(1).await.unwrap();
     for n in 0..10 {
         state
             .apply_etcd(state.applied + 1, &put(&format!("k{n}"), "one"))

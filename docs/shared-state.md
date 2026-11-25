@@ -111,13 +111,12 @@ The design depends on these rules. Later sections refer to them by number.
 ## Bootstrap
 
 1. The first leader creates `shared/state` when it opens the writer.
-2. The first entry that every member applies writes `etcd/members` from the bootstrap
-   configuration. All members start from the same configuration, so they write the same row.
-   Today each member writes it at its own next batch (`node.rs:328-336`).
+2. The first leader proposes `SeedMembers` with its membership. Every member stores that row
+   when it applies the entry. Until then, each member keeps its bootstrap membership in memory.
 3. Before a checkpoint exists, every member uses an empty base. Its overlay starts at index 1,
    and its log holds every entry.
-4. The first leader flushes and publishes the first checkpoint at once. It then writes
-   `shared/bootstrap.json`.
+4. The first leader publishes the first checkpoint after its first state batch, the seed. It
+   then writes `shared/bootstrap.json`.
 5. After `bootstrap.json` exists, a member never starts from an empty base. If it finds no
    checkpoint, it stops with an error. This prevents a replay onto empty state.
 
@@ -212,15 +211,14 @@ the index of the last state change.
 
 ## Determinism
 
-Today two inputs to apply differ by member. Each member keeps its own state, so the difference
-stays local. With a shared base, a member's view would change when its base switches. Shared
-mode removes both inputs:
+Two inputs to apply could differ by member. With a shared base, a member's view would change
+when its base switches. Shared mode removes both inputs:
 
-- **Quota.** `self.quota` is a member flag (`state/put_batch.rs:63-64`). Shared mode stores the
-  quota in the cluster claim, and every member reads it from there.
-- **`members_unsaved`.** One member sets it after an install or at bootstrap
-  (`state/snapshot.rs:120,145`, `node.rs:328-336`). Its next batch then adds `etcd/members`.
-  Shared mode writes `etcd/members` only when a configuration change applies.
+- **Quota.** Shared mode stores the quota in the cluster claim, and every member reads it from
+  there. It ignores the replicated `etcd/quota` row and `SetQuota` entries.
+- **Membership.** Only a `SeedMembers` entry and configuration changes write `etcd/members`.
+  The bootstrap membership of each member stays in memory. A restore writes the row once in
+  the shared database. The cluster claim compares only the voter IDs.
 
 DST must compare every member's view with one reference state to catch any other input.
 

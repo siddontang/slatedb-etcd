@@ -19,7 +19,7 @@ use crate::{Command, Operation, Reply};
 mod auth;
 mod backup;
 mod checkpoint;
-mod cluster;
+pub(crate) mod cluster;
 pub(crate) mod compaction;
 #[cfg(test)]
 pub(crate) mod compaction_tests;
@@ -30,6 +30,7 @@ mod kv;
 mod lease;
 pub(crate) mod overlay;
 pub(crate) mod put_batch;
+pub(crate) mod quota;
 mod read;
 pub(crate) mod rows;
 #[cfg(test)]
@@ -79,7 +80,16 @@ pub struct StateMachine {
     pub auth: Arc<crate::auth::Store>,
     pub members: Arc<crate::cluster::Store>,
     pub(crate) admin: Arc<slatedb::admin::Admin>,
+    /// The quota that apply uses. Zero disables it. See `quota`.
     pub quota: u64,
+    /// The effective flag value of this member. Replicated apply uses it without a cluster quota.
+    quota_flag: i64,
+    /// The quota of the last applied `SetQuota` entry. `None` in shared mode.
+    cluster_quota: Option<quota::ClusterQuota>,
+    /// The index of a first `SetQuota` entry that followed quota-checked entries, or zero.
+    /// Members checkpoint through it, so no log still holds those entries. The row keeps it, so
+    /// a restart can retry the checkpoint.
+    pub(crate) quota_boundary: u64,
     logical_bytes: crate::batch::Usage,
     pub(crate) current: current::CurrentRows,
     pub(crate) key_index: key_index::KeyIndex,
@@ -109,9 +119,18 @@ pub struct StateMachine {
     pub(crate) row_marker: Option<Arc<crate::storage::RowMarker>>,
     /// The object namespace and current database path. Snapshot installs replace the database.
     pub(crate) location: Arc<transfer::Location>,
-    /// The membership exists only in memory. The next write batch stores it. Shared mode does
-    /// not use it: the first applied entry stores the bootstrap membership.
+    /// The next write batch stores the in-memory membership. Only a log of an earlier binary
+    /// sets it. See `state::cluster`.
     pub(crate) members_unsaved: bool,
+    /// The length of the membership row that `before_entry` counted in the logical size before
+    /// the next batch stores it. See `state::cluster`.
+    members_counted: Option<usize>,
+    /// The stored `etcd/members` row, if any. See `cluster::MembersRow`.
+    pub(crate) members_row: Option<cluster::MembersRow>,
+    /// The leader of the last `SeedMembers` entry whose row digest differed from this row.
+    pub(crate) members_mismatch: Option<u64>,
+    /// The term and index of the last `SeedMembers` entry that compared the row.
+    pub(crate) members_checked: Option<(u64, u64)>,
     /// The state that apply reads: the live database, or the shared-mode overlay and base.
     reads: StateView,
     /// The overlay and base of shared state mode. `None` in replicated mode.
@@ -421,19 +440,23 @@ impl StateMachine {
             Some(data) => serde_json::from_slice(&data)?,
             None => vec![],
         };
-        let members = match reads.get(crate::cluster::KEY).await? {
-            Some(data) => serde_json::from_slice(&data)?,
-            None => crate::cluster::Store::default(),
-        };
+        let (members, members_row) = cluster::load(&reads, applied).await?;
         // Both modes store the counter row with the apply marker, so a base needs no full scan.
         // A shared base from an older binary has only the total in `shared::LOGICAL_BYTES`, and
         // its apply marker is past any counter row, so the open counts the split again.
         let logical_bytes = load_logical_size(&reads, applied).await?;
+        let (cluster_quota, quota_boundary) = match &shared {
+            Some(_) => (None, 0),
+            None => quota::load(&reads).await?,
+        };
         Ok(Self {
             members: Arc::new(members),
             admin,
             metrics: Arc::new(crate::metrics::StateMeters::new()?),
-            quota: 0,
+            quota: cluster_quota.map_or(0, |quota| quota.bytes.max(0) as u64),
+            quota_flag: 0,
+            cluster_quota,
+            quota_boundary,
             current: current::CurrentRows::default(),
             key_index: key_index::KeyIndex::load(&reads).await?,
             rows,
@@ -455,6 +478,10 @@ impl StateMachine {
             row_marker: None,
             location,
             members_unsaved: false,
+            members_counted: None,
+            members_row,
+            members_mismatch: None,
+            members_checked: None,
             reads,
             shared,
         })
@@ -513,11 +540,8 @@ impl StateMachine {
         size: crate::batch::Usage,
     ) -> Result<crate::batch::Usage> {
         let members_saved = self.members_unsaved;
-        // Shared mode stores the bootstrap membership in the first applied entry on every
-        // member, so the row does not depend on member-local events.
-        let first = self.is_shared() && self.applied == 0;
         if self.is_shared()
-            && !first
+            && !members_saved
             && batch
                 .keys()
                 .all(|key| key == APPLIED || key == APPLIED_TERM)
@@ -527,7 +551,12 @@ impl StateMachine {
             return Ok(size);
         }
         let mut size = size;
-        if (members_saved || first) && !batch.contains(crate::cluster::KEY) {
+        // The size of this batch counts the row that it stores, so remove the count of
+        // `before_entry`.
+        if let Some(counted) = self.members_counted.take() {
+            size.replace_row(crate::cluster::KEY, Some(counted), None)?;
+        }
+        if members_saved && !batch.contains(crate::cluster::KEY) {
             let value = serde_json::to_vec(self.members.as_ref())?;
             let old = self
                 .applied_state()
@@ -535,6 +564,7 @@ impl StateMachine {
                 .await?
                 .map(|v| v.len());
             size.replace_row(crate::cluster::KEY, old, Some(value.len()))?;
+            self.members_row = Some(cluster::MembersRow::new(&value, index));
             batch.put(crate::cluster::KEY, value);
         }
         // Format 4 rows are hash digests and Watch journals without Put values. Mark the

@@ -271,11 +271,38 @@ and pauses 2 ms between steps. Each step scans about 2,048 rows and writes one S
 A step first hashes the rows for the retained compaction hash. It then removes old history
 versions and their hash records in key order, removes old Watch events, and finishes the hash.
 All versions of one key change in the same step. Every replica applies the same steps at the
-same indexes, so quota accounting and snapshots stay deterministic.
+same indexes, so the logical size and snapshots stay deterministic.
 The progress record shares each step batch with the apply marker. A restart replays lost steps
 from the Raft log. A later Compact waits in the record until earlier boundaries finish.
 HashKV skips rows that the pending pass will remove, so its result does not depend on progress.
 Quota accounting uses the stored row lengths. Each deleted row contributes its original size once.
+
+Apply compares the logical size with the cluster quota in `etcd/quota`. A `SetQuota` entry
+writes that row, so every replica changes the quota at the same index. The row counts toward the
+logical size, like the alarms row. A replica with no row uses its own flag, as earlier binaries
+did, so replicas of such a state can differ. The leader proposes `SetQuota` right after its
+election, before its client writes. An entry applies only when its request is newer than the
+row: `(requested_at, member, bytes)` orders requests on every replica.
+
+A replica checkpoints through a first `SetQuota` entry that follows quota-checked entries. The
+row keeps that index, so a restart retries the checkpoint. So the log of a leader no longer
+holds such entries of earlier binaries. A new member installs a snapshot instead.
+A state that this binary created empty also stops before such an entry and requests a snapshot.
+See [quota changes](operations.md#change-the-quota).
+
+The `etcd/members` row also counts toward the logical size, so every replica must store the
+same bytes. The membership that a member builds from its `--peer` and `--client-peer` flags stays
+in memory. The leader proposes `SeedMembers` right after its election, before `SetQuota`. On a
+state without the row, this entry stores the membership of the leader. Later, cluster commands
+change the stored row, and a rejected command writes nothing. Raft snapshots carry the stored
+row and nothing else. A log of an earlier binary has other entries before any seed. Such an
+entry that finds no row stores the in-memory membership with its batch, as that binary did. A
+state that this binary created empty stops before such an entry and requests a snapshot, as for
+the quota. This guard works in both state modes. A local origin record says, for each guard,
+whether the state was created empty. It keeps the quota mark of #116, and a directory with
+history at the first start replays its membership entries as before. Each seed also carries a
+digest of the row of the leader. See [membership row](operations.md#membership-row).
+
 Each member flushes SlateDB outside ordered apply when a step finishes a physical boundary.
 Writes can apply during this flush. One flush can run at a time.
 The highest queued index covers intervening requests.

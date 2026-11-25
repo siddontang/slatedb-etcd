@@ -71,20 +71,35 @@ The version gauges match the version reported by Maintenance Status.
 `slatedb_etcd_logical_size_bytes` splits the in-use bytes by row kind. The `kind` label is
 `current`, `history` (versions and their hash digests), `watch_journal`, or `other`.
 The four values add up to `etcd_mvcc_db_total_size_in_use_in_bytes`.
-`slatedb_etcd_quota_warning_bytes` is the early-warning threshold: the quota times
+`slatedb_etcd_quota_warning_bytes` is the early-warning threshold: the cluster quota times
 `--quota-warning-fraction`. `slatedb_etcd_quota_warning` is one at or above it.
 The member also logs one warning when usage reaches the threshold.
 The log clears when usage falls below 95% of the threshold. Both gauges are absent when the
 quota or the warning is off.
-The quota gauge reports 2 GiB for zero, the configured capacity for a positive number,
-and the configured negative number when quota enforcement is off.
-Maintenance Status returns the configured value, as etcd does.
+The quota gauge reports the quota that apply uses. In replicated mode that is the cluster quota.
+With a flag of zero it is 2 GiB, as in etcd. A negative value, or zero in shared mode, means that
+quota enforcement is off. Maintenance Status returns the configured value, as etcd does, unless
+the cluster quota differs from it.
 
 The Raft owner snapshots local state for a scrape. The HTTP task reads the manifest.
 A blocking worker formats the result outside the Raft owner.
 Each member permits two concurrent scrapes and returns HTTP 503 on overload or timeout.
 A scrape can read one remote manifest when the member uses an object store.
 If this read fails or takes more than one second, the scrape omits only the physical size gauge.
+
+## Quota and membership gauges
+
+Every member also exports these gauges.
+
+| Gauge | Meaning |
+| --- | --- |
+| `slatedb_etcd_quota_flag_mismatch` | 1 while the member flag differs from the cluster quota |
+| `slatedb_etcd_members_mismatch` | 1 after the members row differed from the row of the leader |
+
+The gauge is 1 during a rolling quota change. A member whose flag did not change since the
+cluster took another value also keeps it at 1. See [quota changes](operations.md#change-the-quota).
+The membership gauge changes when a leader starts a term. See
+[membership row](operations.md#membership-row).
 
 ## Shared state gauges
 

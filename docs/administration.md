@@ -77,7 +77,9 @@ unavailable.
 Status returns local identity, Raft progress, size estimates, quota, and alarms.
 The gRPC health service checks quorum and local apply progress.
 `--quota-backend-bytes` limits logical data bytes. Zero selects the default 2 GiB limit.
-A negative value disables the limit.
+A negative value disables the limit. The members share one quota; see
+[quota changes](operations.md#change-the-quota). Status returns the flag, as etcd does, unless
+the cluster quota differs from it.
 The limit can be exceeded by one request. It does not reserve free disk space.
 NOSPACE alarms reject writes; deletion and compaction can free logical space before alarm disarm.
 

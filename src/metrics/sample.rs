@@ -89,6 +89,16 @@ impl Sample {
                 self.quota,
             ),
             (
+                "slatedb_etcd_quota_flag_mismatch",
+                "The quota flag of this member differs from the cluster quota.",
+                i64::from(self.quota_mismatch),
+            ),
+            (
+                "slatedb_etcd_members_mismatch",
+                "The members row of this member differed from the row of the leader.",
+                i64::from(self.members_mismatch),
+            ),
+            (
                 "etcd_mvcc_db_total_size_in_use_in_bytes",
                 "Logical backend bytes in use.",
                 self.usage.total() as i64,

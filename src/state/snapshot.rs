@@ -19,7 +19,9 @@ impl StateMachine {
         let db = self.database.clone();
         let metrics = self.metrics.clone();
         let applied = self.applied;
-        let members = serde_json::to_vec(self.members.as_ref())?;
+        // Shared mode ignores a cluster quota row from a converted state. A replicated restore
+        // of this image must not use that old value.
+        let shared = self.is_shared();
         Ok(async move {
             if let Some(db) = db {
                 metrics.flush_db(&db).await?;
@@ -31,14 +33,15 @@ impl StateMachine {
             let mut iterator = snapshot.scan_under(b"", &Default::default()).await?;
             while let Some(row) = iterator.next().await? {
                 // Format 4 readers reject the derived meta rows. Install takes the term from the
-                // Raft snapshot metadata and counts the logical size from the rows.
-                if row.key.as_ref() != crate::cluster::KEY && !derived_key(&row.key) {
+                // Raft snapshot metadata and counts the logical size from the rows. The stored
+                // membership row goes as it is. A state without it sends none, so the install
+                // stores no member-local row.
+                let quota_row = shared && row.key.as_ref() == quota::KEY;
+                if !derived_key(&row.key) && !quota_row {
                     crate::codec::write(&mut data, &(row.key, row.value))?;
                     count += 1;
                 }
             }
-            crate::codec::write(&mut data, &(crate::cluster::KEY, members))?;
-            count += 1;
             // Replace the vector length after streaming its rows in the same binary format.
             crate::codec::write(&mut &mut data[count_offset..], &count)?;
             data.shrink_to_fit();
@@ -119,14 +122,13 @@ impl StateMachine {
             Some(data) => serde_json::from_slice(&data)?,
             None => vec![],
         };
-        self.members = Arc::new(match self.applied_state().get(crate::cluster::KEY).await? {
-            Some(data) => serde_json::from_slice(&data)?,
-            None => crate::cluster::Store::default(),
-        });
+        self.reload_members().await?;
         self.auth = Arc::new(match self.applied_state().get(crate::auth::KEY).await? {
             Some(data) => serde_json::from_slice(&data)?,
             None => crate::auth::Store::default(),
         });
+        // The installed cluster quota replaces the current one. Without it, the flag applies.
+        self.reload_quota().await?;
         ensure!(
             self.compact_revision <= self.revision,
             "compaction exceeds current revision"
@@ -166,10 +168,10 @@ impl StateMachine {
         term: u64,
     ) -> Result<()> {
         if index <= self.applied {
-            // A bootstrap membership is stored by the first write after the install.
-            if index == self.applied && self.db().get(crate::cluster::KEY).await?.is_none() {
+            // A restart installs its durable snapshot again. A checkpoint without the row keeps
+            // the membership of the descriptor in memory only, as the first install did.
+            if index == self.applied && self.members_row.is_none() {
                 self.members = Arc::new(serde_json::from_slice(&descriptor.members)?);
-                self.members_unsaved = true;
             }
             return Ok(());
         }
@@ -196,12 +198,16 @@ impl StateMachine {
         let old_name = location.switch(&staging, index).await?;
         crate::failpoint::hit("snapshot-after-install-write");
         next.metrics = self.metrics.clone();
-        next.quota = self.quota;
+        // The copied state supplies the cluster quota, if any.
+        next.set_quota_flag(self.quota_flag());
         next.write_batches = self.write_batches;
         next.row_marker = self.row_marker.take();
         next.watch_capture = self.watch_capture.take();
-        next.members = Arc::new(serde_json::from_slice(&descriptor.members)?);
-        next.members_unsaved = true;
+        // The copied checkpoint holds the row, if the sender stored one. Without it, the
+        // membership of the sender stays in memory only, as the bootstrap membership does.
+        if next.members_row.is_none() {
+            next.members = Arc::new(serde_json::from_slice(&descriptor.members)?);
+        }
         let old = std::mem::replace(self, next);
         location.retire(old.db().clone(), old_name);
         drop(old);

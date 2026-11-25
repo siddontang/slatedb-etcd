@@ -1,7 +1,7 @@
 use super::*;
 use raft::eraftpb::{HardState, Snapshot};
 
-fn options(dir: &std::path::Path) -> NodeOptions {
+pub(super) fn options(dir: &std::path::Path) -> NodeOptions {
     NodeOptions {
         client_peers: BTreeMap::new(),
         transport: crate::tls::Transport::default(),
@@ -17,6 +17,7 @@ fn options(dir: &std::path::Path) -> NodeOptions {
         strict_reconfiguration: false,
         join: false,
         quota_bytes: 0,
+        quota_reassert: false,
         quota_warning_fraction: 0.0,
         auto_compaction: None,
         id: 1,
@@ -599,18 +600,9 @@ pub(super) async fn leader_node_with(
         vote.term = node.raw.raft.term + u64::from(kind == MessageType::MsgRequestPreVoteResponse);
         node.raw.step(vote).unwrap();
     }
-    node.drive_ready().await.unwrap();
-    node.drain_log().await.unwrap();
-    let mut ack = Message::default();
-    ack.set_msg_type(MessageType::MsgAppendResponse);
-    ack.from = 2;
-    ack.to = 1;
-    ack.term = node.raw.raft.term;
-    ack.index = node.raw.store().last_index().unwrap();
-    node.raw.step(ack).unwrap();
-    node.drive_ready().await.unwrap();
-    node.drain_log().await.unwrap();
-    node.drain_apply().await.unwrap();
+    // The seed of the first term, and then the digest of the new row. See `propose_members`.
+    commit_with_peer(&mut node).await;
+    commit_with_peer(&mut node).await;
     assert_eq!(node.raw.raft.state, StateRole::Leader);
     node
 }
@@ -1233,7 +1225,8 @@ async fn read_index_retries_after_the_first_commit_in_a_new_term() {
     confirm_read(&mut node, &id).await;
     node.drain_apply().await.unwrap();
     assert!(reply.await.unwrap().is_ok());
-    assert_eq!(node.raw.store().durable.last_index, 1);
+    // The empty entry, `SeedMembers`, and `SetQuota` of the new leader. Retries append none.
+    assert_eq!(node.raw.store().durable.last_index, 3);
     assert_eq!(node.raw.store().durable.sync_writes, syncs);
     assert!(node.reads.is_empty());
 }
@@ -1648,7 +1641,7 @@ async fn applied_state_enforces_the_effective_etcd_quota() {
     }
 }
 
-async fn commit_with_peer(node: &mut Node) {
+pub(super) async fn commit_with_peer(node: &mut Node) {
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
     let ack = Message {
@@ -2176,10 +2169,45 @@ async fn shared_quota_warning_uses_the_claimed_quota() {
         let node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
             .await
             .unwrap();
-        assert_eq!(node.quota, 10_240, "member {id}");
+        assert_eq!(node.state.quota_bytes, 10_240, "member {id}");
         assert_eq!(node.warning_bytes(), Some(8_192), "member {id}");
         nodes.push((node, receiver));
     }
+}
+
+use super::quota::tests as quota_tests;
+
+/// The early warning of #74 uses the cluster quota. It follows a changed and a restored
+/// cluster quota, not the flag.
+#[tokio::test]
+async fn the_quota_warning_follows_the_cluster_quota() {
+    let open = |dir: PathBuf| async move {
+        let mut config = options(&dir);
+        config.quota_bytes = 1 << 20;
+        config.quota_warning_fraction = 0.8;
+        let (events, _) = mpsc::channel(256);
+        Node::open_with_transport(config, events, Some(BTreeMap::new()))
+            .await
+            .unwrap()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    quota_tests::append_committed(dir.path(), 1, &[quota_tests::set_quota(10_240, 0, 2)]);
+    let mut node = open(dir.path().to_owned()).await;
+    assert_eq!(node.warning_bytes(), Some(838_861));
+    quota_tests::apply_committed(&mut node).await;
+    assert_eq!(node.warning_bytes(), Some(8_192));
+    drop(node);
+    quota_tests::append_committed(dir.path(), 2, &[quota_tests::set_quota(20_480, 7, 2)]);
+    let mut node = open(dir.path().to_owned()).await;
+    quota_tests::apply_committed(&mut node).await;
+    assert_eq!(node.warning_bytes(), Some(16_384));
+
+    let restored = tempfile::tempdir().unwrap();
+    let target = restored.path().join("member");
+    quota_tests::restore_with(restored.path(), &target, quota_tests::row(10_240, 3, 2)).await;
+    let mut node = open(target).await;
+    quota_tests::apply_committed(&mut node).await;
+    assert_eq!(node.warning_bytes(), Some(8_192));
 }
 
 /// A lone voter campaigns before the loop handles its first event. A member of a larger voter

@@ -62,6 +62,8 @@ pub struct ServerConfig {
     pub state_cache: crate::state::StateCache,
     /// Zero selects the default 2 GiB quota. A negative value disables the quota.
     pub quota_bytes: i64,
+    /// Request `quota_bytes` again with a new time at startup. See `NodeOptions`.
+    pub quota_reassert: bool,
     /// Quota usage fraction that raises the early warning. Zero disables the warning.
     pub quota_warning_fraction: f64,
     /// Automatic compaction retention, as etcd's `--auto-compaction-*` flags select it.
@@ -113,6 +115,7 @@ impl ServerConfig {
             log_memory: LogMemory::default(),
             state_cache: crate::state::StateCache::default(),
             quota_bytes: 0,
+            quota_reassert: false,
             quota_warning_fraction: DEFAULT_QUOTA_WARNING_FRACTION,
             auto_compaction: None,
             auth_token: "simple".into(),
@@ -278,12 +281,7 @@ impl Server {
         }
         let mut restore = None;
         if let Some(backup) = config.restore_snapshot.take() {
-            let mut members = crate::cluster::Store::initial(&config.peers);
-            for (&id, address) in &config.client_peers {
-                if let Some(member) = members.members.get_mut(&id) {
-                    member.client_ur_ls = vec![crate::cluster::url(address)];
-                }
-            }
+            let members = crate::cluster::Store::bootstrap(&config.peers, &config.client_peers);
             if config.state_mode.is_replicated() {
                 crate::state::StateMachine::restore_backup(
                     &backup,
@@ -334,6 +332,7 @@ impl Server {
                 log_memory: config.log_memory,
                 state_cache: config.state_cache,
                 quota_bytes: config.quota_bytes,
+                quota_reassert: config.quota_reassert,
                 quota_warning_fraction: config.quota_warning_fraction,
                 auto_compaction: config.auto_compaction,
                 strict_reconfiguration: config.strict_reconfiguration,

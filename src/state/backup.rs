@@ -48,7 +48,12 @@ impl StateMachine {
         members: &crate::cluster::Store,
     ) -> Result<shared::Restore> {
         check_restore_target(dir, id, members)?;
-        let (data, checksum) = restored_data(backup, members)?;
+        let (mut data, checksum) = restored_data(backup, members)?;
+        // The cluster claim sets the quota of shared mode.
+        data.rows.retain(|(key, _)| key != quota::KEY);
+        // The first view checkpoint must hold the membership. See `restored_data`.
+        data.rows
+            .push((crate::cluster::KEY.to_vec(), serde_json::to_vec(members)?));
         Ok(shared::Restore::new(data.rows, checksum))
     }
 }
@@ -69,6 +74,10 @@ fn check_restore_target(dir: &Path, id: u64, members: &crate::cluster::Store) ->
 /// Read and check a native snapshot, and rewrite it for a new cluster with `members`. The rows
 /// are at index 1, with new auth tokens and the alarms on a member of the new cluster.
 /// Also return the snapshot checksum in hexadecimal. It identifies the snapshot.
+///
+/// A replicated restore drops the membership row of the backup. Each member restores with its
+/// own flags, so the first leader of the new cluster seeds the row. A shared restore writes the
+/// rows once for all members, so it stores the membership of the restoring member.
 fn restored_data(backup: &Path, members: &crate::cluster::Store) -> Result<(SnapshotData, String)> {
     let mut bytes = vec![];
     std::fs::File::open(backup)?
@@ -117,8 +126,6 @@ fn restored_data(backup: &Path, members: &crate::cluster::Store) -> Result<(Snap
         .retain(|(key, _)| key != APPLIED && !derived_key(key) && key != crate::cluster::KEY);
     data.rows
         .push((APPLIED.to_vec(), 1_u64.to_be_bytes().to_vec()));
-    data.rows
-        .push((crate::cluster::KEY.to_vec(), serde_json::to_vec(members)?));
     data.applied = 1;
     data.version = crate::SNAPSHOT_FORMAT;
     let checksum = checksum.iter().map(|byte| format!("{byte:02x}")).collect();
