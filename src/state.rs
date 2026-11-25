@@ -268,10 +268,16 @@ impl StateMachine {
         // and pace SST writeback so a large flush does not stall Raft log syncs.
         let local = LocalFileSystem::new_with_prefix(dir)?.with_fsync(true);
         #[cfg(target_os = "linux")]
-        let object_store = Arc::new(crate::object::paced::PacedStore::new(local));
+        let (object_store, metrics) = {
+            let store = crate::object::paced::PacedStore::new(local);
+            // Local SSTs write faster while unflushed memtables pile up.
+            let metrics = store.backlog_recorder(slatedb_settings().max_unflushed_bytes);
+            (Arc::new(store), Some(metrics))
+        };
         #[cfg(not(target_os = "linux"))]
-        let object_store = Arc::new(local);
-        Self::open_store_with_cache(object_store, "state", cache).await
+        let (object_store, metrics) = (Arc::new(local), None);
+        let local = transfer::Backend::Local;
+        Self::open_backend(object_store, "state", cache, local, metrics).await
     }
 
     pub async fn open_store(
@@ -286,7 +292,7 @@ impl StateMachine {
         prefix: &str,
         cache: StateCache,
     ) -> Result<Self> {
-        Self::open_backend(object_store, prefix, cache, transfer::Backend::Local).await
+        Self::open_backend(object_store, prefix, cache, transfer::Backend::Local, None).await
     }
 
     pub(crate) async fn open_backend(
@@ -294,9 +300,11 @@ impl StateMachine {
         prefix: &str,
         cache: StateCache,
         backend: transfer::Backend,
+        metrics: Option<Arc<dyn slatedb_common::metrics::MetricsRecorder>>,
     ) -> Result<Self> {
         cache.validate()?;
-        let location = transfer::Location::open(object_store, prefix, backend, cache).await?;
+        let location =
+            transfer::Location::open(object_store, prefix, backend, cache, metrics).await?;
         let state = Self::open_at(location.clone(), &location.root()).await?;
         if let Err(error) = location.remove_orphans().await {
             tracing::warn!(%error, "cannot delete unused state databases");
@@ -312,12 +320,10 @@ impl StateMachine {
         let cache = cache.build();
         let settings = slatedb_settings();
         let admin = slatedb::admin::Admin::builder(root, object_store.clone()).build();
-        let builder = Db::builder(root, object_store);
-        // Local SSTs write faster while unflushed memtables pile up.
-        #[cfg(target_os = "linux")]
-        let builder = builder.with_metrics_recorder(crate::object::paced::backlog_recorder(
-            settings.max_unflushed_bytes,
-        ));
+        let mut builder = Db::builder(root, object_store);
+        if let Some(metrics) = &location.metrics {
+            builder = builder.with_metrics_recorder(metrics.clone());
+        }
         let db = builder
             .with_db_cache(cache, 0)
             .with_settings(settings)

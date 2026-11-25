@@ -276,7 +276,8 @@ impl Config {
         match mode {
             StateMode::Replicated => {
                 claim_replicated(store.as_ref(), &root, &prefix, cluster, &binding).await?;
-                StateMachine::open_backend(store, &format!("{prefix}/state"), cache, backend).await
+                StateMachine::open_backend(store, &format!("{prefix}/state"), cache, backend, None)
+                    .await
             }
             StateMode::Shared => {
                 let quota =
