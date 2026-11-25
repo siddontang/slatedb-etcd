@@ -583,6 +583,17 @@ mod tests {
         let loaded = KeyIndex::load(&db).await.unwrap();
         assert_eq!(loaded.len(), expected.len());
         assert_eq!(loaded.pin(u64::MAX).count(b"", &[0]), loaded.len() as i64);
+        // The ordered user keys, not only their number, match the visible keys.
+        let visible = |index: &KeyIndex| -> Vec<Arc<[u8]>> {
+            let ordered = index.order.keys.read().unwrap();
+            ordered
+                .keys
+                .iter()
+                .filter(|(_, presence)| presence.visible(u64::MAX))
+                .map(|(key, _)| key.clone())
+                .collect()
+        };
+        assert_eq!(visible(&loaded), visible(&expected));
         assert_eq!(loaded.lease_keys(3), expected.lease_keys(3));
         db.close().await.unwrap();
     }

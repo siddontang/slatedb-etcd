@@ -1066,6 +1066,40 @@ pub(super) mod tests {
         assert_eq!(node.raw.raft.raft_log.last_index(), 4);
     }
 
+    /// A lone voter on an empty directory campaigns before its first event. A write of that
+    /// event follows the term-start entries in the log, so the member can apply it.
+    #[tokio::test]
+    async fn a_lone_voter_seeds_its_log_before_the_first_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = options(dir.path());
+        config.peers = BTreeMap::from([(1, "127.0.0.1:1".to_string())]);
+        let (events, _) = mpsc::channel(256);
+        let mut node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
+            .await
+            .unwrap();
+        node.campaign_alone().unwrap();
+        assert_eq!(node.raw.raft.state, StateRole::Leader);
+        let (tx, _reply) = oneshot::channel();
+        node.propose(quota_put(1), ClientResponse::Kv(tx)).unwrap();
+        apply_committed(&mut node).await;
+        let entries = node
+            .raw
+            .raft
+            .raft_log
+            .entries(1, u64::MAX, raft::GetEntriesContext::empty(false))
+            .unwrap();
+        let commands: Vec<_> = entries
+            .iter()
+            .filter(|entry| !entry.data.is_empty())
+            .map(|entry| RaftCommand::decode(&entry.data).unwrap())
+            .collect();
+        assert!(matches!(commands[0], RaftCommand::SeedMembers(_)));
+        assert!(matches!(commands[1], RaftCommand::SetQuota { .. }));
+        assert!(matches!(commands[2], RaftCommand::Etcd { .. }));
+        assert!(node.quota.blocked().is_none());
+        assert_eq!(node.state.revision, 2);
+    }
+
     async fn open_node(dir: &Path, flag: i64, reassert: bool) -> Node {
         let mut config = options(dir);
         config.quota_bytes = flag;

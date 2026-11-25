@@ -757,6 +757,17 @@ impl Node {
         Ok(())
     }
 
+    /// Like etcd's election tick advance: a lone voter cannot lose an election, so it
+    /// campaigns at once instead of after a randomized timeout. Raft safety does not depend
+    /// on when a node campaigns. The new leader proposes its term-start entries before any
+    /// client write of the first event. The run loop then sees the role change.
+    fn campaign_alone(&mut self) -> Result<()> {
+        if self.raw.raft.prs().is_singleton() && self.raw.raft.promotable() {
+            self.raw.campaign()?;
+        }
+        self.propose_term_start()
+    }
+
     /// The shared-mode objects that the snapshot receive path opens.
     pub(crate) fn shared_source(&self) -> Option<std::sync::Arc<crate::state::shared::Source>> {
         self.writer.as_ref().map(|writer| writer.source.clone())
@@ -806,12 +817,7 @@ impl Node {
             self.raw.raft.term,
             self.raw.raft.leader_id,
         );
-        // Like etcd's election tick advance: a lone voter cannot lose an election, so it
-        // campaigns at once instead of after a randomized timeout. Raft safety does not depend
-        // on when a node campaigns. The loop then sees the role change from `old_role`.
-        if self.raw.raft.prs().is_singleton() && self.raw.raft.promotable() {
-            self.raw.campaign()?;
-        }
+        self.campaign_alone()?;
         loop {
             let mut step_responses = vec![];
             tokio::select! {
