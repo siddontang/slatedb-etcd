@@ -55,16 +55,18 @@ impl std::fmt::Display for TooLarge {
 
 impl std::error::Error for TooLarge {}
 
-/// The status of a failed backup: ResourceExhausted above a size limit, else `other`.
-pub(crate) fn backup_error(
-    error: anyhow::Error,
-    other: impl FnOnce(anyhow::Error) -> crate::mvcc::KvError,
-) -> crate::mvcc::KvError {
+/// The status of a failed backup: ResourceExhausted above a size limit. Other errors are
+/// storage reads, at the start or during the stream. They return Unavailable, as maintenance
+/// reads do, so clients retry them.
+pub(crate) fn backup_error(error: anyhow::Error) -> crate::mvcc::KvError {
     match error.downcast_ref::<TooLarge>() {
         Some(TooLarge(message)) => {
             crate::mvcc::KvError::new(tonic::Code::ResourceExhausted, message)
         }
-        None => other(error),
+        None => crate::mvcc::KvError::new(
+            tonic::Code::Unavailable,
+            &format!("snapshot failed: {error}"),
+        ),
     }
 }
 
@@ -483,6 +485,41 @@ pub(super) fn check(path: &Path) -> Result<Checked> {
     })
 }
 
+/// Send the copied rows of an image in batches of about `RESTORE_BATCH_BYTES`, then return
+/// its digest. Stop without reading the rest when the receiver goes away.
+fn read_batches(
+    path: &Path,
+    tx: &mpsc::Sender<Vec<(Bytes, Bytes)>>,
+) -> Result<[u8; DIGEST as usize]> {
+    let mut image = ImageFile::open(path)?;
+    let mut stopped = false;
+    let rows = (|| {
+        image.header()?;
+        let mut rows = vec![];
+        let mut bytes = 0;
+        while let Some((key, value)) = image.next()? {
+            if replaced(&key) {
+                continue;
+            }
+            bytes += key.len() + value.len();
+            rows.push((key, value));
+            if bytes >= RESTORE_BATCH_BYTES {
+                bytes = 0;
+                if tx.blocking_send(std::mem::take(&mut rows)).is_err() {
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+        if !rows.is_empty() && tx.blocking_send(rows).is_err() {
+            stopped = true;
+        }
+        Ok(())
+    })();
+    ensure!(!stopped, "the restore stopped");
+    image.finish(rows)
+}
+
 /// The value that a restored cluster stores for `key`.
 fn restored(key: &[u8], value: Bytes, member: u64) -> Result<Bytes> {
     if key == crate::auth::KEY {
@@ -522,7 +559,9 @@ impl StateMachine {
     ) -> Result<()> {
         check_restore_target(dir, id, members)?;
         let started = std::time::Instant::now();
-        let checked = check(backup)?;
+        // A large image reads for long. Keep the reads off the runtime that serves other members.
+        let path = backup.to_owned();
+        let checked = tokio::task::spawn_blocking(move || check(&path)).await??;
         tracing::info!(rows = checked.copied, elapsed = ?started.elapsed(), "checked the snapshot to restore");
         Self::restore_checked(&checked, dir, id, cluster_id, members, objects, cache).await
     }
@@ -542,7 +581,8 @@ impl StateMachine {
         // The Raft directory lock reserves the data directory, as at startup. Check the target
         // again under it: another restore or a started member can have taken it since the check
         // in `restore_backup`. Only then create the marker, so a losing restore leaves no marker.
-        let mut storage = crate::storage::RaftStorage::open(
+        // The identity follows the marker, so a crash before the marker leaves no identity.
+        let mut storage = crate::storage::RaftStorage::open_for_restore(
             &dir.join("raft"),
             id,
             cluster_id,
@@ -598,45 +638,38 @@ impl StateMachine {
         members: &crate::cluster::Store,
     ) -> Result<u64> {
         let member = *members.members.keys().next().unwrap();
-        let mut image = ImageFile::open(&checked.path)?;
+        // Read the image in the blocking pool, as `check` does, and write its batches here. A
+        // failed write drops the receiver, which stops the reader.
+        let (tx, mut rx) = mpsc::channel::<Vec<(Bytes, Bytes)>>(1);
+        let path = checked.path.clone();
+        let reader = tokio::task::spawn_blocking(move || read_batches(&path, &tx));
         let mut written = 0;
-        let rows = async {
-            image.header()?;
-            let mut batch = WriteBatch::new();
-            let mut bytes = 0;
+        let copied = async {
             let mut unflushed = 0;
-            while let Some((key, value)) = image.next()? {
-                if replaced(&key) {
-                    continue;
+            while let Some(rows) = rx.recv().await {
+                let mut batch = WriteBatch::new();
+                for (key, value) in rows {
+                    let value = restored(&key, value, member)?;
+                    unflushed += key.len() + value.len();
+                    // The database starts empty, and the check rules out duplicate keys.
+                    batch.put_new(key, value);
+                    written += 1;
                 }
-                let value = restored(&key, value, member)?;
-                bytes += key.len() + value.len();
-                // The database starts empty, and the check rules out duplicate keys.
-                batch.put_new(key, value);
-                written += 1;
-                if bytes >= RESTORE_BATCH_BYTES {
-                    self.store_restored(std::mem::take(&mut batch), written)
-                        .await?;
-                    unflushed += bytes;
-                    bytes = 0;
-                    if unflushed >= RESTORE_FLUSH_BYTES {
-                        self.metrics.flush_db(self.db()).await?;
-                        unflushed = 0;
-                    }
-                }
-            }
-            if !batch.is_empty() {
                 self.store_restored(batch, written).await?;
+                if unflushed >= RESTORE_FLUSH_BYTES {
+                    self.metrics.flush_db(self.db()).await?;
+                    unflushed = 0;
+                }
             }
-            Ok(())
+            anyhow::Ok(())
         }
         .await;
+        drop(rx);
+        let digest = reader.await?;
+        copied?;
         // The file can change after the check. Its digest must match the checked one before
         // the marker goes away.
-        ensure!(
-            image.finish(rows)? == checked.digest,
-            "snapshot changed during restore"
-        );
+        ensure!(digest? == checked.digest, "snapshot changed during restore");
         let index = written + 1;
         let mut batch = WriteBatch::new();
         batch.put(crate::cluster::KEY, serde_json::to_vec(members)?);

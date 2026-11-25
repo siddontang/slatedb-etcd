@@ -564,7 +564,7 @@ async fn a_shared_backup_restores_into_a_replicated_cluster() {
     assert_eq!(padded.rows, data.rows);
     // A shared image above the limit returns ResourceExhausted, as before streaming backups.
     let error = state.view_backup(1024).await.err().unwrap();
-    let error = super::backup::backup_error(error, crate::mvcc::KvError::storage);
+    let error = super::backup::backup_error(error);
     assert_eq!(
         error.code,
         tonic::Code::ResourceExhausted as i32,

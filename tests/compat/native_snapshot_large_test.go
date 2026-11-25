@@ -12,7 +12,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -121,29 +120,23 @@ func TestNativeSnapshotStreamsLargeState(t *testing.T) {
 		require.Less(t, peak-baseline, int64(64)<<20)
 	}
 
-	// Writes continue during this save. The image holds the applied state at one boundary.
-	var revisions sync.Map
-	done := make(chan struct{})
-	writer := make(chan error, 1)
-	go func() {
-		for i := 0; ; i++ {
-			select {
-			case <-done:
-				writer <- nil
-				return
-			default:
-			}
-			response, err := putRetrying(ctx, api, fmt.Sprintf("concurrent/%06d", i), "during save")
-			if err != nil {
-				writer <- err
-				return
-			}
-			revisions.Store(fmt.Sprintf("concurrent/%06d", i), response.Header.Revision)
-		}
-	}()
-	file, _ = save("concurrent.snapshot")
-	close(done)
-	require.NoError(t, <-writer)
+	// Writes do not wait for a save. Pause a save after its first MiB: a Put completes
+	// meanwhile, and the image, pinned at an earlier boundary, excludes it.
+	paused, err := api.Snapshot(ctx)
+	require.NoError(t, err)
+	file = filepath.Join(t.TempDir(), "concurrent.snapshot")
+	out, err := os.Create(file)
+	require.NoError(t, err)
+	_, err = io.CopyN(out, paused, 1024*1024)
+	require.NoError(t, err)
+	putCtx, putCancel := context.WithTimeout(ctx, 30*time.Second)
+	during, err := putRetrying(putCtx, api, "concurrent/during", "during save")
+	putCancel()
+	require.NoError(t, err)
+	_, err = io.Copy(out, paused)
+	require.NoError(t, err)
+	require.NoError(t, paused.Close())
+	require.NoError(t, out.Close())
 
 	started := time.Now()
 	restored := newClusterConfigured(t, 1, func(c *cluster) { c.readyTimeout = 10 * time.Minute },
@@ -161,11 +154,8 @@ func TestNativeSnapshotStreamsLargeState(t *testing.T) {
 	count, err := check.Get(ctx, "large/", clientv3.WithPrefix(), clientv3.WithCountOnly())
 	require.NoError(t, err)
 	require.Equal(t, int64(mib), count.Count)
-	// The image holds exactly the writes at or below its revision.
-	revisions.Range(func(key, revision any) bool {
-		result, err := check.Get(ctx, key.(string))
-		require.NoError(t, err)
-		require.Equal(t, revision.(int64) <= boundary, len(result.Kvs) == 1, key)
-		return true
-	})
+	require.Greater(t, during.Header.Revision, boundary)
+	result, err = check.Get(ctx, "concurrent/during")
+	require.NoError(t, err)
+	require.Empty(t, result.Kvs)
 }

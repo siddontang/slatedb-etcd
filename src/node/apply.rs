@@ -408,10 +408,10 @@ impl Executor {
                                 work.header.fill(stream.header.as_mut());
                                 Ok(stream)
                             }
-                            Err(error) => Err(crate::state::backup::backup_error(
-                                error,
-                                crate::mvcc::KvError::storage,
-                            )),
+                            Err(error) => {
+                                tracing::warn!(%error, "a native backup failed to start");
+                                Err(crate::state::backup::backup_error(error))
+                            }
                         },
                         Err(error) => Err(error),
                     };

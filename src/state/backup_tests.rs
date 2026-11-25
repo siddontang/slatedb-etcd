@@ -370,6 +370,24 @@ async fn restore_checked(
     .await
 }
 
+/// A backup that fails to read storage, at its start or during the stream, returns
+/// Unavailable, as a failed maintenance read does, so clients retry it. A shared backup reads
+/// its pinned view before it returns the stream. Only a size limit returns ResourceExhausted.
+#[test]
+fn a_failed_backup_read_is_retryable() {
+    let read = anyhow::Error::from(std::io::Error::other("an SST went away"));
+    let error = super::backup::backup_error(read);
+    assert_eq!(error.code, tonic::Code::Unavailable as i32, "{error:?}");
+    let error = super::backup::backup_error(
+        super::backup::row_size(b"k", &vec![0; MAX_ROW_BYTES]).unwrap_err(),
+    );
+    assert_eq!(
+        error.code,
+        tonic::Code::ResourceExhausted as i32,
+        "{error:?}"
+    );
+}
+
 /// A backup accepts only rows that a restore decodes. The auth row holds every user and role,
 /// so many small commands can grow it beyond one Raft entry.
 #[tokio::test]
@@ -385,7 +403,7 @@ async fn a_backup_rejects_a_row_that_restore_cannot_read() {
     let mut larger = value.clone();
     larger.push(b'v');
     let error = super::backup::row_size(&key, &larger).unwrap_err();
-    let error = super::backup::backup_error(error, crate::mvcc::KvError::storage);
+    let error = super::backup::backup_error(error);
     assert_eq!(error.code, tonic::Code::ResourceExhausted as i32);
     let path = dir.path().join("largest.snapshot");
     write_image(&path, vec![(key, value)]);
@@ -401,7 +419,7 @@ async fn a_backup_rejects_a_row_that_restore_cannot_read() {
         Ok(_) => panic!("the backup sent a row that restore rejects"),
         Err(error) => error,
     };
-    let error = super::backup::backup_error(error, crate::mvcc::KvError::storage);
+    let error = super::backup::backup_error(error);
     assert_eq!(
         error.code,
         tonic::Code::ResourceExhausted as i32,
@@ -506,6 +524,98 @@ async fn a_restore_does_not_index_the_copied_keys() {
     );
     restored.close().await.unwrap();
     source.close().await.unwrap();
+}
+
+/// A restore publishes its Raft identity only after its marker. A start that creates AutoTLS
+/// fixtures before it takes the Raft lock can take the directory between the first check and
+/// the reservation. The restore then fails and leaves the start its own identity. A crash
+/// after the reservation, before the marker, leaves no identity either.
+#[tokio::test]
+async fn a_restore_publishes_its_identity_only_after_its_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("native.snapshot");
+    write_image(&path, vec![(b"etcd/a".to_vec(), b"1".to_vec())]);
+    let objects = crate::object::Config::Local;
+    let target = dir.path().join("member");
+    std::fs::create_dir_all(target.join("fixtures")).unwrap();
+    let error = restore_checked(&path, &target, "backup-test", &objects)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("empty data directory"),
+        "{error:#}"
+    );
+    assert!(!target.join(RESTORE_MARKER).exists());
+    assert!(crate::storage::RaftStorage::stored_identity(&target.join("raft")).is_err());
+    // The other start, with another identity, opens the directory.
+    drop(crate::storage::RaftStorage::open(&target.join("raft"), 2, "other", vec![2]).unwrap());
+
+    // A crash right after the reservation.
+    let target = dir.path().join("crashed");
+    std::fs::create_dir_all(&target).unwrap();
+    drop(
+        crate::storage::RaftStorage::open_for_restore(
+            &target.join("raft"),
+            1,
+            "backup-test",
+            vec![1],
+        )
+        .unwrap(),
+    );
+    assert!(crate::storage::RaftStorage::stored_identity(&target.join("raft")).is_err());
+    // The completed restore has its identity, and the marker is gone.
+    let target = dir.path().join("restored");
+    restore(&path, &target).await.unwrap();
+    assert!(!target.join(RESTORE_MARKER).exists());
+    let storage = crate::storage::RaftStorage::open_existing(&target.join("raft")).unwrap();
+    assert_eq!(storage.snapshot_index(), 2);
+    assert!(storage.row_marker().is_marked());
+}
+
+/// `Server::start` restores on the runtime that serves other embedded members. The check reads
+/// the whole image, so it runs in the blocking pool, and a timer keeps firing meanwhile.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_check_does_not_stall_a_single_worker_runtime() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("native.snapshot");
+    let rows = (0..256)
+        .map(|n| (format!("etcd/{n:04}").into_bytes(), vec![b'v'; 64 * 1024]))
+        .collect();
+    write_image(&path, rows);
+    // A wrong digest fails the check after its full pass, before the restore writes anything.
+    let mut bytes = std::fs::read(&path).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    std::fs::write(&path, bytes).unwrap();
+    let started = std::time::Instant::now();
+    assert!(super::backup::check(&path).is_err());
+    let pass = started.elapsed();
+
+    let gap = Arc::new(AtomicU64::new(0));
+    let ticker = tokio::spawn({
+        let gap = gap.clone();
+        async move {
+            let mut last = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                let now = std::time::Instant::now();
+                gap.fetch_max((now - last).as_micros() as u64, Ordering::Relaxed);
+                last = now;
+            }
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let error = restore(&path, &dir.path().join("member"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("checksum mismatch"), "{error:#}");
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    ticker.abort();
+    let gap = Duration::from_micros(gap.load(Ordering::Relaxed));
+    assert!(
+        gap < pass / 4,
+        "the timer paused {gap:?} for a {pass:?} check"
+    );
 }
 
 /// An interrupted restore with S3 objects keeps its claim on the member namespace. Removing the
