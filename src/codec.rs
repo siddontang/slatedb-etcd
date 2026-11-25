@@ -23,3 +23,10 @@ pub(crate) fn write(
 ) -> Result<usize, EncodeError> {
     bincode::serde::encode_into_std_write(value, out, legacy())
 }
+
+/// Decode one value from `input`, allocating at most `LIMIT` bytes for it.
+pub(crate) fn read<T: DeserializeOwned, const LIMIT: usize>(
+    input: &mut impl std::io::Read,
+) -> Result<T, DecodeError> {
+    bincode::serde::decode_from_std_read(input, legacy().with_limit::<LIMIT>())
+}

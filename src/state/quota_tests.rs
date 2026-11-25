@@ -14,7 +14,7 @@ async fn check(state: &StateMachine) {
     assert!(state.key_index.matches(state.db()).await.unwrap());
 }
 
-fn put(key: &[u8], value: &[u8], lease: i64) -> RequestOp {
+pub(super) fn put(key: &[u8], value: &[u8], lease: i64) -> RequestOp {
     RequestOp {
         request: Some(Op::RequestPut(PutRequest {
             key: key.to_vec(),
@@ -301,9 +301,17 @@ async fn snapshot_import_requires_the_current_format() {
         1,
         "http://127.0.0.1:2380".into(),
     )]));
-    let error =
-        StateMachine::restore_backup(&path, &dir.path().join("restore"), 1, "test", &members)
-            .unwrap_err();
+    let error = StateMachine::restore_backup(
+        &path,
+        &dir.path().join("restore"),
+        1,
+        "test",
+        &members,
+        &crate::object::Config::Local,
+        StateCache::default(),
+    )
+    .await
+    .unwrap_err();
     assert!(error.to_string().contains("unsupported snapshot version"));
     state.close().await.unwrap();
 }
@@ -592,7 +600,7 @@ async fn images_and_backups_carry_the_cluster_quota() {
     super::tests::check_format_4_backup(&backup);
     let path = dir.path().join("restore");
     std::fs::create_dir(&path).unwrap();
-    let (mut restored, _) = super::tests::restore(&path, backup).await;
+    let mut restored = super::tests::restore(&path, backup).await;
     restored.set_quota_flag(1 << 20);
     assert_eq!(restored.cluster_quota(), Some(request(2000, 5, 1)));
     assert_eq!(restored.quota, 2000);

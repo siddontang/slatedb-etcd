@@ -879,6 +879,14 @@ pub(super) mod tests {
     }
 
     /// Append committed entries `first..` with `commands` to the Raft log of `dir`.
+    /// The Raft index of a restored member. A restore records its snapshot at the row count of
+    /// the backup plus one, so later entries start after it.
+    pub(in crate::node) fn restored_index(dir: &std::path::Path) -> u64 {
+        RaftStorage::open(&dir.join("raft"), 1, "worker-test", vec![1, 2, 3])
+            .unwrap()
+            .snapshot_index()
+    }
+
     pub(in crate::node) fn append_committed(
         dir: &std::path::Path,
         first: u64,
@@ -987,10 +995,20 @@ pub(super) mod tests {
         let target = dir.path().join("member");
         let config = options(&target);
         let members = crate::cluster::Store::initial(&config.peers);
-        StateMachine::restore_backup(&path, &target, 1, "worker-test", &members).unwrap();
-        // The restored log starts at index 1. Later entries follow it.
+        StateMachine::restore_backup(
+            &path,
+            &target,
+            1,
+            "worker-test",
+            &members,
+            &config.object_store,
+            config.state_cache,
+        )
+        .await
+        .unwrap();
+        // Later entries follow the restored snapshot.
         let commands: Vec<_> = (1..=40).map(quota_put).collect();
-        append_committed(&target, 2, &commands);
+        append_committed(&target, restored_index(&target) + 1, &commands);
         let mut config = options(&target);
         config.quota_bytes = 1 << 20;
         let (events, _) = mpsc::channel(256);
@@ -1129,7 +1147,12 @@ pub(super) mod tests {
     }
 
     /// Restore a native backup of a state with the cluster quota `quota` into `target`.
-    pub(in crate::node) async fn restore_with(dir: &Path, target: &Path, quota: ClusterQuota) {
+    /// Restore a backup that holds `quota` into `target`. Return the restored Raft index.
+    pub(in crate::node) async fn restore_with(
+        dir: &Path,
+        target: &Path,
+        quota: ClusterQuota,
+    ) -> u64 {
         let mut source = StateMachine::open(&dir.join("source")).await.unwrap();
         source.apply_set_quota(1, quota, false).await.unwrap();
         let image = source.snapshot_data().await.unwrap();
@@ -1140,7 +1163,18 @@ pub(super) mod tests {
         let path = dir.join("backup");
         std::fs::write(&path, backup).unwrap();
         let members = crate::cluster::Store::initial(&options(target).peers);
-        StateMachine::restore_backup(&path, target, 1, "worker-test", &members).unwrap();
+        StateMachine::restore_backup(
+            &path,
+            target,
+            1,
+            "worker-test",
+            &members,
+            &crate::object::Config::Local,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        restored_index(target)
     }
 
     /// A snapshot install moves a member past its pending request. A newer quota in the snapshot
@@ -1636,8 +1670,8 @@ pub(super) mod tests {
     async fn a_newer_request_with_an_older_value_survives_the_replay() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("member");
-        restore_with(temp.path(), &dir, row(200, 10, 2)).await;
-        append_committed(&dir, 2, &[set_quota(300, 30, 2)]);
+        let index = restore_with(temp.path(), &dir, row(200, 10, 2)).await;
+        append_committed(&dir, index + 1, &[set_quota(300, 30, 2)]);
         Quota::open(&dir, startup(100, 10, false, false)).unwrap();
         Quota::open(&dir, startup(200, 40, false, false)).unwrap();
         let mut node = open_node(&dir, 200, false).await;
@@ -1646,7 +1680,7 @@ pub(super) mod tests {
         let (request, seed) = leader_request(&node).unwrap();
         assert_eq!((request, seed), (row(200, 40, 1), false));
         drop(node);
-        append_committed(&dir, 3, &[set_quota(200, 40, 1)]);
+        append_committed(&dir, index + 2, &[set_quota(200, 40, 1)]);
         let mut node = open_node(&dir, 200, false).await;
         apply_committed(&mut node).await;
         assert_eq!(node.state.cluster_quota, Some(row(200, 40, 1)));
@@ -1659,14 +1693,14 @@ pub(super) mod tests {
     async fn a_newer_request_with_the_same_value_advances_the_row_once() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("member");
-        restore_with(temp.path(), &dir, row(200, 10, 2)).await;
+        let index = restore_with(temp.path(), &dir, row(200, 10, 2)).await;
         Quota::open(&dir, startup(100, 5, false, false)).unwrap();
         Quota::open(&dir, startup(200, 40, false, false)).unwrap();
         let mut node = open_node(&dir, 200, false).await;
         apply_committed(&mut node).await;
         assert_eq!(leader_request(&node), Some((row(200, 40, 1), false)));
         drop(node);
-        append_committed(&dir, 2, &[set_quota(200, 40, 1)]);
+        append_committed(&dir, index + 1, &[set_quota(200, 40, 1)]);
         let mut node = open_node(&dir, 200, false).await;
         apply_committed(&mut node).await;
         assert_eq!(node.state.cluster_quota, Some(row(200, 40, 1)));

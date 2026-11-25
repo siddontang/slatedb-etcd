@@ -2113,6 +2113,47 @@ async fn a_snapshot_that_raft_skips_releases_its_staging_reservation() {
     state.close().await.unwrap();
 }
 
+type Hook = Box<dyn FnOnce(&std::path::Path)>;
+
+thread_local! {
+    /// Runs in `Node::open` between the first restore marker check and the Raft lock.
+    pub(super) static BEFORE_RAFT_LOCK: std::cell::Cell<Option<Hook>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[tokio::test]
+async fn a_restore_marker_created_after_the_first_check_blocks_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    // A restore takes the lock after the first check, creates its marker, and fails.
+    BEFORE_RAFT_LOCK.with(|hook| {
+        hook.set(Some(Box::new(|dir| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(crate::state::backup::RESTORE_MARKER), b"").unwrap();
+        })))
+    });
+    let (events, _) = mpsc::channel(256);
+    let error = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("interrupted snapshot restore"));
+}
+
+#[tokio::test]
+async fn an_interrupted_restore_blocks_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(crate::state::backup::RESTORE_MARKER), b"").unwrap();
+    let (events, _) = mpsc::channel(256);
+    let error = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("interrupted snapshot restore"));
+    // Recovery deletes an S3 namespace only after it compares the owner.
+    assert!(error.to_string().contains("owner.json"), "{error}");
+    assert!(!dir.path().join("raft").exists());
+}
+
 /// The warning threshold is the first whole byte count at or above `quota * fraction`. The
 /// gauge and the log both compare usage with it.
 #[test]

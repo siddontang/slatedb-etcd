@@ -17,7 +17,9 @@ use crate::proto::etcdserverpb::{CompactionRequest, CompactionResponse, RequestO
 use crate::{Command, Operation, Reply};
 
 mod auth;
-mod backup;
+pub(crate) mod backup;
+#[cfg(test)]
+mod backup_tests;
 mod checkpoint;
 pub(crate) mod cluster;
 pub(crate) mod compaction;
@@ -592,29 +594,14 @@ impl StateMachine {
             self.members_row = Some(cluster::MembersRow::new(&value, index));
             batch.put(crate::cluster::KEY, value);
         }
-        // Format 4 rows are hash digests and Watch journals without Put values. Mark the
-        // directory durably before SlateDB can hold the first of them. Earlier batches, such as
-        // empty entries and membership changes, leave the directory readable by older binaries.
-        if let Some(marker) = &self.row_marker {
-            if !marker.is_marked()
-                && (batch.puts_under(crate::maintenance::HASH)
-                    || batch.puts_under(crate::watch::EVENTS))
-            {
-                marker.mark()?;
-            }
-        }
+        self.mark_format_4(&batch)?;
         // Drop shared rows before SlateDB may expose the change. See `rows`.
         for key in batch.keys() {
             if let Some(key) = key.strip_prefix(mvcc::CURRENT) {
                 self.rows.invalidate(key, index);
             }
         }
-        // The counters are outside `etcd/`, so they do not count themselves. Shared mode also
-        // keeps the eight-byte total, which older readers of the shared base load.
-        if self.is_shared() {
-            batch.put(shared::LOGICAL_BYTES, size.total().to_be_bytes());
-        }
-        batch.put(LOGICAL_SIZE, logical_size_row(index, size));
+        self.put_logical_size(&mut batch, index, size);
         let batch = Arc::new(batch);
         match &mut self.shared {
             None => {
@@ -638,6 +625,31 @@ impl StateMachine {
         }
         self.key_index.commit(index);
         Ok(size)
+    }
+
+    /// Format 4 rows are hash digests and Watch journals without Put values. Mark the
+    /// directory durably before SlateDB can hold the first of them. Earlier batches, such as
+    /// empty entries and membership changes, leave the directory readable by older binaries.
+    fn mark_format_4(&self, batch: &WriteBatch) -> Result<()> {
+        if let Some(marker) = &self.row_marker {
+            if !marker.is_marked()
+                && (batch.puts_under(crate::maintenance::HASH)
+                    || batch.puts_under(crate::watch::EVENTS))
+            {
+                marker.mark()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Store the logical size `size` at `index` in `batch`.
+    fn put_logical_size(&self, batch: &mut WriteBatch, index: u64, size: crate::batch::Usage) {
+        // The counters are outside `etcd/`, so they do not count themselves. Shared mode also
+        // keeps the eight-byte total, which older readers of the shared base load.
+        if self.is_shared() {
+            batch.put(shared::LOGICAL_BYTES, size.total().to_be_bytes());
+        }
+        batch.put(LOGICAL_SIZE, logical_size_row(index, size));
     }
 
     /// Return the Watch events of the work since `previous`, if capture is enabled.
