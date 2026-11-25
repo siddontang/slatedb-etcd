@@ -216,7 +216,7 @@ static SOURCES: LazyLock<Mutex<HashMap<String, Weak<Location>>>> =
 pub struct Location {
     store: Arc<dyn ObjectStore>,
     base: String,
-    backend: Backend,
+    pub(crate) backend: Backend,
     namespace: String,
     /// The name of the first database. Later databases are `<first>-N`.
     first: String,

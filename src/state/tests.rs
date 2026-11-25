@@ -1082,6 +1082,38 @@ fn slatedb_settings_bound_compaction_buffers() {
     );
 }
 
+/// A remote store keeps SlateDB's GC retention: a cold scan there can outlive a short
+/// compactor checkpoint, and GC would delete an SST that the scan still needs.
+#[test]
+fn member_settings_shorten_gc_only_on_local_disk() {
+    let defaults = Settings::default();
+    let lifetime = |settings: &Settings| {
+        settings
+            .compactor_options
+            .as_ref()
+            .unwrap()
+            .checkpoint_lifetime
+    };
+    let interval = |settings: &Settings| {
+        let gc = settings.garbage_collector_options.as_ref().unwrap();
+        gc.compacted_options.as_ref().unwrap().interval
+    };
+    let s3 = member_settings(&transfer::Backend::S3 {
+        bucket: "bucket".into(),
+        endpoint: None,
+        region: "us-east-1".into(),
+    });
+    s3.validate().unwrap();
+    assert_eq!(lifetime(&s3), lifetime(&defaults));
+    assert_eq!(interval(&s3), interval(&defaults));
+    assert_eq!(lifetime(&slatedb_settings()), lifetime(&defaults));
+    let local = member_settings(&transfer::Backend::Local);
+    local.validate().unwrap();
+    assert_eq!(lifetime(&local), COMPACTOR_CHECKPOINT_LIFETIME);
+    assert_eq!(interval(&local), Some(COMPACTED_GC_INTERVAL));
+    assert!(lifetime(&local) < lifetime(&defaults));
+}
+
 /// The directory gets the row marker before its first hash or Watch journal row, on both the
 /// general and the batched put path, and not for writes that keep format 3 rows.
 #[tokio::test]

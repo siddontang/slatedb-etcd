@@ -244,12 +244,26 @@ pub(crate) fn slatedb_settings() -> Settings {
             worker.max_fetch_tasks = COMPACTION_FETCH_TASKS;
             worker.bytes_to_fetch = COMPACTION_FETCH_BYTES;
         }
+    }
+    settings
+}
+
+/// SlateDB settings for the state machine of one member in `backend`.
+///
+/// Compaction rewrites the sorted runs several times while a large data set loads. Each replaced
+/// SST stays until its compactor checkpoint expires and the next GC run, which took 15 to 25
+/// minutes with SlateDB's defaults: 2-3 times the live data on disk. A local store frees them
+/// within minutes. A remote store keeps the defaults: a cold scan that fetches one block at a
+/// time, such as the index rebuild at open or a large DeleteRange, can run for minutes there.
+/// GC keeps its default minimum age.
+pub(crate) fn member_settings(backend: &transfer::Backend) -> Settings {
+    let mut settings = slatedb_settings();
+    if *backend != transfer::Backend::Local {
+        return settings;
+    }
+    if let Some(compactor) = settings.compactor_options.as_mut() {
         compactor.checkpoint_lifetime = COMPACTOR_CHECKPOINT_LIFETIME;
     }
-    // Compaction rewrites the sorted runs several times while a large data set loads. Each
-    // replaced SST stays until its compactor checkpoint expires and the next GC run, which took
-    // 15 to 25 minutes with SlateDB's defaults: 2-3 times the live data on disk. GC keeps its
-    // default minimum age.
     if let Some(gc) = settings.garbage_collector_options.as_mut() {
         if let Some(compacted) = gc.compacted_options.as_mut() {
             compacted.interval = Some(COMPACTED_GC_INTERVAL);
@@ -264,11 +278,11 @@ const COMPACTED_GC_INTERVAL: Duration = Duration::from_secs(60);
 /// How long a compaction keeps its input SSTs for iterators that started before it. SlateDB
 /// defaults to 15 minutes.
 ///
-/// A read fails if it still iterates an input SST after this time. The iterators of this server
-/// are short: client reads stop at a 5 s deadline, and Watch catch-up and MVCC compaction scan in
-/// pages. HashKV and the usage count of an older directory scan once, which takes seconds per
-/// GiB. A state transfer copies a named checkpoint, and shared-mode views read their base
-/// checkpoints, so neither depends on this lifetime.
+/// A read fails if it still iterates an input SST after this time. On a local store the
+/// iterators of this server are short: client reads stop at a 5 s deadline, and Watch catch-up
+/// and MVCC compaction scan in pages. The index rebuild at open, a DeleteRange, HashKV, export
+/// and the usage count of an older directory scan once, which takes seconds per GiB. A state
+/// transfer copies a named checkpoint, so it does not depend on this lifetime.
 const COMPACTOR_CHECKPOINT_LIFETIME: Duration = Duration::from_secs(5 * 60);
 
 /// Read the stored logical size, or count it when the counter does not match the apply marker.
@@ -399,7 +413,7 @@ impl StateMachine {
         let object_store = location.store();
         let rows = Arc::new(rows::RowCache::new(cache.row_bytes));
         let cache = cache.build();
-        let settings = slatedb_settings();
+        let settings = member_settings(&location.backend);
         let admin = slatedb::admin::Admin::builder(root, object_store.clone()).build();
         let db = Db::builder(root, object_store)
             .with_db_cache(cache, 0)
