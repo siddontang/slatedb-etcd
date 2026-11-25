@@ -2482,6 +2482,83 @@ async fn every_member_with_another_row_reports_it_after_a_full_restart() {
     }
 }
 
+/// An earlier binary wrote only membership entries. A new member that waits on one does not
+/// lead, in an election or a transfer. In an election, the next leader proposes `SeedMembers`
+/// and `SetQuota` before any other entry of its term, and the member catches up by snapshot.
+#[tokio::test]
+async fn a_member_waiting_on_a_membership_entry_does_not_lead() {
+    for transfer in [false, true] {
+        let mut sim = Simulation::with_holds(17, false, BTreeMap::new(), false, true, true).await;
+        sim.settle(3).await;
+        let leader = sim.leader().unwrap();
+        let publish = RaftCommand::Cluster {
+            id: "publish-2".into(),
+            request: crate::cluster::Command::Publish {
+                id: 2,
+                client_urls: vec!["http://localhost:2381".into()],
+            },
+            credentials: Default::default(),
+        };
+        sim.admin_command(publish).await.result.unwrap();
+        sim.settle(2).await;
+        let waiting = sim.follower(0);
+        sim.replace(waiting, 0).await;
+        sim.until_waiting(waiting).await;
+        assert!(sim.nodes[&waiting].state.members_row.is_none());
+        // Members of this binary lead from here.
+        sim.hold_members = false;
+        for node in sim.nodes.values_mut() {
+            node.hold_members = false;
+        }
+        sim.release_quota();
+        if transfer {
+            sim.nodes
+                .get_mut(&leader)
+                .unwrap()
+                .raw
+                .transfer_leader(waiting);
+        } else {
+            sim.stop(leader);
+            sim.messages
+                .retain(|message| message.to != leader && message.from != leader);
+        }
+        sim.settle_without(waiting, 30).await;
+        let now = sim.leader().unwrap();
+        assert_ne!(now, waiting);
+        assert_eq!(
+            sim.nodes[&waiting].quota.blocked(),
+            None,
+            "transfer {transfer}"
+        );
+        assert_eq!(
+            sim.nodes[&waiting].state.applied,
+            sim.nodes[&now].state.applied
+        );
+        assert!(sim.nodes[&waiting].state.members_row.is_some());
+        if !transfer {
+            let term = sim.nodes[&now].raw.raft.term;
+            let commands: Vec<_> = sim
+                .committed_entries
+                .values()
+                .map(|data| Entry::decode(data.as_slice()).unwrap())
+                .filter(|entry| entry.term == term && !entry.data.is_empty())
+                .map(|entry| RaftCommand::decode(&entry.data).unwrap())
+                .collect();
+            assert!(
+                matches!(
+                    commands.as_slice(),
+                    [
+                        RaftCommand::SeedMembers(_),
+                        RaftCommand::SetQuota { .. },
+                        ..
+                    ]
+                ),
+                "{commands:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn truncation_without_an_image_recovers_and_serves_an_on_demand_snapshot() {
     let mut sim = Simulation::new(7).await;

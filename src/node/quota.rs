@@ -1405,6 +1405,40 @@ pub(super) mod tests {
         assert!(matches!(node.raw.raft.lead_transferee, Some(2 | 3)));
     }
 
+    /// A member that waits on an earlier binary's membership entry and still wins hands
+    /// leadership over. It appends neither `SeedMembers` nor `SetQuota` in its term.
+    #[tokio::test]
+    async fn a_member_waiting_on_a_membership_entry_hands_over_without_seeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = waiting_member(dir.path(), &[publish()], 32 << 20).await;
+        drive(&mut node).await;
+        assert_eq!(node.quota.blocked(), Some(1));
+        node.raw.campaign().unwrap();
+        for kind in [
+            MessageType::MsgRequestPreVoteResponse,
+            MessageType::MsgRequestVoteResponse,
+        ] {
+            let term =
+                node.raw.raft.term + u64::from(kind == MessageType::MsgRequestPreVoteResponse);
+            let (tx, _) = oneshot::channel();
+            node.handle(Event::Step(message(kind, 2, term), tx), &mut vec![])
+                .await
+                .unwrap();
+        }
+        drive(&mut node).await;
+        node.tick().unwrap();
+        assert_eq!(node.raw.raft.state, StateRole::Leader);
+        assert!(matches!(node.raw.raft.lead_transferee, Some(2 | 3)));
+        let entries = node
+            .raw
+            .raft
+            .raft_log
+            .entries(2, u64::MAX, raft::GetEntriesContext::empty(false))
+            .unwrap();
+        assert!(!entries.is_empty());
+        assert!(entries.iter().all(|entry| entry.data.is_empty()));
+    }
+
     /// The row keeps the index of a first cluster quota after an earlier binary. A restart
     /// before the Raft checkpoint still truncates the log through it.
     #[tokio::test]

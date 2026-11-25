@@ -135,7 +135,7 @@ The `etcd/members` row is cluster state, and the quota counts its bytes.
 - An earlier binary stored the flags of each member. Members with other URL text then hold other
   rows. Repair such a member as for a quota difference above.
 - A new member does not apply an earlier binary's entries before the first seed. It asks the
-  leader for a snapshot, as for the quota.
+  leader for a snapshot and does not lead until it installs one, as for the quota.
 
 Keep the entire Raft directory, including its checkpoint data file, when moving a member.
 Older binaries reject the Raft identity after the first checkpoint in the new layout.
