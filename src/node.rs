@@ -704,6 +704,12 @@ impl Node {
             self.raw.raft.term,
             self.raw.raft.leader_id,
         );
+        // Like etcd's election tick advance: a lone voter cannot lose an election, so it
+        // campaigns at once instead of after a randomized timeout. Raft safety does not depend
+        // on when a node campaigns. The loop then sees the role change from `old_role`.
+        if self.raw.raft.prs().is_singleton() && self.raw.raft.promotable() {
+            self.raw.campaign()?;
+        }
         loop {
             let mut step_responses = vec![];
             tokio::select! {
