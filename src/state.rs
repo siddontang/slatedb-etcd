@@ -17,9 +17,11 @@ use crate::proto::etcdserverpb::{CompactionRequest, CompactionResponse, RequestO
 use crate::{Command, Operation, Reply};
 
 mod auth;
-mod backup;
+pub(crate) mod backup;
+#[cfg(test)]
+mod backup_tests;
 mod checkpoint;
-mod cluster;
+pub(crate) mod cluster;
 pub(crate) mod compaction;
 #[cfg(test)]
 pub(crate) mod compaction_tests;
@@ -30,6 +32,7 @@ mod kv;
 mod lease;
 pub(crate) mod overlay;
 pub(crate) mod put_batch;
+pub(crate) mod quota;
 mod read;
 pub(crate) mod rows;
 #[cfg(test)]
@@ -43,6 +46,8 @@ pub(crate) use read::ReadView;
 pub use shared::{StateMode, ViewRetention};
 pub use source::{Row, StateRead, StateScan};
 use view::StateView;
+#[cfg(test)]
+mod history_tests;
 #[cfg(test)]
 mod key_index_tests;
 #[cfg(test)]
@@ -77,8 +82,17 @@ pub struct StateMachine {
     pub auth: Arc<crate::auth::Store>,
     pub members: Arc<crate::cluster::Store>,
     pub(crate) admin: Arc<slatedb::admin::Admin>,
+    /// The quota that apply uses. Zero disables it. See `quota`.
     pub quota: u64,
-    logical_bytes: u64,
+    /// The effective flag value of this member. Replicated apply uses it without a cluster quota.
+    quota_flag: i64,
+    /// The quota of the last applied `SetQuota` entry. `None` in shared mode.
+    cluster_quota: Option<quota::ClusterQuota>,
+    /// The index of a first `SetQuota` entry that followed quota-checked entries, or zero.
+    /// Members checkpoint through it, so no log still holds those entries. The row keeps it, so
+    /// a restart can retry the checkpoint.
+    pub(crate) quota_boundary: u64,
+    logical_bytes: crate::batch::Usage,
     pub(crate) current: current::CurrentRows,
     pub(crate) key_index: key_index::KeyIndex,
     /// Current rows shared by pinned point reads.
@@ -107,9 +121,18 @@ pub struct StateMachine {
     pub(crate) row_marker: Option<Arc<crate::storage::RowMarker>>,
     /// The object namespace and current database path. Snapshot installs replace the database.
     pub(crate) location: Arc<transfer::Location>,
-    /// The membership exists only in memory. The next write batch stores it. Shared mode does
-    /// not use it: the first applied entry stores the bootstrap membership.
+    /// The next write batch stores the in-memory membership. Only a log of an earlier binary
+    /// sets it. See `state::cluster`.
     pub(crate) members_unsaved: bool,
+    /// The length of the membership row that `before_entry` counted in the logical size before
+    /// the next batch stores it. See `state::cluster`.
+    members_counted: Option<usize>,
+    /// The stored `etcd/members` row, if any. See `cluster::MembersRow`.
+    pub(crate) members_row: Option<cluster::MembersRow>,
+    /// The leader of the last `SeedMembers` entry whose row digest differed from this row.
+    pub(crate) members_mismatch: Option<u64>,
+    /// The term and index of the last `SeedMembers` entry that compared the row.
+    pub(crate) members_checked: Option<(u64, u64)>,
     /// The state that apply reads: the live database, or the shared-mode overlay and base.
     reads: StateView,
     /// The overlay and base of shared state mode. `None` in replicated mode.
@@ -230,28 +253,73 @@ pub(crate) fn slatedb_settings() -> Settings {
 /// Read the stored logical size, or count it when the counter does not match the apply marker.
 ///
 /// Directories from older binaries have no counter. An older binary that writes to a directory
-/// moves the apply marker past the counter, so the next open counts again.
-async fn load_logical_size(db: &impl StateRead, applied: u64) -> Result<u64> {
+/// moves the apply marker past the counter, so the next open counts again. A counter without the
+/// split by row kind also comes from an older binary, so it is counted again too.
+async fn load_logical_size(db: &impl StateRead, applied: u64) -> Result<crate::batch::Usage> {
     use prost::Message;
     let stored = match db.get(LOGICAL_SIZE).await? {
         Some(row) => {
             let counter =
                 crate::proto::state::LogicalSize::decode(row).context("invalid size counter")?;
-            (counter.applied == applied).then_some(counter.bytes)
+            stored_usage(&counter, applied)?
         }
         None => None,
     };
-    let Some(bytes) = stored else {
-        return maintenance::count_logical_size(db).await;
+    let Some(size) = stored else {
+        return maintenance::count_logical_usage(db).await;
     };
     if cfg!(debug_assertions) {
-        let counted = maintenance::count_logical_size(db).await?;
+        let counted = maintenance::count_logical_usage(db).await?;
         ensure!(
-            counted == bytes,
-            "stored logical size {bytes} differs from the counted size {counted}"
+            counted == size,
+            "stored logical size {size:?} differs from the counted size {counted:?}"
         );
     }
-    Ok(bytes)
+    Ok(size)
+}
+
+/// The usage in `counter` if it belongs to `applied` and carries the split by row kind.
+fn stored_usage(
+    counter: &crate::proto::state::LogicalSize,
+    applied: u64,
+) -> Result<Option<crate::batch::Usage>> {
+    if counter.applied != applied {
+        return Ok(None);
+    }
+    let (Some(current), Some(history), Some(journal), Some(other)) = (
+        counter.current,
+        counter.history,
+        counter.journal,
+        counter.other,
+    ) else {
+        return Ok(None);
+    };
+    let size = crate::batch::Usage {
+        current,
+        history,
+        journal,
+        other,
+    };
+    ensure!(
+        size.checked_total() == Some(counter.bytes),
+        "logical size split {size:?} does not add up to {}",
+        counter.bytes
+    );
+    Ok(Some(size))
+}
+
+/// Encode the logical size row for `size` after `applied`.
+fn logical_size_row(applied: u64, size: crate::batch::Usage) -> Vec<u8> {
+    use prost::Message;
+    crate::proto::state::LogicalSize {
+        applied,
+        bytes: size.total(),
+        current: Some(size.current),
+        history: Some(size.history),
+        journal: Some(size.journal),
+        other: Some(size.other),
+    }
+    .encode_to_vec()
 }
 
 /// The first key after every `etcd/current/` key.
@@ -386,23 +454,23 @@ impl StateMachine {
             Some(data) => serde_json::from_slice(&data)?,
             None => vec![],
         };
-        let members = match reads.get(crate::cluster::KEY).await? {
-            Some(data) => serde_json::from_slice(&data)?,
-            None => crate::cluster::Store::default(),
-        };
-        // Shared mode stores the counter in each batch, so a base needs no full scan.
-        let logical_bytes = match (&shared, reads.get(shared::LOGICAL_BYTES).await?) {
-            (Some(_), Some(bytes)) => {
-                u64::from_be_bytes(bytes.as_ref().try_into().context("invalid logical size")?)
-            }
-            (Some(_), None) => maintenance::count_logical_size(&reads).await?,
-            (None, _) => load_logical_size(&reads, applied).await?,
+        let (members, members_row) = cluster::load(&reads, applied).await?;
+        // Both modes store the counter row with the apply marker, so a base needs no full scan.
+        // A shared base from an older binary has only the total in `shared::LOGICAL_BYTES`, and
+        // its apply marker is past any counter row, so the open counts the split again.
+        let logical_bytes = load_logical_size(&reads, applied).await?;
+        let (cluster_quota, quota_boundary) = match &shared {
+            Some(_) => (None, 0),
+            None => quota::load(&reads).await?,
         };
         Ok(Self {
             members: Arc::new(members),
             admin,
             metrics: Arc::new(crate::metrics::StateMeters::new()?),
-            quota: 0,
+            quota: cluster_quota.map_or(0, |quota| quota.bytes.max(0) as u64),
+            quota_flag: 0,
+            cluster_quota,
+            quota_boundary,
             current: current::CurrentRows::default(),
             key_index: key_index::KeyIndex::load(&reads).await?,
             rows,
@@ -424,9 +492,34 @@ impl StateMachine {
             row_marker: None,
             location,
             members_unsaved: false,
+            members_counted: None,
+            members_row,
+            members_mismatch: None,
+            members_checked: None,
             reads,
             shared,
         })
+    }
+
+    /// The fields that `load` builds from the rows, in one text. Two states at one index must
+    /// give the same text, whether they applied the entries or loaded a base. The membership is
+    /// its row digest, because the in-memory set before the seed is member-local.
+    #[cfg(test)]
+    pub(crate) fn loaded_fields(&self) -> String {
+        format!(
+            "{} {} {} {} {:?} {} {} {:?} {:?} {:?} {}",
+            self.applied,
+            self.applied_term,
+            self.revision,
+            self.compact_revision,
+            self.compaction,
+            serde_json::to_string(self.leases.as_ref()).unwrap_or_default(),
+            serde_json::to_string(self.auth.as_ref()).unwrap_or_default(),
+            self.alarms,
+            self.members_row.as_ref().map(|row| &row.digest),
+            self.logical_bytes,
+            self.key_index.len(),
+        )
     }
 
     /// The replicated database, if any.
@@ -475,68 +568,52 @@ impl StateMachine {
     }
 
     /// Store `batch` and return `size` with the added membership row, if any.
-    async fn store_batch(&mut self, mut batch: WriteBatch, index: u64, size: u64) -> Result<u64> {
+    async fn store_batch(
+        &mut self,
+        mut batch: WriteBatch,
+        index: u64,
+        size: crate::batch::Usage,
+    ) -> Result<crate::batch::Usage> {
         let members_saved = self.members_unsaved;
-        // Shared mode stores the bootstrap membership in the first applied entry on every
-        // member, so the row does not depend on member-local events.
-        let first = self.is_shared() && self.applied == 0;
         if self.is_shared()
-            && !first
+            && !members_saved
             && batch
                 .keys()
                 .all(|key| key == APPLIED || key == APPLIED_TERM)
         {
             // An entry that changes no state writes no batch. Otherwise each announcement would
-            // dirty the memtable, and its flush would cause the next announcement.
+            // dirty the memtable, and its flush would cause the next announcement. The overlay
+            // still records that the state at `index` is the state after its newest batch.
+            if let Some(shared) = &mut self.shared {
+                shared.overlay.cover(index);
+            }
             return Ok(size);
         }
         let mut size = size;
-        if (members_saved || first) && !batch.contains(crate::cluster::KEY) {
+        // The size of this batch counts the row that it stores, so remove the count of
+        // `before_entry`.
+        if let Some(counted) = self.members_counted.take() {
+            size.replace_row(crate::cluster::KEY, Some(counted), None)?;
+        }
+        if members_saved && !batch.contains(crate::cluster::KEY) {
             let value = serde_json::to_vec(self.members.as_ref())?;
             let old = self
                 .applied_state()
                 .get(crate::cluster::KEY)
                 .await?
                 .map(|v| v.len());
-            size = crate::batch::row_size_after(
-                size,
-                crate::cluster::KEY.len(),
-                old,
-                Some(value.len()),
-            )?;
+            size.replace_row(crate::cluster::KEY, old, Some(value.len()))?;
+            self.members_row = Some(cluster::MembersRow::new(&value, index));
             batch.put(crate::cluster::KEY, value);
         }
-        // Format 4 rows are hash digests and Watch journals without Put values. Mark the
-        // directory durably before SlateDB can hold the first of them. Earlier batches, such as
-        // empty entries and membership changes, leave the directory readable by older binaries.
-        if let Some(marker) = &self.row_marker {
-            if !marker.is_marked()
-                && (batch.puts_under(crate::maintenance::HASH)
-                    || batch.puts_under(crate::watch::EVENTS))
-            {
-                marker.mark()?;
-            }
-        }
+        self.mark_format_4(&batch)?;
         // Drop shared rows before SlateDB may expose the change. See `rows`.
         for key in batch.keys() {
             if let Some(key) = key.strip_prefix(mvcc::CURRENT) {
                 self.rows.invalidate(key, index);
             }
         }
-        // The counters are outside `etcd/`, so they do not count themselves.
-        if self.is_shared() {
-            batch.put(shared::LOGICAL_BYTES, size.to_be_bytes());
-        } else {
-            use prost::Message;
-            batch.put(
-                LOGICAL_SIZE,
-                crate::proto::state::LogicalSize {
-                    applied: index,
-                    bytes: size,
-                }
-                .encode_to_vec(),
-            );
-        }
+        self.put_logical_size(&mut batch, index, size);
         let batch = Arc::new(batch);
         match &mut self.shared {
             None => {
@@ -560,6 +637,31 @@ impl StateMachine {
         }
         self.key_index.commit(index);
         Ok(size)
+    }
+
+    /// Format 4 rows are hash digests and Watch journals without Put values. Mark the
+    /// directory durably before SlateDB can hold the first of them. Earlier batches, such as
+    /// empty entries and membership changes, leave the directory readable by older binaries.
+    fn mark_format_4(&self, batch: &WriteBatch) -> Result<()> {
+        if let Some(marker) = &self.row_marker {
+            if !marker.is_marked()
+                && (batch.puts_under(crate::maintenance::HASH)
+                    || batch.puts_under(crate::watch::EVENTS))
+            {
+                marker.mark()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Store the logical size `size` at `index` in `batch`.
+    fn put_logical_size(&self, batch: &mut WriteBatch, index: u64, size: crate::batch::Usage) {
+        // The counters are outside `etcd/`, so they do not count themselves. Shared mode also
+        // keeps the eight-byte total, which older readers of the shared base load.
+        if self.is_shared() {
+            batch.put(shared::LOGICAL_BYTES, size.total().to_be_bytes());
+        }
+        batch.put(LOGICAL_SIZE, logical_size_row(index, size));
     }
 
     /// Return the Watch events of the work since `previous`, if capture is enabled.

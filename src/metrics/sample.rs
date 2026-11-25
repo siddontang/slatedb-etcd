@@ -89,9 +89,19 @@ impl Sample {
                 self.quota,
             ),
             (
+                "slatedb_etcd_quota_flag_mismatch",
+                "The quota flag of this member differs from the cluster quota.",
+                i64::from(self.quota_mismatch),
+            ),
+            (
+                "slatedb_etcd_members_mismatch",
+                "The members row of this member differed from the row of the leader.",
+                i64::from(self.members_mismatch),
+            ),
+            (
                 "etcd_mvcc_db_total_size_in_use_in_bytes",
                 "Logical backend bytes in use.",
-                self.used as i64,
+                self.usage.total() as i64,
             ),
             (
                 "etcd_debugging_mvcc_current_revision",
@@ -117,13 +127,51 @@ impl Sample {
                 vec![gauge(value, [])],
             );
         }
+        let usage = self.usage;
+        append(
+            families,
+            "slatedb_etcd_logical_size_bytes",
+            "Logical bytes that count toward the quota, by row kind.",
+            MetricType::GAUGE,
+            [
+                ("current", usage.current),
+                ("history", usage.history),
+                ("watch_journal", usage.journal),
+                ("other", usage.other),
+            ]
+            .into_iter()
+            .map(|(kind, bytes)| gauge(bytes as i64, [("kind", kind)]))
+            .collect(),
+        );
+        if let Some(threshold) = self.warning_bytes {
+            for (name, help, value) in [
+                (
+                    "slatedb_etcd_quota_warning_bytes",
+                    "Quota usage that raises the early warning.",
+                    threshold as i64,
+                ),
+                (
+                    "slatedb_etcd_quota_warning",
+                    "One when quota usage reaches the early-warning threshold.",
+                    i64::from(usage.total() >= threshold),
+                ),
+            ] {
+                append(
+                    families,
+                    name,
+                    help,
+                    MetricType::GAUGE,
+                    vec![gauge(value, [])],
+                );
+            }
+        }
         if let Some(size) = physical {
             append(
                 families,
                 "etcd_mvcc_db_total_size_in_bytes",
                 "Backend size in bytes.",
                 MetricType::GAUGE,
-                vec![gauge(size.max(self.used) as i64, [])],
+                vec![gauge(size.max(self.usage.total()) as i64, [])],
             );
         }
         let local = format!("{:x}", self.id);

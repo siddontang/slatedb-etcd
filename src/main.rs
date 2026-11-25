@@ -180,6 +180,20 @@ struct Args {
     /// Logical quota in bytes. Zero selects 2 GiB. A negative value disables the quota.
     #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
     quota_backend_bytes: i64,
+    /// Request --quota-backend-bytes again as the newest quota change in replicated mode.
+    /// Remove it from later restart commands.
+    #[arg(long)]
+    quota_reassert: bool,
+    /// Quota usage fraction that sets the early-warning gauge and log. Zero disables it.
+    #[arg(long, default_value_t = slatedb_etcd::server::DEFAULT_QUOTA_WARNING_FRACTION)]
+    quota_warning_fraction: f64,
+    /// Automatic compaction mode: periodic keeps a duration, revision keeps a revision count.
+    #[arg(long, value_enum, default_value = "periodic")]
+    auto_compaction_mode: slatedb_etcd::compactor::Mode,
+    /// Automatic compaction retention. Zero disables it. Periodic mode reads an integer as
+    /// hours, or a duration such as 30m. Revision mode reads a revision count.
+    #[arg(long, default_value = "0")]
+    auto_compaction_retention: String,
     /// Token mode: simple, or jwt with RS256 public-key and private-key paths.
     #[arg(long, default_value = "simple")]
     auth_token: String,
@@ -337,6 +351,12 @@ async fn run(args: Args) -> Result<()> {
             row_bytes: args.state_row_cache_bytes,
         },
         quota_bytes: args.quota_backend_bytes,
+        quota_reassert: args.quota_reassert,
+        quota_warning_fraction: args.quota_warning_fraction,
+        auto_compaction: slatedb_etcd::compactor::Retention::parse(
+            args.auto_compaction_mode,
+            &args.auto_compaction_retention,
+        )?,
         auth_token: args.auth_token,
         strict_reconfiguration: args.strict_reconfig_check,
         join: args.join,

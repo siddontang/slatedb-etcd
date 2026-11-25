@@ -1,7 +1,7 @@
 use super::*;
 use raft::eraftpb::{HardState, Snapshot};
 
-fn options(dir: &std::path::Path) -> NodeOptions {
+pub(super) fn options(dir: &std::path::Path) -> NodeOptions {
     NodeOptions {
         client_peers: BTreeMap::new(),
         transport: crate::tls::Transport::default(),
@@ -17,6 +17,9 @@ fn options(dir: &std::path::Path) -> NodeOptions {
         strict_reconfiguration: false,
         join: false,
         quota_bytes: 0,
+        quota_reassert: false,
+        quota_warning_fraction: 0.0,
+        auto_compaction: None,
         id: 1,
         cluster_id: "worker-test".into(),
         dir: dir.to_owned(),
@@ -597,18 +600,9 @@ pub(super) async fn leader_node_with(
         vote.term = node.raw.raft.term + u64::from(kind == MessageType::MsgRequestPreVoteResponse);
         node.raw.step(vote).unwrap();
     }
-    node.drive_ready().await.unwrap();
-    node.drain_log().await.unwrap();
-    let mut ack = Message::default();
-    ack.set_msg_type(MessageType::MsgAppendResponse);
-    ack.from = 2;
-    ack.to = 1;
-    ack.term = node.raw.raft.term;
-    ack.index = node.raw.store().last_index().unwrap();
-    node.raw.step(ack).unwrap();
-    node.drive_ready().await.unwrap();
-    node.drain_log().await.unwrap();
-    node.drain_apply().await.unwrap();
+    // The seed of the first term, and then the digest of the new row. See `propose_members`.
+    commit_with_peer(&mut node).await;
+    commit_with_peer(&mut node).await;
     assert_eq!(node.raw.raft.state, StateRole::Leader);
     node
 }
@@ -1231,7 +1225,8 @@ async fn read_index_retries_after_the_first_commit_in_a_new_term() {
     confirm_read(&mut node, &id).await;
     node.drain_apply().await.unwrap();
     assert!(reply.await.unwrap().is_ok());
-    assert_eq!(node.raw.store().durable.last_index, 1);
+    // The empty entry, `SeedMembers`, and `SetQuota` of the new leader. Retries append none.
+    assert_eq!(node.raw.store().durable.last_index, 3);
     assert_eq!(node.raw.store().durable.sync_writes, syncs);
     assert!(node.reads.is_empty());
 }
@@ -1646,7 +1641,7 @@ async fn applied_state_enforces_the_effective_etcd_quota() {
     }
 }
 
-async fn commit_with_peer(node: &mut Node) {
+pub(super) async fn commit_with_peer(node: &mut Node) {
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
     let ack = Message {
@@ -2116,4 +2111,212 @@ async fn a_snapshot_that_raft_skips_releases_its_staging_reservation() {
         Some(true)
     );
     state.close().await.unwrap();
+}
+
+type Hook = Box<dyn FnOnce(&std::path::Path)>;
+
+thread_local! {
+    /// Runs in `Node::open` between the first restore marker check and the Raft lock.
+    pub(super) static BEFORE_RAFT_LOCK: std::cell::Cell<Option<Hook>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[tokio::test]
+async fn a_restore_marker_created_after_the_first_check_blocks_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    // A restore takes the lock after the first check, creates its marker, and fails.
+    BEFORE_RAFT_LOCK.with(|hook| {
+        hook.set(Some(Box::new(|dir| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(crate::state::backup::RESTORE_MARKER), b"").unwrap();
+        })))
+    });
+    let (events, _) = mpsc::channel(256);
+    let error = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("interrupted snapshot restore"));
+}
+
+#[tokio::test]
+async fn an_interrupted_restore_blocks_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(crate::state::backup::RESTORE_MARKER), b"").unwrap();
+    let (events, _) = mpsc::channel(256);
+    let error = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("interrupted snapshot restore"));
+    // Recovery deletes an S3 namespace only after it compares the owner.
+    assert!(error.to_string().contains("owner.json"), "{error}");
+    assert!(!dir.path().join("raft").exists());
+}
+
+/// The warning threshold is the first whole byte count at or above `quota * fraction`. The
+/// gauge and the log both compare usage with it.
+#[test]
+fn quota_warning_threshold_rounds_up() {
+    // 1001 * 0.8 is 800.8, so 800 bytes is below the threshold and 801 reaches it.
+    assert_eq!(warning_bytes(1001, 0.8), Some(801));
+    // A positive threshold below one byte still warns.
+    assert_eq!(warning_bytes(1001, 1e-9), Some(1));
+    assert_eq!(warning_bytes(1001, 1.0), Some(1001));
+    assert_eq!(warning_bytes(1001, 0.0), None);
+    // Zero disables the quota, and so the warning.
+    assert_eq!(warning_bytes(0, 0.5), None);
+}
+
+/// `Node::open` applies the flag rules to a directly built retention: zero disables automatic
+/// compaction, and a negative revision count fails before storage is created.
+#[tokio::test]
+async fn node_open_validates_the_auto_compaction_retention() {
+    use crate::compactor::Retention;
+    let dir = tempfile::tempdir().unwrap();
+    let negative = dir.path().join("negative");
+    let mut config = options(&negative);
+    config.auto_compaction = Some(Retention::Revision(-1));
+    let (events, _receiver) = mpsc::channel(256);
+    assert!(Node::open(config, events).await.is_err());
+    assert!(!negative.exists());
+    for (name, retention) in [
+        ("revision", Retention::Revision(0)),
+        ("periodic", Retention::Periodic(Duration::ZERO)),
+    ] {
+        let mut config = options(&dir.path().join(name));
+        config.auto_compaction = Some(retention);
+        let (events, _receiver) = mpsc::channel(256);
+        let node = Node::open(config, events).await.unwrap();
+        assert!(node.auto_compaction.is_none(), "{name}");
+    }
+}
+
+/// A shared member warns at the fraction of the claimed cluster quota, not of its local flag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_quota_warning_uses_the_claimed_quota() {
+    let store: std::sync::Arc<dyn slatedb::object_store::ObjectStore> =
+        std::sync::Arc::new(slatedb::object_store::memory::InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let mut nodes = vec![];
+    for (id, quota) in [(1, 10_240), (2, 0)] {
+        let mut config = options(&dir.path().join(id.to_string()));
+        config.id = id;
+        config.state_mode = crate::state::StateMode::Shared;
+        config.object_store = crate::object::Config::Test(store.clone(), "root".into());
+        config.quota_bytes = quota;
+        config.quota_warning_fraction = 0.8;
+        let (events, receiver) = mpsc::channel(256);
+        let node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(node.state.quota_bytes, 10_240, "member {id}");
+        assert_eq!(node.warning_bytes(), Some(8_192), "member {id}");
+        nodes.push((node, receiver));
+    }
+}
+
+use super::quota::tests as quota_tests;
+
+/// The early warning of #74 uses the cluster quota. It follows a changed and a restored
+/// cluster quota, not the flag.
+#[tokio::test]
+async fn the_quota_warning_follows_the_cluster_quota() {
+    let open = |dir: PathBuf| async move {
+        let mut config = options(&dir);
+        config.quota_bytes = 1 << 20;
+        config.quota_warning_fraction = 0.8;
+        let (events, _) = mpsc::channel(256);
+        Node::open_with_transport(config, events, Some(BTreeMap::new()))
+            .await
+            .unwrap()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    quota_tests::append_committed(dir.path(), 1, &[quota_tests::set_quota(10_240, 0, 2)]);
+    let mut node = open(dir.path().to_owned()).await;
+    assert_eq!(node.warning_bytes(), Some(838_861));
+    quota_tests::apply_committed(&mut node).await;
+    assert_eq!(node.warning_bytes(), Some(8_192));
+    drop(node);
+    quota_tests::append_committed(dir.path(), 2, &[quota_tests::set_quota(20_480, 7, 2)]);
+    let mut node = open(dir.path().to_owned()).await;
+    quota_tests::apply_committed(&mut node).await;
+    assert_eq!(node.warning_bytes(), Some(16_384));
+
+    let restored = tempfile::tempdir().unwrap();
+    let target = restored.path().join("member");
+    quota_tests::restore_with(restored.path(), &target, quota_tests::row(10_240, 3, 2)).await;
+    let mut node = open(target).await;
+    quota_tests::apply_committed(&mut node).await;
+    assert_eq!(node.warning_bytes(), Some(8_192));
+}
+
+/// Raft restores a requested snapshot at the follower's commit index, also when the follower's
+/// record is already there. The follower then stores nothing, stays live, clears its request,
+/// and takes the next append.
+#[tokio::test]
+async fn an_equal_index_snapshot_clears_the_request_and_keeps_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_log(dir.path(), 20);
+    let (events, mut receiver) = mpsc::channel(256);
+    let mut node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    let (tx, mut reply) = oneshot::channel();
+    node.handle(Event::Checkpoint(tx), &mut vec![])
+        .await
+        .unwrap();
+    for _ in 0..1000 {
+        node.drive_ready().await.unwrap();
+        node.drain_log().await.unwrap();
+        if let Some(completed) = node.worker.step().await.unwrap() {
+            node.complete_apply(completed).unwrap();
+        }
+        while let Ok(event) = receiver.try_recv() {
+            node.handle(event, &mut vec![]).await.unwrap();
+        }
+        node.finish_checkpoint_waiters().unwrap();
+        if reply.try_recv().is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let record = node.raw.store().recovery_snapshot().clone();
+    assert_eq!(record.get_metadata().index, 20);
+    let message = |kind: MessageType| Message {
+        msg_type: kind as i32,
+        from: 2,
+        to: 1,
+        term: 1,
+        ..Default::default()
+    };
+    node.step_peer(message(MessageType::MsgHeartbeat)).unwrap();
+    node.raw.request_snapshot().unwrap();
+    assert_eq!(node.raw.raft.pending_request_snapshot, 20);
+    let mut install = message(MessageType::MsgSnapshot);
+    install.set_snapshot(record.clone());
+    node.step_peer(install).unwrap();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    assert_eq!(node.raw.raft.pending_request_snapshot, 0);
+    assert_eq!(node.raw.store().recovery_snapshot(), &record);
+    let mut append = message(MessageType::MsgAppend);
+    append.index = 20;
+    append.log_term = 1;
+    append.commit = 21;
+    append.entries = vec![Entry {
+        index: 21,
+        term: 1,
+        ..Default::default()
+    }];
+    node.step_peer(append).unwrap();
+    for _ in 0..20 {
+        node.drive_ready().await.unwrap();
+        node.drain_log().await.unwrap();
+        if let Some(completed) = node.worker.step().await.unwrap() {
+            node.complete_apply(completed).unwrap();
+        }
+    }
+    assert_eq!(node.raw.raft.raft_log.last_index(), 21);
+    assert_eq!(node.state.applied, 21);
 }

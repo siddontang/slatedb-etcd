@@ -16,6 +16,7 @@ use crate::storage::{PreparedCheckpoint, RaftStorage};
 use crate::{ApiError, Command, RaftCommand, Request};
 
 mod apply;
+mod auto_compaction;
 /// ReadIndex reads that may wait in the Raft owner's table. One quorum round confirms
 /// every read in a batch, so a larger table lets one round cover more clients.
 pub(crate) const MAX_PENDING_READS: usize = 256;
@@ -33,6 +34,7 @@ mod proposal;
 pub use forwarding::ForwardView;
 pub(crate) use forwarding::LocalRead;
 mod quorum_put;
+mod quota;
 mod read;
 mod ready;
 mod response;
@@ -46,6 +48,19 @@ pub use response::KvReply;
 
 #[cfg(test)]
 mod dst;
+
+/// Reject a data directory that holds an interrupted snapshot restore.
+fn ensure_no_restore_marker(dir: &std::path::Path) -> Result<()> {
+    ensure!(
+        !dir.join(crate::state::backup::RESTORE_MARKER).exists(),
+        "the data directory holds an interrupted snapshot restore; remove it and restore again. \
+         With S3, delete the member namespace first only if its owner.json matches the \
+         object-store.json of this directory; otherwise restore with a new cluster ID or \
+         --s3-prefix"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -61,6 +76,8 @@ pub enum Event {
     Auth(crate::auth::Command, Response),
     AuthLookup(String, Response),
     Maintenance(crate::maintenance::Command, Response),
+    /// Stream a native backup of the applied state. See `state::backup`.
+    Snapshot(oneshot::Sender<Result<crate::state::backup::Stream, crate::mvcc::KvError>>),
     Cluster(crate::cluster::Command, Response),
     SubscribeForwarding(oneshot::Sender<ForwardView>),
     Propose(Request, Response),
@@ -94,15 +111,28 @@ pub enum Event {
         snapshot: bool,
         success: bool,
     },
-    /// The shared-mode publisher created this checkpoint. The leader announces it. The reply
-    /// tells whether Raft took the proposal.
-    ViewCheckpoint(uuid::Uuid, Option<tokio::sync::oneshot::Sender<bool>>),
+    /// The shared-mode publisher created this checkpoint with this row `F`. The leader
+    /// announces it. The reply tells whether Raft took the proposal.
+    ViewCheckpoint(uuid::Uuid, u64, Option<tokio::sync::oneshot::Sender<bool>>),
     /// A member reports the checkpoints that it pins. The leader keeps them.
     ViewAck {
         member: u64,
         checkpoints: std::collections::HashSet<uuid::Uuid>,
         /// A manual checkpoint on the member asks for a publication through this index.
         publish: Option<u64>,
+        /// The process of a member that installs a base above its checkpoint row.
+        coverage: Option<u64>,
+    },
+    /// The first peer frame of a stream or request came from this process of `member`. An
+    /// earlier binary sends no process.
+    PeerProcess {
+        member: u64,
+        process: Option<u64>,
+    },
+    /// `member` refused a snapshot above its row that named process `target`.
+    SnapshotRefused {
+        member: u64,
+        target: u64,
     },
 }
 
@@ -123,6 +153,13 @@ pub struct NodeOptions {
     pub log_memory: LogMemory,
     pub state_cache: crate::state::StateCache,
     pub quota_bytes: i64,
+    /// Request `quota_bytes` again at startup with a new time, so that it replaces a newer
+    /// cluster quota. See `node::quota`.
+    pub quota_reassert: bool,
+    /// Quota usage fraction that raises the early warning. Zero disables the warning.
+    pub quota_warning_fraction: f64,
+    /// Automatic compaction retention. `None` disables automatic compaction.
+    pub auto_compaction: Option<crate::compactor::Retention>,
     pub strict_reconfiguration: bool,
     pub join: bool,
     pub client_peers: BTreeMap<u64, String>,
@@ -171,6 +208,15 @@ impl NodeOptions {
             limit => limit,
         }
     }
+}
+
+/// The usage of `quota` that raises the early warning, or `None` when it is off. Zero
+/// disables the quota.
+///
+/// This is the first whole byte count at or above `quota * fraction`, so a fractional
+/// threshold does not warn early and a tiny one still warns at one byte.
+fn warning_bytes(quota: u64, fraction: f64) -> Option<u64> {
+    (quota > 0 && fraction > 0.0).then(|| ((quota as f64 * fraction).ceil() as u64).clamp(1, quota))
 }
 
 struct Pending {
@@ -292,6 +338,24 @@ pub struct Node {
     renewals: lease::Renewals,
     /// The shared-mode leader writer. `None` in replicated mode.
     writer: Option<shared::Writer>,
+    /// The leader's automatic Compact schedule. `None` when automatic compaction is off.
+    auto_compaction: Option<auto_compaction::AutoCompaction>,
+    /// Quota usage has reached the warning threshold and the warning is logged.
+    quota_warned: bool,
+    /// Simulation: the leader does not propose compaction steps, as if their reads were slow.
+    #[cfg(test)]
+    hold_compact_steps: bool,
+    /// The quota flag of this member and its `SetQuota` proposals.
+    quota: quota::Quota,
+    /// The term and index of the first `SeedMembers` proposal of this member in its last term.
+    members_proposed: Option<(u64, u64)>,
+    /// The last term in which this member proposed its digest again. See `propose_members`.
+    members_rechecked: u64,
+    /// Simulation: the member proposes no `SeedMembers`, like an earlier binary.
+    #[cfg(test)]
+    pub(super) hold_members: bool,
+    /// The node compared the flags with the stored membership row.
+    members_observed: bool,
 }
 
 impl Node {
@@ -313,6 +377,12 @@ impl Node {
             !options.peers.contains_key(&0),
             "zero is not a valid voter id"
         );
+        // A directly built retention gets the same zero and sign rules as the flags.
+        let auto_compaction = options
+            .auto_compaction
+            .map(crate::compactor::Retention::validate)
+            .transpose()?
+            .flatten();
         if options.state_mode == crate::state::StateMode::Shared {
             ensure!(
                 !options.view_max_age.is_zero() && !options.view_pin_max.is_zero(),
@@ -322,6 +392,12 @@ impl Node {
                 options.overlay_max_bytes > 0,
                 "the overlay limit must be positive"
             );
+        }
+        // Check before any change to the directory, and again under the lock below.
+        ensure_no_restore_marker(&options.dir)?;
+        #[cfg(test)]
+        if let Some(hook) = tests::BEFORE_RAFT_LOCK.with(|hook| hook.take()) {
+            hook(&options.dir);
         }
         std::fs::create_dir_all(&options.dir)?;
         // Open Raft first. Its exclusive file lock also protects this node's SlateDB directory.
@@ -336,13 +412,19 @@ impl Node {
             },
             options.log_file_bytes,
         )?;
+        // A restore creates its marker only under this lock, so a restore that started after
+        // the first check is visible now.
+        ensure_no_restore_marker(&options.dir)?;
+        let empty_log = storage.last_index()? == 0;
+        let empty_raft = empty_log && storage.snapshot_index() == 0;
         let shared = crate::state::shared::Options {
             quota: options.effective_quota().max(0) as u64,
             voters: options.peers.keys().copied().collect(),
             join: options.join,
-            empty_log: storage.last_index()? == 0,
+            empty_log,
             pin_max: options.view_pin_max,
             restore: options.restore.clone(),
+            record: crate::state::shared::Record::of(storage.recovery_snapshot())?,
         };
         let mut state = options
             .object_store
@@ -367,11 +449,28 @@ impl Node {
             Some(options.transport.http.clone()),
         );
         let location = state.location.clone();
-        let recovered = async {
-            // Shared mode takes the quota from the cluster claim, so every member uses one value.
-            if !state.is_shared() {
-                state.quota = options.effective_quota().max(0) as u64;
+        let quota = quota::Quota::open(
+            &options.dir,
+            quota::Startup {
+                member: options.id,
+                flag: options.effective_quota(),
+                shared: state.is_shared(),
+                empty: empty_raft && state.applied == 0,
+                reassert: options.quota_reassert,
+                now: quota::now_millis(),
+            },
+        );
+        let mut quota = match quota {
+            Ok(quota) => quota,
+            Err(error) => {
+                let _ = state.close().await;
+                return Err(error);
             }
+        };
+        let recovered = async {
+            // Replicated apply uses the flag only until a `SetQuota` entry applies. Shared mode
+            // takes the quota from the cluster claim.
+            state.set_quota_flag(options.effective_quota());
             // A shared base can be ahead of the log, or on another term at its index.
             Self::align_log(&mut storage, &state)?;
             // Flushed state proves this prefix was committed, even if its commit marker was lost.
@@ -389,16 +488,13 @@ impl Node {
                     .protect(recovery.get_metadata().index, &descriptor.checkpoint);
             }
             state.install_snapshot(storage.recovery_snapshot()).await?;
+            // The bootstrap membership stays in memory. The seed of the first leader stores the
+            // row. See `state::cluster`.
             if state.members.members.is_empty() && !options.join {
-                let mut members = crate::cluster::Store::initial(&options.peers);
-                for (&id, address) in &options.client_peers {
-                    if let Some(member) = members.members.get_mut(&id) {
-                        member.client_ur_ls = vec![crate::cluster::url(address)];
-                    }
-                }
-                state.members = std::sync::Arc::new(members);
-                // Shared mode stores the bootstrap membership with the first applied entry.
-                state.members_unsaved = !state.is_shared();
+                state.members = std::sync::Arc::new(crate::cluster::Store::bootstrap(
+                    &options.peers,
+                    &options.client_peers,
+                ));
             }
             if options.require_peer_tls {
                 ensure!(
@@ -411,8 +507,7 @@ impl Node {
                     }
                 }
             }
-            let mut cache = match log::Cache::load(&storage, state.applied, options.log_memory) {
-                Ok(cache) => cache,
+            let loaded = match log::Cache::load(&storage, state.applied, options.log_memory) {
                 Err(error) if error.is::<cache::PendingQuota>() => {
                     apply::recover(
                         &mut state,
@@ -422,18 +517,59 @@ impl Node {
                             member: options.id,
                             term: storage.initial_state()?.hard_state.term,
                         },
+                        quota.origin(),
                     )
                     .await?;
-                    log::Cache::load(&storage, state.applied, options.log_memory)?
+                    log::Cache::load(&storage, state.applied, options.log_memory)
                 }
-                Err(error) => return Err(error),
+                loaded => loaded,
             };
-            cache.initial_conf = Some(state.members.conf());
+            let guards = quota::Guards::of(&state, quota.origin());
+            if guards.any() {
+                let (gate, scanned, open) = quota::scan_storage(&storage, state.applied, guards)?;
+                quota.set_scan(gate, scanned, open);
+            }
+            // A member that waits for a snapshot before its next entry does not hold its
+            // backlog. Raft treats the committed log as applied, and the cache keeps it only
+            // as evictable history. The snapshot install replaces it.
+            let mut raft_applied = state.applied;
+            let mut conf = state.members.conf();
+            let mut cache = match loaded {
+                Err(error)
+                    if error.is::<cache::PendingQuota>()
+                        && quota.blocked() == Some(state.applied + 1) =>
+                {
+                    // Shared mode does not take this start. An in-process base adoption would
+                    // make the member a voter again while Raft counts the skipped entries above
+                    // the base as applied. A shared member truncates its log at each checkpoint,
+                    // so such a backlog needs a log of an earlier binary that the leader never
+                    // truncated.
+                    ensure!(
+                        !state.is_shared(),
+                        "a waiting shared member cannot skip a log backlog above the pending log \
+                         memory; raise the pending log memory for this start"
+                    );
+                    raft_applied = storage.commit_index();
+                    tracing::warn!(
+                        applied = state.applied,
+                        commit = raft_applied,
+                        "the log backlog waits for a snapshot"
+                    );
+                    // Raft would count the skipped configuration changes as applied without
+                    // seeing them. So this member starts as a learner in memory: Raft does not
+                    // let it campaign or take a transfer, but it still votes. The snapshot
+                    // configuration makes it a voter again. Nothing stores this configuration.
+                    conf = quota::without_vote(conf, options.id);
+                    log::Cache::load(&storage, raft_applied, options.log_memory)?
+                }
+                loaded => loaded?,
+            };
+            cache.initial_conf = Some(conf);
             let config = Config {
                 id: options.id,
                 election_tick: 10,
                 heartbeat_tick: 1,
-                applied: state.applied,
+                applied: raft_applied,
                 check_quorum: true,
                 pre_vote: true,
                 read_only_option: raft::ReadOnlyOption::Safe,
@@ -529,7 +665,14 @@ impl Node {
         let worker = Worker::start(state, events.clone(), manual_apply, log_reader);
         let log_worker = log::Worker::start(storage, manual_apply)?;
         let next_checkpoint = options.next_checkpoint(raw.store().snapshot_index());
+        let auto_compaction = auto_compaction.map(|retention| {
+            auto_compaction::AutoCompaction::new(retention, Instant::now(), applied.revision)
+        });
         let mut node = Self {
+            auto_compaction,
+            quota_warned: false,
+            #[cfg(test)]
+            hold_compact_steps: false,
             location,
             metrics,
             last_observed_leader: 0,
@@ -612,9 +755,47 @@ impl Node {
             lease_promoted: false,
             renewals: lease::Renewals::default(),
             writer,
+            quota,
+            members_proposed: None,
+            members_rechecked: 0,
+            #[cfg(test)]
+            hold_members: false,
+            members_observed: false,
         };
         node.sync_members();
+        node.observe_quota()?;
+        node.observe_members();
+        // A request can arrive before the first apply or tick. The log cache must already know
+        // the base to judge the record. See `Cache::has_image`.
+        node.note_base();
         Ok(node)
+    }
+
+    /// Propose the entries that a leader puts first in its term: `SeedMembers`, then `SetQuota`.
+    /// A leader that waits for a snapshot proposes neither, and hands leadership over.
+    ///
+    /// The node calls this right after each Raft step and tick, before it takes other work. So
+    /// these entries follow the empty entry of a new leader, before every client write, cluster
+    /// command, and `Publish` of the term. See `state::cluster`.
+    fn propose_term_start(&mut self) -> Result<()> {
+        if !self.acts_as_leader() {
+            return Ok(());
+        }
+        self.propose_members()?;
+        self.propose_quota()
+    }
+
+    /// One logical tick. A leader that this tick elects proposes its term-start entries before
+    /// the `Publish` of this member.
+    fn tick(&mut self) -> Result<()> {
+        self.tick_raft()?;
+        self.retry_reads();
+        self.expire_leases()?;
+        self.publish_member()?;
+        self.tick_shared()?;
+        self.drive_auto_compaction(Instant::now())?;
+        self.check_quota_warning();
+        Ok(())
     }
 
     /// The shared-mode objects that the snapshot receive path opens.
@@ -672,13 +853,7 @@ impl Node {
                 _ = tokio::time::sleep_until(
                     self.compact_ready_at.unwrap_or_else(Instant::now).into()
                 ), if self.compact_ready_at.is_some() => { self.compact_ready_at = None; }
-                _ = ticks.tick() => {
-                    self.raw.tick();
-                    self.retry_reads();
-                    self.expire_leases()?;
-                    self.publish_member()?;
-                    self.tick_shared();
-                }
+                _ = ticks.tick() => self.tick()?,
                 persisted = self.log_worker.next() => { self.complete_log(persisted?)?; }
                 _ = self.compact_plan.changed() => {}
                 target = self.compaction.next(), if self.compaction.active() => {
@@ -826,7 +1001,7 @@ impl Node {
                                 .members
                                 .get(&self.options.id)
                                 .is_some_and(|member| member.is_learner),
-                            db_size_quota: self.options.quota_bytes,
+                            db_size_quota: self.status_quota(),
                             leader: self.raw.raft.leader_id,
                             raft_index: self.raw.store().commit_index(),
                             raft_term: self.raw.raft.term,
@@ -845,6 +1020,9 @@ impl Node {
             }
             Event::AuthLookup(name, response) => {
                 self.enqueue_query(Query::AuthLookup(name, response))
+            }
+            Event::Snapshot(response) => {
+                self.enqueue_query(Query::Snapshot(credentials.unwrap_or_default(), response))
             }
             Event::Propose(request, response) => {
                 self.propose(
@@ -964,7 +1142,7 @@ impl Node {
                     let _ = response.send(Err(self.error("peer message rejected")));
                 } else if let Some(reserved) = self.snapshot_objects_ready(&message) {
                     let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
-                    let stepped = self.raw.step(message);
+                    let stepped = self.step_peer(message);
                     if let Some(checkpoint) = reserved {
                         // Raft can skip a snapshot: an older commit, or a log that already
                         // matches. Then no install releases the staging copy.
@@ -1015,8 +1193,11 @@ impl Node {
                     committed: self.raw.raft.raft_log.committed,
                     applied: self.state.applied,
                     pending: self.pending.len(),
-                    quota: self.options.effective_quota(),
-                    used: self.state.logical_size,
+                    quota: self.state.quota_bytes,
+                    quota_mismatch: self.state.quota_mismatch,
+                    usage: self.state.usage,
+                    warning_bytes: self.warning_bytes(),
+                    members_mismatch: self.state.members_mismatch.is_some(),
                     revision: self.state.revision,
                     compact: if self.state.compact_revision == 0 {
                         -1
@@ -1060,8 +1241,8 @@ impl Node {
                 }
             }
             Event::SnapshotBuilt(built) => self.checkpoint_built(built)?,
-            Event::ViewCheckpoint(checkpoint, reply) => {
-                let accepted = self.announce_view(checkpoint)?;
+            Event::ViewCheckpoint(checkpoint, row, reply) => {
+                let accepted = self.announce_view(checkpoint, row)?;
                 if let Some(reply) = reply {
                     let _ = reply.send(accepted);
                 }
@@ -1070,7 +1251,14 @@ impl Node {
                 member,
                 checkpoints,
                 publish,
-            } => self.view_ack(member, checkpoints, publish),
+                coverage,
+            } => self.view_ack(member, checkpoints, publish, coverage),
+            Event::PeerProcess { member, process } => {
+                self.raw.store().note_process(member, process);
+            }
+            Event::SnapshotRefused { member, target } => {
+                self.raw.store().note_refused(member, target);
+            }
             Event::SnapshotDelay(delay_ms, response) => {
                 self.snapshot_delay_ms = delay_ms.min(5000);
                 let _ = response.send(Ok(self.status()?));
@@ -1304,7 +1492,16 @@ impl Node {
     }
 
     fn send(&mut self, messages: Vec<Message>) {
-        for message in messages {
+        for mut message in messages {
+            // A view snapshot above its row names the receiver process that can install it, or
+            // zero, which no process has. The transport sends it on its own route. See
+            // `peer::post_snapshot`.
+            if message.get_msg_type() == MessageType::MsgSnapshot
+                && crate::state::transfer::above_row(message.get_snapshot())
+            {
+                let process = self.raw.store().capable_process(message.to).unwrap_or(0);
+                message.context = process.to_le_bytes().to_vec();
+            }
             if self.raw.raft.state == StateRole::Leader {
                 crate::failpoint::hit("raft-before-leader-send");
             } else {
@@ -1360,6 +1557,10 @@ impl Node {
 
     fn start_checkpoint(&mut self, image: bool) -> Result<()> {
         if self.checkpoint_running || self.apply_busy || self.prepared_puts.is_some() {
+            return Ok(());
+        }
+        // A record built at a base below the record could not replace it. See `certify_base`.
+        if self.base_below_record() {
             return Ok(());
         }
         let store = self.raw.store();
@@ -1515,6 +1716,8 @@ impl Node {
             status["write_profile"] = crate::write_profile::snapshot();
         }
         status["quorum_reply_index"] = self.quorum_reply_index.into();
+        status["quota"] = self.quota_status();
+        status["members_row"] = self.members_status();
         if let (Some(writer), Some((base, applied, bytes))) = (&self.writer, self.state.view) {
             let record = crate::state::transfer::ViewDescriptor::decode(
                 self.raw.store().recovery_snapshot().get_data(),

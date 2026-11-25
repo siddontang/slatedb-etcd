@@ -81,6 +81,10 @@ pub(crate) struct Servers {
     pub(crate) watch: watch_server::WatchServer<Service>,
 }
 
+/// The largest encoded KV response. etcd sends up to `math.MaxInt32` bytes, so an unpaginated
+/// Range of a large prefix succeeds as it does on etcd.
+pub(crate) const MAX_RANGE_RESPONSE_BYTES: usize = i32::MAX as usize;
+
 impl Servers {
     pub(crate) fn new(
         member: u64,
@@ -99,7 +103,7 @@ impl Servers {
             auth: auth_server::AuthServer::new(service.clone()),
             kv: KvServer::new(service.clone())
                 .max_decoding_message_size(1536 * 1024)
-                .max_encoding_message_size(64 * 1024 * 1024),
+                .max_encoding_message_size(MAX_RANGE_RESPONSE_BYTES),
             lease: lease_server::LeaseServer::new(service.clone()),
             watch: watch_server::WatchServer::new(service)
                 .max_encoding_message_size(64 * 1024 * 1024),

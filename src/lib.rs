@@ -8,6 +8,7 @@ pub use batch::WriteBatch;
 pub mod api;
 pub mod auth;
 pub mod cluster;
+pub mod compactor;
 mod failpoint;
 pub mod grpc;
 pub mod lease;
@@ -129,7 +130,36 @@ pub enum RaftCommand {
     ViewCheckpoint {
         id: String,
         checkpoint: String,
+        /// The index through which the checkpoint holds the whole state: no entry after its row
+        /// changed state. An entry of an earlier binary has no value, and zero means the row.
+        #[serde(default)]
+        covers: u64,
     },
+    /// A replicated-mode leader sets the logical quota of the cluster. A non-positive `bytes`
+    /// disables the check. A `seed` entry applies only when the state has no cluster quota.
+    /// Another entry applies only when its `(requested_at, member, bytes)` is newer than the
+    /// stored request. It changes no etcd state except the `etcd/quota` row. Shared mode ignores
+    /// it.
+    ///
+    /// The enum is untagged, so this variant must precede `CompactStep`, which matches any `id`.
+    /// The JSON names the id `quota_id`. An older binary then fails to decode the entry and
+    /// stops, instead of applying it as a `CompactStep`.
+    SetQuota {
+        #[serde(rename = "quota_id")]
+        id: String,
+        bytes: i64,
+        seed: bool,
+        /// The wall clock of the operator request on `member`, in milliseconds. Zero for a seed.
+        requested_at: u64,
+        member: u64,
+    },
+    /// A leader proposes this entry at the start of each term, in both state modes. A state
+    /// without the `etcd/members` row stores `members`, so every member stores the same row. A
+    /// state with the row keeps it, and compares it with `digest`. See `state::cluster`.
+    ///
+    /// Like `SetQuota`, this variant precedes `CompactStep`, and the JSON names its id
+    /// `members_id`. An older binary then stops on the entry.
+    SeedMembers(cluster::Seed),
     /// The leader proposes bounded physical compaction work after a Compact entry.
     CompactStep {
         id: String,
@@ -159,7 +189,9 @@ impl RaftCommand {
             | Self::Compact { id, .. }
             | Self::CompactStep { id }
             | Self::ViewCheckpoint { id, .. }
+            | Self::SetQuota { id, .. }
             | Self::Lease { id, .. } => id,
+            Self::SeedMembers(seed) => &seed.id,
         }
     }
 }

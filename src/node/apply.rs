@@ -18,7 +18,7 @@ pub(super) struct AppliedState {
     pub members: std::sync::Arc<crate::cluster::Store>,
     pub read: std::sync::Arc<crate::state::ReadView>,
     pub write_batches: u64,
-    pub logical_size: u64,
+    pub usage: crate::batch::Usage,
     /// Watch events that this state publishes after the node installs it.
     pub watch: Option<std::sync::Arc<crate::watch::Batch>>,
     pub compaction_pending: bool,
@@ -29,6 +29,20 @@ pub(super) struct AppliedState {
     pub view: Option<(u64, u64, u64)>,
     /// Shared mode: the checkpoint of the base.
     pub base_checkpoint: Option<uuid::Uuid>,
+    /// The quota of the last applied `SetQuota` entry. See `StateMachine::cluster_quota`.
+    pub cluster_quota: Option<crate::state::quota::ClusterQuota>,
+    /// The quota that apply uses. A non-positive value means no limit.
+    pub quota_bytes: i64,
+    /// The flag of this member differs from `quota_bytes`.
+    pub quota_mismatch: bool,
+    /// The checkpoint that must cover a first cluster quota. See `StateMachine::quota_boundary`.
+    pub quota_boundary: u64,
+    /// The stored membership row, if any. See `state::cluster`.
+    pub members_row: Option<crate::state::cluster::MembersRow>,
+    /// The leader whose row differed from this row at the last check.
+    pub members_mismatch: Option<u64>,
+    /// The term and index of the last `SeedMembers` entry that compared the row.
+    pub members_checked: Option<(u64, u64)>,
 }
 
 impl std::ops::Deref for AppliedState {
@@ -46,13 +60,20 @@ impl AppliedState {
             members: state.members.clone(),
             read: state.read_view()?,
             write_batches: state.write_batches,
-            logical_size: state.logical_size(),
+            usage: state.logical_usage(),
             watch: None,
             compaction_pending: state.compaction_pending(),
             compaction_plan: state.compaction_plan.generation(),
             physical_revision: state.physical_revision(),
             view: state.view_status(),
             base_checkpoint: state.base_checkpoint(),
+            cluster_quota: state.cluster_quota(),
+            quota_bytes: state.quota_bytes(),
+            quota_mismatch: state.quota_mismatch(),
+            quota_boundary: state.quota_boundary,
+            members_row: state.members_row.clone(),
+            members_mismatch: state.members_mismatch,
+            members_checked: state.members_checked,
         })
     }
 }
@@ -91,6 +112,11 @@ pub(super) enum Query {
     Read(RequestOp, Option<crate::auth::Credentials>, ClientResponse),
     Linear(RequestOp, Option<crate::auth::Credentials>, u64),
     Local(String, Response),
+    /// Start a native backup at the applied boundary. The image streams outside the worker.
+    Snapshot(
+        crate::auth::Credentials,
+        tokio::sync::oneshot::Sender<Result<crate::state::backup::Stream, crate::mvcc::KvError>>,
+    ),
 }
 
 impl Query {
@@ -130,6 +156,11 @@ impl Query {
                 response.error(error);
                 return;
             }
+            Self::Snapshot(_, response) => {
+                let error = crate::mvcc::KvError::new(tonic::Code::Unavailable, &error.error);
+                let _ = response.send(Err(error));
+                return;
+            }
             Self::Maintenance(_, _, _, response)
             | Self::AuthLookup(_, response)
             | Self::Local(_, response) => response,
@@ -149,8 +180,14 @@ pub(super) enum Job {
     },
     PublishPuts(crate::state::put_batch::PreparedPuts),
     Snapshot(Snapshot),
+    /// Shared mode: offer the checkpoint of a record at or below the applied index as the base.
+    /// The state does not change, so a later `SwitchBase` job switches.
+    RaiseBase(Snapshot),
     /// Shared mode: switch to a base that finished opening, and publish the new view.
     SwitchBase,
+    /// Shared mode: store the apply marker at the applied index, so the next checkpoint has its
+    /// row there. An earlier binary installs a base only at its row.
+    MarkRow,
     /// Shared mode: adopt this opened base above the applied index. The node verified its index
     /// against the delivered commit, and `term` is the log term there. The job holds the base.
     AdoptBase {
@@ -295,7 +332,7 @@ impl Executor {
     /// applied their membership changes.
     async fn rebase(&mut self, header: Header, applied: u64) -> Result<()> {
         let log = self.log.clone().context("rebase needs the log")?;
-        self.state.rebase(applied).await?;
+        self.state.rebase(applied, |index| log.term(index)).await?;
         while self.state.applied < applied {
             let low = self.state.applied + 1;
             let entries = log.entries(low, (low + BATCH_ENTRIES).min(applied + 1))?;
@@ -319,6 +356,7 @@ impl Executor {
                 | Job::Snapshot(_)
                 | Job::PublishPuts(_)
                 | Job::SwitchBase
+                | Job::MarkRow
                 | Job::AdoptBase { .. }
         );
         let copy_state = changes_state || matches!(work.job, Job::Query(Query::Maintenance(..)));
@@ -349,9 +387,17 @@ impl Executor {
             }
             // The switch ran above. The new view goes out with the completion.
             Job::SwitchBase => Output::Entries(Vec::new()),
+            Job::MarkRow => {
+                self.state.mark_row()?;
+                Output::Entries(Vec::new())
+            }
             Job::AdoptBase { base, term } => {
                 self.state.adopt_opened(base, term).await?;
                 Output::Adopted(self.state.members.conf())
+            }
+            Job::RaiseBase(snapshot) => {
+                self.state.raise_to_record(&snapshot).await?;
+                Output::Entries(Vec::new())
             }
             Job::Snapshot(snapshot) => {
                 self.state.install_snapshot(&snapshot).await?;
@@ -390,6 +436,24 @@ impl Executor {
                         value: serde_json::to_value(outcome)?,
                         require_leader: false,
                     }
+                }
+                Query::Snapshot(credentials, response) => {
+                    let result = match self.state.auth.admin(&credentials) {
+                        Ok(()) => match self.state.backup().await {
+                            Ok(mut stream) => {
+                                work.header.fill(stream.header.as_mut());
+                                Ok(stream)
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "a native backup failed to start");
+                                Err(crate::state::backup::backup_error(error))
+                            }
+                        },
+                        Err(error) => Err(error),
+                    };
+                    let _ = response.send(result);
+                    // The reply went out above, so the node has nothing to finish.
+                    Output::Reads(Vec::new())
                 }
                 Query::AuthLookup(name, response) => Output::Query {
                     response,
@@ -647,6 +711,7 @@ pub(super) async fn apply_entries(
                 .as_ref()
                 .map_or(entry.data.as_ref(), |change| change.context.as_ref()),
         )?;
+        state.before_entry(&command)?;
         if change.is_none() && super::quorum_put::kv_command(&command).is_some() {
             let mut commands = vec![(entry.index, command)];
             let mut term = entry.term;
@@ -768,8 +833,31 @@ pub(super) async fn apply_entries(
                     Reply::Encoded(value)
                 }
             }
-            RaftCommand::ViewCheckpoint { checkpoint, .. } => {
-                state.apply_view_checkpoint(entry.index, checkpoint).await?;
+            RaftCommand::ViewCheckpoint {
+                checkpoint, covers, ..
+            } => {
+                state
+                    .apply_view_checkpoint(entry.index, checkpoint, *covers)
+                    .await?;
+                Reply::Encoded(Value::Null)
+            }
+            RaftCommand::SetQuota {
+                bytes,
+                seed,
+                requested_at,
+                member,
+                ..
+            } => {
+                let request = crate::state::quota::ClusterQuota {
+                    bytes: *bytes,
+                    requested_at: *requested_at,
+                    member: *member,
+                };
+                state.apply_set_quota(entry.index, request, *seed).await?;
+                Reply::Encoded(Value::Null)
+            }
+            RaftCommand::SeedMembers(seed) => {
+                state.apply_seed_members(entry.index, seed).await?;
                 Reply::Encoded(Value::Null)
             }
             RaftCommand::CompactStep { .. } => {
@@ -798,17 +886,22 @@ pub(super) async fn recover(
     state: &mut StateMachine,
     storage: &RaftStorage,
     header: Header,
+    origin: super::quota::Guards,
 ) -> Result<()> {
     let mut physical = false;
     while state.applied < storage.commit_index() {
         let low = state.applied + 1;
-        let entries = storage.entries(
+        let mut entries = storage.entries(
             low,
             (low + BATCH_ENTRIES).min(storage.commit_index() + 1),
             Some(BATCH_BYTES),
             raft::GetEntriesContext::empty(false),
         )?;
         ensure!(!entries.is_empty(), "empty recovery batch");
+        // A guarded member stops here and waits for a snapshot. See `node::quota`.
+        if super::quota::guard_replay(state, origin, &mut entries)? {
+            break;
+        }
         let replies = apply_entries(state, entries, header).await?;
         physical |= replies.iter().any(|r| {
             matches!(
@@ -835,205 +928,15 @@ fn fill_value_header(header: Header, outcome: &mut Outcome<Value>) -> Result<()>
 }
 
 #[cfg(test)]
+#[path = "shared/apply_tests.rs"]
+mod shared_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::proto::etcdserverpb::request_op::Request as Op;
     use crate::proto::etcdserverpb::response_op::Response as Resp;
     use crate::proto::etcdserverpb::*;
-
-    /// A shared-mode apply read loses its SST. Apply rebases on the newest checkpoint, replays
-    /// the local log, and applies the job again with the same results.
-    #[tokio::test]
-    async fn a_lost_checkpoint_object_rebases_apply() {
-        use crate::object::faults::{FaultStore, LOSE_SST_ONCE};
-        use slatedb::config::{CheckpointOptions, CheckpointScope, WriteOptions};
-        use slatedb::object_store::ObjectStore;
-        let faults = std::sync::Arc::new(FaultStore::new(std::sync::Arc::new(
-            slatedb::object_store::memory::InMemory::new(),
-        )));
-        let dir = tempfile::tempdir().unwrap();
-        let mut storage = RaftStorage::open(dir.path(), 1, "test", vec![1]).unwrap();
-        let command = |index: u64, request| {
-            RaftCommand::Etcd {
-                id: index.to_string(),
-                origin: 1,
-                etcd: RequestOp {
-                    request: Some(request),
-                },
-            }
-            .encode()
-            .unwrap()
-        };
-        let put = |index: u64| {
-            command(
-                index,
-                Op::RequestPut(PutRequest {
-                    key: format!("k{}", index % 4).into_bytes(),
-                    // Large values give the SST many blocks. The read after the fault then
-                    // needs a block that no earlier read cached.
-                    value: format!("v{index}-{}", "x".repeat(2048)).into_bytes(),
-                    ..Default::default()
-                }),
-            )
-        };
-        let mut entries: Vec<Entry> = (1..=24)
-            .map(|index| Entry {
-                index,
-                term: 1,
-                data: put(index),
-                ..Default::default()
-            })
-            .collect();
-        // Entry 21 is a physical Compact, and entry 22 adds a learner. Their completions come
-        // before the lost read of entry 23 in the same job.
-        entries[20].data = RaftCommand::Compact {
-            id: "21".into(),
-            compact: CompactionRequest {
-                revision: 3,
-                physical: true,
-            },
-        }
-        .encode()
-        .unwrap();
-        let request = crate::cluster::Command::Add(Member {
-            id: 9,
-            peer_ur_ls: vec!["http://127.0.0.1:9".into()],
-            is_learner: true,
-            ..Default::default()
-        });
-        let mut change = request.change();
-        change.context = RaftCommand::Cluster {
-            id: "22".into(),
-            request,
-            credentials: Default::default(),
-        }
-        .encode()
-        .unwrap();
-        entries[21].entry_type = EntryType::EntryConfChange as i32;
-        entries[21].data = change.encode_to_vec();
-        // Entry 23 reads an old revision. Only the base holds that history row.
-        entries[22].data = command(
-            23,
-            Op::RequestTxn(TxnRequest {
-                success: vec![RequestOp {
-                    request: Some(Op::RequestRange(RangeRequest {
-                        key: b"k0".to_vec(),
-                        revision: 5,
-                        ..Default::default()
-                    })),
-                }],
-                ..Default::default()
-            }),
-        );
-        let hs = raft::eraftpb::HardState {
-            term: 1,
-            vote: 1,
-            commit: 24,
-        };
-        storage.persist(&entries, Some(&hs), None).unwrap();
-        let options = crate::state::shared::Options {
-            quota: 0,
-            voters: vec![1],
-            join: false,
-            empty_log: false,
-            pin_max: Duration::from_secs(300),
-            restore: None,
-        };
-        let store: std::sync::Arc<dyn ObjectStore> = faults.clone();
-        let mut state = StateMachine::open_shared(
-            store.clone(),
-            "root",
-            "test",
-            // A tiny cache keeps few blocks, so the read after the fault reaches the store.
-            crate::state::StateCache {
-                block_bytes: 1,
-                meta_bytes: 1,
-                row_bytes: 0,
-            },
-            &options,
-            crate::state::transfer::Backend::Local,
-        )
-        .await
-        .unwrap();
-        let header = Header {
-            cluster: 0,
-            member: 1,
-            term: 1,
-        };
-        apply_entries(&mut state, entries[..20].to_vec(), header)
-            .await
-            .unwrap();
-        // The leader writer checkpoints entry 20 with its own cache. The member switches to it.
-        let handles = state.shared_handles().unwrap();
-        let writer = slatedb::Db::builder(handles.source.state(), store)
-            .with_settings(crate::state::slatedb_settings())
-            .build()
-            .await
-            .unwrap();
-        for (seq, batch) in handles.queue.after(0, usize::MAX) {
-            writer
-                .write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
-                .await
-                .unwrap();
-        }
-        writer.flush().await.unwrap();
-        let options = CheckpointOptions {
-            name: Some(crate::state::shared::view_name(20)),
-            ..Default::default()
-        };
-        let id = writer
-            .create_checkpoint(CheckpointScope::Durable, &options)
-            .await
-            .unwrap()
-            .id;
-        handles
-            .opened
-            .offer(handles.source.open_base(id).await.unwrap());
-        state.switch_base();
-        assert_eq!(*handles.based.borrow(), 20);
-
-        let (events, _) = mpsc::channel(8);
-        let mut executor = Executor {
-            state,
-            events,
-            snapshot_task: None,
-            inline_checkpoints: true,
-            log: Some(storage.reader()),
-        };
-        faults.set(LOSE_SST_ONCE);
-        let completion = executor
-            .execute(Work {
-                job: Job::Entries(entries[20..].to_vec()),
-                header,
-                delay: Duration::ZERO,
-            })
-            .await
-            .unwrap();
-        // The read lost its object once. The rebase restarted the job, and every entry of the
-        // job completes exactly once, with the Compact notice and the membership change.
-        assert_eq!(faults.entered.available_permits(), 1);
-        assert_eq!(completion.applied, 24);
-        let Output::Entries(replies) = completion.output else {
-            panic!("expected entries");
-        };
-        let ids: Vec<_> = replies.iter().map(|reply| reply.id.as_str()).collect();
-        assert_eq!(ids, ["21", "22", "23", "24"]);
-        assert!(matches!(replies[0].reply, Reply::PhysicalCompact { .. }));
-        assert_eq!(replies[1].change.as_ref().unwrap().node_id, 9);
-        let Reply::Kv(outcome) = &replies[2].reply else {
-            panic!("expected a KV reply");
-        };
-        let Some(Resp::ResponseTxn(txn)) = &outcome.result.as_ref().unwrap().response else {
-            panic!("expected a transaction");
-        };
-        // Revision 5 is the put of entry 4.
-        let Some(Resp::ResponseRange(range)) = &txn.responses[0].response else {
-            panic!("expected a range");
-        };
-        assert!(range.kvs[0].value.starts_with(b"v4-"));
-        executor.state.close().await.unwrap();
-        writer.close().await.unwrap();
-    }
 
     #[tokio::test]
     async fn kv_groups_stop_at_leases_and_empty_entries() {
@@ -1497,14 +1400,14 @@ mod tests {
             assert_eq!(grouped.alarms, separate.alarms);
             assert_eq!(grouped.logical_size(), separate.logical_size());
             assert_eq!(
-                grouped.logical_size(),
-                crate::state::maintenance::count_logical_size(grouped.db().as_ref())
+                grouped.logical_usage(),
+                crate::state::maintenance::count_logical_usage(grouped.db().as_ref())
                     .await
                     .unwrap()
             );
             assert_eq!(
-                separate.logical_size(),
-                crate::state::maintenance::count_logical_size(separate.db().as_ref())
+                separate.logical_usage(),
+                crate::state::maintenance::count_logical_usage(separate.db().as_ref())
                     .await
                     .unwrap()
             );
@@ -1926,8 +1829,8 @@ mod tests {
             assert_eq!(grouped.alarms, separate.alarms, "{context}");
             assert_eq!(index_rows(&grouped), index_rows(&separate), "{context}");
             assert_eq!(
-                grouped.logical_size(),
-                crate::state::maintenance::count_logical_size(grouped.db().as_ref())
+                grouped.logical_usage(),
+                crate::state::maintenance::count_logical_usage(grouped.db().as_ref())
                     .await
                     .unwrap(),
                 "{context}"

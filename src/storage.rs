@@ -165,6 +165,25 @@ impl LogReader {
         );
         Ok(entries)
     }
+
+    /// Return the term at `index`: the term of its entry, or of the snapshot record there.
+    pub fn term(&self, index: u64) -> Result<u64> {
+        if let Some(entry) = self
+            .engine
+            .get_entry_with::<EntryCodec, ProstCodec>(GROUP, index)?
+        {
+            return Ok(entry.term);
+        }
+        let record = self
+            .engine
+            .get_value::<Snapshot, ProstCodec>(GROUP, SNAPSHOT)?
+            .unwrap_or_default();
+        ensure!(
+            record.get_metadata().index == index,
+            "the log has no term at {index}"
+        );
+        Ok(record.get_metadata().term)
+    }
 }
 
 impl RaftStorage {
@@ -214,6 +233,36 @@ impl RaftStorage {
         voters: Vec<u64>,
         file_bytes: u64,
     ) -> Result<Self> {
+        Self::open_inner(dir, node_id, cluster_id, voters, file_bytes, true)
+    }
+
+    /// Open the log for a snapshot restore. The engine lock reserves the directory, but a new
+    /// directory gets its identity only from `restore` or a row marker. The caller creates its
+    /// restore marker first, so a crash never leaves a published identity without the marker.
+    pub(crate) fn open_for_restore(
+        dir: &Path,
+        node_id: u64,
+        cluster_id: &str,
+        voters: Vec<u64>,
+    ) -> Result<Self> {
+        Self::open_inner(
+            dir,
+            node_id,
+            cluster_id,
+            voters,
+            DEFAULT_LOG_FILE_BYTES,
+            false,
+        )
+    }
+
+    fn open_inner(
+        dir: &Path,
+        node_id: u64,
+        cluster_id: &str,
+        voters: Vec<u64>,
+        file_bytes: u64,
+        write_identity: bool,
+    ) -> Result<Self> {
         ensure!(
             file_bytes >= MIN_LOG_FILE_BYTES,
             "log file size must be at least {MIN_LOG_FILE_BYTES} bytes"
@@ -262,10 +311,12 @@ impl RaftStorage {
             snapshot
                 .mut_metadata()
                 .set_conf_state(ConfState::from((voters, vec![])));
-            let mut batch = LogBatch::default();
-            batch.put(GROUP, IDENTITY.to_vec(), unmarked.clone())?;
-            batch.put_value::<ProstCodec, _>(GROUP, SNAPSHOT.to_vec(), &snapshot)?;
-            engine.write(&mut batch, true)?;
+            if write_identity {
+                let mut batch = LogBatch::default();
+                batch.put(GROUP, IDENTITY.to_vec(), unmarked.clone())?;
+                batch.put_value::<ProstCodec, _>(GROUP, SNAPSHOT.to_vec(), &snapshot)?;
+                engine.write(&mut batch, true)?;
+            }
         }
         let referenced = checkpoint::load(dir, &engine, &mut snapshot)?;
         let hard_state = engine
@@ -483,6 +534,29 @@ impl RaftStorage {
         self.publish_checkpoint(index, Some(prepared), conf)
     }
 
+    /// Return true when an image at `index` replaces the record at the same index: the record
+    /// has no transferable image, or it names another view checkpoint. A restart or a rebase can
+    /// move the base to another checkpoint at the record index when retention deleted the one
+    /// that the record names.
+    pub(crate) fn replaces_at(&self, index: u64, prepared: Option<&PreparedCheckpoint>) -> bool {
+        let Some(prepared) = prepared else {
+            return false;
+        };
+        if index != self.snapshot_index() {
+            return false;
+        }
+        let view = |data: &[u8]| {
+            crate::state::transfer::ViewDescriptor::decode(data)
+                .ok()
+                .flatten()
+                .map(|view| view.checkpoint)
+        };
+        self.metadata_only()
+            || view(&self.snapshot.data)
+                .zip(view(&prepared.data))
+                .is_some_and(|(old, new)| old != new)
+    }
+
     /// Return true when the current snapshot record has no transferable image.
     ///
     /// A received or aged checkpoint descriptor is not transferable. See `transfer::sendable`.
@@ -510,7 +584,7 @@ impl RaftStorage {
             index <= self.hard_state.commit,
             "cannot snapshot uncommitted data"
         );
-        let attach = prepared.is_some() && index == self.snapshot_index() && self.metadata_only();
+        let attach = self.replaces_at(index, prepared.as_ref());
         ensure!(
             index > self.snapshot_index() || attach,
             "snapshot did not advance"
@@ -558,6 +632,43 @@ impl RaftStorage {
         self.snapshot = snapshot;
         self.purge()?;
         crate::failpoint::hit("checkpoint-after-gc");
+        Ok(())
+    }
+
+    /// Return true for a directory without a snapshot, a vote, or log entries.
+    pub(crate) fn is_new(&self) -> bool {
+        self.snapshot_index() == 0
+            && self.hard_state == HardState::default()
+            && self.engine.last_index(GROUP).is_none()
+    }
+
+    /// Record a restored state at `index` in a new directory, with a snapshot without an image.
+    ///
+    /// The caller must first flush the restored SlateDB state with its apply marker at `index`.
+    /// That state covers the log before `index`, as after `publish_checkpoint` without an image.
+    pub(crate) fn restore(&mut self, index: u64, conf: ConfState) -> Result<()> {
+        ensure!(self.is_new(), "restore requires a new Raft directory");
+        let mut snapshot = Snapshot::default();
+        snapshot.mut_metadata().index = index;
+        snapshot.mut_metadata().term = 1;
+        snapshot.mut_metadata().set_conf_state(conf);
+        let hard_state = HardState {
+            term: 1,
+            commit: index,
+            ..Default::default()
+        };
+        // The restored rows are format 4 rows. `open_for_restore` can leave the identity unset.
+        let rows = Arc::clone(&self.rows);
+        let mut stored = rows.lock();
+        let mut batch = LogBatch::default();
+        batch.put(GROUP, IDENTITY.to_vec(), rows.marked.clone())?;
+        checkpoint::publish_metadata(&snapshot, &mut batch)?;
+        batch.put_value::<ProstCodec, _>(GROUP, HARD_STATE.to_vec(), &hard_state)?;
+        self.engine.write(&mut batch, true)?;
+        rows.set(&mut stored);
+        self.sync_writes += 1;
+        self.hard_state = hard_state;
+        self.snapshot = snapshot;
         Ok(())
     }
 

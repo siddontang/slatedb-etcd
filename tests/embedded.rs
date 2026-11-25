@@ -524,3 +524,62 @@ async fn follower_behind_an_imageless_truncation_catches_up_from_an_on_demand_im
         server.shutdown().await.unwrap();
     }
 }
+
+/// A host that sets the retention directly gets the flag rules: zero disables automatic
+/// compaction in both modes, and a negative revision count fails before storage is created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn embedded_auto_compaction_retention_is_validated() {
+    use slatedb_etcd::compactor::Retention;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = ServerConfig::single_node(dir.path().join("negative"));
+    config.auto_compaction = Some(Retention::Revision(-2));
+    assert!(Server::start(config.clone()).await.is_err());
+    assert!(!config.dir.exists());
+    for (name, retention) in [
+        ("revision", Retention::Revision(0)),
+        ("periodic", Retention::Periodic(Duration::ZERO)),
+    ] {
+        let mut config = ServerConfig::single_node(dir.path().join(name));
+        config.auto_compaction = Some(retention);
+        let server = Server::start(config).await.unwrap();
+        assert_eq!(server.config().auto_compaction, None, "{name}");
+        server.shutdown().await.unwrap();
+    }
+    let mut config = ServerConfig::single_node(dir.path().join("kept"));
+    config.auto_compaction = Some(Retention::Revision(5));
+    let server = Server::start(config).await.unwrap();
+    assert_eq!(
+        server.config().auto_compaction,
+        Some(Retention::Revision(5))
+    );
+    server.shutdown().await.unwrap();
+}
+
+/// An unpaginated Range larger than 64 MiB returns every row, as etcd sends up to
+/// `math.MaxInt32` bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unpaginated_range_above_64_mib_returns_every_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(ServerConfig::single_node(dir.path()))
+        .await
+        .unwrap();
+    ready(&server).await;
+    let value = vec![b'v'; 1024 * 1024];
+    for i in 0..72u32 {
+        put(&server, format!("big/{i:03}").as_bytes(), &value).await;
+    }
+    let reply = KvClient::connect(server.client_url())
+        .await
+        .unwrap()
+        .max_decoding_message_size(usize::MAX)
+        .range(RangeRequest {
+            key: b"big/".to_vec(),
+            range_end: b"big0".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((reply.count, reply.kvs.len(), reply.more), (72, 72, false));
+    assert!(reply.kvs.iter().all(|kv| kv.value == value));
+}

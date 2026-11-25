@@ -181,6 +181,24 @@ impl SharedView {
         }
         best
     }
+
+    /// Return the last overlay key in `[start, upper)` with its newest version at `seq`.
+    /// The newest segment wins for equal keys.
+    fn prev_overlay(
+        &self,
+        start: &[u8],
+        upper: Bound<&[u8]>,
+        end: &End<'_>,
+    ) -> Option<(Bytes, Option<Bytes>)> {
+        let mut best: Option<(Bytes, Option<Bytes>)> = None;
+        for segment in self.segments.iter().rev() {
+            let limit = best.as_ref().map(|(key, _)| key.as_ref());
+            if let Some(found) = segment.last_before(start, upper, end, self.seq, limit) {
+                best = Some(found);
+            }
+        }
+        best
+    }
 }
 
 /// The upper end of a scan that the scan owns.
@@ -196,6 +214,15 @@ impl Limit {
             Self::Prefix(prefix) => End::Prefix(prefix),
         }
     }
+
+    /// The exclusive upper bound of a descending scan. A prefix scan walks down from the end of
+    /// the keys and skips the keys past the prefix.
+    fn upper(&self) -> Bound<&[u8]> {
+        match self {
+            Self::Before(end) => Bound::Excluded(end),
+            Self::Prefix(_) => Bound::Unbounded,
+        }
+    }
 }
 
 /// Merge a base scan with the overlay rows of a view. An overlay delete hides the base row.
@@ -205,6 +232,8 @@ pub(crate) struct SharedScan<'a> {
     limit: Limit,
     base: Option<DbIterator>,
     base_row: Option<Row>,
+    /// Rows come in descending key order.
+    descending: bool,
     /// The last overlay key that the scan used.
     after: Option<Bytes>,
     overlay_row: Option<(Bytes, Option<Bytes>)>,
@@ -224,18 +253,27 @@ impl StateScan for SharedScan<'_> {
                 }
             }
             if self.overlay_row.is_none() && !self.overlay_done {
-                let lower = match &self.after {
-                    Some(key) => Bound::Excluded(key.as_ref()),
-                    None => Bound::Included(self.start.as_slice()),
+                let end = self.limit.end();
+                self.overlay_row = if self.descending {
+                    let upper = match &self.after {
+                        Some(key) => Bound::Excluded(key.as_ref()),
+                        None => self.limit.upper(),
+                    };
+                    self.view.prev_overlay(&self.start, upper, &end)
+                } else {
+                    let lower = match &self.after {
+                        Some(key) => Bound::Excluded(key.as_ref()),
+                        None => Bound::Included(self.start.as_slice()),
+                    };
+                    self.view.next_overlay(lower, &end)
                 };
-                self.overlay_row = self.view.next_overlay(lower, &self.limit.end());
                 self.overlay_done = self.overlay_row.is_none();
             }
             let overlay_first = match (&self.base_row, &self.overlay_row) {
                 (None, None) => return Ok(None),
                 (Some(_), None) => false,
                 (None, Some(_)) => true,
-                (Some(base), Some((key, _))) => match key.as_ref().cmp(base.key.as_ref()) {
+                (Some(base), Some((key, _))) => match self.order(key, &base.key) {
                     std::cmp::Ordering::Less => true,
                     std::cmp::Ordering::Equal => {
                         // The overlay holds a newer version of this row.
@@ -253,6 +291,55 @@ impl StateScan for SharedScan<'_> {
             if let Some(value) = value {
                 return Ok(Some(Row { key, value }));
             }
+        }
+    }
+
+    /// Move forward to the first merged row at or after `key`, like `DbIterator::seek`.
+    /// A buffered row at or after `key` is kept; the base and overlay never move backward.
+    async fn seek(&mut self, key: &[u8]) -> Result<(), slatedb::Error> {
+        if self.descending {
+            return Err(slatedb::Error::invalid(
+                "seek on a descending shared scan".to_owned(),
+            ));
+        }
+        self.view.check()?;
+        if self
+            .base_row
+            .as_ref()
+            .is_none_or(|row| row.key.as_ref() < key)
+        {
+            self.base_row = None;
+            if let Some(base) = &mut self.base {
+                self.view
+                    .bounded(Box::pin(StateScan::seek(base, key)))
+                    .await?;
+            }
+        }
+        if self
+            .overlay_row
+            .as_ref()
+            .is_none_or(|(k, _)| k.as_ref() < key)
+        {
+            self.overlay_row = None;
+            if self.after.as_ref().is_none_or(|after| after.as_ref() < key) {
+                self.after = None;
+                if self.start.as_slice() < key {
+                    self.start = key.to_vec();
+                }
+            }
+            self.overlay_done = false;
+        }
+        Ok(())
+    }
+}
+
+impl SharedScan<'_> {
+    /// Compare two keys in the order of the scan.
+    fn order(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        if self.descending {
+            b.cmp(a)
+        } else {
+            a.cmp(b)
         }
     }
 }
@@ -291,6 +378,7 @@ impl StateRead for SharedView {
             limit: Limit::Before(range.end),
             base,
             base_row: None,
+            descending: matches!(options.order, slatedb::IterationOrder::Descending),
             after: None,
             overlay_row: None,
             overlay_done: false,
@@ -319,6 +407,7 @@ impl StateRead for SharedView {
             limit: Limit::Prefix(prefix.to_vec()),
             base,
             base_row: None,
+            descending: matches!(options.order, slatedb::IterationOrder::Descending),
             after: None,
             overlay_row: None,
             overlay_done: false,
@@ -359,6 +448,13 @@ impl StateScan for ViewScan<'_> {
         match self {
             Self::Db(scan) => StateScan::next(scan).await,
             Self::Shared(scan) => scan.next().await,
+        }
+    }
+
+    async fn seek(&mut self, key: &[u8]) -> Result<(), slatedb::Error> {
+        match self {
+            Self::Db(scan) => StateScan::seek(scan, key).await,
+            Self::Shared(scan) => scan.seek(key).await,
         }
     }
 }
@@ -464,6 +560,113 @@ mod tests {
         let base = Base::open(store, "state", id, cache).await.unwrap();
         assert_eq!(base.applied, 3);
         (db, Arc::new(base))
+    }
+
+    /// Collect a scan of `range` after `next` rows and a seek to `to`.
+    async fn scan_seek(view: &SharedView, range: Range<&str>, next: usize, to: &str) -> Vec<Row> {
+        let range = range.start.as_bytes().to_vec()..range.end.as_bytes().to_vec();
+        let mut scan = view
+            .scan_range(range, &ScanOptions::default())
+            .await
+            .unwrap();
+        let mut found = vec![];
+        for _ in 0..next {
+            found.push(scan.next().await.unwrap().unwrap());
+        }
+        scan.seek(to.as_bytes()).await.unwrap();
+        while let Some(row) = scan.next().await.unwrap() {
+            found.push(row);
+        }
+        found
+    }
+
+    #[tokio::test]
+    async fn shared_scans_seek_forward_over_base_and_overlay() {
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let (_db, base) = checkpoint_base(store).await;
+        let mut overlay = Overlay::new(3);
+        overlay.push(
+            5,
+            batch(&[("a/0", Some("new")), ("a/2", None), ("a/35", Some("mid"))]),
+        );
+        let view = SharedView::new(base, overlay.segments(), 5);
+        // Merged order: a/0 (overlay), a/1, a/3, a/35 (overlay), a/4. a/2 is deleted.
+        // Seek from the start skips both sources to the first row at or after the key.
+        assert_eq!(
+            scan_seek(&view, "a/".."b", 0, "a/3").await,
+            vec![
+                row("a/3", "base-a/3"),
+                row("a/35", "mid"),
+                row("a/4", "base-a/4")
+            ]
+        );
+        // A seek between rows lands on the next overlay row.
+        assert_eq!(
+            scan_seek(&view, "a/".."b", 1, "a/31").await,
+            vec![
+                row("a/0", "new"),
+                row("a/35", "mid"),
+                row("a/4", "base-a/4")
+            ]
+        );
+        // After a/0 from the overlay, the base row a/1 is buffered. A seek to a key before it
+        // keeps the buffered row instead of seeking the base iterator backward.
+        assert_eq!(
+            scan_seek(&view, "a/".."b", 1, "a/05").await,
+            vec![
+                row("a/0", "new"),
+                row("a/1", "base-a/1"),
+                row("a/3", "base-a/3"),
+                row("a/35", "mid"),
+                row("a/4", "base-a/4"),
+            ]
+        );
+        // A seek onto a deleted key skips it.
+        assert_eq!(
+            scan_seek(&view, "a/".."b", 0, "a/2").await,
+            vec![
+                row("a/3", "base-a/3"),
+                row("a/35", "mid"),
+                row("a/4", "base-a/4")
+            ]
+        );
+        // A seek past the end yields nothing.
+        assert!(scan_seek(&view, "a/".."b", 0, "a/9").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn descending_shared_scans_merge_base_and_overlay_in_reverse() {
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let (_db, base) = checkpoint_base(store).await;
+        let mut overlay = Overlay::new(3);
+        overlay.push(5, batch(&[("a/0", Some("old")), ("a/35", Some("mid"))]));
+        overlay.close_segment();
+        overlay.push(6, batch(&[("a/0", Some("new")), ("a/2", None)]));
+        let view = SharedView::new(base, overlay.segments(), 6);
+        let options = ScanOptions {
+            order: slatedb::IterationOrder::Descending,
+            ..ScanOptions::default()
+        };
+        let mut scan = view
+            .scan_range(b"a/".to_vec()..b"a/4".to_vec(), &options)
+            .await
+            .unwrap();
+        let mut found = vec![];
+        while let Some(row) = scan.next().await.unwrap() {
+            found.push(row);
+        }
+        // a/4 is past the end, a/2 is deleted, and the newer segment holds a/0.
+        assert_eq!(
+            found,
+            vec![
+                row("a/35", "mid"),
+                row("a/3", "base-a/3"),
+                row("a/1", "base-a/1"),
+                row("a/0", "new"),
+            ]
+        );
     }
 
     #[tokio::test]

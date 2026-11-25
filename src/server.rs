@@ -30,6 +30,9 @@ pub const DEFAULT_VIEW_PIN_MAX: Duration = Duration::from_secs(5 * 60);
 /// The default soft limit of the shared-mode overlay.
 pub const DEFAULT_OVERLAY_MAX_BYTES: u64 = 1 << 30;
 
+/// The default quota usage fraction for the early warning.
+pub const DEFAULT_QUOTA_WARNING_FRACTION: f64 = 0.8;
+
 /// Configuration for one member. Preserve its ID, cluster ID, and directory across restarts.
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -59,6 +62,13 @@ pub struct ServerConfig {
     pub state_cache: crate::state::StateCache,
     /// Zero selects the default 2 GiB quota. A negative value disables the quota.
     pub quota_bytes: i64,
+    /// Request `quota_bytes` again with a new time at startup. See `NodeOptions`.
+    pub quota_reassert: bool,
+    /// Quota usage fraction that raises the early warning. Zero disables the warning.
+    pub quota_warning_fraction: f64,
+    /// Automatic compaction retention, as etcd's `--auto-compaction-*` flags select it.
+    /// `None` disables automatic compaction.
+    pub auto_compaction: Option<crate::compactor::Retention>,
     pub auth_token: String,
     pub strict_reconfiguration: bool,
     pub join: bool,
@@ -105,6 +115,9 @@ impl ServerConfig {
             log_memory: LogMemory::default(),
             state_cache: crate::state::StateCache::default(),
             quota_bytes: 0,
+            quota_reassert: false,
+            quota_warning_fraction: DEFAULT_QUOTA_WARNING_FRACTION,
+            auto_compaction: None,
             auth_token: "simple".into(),
             strict_reconfiguration: true,
             join: false,
@@ -145,6 +158,16 @@ impl Server {
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
         config.log_memory.validate()?;
         config.state_cache.validate()?;
+        ensure!(
+            (0.0..=1.0).contains(&config.quota_warning_fraction),
+            "the quota warning fraction must be from 0 to 1"
+        );
+        // A directly built retention gets the same zero and sign rules as the flags.
+        config.auto_compaction = config
+            .auto_compaction
+            .map(crate::compactor::Retention::validate)
+            .transpose()?
+            .flatten();
         ensure!(
             !config.join || config.restore_snapshot.is_none(),
             "join cannot restore a snapshot"
@@ -258,12 +281,7 @@ impl Server {
         }
         let mut restore = None;
         if let Some(backup) = config.restore_snapshot.take() {
-            let mut members = crate::cluster::Store::initial(&config.peers);
-            for (&id, address) in &config.client_peers {
-                if let Some(member) = members.members.get_mut(&id) {
-                    member.client_ur_ls = vec![crate::cluster::url(address)];
-                }
-            }
+            let members = crate::cluster::Store::bootstrap(&config.peers, &config.client_peers);
             if config.state_mode.is_replicated() {
                 crate::state::StateMachine::restore_backup(
                     &backup,
@@ -271,7 +289,10 @@ impl Server {
                     config.id,
                     &config.cluster_id,
                     &members,
-                )?;
+                    &config.object_store,
+                    config.state_cache,
+                )
+                .await?;
             } else {
                 // A new shared cluster gets the rows in its shared database when it opens.
                 restore = Some(crate::state::StateMachine::restore_shared(
@@ -314,6 +335,9 @@ impl Server {
                 log_memory: config.log_memory,
                 state_cache: config.state_cache,
                 quota_bytes: config.quota_bytes,
+                quota_reassert: config.quota_reassert,
+                quota_warning_fraction: config.quota_warning_fraction,
+                auto_compaction: config.auto_compaction,
                 strict_reconfiguration: config.strict_reconfiguration,
                 join: config.join,
                 object_store: config.object_store.clone(),

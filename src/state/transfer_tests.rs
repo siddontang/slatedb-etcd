@@ -94,16 +94,16 @@ async fn a_follower_installs_copied_checkpoint_objects() {
         Some("value-1")
     );
     assert_eq!(follower.local_value("stale").await.unwrap(), None);
-    assert!(follower.members_unsaved);
-    // The installed database accepts the next entry and stores the membership with it.
+    // The leader stored no membership row, so the install stores none either.
+    assert!(follower.members_row.is_none());
+    // The installed database accepts the next entry.
     put(&mut follower, 51, "key-1", "changed").await;
-    assert!(!follower.members_unsaved);
     assert!(follower
         .db()
         .get(crate::cluster::KEY)
         .await
         .unwrap()
-        .is_some());
+        .is_none());
     // Raft replays unflushed entries after a crash. Flush to keep this test local.
     follower.db().flush().await.unwrap();
     follower.close().await.unwrap();
@@ -236,7 +236,8 @@ async fn a_restart_restores_the_membership_of_an_installed_snapshot() {
     // Node startup installs its recovery snapshot again. The index is already applied.
     follower.install_snapshot(&snapshot).await.unwrap();
     assert_eq!(follower.members.members.len(), 2);
-    assert!(follower.members_unsaved);
+    // The membership of a checkpoint without the row stays in memory only.
+    assert!(follower.members_row.is_none());
     follower.close().await.unwrap();
     leader.close().await.unwrap();
 }
@@ -501,4 +502,27 @@ async fn a_copy_never_claims_a_database_that_an_install_made_current() {
     );
     follower.close().await.unwrap();
     leader.close().await.unwrap();
+}
+
+/// A record above its checkpoint row carries the row after the encoded fields. An earlier
+/// binary decodes the same fields and ignores the row. A record without a row has none.
+#[test]
+fn a_view_record_carries_its_row_after_the_earlier_fields() {
+    #[derive(serde::Deserialize)]
+    struct Earlier {
+        version: u32,
+        checkpoint: String,
+    }
+    let id = uuid::Uuid::new_v4();
+    let above = ViewDescriptor::above_row(id, 7).encode().unwrap();
+    let decoded = ViewDescriptor::decode(&above).unwrap().unwrap();
+    assert_eq!((decoded.checkpoint().unwrap(), decoded.row), (id, Some(7)));
+    let earlier: Earlier = crate::codec::decode(&above).unwrap();
+    assert_eq!(
+        (earlier.version, earlier.checkpoint),
+        (VIEW_SNAPSHOT_FORMAT, id.to_string())
+    );
+    let exact = ViewDescriptor::new(id).encode().unwrap();
+    assert_eq!(ViewDescriptor::decode(&exact).unwrap().unwrap().row, None);
+    assert!(exact.len() < above.len());
 }

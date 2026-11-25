@@ -9,6 +9,11 @@ use tonic::Code;
 
 impl StateMachine {
     pub fn logical_size(&self) -> u64 {
+        self.logical_bytes.total()
+    }
+
+    /// Logical bytes by row kind.
+    pub fn logical_usage(&self) -> crate::batch::Usage {
         self.logical_bytes
     }
 
@@ -59,6 +64,8 @@ impl StateMachine {
                 .await
                 .map_err(KvError::storage)
                 .map(|()| json!({"header": mvcc::header(self.revision)})),
+            // gRPC Snapshot streams a backup through `Event::Snapshot`. This command keeps the
+            // bounded in-memory image for Rust callers of the maintenance interface.
             Command::Snapshot => {
                 let _timer = self.metrics.snapshot.start_timer();
                 let bytes = self.snapshot_data().await?;
@@ -414,14 +421,12 @@ async fn hash_rows<R: StateRead>(
         .map_err(KvError::storage)
 }
 
-// Rebuild derived accounting when opening stored state.
-pub(crate) async fn count_logical_size(db: &impl StateRead) -> Result<u64> {
+// Rebuild derived quota accounting by row kind when opening stored state.
+pub(crate) async fn count_logical_usage(db: &impl StateRead) -> Result<crate::batch::Usage> {
     let mut scan = db.scan_under(b"etcd/", &Default::default()).await?;
-    let mut size = 0_u64;
+    let mut size = crate::batch::Usage::default();
     while let Some(row) = scan.next().await? {
-        size = size
-            .checked_add((row.key.len() + row.value.len()) as u64)
-            .context("logical size counter overflow")?;
+        size.add_row(&row.key, row.value.len())?;
     }
     Ok(size)
 }

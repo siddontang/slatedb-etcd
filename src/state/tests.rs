@@ -296,14 +296,10 @@ async fn streamed_snapshot_matches_the_complete_state_encoding() {
     let mut scan = state.db().scan_prefix(b"", ..).await.unwrap();
     while let Some(row) = scan.next().await.unwrap() {
         // The image omits the derived rows. Install takes the term from the Raft snapshot.
-        if row.key.as_ref() != crate::cluster::KEY && !derived_key(&row.key) {
+        if !derived_key(&row.key) {
             rows.push((row.key.to_vec(), row.value.to_vec()));
         }
     }
-    rows.push((
-        crate::cluster::KEY.to_vec(),
-        serde_json::to_vec(state.members.as_ref()).unwrap(),
-    ));
     assert!(rows.len() > 255);
     let expected = crate::codec::encode(&SnapshotData {
         version: crate::SNAPSHOT_FORMAT,
@@ -1186,7 +1182,7 @@ async fn apply_without_term(state: &mut StateMachine, index: u64) {
     state.applied = index;
 }
 
-async fn reopen(state: StateMachine, dir: &std::path::Path) -> StateMachine {
+pub(super) async fn reopen(state: StateMachine, dir: &std::path::Path) -> StateMachine {
     state.db().flush().await.unwrap();
     state.close().await.unwrap();
     drop(state);
@@ -1283,8 +1279,9 @@ pub(super) fn backup_bytes(mut image: Vec<u8>) -> Vec<u8> {
     image
 }
 
-/// Restore `backup` and install its Raft snapshot. Return the restored state.
-pub(super) async fn restore(dir: &std::path::Path, backup: Vec<u8>) -> (StateMachine, Snapshot) {
+/// Restore `backup`, open the restored state, and install the Raft snapshot like startup.
+/// The Raft snapshot records the restored index with term 1 and holds no image.
+pub(super) async fn restore(dir: &std::path::Path, backup: Vec<u8>) -> StateMachine {
     let path = dir.join("backup");
     std::fs::write(&path, backup).unwrap();
     let members = crate::cluster::Store::initial(&std::collections::BTreeMap::from([(
@@ -1292,19 +1289,42 @@ pub(super) async fn restore(dir: &std::path::Path, backup: Vec<u8>) -> (StateMac
         "http://127.0.0.1:2380".into(),
     )]));
     let restore = dir.join("restore");
-    StateMachine::restore_backup(&path, &restore, 1, "test", &members).unwrap();
+    StateMachine::restore_backup(
+        &path,
+        &restore,
+        1,
+        "test",
+        &members,
+        &crate::object::Config::Local,
+        StateCache::default(),
+    )
+    .await
+    .unwrap();
     let snapshot =
         crate::storage::RaftStorage::open(&restore.join("raft"), 1, "test", members.conf().voters)
             .unwrap()
             .recovery_snapshot()
             .clone();
-    let mut restored = StateMachine::open(&restore.join("state")).await.unwrap();
+    assert!(snapshot.data.is_empty());
+    assert_eq!(snapshot.get_metadata().term, 1);
+    let mut restored = StateMachine::open(&restore.join("objects")).await.unwrap();
+    assert_eq!(restored.applied, snapshot.get_metadata().index);
     restored.install_snapshot(&snapshot).await.unwrap();
-    (restored, snapshot)
+    restored
+}
+
+/// Collect a streamed native backup.
+pub(super) async fn streamed_backup(state: &StateMachine) -> Vec<u8> {
+    let mut stream = state.backup().await.unwrap();
+    let mut data = vec![];
+    while let Some(chunk) = stream.chunks.recv().await {
+        data.extend_from_slice(&chunk.unwrap().blob);
+    }
+    data
 }
 
 /// Images and backups keep the format 4 rows, so the previous binary reads them. Install takes
-/// the term from the Raft snapshot metadata, and a restored backup starts at (1, 1).
+/// the term from the Raft snapshot metadata, and a restored backup starts at term 1.
 #[tokio::test]
 async fn images_and_backups_omit_the_term_row() {
     let dir = tempfile::tempdir().unwrap();
@@ -1326,6 +1346,7 @@ async fn images_and_backups_omit_the_term_row() {
     assert_eq!(data.version, crate::SNAPSHOT_FORMAT);
     check_format_4(&data);
     check_format_4_backup(&backup_bytes(image.clone()));
+    check_format_4_backup(&streamed_backup(&source).await);
 
     let mut target = StateMachine::open(&dir.path().join("target"))
         .await
@@ -1343,9 +1364,8 @@ async fn images_and_backups_omit_the_term_row() {
     assert_eq!((target.applied, target.applied_term), (2, 6));
     target.close().await.unwrap();
 
-    let (restored, snapshot) = restore(dir.path(), backup_bytes(image)).await;
-    check_format_4(&crate::codec::decode(&snapshot.data).unwrap());
-    assert_eq!((restored.applied, restored.applied_term), (1, 1));
+    let restored = restore(dir.path(), backup_bytes(image)).await;
+    assert_eq!(restored.applied_term, 1);
     assert_eq!(stored_term(&restored).await, Some(1));
     restored.close().await.unwrap();
     source.close().await.unwrap();
@@ -1386,9 +1406,8 @@ async fn images_and_backups_from_an_older_exporter_may_hold_the_term_row() {
     );
     target.close().await.unwrap();
 
-    let (restored, snapshot) = restore(dir.path(), backup_bytes(image)).await;
-    check_format_4(&crate::codec::decode(&snapshot.data).unwrap());
-    assert_eq!((restored.applied, restored.applied_term), (1, 1));
+    let restored = restore(dir.path(), backup_bytes(image)).await;
+    assert_eq!(restored.applied_term, 1);
     assert_eq!(stored_term(&restored).await, Some(1));
     restored.close().await.unwrap();
     source.close().await.unwrap();
@@ -1413,8 +1432,8 @@ async fn the_applied_term_changes_no_quota_or_hash() {
         }
         assert_eq!(stored_term(&state).await, Some(term));
         assert_eq!(
-            state.logical_size(),
-            maintenance::count_logical_size(state.db().as_ref())
+            state.logical_usage(),
+            maintenance::count_logical_usage(state.db().as_ref())
                 .await
                 .unwrap()
         );
@@ -1440,5 +1459,303 @@ async fn the_applied_term_changes_no_quota_or_hash() {
     }
     for state in states {
         state.close().await.unwrap();
+    }
+}
+
+/// A counter row whose split overflows must not pass the total check by wrapping.
+#[test]
+fn logical_size_split_that_overflows_is_rejected() {
+    let counter = crate::proto::state::LogicalSize {
+        applied: 7,
+        bytes: 0,
+        current: Some(u64::MAX),
+        history: Some(1),
+        journal: Some(0),
+        other: Some(0),
+    };
+    assert!(stored_usage(&counter, 7).is_err());
+    let valid = crate::proto::state::LogicalSize {
+        bytes: 3,
+        current: Some(1),
+        history: Some(2),
+        ..counter
+    };
+    assert_eq!(
+        stored_usage(&valid, 7).unwrap().map(|usage| usage.total()),
+        Some(3)
+    );
+}
+
+/// The replicated membership row. See `state::cluster`.
+mod members {
+    use super::*;
+    use crate::cluster::{Command as C, Store};
+    use crate::proto::etcdserverpb::Member;
+    use std::collections::BTreeMap;
+
+    fn peers() -> BTreeMap<u64, String> {
+        (1..=3).map(|id| (id, format!("127.0.0.1:{id}"))).collect()
+    }
+
+    /// The bootstrap membership of a member whose client URLs use the host text `host`.
+    fn flags(host: &str) -> Store {
+        let clients = (1..=3)
+            .map(|id| (id, format!("http://{host}:{}", 2379 + id)))
+            .collect();
+        Store::bootstrap(&peers(), &clients)
+    }
+
+    /// Open a replicated state with the bootstrap membership of `host` in memory, as a node does.
+    async fn member(dir: &std::path::Path, host: &str) -> StateMachine {
+        let mut state = StateMachine::open(dir).await.unwrap();
+        state.members = Arc::new(flags(host));
+        state
+    }
+
+    async fn row(state: &StateMachine) -> Option<Vec<u8>> {
+        state
+            .applied_state()
+            .get(crate::cluster::KEY)
+            .await
+            .unwrap()
+            .map(|row| row.to_vec())
+    }
+
+    fn learner(id: u64) -> C {
+        C::Add(Member {
+            id,
+            name: String::new(),
+            peer_ur_ls: vec![format!("http://127.0.0.1:{id}")],
+            client_ur_ls: vec![],
+            is_learner: true,
+        })
+    }
+
+    fn json(members: &Store) -> serde_json::Value {
+        serde_json::to_value(members).unwrap()
+    }
+
+    fn admin() -> crate::auth::Credentials {
+        crate::auth::Credentials::default()
+    }
+
+    /// A `SeedMembers` entry of leader `origin` with the row `members`.
+    fn seed_entry(
+        origin: u64,
+        members: &str,
+        digest: Option<&str>,
+        applied: u64,
+    ) -> crate::cluster::Seed {
+        crate::cluster::Seed {
+            id: String::new(),
+            origin,
+            members: members.to_owned(),
+            digest: digest.map(str::to_owned),
+            applied,
+        }
+    }
+
+    /// The seed replaces the bootstrap membership in memory. A later configuration change starts
+    /// from the stored row, so members with other client URL text still store the same row.
+    #[tokio::test]
+    async fn a_change_after_the_seed_writes_the_same_row_on_every_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = serde_json::to_string(&flags("leader")).unwrap();
+        let mut states = vec![];
+        for host in ["127.0.0.1", "other.example"] {
+            let mut state = member(&dir.path().join(host), host).await;
+            state.apply(1, None).await.unwrap();
+            // The bootstrap membership does not count toward the logical size.
+            assert_eq!((state.logical_size(), row(&state).await), (0, None));
+            state
+                .apply_seed_members(2, &seed_entry(1, &seed, None, 1))
+                .await
+                .unwrap();
+            assert_eq!(row(&state).await.unwrap(), seed.as_bytes());
+            assert_eq!(
+                state.members.members[&1].client_ur_ls,
+                ["http://leader:2380"]
+            );
+            let outcome = state.apply_cluster(3, &learner(4), &admin()).await.unwrap();
+            outcome.result.unwrap();
+            let publish = C::Publish {
+                id: 4,
+                client_urls: vec!["http://127.0.0.1:2383".into()],
+            };
+            state.apply_cluster(4, &publish, &admin()).await.unwrap();
+            states.push(state);
+        }
+        let (first, second) = (&states[0], &states[1]);
+        assert_eq!(row(first).await, row(second).await);
+        assert_eq!(first.logical_size(), second.logical_size());
+        assert_eq!(first.members_row, second.members_row);
+        assert_eq!(first.members_row.as_ref().unwrap().written, 4);
+        // A seed of a later term keeps the row.
+        let other = serde_json::to_string(&flags("next")).unwrap();
+        for state in &mut states {
+            let before = row(state).await;
+            let digest = state.members_row.as_ref().unwrap().digest.clone();
+            state
+                .apply_seed_members(5, &seed_entry(2, &other, Some(digest.as_str()), 4))
+                .await
+                .unwrap();
+            assert_eq!(row(state).await, before);
+            assert_eq!(state.members_mismatch, None);
+        }
+        for state in states {
+            state.close().await.unwrap();
+        }
+    }
+
+    /// A rejected cluster command writes no row: not the stored row, and not the bootstrap
+    /// membership of a state without one.
+    #[tokio::test]
+    async fn a_rejected_cluster_command_writes_no_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = StateMachine::open(dir.path()).await.unwrap();
+        let outcome = state
+            .apply_cluster(1, &C::Remove(9), &admin())
+            .await
+            .unwrap();
+        assert!(outcome.result.is_err());
+        assert_eq!((row(&state).await, state.logical_size()), (None, 0));
+        let seed = serde_json::to_string(&flags("leader")).unwrap();
+        state
+            .apply_seed_members(2, &seed_entry(1, &seed, None, 1))
+            .await
+            .unwrap();
+        let (size, written) = (state.logical_size(), state.members_row.clone());
+        for (index, request) in [
+            (3, C::Remove(9)),
+            (4, learner(1)),
+            (5, C::List(Default::default())),
+        ] {
+            let outcome = state
+                .apply_cluster(index, &request, &admin())
+                .await
+                .unwrap();
+            assert_eq!(outcome.result.is_err(), index != 5);
+            assert_eq!(row(&state).await.unwrap(), seed.as_bytes());
+            assert_eq!((state.logical_size(), &state.members_row), (size, &written));
+        }
+        state.close().await.unwrap();
+    }
+
+    /// A seed of another term compares digests only when the row did not change after the index of
+    /// the leader. A member that applied a later change raises no warning. A different row at the
+    /// same index sets the mismatch, and an equal digest clears it.
+    #[tokio::test]
+    async fn a_seed_compares_the_row_only_at_the_index_of_the_leader() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = member(dir.path(), "127.0.0.1").await;
+        let seed = serde_json::to_string(&flags("leader")).unwrap();
+        state
+            .apply_seed_members(1, &seed_entry(1, &seed, None, 0))
+            .await
+            .unwrap();
+        state.apply_cluster(2, &learner(4), &admin()).await.unwrap();
+        let digest = state.members_row.as_ref().unwrap().digest.clone();
+        let stale = crate::cluster::digest(seed.as_bytes());
+        // The leader read its row at index 1, before the change at index 2.
+        state
+            .apply_seed_members(3, &seed_entry(2, &seed, Some(stale.as_str()), 1))
+            .await
+            .unwrap();
+        assert_eq!(state.members_mismatch, None);
+        state
+            .apply_seed_members(4, &seed_entry(2, &seed, Some("0000000000000000"), 3))
+            .await
+            .unwrap();
+        assert_eq!(state.members_mismatch, Some(2));
+        state
+            .apply_seed_members(5, &seed_entry(3, &seed, Some(digest.as_str()), 4))
+            .await
+            .unwrap();
+        assert_eq!(state.members_mismatch, None);
+        // A restart knows only that the row changed at or before the applied index.
+        state.db().flush().await.unwrap();
+        state.close().await.unwrap();
+        drop(state);
+        let mut state = StateMachine::open(dir.path()).await.unwrap();
+        assert_eq!(state.members_row.as_ref().unwrap().written, 5);
+        assert_eq!(state.members.members.len(), 4);
+        state
+            .apply_seed_members(6, &seed_entry(3, &seed, Some("0000000000000000"), 4))
+            .await
+            .unwrap();
+        assert_eq!(state.members_mismatch, None);
+        state.close().await.unwrap();
+    }
+
+    /// A Raft snapshot carries the stored row and no member-local membership. An install of an image
+    /// without the row keeps the bootstrap membership in memory only.
+    #[tokio::test]
+    async fn an_image_carries_only_the_stored_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut leader = member(&dir.path().join("leader"), "leader").await;
+        leader.apply(1, None).await.unwrap();
+        let image = leader.snapshot_data().await.unwrap();
+        let data: SnapshotData = crate::codec::decode(&image).unwrap();
+        assert!(data.rows.iter().all(|(key, _)| key != crate::cluster::KEY));
+        let mut snapshot = Snapshot::default();
+        snapshot.mut_metadata().index = 1;
+        snapshot.mut_metadata().term = 1;
+        snapshot.data = image;
+        let mut follower = member(&dir.path().join("follower"), "127.0.0.1").await;
+        follower.install_snapshot(&snapshot).await.unwrap();
+        assert_eq!((row(&follower).await, &follower.members_row), (None, &None));
+        assert_eq!(json(&follower.members), json(&flags("127.0.0.1")));
+
+        let seed = serde_json::to_string(&flags("leader")).unwrap();
+        leader
+            .apply_seed_members(2, &seed_entry(1, &seed, None, 1))
+            .await
+            .unwrap();
+        snapshot.mut_metadata().index = 2;
+        snapshot.data = leader.snapshot_data().await.unwrap();
+        follower.install_snapshot(&snapshot).await.unwrap();
+        assert_eq!(row(&follower).await.unwrap(), seed.as_bytes());
+        assert_eq!(json(&follower.members), json(&flags("leader")));
+        assert_eq!(follower.logical_size(), leader.logical_size());
+        assert_eq!(
+            follower.members_row.as_ref().unwrap().digest,
+            leader.members_row.as_ref().unwrap().digest
+        );
+        leader.close().await.unwrap();
+        follower.close().await.unwrap();
+    }
+
+    /// A replicated restore drops the membership row of the backup. Each member restores with its
+    /// own flags, so the first leader of the new cluster seeds the row.
+    #[tokio::test]
+    async fn a_replicated_restore_stores_no_member_local_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = member(&dir.path().join("source"), "source").await;
+        let seed = serde_json::to_string(&flags("source")).unwrap();
+        source
+            .apply_seed_members(1, &seed_entry(1, &seed, None, 0))
+            .await
+            .unwrap();
+        let backup = backup_bytes(source.snapshot_data().await.unwrap());
+        let mut restored = restore(dir.path(), backup).await;
+        assert_eq!((row(&restored).await, &restored.members_row), (None, &None));
+        let seed = serde_json::to_string(&flags("new")).unwrap();
+        restored
+            .apply_seed_members(2, &seed_entry(1, &seed, None, 1))
+            .await
+            .unwrap();
+        assert_eq!(row(&restored).await.unwrap(), seed.as_bytes());
+        source.close().await.unwrap();
+        restored.close().await.unwrap();
+    }
+
+    #[test]
+    fn differences_compare_ids_and_urls() {
+        assert!(flags("a").differences(&flags("a")).is_empty());
+        assert_eq!(flags("a").differences(&flags("b")), [1, 2, 3]);
+        let mut other = flags("a");
+        other.members.remove(&2);
+        other.members.get_mut(&3).unwrap().peer_ur_ls = vec!["http://127.0.0.1:9".into()];
+        assert_eq!(flags("a").differences(&other), [2, 3]);
     }
 }

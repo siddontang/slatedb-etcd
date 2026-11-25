@@ -49,7 +49,11 @@ impl Node {
 
     /// The checkpoint to start once `applied` entries have been applied, if one is due.
     /// `Some(true)` builds a complete image; `Some(false)` only flushes state and truncates.
-    fn checkpoint_due(&self, applied: u64) -> Option<bool> {
+    pub(super) fn checkpoint_due(&self, applied: u64) -> Option<bool> {
+        // No checkpoint below the record can replace it. `certify_base` raises the base first.
+        if self.base_below_record() {
+            return None;
+        }
         // Shared mode records its base `F`. The log stays above the base, so the record needs
         // no flush, and any member can send it.
         let applied = self.checkpointable(applied);
@@ -65,8 +69,10 @@ impl Node {
                     .iter()
                     .any(|(index, _)| *index <= applied));
         // Automatic checkpoints only flush state and truncate the local log.
-        let truncate_due = ((self.membership_checkpoint > snapshot_index
-            && applied >= self.membership_checkpoint)
+        // A membership change needs a checkpoint at its index. So does a first cluster quota
+        // after entries of an earlier binary; its row keeps that index across restarts.
+        let forced = self.membership_checkpoint.max(self.state.quota_boundary);
+        let truncate_due = ((forced > snapshot_index && applied >= forced)
             || (self.next_checkpoint.is_some_and(|index| applied >= index)
                 && self.appended_bytes >= self.options.snapshot_min_bytes))
             && applied > snapshot_index
@@ -88,6 +94,10 @@ impl Node {
     fn submit_entries(&mut self, applied: u64, committed: u64) -> Result<()> {
         let low = applied + 1;
         let high = (low + apply::APPLY_ENTRIES).min(committed + 1);
+        let high = self.quota_apply_limit(low, high);
+        if high <= low {
+            return Ok(());
+        }
         let entries = self.raw.store().entries(
             low,
             high,
@@ -113,6 +123,7 @@ impl Node {
             let committed = self.committed_ready;
             if last >= committed
                 || self.apply_paused()
+                || self.quota_guarded()
                 || self.raw.store().snapshot_pending()
                 || last < self.raw.store().snapshot_index()
                 || self.prepared_puts.is_some()
@@ -124,6 +135,30 @@ impl Node {
             self.submit_entries(last, committed)?;
         }
         Ok(())
+    }
+
+    /// Keep the election timer past the leader lease, so the member still votes, but below the
+    /// largest randomized timeout, so it does not campaign. See `tick_raft`.
+    pub(super) fn hold_campaign(&mut self) {
+        let raft = &mut self.raw.raft;
+        let timeout = 2 * raft.election_timeout() - 1;
+        raft.set_randomized_election_timeout(timeout);
+        raft.election_elapsed = raft.election_elapsed.min(timeout - 2);
+    }
+
+    /// Return true from the time Raft accepts a snapshot until apply installs it: while Raft
+    /// holds it as unstable, while the log cache stages it, and while it waits for apply. The
+    /// log cache moves its first index at staging, and Raft drops its unstable snapshot before
+    /// the write ends, so each step needs its own index.
+    pub(super) fn installing(&self) -> bool {
+        let store = self.raw.store();
+        let unstable = self.raw.raft.raft_log.unstable.snapshot.as_ref();
+        let accepted = unstable.map_or(0, |snapshot| snapshot.get_metadata().index);
+        let stored = store.staged_snapshot_index().max(store.snapshot_index());
+        // Raft scans from its own applied index. `complete_apply` keeps that index at or above
+        // `state.applied`, also for a waiting member that starts with Raft ahead. So Raft's
+        // index is below a snapshot only when this one is, and the guard holds then.
+        accepted.max(stored) > self.state.applied
     }
 
     pub(super) fn schedule_apply(&mut self) -> Result<()> {
@@ -144,9 +179,16 @@ impl Node {
                 snapshot_index,
             );
         }
+        if self.take_raise() {
+            let record = self.raw.store().recovery_snapshot().clone();
+            return self.submit_apply(Job::RaiseBase(record), self.state.applied);
+        }
         // A switch frees overlay memory, so it goes before other work.
         if self.prepared_puts.is_none() && self.take_switch() {
             return self.submit_apply(Job::SwitchBase, self.state.applied);
+        }
+        if self.prepared_puts.is_none() && self.take_mark_row() {
+            return self.submit_apply(Job::MarkRow, self.state.applied);
         }
         if let Some((base, term)) = self.adoptable() {
             let index = base.applied;
@@ -229,6 +271,8 @@ impl Node {
         let mut state = state;
         let batch = state.watch.take();
         self.state = state;
+        self.observe_quota()?;
+        self.observe_members();
         self.forwarding.apply(self.state.revision);
         self.publish_local_reads();
         self.publish_watch(batch);
@@ -238,8 +282,13 @@ impl Node {
         self.sync_lease_deadlines();
         self.expire_pending();
         self.finish_output(completed.output)?;
-        self.raw.advance_apply_to(self.state.applied);
+        // A member that waits for a snapshot can start with Raft ahead of its state. See
+        // `node::quota`.
+        if self.state.applied >= self.raw.raft.raft_log.applied {
+            self.raw.advance_apply_to(self.state.applied);
+        }
         self.raw.mut_store().applied_to(self.state.applied);
+        self.note_base();
         if membership_changed {
             self.sync_members();
             // Each checkpoint must hold the membership that Raft uses.

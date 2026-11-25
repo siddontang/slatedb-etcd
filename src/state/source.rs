@@ -21,10 +21,13 @@ pub struct Row {
     pub value: Bytes,
 }
 
-/// Rows of one scan in ascending key order.
+/// Rows of one scan in the key order of its options.
 pub trait StateScan: Send {
     /// Return the next row, or `None` after the last row.
     fn next(&mut self) -> impl Future<Output = Result<Option<Row>, slatedb::Error>> + Send;
+
+    /// Move an ascending scan to the first row at or after `key`.
+    fn seek(&mut self, key: &[u8]) -> impl Future<Output = Result<(), slatedb::Error>> + Send;
 }
 
 /// Point reads and ordered scans of one state.
@@ -61,6 +64,10 @@ impl StateScan for DbIterator {
             key: kv.key,
             value: kv.value,
         }))
+    }
+
+    async fn seek(&mut self, key: &[u8]) -> Result<(), slatedb::Error> {
+        DbIterator::seek(self, key).await
     }
 }
 

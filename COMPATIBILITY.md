@@ -111,8 +111,8 @@ leader. A follower on an older binary cannot install a snapshot from an upgraded
 An older member that installed a checkpoint with `meta/applied-term` exports that row in its
 backups. Restore such a backup with the newer binary. Older restores reject the row.
 Use `--restore-snapshot` for native backups; `etcdutl` cannot restore them.
-Use the [native export tool](docs/operations.md#backups-and-restoration) to save a backup.
-`etcdctl snapshot save` can reject the native image because it requires bbolt page alignment.
+Save a backup with `etcdctl snapshot save` or the
+[native export tool](docs/operations.md#backups-and-restoration).
 Downgrade returns Unimplemented after administrator authorization.
 Automatic certificate generation and certificate reload remain unsupported.
 HashKV requires revision records from database creation; older databases return a format error.
@@ -122,7 +122,10 @@ Neither operation promises immediate filesystem shrinkage. SlateDB checkpoints c
 Quota uses logical bytes and can be exceeded by one request. It is not a free-space reservation.
 
 State scans and full snapshot buffers do not have independent memory quotas.
-Native backups and peer snapshots have a 64 MiB limit.
+KV responses use etcd's send limit of `math.MaxInt32` bytes.
+An unpaginated Range holds its whole response in memory, as on etcd.
+Native backups have no image size limit, but each row has a 64 MiB limit. In shared state mode,
+a native backup image is limited to 64 MiB. Peer snapshots copy objects and have no size limit.
 Lease remaining TTL is not checkpointed. A new leader resets surviving leases to their full TTL.
 DST does not control wall-clock lease expiry, operating system threads, or partial sector writes.
 The local Jepsen driver does not reproduce the upstream SSH, clock, bit-flip, or lazyfs environment.

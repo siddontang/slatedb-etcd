@@ -229,9 +229,34 @@ Raft log replay and full snapshots restore both current state and historical ver
 The revision is independent of the SlateDB sequence number, which tracks the Raft apply index.
 
 Point reads use the current-key index. Current range reads scan the requested key interval.
-Historical point reads scan one key's versions. Historical range reads currently scan all history.
-Range responses collect matching keys in memory before sorting or applying a limit.
-These choices favor compatibility testing. Large data sets need bounded scans and a history index.
+History rows sort by user key and then by revision, because the hex key encoding keeps key order.
+A historical point read uses one descending scan that ends at the requested revision.
+Two historical Range kinds first try the Watch journal after their revision: a count-only Range,
+and a key-ordered Range with a positive limit and no filters.
+A key that no later journal event names has the same current row now as at the revision.
+The Range merges those current rows with the versions at the revision of the named keys.
+It stops after `limit + 1` rows. Its count starts from the current-key count of the pinned view.
+Each named key then adds or removes one. The first later event of a key shows whether the key
+was live at the revision: a delete removes a live key, and a Put of a live key keeps its create
+revision. The count therefore reads no history. Only named keys inside the page read a version.
+The journal row of a revision shares its batch, and compaction keeps rows after the boundary.
+The journal scan decodes only the event keys, types, and revisions, and the Range keeps at most
+`limit + 1` old values.
+A page then costs about `limit` rows plus a key decode of the writes after its revision.
+It does not depend on the history size.
+The count also walks the in-memory key order of the interval, as a current-revision count does.
+Debug builds also read the history rows and check the result against them.
+
+The other historical Ranges read the history rows of their key interval.
+These are the sorted, filtered, or unlimited Ranges that are not count-only.
+A Range also falls back when the view has no key order, or when the later journal has more
+events than 1024 or the current-key count of the interval, whichever is larger.
+This scan reads the versions of a key up to the revision by row key and decodes only one.
+It reads up to eight later versions and then seeks past the rest.
+A key with more than 16 versions up to the revision reads its current row instead.
+If that row is newer than the revision, one descending scan reads the version.
+The cost is about one row and one seek per key in the interval.
+Sorted, filtered, and unlimited Ranges collect the interval in memory before they sort or filter it.
 Range scans set `cache_blocks`, so repeated scans read blocks from the state block cache.
 SlateDB scans otherwise bypass that cache and fetch every block from the object store.
 
@@ -249,11 +274,38 @@ and pauses 2 ms between steps. Each step scans about 2,048 rows and writes one S
 A step first hashes the rows for the retained compaction hash. It then removes old history
 versions and their hash records in key order, removes old Watch events, and finishes the hash.
 All versions of one key change in the same step. Every replica applies the same steps at the
-same indexes, so quota accounting and snapshots stay deterministic.
+same indexes, so the logical size and snapshots stay deterministic.
 The progress record shares each step batch with the apply marker. A restart replays lost steps
 from the Raft log. A later Compact waits in the record until earlier boundaries finish.
 HashKV skips rows that the pending pass will remove, so its result does not depend on progress.
 Quota accounting uses the stored row lengths. Each deleted row contributes its original size once.
+
+Apply compares the logical size with the cluster quota in `etcd/quota`. A `SetQuota` entry
+writes that row, so every replica changes the quota at the same index. The row counts toward the
+logical size, like the alarms row. A replica with no row uses its own flag, as earlier binaries
+did, so replicas of such a state can differ. The leader proposes `SetQuota` right after its
+election, before its client writes. An entry applies only when its request is newer than the
+row: `(requested_at, member, bytes)` orders requests on every replica.
+
+A replica checkpoints through a first `SetQuota` entry that follows quota-checked entries. The
+row keeps that index, so a restart retries the checkpoint. So the log of a leader no longer
+holds such entries of earlier binaries. A new member installs a snapshot instead.
+A state that this binary created empty also stops before such an entry and requests a snapshot.
+See [quota changes](operations.md#change-the-quota).
+
+The `etcd/members` row also counts toward the logical size, so every replica must store the
+same bytes. The membership that a member builds from its `--peer` and `--client-peer` flags stays
+in memory. The leader proposes `SeedMembers` right after its election, before `SetQuota`. On a
+state without the row, this entry stores the membership of the leader. Later, cluster commands
+change the stored row, and a rejected command writes nothing. Raft snapshots carry the stored
+row and nothing else. A log of an earlier binary has other entries before any seed. Such an
+entry that finds no row stores the in-memory membership with its batch, as that binary did. A
+state that this binary created empty stops before such an entry and requests a snapshot, as for
+the quota. This guard works in both state modes. A local origin record says, for each guard,
+whether the state was created empty. It keeps the quota mark of #116, and a directory with
+history at the first start replays its membership entries as before. Each seed also carries a
+digest of the row of the leader. See [membership row](operations.md#membership-row).
+
 Each member flushes SlateDB outside ordered apply when a step finishes a physical boundary.
 Writes can apply during this flush. One flush can run at a time.
 The highest queued index covers intervening requests.

@@ -574,6 +574,7 @@ mod tests {
                     empty_log: true,
                     pin_max: Duration::from_secs(300),
                     restore: None,
+                    record: None,
                 };
                 claim_shared(store, &root, &prefix, "cluster", &binding, &options)
                     .await
@@ -676,6 +677,7 @@ mod tests {
             empty_log: true,
             pin_max: Duration::from_secs(300),
             restore: None,
+            record: None,
         };
         let root = config.cluster_prefix("cluster");
         let prefix = config.member_prefix("cluster", 4);
@@ -746,6 +748,7 @@ mod tests {
                     empty_log: true,
                     pin_max: Duration::from_secs(300),
                     restore: None,
+                    record: None,
                 };
                 config
                     .open(

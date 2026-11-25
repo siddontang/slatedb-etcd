@@ -265,7 +265,7 @@ async fn stepped_compaction_matches_single_batch_compaction() {
         assert_eq!(state.logical_bytes, reference.logical_bytes);
         assert_eq!(
             state.logical_bytes,
-            maintenance::count_logical_size(state.db().as_ref())
+            maintenance::count_logical_usage(state.db().as_ref())
                 .await
                 .unwrap()
         );
@@ -331,7 +331,7 @@ async fn compact_applies_without_deleting_a_large_history() {
     assert!(state.db().get(compaction::PENDING).await.unwrap().is_none());
     assert_eq!(
         state.logical_bytes,
-        maintenance::count_logical_size(state.db().as_ref())
+        maintenance::count_logical_usage(state.db().as_ref())
             .await
             .unwrap()
     );
@@ -475,7 +475,7 @@ async fn snapshot_install_carries_a_pending_compaction() {
     for state in [&source, &target] {
         assert_eq!(
             state.logical_bytes,
-            maintenance::count_logical_size(state.db().as_ref())
+            maintenance::count_logical_usage(state.db().as_ref())
                 .await
                 .unwrap()
         );

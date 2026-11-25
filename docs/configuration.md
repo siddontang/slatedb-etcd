@@ -86,7 +86,11 @@ For example, use `--watch-progress-notify-interval=200ms` for the upstream clien
 | `--snapshot-every` | 10000 | Applied entries between checkpoint opportunities; zero disables it. |
 | `--snapshot-min-bytes` | 67108864 | Log bytes needed before auto truncation; zero disables it. |
 | `--log-file-bytes` | 67108864 | Log file size, at least 65536. Truncation frees whole files. |
-| `--quota-backend-bytes` | 0 | Zero selects 2 GiB. A negative value disables the quota. |
+| `--quota-backend-bytes` | 0 | Seeds or changes the cluster quota. Zero selects 2 GiB. |
+| `--quota-reassert` | off | Requests the quota flag again as the newest change. Use it once. |
+| `--quota-warning-fraction` | 0.8 | Quota share that raises the early warning; zero disables it. |
+| `--auto-compaction-mode` | periodic | `periodic` keeps a duration; `revision` keeps a count. |
+| `--auto-compaction-retention` | 0 | History to keep. Zero disables automatic compaction. |
 | `--log-cache-bytes` | 8388608 | Cache budget for log entries. |
 | `--log-pending-bytes` | 33554432 | Pending entry budget, including unapplied entries. |
 | `--log-read-bytes` | 16777216 | Budget for asynchronous log read results. |
@@ -117,10 +121,38 @@ its `max_unflushed_bytes`, writeback of that member starts 1 MiB at a time, so f
 compaction catch up. A background flush alone does not update the sample.
 On Linux, jemalloc background threads return freed pages to the OS after 200 ms.
 `_RJEM_MALLOC_CONF` overrides that default.
+A negative quota value disables the quota. The quota is cluster state, so a flag change takes
+effect only when that member leads; see [quota changes](operations.md#change-the-quota).
 The quota can be exceeded by one operation and does not reserve free disk space.
-Native backups and `Maintenance.Snapshot` have a 64 MiB limit. Peer snapshots copy SlateDB
-checkpoint objects and have no size limit; see [object storage Raft snapshots](object-snapshots.md).
+Native backups and `Maintenance.Snapshot` stream from a pinned checkpoint with bounded memory.
+The image has no size limit, but each row has a 64 MiB limit. In shared state mode, the image
+is built in memory and limited to 64 MiB; see
+[administration](administration.md#maintenance-and-storage).
+Peer snapshots copy SlateDB checkpoint objects and have no size limit; see
+[object storage Raft snapshots](object-snapshots.md).
 See [log pool accounting](architecture.md#bounded-log-pools) for admission and recovery rules.
+
+## Automatic compaction
+
+The two `--auto-compaction-*` flags use the names, values, and schedule of etcd v3.6.
+Periodic mode reads an integer retention as hours, or a Go duration such as `30m` or `1.5h`.
+It samples the revision ten times per retention period, capped at one sample per six minutes.
+The first Compact waits one period. Later ones run once per period, or hourly for longer periods.
+Each uses the newest sample that is at least one period old. The member checks once per 100 ms
+Raft tick, so a short period can keep up to one extra tick of history.
+Revision mode reads a revision count. Every five minutes it compacts to the current revision
+minus that count. Like etcd, it reads a duration as its nanosecond count.
+A duration is parsed like Go's `time.ParseDuration`, so each part truncates to whole nanoseconds.
+A negative retention is an error. etcd accepts a negative duration but cannot use it.
+An embedding host that sets `ServerConfig.auto_compaction` gets the same rules: zero disables it.
+
+Only the leader proposes. Each Compact goes through Raft with a fixed revision, like a client
+Compact without Physical. Followers keep sampling, so a new leader compacts on its own schedule.
+A Compact that loses leadership fails and retries later. A revision that is already compacted
+counts as done. A restart drops the samples, so the member waits one full period again.
+While compacted rows are still being removed, the leader keeps sampling but proposes no new
+automatic Compact. A new boundary would restart the removal step that is being read.
+Compaction runs as an internal request, so Auth does not apply to it.
 
 ## S3 objects
 
@@ -184,9 +216,32 @@ Rules and limits:
   when the member is idle, unless a newer checkpoint waits.
 - Two writer opens can race for the same manifest version. A leader that loses the race opens
   the writer again, as after a fence.
-- Each member truncates its log through the index of its base checkpoint. Its Raft snapshot names
-  that checkpoint. A member that receives the snapshot opens the checkpoint and adopts it.
-- A restart opens the newest checkpoint. It adopts the checkpoint when the log ends below it.
+- Each member truncates its log through its base index. Its Raft snapshot names the base
+  checkpoint at that index. A member that receives the snapshot opens the checkpoint and adopts
+  it. The base index can be above the checkpoint row when an announcement certified that no
+  entry in between changed state.
+- A follower can ask for a snapshot at its last index, for example after the guard below. A
+  follower's manual checkpoint can also need a base above the leader's base index. The leader
+  then announces its base checkpoint again with its covered index, if it stored no batch above
+  the checkpoint row. Otherwise it publishes a new checkpoint first. One announcement serves
+  each demand, and an idle cluster then appends nothing more.
+- A request of an earlier term can name a suffix that the leader replaced. The leader serves
+  each peer at most its last log index, pinned at the first request, so the follower takes a
+  snapshot and then appends. Both state modes do this.
+- A member reports whether it installs a base above its checkpoint row, with the ID of its
+  process. The leader extends coverage only while every member reported it. An earlier binary
+  gets only a snapshot at its checkpoint row: the leader publishes a new checkpoint for it when
+  its record is above the row. While some member lacks the capability, any request above the
+  record or follower's manual checkpoint gets such a checkpoint. A snapshot above its row uses
+  its own route, which an earlier binary refuses before Raft. A refusal ends the capability of
+  the process that the snapshot named, not of a later one.
+- A restart opens the newest checkpoint. It adopts the checkpoint when the log ends below it. A
+  Raft snapshot record above the newest checkpoint row names its checkpoint, and the restart
+  opens that one at the record index. If retention deleted it, the restart takes the newest
+  checkpoint whose row is between the record row and the record index, and the leader then
+  records and sends that checkpoint. A record that names a checkpoint other than the base is not
+  sent. The leader records the base instead. A leader whose base is below its record takes the
+  record index as a demand.
 - A missing checkpoint object fails a read with a retryable error. In apply it rebuilds the
   state from the newest checkpoint and replays the local log.
 - A member that waits on its overlay limit adopts a newer checkpoint in process when its log
