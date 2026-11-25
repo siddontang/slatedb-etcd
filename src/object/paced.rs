@@ -11,8 +11,9 @@
 //! Block-sized windows cost one disk round trip per block. After a bulk load, flushes and
 //! compaction then fell behind: unflushed memtables reached `max_unflushed_bytes`, and SlateDB
 //! held the apply pipeline for seconds. So while SlateDB reports unflushed memtable bytes of at
-//! least [`BACKLOG_PERCENT`] of that limit, each window fills `PACE_BYTES`. Raft log syncs then
-//! wait longer, but writers no longer wait for seconds of backpressure.
+//! least [`BACKLOG_PERCENT`] of that limit, each window fills `BACKLOG_BYTES`, and from
+//! [`FULL_BACKLOG_PERCENT`], `PACE_BYTES`. Raft log syncs then wait longer, but writers no longer
+//! wait for seconds of backpressure.
 //!
 //! SlateDB uploads a large SST as 10 MiB multipart parts, up to 8 at a time, and flushes and
 //! compactions run concurrently. Pacing each writer alone still left dozens of windows in
@@ -32,7 +33,7 @@ use std::io::ErrorKind;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use async_trait::async_trait;
@@ -45,12 +46,19 @@ use super::sst_reads::{self, SstReads};
 
 /// The largest window. Windows are this large only during a write backlog.
 const PACE_BYTES: u64 = 1024 * 1024;
-/// Unflushed memtable bytes, in percent of `max_unflushed_bytes`, that start backlog windows.
+/// The window during a small write backlog.
+const BACKLOG_BYTES: u64 = 256 * 1024;
+/// Unflushed memtable bytes, in percent of `max_unflushed_bytes`, that start `BACKLOG_BYTES`
+/// windows.
 ///
 /// A bulk load reached the limit within 5 s and then stalled apply for seconds. Short write
-/// bursts, such as 100,000 puts of 4 KiB values, stayed below 40 %. Backlog windows during such
-/// a burst moved more SST writeback in front of Raft log syncs and cost 10-15 % throughput.
+/// bursts, such as 100,000 puts of 4 KiB values, came to 40-70 %. `PACE_BYTES` windows during
+/// such a burst moved more SST writeback in front of Raft log syncs and cost 10-25 %
+/// throughput, and `BACKLOG_BYTES` windows about a third of that.
 pub(crate) const BACKLOG_PERCENT: usize = 50;
+/// Unflushed memtable bytes, in percent of `max_unflushed_bytes`, that start `PACE_BYTES`
+/// windows. `BACKLOG_BYTES` windows alone let a bulk load fill memory up to the limit.
+pub(crate) const FULL_BACKLOG_PERCENT: usize = 75;
 /// SST windows in writeback across the process.
 const MAX_WINDOWS: usize = 4;
 /// Windows compaction output may hold. One keeps compaction moving while memtable flushes get
@@ -202,8 +210,8 @@ impl Writer {
 struct Lane {
     state: Mutex<LaneState>,
     freed: Condvar,
-    /// SlateDB has a write backlog, so windows fill `PACE_BYTES`.
-    backlog: AtomicBool,
+    /// The window size during a write backlog, or 0 for one window per chunk.
+    backlog: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -239,7 +247,7 @@ impl Lane {
                 windows: 0,
             }),
             freed: Condvar::new(),
-            backlog: AtomicBool::new(false),
+            backlog: AtomicU64::new(0),
         }
     }
 
@@ -402,8 +410,8 @@ impl<'a> Pacer<'a> {
 
 /// Write `data` at `offset`, one window in writeback at a time.
 ///
-/// A window ends with each chunk of `data`, or at `PACE_BYTES` during a write backlog. The next
-/// window is copied into the page cache while the previous one is on the device.
+/// A window ends with each chunk of `data`, or at the lane's backlog window size. The next window
+/// is copied into the page cache while the previous one is on the device.
 fn write_paced(
     file: &File,
     mut offset: u64,
@@ -423,12 +431,18 @@ fn write_paced(
     for chunk in data.iter() {
         let mut chunk = chunk.as_ref();
         while !chunk.is_empty() {
-            let len = chunk.len().min((PACE_BYTES - (offset - start)) as usize);
+            let backlog = lane.backlog.load(Ordering::Relaxed);
+            let size = if backlog == 0 { PACE_BYTES } else { backlog };
+            if offset - start >= size {
+                pacer.submit(start, offset - start)?;
+                start = offset;
+            }
+            let len = chunk.len().min((size - (offset - start)) as usize);
             file.write_all_at(&chunk[..len], offset)
                 .map_err(|e| io_error(e, path))?;
             offset += len as u64;
             chunk = &chunk[len..];
-            if offset - start == PACE_BYTES || !lane.backlog.load(Ordering::Relaxed) {
+            if backlog == 0 {
                 pacer.submit(start, offset - start)?;
                 start = offset;
             }
@@ -671,17 +685,19 @@ impl MultipartUpload for PacedUpload {
     }
 }
 
-/// A SlateDB metrics recorder that turns backlog windows on and off.
+/// A SlateDB metrics recorder that sets the backlog window size.
 ///
 /// SlateDB sets its unflushed memtable gauge before each write. The recorder compares it with
-/// [`BACKLOG_PERCENT`] of `max_unflushed_bytes`. It drops every other metric.
+/// [`BACKLOG_PERCENT`] and [`FULL_BACKLOG_PERCENT`] of `max_unflushed_bytes`. It drops every
+/// other metric.
 pub(crate) fn backlog_recorder(
     max_unflushed_bytes: usize,
 ) -> Arc<dyn slatedb_common::metrics::MetricsRecorder> {
     Arc::new(BacklogRecorder {
         gauge: Arc::new(UnflushedGauge {
             lane: &LANE,
-            threshold: (max_unflushed_bytes / 100 * BACKLOG_PERCENT) as i64,
+            low: (max_unflushed_bytes / 100 * BACKLOG_PERCENT) as i64,
+            high: (max_unflushed_bytes / 100 * FULL_BACKLOG_PERCENT) as i64,
         }),
         noop: slatedb_common::metrics::NoopMetricsRecorder::new(),
     })
@@ -694,14 +710,20 @@ struct BacklogRecorder {
 
 struct UnflushedGauge {
     lane: &'static Lane,
-    threshold: i64,
+    low: i64,
+    high: i64,
 }
 
 impl slatedb_common::metrics::GaugeFn for UnflushedGauge {
     fn set(&self, value: i64) {
-        self.lane
-            .backlog
-            .store(value >= self.threshold, Ordering::Relaxed);
+        let size = if value >= self.high {
+            PACE_BYTES
+        } else if value >= self.low {
+            BACKLOG_BYTES
+        } else {
+            0
+        };
+        self.lane.backlog.store(size, Ordering::Relaxed);
     }
 }
 
@@ -1155,7 +1177,8 @@ mod tests {
     }
 
     /// Windows end with each chunk, so a Raft log sync waits behind a few SST blocks. During a
-    /// write backlog they fill `PACE_BYTES`, across chunk and part boundaries.
+    /// write backlog they fill `BACKLOG_BYTES` or `PACE_BYTES`, across chunk and part
+    /// boundaries.
     #[tokio::test]
     async fn backlog_windows_fill_pace_bytes() {
         use slatedb_common::metrics::MetricsRecorder;
@@ -1183,16 +1206,22 @@ mod tests {
         let recorder = BacklogRecorder {
             gauge: Arc::new(UnflushedGauge {
                 lane,
-                threshold: 100,
+                low: 100,
+                high: 200,
             }),
             noop: slatedb_common::metrics::NoopMetricsRecorder::new(),
         };
         let gauge = recorder.register_gauge(slatedb::db_stats::TOTAL_MEM_SIZE_BYTES, "", &[]);
         gauge.set(99);
-        assert!(!lane.backlog.load(Ordering::Relaxed));
+        assert_eq!(lane.backlog.load(Ordering::Relaxed), 0);
         gauge.set(100);
-        assert!(lane.backlog.load(Ordering::Relaxed));
+        assert_eq!(lane.backlog.load(Ordering::Relaxed), BACKLOG_BYTES);
+        store.put(&path, payload()).await.unwrap();
+        assert_eq!(windows(lane), data.len().div_ceil(BACKLOG_BYTES as usize));
+        assert_eq!(store.get(&path).await.unwrap().bytes().await.unwrap(), data);
 
+        gauge.set(200);
+        assert_eq!(lane.backlog.load(Ordering::Relaxed), PACE_BYTES);
         store.put(&path, payload()).await.unwrap();
         assert_eq!(windows(lane), 3);
         assert_eq!(store.get(&path).await.unwrap().bytes().await.unwrap(), data);
