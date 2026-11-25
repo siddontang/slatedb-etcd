@@ -155,6 +155,9 @@ impl Node {
         let unstable = self.raw.raft.raft_log.unstable.snapshot.as_ref();
         let accepted = unstable.map_or(0, |snapshot| snapshot.get_metadata().index);
         let stored = store.staged_snapshot_index().max(store.snapshot_index());
+        // Raft scans from its own applied index. `complete_apply` keeps that index at or above
+        // `state.applied`, also for a waiting member that starts with Raft ahead. So Raft's
+        // index is below a snapshot only when this one is, and the guard holds then.
         accepted.max(stored) > self.state.applied
     }
 
