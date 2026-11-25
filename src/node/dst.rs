@@ -77,6 +77,9 @@ struct Simulation {
     reference: Option<StateMachine>,
     /// The reference digest of the `etcd/` rows after each index.
     digests: BTreeMap<u64, u32>,
+    /// Shared mode: the loaded fields of the first member seen at each index. A member that
+    /// opens or installs a base above its row must give the same fields as one that applied.
+    loaded: BTreeMap<u64, String>,
     /// The last applied index that the view check covered on each member.
     checked: BTreeMap<u64, u64>,
     /// Member views that matched the reference.
@@ -195,6 +198,7 @@ impl Simulation {
             }),
             reference,
             digests: BTreeMap::new(),
+            loaded: BTreeMap::new(),
             checked: BTreeMap::new(),
             view_checks: 0,
             quotas,
@@ -566,6 +570,7 @@ impl Simulation {
             let digest = rows_digest(reference.applied_state()).await.unwrap();
             self.digests.insert(reference.applied, digest);
         }
+        self.check_loaded();
         for (&id, node) in &self.nodes {
             let applied = node.state.applied;
             if self.checked.get(&id) == Some(&applied) {
@@ -2876,6 +2881,15 @@ impl Simulation {
                 11..=12 => {
                     let id = sim.choose(3) as u64 + 1;
                     sim.tick(id).await;
+                    // A follower asks for a snapshot at its last index. Announcements and
+                    // unmaterialized batches can follow the leader's base row.
+                    if sim.choose(2) == 0 {
+                        if let Some(node) = sim.nodes.get_mut(&id) {
+                            if node.raw.request_snapshot().is_ok() {
+                                sim.trace.push(format!("request snapshot {id}"));
+                            }
+                        }
+                    }
                 }
                 13..=17 => sim.propose().await,
                 18 => sim.view_read().await,

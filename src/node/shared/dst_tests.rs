@@ -4,6 +4,24 @@
 use super::*;
 
 impl Simulation {
+    /// Shared mode: compare the loaded fields of each member with the first member seen at its
+    /// index. A member that opens or installs a base above its row must equal one that applied.
+    pub(super) fn check_loaded(&mut self) {
+        if self.shared.is_none() {
+            return;
+        }
+        for (&id, node) in &self.nodes {
+            let state = node.worker.state();
+            let fields = state.loaded_fields();
+            let first = self.loaded.entry(state.applied).or_insert(fields.clone());
+            assert_eq!(
+                *first, fields,
+                "seed {}: member {id} loaded other fields at {}",
+                self.seed, state.applied
+            );
+        }
+    }
+
     /// Propose a Put on the leader that no client waits for. With `ignore_value` on a missing
     /// key it fails, so it changes no state and stores no batch.
     async fn propose_put(&mut self, put: PutRequest) {
@@ -390,7 +408,8 @@ async fn a_buffered_put_keeps_the_coverage_at_the_checkpoint_row() {
 /// Condition (b): checkpoint X has row `b` in term 1. After an election, the leader certifies
 /// X through `c` in term 2 for a snapshot request. The follower saves the record and stops
 /// before the install. A Defragment then adds checkpoint Y at row `b`, so Y is the newest. The
-/// restart opens X by the record ID at `c` with term 2, and it applies the later entries once.
+/// restart opens X by the record ID at `c` with term 2. It loads the same fields as a member
+/// that applied through `c`, and it applies the later entries once.
 #[tokio::test]
 async fn a_member_restarts_at_a_record_above_its_checkpoint_row() {
     let mut sim = Simulation::with_mode(41, true).await;
@@ -455,6 +474,7 @@ async fn a_member_restarts_at_a_record_above_its_checkpoint_row() {
     let state = sim.nodes[&member].worker.state();
     assert_eq!((state.applied, state.applied_term), (c, term2));
     assert_eq!(state.base_checkpoint(), Some(x));
+    assert_eq!(Some(&state.loaded_fields()), sim.loaded.get(&c));
     sim.settle(4).await;
     sim.propose().await;
     sim.settle(4).await;
