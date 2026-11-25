@@ -231,25 +231,29 @@ The revision is independent of the SlateDB sequence number, which tracks the Raf
 Point reads use the current-key index. Current range reads scan the requested key interval.
 History rows sort by user key and then by revision, because the hex key encoding keeps key order.
 A historical point read uses one descending scan that ends at the requested revision.
-A key-ordered historical Range without filters first tries the Watch journal after its revision.
+Two historical Range kinds first try the Watch journal after their revision: a count-only Range,
+and a key-ordered Range with a positive limit and no filters.
 A key that no later journal event names has the same current row now as at the revision.
 The Range merges those current rows with the versions at the revision of the named keys.
 It stops after `limit + 1` rows. Its count starts from the current-key count of the pinned view.
 Each named key then adds or removes one.
 The journal row of a revision shares its batch, and compaction keeps rows after the boundary.
+The journal scan decodes only the event keys, and the Range keeps at most `limit + 1` old values.
 A page then costs about `limit` current rows plus the writes after its revision.
 It does not depend on the history size.
+The count also walks the in-memory key order of the interval, as a current-revision count does.
 Debug builds also read the history rows and check the result against them.
 
-The Range reads the history rows of its key interval instead in two cases.
-The view has no key order, or the later journal has more events than 1024 or the current-key
-count of the interval, whichever is larger.
+The other historical Ranges read the history rows of their key interval.
+These are the sorted, filtered, or unlimited Ranges that are not count-only.
+A Range also falls back when the view has no key order, or when the later journal has more
+events than 1024 or the current-key count of the interval, whichever is larger.
 This scan reads the versions of a key up to the revision by row key and decodes only one.
 It reads up to eight later versions and then seeks past the rest.
 A key with more than 16 versions up to the revision reads its current row instead.
 If that row is newer than the revision, one descending scan reads the version.
 The cost is about one row and one seek per key in the interval.
-Other historical Ranges collect the interval in memory before they sort or filter it.
+Sorted, filtered, and unlimited Ranges collect the interval in memory before they sort or filter it.
 Range scans set `cache_blocks`, so repeated scans read blocks from the state block cache.
 SlateDB scans otherwise bypass that cache and fetch every block from the object store.
 

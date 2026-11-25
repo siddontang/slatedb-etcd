@@ -344,8 +344,13 @@ async fn historical_ranges_match_every_retained_revision() {
     super::compaction_tests::finish(&mut state).await;
     check(&state, &model, &mut random).await;
     // A restart reads the same history.
-    drop(state);
-    let state = StateMachine::open(dir.path()).await.unwrap();
+    let (revision, compacted) = (state.revision, state.compact_revision);
+    assert!(revision > 50 && compacted > 1, "{revision} {compacted}");
+    let state = super::tests::reopen(state, dir.path()).await;
+    assert_eq!(
+        (state.revision, state.compact_revision),
+        (revision, compacted)
+    );
     check(&state, &model, &mut random).await;
 }
 
@@ -393,4 +398,144 @@ async fn historical_pages_skip_versions_after_the_revision() {
         .kvs
         .iter()
         .all(|kv| kv.value == b"old" && kv.mod_revision <= old));
+}
+
+/// Count the bytes that the test thread allocates while `PEAK_TRACKING` is set.
+struct PeakAlloc;
+
+thread_local! {
+    static PEAK_TRACKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PEAK_LIVE: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    static PEAK_MAX: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+fn track(delta: isize) {
+    let _ = PEAK_TRACKING.try_with(|tracking| {
+        if tracking.get() {
+            let live = PEAK_LIVE.get() + delta;
+            PEAK_LIVE.set(live);
+            PEAK_MAX.set(PEAK_MAX.get().max(live));
+        }
+    });
+}
+
+// SAFETY: every call forwards to the system allocator unchanged.
+unsafe impl std::alloc::GlobalAlloc for PeakAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let ptr = unsafe { std::alloc::System.alloc(layout) };
+        if !ptr.is_null() {
+            track(layout.size() as isize);
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        track(-(layout.size() as isize));
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        let new = unsafe { std::alloc::System.realloc(ptr, layout, size) };
+        if !new.is_null() {
+            track(size as isize - layout.size() as isize);
+        }
+        new
+    }
+}
+
+#[global_allocator]
+static PEAK_ALLOC: PeakAlloc = PeakAlloc;
+
+/// Read `request` from a pinned view and return the reply with the peak bytes that the read
+/// allocated on this thread.
+async fn peak_read(state: &StateMachine, request: RangeRequest) -> (RangeResponse, usize) {
+    let request = RequestOp {
+        request: Some(Op::RequestRange(request)),
+    };
+    let view = state.read_view().unwrap();
+    PEAK_LIVE.set(0);
+    PEAK_MAX.set(0);
+    PEAK_TRACKING.set(true);
+    let outcome = view.read(&request, None).await;
+    PEAK_TRACKING.set(false);
+    let peak = PEAK_MAX.get() as usize;
+    match outcome.unwrap().result {
+        Ok(ResponseOp {
+            response: Some(Resp::ResponseRange(reply)),
+        }) => (reply, peak),
+        other => panic!("unexpected response {other:?}"),
+    }
+}
+
+const LARGE: usize = 512 << 10;
+const LARGE_KEYS: u8 = 16;
+
+async fn put(state: &mut StateMachine, key: Vec<u8>, value: Vec<u8>) {
+    let request = Op::RequestPut(PutRequest {
+        key,
+        value,
+        ..Default::default()
+    });
+    apply(state, request).await;
+}
+
+/// A page and a count at a revision before many large values changed hold at most the page.
+#[tokio::test]
+async fn journal_pages_hold_only_the_values_of_the_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    for key in 0..LARGE_KEYS {
+        put(&mut state, vec![b'k', key], vec![key; LARGE]).await;
+    }
+    let old = state.revision;
+    for key in 0..LARGE_KEYS {
+        put(&mut state, vec![b'k', key], b"small".to_vec()).await;
+    }
+    let all = usize::from(LARGE_KEYS) * LARGE;
+    for (count_only, limit) in [(true, 0), (false, 1)] {
+        let request = RangeRequest {
+            count_only,
+            limit,
+            ..range(b"k", b"l", old)
+        };
+        let (reply, peak) = peak_read(&state, request).await;
+        assert_eq!(reply.count, i64::from(LARGE_KEYS));
+        assert_eq!(reply.kvs.len(), limit as usize);
+        assert!(
+            reply.kvs.iter().all(|kv| kv.value.len() == LARGE),
+            "{count_only} {limit}"
+        );
+        // The page, its older version, one decoded version, and the debug history check each
+        // hold a few values. Holding every changed value takes more than all of them.
+        assert!(
+            peak < all / 2,
+            "count_only {count_only} limit {limit}: peak {peak} of {all} bytes"
+        );
+    }
+}
+
+/// A page of an unrelated prefix does not copy the values that a later range delete removed.
+#[tokio::test]
+async fn journal_pages_skip_the_values_of_unrelated_deletes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    put(&mut state, b"a".to_vec(), b"a".to_vec()).await;
+    for key in 0..LARGE_KEYS {
+        put(&mut state, vec![b'd', key], vec![key; LARGE]).await;
+    }
+    let old = state.revision;
+    let request = Op::RequestDeleteRange(DeleteRangeRequest {
+        key: b"d".to_vec(),
+        range_end: b"e".to_vec(),
+        ..Default::default()
+    });
+    apply(&mut state, request).await;
+    let all = usize::from(LARGE_KEYS) * LARGE;
+    let request = RangeRequest {
+        limit: 1,
+        ..range(b"a", b"b", old)
+    };
+    let (reply, peak) = peak_read(&state, request).await;
+    assert_eq!((reply.count, reply.kvs.len()), (1, 1));
+    assert!(peak < all / 4, "peak {peak} of {all} bytes");
 }

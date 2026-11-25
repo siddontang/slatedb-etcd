@@ -1186,7 +1186,7 @@ async fn apply_without_term(state: &mut StateMachine, index: u64) {
     state.applied = index;
 }
 
-async fn reopen(state: StateMachine, dir: &std::path::Path) -> StateMachine {
+pub(super) async fn reopen(state: StateMachine, dir: &std::path::Path) -> StateMachine {
     state.db().flush().await.unwrap();
     state.close().await.unwrap();
     drop(state);

@@ -1,6 +1,7 @@
 //! Time paginated historical LIST pages while the history grows.
 //!
 //! Run with `cargo run --release --example history_range -- [keys] [rounds] [page] [dir]`.
+//! The member data goes to a new temporary child of `dir`, which the run removes at exit.
 //! The example writes `keys` keys, then overwrites every key `rounds` times. After some rounds it
 //! reads all keys in pages of `page` rows at the first write (`old`) and at the latest write
 //! (`new`). The `churn` read uses the latest write while 100 writes to other keys land between
@@ -111,11 +112,15 @@ async fn main() -> anyhow::Result<()> {
     let keys = arg(1, 20_000);
     let rounds = arg(2, 20);
     let page = arg(3, 500) as i64;
-    let dir = std::env::args()
+    let parent = std::env::args()
         .nth(4)
         .unwrap_or_else(|| "tmp/history-range".into());
-    let _ = std::fs::remove_dir_all(&dir);
-    let server = Server::start(ServerConfig::single_node(&dir)).await?;
+    // The member data goes to a new child of `dir`, so the run never deletes existing data.
+    std::fs::create_dir_all(&parent)?;
+    let dir = tempfile::Builder::new()
+        .prefix("member-")
+        .tempdir_in(&parent)?;
+    let server = Server::start(ServerConfig::single_node(dir.path())).await?;
     let result = async {
         server.wait_ready(Duration::from_secs(10)).await?;
         let mut client = KvClient::connect(server.client_url())

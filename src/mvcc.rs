@@ -354,6 +354,27 @@ struct View<'a, R> {
     keys: Option<&'a crate::state::key_index::KeyPin>,
 }
 
+// The keys of a `state.Journal` row. Decoding skips the values and the other fields.
+#[derive(prost::Message)]
+struct JournalKeys {
+    #[prost(message, repeated, tag = "1")]
+    events: Vec<EventKey>,
+}
+
+// The key of a `mvccpb.Event`.
+#[derive(prost::Message)]
+struct EventKey {
+    #[prost(message, optional, tag = "2")]
+    kv: Option<KeyOnly>,
+}
+
+// The key of a `mvccpb.KeyValue`.
+#[derive(prost::Message)]
+struct KeyOnly {
+    #[prost(bytes = "vec", tag = "1")]
+    key: Vec<u8>,
+}
+
 impl<R: StateRead> View<'_, R> {
     /// Find the base metadata of a key. `None` means that the index is unavailable.
     fn indexed(&self, key: &[u8]) -> Option<Option<KeyValue>> {
@@ -618,8 +639,8 @@ impl<R: StateRead> View<'_, R> {
                 .await
                 .map_err(KvError::storage)?;
             while let Some(row) = scan.next().await.map_err(KvError::storage)? {
-                let journal =
-                    crate::proto::state::Journal::decode(row.value).map_err(KvError::storage)?;
+                // The key projection skips the values of the events without copying them.
+                let journal = JournalKeys::decode(row.value).map_err(KvError::storage)?;
                 events += journal.events.len();
                 if events > budget {
                     return Ok(None);
@@ -631,28 +652,32 @@ impl<R: StateRead> View<'_, R> {
                 }
             }
         }
-        let mut changed = BTreeMap::new();
-        for named in named {
-            let live_now = keys.count(&named, &[named.as_slice(), &[0]].concat()) == 1;
+        // Only the first `keep` older versions in key order can enter the page.
+        let mut older = Vec::new();
+        for named in &named {
+            let live_now = keys.count(named, &[named.as_slice(), &[0]].concat()) == 1;
             let then = self
-                .version_at(&named, revision)
+                .version_at(named, revision)
                 .await?
                 .and_then(|version| version.value);
             count += i64::from(then.is_some()) - i64::from(live_now);
-            changed.insert(named, then);
+            if older.len() < keep {
+                older.extend(then);
+            }
         }
+        let changed = named;
         let mut rows = Vec::new();
         if keep == 0 {
             return Ok(Some((rows, count)));
         }
-        let mut older = changed.values().flatten().peekable();
+        let mut older = older.iter().peekable();
         let mut scan = self.db.scan(bounds).await.map_err(KvError::storage)?;
         let mut current = None;
         while rows.len() < keep {
             if current.is_none() {
                 while let Some(row) = scan.next().await.map_err(KvError::storage)? {
                     let kv = KeyValue::decode(row.value).map_err(KvError::storage)?;
-                    if !changed.contains_key(&kv.key) {
+                    if !changed.contains(&kv.key) {
                         current = Some(kv);
                         break;
                     }
