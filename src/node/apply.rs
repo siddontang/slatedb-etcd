@@ -29,6 +29,12 @@ pub(super) struct AppliedState {
     pub view: Option<(u64, u64, u64)>,
     /// Shared mode: the checkpoint of the base.
     pub base_checkpoint: Option<uuid::Uuid>,
+    /// The quota of the last applied `SetQuota` entry. See `StateMachine::cluster_quota`.
+    pub cluster_quota: Option<i64>,
+    /// The quota that apply uses. A non-positive value means no limit.
+    pub quota_bytes: i64,
+    /// The flag of this member differs from `quota_bytes`.
+    pub quota_mismatch: bool,
 }
 
 impl std::ops::Deref for AppliedState {
@@ -53,6 +59,9 @@ impl AppliedState {
             physical_revision: state.physical_revision(),
             view: state.view_status(),
             base_checkpoint: state.base_checkpoint(),
+            cluster_quota: state.cluster_quota(),
+            quota_bytes: state.quota_bytes(),
+            quota_mismatch: state.quota_mismatch(),
         })
     }
 }
@@ -770,6 +779,10 @@ pub(super) async fn apply_entries(
             }
             RaftCommand::ViewCheckpoint { checkpoint, .. } => {
                 state.apply_view_checkpoint(entry.index, checkpoint).await?;
+                Reply::Encoded(Value::Null)
+            }
+            RaftCommand::SetQuota { bytes, seed, .. } => {
+                state.apply_set_quota(entry.index, *bytes, *seed).await?;
                 Reply::Encoded(Value::Null)
             }
             RaftCommand::CompactStep { .. } => {

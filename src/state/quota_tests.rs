@@ -462,3 +462,124 @@ async fn append_accounting_keeps_original_absence_through_batch_rewrites() {
     assert_eq!(state.logical_bytes.total(), 0);
     state.close().await.unwrap();
 }
+
+/// Apply `count` Puts of about 70 logical bytes each. Return the failed ones.
+async fn put_many(state: &mut StateMachine, count: u64) -> usize {
+    let mut failed = 0;
+    for _ in 0..count {
+        let index = state.applied + 1;
+        let request = put(format!("key-{index}").as_bytes(), &[b'v'; 16], 0);
+        let outcome = state.apply_etcd_quota(index, &request, 1).await.unwrap();
+        failed += usize::from(outcome.result.is_err());
+    }
+    failed
+}
+
+async fn same_state(left: &StateMachine, right: &StateMachine) {
+    assert_eq!(left.applied, right.applied);
+    assert_eq!(left.revision, right.revision);
+    assert_eq!(left.alarms.len(), right.alarms.len());
+    assert_eq!(left.quota, right.quota);
+    assert_eq!(left.cluster_quota(), right.cluster_quota());
+    assert_eq!(left.logical_size(), right.logical_size());
+    check(left).await;
+    check(right).await;
+}
+
+/// Members with different flags apply the same entries alike after a `SetQuota` entry.
+#[tokio::test]
+async fn members_with_different_flags_apply_one_cluster_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut small = StateMachine::open(&dir.path().join("small")).await.unwrap();
+    let mut large = StateMachine::open(&dir.path().join("large")).await.unwrap();
+    small.set_quota_flag(300);
+    large.set_quota_flag(1 << 20);
+    let mut failed = vec![];
+    for state in [&mut small, &mut large] {
+        assert_eq!(state.cluster_quota(), None);
+        state.apply_set_quota(1, 2000, true).await.unwrap();
+        assert_eq!((state.quota, state.quota_bytes()), (2000, 2000));
+        // A later seed changes nothing. A leader with an old view proposes it.
+        state.apply_set_quota(2, 9, true).await.unwrap();
+        assert_eq!(state.cluster_quota(), Some(2000));
+        failed.push(put_many(state, 40).await);
+        assert_eq!(state.alarms.len(), 1);
+    }
+    assert_eq!(failed[0], failed[1]);
+    assert!(failed[0] > 0 && failed[0] < 40, "{failed:?}");
+    assert!(small.quota_mismatch() && large.quota_mismatch());
+    same_state(&small, &large).await;
+    small.close().await.unwrap();
+    large.close().await.unwrap();
+}
+
+/// A non-positive cluster quota disables the check, whatever the flag of the member.
+#[tokio::test]
+async fn a_non_positive_cluster_quota_disables_the_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    state.set_quota_flag(100);
+    state.apply_set_quota(1, -1, false).await.unwrap();
+    assert_eq!((state.quota, state.quota_bytes()), (0, -1));
+    assert_eq!(put_many(&mut state, 10).await, 0);
+    assert!(state.alarms.is_empty());
+    // The row counts toward the logical size, like every `etcd/` row.
+    check(&state).await;
+    state.snapshot_data().await.unwrap();
+    state.close().await.unwrap();
+    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    assert_eq!(state.cluster_quota(), Some(-1));
+    state.set_quota_flag(100);
+    assert_eq!(state.quota, 0);
+    state.close().await.unwrap();
+}
+
+/// A Raft snapshot image and a native backup carry the cluster quota. Entries above the
+/// installed index apply under it, not under the flag of the new member.
+#[tokio::test]
+async fn images_and_backups_carry_the_cluster_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut source = StateMachine::open(&dir.path().join("source"))
+        .await
+        .unwrap();
+    source.set_quota_flag(1 << 20);
+    source.apply_set_quota(1, 2000, false).await.unwrap();
+    assert_eq!(put_many(&mut source, 10).await, 0);
+    let image = source.snapshot_data().await.unwrap();
+    let data: SnapshotData = crate::codec::decode(&image).unwrap();
+    super::tests::check_format_4(&data);
+    assert!(data.rows.iter().any(|(key, _)| key == quota::KEY));
+
+    let mut follower = StateMachine::open(&dir.path().join("follower"))
+        .await
+        .unwrap();
+    follower.set_quota_flag(1 << 20);
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = source.applied;
+    snapshot.mut_metadata().term = 1;
+    snapshot.set_data(image.clone());
+    follower.install_snapshot(&snapshot).await.unwrap();
+    assert_eq!(follower.cluster_quota(), Some(2000));
+    assert_eq!(follower.quota, 2000);
+
+    let backup = super::tests::backup_bytes(image);
+    super::tests::check_format_4_backup(&backup);
+    let path = dir.path().join("restore");
+    std::fs::create_dir(&path).unwrap();
+    let (mut restored, _) = super::tests::restore(&path, backup).await;
+    restored.set_quota_flag(1 << 20);
+    assert_eq!(restored.cluster_quota(), Some(2000));
+    assert_eq!(restored.quota, 2000);
+
+    let failed = put_many(&mut source, 30).await;
+    assert!(failed > 0);
+    for state in [&mut follower, &mut restored] {
+        assert_eq!(put_many(state, 30).await, failed);
+        assert_eq!(state.revision, source.revision);
+        assert_eq!(state.alarms.len(), source.alarms.len());
+        check(state).await;
+    }
+    for state in [source, follower, restored] {
+        state.close().await.unwrap();
+    }
+}

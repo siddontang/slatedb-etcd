@@ -271,11 +271,17 @@ and pauses 2 ms between steps. Each step scans about 2,048 rows and writes one S
 A step first hashes the rows for the retained compaction hash. It then removes old history
 versions and their hash records in key order, removes old Watch events, and finishes the hash.
 All versions of one key change in the same step. Every replica applies the same steps at the
-same indexes, so quota accounting and snapshots stay deterministic.
+same indexes, so the logical size and snapshots stay deterministic.
 The progress record shares each step batch with the apply marker. A restart replays lost steps
 from the Raft log. A later Compact waits in the record until earlier boundaries finish.
 HashKV skips rows that the pending pass will remove, so its result does not depend on progress.
 Quota accounting uses the stored row lengths. Each deleted row contributes its original size once.
+
+Apply compares the logical size with the cluster quota in `etcd/quota`. A `SetQuota` entry
+writes that row, so every replica changes the quota at the same index. The row counts toward the
+logical size, like the alarms row. A replica with no row uses its own flag, as earlier binaries
+did, so replicas of such a state can differ. The leader proposes `SetQuota` right after its
+election, before its client writes. See [quota changes](operations.md#change-the-quota).
 Each member flushes SlateDB outside ordered apply when a step finishes a physical boundary.
 Writes can apply during this flush. One flush can run at a time.
 The highest queued index covers intervening requests.

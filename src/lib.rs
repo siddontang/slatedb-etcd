@@ -131,6 +131,19 @@ pub enum RaftCommand {
         id: String,
         checkpoint: String,
     },
+    /// A replicated-mode leader sets the logical quota of the cluster. A non-positive `bytes`
+    /// disables the check. A `seed` entry applies only when the state has no cluster quota. It
+    /// changes no etcd state except the `etcd/quota` row. Shared mode ignores it.
+    ///
+    /// The enum is untagged, so this variant must precede `CompactStep`, which matches any `id`.
+    /// The JSON names the id `quota_id`. An older binary then fails to decode the entry and
+    /// stops, instead of applying it as a `CompactStep`.
+    SetQuota {
+        #[serde(rename = "quota_id")]
+        id: String,
+        bytes: i64,
+        seed: bool,
+    },
     /// The leader proposes bounded physical compaction work after a Compact entry.
     CompactStep {
         id: String,
@@ -160,6 +173,7 @@ impl RaftCommand {
             | Self::Compact { id, .. }
             | Self::CompactStep { id }
             | Self::ViewCheckpoint { id, .. }
+            | Self::SetQuota { id, .. }
             | Self::Lease { id, .. } => id,
         }
     }

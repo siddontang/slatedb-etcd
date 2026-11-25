@@ -229,6 +229,7 @@ impl Node {
         let mut state = state;
         let batch = state.watch.take();
         self.state = state;
+        self.observe_quota()?;
         self.forwarding.apply(self.state.revision);
         self.publish_local_reads();
         self.publish_watch(batch);

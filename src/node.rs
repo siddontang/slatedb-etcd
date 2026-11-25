@@ -34,6 +34,7 @@ mod proposal;
 pub use forwarding::ForwardView;
 pub(crate) use forwarding::LocalRead;
 mod quorum_put;
+mod quota;
 mod read;
 mod ready;
 mod response;
@@ -310,11 +311,11 @@ pub struct Node {
     auto_compaction: Option<auto_compaction::AutoCompaction>,
     /// Quota usage has reached the warning threshold and the warning is logged.
     quota_warned: bool,
-    /// The enforced quota. Shared mode takes it from the cluster claim. Zero disables it.
-    quota: u64,
     /// Simulation: the leader does not propose compaction steps, as if their reads were slow.
     #[cfg(test)]
     hold_compact_steps: bool,
+    /// The quota flag of this member and its `SetQuota` proposals.
+    quota: quota::Quota,
 }
 
 impl Node {
@@ -397,10 +398,9 @@ impl Node {
         );
         let location = state.location.clone();
         let recovered = async {
-            // Shared mode takes the quota from the cluster claim, so every member uses one value.
-            if !state.is_shared() {
-                state.quota = options.effective_quota().max(0) as u64;
-            }
+            // Replicated apply uses the flag only until a `SetQuota` entry applies. Shared mode
+            // takes the quota from the cluster claim.
+            state.set_quota_flag(options.effective_quota());
             // A shared base can be ahead of the log, or on another term at its index.
             Self::align_log(&mut storage, &state)?;
             // Flushed state proves this prefix was committed, even if its commit marker was lost.
@@ -488,6 +488,14 @@ impl Node {
                 return Err(error);
             }
         };
+        let quota =
+            match quota::Quota::open(&options.dir, options.effective_quota(), state.is_shared()) {
+                Ok(quota) => quota,
+                Err(error) => {
+                    let _ = state.close().await;
+                    return Err(error);
+                }
+            };
         let manual_apply = transport_override.is_some();
         state.set_open_retries(!manual_apply);
         let mut traffic = BTreeMap::<u64, std::sync::Arc<crate::metrics::PeerTraffic>>::new();
@@ -555,7 +563,6 @@ impl Node {
         }
         let compact_plan = compaction::PlanReady::new(&state, manual_apply);
         let log_reader = state.is_shared().then(|| storage.reader());
-        let quota = state.quota;
         let worker = Worker::start(state, events.clone(), manual_apply, log_reader);
         let log_worker = log::Worker::start(storage, manual_apply)?;
         let next_checkpoint = options.next_checkpoint(raw.store().snapshot_index());
@@ -565,7 +572,6 @@ impl Node {
         let mut node = Self {
             auto_compaction,
             quota_warned: false,
-            quota,
             #[cfg(test)]
             hold_compact_steps: false,
             location,
@@ -650,8 +656,10 @@ impl Node {
             lease_promoted: false,
             renewals: lease::Renewals::default(),
             writer,
+            quota,
         };
         node.sync_members();
+        node.observe_quota()?;
         Ok(node)
     }
 
@@ -712,6 +720,7 @@ impl Node {
                 ), if self.compact_ready_at.is_some() => { self.compact_ready_at = None; }
                 _ = ticks.tick() => {
                     self.raw.tick();
+                    self.propose_quota()?;
                     self.retry_reads();
                     self.expire_leases()?;
                     self.publish_member()?;
@@ -866,7 +875,7 @@ impl Node {
                                 .members
                                 .get(&self.options.id)
                                 .is_some_and(|member| member.is_learner),
-                            db_size_quota: self.options.quota_bytes,
+                            db_size_quota: self.status_quota(),
                             leader: self.raw.raft.leader_id,
                             raft_index: self.raw.store().commit_index(),
                             raft_term: self.raw.raft.term,
@@ -1005,6 +1014,8 @@ impl Node {
                 } else if let Some(reserved) = self.snapshot_objects_ready(&message) {
                     let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
                     let stepped = self.raw.step(message);
+                    // A new leader proposes the cluster quota before the next client write.
+                    self.propose_quota()?;
                     if let Some(checkpoint) = reserved {
                         // Raft can skip a snapshot: an older commit, or a log that already
                         // matches. Then no install releases the staging copy.
@@ -1055,7 +1066,8 @@ impl Node {
                     committed: self.raw.raft.raft_log.committed,
                     applied: self.state.applied,
                     pending: self.pending.len(),
-                    quota: self.options.effective_quota(),
+                    quota: self.state.quota_bytes,
+                    quota_mismatch: self.state.quota_mismatch,
                     usage: self.state.usage,
                     warning_bytes: self.warning_bytes(),
                     revision: self.state.revision,
@@ -1556,6 +1568,7 @@ impl Node {
             status["write_profile"] = crate::write_profile::snapshot();
         }
         status["quorum_reply_index"] = self.quorum_reply_index.into();
+        status["quota"] = self.quota_status();
         if let (Some(writer), Some((base, applied, bytes))) = (&self.writer, self.state.view) {
             let record = crate::state::transfer::ViewDescriptor::decode(
                 self.raw.store().recovery_snapshot().get_data(),

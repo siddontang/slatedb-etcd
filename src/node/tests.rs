@@ -1,7 +1,7 @@
 use super::*;
 use raft::eraftpb::{HardState, Snapshot};
 
-fn options(dir: &std::path::Path) -> NodeOptions {
+pub(super) fn options(dir: &std::path::Path) -> NodeOptions {
     NodeOptions {
         client_peers: BTreeMap::new(),
         transport: crate::tls::Transport::default(),
@@ -1233,7 +1233,8 @@ async fn read_index_retries_after_the_first_commit_in_a_new_term() {
     confirm_read(&mut node, &id).await;
     node.drain_apply().await.unwrap();
     assert!(reply.await.unwrap().is_ok());
-    assert_eq!(node.raw.store().durable.last_index, 1);
+    // The empty entry and the `SetQuota` entry of the new leader. The retries append nothing.
+    assert_eq!(node.raw.store().durable.last_index, 2);
     assert_eq!(node.raw.store().durable.sync_writes, syncs);
     assert!(node.reads.is_empty());
 }
@@ -2176,7 +2177,7 @@ async fn shared_quota_warning_uses_the_claimed_quota() {
         let node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
             .await
             .unwrap();
-        assert_eq!(node.quota, 10_240, "member {id}");
+        assert_eq!(node.state.quota_bytes, 10_240, "member {id}");
         assert_eq!(node.warning_bytes(), Some(8_192), "member {id}");
         nodes.push((node, receiver));
     }

@@ -89,6 +89,11 @@ mod tests {
                 id: "view".into(),
                 checkpoint: uuid::Uuid::new_v4().to_string(),
             },
+            RaftCommand::SetQuota {
+                id: "quota".into(),
+                bytes: -1,
+                seed: true,
+            },
             RaftCommand::CompactStep { id: "step".into() },
             RaftCommand::Lease {
                 id: "lease".into(),
@@ -113,6 +118,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `CompactStep` matches any `id`, so `SetQuota` must decode before it.
+    #[test]
+    fn set_quota_does_not_decode_as_a_compaction_step() {
+        for (bytes, seed) in [(2 << 30, true), (0, false), (-3, false)] {
+            let command = RaftCommand::SetQuota {
+                id: "quota".into(),
+                bytes,
+                seed,
+            };
+            let decoded = RaftCommand::decode(&command.encode().unwrap()).unwrap();
+            assert!(
+                matches!(
+                    decoded,
+                    RaftCommand::SetQuota { ref id, bytes: b, seed: s } if id == "quota"
+                        && b == bytes && s == seed
+                ),
+                "{decoded:?}"
+            );
+        }
+        let step = RaftCommand::CompactStep { id: "step".into() };
+        let step = RaftCommand::decode(&step.encode().unwrap()).unwrap();
+        assert!(matches!(step, RaftCommand::CompactStep { .. }));
+        // An older binary has no `SetQuota`. Its `CompactStep` needs an `id`, so it rejects the
+        // entry and does not apply a compaction step that other members skip.
+        #[derive(serde::Deserialize)]
+        struct OlderCompactStep {
+            #[allow(dead_code)]
+            id: String,
+        }
+        let json = serde_json::to_vec(&RaftCommand::SetQuota {
+            id: "quota".into(),
+            bytes: 1,
+            seed: false,
+        })
+        .unwrap();
+        assert!(serde_json::from_slice::<OlderCompactStep>(&json).is_err());
     }
 
     #[test]

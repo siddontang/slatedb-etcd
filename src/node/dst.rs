@@ -68,14 +68,17 @@ struct Simulation {
     proposed: BTreeSet<(String, String)>,
     /// Shared mode: the one object store of all members.
     shared: Option<std::sync::Arc<crate::object::faults::FaultStore>>,
-    /// Shared mode: a replicated state that applies the committed entries in order.
+    /// Shared mode and quota checks: a replicated state that applies the committed entries in
+    /// order. Its quota flag disables the check, unlike the flag of any member.
     reference: Option<StateMachine>,
-    /// Shared mode: the reference digest of the `etcd/` rows after each index.
+    /// The reference digest of the `etcd/` rows after each index.
     digests: BTreeMap<u64, u32>,
-    /// Shared mode: the last applied index that the view check covered on each member.
+    /// The last applied index that the view check covered on each member.
     checked: BTreeMap<u64, u64>,
-    /// Shared mode: member views that matched the reference.
+    /// Member views that matched the reference.
     view_checks: u64,
+    /// The `--quota-backend-bytes` value of each member. Zero selects 2 GiB.
+    quotas: BTreeMap<u64, i64>,
 }
 
 impl Drop for Simulation {
@@ -91,14 +94,26 @@ impl Drop for Simulation {
 }
 
 impl Simulation {
+    /// Start three replicated members. Their quota flags differ, but none rejects a write.
     async fn new(seed: u64) -> Self {
-        Self::with_mode(seed, false).await
+        let quotas = BTreeMap::from([(1, 0), (2, 1 << 30), (3, -1)]);
+        Self::with_options(seed, false, quotas, false).await
+    }
+
+    async fn with_mode(seed: u64, shared: bool) -> Self {
+        Self::with_options(seed, shared, BTreeMap::new(), shared).await
     }
 
     /// Start three members. Shared mode gives them one fault-injectable in-memory store.
-    async fn with_mode(seed: u64, shared: bool) -> Self {
+    /// `reference` checks each member state against a reference state after every step.
+    async fn with_options(
+        seed: u64,
+        shared: bool,
+        quotas: BTreeMap<u64, i64>,
+        reference: bool,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
-        let reference = if shared {
+        let reference = if reference {
             let mut reference = StateMachine::open(&root.path().join("reference"))
                 .await
                 .unwrap();
@@ -146,6 +161,7 @@ impl Simulation {
             digests: BTreeMap::new(),
             checked: BTreeMap::new(),
             view_checks: 0,
+            quotas,
         };
         for id in 1..=3 {
             sim.start(id).await;
@@ -213,7 +229,7 @@ impl Simulation {
                 ),
                 strict_reconfiguration: false,
                 join: false,
-                quota_bytes: 0,
+                quota_bytes: self.quotas.get(&id).copied().unwrap_or(0),
                 quota_warning_fraction: 0.0,
                 auto_compaction: None,
                 id,
@@ -324,7 +340,15 @@ impl Simulation {
         for mut request in self.requests.drain(..) {
             match request.reply.try_recv() {
                 Ok(Ok(result)) => {
-                    let mut result = result.into_outcome().result.unwrap();
+                    let mut result = match result.into_outcome().result {
+                        Ok(result) => result,
+                        // Only a quota check rejects a client Put here.
+                        Err(error) => {
+                            assert_eq!(error.code, tonic::Code::ResourceExhausted as i32);
+                            self.trace.push(format!("reject {}", request.key));
+                            continue;
+                        }
+                    };
                     let revision = crate::mvcc::response_header(&mut result).unwrap().revision;
                     for (&id, node) in &mut self.nodes {
                         let (tx, rx) = oneshot::channel();
@@ -450,17 +474,16 @@ impl Simulation {
             }
         }
         if self.shared.is_some() {
-            self.check_shared().await;
+            self.settle_opens().await;
+        }
+        if self.reference.is_some() {
+            self.check_reference().await;
         }
     }
 
-    /// Shared-mode invariants after every step.
-    ///
-    /// - Background checkpoint opens finish before the next step, so a schedule stays exact.
-    /// - A replicated reference applies the committed entries in order.
-    /// - Each member's view at its applied index equals the reference at that index. A view can
-    ///   fail on a deleted object, but it never returns other data.
-    async fn check_shared(&mut self) {
+    /// Background checkpoint opens of shared mode finish before the next step, so a schedule
+    /// stays exact.
+    async fn settle_opens(&mut self) {
         for node in self.nodes.values_mut() {
             if node.worker.state_mut().settle_opens().await {
                 if let Some(writer) = &mut node.writer {
@@ -468,6 +491,12 @@ impl Simulation {
                 }
             }
         }
+    }
+
+    /// The reference applies the committed entries in order. Each member's view at its applied
+    /// index must equal the reference at that index. A view can fail on a deleted object, but it
+    /// never returns other data.
+    async fn check_reference(&mut self) {
         let reference = self.reference.as_mut().unwrap();
         while let Some(bytes) = self.committed_entries.get(&(reference.applied + 1)) {
             let entry = Entry::decode(bytes.as_slice()).unwrap();
@@ -1924,6 +1953,14 @@ impl Simulation {
                 );
             }
         }
+        // The members have other flags, but they apply the quota of the first leader.
+        let quotas: BTreeSet<_> = sim
+            .nodes
+            .values()
+            .map(|node| (node.state.cluster_quota, node.state.quota_bytes))
+            .collect();
+        assert_eq!(quotas.len(), 1, "seed {seed}: {quotas:?}");
+        assert!(quotas.iter().all(|(cluster, _)| cluster.is_some()));
         sim.renew_under_partition().await;
         sim.batch_and_pinned_reads().await;
         sim.crash_after_quorum_reply().await;
@@ -1958,6 +1995,129 @@ async fn seeded_fault_schedules_replay_identically() {
         assert_eq!(first, second, "seed {seed}: simulation schedule changed");
         eprintln!("DST seed {seed}: {} events replayed", first.len());
     }
+}
+
+impl Simulation {
+    /// Make `id` the leader with a leadership transfer.
+    async fn lead(&mut self, id: u64) {
+        for _ in 0..40 {
+            match self.leader() {
+                Some(leader) if leader == id => return,
+                Some(leader) => self.nodes.get_mut(&leader).unwrap().raw.transfer_leader(id),
+                None => {}
+            }
+            for _ in 0..30 {
+                self.deliver(false).await;
+            }
+            for member in 1..=3 {
+                self.tick(member).await;
+            }
+        }
+        panic!("member {id} did not become the leader");
+    }
+
+    /// Restart `id` with the quota flag `flag`.
+    async fn restart_with(&mut self, id: u64, flag: i64) {
+        self.stop(id);
+        self.quotas.insert(id, flag);
+        self.start(id).await;
+        self.settle(2).await;
+    }
+
+    /// Propose `count` Puts on the leader and deliver their messages.
+    async fn write(&mut self, count: usize) {
+        for _ in 0..count {
+            self.propose().await;
+            for _ in 0..30 {
+                self.deliver(false).await;
+            }
+        }
+        self.settle(1).await;
+    }
+
+    /// Return the cluster quota that every member applied. Members must agree on the state.
+    fn cluster_quota(&self) -> Option<i64> {
+        let first = &self.nodes[&1].state;
+        for (&id, node) in &self.nodes {
+            let state = &node.state;
+            assert_eq!(state.applied, first.applied, "member {id}");
+            assert_eq!(state.revision, first.revision, "member {id}");
+            assert_eq!(state.usage.total(), first.usage.total(), "member {id}");
+            assert_eq!(state.cluster_quota, first.cluster_quota, "member {id}");
+            assert_eq!(
+                node.worker.state().alarms.len(),
+                self.nodes[&1].worker.state().alarms.len(),
+                "member {id}"
+            );
+        }
+        first.cluster_quota
+    }
+
+    /// The indexes of the committed `SetQuota` entries that set `bytes`.
+    fn set_quota_indexes(&self, bytes: i64) -> Vec<u64> {
+        self.committed_entries
+            .iter()
+            .filter_map(|(&index, data)| {
+                let entry = Entry::decode(data.as_slice()).unwrap();
+                match RaftCommand::decode(&entry.data) {
+                    Ok(RaftCommand::SetQuota { bytes: b, .. }) if b == bytes => Some(index),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Members with different quota flags apply one cluster quota. Each member state at each applied
+/// index equals a reference state that applies the committed entries in order.
+#[tokio::test]
+async fn members_with_different_quota_flags_switch_quota_at_one_index() {
+    let quotas = BTreeMap::from([(1, 1 << 20), (2, 3000), (3, 1 << 20)]);
+    let mut sim = Simulation::with_options(7, false, quotas, true).await;
+    sim.settle(3).await;
+    assert_eq!(sim.leader(), Some(1));
+    // Client Puts use this lease.
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    // The first leader seeds the cluster quota. Member 2 does not apply its small flag.
+    sim.write(40).await;
+    assert_eq!(sim.cluster_quota(), Some(1 << 20));
+    assert_eq!(sim.acknowledged.len(), 40);
+    assert!(sim.nodes[&2].state.usage.total() > 3000);
+    assert!(sim.nodes[&2].state.quota_mismatch);
+    assert!(!sim.nodes[&1].state.quota_mismatch);
+    // Member 2 leads with its unchanged flag. The cluster quota stays.
+    sim.lead(2).await;
+    sim.write(3).await;
+    assert_eq!(sim.cluster_quota(), Some(1 << 20));
+    // An operator changes the flag of member 3 and restarts it twice. It follows while other
+    // entries commit, and proposes the latest flag when it leads.
+    sim.restart_with(3, 9000).await;
+    sim.restart_with(3, 5000).await;
+    sim.write(3).await;
+    assert_eq!(sim.cluster_quota(), Some(1 << 20));
+    sim.lead(3).await;
+    sim.settle(2).await;
+    assert_eq!(sim.cluster_quota(), Some(5000));
+    assert_eq!(sim.set_quota_indexes(5000).len(), 1);
+    assert!(sim.set_quota_indexes(9000).is_empty());
+    // The size exceeds the new quota, so every member rejects the next Put alike.
+    let acknowledged = sim.acknowledged.len();
+    sim.write(3).await;
+    assert_eq!(sim.acknowledged.len(), acknowledged);
+    assert_eq!(sim.cluster_quota(), Some(5000));
+    assert_eq!(sim.nodes[&1].worker.state().alarms.len(), 1);
+    // Member 2 restarts with its old flag and leads. It does not revert the quota.
+    sim.restart_with(2, 3000).await;
+    sim.lead(2).await;
+    sim.write(1).await;
+    assert_eq!(sim.cluster_quota(), Some(5000));
+    // Member 1 replays its whole log after a restart, under the quota in force at each index.
+    let applied = sim.nodes[&1].state.applied;
+    sim.restart_with(1, 1 << 20).await;
+    sim.settle(2).await;
+    assert!(sim.nodes[&1].state.applied >= applied);
+    assert_eq!(sim.cluster_quota(), Some(5000));
+    assert!(sim.view_checks > 100, "{} view checks", sim.view_checks);
 }
 
 #[tokio::test]
