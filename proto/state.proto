@@ -22,7 +22,14 @@ message Journal {
 
 // The logical size of all `etcd/` rows after the apply index `applied`. The row is valid only
 // when `applied` equals the apply marker. Older binaries do not update it.
+//
+// `bytes` is the total. The optional fields split it by row kind, as `batch::Usage` does. Rows
+// from binaries that wrote only `bytes` lack the split, so readers count the rows again.
 message LogicalSize {
   uint64 applied = 1;
   uint64 bytes = 2;
+  optional uint64 current = 3;
+  optional uint64 history = 4;
+  optional uint64 journal = 5;
+  optional uint64 other = 6;
 }

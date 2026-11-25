@@ -299,13 +299,49 @@ cluster with no leader therefore keep their checkpoints.
 1. Apply `ViewCheckpoint(C)`. Close the segment. Start `DbReader::open(Checkpoint(C))` in the
    background. Apply continues.
 2. When the reader is open, read `F(C)`. If `F(C)` is not above the current base, close the
-   reader and stop (invariant 6). Opens can finish out of order.
+   reader and stop (invariant 6). Opens can finish out of order. Then warm the cache for at
+   most 500 ms. See [Base cache warm](#base-cache-warm).
 3. Publish later views as `(reader(C), segments above F(C))`. Report `C` in `ViewAck`.
 4. When no view uses the old reader, close it and release the segments at or below `F(C)`.
 5. Write a Raft snapshot record for `C` and allow log truncation through `F(C)` (invariant 5).
 
 A failed open does not change the current base. The member keeps its view and overlay, and it
 waits for the next checkpoint.
+
+### Base cache warm
+
+A replicated member caches SST indexes, filters, and `etcd/current/` blocks when it flushes an L0
+SST. SlateDB also caches the index and filters of compaction output. A shared-mode member writes
+no SST, so every first read of a block in a new base was an S3 GET.
+
+A member therefore loads the same entries with `DbReader::warm_sst` when it adopts an announced
+base, before the switch. L0 SSTs get indexes, filters, and `etcd/current/` blocks. Sorted run SSTs
+get indexes and filters. The cost is one GET per contiguous range of current-row blocks in each
+new L0 SST, on each member. These rules apply:
+
+- The warm stops after 500 ms, and the member then switches. A slow store cannot hold back a
+  usable base while the overlay grows.
+- An SST counts as warm only after all its entries loaded. A failed or stopped warm leaves the SST
+  for the next base.
+- The set of warm SSTs keeps only SSTs of live bases, so it does not grow with each flush.
+- A publication, a snapshot receipt, a restart, and a manual apply such as DST open a base with no
+  warm. They do not wait for SST reads.
+
+Benchmark note: three members on one host with MinIO, 100,000 preloaded keys of 256 B, 64
+clients. Before this step, followers missed 41% of their data block lookups. Linearizable random
+reads ran at 11,300 ops/s with a p99 of 59 ms, and replicated mode at 27,400 ops/s with a p99 of
+5.5 ms. With this step, followers missed none. Linearizable reads ran at 29,400 ops/s with a p99
+of 5.1 ms, and serializable reads at 32,800 ops/s with a p99 of 4.6 ms. Before this step, a
+second pass on the same cluster already ran at 24,600 ops/s. So cold blocks were the cause, not
+the cost of the overlay or the base reader.
+
+Each follower now downloads about the current-row bytes of every write once. In a run of
+100,000 puts of 256 B (put-c256), cluster-wide S3 GET response bytes rose from 2.5 MiB to
+45.3 MiB during the load, and from 1.9 MiB to 25.9 MiB while it settled: a 15 s pause and a
+checkpoint on each member. The total rose from 4.4 MiB to 71.2 MiB. The GET count did not
+change.
+After a Defragment or another compaction, both modes read cold compaction output. In the same
+setup, one read pass then ran at about 9,500 ops/s in both modes.
 
 ## Rebase
 
@@ -343,8 +379,10 @@ differ in whether the Raft log changes.
 1. Build the derived state from `reader(C)`. This is a reader variant of
    `StateMachine::open_at` (`state.rs:253-269`). It makes a new `RowCache`, invalidates the Watch
    capture, and clears the compaction plan.
-2. Load the quota counter from `meta/logical-bytes`. Shared mode writes this row in each batch,
-   so install does not scan every `etcd/` row (`state/maintenance.rs:448`).
+2. Load the quota counters from `meta/logical-size`, which each batch writes with the apply
+   marker, so install does not scan every `etcd/` row. The batch also writes the eight-byte total
+   to `meta/logical-bytes` for older readers. A base from an older binary has no counter row that
+   matches its apply marker, so install counts the rows once (`state/maintenance.rs`).
 
 **Local rebuild, `F(C) <= applied`.** Rebase and restart use this form. The Raft log does not
 change.
@@ -477,6 +515,9 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
 - **Leader memory:** the leader holds the overlay and the `Db` memtable. `Bytes` sharing removes
   most of the value copy. This must be measured before release.
 - **Snapshot install:** no data copy. It reads the live rows to rebuild the key index.
+- **Follower S3 reads:** each member reads the indexes, filters, and current-row blocks of each
+  new L0 SST once, at its base switch. This adds few GET requests but about the current-row
+  bytes of all writes. A replicated member gets the same entries from its own flush.
 - **Fault domain:** members no longer hold independent copies. A writer bug or an object loss
   affects all members. HashKV can still detect divergent apply, but not storage corruption.
 - **Isolation:** every voter can write the shared prefix.

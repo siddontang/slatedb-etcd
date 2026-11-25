@@ -48,7 +48,8 @@ impl StateMode {
     }
 }
 
-/// The logical size after each shared-mode batch. Install reads it instead of a full scan.
+/// The eight-byte logical size total after each shared-mode batch, for older readers. The
+/// split by row kind is in the counter row with the apply marker.
 pub(crate) const LOGICAL_BYTES: &[u8] = b"meta/logical-bytes";
 /// The name prefix of the checkpoints that the publisher creates.
 const VIEW: &str = "view-";
@@ -266,6 +267,9 @@ struct Pins {
     opening: std::collections::HashMap<uuid::Uuid, usize>,
     /// Checkpoints that retention selected and deletes.
     retiring: HashSet<uuid::Uuid>,
+    /// The SSTs whose cache entries a warm loaded. Only SSTs of registered live bases stay here.
+    /// The same lock orders base registrations, warm results, and pruning.
+    warmed: HashSet<slatedb::manifest::SsTableId>,
 }
 
 impl Pins {
@@ -276,6 +280,15 @@ impl Pins {
             .map(|(id, _)| *id)
             .chain(self.opening.keys().copied())
             .collect()
+    }
+}
+
+/// Prunes the warm set when a warm ends or its caller drops it.
+struct Prune<'a>(&'a Source);
+
+impl Drop for Prune<'_> {
+    fn drop(&mut self) {
+        self.0.prune_warmed();
     }
 }
 
@@ -326,6 +339,75 @@ impl Source {
             .push((id, Arc::downgrade(&base)));
         drop(opening);
         Ok(base)
+    }
+
+    /// Load the cache entries of the SSTs of `base` that no earlier warm loaded. See
+    /// `Base::warm_sst`. Only a follower adoption calls this, within `WARM_MAX`. A publication,
+    /// a snapshot receipt, or a restart opens a base without it.
+    ///
+    /// Each SST counts as warm only after its entries loaded, so a failed or stopped warm leaves
+    /// it for the next base. Concurrent warms add to one set. When the warm ends or its caller
+    /// drops it at the time limit, the set drops SSTs that no live base holds. So the set does
+    /// not grow with each flush and compaction, also when every warm times out.
+    pub(crate) async fn warm(&self, base: &Base) {
+        let _prune = Prune(self);
+        let cold: Vec<_> = {
+            let pins = self.pins.lock().unwrap();
+            base.ssts()
+                .iter()
+                .filter(|(id, _)| !pins.warmed.contains(id))
+                .copied()
+                .collect()
+        };
+        for (id, l0) in cold {
+            match base.warm_sst(id, l0).await {
+                Ok(()) => {
+                    self.pins.lock().unwrap().warmed.insert(id);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, sst = %id.value(), "cannot warm the cache for an SST");
+                }
+            }
+        }
+    }
+
+    /// Drop the warm SSTs that no registered live base holds. A warm and a base switch call
+    /// this. The base of a running warm is live, because the warm borrows it. One lock covers the
+    /// live bases and the set, so a base that registers or a warm that ends at the same time is
+    /// ordered before or after this.
+    fn prune_warmed(&self) {
+        let mut pins = self.pins.lock().unwrap();
+        pins.bases.retain(|(_, base)| base.strong_count() > 0);
+        // The references end after the lock: the last one may drop a base and its reader.
+        let live: Vec<Arc<Base>> = pins.bases.iter().filter_map(|(_, b)| b.upgrade()).collect();
+        let ssts: HashSet<_> = live
+            .iter()
+            .flat_map(|base| base.ssts().iter().map(|(id, _)| *id))
+            .collect();
+        pins.warmed.retain(|id| ssts.contains(id));
+        drop(pins);
+        drop(live);
+    }
+
+    /// The SSTs whose cache entries a warm loaded, and the SSTs of the registered live bases,
+    /// read under one lock.
+    #[cfg(test)]
+    pub(crate) fn warmed(
+        &self,
+    ) -> (
+        HashSet<slatedb::manifest::SsTableId>,
+        HashSet<slatedb::manifest::SsTableId>,
+    ) {
+        let pins = self.pins.lock().unwrap();
+        let live: Vec<Arc<Base>> = pins.bases.iter().filter_map(|(_, b)| b.upgrade()).collect();
+        let ssts = live
+            .iter()
+            .flat_map(|base| base.ssts().iter().map(|(id, _)| *id))
+            .collect();
+        let warmed = pins.warmed.clone();
+        drop(pins);
+        drop(live);
+        (warmed, ssts)
     }
 
     /// The checkpoints that this member uses: live bases and opens in flight.
@@ -1041,6 +1123,11 @@ pub(crate) struct Shared {
     pub(crate) pin_max: Duration,
 }
 
+/// The longest time that a follower warms the cache for a new base before it offers the base.
+/// SSTs that a stopped warm did not load stay cold, and the next base warms them. A slow store
+/// thus cannot hold back a usable base while the overlay grows.
+pub(crate) const WARM_MAX: Duration = Duration::from_millis(500);
+
 /// The first wait before a failed checkpoint open tries again.
 const OPEN_RETRY_MIN: Duration = Duration::from_millis(100);
 /// The longest wait between two open attempts.
@@ -1064,6 +1151,9 @@ struct Pending {
 /// backoff from `OPEN_RETRY_MIN` to `OPEN_RETRY_MAX`, also on an idle member. A newer waiting
 /// checkpoint replaces the failed one before the next attempt. The task stops when nothing
 /// waits, or when the state closes. A transient error never leaves the member on an old base.
+///
+/// Each opened base first warms the cache for at most `WARM_MAX`, so reads after the switch
+/// find the blocks of the new SSTs.
 async fn open_announced(
     source: Arc<Source>,
     opened: Arc<Opened>,
@@ -1083,6 +1173,12 @@ async fn open_announced(
         loop {
             match source.open_base(id).await {
                 Ok(base) => {
+                    if tokio::time::timeout(WARM_MAX, source.warm(&base))
+                        .await
+                        .is_err()
+                    {
+                        tracing::debug!(%id, "the cache warm of a base reached its time limit");
+                    }
                     opened.offer(base);
                     break;
                 }
@@ -1110,7 +1206,8 @@ async fn open_announced(
 }
 
 /// Open checkpoint `id` once and offer its base. A manual apply, such as DST, uses this, so
-/// each announcement opens its own checkpoint at a fixed point of the schedule.
+/// each announcement opens its own checkpoint at a fixed point of the schedule. It does not warm
+/// the cache, because a timed warm would make the schedule depend on the clock.
 async fn open_once(source: Arc<Source>, opened: Arc<Opened>, id: uuid::Uuid) {
     match source.open_base(id).await {
         Ok(base) => opened.offer(base),
@@ -1378,6 +1475,8 @@ impl StateMachine {
         if let Some(shared) = &mut self.shared {
             if shared.switch() {
                 self.reads = shared.live();
+                // The warm of the new base pruned the set while the old base was still live.
+                shared.source.prune_warmed();
             }
         }
     }

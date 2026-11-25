@@ -30,6 +30,9 @@ pub const DEFAULT_VIEW_PIN_MAX: Duration = Duration::from_secs(5 * 60);
 /// The default soft limit of the shared-mode overlay.
 pub const DEFAULT_OVERLAY_MAX_BYTES: u64 = 1 << 30;
 
+/// The default quota usage fraction for the early warning.
+pub const DEFAULT_QUOTA_WARNING_FRACTION: f64 = 0.8;
+
 /// Configuration for one member. Preserve its ID, cluster ID, and directory across restarts.
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -59,6 +62,11 @@ pub struct ServerConfig {
     pub state_cache: crate::state::StateCache,
     /// Zero selects the default 2 GiB quota. A negative value disables the quota.
     pub quota_bytes: i64,
+    /// Quota usage fraction that raises the early warning. Zero disables the warning.
+    pub quota_warning_fraction: f64,
+    /// Automatic compaction retention, as etcd's `--auto-compaction-*` flags select it.
+    /// `None` disables automatic compaction.
+    pub auto_compaction: Option<crate::compactor::Retention>,
     pub auth_token: String,
     pub strict_reconfiguration: bool,
     pub join: bool,
@@ -105,6 +113,8 @@ impl ServerConfig {
             log_memory: LogMemory::default(),
             state_cache: crate::state::StateCache::default(),
             quota_bytes: 0,
+            quota_warning_fraction: DEFAULT_QUOTA_WARNING_FRACTION,
+            auto_compaction: None,
             auth_token: "simple".into(),
             strict_reconfiguration: true,
             join: false,
@@ -145,6 +155,16 @@ impl Server {
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
         config.log_memory.validate()?;
         config.state_cache.validate()?;
+        ensure!(
+            (0.0..=1.0).contains(&config.quota_warning_fraction),
+            "the quota warning fraction must be from 0 to 1"
+        );
+        // A directly built retention gets the same zero and sign rules as the flags.
+        config.auto_compaction = config
+            .auto_compaction
+            .map(crate::compactor::Retention::validate)
+            .transpose()?
+            .flatten();
         ensure!(
             !config.join || config.restore_snapshot.is_none(),
             "join cannot restore a snapshot"
@@ -317,6 +337,8 @@ impl Server {
                 log_memory: config.log_memory,
                 state_cache: config.state_cache,
                 quota_bytes: config.quota_bytes,
+                quota_warning_fraction: config.quota_warning_fraction,
+                auto_compaction: config.auto_compaction,
                 strict_reconfiguration: config.strict_reconfiguration,
                 join: config.join,
                 object_store: config.object_store.clone(),

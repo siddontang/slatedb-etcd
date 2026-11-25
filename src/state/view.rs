@@ -8,12 +8,14 @@
 //! A shared-mode view is `(base, segments, seq)`: a read-only SlateDB checkpoint plus the overlay
 //! batches at or below `seq`. See `docs/shared-state.md`.
 
+use std::collections::HashSet;
 use std::ops::{Bound, Range};
 use std::sync::Arc;
 
 use bytes::Bytes;
 use slatedb::config::{DbReaderOptions, ScanOptions};
-use slatedb::{Db, DbIterator, DbReader, DbReaderMode, DbSnapshot};
+use slatedb::manifest::SsTableId;
+use slatedb::{CacheTarget, Db, DbCacheManagerOps, DbIterator, DbReader, DbReaderMode, DbSnapshot};
 
 use super::overlay::{End, Segment};
 use super::{Row, StateRead, StateScan};
@@ -36,6 +38,8 @@ pub(crate) struct Base {
     pub checkpoint: Option<uuid::Uuid>,
     /// `F`: the index of the last state change in the checkpoint.
     pub applied: u64,
+    /// The SSTs of the checkpoint. The flag is true for an L0 SST.
+    ssts: Vec<(SsTableId, bool)>,
 }
 
 impl Base {
@@ -44,6 +48,7 @@ impl Base {
             reader: None,
             checkpoint: None,
             applied: 0,
+            ssts: vec![],
         }
     }
 
@@ -65,10 +70,17 @@ impl Base {
             .build()
             .await?;
         let applied = super::decode_applied(reader.get(super::APPLIED).await?)?;
+        let manifest = reader.manifest();
+        let l0 = manifest.l0().iter().map(|view| (view.sst.id, true));
+        let runs = manifest.compacted().iter().flat_map(|run| run.sst_views());
+        let mut ssts: Vec<_> = l0.chain(runs.map(|view| (view.sst.id, false))).collect();
+        let mut seen = HashSet::new();
+        ssts.retain(|(id, _)| seen.insert(*id));
         Ok(Self {
             reader: Some(reader),
             checkpoint: Some(id),
             applied,
+            ssts,
         })
     }
 
@@ -76,6 +88,31 @@ impl Base {
         match &self.reader {
             Some(reader) => reader.get(key).await,
             None => Ok(None),
+        }
+    }
+
+    /// The SSTs of the checkpoint. The flag is true for an L0 SST.
+    pub(crate) fn ssts(&self) -> &[(SsTableId, bool)] {
+        &self.ssts
+    }
+
+    /// Load the cache entries of SST `id` that the member would cache if it wrote the SST.
+    ///
+    /// A replicated member caches the entries of `flush_targets` when it flushes an L0 SST, and
+    /// SlateDB caches the index and filters of compaction output. A shared-mode member writes no
+    /// SST, so without this step each first read of a new block is an object store GET. On a
+    /// local MinIO, these cold reads cut point read throughput by more than half and raised the
+    /// p99 latency ten times. See `Source::warm` and `docs/shared-state.md`.
+    pub(crate) async fn warm_sst(&self, id: SsTableId, l0: bool) -> Result<(), slatedb::Error> {
+        let Some(reader) = &self.reader else {
+            return Ok(());
+        };
+        if l0 {
+            reader.warm_sst(id, &super::flush_targets()).await
+        } else {
+            reader
+                .warm_sst(id, &[CacheTarget::Index, CacheTarget::Filters])
+                .await
         }
     }
 }
@@ -144,6 +181,24 @@ impl SharedView {
         }
         best
     }
+
+    /// Return the last overlay key in `[start, upper)` with its newest version at `seq`.
+    /// The newest segment wins for equal keys.
+    fn prev_overlay(
+        &self,
+        start: &[u8],
+        upper: Bound<&[u8]>,
+        end: &End<'_>,
+    ) -> Option<(Bytes, Option<Bytes>)> {
+        let mut best: Option<(Bytes, Option<Bytes>)> = None;
+        for segment in self.segments.iter().rev() {
+            let limit = best.as_ref().map(|(key, _)| key.as_ref());
+            if let Some(found) = segment.last_before(start, upper, end, self.seq, limit) {
+                best = Some(found);
+            }
+        }
+        best
+    }
 }
 
 /// The upper end of a scan that the scan owns.
@@ -159,6 +214,15 @@ impl Limit {
             Self::Prefix(prefix) => End::Prefix(prefix),
         }
     }
+
+    /// The exclusive upper bound of a descending scan. A prefix scan walks down from the end of
+    /// the keys and skips the keys past the prefix.
+    fn upper(&self) -> Bound<&[u8]> {
+        match self {
+            Self::Before(end) => Bound::Excluded(end),
+            Self::Prefix(_) => Bound::Unbounded,
+        }
+    }
 }
 
 /// Merge a base scan with the overlay rows of a view. An overlay delete hides the base row.
@@ -168,6 +232,8 @@ pub(crate) struct SharedScan<'a> {
     limit: Limit,
     base: Option<DbIterator>,
     base_row: Option<Row>,
+    /// Rows come in descending key order.
+    descending: bool,
     /// The last overlay key that the scan used.
     after: Option<Bytes>,
     overlay_row: Option<(Bytes, Option<Bytes>)>,
@@ -187,18 +253,27 @@ impl StateScan for SharedScan<'_> {
                 }
             }
             if self.overlay_row.is_none() && !self.overlay_done {
-                let lower = match &self.after {
-                    Some(key) => Bound::Excluded(key.as_ref()),
-                    None => Bound::Included(self.start.as_slice()),
+                let end = self.limit.end();
+                self.overlay_row = if self.descending {
+                    let upper = match &self.after {
+                        Some(key) => Bound::Excluded(key.as_ref()),
+                        None => self.limit.upper(),
+                    };
+                    self.view.prev_overlay(&self.start, upper, &end)
+                } else {
+                    let lower = match &self.after {
+                        Some(key) => Bound::Excluded(key.as_ref()),
+                        None => Bound::Included(self.start.as_slice()),
+                    };
+                    self.view.next_overlay(lower, &end)
                 };
-                self.overlay_row = self.view.next_overlay(lower, &self.limit.end());
                 self.overlay_done = self.overlay_row.is_none();
             }
             let overlay_first = match (&self.base_row, &self.overlay_row) {
                 (None, None) => return Ok(None),
                 (Some(_), None) => false,
                 (None, Some(_)) => true,
-                (Some(base), Some((key, _))) => match key.as_ref().cmp(base.key.as_ref()) {
+                (Some(base), Some((key, _))) => match self.order(key, &base.key) {
                     std::cmp::Ordering::Less => true,
                     std::cmp::Ordering::Equal => {
                         // The overlay holds a newer version of this row.
@@ -218,6 +293,55 @@ impl StateScan for SharedScan<'_> {
             }
         }
     }
+
+    /// Move forward to the first merged row at or after `key`, like `DbIterator::seek`.
+    /// A buffered row at or after `key` is kept; the base and overlay never move backward.
+    async fn seek(&mut self, key: &[u8]) -> Result<(), slatedb::Error> {
+        if self.descending {
+            return Err(slatedb::Error::invalid(
+                "seek on a descending shared scan".to_owned(),
+            ));
+        }
+        self.view.check()?;
+        if self
+            .base_row
+            .as_ref()
+            .is_none_or(|row| row.key.as_ref() < key)
+        {
+            self.base_row = None;
+            if let Some(base) = &mut self.base {
+                self.view
+                    .bounded(Box::pin(StateScan::seek(base, key)))
+                    .await?;
+            }
+        }
+        if self
+            .overlay_row
+            .as_ref()
+            .is_none_or(|(k, _)| k.as_ref() < key)
+        {
+            self.overlay_row = None;
+            if self.after.as_ref().is_none_or(|after| after.as_ref() < key) {
+                self.after = None;
+                if self.start.as_slice() < key {
+                    self.start = key.to_vec();
+                }
+            }
+            self.overlay_done = false;
+        }
+        Ok(())
+    }
+}
+
+impl SharedScan<'_> {
+    /// Compare two keys in the order of the scan.
+    fn order(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        if self.descending {
+            b.cmp(a)
+        } else {
+            a.cmp(b)
+        }
+    }
 }
 
 impl StateRead for SharedView {
@@ -225,11 +349,14 @@ impl StateRead for SharedView {
 
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, slatedb::Error> {
         self.check()?;
+        let meters = &crate::metrics::reads::READS;
         for segment in self.segments.iter().rev() {
             if let Some(value) = segment.get(key, self.seq) {
+                meters.overlay_reads.inc();
                 return Ok(value);
             }
         }
+        meters.base_reads.inc();
         self.bounded(Box::pin(self.base.get(key))).await
     }
 
@@ -251,6 +378,7 @@ impl StateRead for SharedView {
             limit: Limit::Before(range.end),
             base,
             base_row: None,
+            descending: matches!(options.order, slatedb::IterationOrder::Descending),
             after: None,
             overlay_row: None,
             overlay_done: false,
@@ -279,6 +407,7 @@ impl StateRead for SharedView {
             limit: Limit::Prefix(prefix.to_vec()),
             base,
             base_row: None,
+            descending: matches!(options.order, slatedb::IterationOrder::Descending),
             after: None,
             overlay_row: None,
             overlay_done: false,
@@ -319,6 +448,13 @@ impl StateScan for ViewScan<'_> {
         match self {
             Self::Db(scan) => StateScan::next(scan).await,
             Self::Shared(scan) => scan.next().await,
+        }
+    }
+
+    async fn seek(&mut self, key: &[u8]) -> Result<(), slatedb::Error> {
+        match self {
+            Self::Db(scan) => StateScan::seek(scan, key).await,
+            Self::Shared(scan) => scan.seek(key).await,
         }
     }
 }
@@ -426,6 +562,113 @@ mod tests {
         (db, Arc::new(base))
     }
 
+    /// Collect a scan of `range` after `next` rows and a seek to `to`.
+    async fn scan_seek(view: &SharedView, range: Range<&str>, next: usize, to: &str) -> Vec<Row> {
+        let range = range.start.as_bytes().to_vec()..range.end.as_bytes().to_vec();
+        let mut scan = view
+            .scan_range(range, &ScanOptions::default())
+            .await
+            .unwrap();
+        let mut found = vec![];
+        for _ in 0..next {
+            found.push(scan.next().await.unwrap().unwrap());
+        }
+        scan.seek(to.as_bytes()).await.unwrap();
+        while let Some(row) = scan.next().await.unwrap() {
+            found.push(row);
+        }
+        found
+    }
+
+    #[tokio::test]
+    async fn shared_scans_seek_forward_over_base_and_overlay() {
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let (_db, base) = checkpoint_base(store).await;
+        let mut overlay = Overlay::new(3);
+        overlay.push(
+            5,
+            batch(&[("a/0", Some("new")), ("a/2", None), ("a/35", Some("mid"))]),
+        );
+        let view = SharedView::new(base, overlay.segments(), 5);
+        // Merged order: a/0 (overlay), a/1, a/3, a/35 (overlay), a/4. a/2 is deleted.
+        // Seek from the start skips both sources to the first row at or after the key.
+        assert_eq!(
+            scan_seek(&view, "a/".."b", 0, "a/3").await,
+            vec![
+                row("a/3", "base-a/3"),
+                row("a/35", "mid"),
+                row("a/4", "base-a/4")
+            ]
+        );
+        // A seek between rows lands on the next overlay row.
+        assert_eq!(
+            scan_seek(&view, "a/".."b", 1, "a/31").await,
+            vec![
+                row("a/0", "new"),
+                row("a/35", "mid"),
+                row("a/4", "base-a/4")
+            ]
+        );
+        // After a/0 from the overlay, the base row a/1 is buffered. A seek to a key before it
+        // keeps the buffered row instead of seeking the base iterator backward.
+        assert_eq!(
+            scan_seek(&view, "a/".."b", 1, "a/05").await,
+            vec![
+                row("a/0", "new"),
+                row("a/1", "base-a/1"),
+                row("a/3", "base-a/3"),
+                row("a/35", "mid"),
+                row("a/4", "base-a/4"),
+            ]
+        );
+        // A seek onto a deleted key skips it.
+        assert_eq!(
+            scan_seek(&view, "a/".."b", 0, "a/2").await,
+            vec![
+                row("a/3", "base-a/3"),
+                row("a/35", "mid"),
+                row("a/4", "base-a/4")
+            ]
+        );
+        // A seek past the end yields nothing.
+        assert!(scan_seek(&view, "a/".."b", 0, "a/9").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn descending_shared_scans_merge_base_and_overlay_in_reverse() {
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let (_db, base) = checkpoint_base(store).await;
+        let mut overlay = Overlay::new(3);
+        overlay.push(5, batch(&[("a/0", Some("old")), ("a/35", Some("mid"))]));
+        overlay.close_segment();
+        overlay.push(6, batch(&[("a/0", Some("new")), ("a/2", None)]));
+        let view = SharedView::new(base, overlay.segments(), 6);
+        let options = ScanOptions {
+            order: slatedb::IterationOrder::Descending,
+            ..ScanOptions::default()
+        };
+        let mut scan = view
+            .scan_range(b"a/".to_vec()..b"a/4".to_vec(), &options)
+            .await
+            .unwrap();
+        let mut found = vec![];
+        while let Some(row) = scan.next().await.unwrap() {
+            found.push(row);
+        }
+        // a/4 is past the end, a/2 is deleted, and the newer segment holds a/0.
+        assert_eq!(
+            found,
+            vec![
+                row("a/35", "mid"),
+                row("a/3", "base-a/3"),
+                row("a/1", "base-a/1"),
+                row("a/0", "new"),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn views_merge_the_overlay_over_a_checkpoint_at_their_sequence() {
         let store: Arc<dyn slatedb::object_store::ObjectStore> =
@@ -493,5 +736,55 @@ mod tests {
         assert_eq!(view.get(b"k/1").await.unwrap(), Some("v".into()));
         assert_eq!(view.get(b"k/2").await.unwrap(), None);
         assert_eq!(rows(&view, b"k/").await, vec![row("k/1", "v")]);
+    }
+
+    /// A warm base serves current rows of its L0 SSTs from the cache. Other rows still need GETs.
+    #[tokio::test]
+    async fn a_warm_base_reads_current_rows_without_sst_gets() {
+        use crate::object::faults::{FaultStore, FAIL_SST_GET};
+        let faults = Arc::new(FaultStore::new(Arc::new(
+            slatedb::object_store::memory::InMemory::new(),
+        )));
+        let store: Arc<dyn slatedb::object_store::ObjectStore> = faults.clone();
+        let db = Db::builder("state", store.clone())
+            .with_settings(super::super::slatedb_settings())
+            .build()
+            .await
+            .unwrap();
+        // Many rows, so the current rows, history rows, and apply marker are in separate blocks.
+        let mut rows = crate::WriteBatch::new();
+        for i in 0..300 {
+            rows.put(format!("etcd/current/{i:04}"), vec![b'c'; 200]);
+            rows.put(format!("etcd/history/{i:04}"), vec![b'h'; 200]);
+        }
+        rows.put(super::super::APPLIED, 3_u64.to_be_bytes());
+        db.write_with_options(rows.to_storage(), &WriteOptions { seqnum: 3 })
+            .await
+            .unwrap();
+        db.flush().await.unwrap();
+        let id = db
+            .create_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
+            .await
+            .unwrap()
+            .id;
+        let open = || async {
+            let cache = crate::state::StateCache::default().build();
+            Base::open(store.clone(), "state", id, cache).await.unwrap()
+        };
+        let (warm, cold) = (open().await, open().await);
+        assert_eq!(warm.ssts().len(), 1);
+        let (id, l0) = warm.ssts()[0];
+        assert!(l0);
+        warm.warm_sst(id, l0).await.unwrap();
+
+        faults.set(FAIL_SST_GET);
+        for i in [0, 150, 299] {
+            let key = format!("etcd/current/{i:04}");
+            assert_eq!(warm.get(key.as_bytes()).await.unwrap().unwrap().len(), 200);
+            assert!(cold.get(key.as_bytes()).await.is_err());
+        }
+        assert!(warm.get(b"etcd/history/0150").await.is_err());
+        faults.set(0);
+        db.close().await.unwrap();
     }
 }

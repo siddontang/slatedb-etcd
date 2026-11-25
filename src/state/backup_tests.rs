@@ -106,7 +106,7 @@ async fn a_backup_streams_its_applied_boundary_while_writes_continue() {
             .result
             .unwrap();
     }
-    assert!(state.logical_bytes > 0);
+    assert!(state.logical_bytes.total() > 0);
     let boundary = state.applied;
     let size = state.logical_bytes;
     let expected = rows(&state).await;
@@ -163,7 +163,7 @@ async fn a_backup_streams_its_applied_boundary_while_writes_continue() {
     // The restored size is the source size at the boundary plus the new membership row, which
     // the source keeps only in memory.
     let members = crate::cluster::KEY.len() + serde_json::to_vec(&members()).unwrap().len();
-    assert_eq!(restored.logical_bytes, size + members as u64);
+    assert_eq!(restored.logical_bytes.total(), size.total() + members as u64);
     restored.close().await.unwrap();
     state.close().await.unwrap();
 }
@@ -518,7 +518,7 @@ async fn a_restore_does_not_index_the_copied_keys() {
     // The copy counted the logical size that startup reads.
     assert_eq!(
         restored.logical_bytes,
-        super::maintenance::count_logical_size(restored.applied_state())
+        super::maintenance::count_logical_usage(restored.applied_state())
             .await
             .unwrap()
     );

@@ -70,6 +70,11 @@ Defragment rewrites active SSTs and waits for manifest publication.
 Neither operation guarantees immediate disk shrinkage. Checkpoints can retain old objects.
 SlateDB's garbage collector removes objects after their retention rules permit it.
 
+Set `--auto-compaction-retention` when clients do not compact. Otherwise history grows until
+NOSPACE. See [automatic compaction](configuration.md#automatic-compaction).
+Alert on `slatedb_etcd_quota_warning`. Then check which `slatedb_etcd_logical_size_bytes`
+kind grows. Compaction frees `history` and `watch_journal` bytes, not `current` bytes.
+
 Inspect alarms before retrying failed writes. A NOSPACE alarm rejects writes and lease grants.
 Deletion and compaction remain available for cleanup. Disarm the alarm after resolving the cause.
 The quota counts logical stored bytes; it does not reserve disk capacity.
