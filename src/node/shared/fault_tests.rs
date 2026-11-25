@@ -35,7 +35,7 @@ fn the_outer_slatedb_kind_classifies_an_error() {
     assert_eq!(classify(&panic.into()), Fault::Data);
     let fence = slatedb::Error::closed("fenced".into(), slatedb::CloseReason::Fenced);
     assert_eq!(classify(&fence.into()), Fault::Fenced);
-    let stored = crate::state::shared::stored("invalid bootstrap claim").context("publish");
+    let stored = crate::state::stored("invalid bootstrap claim").context("publish");
     assert_eq!(classify(&stored), Fault::Data);
     let invariant = anyhow::anyhow!("the base checkpoint has no applied term");
     assert_eq!(classify(&invariant), Fault::Invariant);

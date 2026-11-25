@@ -95,7 +95,7 @@ impl Base {
 
     async fn of(reader: DbReader, id: uuid::Uuid) -> anyhow::Result<Self> {
         let applied = super::decode_applied(reader.get(super::APPLIED).await?)
-            .map_err(|error| super::shared::stored(format!("checkpoint {id}: {error:#}")))?;
+            .map_err(|error| super::stored(format!("checkpoint {id}: {error:#}")))?;
         let manifest = reader.manifest();
         let l0 = manifest.l0().iter().map(|view| (view.sst.id, true));
         let runs = manifest.compacted().iter().flat_map(|run| run.sst_views());

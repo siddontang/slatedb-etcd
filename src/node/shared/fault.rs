@@ -70,7 +70,7 @@ pub(in crate::node) fn classify(error: &anyhow::Error) -> Fault {
     }
     if error
         .chain()
-        .any(|cause| cause.is::<crate::state::shared::StoredData>())
+        .any(|cause| cause.is::<crate::state::StoredData>())
     {
         return Fault::Data;
     }
