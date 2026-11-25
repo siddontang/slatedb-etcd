@@ -453,10 +453,14 @@ checkpoint is gone, it takes a checkpoint in the same range as a restart does.
     capability of the process that the snapshot named. A late answer for an earlier process
     does not change the capability of the current one. So a member that restarts on an earlier
     binary while the snapshot travels never stores it.
-- **Record checkpoint:** a restart or a rebase can use another checkpoint at the record index,
-  when retention deleted the one that the record names. The log cache does not send a record of
-  a checkpoint other than the base at the base index. The leader records the base at that index
-  instead, so a peer never gets a checkpoint that it cannot open.
+- **Record checkpoint:** only a live base pins its checkpoint. After the base moves, retention
+  can delete the checkpoint that the record names, and a restart or a rebase then uses another
+  checkpoint. The log cache does not send a record that names a checkpoint other than the base,
+  at any index at or below the base index. The leader records the base instead, so a peer never
+  gets a checkpoint that it cannot open. The log cache knows the base when the node opens, so
+  a request before the first tick also follows this rule. The base index is never below the
+  record index: a member that skips a received snapshot, because it applied past it, raises
+  its base to that checkpoint.
 
 ## Install
 

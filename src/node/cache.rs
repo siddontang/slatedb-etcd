@@ -523,9 +523,12 @@ impl Cache {
     }
     /// Return true when the durable snapshot holds an image that this member can send.
     ///
-    /// A view record at the base index that names another checkpoint than the base is not
-    /// sendable. A restart or a rebase uses another checkpoint when retention deleted the one of
-    /// the record, so peers could not open it. The owner then records the base at that index.
+    /// A view record that names another checkpoint than the base is not sendable. Only a live base
+    /// pins its checkpoint, so retention can delete the checkpoint of the record after a base
+    /// switch, and a restart or a rebase can use another checkpoint for that reason. The owner
+    /// then records the base at the base index. The base index is not below the record index:
+    /// the log starts after the record, so no base below it can start. If it were, the record
+    /// stays sendable, and no rebuild runs that cannot publish.
     pub fn has_image(&self) -> bool {
         let data = &self.durable.snapshot.data;
         let stale = match (
@@ -533,7 +536,7 @@ impl Cache {
             self.base.get(),
         ) {
             (Ok(Some(view)), Some((checkpoint, index))) => {
-                index == self.snapshot_index() && view.checkpoint().ok() != Some(checkpoint)
+                index >= self.snapshot_index() && view.checkpoint().ok() != Some(checkpoint)
             }
             _ => false,
         };

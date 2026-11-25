@@ -1860,6 +1860,20 @@ impl StateMachine {
         // Release the receipt on every path, also for a snapshot that applies nothing.
         let received = shared.source.take_received(id);
         if index <= self.applied {
+            // The member applied past the record, so it installs nothing. The checkpoint holds
+            // the state at `index`, so it can still raise the base there. The base index then
+            // stays at or above the record index.
+            if index > shared.base_index {
+                let base = match received {
+                    _ if shared.base.checkpoint == Some(id) => Ok(shared.base.clone()),
+                    Some(base) => Ok(base),
+                    None => shared.source.open_base(id).await,
+                };
+                match base {
+                    Ok(base) => shared.opened.offer(base, index),
+                    Err(error) => tracing::warn!(%error, %id, "cannot open a received checkpoint"),
+                }
+            }
             return Ok(());
         }
         let base = match received {

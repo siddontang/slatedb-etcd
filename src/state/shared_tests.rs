@@ -993,27 +993,50 @@ async fn an_equal_index_snapshot_with_another_term_fails() {
     state.close().await.unwrap();
 }
 
-/// A received snapshot that applies nothing releases its checkpoint.
+/// A received snapshot that applies nothing and is not above the base releases its checkpoint.
+/// One above the base raises the base there, because the checkpoint holds that state.
 #[tokio::test]
 async fn a_skipped_snapshot_releases_its_receipt() {
     let mut state = open_shared(Arc::new(InMemory::new())).await;
     state.apply_etcd(1, &put("a", "1")).await.unwrap();
     let mut written = 0;
     let writer = writer(&state).await;
-    let id = checkpoint(&state, &writer, &mut written)
+    let first = checkpoint(&state, &writer, &mut written).await;
+    let x = first.checkpoint.unwrap();
+    let second = writer
+        .create_checkpoint(
+            CheckpointScope::Durable,
+            &CheckpointOptions {
+                name: Some(shared::view_name(1)),
+                ..Default::default()
+            },
+        )
         .await
-        .checkpoint
-        .unwrap();
+        .unwrap()
+        .id;
     state.apply_etcd(2, &put("b", "2")).await.unwrap();
     let source = state.shared.as_ref().unwrap().source.clone();
-    source.receive(id).await.unwrap();
-    assert!(source.pinned().contains(&id));
-    let mut snapshot = Snapshot::default();
-    snapshot.mut_metadata().index = 1;
-    snapshot.data = transfer::ViewDescriptor::new(id).encode().unwrap();
-    state.install_snapshot(&snapshot).await.unwrap();
+    let install = |id: uuid::Uuid| {
+        let mut snapshot = Snapshot::default();
+        snapshot.mut_metadata().index = 1;
+        snapshot.data = transfer::ViewDescriptor::new(id).encode().unwrap();
+        snapshot
+    };
+    // Above the base at 0: the base moves to X at 1.
+    source.receive(x).await.unwrap();
+    state.install_snapshot(&install(x)).await.unwrap();
     assert_eq!(state.applied, 2);
-    assert!(!source.pinned().contains(&id));
+    state.switch_base();
+    assert_eq!(state.base_checkpoint(), Some(x));
+    assert_eq!(state.view_status().unwrap().0, 1);
+    // At the base index: nothing changes, and the receipt goes.
+    source.receive(second).await.unwrap();
+    assert!(source.pinned().contains(&second));
+    state.install_snapshot(&install(second)).await.unwrap();
+    state.switch_base();
+    assert_eq!(state.base_checkpoint(), Some(x));
+    assert!(!source.pinned().contains(&second));
+    drop(first);
     state.close().await.unwrap();
 }
 

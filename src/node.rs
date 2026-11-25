@@ -741,6 +741,9 @@ impl Node {
         node.sync_members();
         node.observe_quota()?;
         node.observe_members();
+        // A request can arrive before the first apply or tick. The log cache must already know
+        // the base to judge the record. See `Cache::has_image`.
+        node.note_base();
         Ok(node)
     }
 
