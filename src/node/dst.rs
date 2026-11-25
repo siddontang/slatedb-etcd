@@ -2199,8 +2199,51 @@ impl Simulation {
     /// for example when a transfer to it arrives after the snapshot.
     fn assert_not_leading(&self, id: u64) {
         if self.leader() == Some(id) {
-            assert_eq!(self.nodes[&id].quota.blocked(), None, "member {id} leads");
+            let node = &self.nodes[&id];
+            assert_eq!(node.quota.blocked(), None, "member {id} leads");
+            // An independent check: `replace` starts the member with no install.
+            assert!(
+                node.installed_snapshots > 0,
+                "member {id} leads before an install"
+            );
         }
+    }
+
+    /// Transfer leadership from `leader` to member `id`, which waits for a snapshot. Hold the
+    /// snapshots for the member until the transfer reaches it, so the transfer arrives while it
+    /// waits. It stays a follower.
+    async fn transfer_while_waiting(&mut self, leader: u64, id: u64) {
+        let is = |message: &Message, kind| message.to == id && message.get_msg_type() == kind;
+        self.nodes.get_mut(&leader).unwrap().raw.transfer_leader(id);
+        let mut held = vec![];
+        for _ in 0..2000 {
+            let (snapshots, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.messages)
+                .into_iter()
+                .partition(|message| is(message, MessageType::MsgSnapshot));
+            held.extend(snapshots);
+            self.messages = rest;
+            let transfer = self
+                .messages
+                .iter()
+                .position(|message| is(message, MessageType::MsgTimeoutNow));
+            if let Some(position) = transfer {
+                let message = self.messages.remove(position);
+                assert!(self.nodes[&id].quota.blocked().is_some());
+                self.trace.push(format!("transfer to waiting member {id}"));
+                let node = self.nodes.get_mut(&id).unwrap();
+                node.step_peer(message).unwrap();
+                node.drive_ready().await.unwrap();
+                self.drive().await;
+                assert_eq!(self.nodes[&id].raw.raft.state, StateRole::Follower);
+                self.messages.extend(held);
+                return;
+            }
+            if self.messages.is_empty() {
+                self.tick(leader).await;
+            }
+            self.deliver(false).await;
+        }
+        panic!("the transfer did not reach member {id}");
     }
 
     /// A follower, not `except`.
@@ -2348,8 +2391,7 @@ async fn a_waiting_member_does_not_lead_in_an_election_or_a_transfer() {
         sim.replace(waiting, 3000).await;
         sim.until_waiting(waiting).await;
         if transfer {
-            let node = sim.nodes.get_mut(&leader).unwrap();
-            node.raw.transfer_leader(waiting);
+            sim.transfer_while_waiting(leader, waiting).await;
         } else {
             sim.stop(leader);
             sim.messages
@@ -2357,7 +2399,7 @@ async fn a_waiting_member_does_not_lead_in_an_election_or_a_transfer() {
         }
         sim.settle_without(waiting, 30).await;
         let now = sim.leader().unwrap();
-        assert!(transfer || now != waiting);
+        assert_ne!(now, waiting);
         assert_eq!(
             sim.nodes[&waiting].quota.blocked(),
             None,
@@ -2368,12 +2410,15 @@ async fn a_waiting_member_does_not_lead_in_an_election_or_a_transfer() {
             sim.nodes[&now].state.applied
         );
         assert!(sim.nodes[&waiting].worker.state().alarms.is_empty());
-        if !transfer {
+        if transfer {
+            // After its install, the member can lead.
+            sim.lead(waiting).await;
+            sim.assert_not_leading(waiting);
+        } else {
             sim.start(leader).await;
             sim.settle(3).await;
         }
-        // The leader seeds the cluster quota with its flag. After its install, the member can
-        // be that leader.
+        // The leader seeds the cluster quota with its flag.
         let seeder = sim.leader().unwrap();
         sim.release_quota();
         sim.settle(2).await;
@@ -2523,11 +2568,7 @@ async fn a_member_waiting_on_a_membership_entry_does_not_lead() {
         }
         sim.release_quota();
         if transfer {
-            sim.nodes
-                .get_mut(&leader)
-                .unwrap()
-                .raw
-                .transfer_leader(waiting);
+            sim.transfer_while_waiting(leader, waiting).await;
         } else {
             sim.stop(leader);
             sim.messages
@@ -2535,7 +2576,7 @@ async fn a_member_waiting_on_a_membership_entry_does_not_lead() {
         }
         sim.settle_without(waiting, 30).await;
         let now = sim.leader().unwrap();
-        assert!(transfer || now != waiting);
+        assert_ne!(now, waiting);
         assert_eq!(
             sim.nodes[&waiting].quota.blocked(),
             None,
