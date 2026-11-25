@@ -244,9 +244,32 @@ pub(crate) fn slatedb_settings() -> Settings {
             worker.max_fetch_tasks = COMPACTION_FETCH_TASKS;
             worker.bytes_to_fetch = COMPACTION_FETCH_BYTES;
         }
+        compactor.checkpoint_lifetime = COMPACTOR_CHECKPOINT_LIFETIME;
+    }
+    // Compaction rewrites the sorted runs several times while a large data set loads. Each
+    // replaced SST stays until its compactor checkpoint expires and the next GC run, which took
+    // 15 to 25 minutes with SlateDB's defaults: 2-3 times the live data on disk. GC keeps its
+    // default minimum age.
+    if let Some(gc) = settings.garbage_collector_options.as_mut() {
+        if let Some(compacted) = gc.compacted_options.as_mut() {
+            compacted.interval = Some(COMPACTED_GC_INTERVAL);
+        }
     }
     settings
 }
+
+/// How often SlateDB deletes compacted SSTs that no manifest or checkpoint references.
+const COMPACTED_GC_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long a compaction keeps its input SSTs for iterators that started before it. SlateDB
+/// defaults to 15 minutes.
+///
+/// A read fails if it still iterates an input SST after this time. The iterators of this server
+/// are short: client reads stop at a 5 s deadline, and Watch catch-up and MVCC compaction scan in
+/// pages. HashKV and the usage count of an older directory scan once, which takes seconds per
+/// GiB. A state transfer copies a named checkpoint, and shared-mode views read their base
+/// checkpoints, so neither depends on this lifetime.
+const COMPACTOR_CHECKPOINT_LIFETIME: Duration = Duration::from_secs(5 * 60);
 
 /// Read the stored logical size, or count it when the counter does not match the apply marker.
 ///
