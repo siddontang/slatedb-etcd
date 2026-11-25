@@ -467,6 +467,7 @@ mod tests {
             empty_log: true,
             pin_max: Duration::from_secs(300),
             restore: None,
+            record: None,
         };
         let mut results = vec![];
         for host in ["127.0.0.1".to_owned(), long_host()] {

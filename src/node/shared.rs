@@ -255,7 +255,6 @@ impl Writer {
             reports: Reports::default(),
             announced: 0,
             applied: Applied {
-                based: handles.based.clone(),
                 announced: handles.announced.clone(),
                 base_id: handles.base_id.clone(),
                 #[cfg(test)]
@@ -681,7 +680,9 @@ pub(super) async fn materialize(
     let mut written = progress.written();
     let mut pushed = queue.subscribe();
     loop {
-        pushed.wait_for(|pushed| *pushed > written).await?;
+        pushed
+            .wait_for(|position| position.pushed > written)
+            .await?;
         for (seq, batch) in queue.after(written, MATERIALIZE_BATCHES) {
             db.write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
                 .await?;
@@ -832,12 +833,10 @@ async fn checkpoint_covers_compaction(
 /// The applied state that a publisher checks before it announces a checkpoint again.
 #[derive(Clone)]
 struct Applied {
-    /// The `F` of the current base.
-    based: tokio::sync::watch::Receiver<u64>,
     /// The checkpoint of the newest applied `ViewCheckpoint` entry.
     announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
-    /// The checkpoint of the current base.
-    base_id: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
+    /// The checkpoint of the current base and its row `F`.
+    base_id: tokio::sync::watch::Receiver<Option<(uuid::Uuid, u64)>>,
     /// Checks that fail before they read storage, for tests.
     #[cfg(test)]
     failures: Arc<std::sync::atomic::AtomicU32>,
@@ -854,8 +853,8 @@ const RETRY_MAX: Duration = Duration::from_secs(2);
 /// publisher checks again with a backoff from `RETRY_MIN` to `RETRY_MAX`, also on an idle
 /// cluster.
 struct Retry {
-    /// The checkpoint that the publisher announced last.
-    awaiting: Option<uuid::Uuid>,
+    /// The checkpoint that the publisher announced last, with its row `F`.
+    awaiting: Option<(uuid::Uuid, u64)>,
     /// The time of the next check, if one is due.
     at: Option<Instant>,
     backoff: Duration,
@@ -889,7 +888,7 @@ impl Retry {
     /// The publisher sent checkpoint `id`. Raft took the proposal if `accepted`. An entry in
     /// the leader's log commits in its term, so the next check waits `RETRY_MAX`. A dropped
     /// proposal is sent again after the backoff, which grows while the same checkpoint waits.
-    fn sent(&mut self, id: uuid::Uuid, accepted: bool) {
+    fn sent(&mut self, id: (uuid::Uuid, u64), accepted: bool) {
         if accepted {
             self.at = Some(Instant::now() + RETRY_MAX);
         } else {
@@ -921,7 +920,7 @@ async fn stranded(
     admin: &slatedb::admin::Admin,
     source: &Source,
     applied: &Applied,
-) -> Result<Option<uuid::Uuid>> {
+) -> Result<Option<(uuid::Uuid, u64)>> {
     #[cfg(test)]
     if applied
         .failures
@@ -941,18 +940,18 @@ async fn stranded(
         return Ok(None);
     };
     if *applied.announced.borrow() == Some(checkpoint.id)
-        || *applied.base_id.borrow() == Some(checkpoint.id)
+        || applied.base_id.borrow().map(|(id, _)| id) == Some(checkpoint.id)
     {
         return Ok(None);
     }
     let base = source.open_base(checkpoint.id).await?;
-    if base.applied < *applied.based.borrow() {
+    if base.applied < applied.base_id.borrow().map_or(0, |(_, row)| row) {
         return Ok(None);
     }
     if base.get(crate::cluster::KEY).await?.is_none() {
         return Ok(None);
     }
-    Ok(Some(checkpoint.id))
+    Ok(Some((checkpoint.id, base.applied)))
 }
 
 /// Flush the shared `Db` when its oldest write reaches the age limit or on request. Create one
@@ -1046,6 +1045,7 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
             continue;
         }
         tracing::debug!(checkpoint = %checkpoint.id, applied = base.applied, "publish view");
+        let row = base.applied;
         drop(base);
         // The marker comes before the first announcement. The checkpoint already exists, so a
         // restart after the marker still finds a base.
@@ -1053,10 +1053,10 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
             source.mark_bootstrapped(checkpoint.id).await?;
             bootstrapped = true;
         }
-        let Some(accepted) = announce(&events, checkpoint.id).await else {
+        let Some(accepted) = announce(&events, (checkpoint.id, row)).await else {
             return Ok(());
         };
-        retry.sent(checkpoint.id, accepted);
+        retry.sent((checkpoint.id, row), accepted);
         let views = view_checkpoints(&admin).await?.len();
         if let Some(gauge) = &retained {
             gauge.set(views as i64);
@@ -1086,7 +1086,7 @@ async fn reannounce(
     // A sent announcement counts when applied state shows it. Until then this publisher sends
     // its own checkpoint again. The usual case reads no storage.
     if let Some(id) = retry.awaiting {
-        if *applied.announced.borrow() == Some(id) {
+        if *applied.announced.borrow() == Some(id.0) {
             retry.done();
             return Ok(true);
         }
@@ -1108,9 +1108,9 @@ async fn reannounce(
             return Ok(true);
         }
     };
-    tracing::info!(checkpoint = %id, "announce a stranded view checkpoint");
+    tracing::info!(checkpoint = %id.0, "announce a stranded view checkpoint");
     if !*bootstrapped {
-        source.mark_bootstrapped(id).await?;
+        source.mark_bootstrapped(id.0).await?;
         *bootstrapped = true;
     }
     let Some(accepted) = announce(events, id).await else {
@@ -1120,12 +1120,12 @@ async fn reannounce(
     Ok(true)
 }
 
-/// Send checkpoint `id` to the node for its announcement. Return whether Raft took the
-/// proposal, or `None` when the node no longer takes events.
-async fn announce(events: &mpsc::Sender<Event>, id: uuid::Uuid) -> Option<bool> {
+/// Send checkpoint `id` with its row `F` to the node for its announcement. Return whether Raft
+/// took the proposal, or `None` when the node no longer takes events.
+async fn announce(events: &mpsc::Sender<Event>, (id, row): (uuid::Uuid, u64)) -> Option<bool> {
     let (reply, accepted) = tokio::sync::oneshot::channel();
     events
-        .send(Event::ViewCheckpoint(id, Some(reply)))
+        .send(Event::ViewCheckpoint(id, row, Some(reply)))
         .await
         .ok()?;
     Some(accepted.await.unwrap_or(false))
@@ -1279,9 +1279,18 @@ impl Node {
         Ok(())
     }
 
-    /// Propose a checkpoint that the publisher created. Only the leader announces. Return true
-    /// when Raft took the proposal.
-    pub(super) fn announce_view(&mut self, checkpoint: uuid::Uuid) -> Result<bool> {
+    /// Propose a checkpoint with row `row` that the publisher created. Only the leader
+    /// announces. Return true when Raft took the proposal.
+    pub(super) fn announce_view(&mut self, checkpoint: uuid::Uuid, row: u64) -> Result<bool> {
+        let Some(writer) = &self.writer else {
+            return Ok(false);
+        };
+        let covers = demand::coverage(row, writer.queue.position());
+        self.propose_view(checkpoint, covers)
+    }
+
+    /// Propose a `ViewCheckpoint` entry that certifies `checkpoint` through `covers`.
+    fn propose_view(&mut self, checkpoint: uuid::Uuid, covers: u64) -> Result<bool> {
         let Some(writer) = &mut self.writer else {
             return Ok(false);
         };
@@ -1291,6 +1300,7 @@ impl Node {
         let data = RaftCommand::ViewCheckpoint {
             id: uuid::Uuid::new_v4().to_string(),
             checkpoint: checkpoint.to_string(),
+            covers,
         }
         .encode()?;
         // The entry frees memory, so it bypasses the client admission limits. Raft can drop the
@@ -1456,7 +1466,7 @@ impl Node {
                     return anyhow::Ok(());
                 };
                 if seq > base {
-                    opened.offer(source.open_base(checkpoint.id).await?);
+                    opened.offer(source.open_base(checkpoint.id).await?, 0);
                 }
                 Ok(())
             }
@@ -1511,7 +1521,7 @@ impl Node {
         if !writer.paused || self.prepared_puts.is_some() || self.held_puts.is_some() {
             return None;
         }
-        let base = writer.opened_slot.take()?;
+        let (base, covers) = writer.opened_slot.take()?;
         let index = base.applied;
         let term = (index > self.state.applied && index <= self.committed_ready)
             .then(|| self.raw.raft.raft_log.term(index).ok())
@@ -1519,7 +1529,7 @@ impl Node {
         match term {
             Some(term) => Some((base, term)),
             None => {
-                writer.opened_slot.offer(base);
+                writer.opened_slot.offer(base, covers);
                 None
             }
         }
@@ -1544,8 +1554,8 @@ pub(super) struct DstWriter {
     pub epoch: u64,
     published: u64,
     bootstrapped: bool,
-    /// A checkpoint that the next announce step proposes.
-    pub pending: Option<uuid::Uuid>,
+    /// A checkpoint with its row that the next announce step proposes.
+    pub pending: Option<(uuid::Uuid, u64)>,
 }
 
 /// Compact every L0 SST and sorted run into one run when the L0 has `limit` SSTs or more, and
@@ -1652,7 +1662,7 @@ impl Node {
         dst.bootstrapped = writer.source.bootstrapped().await?;
         // A new writer announces a stranded checkpoint, as `publish` does.
         dst.pending = stranded(&writer.admin, &writer.source, &writer.applied).await?;
-        if let (Some(id), false) = (dst.pending, dst.bootstrapped) {
+        if let (Some((id, _)), false) = (dst.pending, dst.bootstrapped) {
             writer.source.mark_bootstrapped(id).await?;
             dst.bootstrapped = true;
         }
@@ -1709,14 +1719,14 @@ impl Node {
             writer.source.mark_bootstrapped(id).await?;
             dst.bootstrapped = true;
         }
-        dst.pending = Some(id);
+        dst.pending = Some((id, base.applied));
         Ok(Some(id))
     }
 
     /// Propose the pending checkpoint. Only the leader proposes.
     pub(super) fn dst_announce(&mut self, dst: &mut DstWriter) -> Result<()> {
         match dst.pending.take() {
-            Some(id) => self.announce_view(id).map(drop),
+            Some((id, row)) => self.announce_view(id, row).map(drop),
             None => Ok(()),
         }
     }
@@ -1756,6 +1766,10 @@ impl Node {
         self.pinned_checkpoints()
     }
 }
+
+mod demand;
+#[cfg(test)]
+mod record_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2034,6 +2048,7 @@ mod tests {
             empty_log: false,
             pin_max: Duration::from_secs(300),
             restore: None,
+            record: None,
         };
         let mut state = StateMachine::open_shared(
             Arc::new(InMemory::new()),
@@ -2179,6 +2194,7 @@ mod tests {
             empty_log: false,
             pin_max: Duration::from_secs(300),
             restore: None,
+            record: None,
         };
         let mut state = StateMachine::open_shared(
             Arc::new(InMemory::new()),
@@ -2216,7 +2232,7 @@ mod tests {
         // A checkpoint above the fence appears. The writer task did not stop the member.
         let covered = tokio::time::timeout(Duration::from_secs(20), async {
             while let Some(event) = announced.recv().await {
-                if let Event::ViewCheckpoint(id, reply) = event {
+                if let Event::ViewCheckpoint(id, _, reply) = event {
                     if let Some(reply) = reply {
                         let _ = reply.send(true);
                     }
@@ -2257,7 +2273,7 @@ mod tests {
         async fn next(&mut self, wait: Duration, accepted: bool) -> uuid::Uuid {
             tokio::time::timeout(wait, async {
                 loop {
-                    if let Some(Event::ViewCheckpoint(id, reply)) = self.0.recv().await {
+                    if let Some(Event::ViewCheckpoint(id, _, reply)) = self.0.recv().await {
                         if let Some(reply) = reply {
                             let _ = reply.send(accepted);
                         }
@@ -2296,6 +2312,7 @@ mod tests {
             empty_log: false,
             pin_max: Duration::from_secs(300),
             restore: None,
+            record: None,
         };
         let mut state = StateMachine::open_shared(
             Arc::new(InMemory::new()),
@@ -2349,7 +2366,7 @@ mod tests {
         let limit = RETRY_MAX + Duration::from_millis(500);
         assert_eq!(announcements.next(limit, true).await, lost);
         state
-            .apply_view_checkpoint(2, &lost.to_string())
+            .apply_view_checkpoint(2, &lost.to_string(), 0)
             .await
             .unwrap();
         state.settle_opens().await;
@@ -2409,6 +2426,7 @@ mod tests {
             empty_log: false,
             pin_max: Duration::from_secs(300),
             restore: None,
+            record: None,
         };
         // A tiny cache, so the open reads the store.
         let cache = crate::state::StateCache {
@@ -2443,7 +2461,7 @@ mod tests {
         // The announcement applies while every read fails.
         faults.set(FAIL_GET);
         state
-            .apply_view_checkpoint(2, &id.to_string())
+            .apply_view_checkpoint(2, &id.to_string(), 0)
             .await
             .unwrap();
         let applied = state.applied;
@@ -2483,6 +2501,7 @@ mod tests {
             empty_log: false,
             pin_max: Duration::from_secs(300),
             restore: None,
+            record: None,
         };
         // A tiny cache, so each open reads the store.
         let cache = crate::state::StateCache {
@@ -2542,7 +2561,7 @@ mod tests {
         for id in &checkpoints {
             let index = state.applied + 1;
             state
-                .apply_view_checkpoint(index, &id.to_string())
+                .apply_view_checkpoint(index, &id.to_string(), 0)
                 .await
                 .unwrap();
             tokio::time::sleep(Duration::from_millis(40)).await;
@@ -2599,7 +2618,7 @@ mod tests {
     async fn adopt_announced(state: &mut StateMachine, id: uuid::Uuid) {
         let index = state.applied + 1;
         state
-            .apply_view_checkpoint(index, &id.to_string())
+            .apply_view_checkpoint(index, &id.to_string(), 0)
             .await
             .unwrap();
         state.settle_opens().await;
@@ -2679,6 +2698,7 @@ mod tests {
             empty_log: true,
             pin_max: Duration::from_secs(300),
             restore: None,
+            record: None,
         };
         let mut state = StateMachine::open_shared(
             store,
@@ -3032,7 +3052,7 @@ mod tests {
         // Hold the announcement of the aged flush: no reply, no apply.
         let (old, reply) = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if let Some(Event::ViewCheckpoint(id, reply)) = announcements.0.recv().await {
+                if let Some(Event::ViewCheckpoint(id, _, reply)) = announcements.0.recv().await {
                     return (id, reply.unwrap());
                 }
             }
@@ -3172,6 +3192,7 @@ mod tests {
             empty_log: false,
             pin_max: Duration::from_secs(300),
             restore: None,
+            record: None,
         };
         let mut state = StateMachine::open_shared(
             Arc::new(InMemory::new()),

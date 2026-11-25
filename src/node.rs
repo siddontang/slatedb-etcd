@@ -96,9 +96,9 @@ pub enum Event {
         snapshot: bool,
         success: bool,
     },
-    /// The shared-mode publisher created this checkpoint. The leader announces it. The reply
-    /// tells whether Raft took the proposal.
-    ViewCheckpoint(uuid::Uuid, Option<tokio::sync::oneshot::Sender<bool>>),
+    /// The shared-mode publisher created this checkpoint with this row `F`. The leader
+    /// announces it. The reply tells whether Raft took the proposal.
+    ViewCheckpoint(uuid::Uuid, u64, Option<tokio::sync::oneshot::Sender<bool>>),
     /// A member reports the checkpoints that it pins. The leader keeps them.
     ViewAck {
         member: u64,
@@ -387,6 +387,7 @@ impl Node {
             empty_log,
             pin_max: options.view_pin_max,
             restore: options.restore.clone(),
+            record: crate::state::shared::Record::of(storage.recovery_snapshot())?,
         };
         let mut state = options
             .object_store
@@ -1197,8 +1198,8 @@ impl Node {
                 }
             }
             Event::SnapshotBuilt(built) => self.checkpoint_built(built)?,
-            Event::ViewCheckpoint(checkpoint, reply) => {
-                let accepted = self.announce_view(checkpoint)?;
+            Event::ViewCheckpoint(checkpoint, row, reply) => {
+                let accepted = self.announce_view(checkpoint, row)?;
                 if let Some(reply) = reply {
                     let _ = reply.send(accepted);
                 }

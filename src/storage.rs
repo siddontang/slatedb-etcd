@@ -165,6 +165,25 @@ impl LogReader {
         );
         Ok(entries)
     }
+
+    /// Return the term at `index`: the term of its entry, or of the snapshot record there.
+    pub fn term(&self, index: u64) -> Result<u64> {
+        if let Some(entry) = self
+            .engine
+            .get_entry_with::<EntryCodec, ProstCodec>(GROUP, index)?
+        {
+            return Ok(entry.term);
+        }
+        let record = self
+            .engine
+            .get_value::<Snapshot, ProstCodec>(GROUP, SNAPSHOT)?
+            .unwrap_or_default();
+        ensure!(
+            record.get_metadata().index == index,
+            "the log has no term at {index}"
+        );
+        Ok(record.get_metadata().term)
+    }
 }
 
 impl RaftStorage {

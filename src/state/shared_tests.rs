@@ -15,6 +15,7 @@ fn options() -> shared::Options {
         empty_log: false,
         pin_max: Duration::from_secs(300),
         restore: None,
+        record: None,
     }
 }
 
@@ -233,7 +234,7 @@ async fn no_op_entries_write_no_batch_after_the_membership_seed() {
     assert!(members.unwrap().is_some());
     state.apply(3, None).await.unwrap();
     state
-        .apply_view_checkpoint(4, &uuid::Uuid::new_v4().to_string())
+        .apply_view_checkpoint(4, &uuid::Uuid::new_v4().to_string(), 0)
         .await
         .unwrap();
     assert_eq!(state.applied, 4);
@@ -314,7 +315,7 @@ async fn bases_switch_monotonically_and_release_covered_segments() {
     let older = checkpoint(&state, &writer, &mut written).await;
     assert_eq!(older.applied, 10);
     state
-        .apply_view_checkpoint(state.applied + 1, &uuid::Uuid::new_v4().to_string())
+        .apply_view_checkpoint(state.applied + 1, &uuid::Uuid::new_v4().to_string(), 0)
         .await
         .unwrap();
     for n in 0..10 {
@@ -326,7 +327,7 @@ async fn bases_switch_monotonically_and_release_covered_segments() {
     let newer = checkpoint(&state, &writer, &mut written).await;
     assert_eq!(newer.applied, 21);
     state
-        .apply_view_checkpoint(state.applied + 1, &uuid::Uuid::new_v4().to_string())
+        .apply_view_checkpoint(state.applied + 1, &uuid::Uuid::new_v4().to_string(), 0)
         .await
         .unwrap();
     state
@@ -1210,7 +1211,7 @@ async fn historical_point_reads_return_the_version_at_the_revision() {
 async fn announce(state: &mut StateMachine, base: &view::Base) {
     let id = base.checkpoint.unwrap().to_string();
     let index = state.applied + 1;
-    state.apply_view_checkpoint(index, &id).await.unwrap();
+    state.apply_view_checkpoint(index, &id, 0).await.unwrap();
 }
 
 /// A deposed leader's `ViewCheckpoint` commits after a newer one. The base does not go back.
@@ -1279,7 +1280,7 @@ async fn a_member_behind_a_checkpoint_adopts_it() {
             .unwrap();
     }
     let opened = behind.shared_handles().unwrap().opened;
-    opened.offer(at_six.clone());
+    opened.offer(at_six.clone(), 0);
     // A switch cannot use a base above the applied index.
     behind.switch_base();
     assert_eq!(behind.applied, 2);
@@ -1289,7 +1290,7 @@ async fn a_member_behind_a_checkpoint_adopts_it() {
     assert_eq!(rows(&behind, b"etcd/").await, rows_at_four);
     assert_eq!(opened.newest(), Some(6));
     behind
-        .adopt_opened(opened.take().unwrap(), 4)
+        .adopt_opened(opened.take().unwrap().0, 4)
         .await
         .unwrap();
     assert_eq!(behind.applied, 6);
@@ -1583,7 +1584,7 @@ fn current(key: &str) -> Vec<u8> {
 /// Apply the announcement of `id` and switch to its base once the background open offers it.
 async fn adopt(state: &mut StateMachine, id: uuid::Uuid) {
     state
-        .apply_view_checkpoint(state.applied + 1, &id.to_string())
+        .apply_view_checkpoint(state.applied + 1, &id.to_string(), 0)
         .await
         .unwrap();
     state.settle_opens().await;
@@ -1640,7 +1641,7 @@ async fn an_adoption_switches_within_the_warm_limit() {
     faults.set(DELAY_SST_GET);
     let started = std::time::Instant::now();
     state
-        .apply_view_checkpoint(state.applied + 1, &id.to_string())
+        .apply_view_checkpoint(state.applied + 1, &id.to_string(), 0)
         .await
         .unwrap();
     while state.base_checkpoint() != Some(id) && started.elapsed() < Duration::from_secs(3) {

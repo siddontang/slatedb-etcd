@@ -59,7 +59,10 @@ flowchart LR
 | Term | Meaning |
 | --- | --- |
 | `F(C)` | The Raft index that checkpoint `C` covers: its `meta/applied` row |
+| Covered index | The applied index through which a member's stored batches are the whole state |
+| Coverage | The index through which an announcement certifies that `C` is the whole state |
 | Base | The checkpoint under a member's current views |
+| Base index | The index through which the base is the member's whole state, `F(C)` or more |
 | Overlay | Per-member memory that holds the applied batches above the base |
 | View `(C, S)` | Base `C` plus overlay batches in `(F(C), S]`: the state at `S` |
 | Materializer | The leader task that writes overlay batches into the shared `Db` |
@@ -80,9 +83,9 @@ The design depends on these rules. Later sections refer to them by number.
    removes the two per-member inputs to apply (see [Determinism](#determinism)).
 4. **Overlay cover.** A member keeps every overlay batch above `F(C)` for each checkpoint `C`
    that a live view uses.
-5. **Log cover.** A member truncates its log only through `F(C)` of its base. That checkpoint is
+5. **Log cover.** A member truncates its log only through its base index. That checkpoint is
    durable in S3.
-6. **Monotonic base.** A member's base `F` never goes down.
+6. **Monotonic base.** A member's base index never goes down.
 7. **Fail closed.** A read that cannot find an object fails. No path substitutes other data.
 
 ## Storage layout and mode
@@ -199,15 +202,33 @@ Step 3 replaces `db.write_with_options` in `store_batch` (`state.rs:369`). The e
 (`PublishPuts`, `apply.rs:264-274`) uses the same steps. Replies no longer wait for a SlateDB
 memtable insert.
 
-`ViewCheckpoint { checkpoint }` is a new entry type. It closes the open segment and starts a
-background open of `reader(checkpoint)`. It changes no etcd state and does not advance the KV
-revision. The checkpoint covers only entries below this entry, so the member has applied them.
+`ViewCheckpoint { checkpoint, covers }` is a new entry type. It closes the open segment and
+starts a background open of `reader(checkpoint)`. It changes no etcd state and does not advance
+the KV revision. The checkpoint covers only entries below this entry, so the member has applied
+them.
+
+`covers` is the **coverage**: the leader certifies that the checkpoint is the whole state at each
+index from `F` through `covers`. The leader reads `pushed` and the covered index from one
+applied state. It sets `covers` to its covered index only when no batch of its own is above
+`F`, materialized or not. Otherwise `covers` is `F`. An entry of an earlier binary has no
+`covers`, which means `F`. An announcement of the current base only raises its coverage, so it
+opens nothing and creates no checkpoint. The coverage belongs to the checkpoint ID. Another
+checkpoint at the same `F`, such as a Defragment output, does not get it.
 
 In shared mode an entry that changes no state writes **no batch**. This covers empty entries and
 `ViewCheckpoint`. Today such entries still write `meta/applied`. Here that write would make the
 memtable dirty, and the age flush would then publish a checkpoint for it. Each announcement
 would cause the next one on an idle cluster. `applied` still advances in memory, and `F` stays
 the index of the last state change.
+
+The overlay therefore keeps two positions. `pushed` is the index of the newest batch. The
+**covered index** is the applied index through which the stored batches are the whole state.
+An entry without a batch advances only the covered index. A view and a base switch use the
+covered index. The materializer and the publication targets use `pushed`.
+
+Members group entries in different ways. One member can store a batch at 2 for a Put at 1 and a
+failed update at 2. Another member stores a batch at 1 and none at 2. Both states at 2 are
+equal, so either member can use a checkpoint of the other.
 
 ## Determinism
 
@@ -296,12 +317,19 @@ cluster with no leader therefore keep their checkpoints.
 
 1. Apply `ViewCheckpoint(C)`. Close the segment. Start `DbReader::open(Checkpoint(C))` in the
    background. Apply continues.
-2. When the reader is open, read `F(C)`. If `F(C)` is not above the current base, close the
-   reader and stop (invariant 6). Opens can finish out of order. Then warm the cache for at
-   most 500 ms. See [Base cache warm](#base-cache-warm).
-3. Publish later views as `(reader(C), segments above F(C))`. Report `C` in `ViewAck`.
-4. When no view uses the old reader, close it and release the segments at or below `F(C)`.
-5. Write a Raft snapshot record for `C` and allow log truncation through `F(C)` (invariant 5).
+2. When the reader is open, read `F(C)`. Then warm the cache for at most 500 ms. See
+   [Base cache warm](#base-cache-warm).
+3. The switch waits until the covered index reaches `F(C)`. The new base index is
+   `min(covers, covered)`. If it is not above the current base index, close the reader and stop
+   (invariant 6). Opens can finish out of order.
+4. Publish later views as `(reader(C), segments above the base index)`. Report `C` in `ViewAck`.
+5. When no view uses the old reader, close it and release the segments at or below the base
+   index.
+6. Write a Raft snapshot record for `C` at the base index, with the Raft term there, and allow
+   log truncation through it (invariant 5).
+
+A member can release a batch above `F(C)`. The batch holds only rows that `C` already holds, so
+a new leader's materializer can skip it. `last_l0_seq` is at or above `F(C)`.
 
 A failed open does not change the current base. The member keeps its view and overlay, and it
 waits for the next checkpoint.
@@ -352,7 +380,9 @@ mode a missing SST rebases the member instead. Every other storage error still s
 3. [Install](#install) `C`: a local rebuild if `F(C) <= applied`, otherwise an adopt.
 4. Resume apply above the new `applied`.
 
-A rebase rescans the live data. It is the cost of losing a base, not of a leader change.
+A rebase rescans the live data. It is the cost of losing a base, not of a leader change. The
+log can start above the newest checkpoint row. If no newer checkpoint reaches the base index,
+the rebase opens the current base again at its base index, with the log term there.
 
 ## Log truncation and Raft snapshots
 
@@ -366,6 +396,10 @@ A rebase rescans the live data. It is the cost of losing a base, not of a leader
   today's handler copies objects first (`api.rs:103-117`). A failed open fails the request, and
   Raft retries. The handler keeps the reader until the install finishes, and the member reports
   `C` in `ViewAck`.
+- The record index can be above `F(C)`. The record keeps the two apart: the checkpoint gives `F`
+  and its term, and the record metadata gives the index and the term there. Install loads the
+  state at `F`, so the counter and term rows match. It then raises the applied index, the
+  covered index, and the term to the record values.
 
 ## Install
 
@@ -472,6 +506,10 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
 
 1. Read the base from the local Raft snapshot record. If that checkpoint was deleted, take the
    newest `view-` checkpoint. If none exists and `bootstrap.json` exists, stop with an error.
+   A record above the newest checkpoint row names a checkpoint with certified coverage. The
+   member opens that checkpoint by its ID, because a Defragment can add a newer one at the same
+   row. It loads the state at `F` and starts at the record index with the record term. This
+   runs before the log check, because the log starts after the record index.
 2. [Install](#install) the base. If the local log ends below `F` or its term at `F` differs,
    this is an adopt. Otherwise it is a local rebuild with nothing to replay yet.
 3. Replay committed log entries above `F` into the overlay. This is the current replay path with

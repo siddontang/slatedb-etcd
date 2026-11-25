@@ -766,10 +766,11 @@ pub(crate) fn missing_object(error: &anyhow::Error) -> bool {
     })
 }
 
-/// Bases that opened in the background. Apply takes the newest one.
+/// Bases that opened in the background, each with the index that its announcement certified.
+/// Apply takes the newest one.
 pub(crate) struct Opened {
-    slot: Mutex<Option<Arc<Base>>>,
-    /// The `F` of the newest offered base. The node starts a switch when it goes up.
+    slot: Mutex<Option<(Arc<Base>, u64)>>,
+    /// The coverage of the newest offered base. The node starts a switch when it goes up.
     ready: tokio::sync::watch::Sender<u64>,
 }
 
@@ -784,26 +785,33 @@ impl Default for Opened {
 
 impl Opened {
     /// Keep `base` unless an opened base already covers more. Opens can finish out of order.
-    /// A later checkpoint at the same index, such as after a Defragment, replaces the waiting
+    /// A later checkpoint at the same coverage, such as after a Defragment, replaces the waiting
     /// one, so its new layout reaches the member.
-    pub(crate) fn offer(&self, base: Arc<Base>) {
-        let applied = base.applied;
+    ///
+    /// `covers` is the index through which the base holds the whole state, as its announcement
+    /// certified. A lower value means the base row `F`. The coverage belongs to this checkpoint
+    /// only. Another checkpoint at the same row does not get it.
+    pub(crate) fn offer(&self, base: Arc<Base>, covers: u64) {
+        let covers = covers.max(base.applied);
         let mut slot = self.slot.lock().unwrap();
-        if slot.as_ref().is_some_and(|old| {
-            old.applied > applied || (old.applied == applied && old.checkpoint == base.checkpoint)
+        if slot.as_ref().is_some_and(|(old, old_covers)| {
+            *old_covers > covers || (*old_covers == covers && old.checkpoint == base.checkpoint)
         }) {
             return;
         }
-        *slot = Some(base);
+        *slot = Some((base, covers));
         drop(slot);
         // Each offer starts a switch, also at an unchanged index.
-        self.ready.send_modify(|old| *old = (*old).max(applied));
+        self.ready.send_modify(|old| *old = (*old).max(covers));
     }
 
-    fn take_through(&self, pushed: u64) -> Option<Arc<Base>> {
+    fn take_through(&self, covered: u64) -> Option<(Arc<Base>, u64)> {
         let mut slot = self.slot.lock().unwrap();
         // A base above the applied state needs an adopt: a snapshot install or a restart.
-        if slot.as_ref().is_some_and(|base| base.applied <= pushed) {
+        if slot
+            .as_ref()
+            .is_some_and(|(base, _)| base.applied <= covered)
+        {
             return slot.take();
         }
         None
@@ -816,11 +824,16 @@ impl Opened {
     /// The `F` of the opened base that waits in the slot.
     #[cfg(test)]
     pub(crate) fn newest(&self) -> Option<u64> {
-        self.slot.lock().unwrap().as_ref().map(|base| base.applied)
+        self.slot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(base, _)| base.applied)
     }
 
-    /// Take the opened base. The caller holds it until it adopts it or offers it back.
-    pub(crate) fn take(&self) -> Option<Arc<Base>> {
+    /// Take the opened base and its coverage. The caller holds them until it adopts the base or
+    /// offers it back.
+    pub(crate) fn take(&self) -> Option<(Arc<Base>, u64)> {
         self.slot.lock().unwrap().take()
     }
 }
@@ -840,6 +853,32 @@ pub(crate) struct Options {
     pub pin_max: Duration,
     /// Rows of a native snapshot that seed a new cluster.
     pub restore: Option<Restore>,
+    /// The checkpoint that the durable Raft snapshot record names, if any.
+    pub record: Option<Record>,
+}
+
+/// A format 6 Raft snapshot record: a checkpoint, the record index, and the term there. The
+/// index can be above the checkpoint row, because a certified announcement extends it. The
+/// extension belongs to this checkpoint only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Record {
+    pub checkpoint: uuid::Uuid,
+    pub index: u64,
+    pub term: u64,
+}
+
+impl Record {
+    /// Read the record of a Raft snapshot. Other formats give `None`.
+    pub(crate) fn of(snapshot: &raft::eraftpb::Snapshot) -> Result<Option<Self>> {
+        let Some(view) = transfer::ViewDescriptor::decode(snapshot.get_data())? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            checkpoint: view.checkpoint()?,
+            index: snapshot.get_metadata().index,
+            term: snapshot.get_metadata().term,
+        }))
+    }
 }
 
 /// The rows of a native snapshot that seed a new shared cluster. The shared database gets them
@@ -1102,6 +1141,10 @@ async fn write_seed(
 pub(crate) struct Shared {
     pub(crate) overlay: Overlay,
     pub(crate) base: Arc<Base>,
+    /// The index through which the base holds the whole state of this member. It is the base
+    /// row `F`, or a higher index that an announcement of the same checkpoint certified and that
+    /// this member applied. No entry in between changed state. See `docs/shared-state.md`.
+    pub(crate) base_index: u64,
     opened: Arc<Opened>,
     pub(crate) source: Arc<Source>,
     /// `ViewCheckpoint` entries that this member applied.
@@ -1109,8 +1152,8 @@ pub(crate) struct Shared {
     /// The checkpoint of the newest applied `ViewCheckpoint` entry. A new writer does not
     /// announce it again.
     announced: Arc<tokio::sync::watch::Sender<Option<uuid::Uuid>>>,
-    /// The checkpoint of the current base.
-    base_id: Arc<tokio::sync::watch::Sender<Option<uuid::Uuid>>>,
+    /// The checkpoint of the current base and its row `F`.
+    base_id: Arc<tokio::sync::watch::Sender<Option<(uuid::Uuid, u64)>>>,
     /// Background opens of announced checkpoints. DST waits for them to keep schedules exact.
     opening: Vec<tokio::task::JoinHandle<()>>,
     /// A failed open tries again until the base opens or a newer announcement replaces it.
@@ -1118,7 +1161,7 @@ pub(crate) struct Shared {
     retry_opens: bool,
     /// The checkpoint that waits for the opener task.
     pending: Arc<Mutex<Pending>>,
-    /// The `F` of the current base. Physical Compact replies wait for a covering base.
+    /// The `base_index` of the current base. Physical Compact replies wait for a covering base.
     based: Arc<tokio::sync::watch::Sender<u64>>,
     pub(crate) pin_max: Duration,
 }
@@ -1136,8 +1179,9 @@ const OPEN_RETRY_MAX: Duration = Duration::from_secs(2);
 /// The announced checkpoint that waits for an open, and whether an opener task runs.
 #[derive(Default)]
 struct Pending {
-    /// Only the newest waiting checkpoint. A newer announcement replaces an older one.
-    id: Option<uuid::Uuid>,
+    /// Only the newest waiting checkpoint, with its certified coverage. A newer announcement
+    /// replaces an older one.
+    id: Option<(uuid::Uuid, u64)>,
     running: bool,
 }
 
@@ -1168,7 +1212,7 @@ async fn open_announced(
     };
     let waiting = || pending.lock().unwrap().id.is_some();
     let mut current = next();
-    while let Some(id) = current {
+    while let Some((id, covers)) = current {
         let mut backoff = OPEN_RETRY_MIN;
         loop {
             match source.open_base(id).await {
@@ -1179,7 +1223,7 @@ async fn open_announced(
                     {
                         tracing::debug!(%id, "the cache warm of a base reached its time limit");
                     }
-                    opened.offer(base);
+                    opened.offer(base, covers);
                     break;
                 }
                 Err(error) => tracing::warn!(%error, %id, "cannot open a view checkpoint"),
@@ -1208,9 +1252,9 @@ async fn open_announced(
 /// Open checkpoint `id` once and offer its base. A manual apply, such as DST, uses this, so
 /// each announcement opens its own checkpoint at a fixed point of the schedule. It does not warm
 /// the cache, because a timed warm would make the schedule depend on the clock.
-async fn open_once(source: Arc<Source>, opened: Arc<Opened>, id: uuid::Uuid) {
+async fn open_once(source: Arc<Source>, opened: Arc<Opened>, id: uuid::Uuid, covers: u64) {
     match source.open_base(id).await {
-        Ok(base) => opened.offer(base),
+        Ok(base) => opened.offer(base, covers),
         // The member keeps its base and waits for the next checkpoint.
         Err(error) => tracing::warn!(%error, %id, "cannot open a view checkpoint"),
     }
@@ -1221,7 +1265,8 @@ impl Shared {
         Self {
             overlay: Overlay::new(base.applied),
             based: Arc::new(tokio::sync::watch::channel(base.applied).0),
-            base_id: Arc::new(tokio::sync::watch::channel(base.checkpoint).0),
+            base_id: Arc::new(tokio::sync::watch::channel(base_id(&base)).0),
+            base_index: base.applied,
             base,
             opened: Arc::default(),
             source,
@@ -1248,28 +1293,35 @@ impl Shared {
         self.view(u64::MAX)
     }
 
-    /// The view after the newest batch, which equals the applied state.
+    /// The view at the covered index, which equals the applied state.
     pub(crate) fn pinned(&self) -> StateView {
-        self.view(self.overlay.queue().pushed())
+        self.view(self.overlay.queue().covered())
     }
 
-    /// Close the open segment and open checkpoint `id` in the background.
-    pub(crate) fn announce(&mut self, id: uuid::Uuid) {
+    /// Close the open segment and open checkpoint `id` in the background. The announcement
+    /// certifies that the checkpoint holds the whole state through `covers`.
+    ///
+    /// An announcement of the current base only raises its coverage, so it opens nothing.
+    pub(crate) fn announce(&mut self, id: uuid::Uuid, covers: u64) {
         self.announcements += 1;
         self.announced.send_replace(Some(id));
         self.overlay.close_segment();
+        if self.base.checkpoint == Some(id) {
+            self.opened.offer(self.base.clone(), covers);
+            return;
+        }
         let source = self.source.clone();
         let opened = self.opened.clone();
         self.opening.retain(|task| !task.is_finished());
         if !self.retry_opens {
             self.opening
-                .push(tokio::spawn(open_once(source, opened, id)));
+                .push(tokio::spawn(open_once(source, opened, id, covers)));
             return;
         }
         // The checkpoint waits for the opener. It replaces an older waiting one, but not the
         // open that runs.
         let mut pending = self.pending.lock().unwrap();
-        pending.id = Some(id);
+        pending.id = Some((id, covers));
         if pending.running {
             return;
         }
@@ -1285,41 +1337,62 @@ impl Shared {
     /// Offer a base that opened elsewhere, such as in a test.
     #[cfg(test)]
     pub(crate) fn offer(&self, base: Arc<Base>) {
-        self.opened.offer(base);
+        self.opened.offer(base, 0);
     }
 
-    fn set_base(&mut self, base: Arc<Base>) {
-        self.based.send_replace(base.applied);
-        self.base_id.send_replace(base.checkpoint);
+    fn set_base(&mut self, base: Arc<Base>, index: u64) {
+        self.based.send_replace(index);
+        self.base_id.send_replace(base_id(&base));
+        self.base_index = index;
         self.base = base;
     }
 
     /// Switch to the newest opened base when it covers more than the current one. Return true
-    /// after a switch. The base `F` never goes down.
+    /// after a switch. The base index never goes down.
+    ///
+    /// A base at row `F` that holds the state through `covers` is usable once this member
+    /// covers `F`. It then holds this member's state at each index from `F` through
+    /// `min(covers, covered)`, so the overlay drops the batches through that index. Members
+    /// group entries in other ways, so a member can store a batch where the leader stored none.
     pub(crate) fn switch(&mut self) -> bool {
-        let Some(base) = self.opened.take_through(self.overlay.queue().pushed()) else {
+        let covered = self.overlay.queue().covered();
+        let Some((base, covers)) = self.opened.take_through(covered) else {
             return false;
         };
+        let index = covers.min(covered);
         // The base never moves back. A new checkpoint at the same index replaces the base: a
         // Defragment publishes one with a compacted layout.
-        if base.applied < self.base.applied
-            || (base.applied == self.base.applied && base.checkpoint == self.base.checkpoint)
+        if index < self.base_index
+            || (index == self.base_index && base.checkpoint == self.base.checkpoint)
         {
             return false;
         }
         // A paused member switches before the next `ViewCheckpoint` entry applies, so the
         // switch also closes the open segment. A covered open segment is then released.
         self.overlay.close_segment();
-        self.overlay.release(base.applied);
-        self.set_base(base);
+        self.overlay.release(index);
+        self.set_base(base, index);
         true
     }
 
     /// Make `base` the whole state and drop the overlay. Install and rebase use this.
     fn reset(&mut self, base: Arc<Base>) {
         self.overlay.reset(base.applied);
-        self.set_base(base);
+        let index = base.applied;
+        self.set_base(base, index);
     }
+
+    /// Raise the index of a base with an empty overlay to `index`. The caller knows that the
+    /// base holds the whole state there.
+    fn extend(&mut self, index: u64) {
+        self.overlay.cover(index);
+        self.base_index = index;
+        self.based.send_replace(index);
+    }
+}
+
+fn base_id(base: &Base) -> Option<(uuid::Uuid, u64)> {
+    base.checkpoint.map(|id| (id, base.applied))
 }
 
 /// The shared-mode handles that the node uses outside apply.
@@ -1327,12 +1400,12 @@ pub(crate) struct Handles {
     pub admin: Arc<slatedb::admin::Admin>,
     pub queue: Arc<super::overlay::Queue>,
     pub source: Arc<Source>,
-    /// The `F` of the current base.
+    /// The index through which the current base holds the whole state.
     pub based: tokio::sync::watch::Receiver<u64>,
     /// The checkpoint of the newest applied `ViewCheckpoint` entry.
     pub announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
-    /// The checkpoint of the current base.
-    pub base_id: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
+    /// The checkpoint of the current base and its row `F`.
+    pub base_id: tokio::sync::watch::Receiver<Option<(uuid::Uuid, u64)>>,
     pub opened: Arc<Opened>,
 }
 
@@ -1398,9 +1471,35 @@ impl StateMachine {
             }
             None => Arc::new(Base::empty()),
         };
+        // The Raft record can name a checkpoint that holds the state above its own row. The log
+        // then starts after the record index, so no checkpoint below that index can start this
+        // member. The newest checkpoint can be another one at the same row, such as after a
+        // Defragment, so the record checkpoint opens by its ID.
+        let record = options.record.filter(|record| base.applied < record.index);
+        let base = match record {
+            Some(record) if base.checkpoint != Some(record.checkpoint) => {
+                source.open_base(record.checkpoint).await.with_context(|| {
+                    format!(
+                        "cannot open checkpoint {} of the Raft snapshot record",
+                        record.checkpoint
+                    )
+                })?
+            }
+            _ => base,
+        };
         let shared = Shared::new(base, source, options.pin_max);
         let reads = shared.live();
         let mut state = Self::load(None, admin, location, rows, reads, Some(shared)).await?;
+        // The state loads at the row, so its counter and term rows match. The record gives the
+        // index and the term of the extension.
+        if let Some(record) = record {
+            ensure!(
+                state.applied <= record.index,
+                "checkpoint {} is above its Raft snapshot record",
+                record.checkpoint
+            );
+            state.extend_base(record.index, record.term)?;
+        }
         state.quota = quota;
         state.plan_compaction();
         Ok(state)
@@ -1426,10 +1525,15 @@ impl StateMachine {
     }
 
     /// Apply a `ViewCheckpoint` entry. It changes no etcd state and writes no batch.
+    ///
+    /// `covers` is the index through which the leader certified the checkpoint. An entry of an
+    /// earlier binary has none, and zero means the checkpoint row. The leader proposed the entry
+    /// after it applied `covers`, so a value at or above `index` is not valid.
     pub(crate) async fn apply_view_checkpoint(
         &mut self,
         index: u64,
         checkpoint: &str,
+        covers: u64,
     ) -> Result<()> {
         let Some(shared) = &mut self.shared else {
             // A replicated member stores only the apply position.
@@ -1441,7 +1545,9 @@ impl StateMachine {
             "non-contiguous state machine apply"
         );
         let id = uuid::Uuid::parse_str(checkpoint).context("invalid view checkpoint")?;
-        shared.announce(id);
+        ensure!(covers < index, "a view checkpoint covers its own entry");
+        shared.announce(id, covers);
+        shared.overlay.cover(index);
         self.reads = shared.live();
         self.applied = index;
         self.applied_term = self.entry_term;
@@ -1536,20 +1642,66 @@ impl StateMachine {
 
     /// Rebuild the state from the newest checkpoint at or below `limit` after a missing object.
     /// The caller replays the local log from the new `applied` to `limit`.
-    pub(crate) async fn rebase(&mut self, limit: u64) -> Result<()> {
+    ///
+    /// The log can start above the newest checkpoint row: a member truncates through its base
+    /// index. If no newer checkpoint reaches that index, the rebase opens the current base again
+    /// and raises it to its index. `term` gives the Raft term at an index of the local log.
+    pub(crate) async fn rebase(
+        &mut self,
+        limit: u64,
+        term: impl FnOnce(u64) -> Result<u64>,
+    ) -> Result<()> {
         let shared = self
             .shared
             .as_ref()
             .context("rebase needs shared state mode")?;
-        let base = newest_base_through(&self.admin, &shared.source, limit)
-            .await?
-            .context("the shared state has no view checkpoint at or below the rebase index")?;
+        let (current, index) = (shared.base.checkpoint, shared.base_index);
+        let newest = newest_base_through(&self.admin, &shared.source, limit).await?;
+        let base = match (newest, current) {
+            (Some(base), _) if base.applied >= index => base,
+            (_, Some(current)) if index > shared.base.applied => {
+                shared.source.open_base(current).await?
+            }
+            (Some(base), _) => base,
+            (None, _) => {
+                bail!("the shared state has no view checkpoint at or below the rebase index")
+            }
+        };
         tracing::warn!(
             base = base.applied,
+            index,
             applied = self.applied,
             "rebase on a new checkpoint"
         );
-        self.adopt_base(base, 0).await
+        let extend = base.checkpoint == current && base.applied < index;
+        self.adopt_base(base, 0).await?;
+        if extend {
+            self.extend_base(index, term(index)?)?;
+        }
+        Ok(())
+    }
+
+    /// Raise a base that has an empty overlay from its row `F` to `index`. The caller knows that
+    /// no entry in `(F, index]` changed state: a certified announcement or a Raft snapshot record
+    /// of this checkpoint says so. `term` is the Raft term at `index`. The derived state loaded
+    /// at `F`, so its counter rows match the base. Only the position and the term change.
+    pub(crate) fn extend_base(&mut self, index: u64, term: u64) -> Result<()> {
+        let shared = self.shared.as_mut().context("not in shared state mode")?;
+        ensure!(
+            self.applied == shared.base.applied && shared.overlay.queue().pushed() == self.applied,
+            "only a base without overlay batches can extend"
+        );
+        if index == self.applied {
+            return Ok(());
+        }
+        ensure!(index > self.applied, "the base cannot extend below its row");
+        ensure!(term != 0, "an extended base needs the Raft term at {index}");
+        shared.extend(index);
+        self.applied = index;
+        self.applied_term = term;
+        self.entry_term = term;
+        self.durable_applied = index;
+        Ok(())
     }
 
     /// Adopt the opened base above the applied index. A paused member uses this when its log
@@ -1580,12 +1732,16 @@ impl StateMachine {
             Some(base) => base,
             None => shared.source.open_base(id).await?,
         };
+        // The record index can be above the checkpoint row: the leader certified that no entry
+        // in between changed state. The record gives the term at its own index only.
         ensure!(
-            base.applied == index,
-            "checkpoint index {} differs from snapshot index {index}",
+            base.applied <= index,
+            "checkpoint index {} is above snapshot index {index}",
             base.applied
         );
-        self.adopt_base(base, term).await
+        let row_term = if base.applied == index { term } else { 0 };
+        self.adopt_base(base, row_term).await?;
+        self.extend_base(index, term)
     }
 
     /// The format 6 snapshot of the current base: its index, data, and ConfState. `None` before
@@ -1605,19 +1761,19 @@ impl StateMachine {
             .context("the base checkpoint has no membership")?;
         let members: crate::cluster::Store = serde_json::from_slice(&members)?;
         let data = transfer::ViewDescriptor::new(id).encode()?;
-        Ok(Some((shared.base.applied, data, members.conf())))
+        Ok(Some((shared.base_index, data, members.conf())))
     }
 
-    /// The base index `F`, the applied announcements, and the overlay bytes, in shared mode.
     /// The checkpoint of the base, if any.
     pub(crate) fn base_checkpoint(&self) -> Option<uuid::Uuid> {
         self.shared.as_ref()?.base.checkpoint
     }
 
+    /// The base index, the applied announcements, and the overlay bytes, in shared mode.
     pub(crate) fn view_status(&self) -> Option<(u64, u64, u64)> {
         let shared = self.shared.as_ref()?;
         Some((
-            shared.base.applied,
+            shared.base_index,
             shared.announcements,
             shared.overlay.bytes(),
         ))

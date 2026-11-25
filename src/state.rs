@@ -547,7 +547,11 @@ impl StateMachine {
                 .all(|key| key == APPLIED || key == APPLIED_TERM)
         {
             // An entry that changes no state writes no batch. Otherwise each announcement would
-            // dirty the memtable, and its flush would cause the next announcement.
+            // dirty the memtable, and its flush would cause the next announcement. The overlay
+            // still records that the state at `index` is the state after its newest batch.
+            if let Some(shared) = &mut self.shared {
+                shared.overlay.cover(index);
+            }
             return Ok(size);
         }
         let mut size = size;
