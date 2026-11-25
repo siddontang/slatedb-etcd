@@ -573,3 +573,32 @@ async fn a_single_member_serves_writes_after_each_start() {
         server.shutdown().await.unwrap();
     }
 }
+
+/// An unpaginated Range larger than 64 MiB returns every row, as etcd sends up to
+/// `math.MaxInt32` bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unpaginated_range_above_64_mib_returns_every_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(ServerConfig::single_node(dir.path()))
+        .await
+        .unwrap();
+    ready(&server).await;
+    let value = vec![b'v'; 1024 * 1024];
+    for i in 0..72u32 {
+        put(&server, format!("big/{i:03}").as_bytes(), &value).await;
+    }
+    let reply = KvClient::connect(server.client_url())
+        .await
+        .unwrap()
+        .max_decoding_message_size(usize::MAX)
+        .range(RangeRequest {
+            key: b"big/".to_vec(),
+            range_end: b"big0".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((reply.count, reply.kvs.len(), reply.more), (72, 72, false));
+    assert!(reply.kvs.iter().all(|kv| kv.value == value));
+}

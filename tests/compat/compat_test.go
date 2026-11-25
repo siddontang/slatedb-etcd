@@ -38,6 +38,8 @@ type cluster struct {
 	processes     map[int]*exec.Cmd
 	logs          map[int]*os.File
 	args          []string
+	// readyTimeout replaces the 20 s startup wait, for example for a large restore.
+	readyTimeout time.Duration
 }
 
 func listenLocal(t *testing.T) net.Listener {
@@ -236,7 +238,11 @@ func (c *cluster) leader() int {
 func (c *cluster) waitReady() {
 	c.t.Helper()
 	// Initial clients can select any member. Each member must know the elected leader.
-	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); {
+	timeout := 20 * time.Second
+	if c.readyTimeout > 0 {
+		timeout = c.readyTimeout
+	}
+	for deadline := time.Now().Add(timeout); time.Now().Before(deadline); {
 		var leader, term any
 		ready, sawLeader := true, false
 		for id := range c.processes {

@@ -93,7 +93,8 @@ advance `meta/applied` alone, so a different index or a missing row means an unk
 next state batch stores the term again. A copied checkpoint with a known term must match the
 Raft snapshot term. At startup, a durable Raft snapshot at the applied index fills an unknown
 term in memory and must match a known term. Logical images and native backups omit the row.
-Install takes the term from the Raft snapshot metadata, and restore starts at index 1 in term 1.
+Install takes the term from the Raft snapshot metadata. A replicated restore starts in term 1 at
+the copied row count plus one, and a shared restore at index 1 in term 1.
 
 ## Durability and ordering contract
 
@@ -540,7 +541,8 @@ The leader and any forwarding member wait for their local flush before they retu
 Defragment rewrites SSTs through the SlateDB compactor.
 Both operations run on the apply worker. Slow state work cannot stop Raft heartbeats.
 Compactor failures return RPC errors; they do not stop the Raft owner.
-Native snapshot export includes SHA-256 and uses bounded response chunks, but builds a full buffer.
+Native snapshot export includes SHA-256 and uses bounded response chunks. Replicated mode streams
+it from a pinned checkpoint; shared mode builds the image of its pinned view in one buffer.
 Snapshots contain authentication, membership, alarms, leases, and revision metadata together.
 
 ## Monitoring

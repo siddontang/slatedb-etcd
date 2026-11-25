@@ -119,8 +119,12 @@ On Linux, jemalloc background threads return freed pages to the OS after 200 ms.
 A negative quota value disables the quota. The quota is cluster state, so a flag change takes
 effect only when that member leads; see [quota changes](operations.md#change-the-quota).
 The quota can be exceeded by one operation and does not reserve free disk space.
-Native backups and `Maintenance.Snapshot` have a 64 MiB limit. Peer snapshots copy SlateDB
-checkpoint objects and have no size limit; see [object storage Raft snapshots](object-snapshots.md).
+Native backups and `Maintenance.Snapshot` stream from a pinned checkpoint with bounded memory.
+The image has no size limit, but each row has a 64 MiB limit. In shared state mode, the image
+is built in memory and limited to 64 MiB; see
+[administration](administration.md#maintenance-and-storage).
+Peer snapshots copy SlateDB checkpoint objects and have no size limit; see
+[object storage Raft snapshots](object-snapshots.md).
 See [log pool accounting](architecture.md#bounded-log-pools) for admission and recovery rules.
 
 ## Automatic compaction
