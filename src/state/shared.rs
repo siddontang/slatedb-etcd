@@ -250,8 +250,6 @@ pub(crate) struct Source {
     /// Bases of received snapshots, with their receive time. Install takes the base. Raft can
     /// also drop a snapshot, so a receipt expires after `RECEIPT_LIFETIME`.
     received: Mutex<std::collections::HashMap<uuid::Uuid, (std::time::Instant, Arc<Base>)>>,
-    /// The SSTs whose cache entries a warm loaded. Only SSTs of live bases stay here.
-    warmed: Mutex<HashSet<slatedb::manifest::SsTableId>>,
 }
 
 /// The checkpoints that this member uses, and the ones that retention deletes.
@@ -268,6 +266,9 @@ struct Pins {
     opening: std::collections::HashMap<uuid::Uuid, usize>,
     /// Checkpoints that retention selected and deletes.
     retiring: HashSet<uuid::Uuid>,
+    /// The SSTs whose cache entries a warm loaded. Only SSTs of registered live bases stay here.
+    /// The same lock orders base registrations, warm results, and pruning.
+    warmed: HashSet<slatedb::manifest::SsTableId>,
 }
 
 impl Pins {
@@ -278,6 +279,15 @@ impl Pins {
             .map(|(id, _)| *id)
             .chain(self.opening.keys().copied())
             .collect()
+    }
+}
+
+/// Prunes the warm set when a warm ends or its caller drops it.
+struct Prune<'a>(&'a Source);
+
+impl Drop for Prune<'_> {
+    fn drop(&mut self) {
+        self.0.prune_warmed();
     }
 }
 
@@ -335,51 +345,68 @@ impl Source {
     /// a snapshot receipt, or a restart opens a base without it.
     ///
     /// Each SST counts as warm only after its entries loaded, so a failed or stopped warm leaves
-    /// it for the next base. Concurrent warms add to one set. The set then drops SSTs that no
-    /// live base holds, so it does not grow with each flush and compaction.
+    /// it for the next base. Concurrent warms add to one set. When the warm ends or its caller
+    /// drops it at the time limit, the set drops SSTs that no live base holds. So the set does
+    /// not grow with each flush and compaction, also when every warm times out.
     pub(crate) async fn warm(&self, base: &Base) {
+        let _prune = Prune(self);
         let cold: Vec<_> = {
-            let warmed = self.warmed.lock().unwrap();
+            let pins = self.pins.lock().unwrap();
             base.ssts()
                 .iter()
-                .filter(|(id, _)| !warmed.contains(id))
+                .filter(|(id, _)| !pins.warmed.contains(id))
                 .copied()
                 .collect()
         };
         for (id, l0) in cold {
             match base.warm_sst(id, l0).await {
                 Ok(()) => {
-                    self.warmed.lock().unwrap().insert(id);
+                    self.pins.lock().unwrap().warmed.insert(id);
                 }
                 Err(error) => {
                     tracing::warn!(%error, sst = %id.value(), "cannot warm the cache for an SST");
                 }
             }
         }
-        self.prune_warmed();
     }
 
-    /// Drop the warm SSTs that no live base holds. A base in a warm is live too.
+    /// Drop the warm SSTs that no registered live base holds. A warm and a base switch call
+    /// this. The base of a running warm is live, because the warm borrows it. One lock covers the
+    /// live bases and the set, so a base that registers or a warm that ends at the same time is
+    /// ordered before or after this.
     fn prune_warmed(&self) {
-        let live = self.live_ssts();
-        self.warmed.lock().unwrap().retain(|id| live.contains(id));
-    }
-
-    /// The SSTs of the bases that opened and still have a reference.
-    fn live_ssts(&self) -> HashSet<slatedb::manifest::SsTableId> {
         let mut pins = self.pins.lock().unwrap();
         pins.bases.retain(|(_, base)| base.strong_count() > 0);
-        pins.bases
+        // The references end after the lock: the last one may drop a base and its reader.
+        let live: Vec<Arc<Base>> = pins.bases.iter().filter_map(|(_, b)| b.upgrade()).collect();
+        let ssts: HashSet<_> = live
             .iter()
-            .filter_map(|(_, base)| base.upgrade())
-            .flat_map(|base| base.ssts().iter().map(|(id, _)| *id).collect::<Vec<_>>())
-            .collect()
+            .flat_map(|base| base.ssts().iter().map(|(id, _)| *id))
+            .collect();
+        pins.warmed.retain(|id| ssts.contains(id));
+        drop(pins);
+        drop(live);
     }
 
-    /// The SSTs whose cache entries a warm loaded.
+    /// The SSTs whose cache entries a warm loaded, and the SSTs of the registered live bases,
+    /// read under one lock.
     #[cfg(test)]
-    pub(crate) fn warmed(&self) -> HashSet<slatedb::manifest::SsTableId> {
-        self.warmed.lock().unwrap().clone()
+    pub(crate) fn warmed(
+        &self,
+    ) -> (
+        HashSet<slatedb::manifest::SsTableId>,
+        HashSet<slatedb::manifest::SsTableId>,
+    ) {
+        let pins = self.pins.lock().unwrap();
+        let live: Vec<Arc<Base>> = pins.bases.iter().filter_map(|(_, b)| b.upgrade()).collect();
+        let ssts = live
+            .iter()
+            .flat_map(|base| base.ssts().iter().map(|(id, _)| *id))
+            .collect();
+        let warmed = pins.warmed.clone();
+        drop(pins);
+        drop(live);
+        (warmed, ssts)
     }
 
     /// The checkpoints that this member uses: live bases and opens in flight.
@@ -653,7 +680,6 @@ pub(crate) fn offline_source(
         cache: cache.build(),
         pins: Mutex::default(),
         received: Mutex::default(),
-        warmed: Mutex::default(),
     }))
 }
 
@@ -1343,7 +1369,6 @@ impl StateMachine {
             cache: cache.build(),
             pins: Mutex::default(),
             received: Mutex::default(),
-            warmed: Mutex::default(),
         });
         ensure!(
             state_root == source.state(),
@@ -1449,6 +1474,8 @@ impl StateMachine {
         if let Some(shared) = &mut self.shared {
             if shared.switch() {
                 self.reads = shared.live();
+                // The warm of the new base pruned the set while the old base was still live.
+                shared.source.prune_warmed();
             }
         }
     }

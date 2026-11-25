@@ -336,9 +336,10 @@ second pass on the same cluster already ran at 24,600 ops/s. So cold blocks were
 the cost of the overlay or the base reader.
 
 Each follower now downloads about the current-row bytes of every write once. In a run of
-100,000 puts of 256 B (put-c256), S3 GET response bytes rose from 2.5 MiB to 45.3 MiB during the
-load, and from 1.9 MiB to 25.9 MiB while it settled: a 15 s pause and a checkpoint on each
-member. The total rose from 4.4 MiB to 71.2 MiB. The GET count did not change.
+100,000 puts of 256 B (put-c256), cluster-wide S3 GET response bytes rose from 2.5 MiB to
+45.3 MiB during the load, and from 1.9 MiB to 25.9 MiB while it settled: a 15 s pause and a
+checkpoint on each member. The total rose from 4.4 MiB to 71.2 MiB. The GET count did not
+change.
 After a Defragment or another compaction, both modes read cold compaction output. In the same
 setup, one read pass then ran at about 9,500 ops/s in both modes.
 

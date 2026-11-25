@@ -1168,16 +1168,7 @@ async fn cold_checkpoint(
     writer: &slatedb::Db,
     written: &mut u64,
 ) -> uuid::Uuid {
-    let queue = state.shared.as_ref().unwrap().overlay.queue();
-    for (seq, batch) in queue.after(*written, usize::MAX) {
-        writer
-            .write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
-            .await
-            .unwrap();
-        *written = seq;
-    }
-    writer.flush().await.unwrap();
-    writer.get(APPLIED).await.unwrap();
+    cold_flush(state, writer, written).await;
     writer
         .create_checkpoint(
             CheckpointScope::Durable,
@@ -1189,6 +1180,21 @@ async fn cold_checkpoint(
         .await
         .unwrap()
         .id
+}
+
+/// Write the overlay into `writer` and flush it to a new L0 SST. A read of the apply marker
+/// caches what a base open reads, but no current-row block.
+async fn cold_flush(state: &StateMachine, writer: &slatedb::Db, written: &mut u64) {
+    let queue = state.shared.as_ref().unwrap().overlay.queue();
+    for (seq, batch) in queue.after(*written, usize::MAX) {
+        writer
+            .write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
+            .await
+            .unwrap();
+        *written = seq;
+    }
+    writer.flush().await.unwrap();
+    writer.get(APPLIED).await.unwrap();
 }
 
 /// Put `count` keys from `first` with 200 B values, so the rows fill many blocks.
@@ -1249,7 +1255,7 @@ async fn slow_sst_reads_do_not_delay_metadata_opens() {
         .expect("a receipt waited for SST reads")
         .unwrap();
     assert!(source.pinned().contains(&id));
-    assert!(source.warmed().is_empty());
+    assert!(source.warmed().0.is_empty());
     drop(base);
     faults.set(0);
     writer.close().await.unwrap();
@@ -1297,7 +1303,7 @@ async fn a_failed_warm_is_retried_on_a_later_base() {
     adopt(&mut state, first).await;
     faults.set(0);
     let source = state.shared.as_ref().unwrap().source.clone();
-    assert!(source.warmed().is_empty());
+    assert!(source.warmed().0.is_empty());
     put_rows(&mut state, 300, 10).await;
     let second = cold_checkpoint(&state, &writer, &mut written).await;
     adopt(&mut state, second).await;
@@ -1328,7 +1334,7 @@ async fn concurrent_warms_keep_both_results() {
     let all: std::collections::HashSet<_> =
         a.ssts().iter().chain(b.ssts()).map(|(id, _)| *id).collect();
     assert_eq!(all.len(), 2);
-    assert_eq!(source.warmed(), all);
+    assert_eq!(source.warmed().0, all);
     writer.close().await.unwrap();
     state.close().await.unwrap();
 }
@@ -1342,33 +1348,81 @@ async fn the_warm_set_stays_bounded_across_base_switches() {
     let admin = slatedb::admin::Admin::builder(source.state(), source.store.clone()).build();
     let mut written = 0;
     let mut seen = std::collections::HashSet::new();
-    let mut previous: Vec<_> = vec![];
     for round in 0..6 {
         put_rows(&mut state, round * 20, 20).await;
         let id = cold_checkpoint(&state, &writer, &mut written).await;
         adopt(&mut state, id).await;
         let base = state.shared.as_ref().unwrap().base.clone();
         let current: Vec<_> = base.ssts().iter().map(|(id, _)| *id).collect();
-        let warmed = source.warmed();
+        // Only SSTs of live bases stay. Another task, such as a read, can still hold an older
+        // base, so the bound is the set of live bases, not the last two.
+        let (warmed, live) = source.warmed();
         assert!(
-            warmed
-                .iter()
-                .all(|id| current.contains(id) || previous.contains(id)),
-            "round {round}: {} warm SSTs",
-            warmed.len()
+            warmed.is_subset(&live),
+            "round {round}: {} warm SSTs, {} retired",
+            warmed.len(),
+            warmed.difference(&live).count()
         );
         seen.extend(current.iter().copied());
-        previous = current;
         crate::state::maintenance::compact_all(&admin)
             .await
             .unwrap();
     }
     // Each round adds an L0 SST and new compacted SSTs. Without the pruning, all would stay.
-    let warmed = source.warmed().len();
+    let warmed = source.warmed().0.len();
+    assert!(seen.len() >= 12, "{warmed} of {}", seen.len());
+    writer.close().await.unwrap();
+    state.close().await.unwrap();
+}
+
+/// Adoptions on a slow store each warm some SSTs and then reach the time limit. The warm set
+/// still keeps only SSTs of live bases across compactions.
+#[tokio::test]
+async fn timed_out_warms_keep_the_warm_set_bounded() {
+    use crate::object::faults::DELAY_SST_GET;
+    let (faults, mut state) = fault_state().await;
+    let writer = cold_writer(&state).await;
+    let source = state.shared.as_ref().unwrap().source.clone();
+    let admin = slatedb::admin::Admin::builder(source.state(), source.store.clone()).build();
+    faults.set_delay(Duration::from_millis(150));
+    let mut written = 0;
+    let mut partial = 0;
+    for round in 0..6 {
+        // Four cold L0 SSTs. Each data read takes 150 ms, so a warm loads about three of them.
+        for flush in 0..4 {
+            put_rows(&mut state, (round * 4 + flush) * 20, 20).await;
+            cold_flush(&state, &writer, &mut written).await;
+        }
+        let id = cold_checkpoint(&state, &writer, &mut written).await;
+        faults.set(DELAY_SST_GET);
+        adopt(&mut state, id).await;
+        faults.set(0);
+        let base = state.shared.as_ref().unwrap().base.clone();
+        let current: Vec<_> = base.ssts().iter().map(|(id, _)| *id).collect();
+        // Only SSTs of live bases stay. Another task, such as a read, can still hold an older
+        // base, so the bound is the set of live bases, not the last two.
+        let (warmed, live) = source.warmed();
+        assert!(
+            warmed.is_subset(&live),
+            "round {round}: {} warm SSTs, {} retired",
+            warmed.len(),
+            warmed.difference(&live).count()
+        );
+        let cold = base
+            .ssts()
+            .iter()
+            .filter(|(id, l0)| *l0 && !warmed.contains(id))
+            .count();
+        if cold > 0 && warmed.iter().any(|id| current.contains(id)) {
+            partial += 1;
+        }
+        crate::state::maintenance::compact_all(&admin)
+            .await
+            .unwrap();
+    }
     assert!(
-        seen.len() >= 12 && warmed <= 2 * previous.len(),
-        "{warmed} of {}",
-        seen.len()
+        partial >= 3,
+        "only {partial} warms loaded some SSTs and then stopped"
     );
     writer.close().await.unwrap();
     state.close().await.unwrap();
