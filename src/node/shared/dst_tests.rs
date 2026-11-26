@@ -9,8 +9,11 @@ impl Simulation {
     /// member restarts once. A record above its checkpoint row opens that checkpoint at its row
     /// and raises it.
     pub(super) async fn restart_above_rows(&mut self) {
-        if self.leader().is_some() {
-            let follower = self.follower(0);
+        if let Some(leader) = self.leader() {
+            // A failed writer step can leave a follower stopped. The first running one asks.
+            let follower = (1..=self.members)
+                .find(|id| *id != leader && self.nodes.contains_key(id))
+                .unwrap();
             let node = self.nodes.get_mut(&follower).unwrap();
             if node.raw.request_snapshot().is_ok() {
                 self.trace.push(format!("request snapshot {follower}"));
