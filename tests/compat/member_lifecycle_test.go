@@ -2,7 +2,9 @@ package compat
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -93,6 +95,24 @@ func testLearnerLifecycle(t *testing.T, size int, strict bool) {
 	require.NoError(t, err)
 	require.Equal(t, id, s.Leader)
 	require.False(t, s.IsLearner)
+	// A new leader refuses a membership change until it applies the entries that it had when it
+	// took the lead, see #148. Shared state mode applies more slowly than replicated state mode.
+	// Wait until the leader applied all entries in its log.
+	require.Eventually(t, func() bool {
+		response, err := http.Get("http://" + endpoint + "/status")
+		if err != nil {
+			return false
+		}
+		defer response.Body.Close()
+		var state map[string]any
+		if json.NewDecoder(response.Body).Decode(&state) != nil || state["role"] != "Leader" {
+			return false
+		}
+		applied, _ := state["applied_index"].(float64)
+		committed, _ := state["commit_index"].(float64)
+		last, _ := state["last_log_index"].(float64)
+		return committed >= last && applied >= committed
+	}, 10*time.Second, 20*time.Millisecond, "the new leader did not apply its log")
 	removed := uint64(1)
 	// A two-voter cluster needs both voters until removal commits.
 	if size > 1 {
