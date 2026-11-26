@@ -698,10 +698,17 @@ at the applied index first. A shutdown ends the retry at once. A membership chan
 only after its batch is stored. Base readers stop after the retries of the member database, so
 a read fails instead of waiting forever. Corrupt data and invariant errors still stop apply.
 
+An early Put reply evaluates its entries before the state write, and they can be uncommitted. A
+storage error there does not retry, because a new leader can replace the entries. Early replies
+stop until apply passes those entries, and the entries apply on the committed path above.
+
 A Watch page that fails for a transient or missing object runs again on a new view. Each
 watcher resumes at its own next revision, so no revision is lost. The first retry runs at once,
 and later retries in a row wait from 100 ms up to 5 s. A corrupt page ends the stream with
-`DataLoss`.
+`DataLoss`. The stream reads one catch-up page at a time between its other work. So a Cancel, a
+closed client, or a closed request stream still ends the work while the store fails. A progress
+request waits until its watchers have every event through its revision. Until its reply, the
+stream takes no feed batch, so no later event goes before it.
 
 ### Writer faults
 

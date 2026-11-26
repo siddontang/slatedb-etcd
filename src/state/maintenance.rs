@@ -404,10 +404,18 @@ pub(crate) fn hash_append(crc: u32, record: &[u8]) -> Result<(u32, u64)> {
 }
 
 fn hash_main(key: &[u8]) -> std::result::Result<i64, KvError> {
-    key.get(HASH.len()..HASH.len() + 8)
-        .and_then(|main| main.try_into().ok())
-        .map(i64::from_be_bytes)
-        .ok_or_else(|| KvError::corrupt("invalid hash key"))
+    // The whole key must have the form of `hash_key`: the main revision, `_`, the
+    // subrevision, and an optional tombstone mark.
+    let record = key.get(HASH.len()..).unwrap_or_default();
+    let valid = match record.len() {
+        17 => true,
+        18 => record[17] == b't',
+        _ => false,
+    } && record[8] == b'_';
+    match record.get(..8) {
+        Some(main) if valid => Ok(i64::from_be_bytes(main.try_into().expect("eight bytes"))),
+        _ => Err(KvError::corrupt("invalid hash key")),
+    }
 }
 
 /// Scan the hash records through `revision`.

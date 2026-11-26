@@ -35,7 +35,7 @@ pub struct KvError {
     pub message: String,
     /// The class of a storage error. It does not cross the wire, so a reply keeps only its code.
     #[serde(skip)]
-    pub(crate) fault: Option<crate::mvcc::storage_fault::StorageFault>,
+    fault: Option<crate::mvcc::storage_fault::StorageFault>,
 }
 
 impl KvError {
@@ -103,10 +103,19 @@ impl KvError {
         Self::new(Code::Internal, &format!("invariant error: {error}"))
     }
 
+    /// Return the error of this member's own invariants, which stops the member. A storage
+    /// error fails only its request, so it returns `None`.
+    pub(crate) fn stops_member(&self) -> Option<anyhow::Error> {
+        match self.fault {
+            Some(_) => None,
+            None => self.unapplied(),
+        }
+    }
+
     /// Return the error that stops apply instead of becoming the result of an entry: a storage
     /// error, whose class survives, or an invariant error. Each member must reach the same
     /// result, so a read that failed on this member cannot be one.
-    pub(crate) fn unapplied(&self) -> Option<anyhow::Error> {
+    fn unapplied(&self) -> Option<anyhow::Error> {
         if let Some(fault) = self.fault {
             return Some(anyhow::Error::new(crate::mvcc::storage_fault::Classified {
                 fault,
@@ -118,6 +127,25 @@ impl KvError {
 
     pub fn status(self) -> Status {
         Status::new(Code::from_i32(self.code), self.message)
+    }
+}
+
+/// The error of an apply entry point. Only a `Request` error is the result of an entry.
+#[derive(Debug)]
+pub(crate) enum ApplyError {
+    /// The result of the entry. Each member reaches the same one.
+    Request(KvError),
+    /// A storage error of a read, with its class, or an invariant error. The entry stays
+    /// unapplied.
+    Unapplied(anyhow::Error),
+}
+
+impl From<KvError> for ApplyError {
+    fn from(error: KvError) -> Self {
+        match error.unapplied() {
+            Some(error) => Self::Unapplied(error),
+            None => Self::Request(error),
+        }
     }
 }
 
@@ -1282,8 +1310,15 @@ pub async fn prepare(
     request: &RequestOp,
     leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
 ) -> KvResult<(ResponseOp, WriteBatch, i64)> {
-    let (response, batch, next, _) =
-        prepare_with_counts(db, None, revision, compact_revision, request, leases).await?;
+    let (response, batch, next, _) = prepare_view(
+        ReadDb::Live(db),
+        None,
+        revision,
+        compact_revision,
+        request,
+        leases,
+    )
+    .await?;
     Ok((response, batch, next))
 }
 
@@ -1295,7 +1330,7 @@ pub(crate) async fn prepare_with_counts(
     compact_revision: i64,
     request: &RequestOp,
     leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
-) -> KvResult<(ResponseOp, WriteBatch, i64, crate::metrics::Writes)> {
+) -> Result<(ResponseOp, WriteBatch, i64, crate::metrics::Writes), ApplyError> {
     prepare_view(
         ReadDb::Live(db),
         index,
@@ -1305,6 +1340,7 @@ pub(crate) async fn prepare_with_counts(
         leases,
     )
     .await
+    .map_err(ApplyError::from)
 }
 
 /// Evaluate a request after earlier writes of the same apply group.
@@ -1316,7 +1352,7 @@ pub(crate) async fn prepare_grouped(
     compact_revision: i64,
     request: &RequestOp,
     leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
-) -> KvResult<(ResponseOp, WriteBatch, i64, crate::metrics::Writes)> {
+) -> Result<(ResponseOp, WriteBatch, i64, crate::metrics::Writes), ApplyError> {
     let db = ReadDb::Overlay {
         db: current.db,
         previous,
@@ -1331,6 +1367,7 @@ pub(crate) async fn prepare_grouped(
         leases,
     )
     .await
+    .map_err(ApplyError::from)
 }
 
 async fn prepare_view(

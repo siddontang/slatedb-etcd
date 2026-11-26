@@ -117,10 +117,8 @@ impl ReadView {
         // A storage error fails only this read, and the client retries. A deleted checkpoint
         // object or an expired pin is one, so the retry reads a new view. Only an error of the
         // member's own invariants stops the member.
-        if let Some(error) = result.as_ref().err().filter(|error| error.fault.is_none()) {
-            if let Some(error) = error.unapplied() {
-                return Err(error);
-            }
+        if let Some(error) = result.as_ref().err().and_then(mvcc::KvError::stops_member) {
+            return Err(error);
         }
         Ok(Some(Outcome { result }))
     }

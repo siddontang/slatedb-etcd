@@ -162,12 +162,8 @@ impl StateMachine {
                             revision = next;
                             Ok(reply)
                         }
-                        Err(error) => {
-                            if let Some(error) = error.unapplied() {
-                                return Err(error);
-                            }
-                            Err(error)
-                        }
+                        Err(mvcc::ApplyError::Request(error)) => Err(error),
+                        Err(mvcc::ApplyError::Unapplied(error)) => return Err(error),
                     }
                 }
             };

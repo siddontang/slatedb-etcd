@@ -92,12 +92,35 @@ pub async fn prepare(
     command: &LeaseCommand,
 ) -> Result<PreparedLease, KvError> {
     let (prepared, _) =
-        prepare_with_counts(db, None, revision, compact_revision, index, leases, command).await?;
+        evaluate(db, None, revision, compact_revision, index, leases, command).await?;
     Ok(prepared)
 }
 
-/// Evaluate a lease command. `index_keys` must describe the applied current rows of `db`.
+/// Evaluate a lease command in apply. `index_keys` must describe the applied current rows of
+/// `db`.
 pub(crate) async fn prepare_with_counts(
+    db: &impl StateRead,
+    index_keys: Option<&crate::state::key_index::KeyIndex>,
+    revision: i64,
+    compact_revision: i64,
+    index: u64,
+    leases: &BTreeMap<i64, LeaseRecord>,
+    command: &LeaseCommand,
+) -> Result<(PreparedLease, u64), mvcc::ApplyError> {
+    let evaluated = evaluate(
+        db,
+        index_keys,
+        revision,
+        compact_revision,
+        index,
+        leases,
+        command,
+    );
+    Ok(evaluated.await?)
+}
+
+/// The body of `prepare_with_counts`, with the raw request error.
+async fn evaluate(
     db: &impl StateRead,
     index_keys: Option<&crate::state::key_index::KeyIndex>,
     revision: i64,

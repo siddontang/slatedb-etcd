@@ -215,6 +215,28 @@ async fn a_corrupt_row_fails_coalesced_reads_once() {
 /// and a Range on the same state still succeeds.
 #[tokio::test]
 async fn a_short_hash_record_fails_only_hash_kv() {
+    let short = [crate::maintenance::HASH, &[0; 3]].concat();
+    a_bad_hash_record_fails_only_hash_kv(short, b"record".to_vec()).await;
+}
+
+/// A record key with only its main revision fails HashKV with `DataLoss`, even with a valid
+/// record value. The key must have the whole form of `hash_key`.
+#[tokio::test]
+async fn a_hash_record_key_without_its_subrevision_fails_only_hash_kv() {
+    use prost::Message;
+    let key = [crate::maintenance::HASH, &2i64.to_be_bytes()].concat();
+    let record = crate::proto::mvccpb::KeyValue {
+        key: b"good".to_vec(),
+        value: b"value".to_vec(),
+        create_revision: 2,
+        mod_revision: 2,
+        version: 1,
+        ..Default::default()
+    };
+    a_bad_hash_record_fails_only_hash_kv(key, record.encode_to_vec()).await;
+}
+
+async fn a_bad_hash_record_fails_only_hash_kv(key: Vec<u8>, value: Vec<u8>) {
     let _counted = COUNTED.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let mut state = StateMachine::open(dir.path()).await.unwrap();
@@ -228,8 +250,7 @@ async fn a_short_hash_record_fails_only_hash_kv() {
         )),
     };
     state.apply_etcd(1, &put).await.unwrap();
-    let short = [crate::maintenance::HASH, &[0; 3]].concat();
-    state.db().put(&short, b"record").await.unwrap();
+    state.db().put(&key, &value).await.unwrap();
     state.applied += 1;
     let before = CORRUPT_READS.get();
     let outcome = state
@@ -251,6 +272,22 @@ async fn a_short_hash_record_fails_only_hash_kv() {
         panic!("expected a Range reply");
     };
     assert_eq!(reply.kvs[0].value, b"value");
+    state.close().await.unwrap();
+}
+
+/// A diagnostic value that is not UTF-8 is corrupt stored data. `/debug/value` fails with
+/// `DataLoss` and counts it.
+#[tokio::test]
+async fn a_corrupt_diagnostic_value_fails_with_data_loss() {
+    let _counted = COUNTED.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let state = StateMachine::open(dir.path()).await.unwrap();
+    state.db().put(b"data/bad", b"\xff\xfe").await.unwrap();
+    let before = CORRUPT_READS.get();
+    let error = state.local_value("bad").await.unwrap_err();
+    let error = crate::mvcc::KvError::read_failure(error);
+    assert_eq!(error.code, tonic::Code::DataLoss as i32, "{error:?}");
+    assert_eq!(CORRUPT_READS.get(), before + 1);
     state.close().await.unwrap();
 }
 
@@ -304,5 +341,148 @@ async fn a_failed_watch_page_runs_again_without_a_gap() {
     assert!(faults.entered.available_permits() > 0, "no read failed");
     let first = revisions[0];
     assert_eq!(revisions, (first..first + 10).collect::<Vec<_>>());
+    server.shutdown().await.unwrap();
+}
+
+/// A Watch stream on a member whose store fails, with requests from `requests`.
+async fn watch_stream(
+    server: &Server,
+    requests: tokio::sync::mpsc::Receiver<crate::proto::etcdserverpb::WatchRequest>,
+) -> tonic::Streaming<crate::proto::etcdserverpb::WatchResponse> {
+    use crate::proto::etcdserverpb::watch_client::WatchClient;
+    WatchClient::new(connect(server).await)
+        .watch(tokio_stream::wrappers::ReceiverStream::new(requests))
+        .await
+        .unwrap()
+        .into_inner()
+}
+
+/// A Watch request for `k0` to `k9` from revision 1.
+fn historical() -> crate::proto::etcdserverpb::WatchRequest {
+    use crate::proto::etcdserverpb::{watch_request::RequestUnion, WatchCreateRequest};
+    crate::proto::etcdserverpb::WatchRequest {
+        request_union: Some(RequestUnion::CreateRequest(WatchCreateRequest {
+            key: b"k".to_vec(),
+            range_end: b"l".to_vec(),
+            start_revision: 1,
+            ..Default::default()
+        })),
+    }
+}
+
+async fn reply(
+    stream: &mut tonic::Streaming<crate::proto::etcdserverpb::WatchResponse>,
+) -> crate::proto::etcdserverpb::WatchResponse {
+    tokio::time::timeout(Duration::from_secs(2), stream.message())
+        .await
+        .expect("the watch did not reply")
+        .expect("the watch failed")
+        .expect("the watch ended")
+}
+
+/// Wait until the store fails one more read.
+async fn failed_read(faults: &FaultStore) {
+    tokio::time::timeout(Duration::from_secs(2), faults.entered.acquire())
+        .await
+        .expect("no read failed")
+        .unwrap()
+        .forget();
+}
+
+/// The active Watch streams of the member.
+async fn streams(server: &Server) -> String {
+    let (_, metrics) = http(server, "GET", "/metrics", "").await;
+    metrics
+        .lines()
+        .find(|line| line.starts_with("etcd_debugging_mvcc_watch_stream_total "))
+        .unwrap()
+        .to_owned()
+}
+
+/// A historical catch-up whose reads keep failing does not hold the stream. A Cancel gets its
+/// reply, and a stream whose client leaves ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failing_catch_up_still_serves_cancel_and_disconnect() {
+    use crate::proto::etcdserverpb::{watch_request::RequestUnion, WatchCancelRequest};
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let dir = tempfile::tempdir().unwrap();
+    let (server, _) = flushed(dir.path(), &faults).await;
+    faults.set(FAIL_SST_GET);
+    let (requests, input) = tokio::sync::mpsc::channel(4);
+    let mut stream = watch_stream(&server, input).await;
+    requests.send(historical()).await.unwrap();
+    let created = reply(&mut stream).await;
+    assert!(created.created);
+    failed_read(&faults).await;
+    let cancel = RequestUnion::CancelRequest(WatchCancelRequest {
+        watch_id: created.watch_id,
+    });
+    requests
+        .send(crate::proto::etcdserverpb::WatchRequest {
+            request_union: Some(cancel),
+        })
+        .await
+        .unwrap();
+    assert!(reply(&mut stream).await.canceled);
+    drop((requests, stream));
+    // A second stream leaves while its catch-up fails. Its task ends.
+    let (requests, input) = tokio::sync::mpsc::channel(4);
+    let mut stream = watch_stream(&server, input).await;
+    requests.send(historical()).await.unwrap();
+    assert!(reply(&mut stream).await.created);
+    failed_read(&faults).await;
+    drop((requests, stream));
+    let ended = "etcd_debugging_mvcc_watch_stream_total 0";
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while streams(&server).await != ended {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the stream task did not end"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    faults.set(0);
+    server.shutdown().await.unwrap();
+}
+
+/// A progress request during a failing catch-up waits. Its reply follows every earlier event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_progress_reply_follows_the_events_of_a_failing_catch_up() {
+    use crate::proto::etcdserverpb::{watch_request::RequestUnion, WatchProgressRequest};
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let dir = tempfile::tempdir().unwrap();
+    let (server, _) = flushed(dir.path(), &faults).await;
+    faults.set(FAIL_SST_GET);
+    let (requests, input) = tokio::sync::mpsc::channel(4);
+    let mut stream = watch_stream(&server, input).await;
+    requests.send(historical()).await.unwrap();
+    assert!(reply(&mut stream).await.created);
+    failed_read(&faults).await;
+    let progress = RequestUnion::ProgressRequest(WatchProgressRequest {});
+    requests
+        .send(crate::proto::etcdserverpb::WatchRequest {
+            request_union: Some(progress),
+        })
+        .await
+        .unwrap();
+    let early = tokio::time::timeout(Duration::from_millis(500), stream.message()).await;
+    assert!(early.is_err(), "a reply came while the store failed");
+    faults.set(0);
+    let mut revisions = vec![];
+    let progress = loop {
+        let reply = reply(&mut stream).await;
+        if reply.watch_id == -1 {
+            break reply;
+        }
+        revisions.extend(
+            reply
+                .events
+                .iter()
+                .map(|e| e.kv.as_ref().unwrap().mod_revision),
+        );
+    };
+    let first = revisions[0];
+    assert_eq!(revisions, (first..first + 10).collect::<Vec<_>>());
+    assert!(progress.header.unwrap().revision >= revisions[9]);
     server.shutdown().await.unwrap();
 }

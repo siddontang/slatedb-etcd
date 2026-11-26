@@ -11,7 +11,7 @@ impl StateMachine {
         )
         .await;
         if let Err(error) = &result {
-            if let Some(error) = error.unapplied() {
+            if let mvcc::ApplyError::Unapplied(error) = error.clone().into() {
                 return Err(error);
             }
         }
@@ -73,17 +73,13 @@ impl StateMachine {
         .await
         {
             Ok((response, batch, revision, counts)) => (Ok(response), batch, revision, counts),
-            Err(error) => {
-                if let Some(error) = error.unapplied() {
-                    return Err(error);
-                }
-                (
-                    Err(error),
-                    WriteBatch::new(),
-                    self.revision,
-                    Default::default(),
-                )
-            }
+            Err(mvcc::ApplyError::Request(error)) => (
+                Err(error),
+                WriteBatch::new(),
+                self.revision,
+                Default::default(),
+            ),
+            Err(mvcc::ApplyError::Unapplied(error)) => return Err(error),
         };
         self.mark_applied(&mut batch, index);
         self.write_batch(batch, index).await?;

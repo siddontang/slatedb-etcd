@@ -325,6 +325,7 @@ impl Node {
                 self.expire_pending();
                 self.finish_output(Output::Entries(replies))?;
             }
+            Output::Unprepared(last) => self.unprepared = last,
             Output::Entries(replies) => {
                 for command in replies {
                     if let Some(change) = &command.change {

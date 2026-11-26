@@ -298,6 +298,17 @@ pub(crate) async fn prepare_put(
     request: &RequestOp,
     batch: &mut WriteBatch,
     size: &mut crate::batch::Usage,
+) -> Result<(ResponseOp, i64), ApplyError> {
+    Ok(put_once(view, revision, request, batch, size).await?)
+}
+
+/// The body of `prepare_put`, with the raw request error.
+async fn put_once(
+    view: &CurrentView<'_, impl StateRead>,
+    revision: i64,
+    request: &RequestOp,
+    batch: &mut WriteBatch,
+    size: &mut crate::batch::Usage,
 ) -> KvResult<(ResponseOp, i64)> {
     let Some(Op::RequestPut(p)) = &request.request else {
         return Err(KvError::invalid("expected an ordinary put"));
@@ -355,6 +366,31 @@ thread_local! {
 /// `None` means that the chosen branch is empty. The caller then uses the general evaluator.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_txn_puts(
+    view: &CurrentView<'_, impl StateRead>,
+    revision: i64,
+    compact_revision: i64,
+    request: &RequestOp,
+    leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
+    batch: &mut WriteBatch,
+    size: &mut crate::batch::Usage,
+    counts: &mut crate::metrics::Writes,
+) -> Result<Option<(ResponseOp, i64)>, ApplyError> {
+    let prepared = txn_puts_once(
+        view,
+        revision,
+        compact_revision,
+        request,
+        leases,
+        batch,
+        size,
+        counts,
+    );
+    Ok(prepared.await?)
+}
+
+/// The body of `prepare_txn_puts`, with the raw request error.
+#[allow(clippy::too_many_arguments)]
+async fn txn_puts_once(
     view: &CurrentView<'_, impl StateRead>,
     revision: i64,
     compact_revision: i64,

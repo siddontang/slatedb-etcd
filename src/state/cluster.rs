@@ -104,8 +104,9 @@ impl StateMachine {
             }
             response
         });
-        // Stage the membership until the batch is stored. A failed read in `write_batch` then
-        // leaves the membership of the applied prefix.
+        // Stage the membership until the batch is stored. A failed store then leaves the
+        // membership of the applied prefix. The size count takes the length of the row read
+        // above, so it reads nothing.
         let mut batch = WriteBatch::new();
         let mut staged = None;
         if result.is_ok() {
@@ -113,7 +114,8 @@ impl StateMachine {
             let row = (stored.as_deref() != Some(value.as_slice()))
                 .then(|| MembersRow::new(&value, index));
             if row.is_some() {
-                batch.put(crate::cluster::KEY, value);
+                let old_len = stored.as_ref().map(|row| row.len());
+                batch.put_known(crate::cluster::KEY, value, old_len);
             }
             staged = Some((members, row));
         }

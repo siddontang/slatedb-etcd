@@ -89,17 +89,18 @@ impl Executor {
     ) -> Result<Vec<AppliedCommand>> {
         let mut replies = vec![];
         let mut retry = Retry::default();
+        // Each try starts at the first entry of the job that did not apply. Every applied entry
+        // raises the applied index by one, so `apply_into` still checks each index of the job
+        // and rejects an overlap.
+        let mut next = 0;
         loop {
-            let applied = self.state.applied;
-            let rest: Vec<_> = entries
-                .iter()
-                .filter(|entry| entry.index > applied)
-                .cloned()
-                .collect();
+            let before = self.state.applied;
+            let rest = entries[next..].to_vec();
             let tried = Box::pin(apply_into(&mut self.state, rest, header, &mut replies)).await;
             let Err(error) = tried else {
                 return Ok(replies);
             };
+            next += (self.state.applied - before) as usize;
             match retryable(&error) {
                 Some(StorageFault::Missing) if self.log.is_some() => {
                     tracing::warn!(%error, "an apply read lost its checkpoint object");
@@ -112,22 +113,25 @@ impl Executor {
         }
     }
 
-    /// Evaluate a group of committed Puts. The evaluation changes no state, so a transient
-    /// storage error of a read evaluates the whole group again.
-    pub(super) async fn prepare_retrying(
+    /// Evaluate a group of Puts before their state write. The entries can still be uncommitted,
+    /// and a new leader can replace them. So a storage error of a read does not retry here,
+    /// where it would hold the worker. The group returns `None`, and its entries apply on the
+    /// committed path, which retries and rebases.
+    pub(super) async fn prepare_or_skip(
         &mut self,
         commands: &[(u64, RaftCommand)],
         term: u64,
         header: Header,
-    ) -> Result<(crate::state::put_batch::PreparedPuts, Vec<AppliedCommand>)> {
-        let mut retry = Retry::default();
-        loop {
-            match super::quorum_put::prepare(&self.state, commands, term, header).await {
-                Err(error) if retryable(&error) == Some(StorageFault::Transient) => {
-                    retry.wait(&mut self.stop, &error).await?;
-                }
-                prepared => return prepared,
+    ) -> Result<Option<(crate::state::put_batch::PreparedPuts, Vec<AppliedCommand>)>> {
+        match super::quorum_put::prepare(&self.state, commands, term, header).await {
+            Err(error) if retryable(&error).is_some() => {
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    "an early Put evaluation failed; apply the entries after commit"
+                );
+                Ok(None)
             }
+            prepared => prepared.map(Some),
         }
     }
 }

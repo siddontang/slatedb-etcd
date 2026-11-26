@@ -1,6 +1,6 @@
 use super::*;
 use crate::watch::{Batch, FeedState, PAGE_REVISIONS};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 use tokio_stream::wrappers::ReceiverStream;
@@ -54,6 +54,8 @@ struct Stream {
     storage_stops: u32,
     /// The next storage catch-up waits until this time.
     retry_at: tokio::time::Instant,
+    /// The goal revisions of progress requests that wait for their events, oldest first.
+    progress_goals: VecDeque<i64>,
     /// Runs once after the next journal scan, before the responses take a new view.
     #[cfg(test)]
     after_scan: Option<Box<dyn FnOnce() + Send>>,
@@ -111,6 +113,7 @@ impl Stream {
             next_id: 0,
             storage_stops: 0,
             retry_at: tokio::time::Instant::now(),
+            progress_goals: VecDeque::new(),
             #[cfg(test)]
             after_scan: None,
         }
@@ -567,9 +570,15 @@ impl Stream {
         Ok(covered < limit)
     }
 
-    async fn catch_up_all(&mut self, through: Option<i64>) -> Result<(), Status> {
-        while self.catch_up(through).await? {
+    /// Run storage catch-up and the waiting progress requests to their end.
+    #[cfg(test)]
+    async fn settle(&mut self) -> Result<(), Status> {
+        while self.unsynced() || !self.progress_goals.is_empty() {
             tokio::time::sleep_until(self.retry_at).await;
+            match self.progress_goals.is_empty() {
+                true => self.catch_up(None).await.map(drop)?,
+                false => self.progress_page().await?,
+            }
         }
         Ok(())
     }
@@ -673,12 +682,9 @@ impl Stream {
             request,
             progress: tokio::time::Instant::now(),
         };
+        // A historical watcher is unsynced. The stream loop reads its pages one at a time.
         let start = watcher.request.start_revision;
-        let historical = start <= self.position;
         self.insert(watcher, start);
-        if historical {
-            self.catch_up_all(None).await?;
-        }
         Ok(())
     }
 
@@ -699,10 +705,25 @@ impl Stream {
         Ok(())
     }
 
-    /// Report progress after all events through the current applied revision.
-    async fn progress(&mut self) -> Result<(), Status> {
+    /// Report progress after all events through the current applied revision. The request
+    /// waits in `progress_goals`, and the stream loop reads its pages one at a time. So a
+    /// failing store does not keep the loop from a Cancel or a closed client.
+    fn progress(&mut self) -> Result<(), Status> {
         let goal = self.current(false)?.view.revision;
-        self.catch_up_all(Some(goal)).await?;
+        self.progress_goals.push_back(goal);
+        Ok(())
+    }
+
+    /// Read one page for the oldest waiting progress request. Answer the request once its
+    /// watchers have every event through its goal.
+    async fn progress_page(&mut self) -> Result<(), Status> {
+        let Some(&goal) = self.progress_goals.front() else {
+            return Ok(());
+        };
+        if self.catch_up(Some(goal)).await? {
+            return Ok(());
+        }
+        self.progress_goals.pop_front();
         let header = self.current(false)?.header(goal);
         if !self.watchers.is_empty() && self.watchers.values().all(|w| self.start(w) <= goal + 1) {
             send(
@@ -858,22 +879,30 @@ impl Service {
                 // The create fails without a leader. The stream may have no watcher yet.
                 stream.current(false)?;
             }
+            // A waiting progress request holds the feed, so no later event goes before its
+            // answer. Requests then observe no new batch either.
+            let progress = !stream.progress_goals.is_empty();
             tokio::select! {
                 _ = tx.closed() => return Ok(()),
-                received = events.recv() => stream.receive(received).await?,
+                received = events.recv(), if !progress => stream.receive(received).await?,
                 changed = changes.changed() => {
                     changed.map_err(|_| unavailable())?;
                     stream.state_changed()?;
                 }
                 _ = checks.tick() => stream.check().await?,
-                _ = tokio::time::sleep_until(stream.retry_at), if unsynced => {
+                _ = tokio::time::sleep_until(stream.retry_at), if progress => {
+                    stream.progress_page().await?;
+                }
+                _ = tokio::time::sleep_until(stream.retry_at), if unsynced && !progress => {
                     stream.catch_up(None).await?;
                 }
                 applied = async { pending.as_mut().expect("waiting").1.as_mut().await }, if waiting => {
                     applied?;
                     let (request, _) = pending.take().expect("waiting");
                     // The create observes every batch through the replied Puts.
-                    stream.drain(&mut events).await?;
+                    if !progress {
+                        stream.drain(&mut events).await?;
+                    }
                     stream.create(request).await?;
                 }
                 message = input.message(), if !waiting => {
@@ -884,12 +913,16 @@ impl Service {
                             pending = Some((request, Box::pin(self.apply_barrier())));
                         }
                         Some(RequestUnion::CancelRequest(request)) => {
-                            stream.drain(&mut events).await?;
+                            if !progress {
+                                stream.drain(&mut events).await?;
+                            }
                             stream.cancel(request.watch_id).await?
                         }
                         Some(RequestUnion::ProgressRequest(_)) => {
-                            stream.drain(&mut events).await?;
-                            stream.progress().await?
+                            if !progress {
+                                stream.drain(&mut events).await?;
+                            }
+                            stream.progress()?
                         }
                         None => continue,
                     }
@@ -1050,6 +1083,7 @@ mod tests {
 
         async fn watch(&mut self, request: WatchCreateRequest) {
             self.stream.create(request).await.unwrap();
+            self.stream.settle().await.unwrap();
             let created = self.output.recv().await.unwrap().unwrap();
             assert!(created.created && !created.canceled);
         }
@@ -1160,7 +1194,7 @@ mod tests {
         f.stream.batch(&gap).await.unwrap();
         assert_eq!(f.stream.pinned.len(), 3);
         assert!(f.stream.unsynced());
-        f.stream.catch_up_all(None).await.unwrap();
+        f.stream.settle().await.unwrap();
         assert_eq!(f.events(), [(2, 5, 0), (3, 5, 0)]);
         assert!(f.stream.pinned.is_empty() && !f.stream.unsynced());
         f.close().await;
@@ -1173,7 +1207,8 @@ mod tests {
         f.watch(request(2, "other", 0)).await;
         // The view has revision 2, but the stream has not received its batch yet.
         let late = f.put("k", "1").await;
-        f.stream.progress().await.unwrap();
+        f.stream.progress().unwrap();
+        f.stream.settle().await.unwrap();
         let responses = f.responses();
         assert_eq!(responses.len(), 2);
         assert_eq!((responses[0].watch_id, responses[0].events.len()), (1, 1));
@@ -1242,7 +1277,7 @@ mod tests {
             f.stream.batch(&batch).await.unwrap();
             // The feed stops inside the revision. The other watchers read storage.
             assert!(f.stream.unsynced());
-            f.stream.catch_up_all(None).await.unwrap();
+            f.stream.settle().await.unwrap();
             assert!(!f.stream.unsynced());
         }
         let mut events = f.events();
@@ -1252,6 +1287,7 @@ mod tests {
                 .create(request(id, "k", revisions[0]))
                 .await
                 .unwrap();
+            f.stream.settle().await.unwrap();
         }
         events.extend(f.events());
         let largest = LARGEST_BATCH.load(std::sync::atomic::Ordering::Relaxed);
@@ -1275,7 +1311,7 @@ mod tests {
         assert!(batch.journals().is_none());
         f.stream.batch(&batch).await.unwrap();
         assert!(f.events().is_empty());
-        f.stream.catch_up_all(None).await.unwrap();
+        f.stream.settle().await.unwrap();
         assert_eq!(f.events(), [(1, 2, 0)]);
         f.close().await;
     }
@@ -1339,6 +1375,7 @@ mod tests {
             ..request(4, "a", 2)
         };
         f.stream.create(history).await.unwrap();
+        f.stream.settle().await.unwrap();
         let responses = f.responses();
         assert!(responses[0].created);
         let events: Vec<_> = responses[1..].iter().flat_map(|r| &r.events).collect();
@@ -1371,6 +1408,7 @@ mod tests {
             .unwrap();
         f.feed.send_replace(feed_state(&f.state));
         f.stream.create(request(1, "k", 2)).await.unwrap();
+        f.stream.settle().await.unwrap();
         let responses = f.responses();
         assert!(responses[0].created);
         assert!(responses[1].canceled);
@@ -1419,6 +1457,7 @@ mod tests {
             .create(request(1, "k", revisions[0]))
             .await
             .unwrap();
+        f.stream.settle().await.unwrap();
         assert!(f.stream.after_scan.is_none(), "the scan ran");
         let responses = f.responses();
         assert_eq!(responses.len(), 2);
@@ -1443,13 +1482,15 @@ mod tests {
             f.stream.batch(&batch).await.unwrap();
         }
         f.watch(request(1, "k", 0)).await;
-        f.stream.progress().await.unwrap();
+        f.stream.progress().unwrap();
+        f.stream.settle().await.unwrap();
         let progress = f.responses();
         assert_eq!(progress.len(), 1);
         assert_eq!(progress[0].watch_id, -1);
         assert_eq!(progress[0].header.as_ref().unwrap().revision, 4);
         f.watch(request(2, "k", 6)).await;
-        f.stream.progress().await.unwrap();
+        f.stream.progress().unwrap();
+        f.stream.settle().await.unwrap();
         assert!(f.responses().is_empty());
         f.close().await;
     }

@@ -254,6 +254,9 @@ pub(super) enum Output {
     },
     Entries(Vec<AppliedCommand>),
     PreparedPuts(crate::state::put_batch::PreparedPuts, Vec<AppliedCommand>),
+    /// A storage error ended a PreparePuts job through this index. Its entries apply on the
+    /// committed path.
+    Unprepared(u64),
     Snapshot(Rebound),
     Query {
         response: Response,
@@ -358,8 +361,10 @@ impl Executor {
                 Output::Entries(Box::pin(self.apply_retrying(entries, work.header)).await?)
             }
             Job::PreparePuts { commands, term } => {
-                let (batch, replies) = self.prepare_retrying(&commands, term, work.header).await?;
-                Output::PreparedPuts(batch, replies)
+                match self.prepare_or_skip(&commands, term, work.header).await? {
+                    Some((batch, replies)) => Output::PreparedPuts(batch, replies),
+                    None => Output::Unprepared(commands.last().map_or(0, |(index, _)| *index)),
+                }
             }
             Job::PublishPuts(batch) => {
                 // The clients already have their replies. Recovery must replay the same outcome.

@@ -305,6 +305,9 @@ pub struct Node {
     held_puts: Option<quorum_put::HeldPuts>,
     /// The term of the entries in the last submitted PreparePuts job.
     prepare_term: u64,
+    /// The last entry of a PreparePuts job that a storage error ended. No early reply runs
+    /// until apply passes it, so the committed path applies those entries and retries.
+    unprepared: u64,
     quorum_reply_index: u64,
     /// Watch creations that wait while a Put reply runs ahead of the local apply.
     watch_waiters: Vec<oneshot::Sender<()>>,
@@ -743,6 +746,7 @@ impl Node {
             prepared_puts: None,
             held_puts: None,
             prepare_term: 0,
+            unprepared: 0,
             quorum_reply_index: 0,
             watch_waiters: Vec::new(),
             state: applied,
