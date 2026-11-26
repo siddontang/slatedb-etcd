@@ -1629,11 +1629,10 @@ impl Node {
         let body = json!({"member": self.options.id, "checkpoints": pinned, "publish": publish,
             "coverage": crate::peer::process_id(), "writer": health});
         let client = self.options.transport.http.clone();
-        let cluster = self.options.cluster_id.clone();
+        let identity = self.peer.clone();
         tokio::spawn(async move {
-            let sent = client
-                .post(url)
-                .header("x-cluster-id", cluster)
+            let sent = identity
+                .headers(client.post(url))
                 .timeout(Duration::from_secs(2))
                 .json(&body)
                 .send()

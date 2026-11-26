@@ -28,6 +28,7 @@ new clusters. A stopped replicated S3 cluster can be converted offline. See
 <prefix>/<sha256(cluster-id)>/
     mode.json                  the cluster mode, written before any state
     shared/owner.json          the cluster claim: mode, quota, and the initial voters
+    shared/store-id.json       the random ID of this shared store
     shared/bootstrap.json      written once after the first checkpoint
     shared/bootstrap-op.json   the one bootstrap operation: empty, or a snapshot restore
     shared/restore-input.json  the snapshot digest, row count, and membership of a restore
@@ -39,6 +40,25 @@ new clusters. A stopped replicated S3 cluster can be converted offline. See
 
 Each member keeps its Raft log in its local data directory. S3 does not replace the log.
 All members use the same bucket, endpoint, region, and prefix.
+
+### Shared store ID
+
+The first voter creates `shared/store-id.json` with a random ID. The other members read it, and a
+`--join` member needs it. Each member sends the ID with its Raft traffic and view reports. A
+member refuses peer traffic with another ID, or with no ID, before Raft sees it.
+
+So a member with the correct cluster ID and voters, but another bucket or prefix, cannot join the
+quorum. It cannot open the checkpoints of the other store. Both sides increment
+`slatedb_etcd_peer_store_refusals_total` and log this error at most every 10 s:
+
+```text
+ERROR refused a peer on another shared store: all members must use the same bucket and prefix
+local=Some("<this store ID>") peer=Some("<peer store ID>")
+```
+
+`/status` shows the ID as `shared_state.store_id`. Compare it on all members. Start the wrong
+member with the correct bucket and prefix and an empty data directory. Its binding keeps the old
+location. Then delete the objects that it wrote under the wrong prefix.
 
 ## Credentials and access
 
@@ -262,6 +282,7 @@ place. Delete them after you check the converted cluster.
 | A member reads a deleted SST | The read fails and can retry. Apply rebuilds from a newer base |
 | The new leader's clock is behind | The writer waits, or refuses above `--max-clock-skew` |
 | All members restart | Each member opens the newest checkpoint and replays its log |
+| A member uses another bucket or prefix | Peers refuse its traffic. It cannot join the quorum |
 | The shared database is lost | All members lose state together. Restore from a backup |
 
 `/status` reports the writer health under `shared_state.writer.health`: the failures in a row,

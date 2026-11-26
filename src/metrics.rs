@@ -65,6 +65,7 @@ pub(crate) struct Member {
     pub leader_changes: IntCounter,
     pub failed_proposals: IntCounter,
     pub failed_read_indexes: IntCounter,
+    pub refused_peer_stores: IntCounter,
 }
 
 /// Raft and applied state from one turn of the member's event loop.
@@ -135,6 +136,10 @@ impl Member {
             failed_read_indexes: counter(
                 "etcd_server_read_indexes_failed_total",
                 "Failed Raft read proofs.",
+            )?,
+            refused_peer_stores: counter(
+                "slatedb_etcd_peer_store_refusals_total",
+                "Peer requests refused because they name another shared store or none.",
             )?,
             registry,
             admin: std::sync::RwLock::new(admin),

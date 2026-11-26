@@ -1845,3 +1845,27 @@ async fn manifest_gc_continues_on_a_local_store_after_a_writer_change() {
         state.close().await.unwrap();
     }
 }
+
+/// Concurrent first voters get one store ID, and the claim of a later voter keeps it. A read
+/// does not create an ID. Another prefix gets another ID.
+#[tokio::test]
+async fn the_cluster_claim_creates_the_store_id_once() {
+    use futures::StreamExt;
+    let store = InMemory::new();
+    assert!(shared::store_id(&store, "root", false).await.is_err());
+    assert!(store.list(None).next().await.is_none());
+    let (first, second) = tokio::join!(
+        shared::store_id(&store, "root", true),
+        shared::store_id(&store, "root", true)
+    );
+    let id = first.unwrap();
+    assert_eq!(second.unwrap(), id);
+    shared::claim(&store, "root", "test", 0, &[1])
+        .await
+        .unwrap();
+    assert_eq!(shared::store_id(&store, "root", false).await.unwrap(), id);
+    shared::claim(&store, "other", "test", 0, &[1])
+        .await
+        .unwrap();
+    assert_ne!(shared::store_id(&store, "other", false).await.unwrap(), id);
+}

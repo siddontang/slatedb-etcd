@@ -93,6 +93,7 @@ The design depends on these rules. Later sections refer to them by number.
 ```text
 <prefix>/<sha256(cluster-id)>/
     shared/owner.json          cluster claim and mode, created with PutMode::Create
+    shared/store-id.json       random store ID, created with PutMode::Create
     shared/bootstrap.json      written once after the first checkpoint, PutMode::Create
     shared/state/              the one SlateDB: manifest/, compacted/, wal/ fence files
     member-<id>/binding.json   member identity and mode check, no state
@@ -102,6 +103,8 @@ The design depends on these rules. Later sections refer to them by number.
   the claim. Each member's local binding repeats the mode and root. A member with a different
   mode or root refuses to start.
 - `shared` requires S3. All members must use the same bucket, endpoint, region, and prefix.
+  Members send the ID in `shared/store-id.json` with their peer traffic. A member refuses peer
+  traffic with another ID or no ID, so members on different stores form no quorum.
 - Every voter needs read and write access to `shared/state/`, because any voter can become the
   leader. Per-member write isolation is lost. See [Costs](#costs-and-trade-offs).
 - Scope each voter's credentials to its own cluster prefix. A learner can use read-only

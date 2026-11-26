@@ -303,7 +303,7 @@ impl Node {
             self.transports.spawn(transport_to(
                 id,
                 address_rx,
-                self.options.cluster_id.clone(),
+                self.peer.clone(),
                 rx,
                 self.events.clone(),
                 self.options.transport.clone(),

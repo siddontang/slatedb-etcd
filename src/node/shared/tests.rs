@@ -1395,3 +1395,82 @@ async fn an_old_term_task_end_is_not_a_failure() {
     state.apply(1, None).await.unwrap();
     state.close().await.unwrap();
 }
+
+/// The count of peer requests that `server` refused for their shared store.
+async fn refused_stores(server: &crate::server::Server) -> u64 {
+    let url = format!("http://{}/metrics", server.client_addr());
+    let text = reqwest::get(url).await.unwrap().text().await.unwrap();
+    text.lines()
+        .find_map(|line| line.strip_prefix("slatedb_etcd_peer_store_refusals_total "))
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// Two voters with one cluster ID and one voter list, but on different prefixes, each create
+/// their own store ID. Each voter refuses the other, so no leader is elected and a write fails.
+/// The same voters on one prefix elect a leader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voters_on_different_shared_stores_form_no_quorum() {
+    use crate::proto::etcdserverpb::{kv_client::KvClient, PutRequest};
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    for roots in [["root", "root"], ["root-1", "root-2"]] {
+        let dir = tempfile::tempdir().unwrap();
+        let peers: std::collections::BTreeMap<u64, String> =
+            (1..=2).map(|id| (id, crate::server::test_port())).collect();
+        let mut servers = vec![];
+        for (id, root) in (1..=2).zip(roots) {
+            let mut config =
+                crate::server::ServerConfig::single_node(dir.path().join(id.to_string()));
+            config.state_mode = crate::state::StateMode::Shared;
+            config.object_store = crate::object::Config::Test(store.clone(), root.into());
+            config.id = id;
+            config.listen = peers[&id].parse().unwrap();
+            config.peers = peers.clone();
+            config.client_peers = peers.clone();
+            servers.push(crate::server::Server::start(config).await.unwrap());
+        }
+        if roots[0] == roots[1] {
+            for server in &servers {
+                server.wait_ready(Duration::from_secs(15)).await.unwrap();
+            }
+            let mut ids = vec![];
+            for server in &servers {
+                eventually("the shared state status", async || {
+                    status(server).await["shared_state"]["store_id"].is_string()
+                })
+                .await;
+                ids.push(status(server).await["shared_state"]["store_id"].clone());
+                assert_eq!(refused_stores(server).await, 0);
+            }
+            assert_eq!(ids[0], ids[1]);
+        } else {
+            // Without the check, a leader is elected within two election timeouts.
+            let ready = servers[0].wait_ready(Duration::from_secs(4)).await;
+            assert!(ready.is_err(), "the voters formed a quorum");
+            let channel = tonic::transport::Endpoint::from_shared(servers[1].client_url())
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let put = PutRequest {
+                key: b"key".to_vec(),
+                value: b"value".to_vec(),
+                ..Default::default()
+            };
+            let written =
+                tokio::time::timeout(Duration::from_secs(2), KvClient::new(channel).put(put)).await;
+            assert!(!matches!(written, Ok(Ok(_))), "{written:?}");
+            for server in &servers {
+                assert_eq!(status(server).await["leader_id"], 0);
+                eventually("a refused peer store", async || {
+                    refused_stores(server).await > 0
+                })
+                .await;
+            }
+        }
+        for server in servers {
+            server.shutdown().await.unwrap();
+        }
+    }
+}

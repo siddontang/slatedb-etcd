@@ -382,6 +382,10 @@ impl Server {
             location: Some(node.location.clone()),
             shared: node.shared_source(),
             fault_controls: config.fault_controls,
+            store: std::sync::Arc::new(crate::api::StoreCheck::new(
+                node.store_id(),
+                node.metrics.refused_peer_stores.clone(),
+            )),
         });
         // Peer gRPC has no RPC metrics; diagnostics paths never collide with gRPC services.
         let peer_app = App::new(

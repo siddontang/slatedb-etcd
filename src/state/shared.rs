@@ -62,6 +62,8 @@ pub(crate) const LOGICAL_BYTES: &[u8] = b"meta/logical-bytes";
 /// The name prefix of the checkpoints that the publisher creates.
 const VIEW: &str = "view-";
 const CLAIM: &str = "shared/owner.json";
+/// The random ID of the shared store. Members send it with their peer traffic.
+const STORE_ID: &str = "shared/store-id.json";
 const BOOTSTRAP: &str = "shared/bootstrap.json";
 const STATE: &str = "shared/state";
 /// A received snapshot that Raft did not install releases its checkpoint after this time.
@@ -185,6 +187,7 @@ pub(crate) async fn claimed_quota(
 ///
 /// The claim holds the initial voters. Two members that each bootstrap a separate one-voter
 /// cluster in the same namespace race on one `PutMode::Create`, so only one opens the writer.
+/// A checked claim also creates the store ID, so a joining member finds both.
 pub(crate) async fn claim(
     store: &dyn ObjectStore,
     root: &str,
@@ -202,7 +205,7 @@ pub(crate) async fn claim(
         quota,
         voters,
     };
-    match store
+    let quota = match store
         .put_opts(
             &path,
             serde_json::to_vec(&claim)?.into(),
@@ -210,7 +213,7 @@ pub(crate) async fn claim(
         )
         .await
     {
-        Ok(_) => Ok(quota),
+        Ok(_) => quota,
         Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
             let data = store.get(&path).await?.bytes().await?;
             let existing: Claim = serde_json::from_slice(&data).context("invalid cluster claim")?;
@@ -234,9 +237,54 @@ pub(crate) async fn claim(
                     "the cluster claim sets the quota"
                 );
             }
-            Ok(existing.quota)
+            existing.quota
         }
-        Err(error) => Err(error).context("cannot claim the shared state"),
+        Err(error) => return Err(error).context("cannot claim the shared state"),
+    };
+    store_id(store, root, true).await?;
+    Ok(quota)
+}
+
+/// The ID of one shared store. See `STORE_ID`.
+#[derive(Deserialize, Serialize)]
+struct StoreId {
+    id: String,
+}
+
+/// Read the ID of the shared store under `root`. With `create`, create a missing ID.
+///
+/// The cluster claim creates the ID with `PutMode::Create`, and every member reads it. Members
+/// of one cluster on another bucket or prefix get another ID, so their peers refuse them.
+pub(crate) async fn store_id(store: &dyn ObjectStore, root: &str, create: bool) -> Result<String> {
+    let path = Path::from(join(root, STORE_ID));
+    let read = |data: &[u8]| -> Result<String> {
+        let existing: StoreId = serde_json::from_slice(data).context("invalid shared store ID")?;
+        Ok(existing.id)
+    };
+    match store.get(&path).await {
+        Ok(result) => return read(&result.bytes().await?),
+        Err(slatedb::object_store::Error::NotFound { .. }) if create => {}
+        Err(slatedb::object_store::Error::NotFound { .. }) => {
+            bail!("the shared state has no store ID")
+        }
+        Err(error) => return Err(error).context("cannot read the shared store ID"),
+    }
+    let id = StoreId {
+        id: uuid::Uuid::new_v4().to_string(),
+    };
+    match store
+        .put_opts(
+            &path,
+            serde_json::to_vec(&id)?.into(),
+            PutMode::Create.into(),
+        )
+        .await
+    {
+        Ok(_) => Ok(id.id),
+        Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
+            read(&store.get(&path).await?.bytes().await?)
+        }
+        Err(error) => Err(error).context("cannot create the shared store ID"),
     }
 }
 
@@ -1047,6 +1095,8 @@ pub(crate) struct Shared {
     pub(crate) base_index: u64,
     opened: Arc<Opened>,
     pub(crate) source: Arc<Source>,
+    /// The ID in `shared/store-id.json`. Peers of another store refuse this member.
+    pub(crate) store_id: String,
     /// `ViewCheckpoint` entries that this member applied.
     pub(crate) announcements: u64,
     /// The checkpoint of the newest applied `ViewCheckpoint` entry. A new writer does not
@@ -1166,8 +1216,9 @@ async fn open_once(source: Arc<Source>, opened: Arc<Opened>, id: uuid::Uuid, cov
 }
 
 impl Shared {
-    fn new(base: Arc<Base>, source: Arc<Source>, options: &Options) -> Self {
+    fn new(base: Arc<Base>, source: Arc<Source>, store_id: String, options: &Options) -> Self {
         Self {
+            store_id,
             overlay: Overlay::new(base.applied),
             based: Arc::new(tokio::sync::watch::channel(base.applied).0),
             base_id: Arc::new(tokio::sync::watch::channel(base_ref(&base, base.applied)).0),
@@ -1356,6 +1407,7 @@ impl StateMachine {
             )
             .await?
         };
+        let store_id = store_id(store.as_ref(), root, false).await?;
         let location = transfer::Location::open(
             store.clone(),
             &join(root, STATE),
@@ -1417,7 +1469,7 @@ impl StateMachine {
             }
             _ => base,
         };
-        let shared = Shared::new(base, source, options);
+        let shared = Shared::new(base, source, store_id, options);
         let holders = shared.holders.clone();
         let reads = shared.live();
         let mut state = Self::load(None, admin, location, rows, reads, Some(shared)).await?;
@@ -1440,6 +1492,11 @@ impl StateMachine {
     /// Return true in shared state mode.
     pub(crate) fn is_shared(&self) -> bool {
         self.shared.is_some()
+    }
+
+    /// The ID of the shared store, in shared state mode.
+    pub(crate) fn store_id(&self) -> Option<String> {
+        Some(self.shared.as_ref()?.store_id.clone())
     }
 
     /// The handles of the node, in shared mode.

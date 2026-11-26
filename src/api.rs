@@ -24,6 +24,64 @@ pub struct ApiState {
     pub(crate) shared: Option<std::sync::Arc<crate::state::shared::Source>>,
     /// Serve the fault controls under `/debug`. Off unless a test cluster enables them.
     pub(crate) fault_controls: bool,
+    pub(crate) store: std::sync::Arc<StoreCheck>,
+}
+
+/// The shared store check of peer traffic.
+pub(crate) struct StoreCheck {
+    /// The ID in `shared/store-id.json`. A replicated member has none.
+    id: Option<String>,
+    /// Peer requests that named another store, or no store.
+    refused: prometheus::IntCounter,
+    /// The time of the last error log. A refused peer tries again on each Raft tick.
+    logged: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+/// The shortest time between two error logs of refused peer stores.
+const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+impl StoreCheck {
+    pub(crate) fn new(id: Option<String>, refused: prometheus::IntCounter) -> Self {
+        Self {
+            id,
+            refused,
+            logged: Default::default(),
+        }
+    }
+}
+
+impl ApiState {
+    /// Admit peer traffic that names this cluster and this shared store.
+    ///
+    /// A member on another bucket or prefix cannot open the checkpoints of this store. So its
+    /// traffic stops here, before Raft can count it in a quorum. A peer that names no store is
+    /// also refused.
+    pub(crate) fn admit(
+        &self,
+        cluster: Option<&str>,
+        store: Option<&str>,
+    ) -> Result<(), &'static str> {
+        if cluster != Some(self.cluster_id.as_str()) {
+            return Err("peer cluster does not match");
+        }
+        let check = &self.store;
+        if store == check.id.as_deref() {
+            return Ok(());
+        }
+        check.refused.inc();
+        let now = std::time::Instant::now();
+        let mut logged = check.logged.lock().unwrap();
+        if logged.is_none_or(|last| now.duration_since(last) >= REFUSAL_LOG_INTERVAL) {
+            *logged = Some(now);
+            tracing::error!(
+                local = ?check.id,
+                peer = ?store,
+                "refused a peer on another shared store: all members must use the same bucket \
+                 and prefix"
+            );
+        }
+        Err("peer shared store does not match")
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -98,13 +156,15 @@ async fn propose(State(state): State<ApiState>, Json(request): Json<Request>) ->
         .into_response()
 }
 
+/// Admit the peer request of `headers`. See `ApiState::admit`.
+fn admit(state: &ApiState, headers: &HeaderMap) -> Result<(), &'static str> {
+    let header = |name| headers.get(name).and_then(|value| value.to_str().ok());
+    state.admit(header(crate::peer::CLUSTER), header(crate::peer::STORE))
+}
+
 async fn raft_message(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Response {
-    if headers
-        .get("x-cluster-id")
-        .and_then(|value| value.to_str().ok())
-        != Some(&state.cluster_id)
-    {
-        return StatusCode::FORBIDDEN.into_response();
+    if let Err(refusal) = admit(&state, &headers) {
+        return (StatusCode::FORBIDDEN, refusal).into_response();
     }
     let size = body.len();
     let Ok(message) = crate::peer::decode_message(body) else {
@@ -121,12 +181,8 @@ async fn covered_snapshot(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if headers
-        .get("x-cluster-id")
-        .and_then(|value| value.to_str().ok())
-        != Some(&state.cluster_id)
-    {
-        return StatusCode::FORBIDDEN.into_response();
+    if let Err(refusal) = admit(&state, &headers) {
+        return (StatusCode::FORBIDDEN, refusal).into_response();
     }
     let target = crate::peer::process_of(
         headers
@@ -230,12 +286,8 @@ async fn view_ack(
     headers: HeaderMap,
     Json(report): Json<ViewAck>,
 ) -> Response {
-    if headers
-        .get("x-cluster-id")
-        .and_then(|value| value.to_str().ok())
-        != Some(&state.cluster_id)
-    {
-        return StatusCode::FORBIDDEN.into_response();
+    if let Err(refusal) = admit(&state, &headers) {
+        return (StatusCode::FORBIDDEN, refusal).into_response();
     }
     let event = Event::ViewAck {
         member: report.member,
@@ -263,7 +315,7 @@ async fn snapshot_file(
     Query(query): Query<FileQuery>,
 ) -> Response {
     if headers
-        .get("x-cluster-id")
+        .get(crate::peer::CLUSTER)
         .and_then(|value| value.to_str().ok())
         != Some(&state.cluster_id)
     {

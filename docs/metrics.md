@@ -101,6 +101,10 @@ cluster took another value also keeps it at 1. See [quota changes](operations.md
 The membership gauge changes when a leader starts a term. See
 [membership row](operations.md#membership-row).
 
+`slatedb_etcd_peer_store_refusals_total` counts peer requests that this member refused because
+they named another shared store, or none. Every member exports it. See the
+[shared store ID](shared-state-guide.md#shared-store-id).
+
 ## Shared state gauges
 
 A member in shared state mode also exports these gauges. Replicated members omit them. See the
