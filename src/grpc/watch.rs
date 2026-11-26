@@ -638,8 +638,14 @@ impl Stream {
         } else {
             ""
         };
-        let slot = match reason {
-            "" => self.limits.admit(),
+        // Check the range before the create takes a member slot. A denied create whose
+        // acknowledgment waits for a slow client must not hold one.
+        let denied = match reason {
+            "" => permit(&state.view.auth, &self.credentials(), &request).err(),
+            _ => None,
+        };
+        let slot = match (reason, &denied) {
+            ("", None) => self.limits.admit(),
             _ => Ok(None),
         };
         let reason = if slot.is_err() {
@@ -655,8 +661,7 @@ impl Stream {
             self.next_id += 1;
         }
         let header = state.header(self.position);
-        let auth = state.view.auth.clone();
-        // Release the state before the send. The Auth store does not pin the view.
+        // Release the state before the send.
         drop(state);
         send(
             &self.tx,
@@ -674,13 +679,15 @@ impl Stream {
             },
         )
         .await?;
+        if let Some(error) = denied {
+            return Err(error);
+        }
         if !reason.is_empty() {
             return Ok(());
         }
         if request.start_revision <= 0 {
             request.start_revision = self.position + 1;
         }
-        permit(&auth, &self.credentials(), &request)?;
         let watcher = Watcher {
             _active: self
                 .meters
@@ -1449,25 +1456,88 @@ mod tests {
         });
         let _live = shared.admit().unwrap();
         let start = Arc::new(std::sync::Barrier::new(2));
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let refuser = std::thread::spawn({
-            let (shared, start, done) = (shared.clone(), start.clone(), done.clone());
+            let (shared, start) = (shared.clone(), start.clone());
             move || {
                 start.wait();
                 for _ in 0..100_000 {
                     assert!(shared.admit().is_err());
                 }
-                done.store(true, Ordering::Release);
             }
         });
-        // Sample the count during every refused create.
+        // Sample the count during every refused create. A failed assertion also ends the thread.
         start.wait();
         let mut over = false;
-        while !done.load(Ordering::Acquire) {
+        while !refuser.is_finished() {
             over |= shared.watchers.load(Ordering::Relaxed) > 1;
         }
         refuser.join().unwrap();
         assert!(!over);
+    }
+
+    /// A create for a range that the user cannot read takes no member slot, even while its
+    /// acknowledgment waits for a slow client.
+    #[tokio::test]
+    async fn a_denied_create_holds_no_slot_while_its_acknowledgment_waits() {
+        let mut f = Fixture::new().await;
+        let mut auth = crate::auth::Store::default();
+        auth.enabled = true;
+        // A user without roles can read no key. Root can read every key.
+        for (name, roles) in [("reader", vec![]), ("root", vec!["root".to_string()])] {
+            let user = crate::auth::User {
+                roles: roles.into_iter().collect(),
+                ..Default::default()
+            };
+            auth.users.insert(name.into(), user);
+        }
+        f.state.auth = Arc::new(auth);
+        f.feed.send_replace(feed_state(&f.state));
+        let shared = limits(WatchOptions {
+            max_watchers: 1,
+            ..Default::default()
+        });
+        let user = |name: &str| crate::auth::Credentials {
+            user: Some(name.into()),
+            ..Default::default()
+        };
+        // The slow stream's output already holds a response it has not read.
+        let (tx, mut slow_output) = mpsc::channel(1);
+        tx.try_send(Ok(WatchResponse::default())).unwrap();
+        let mut slow = Stream::new(
+            tx,
+            false,
+            user("reader"),
+            None,
+            f.feed.subscribe(),
+            shared.clone(),
+        );
+        let denied = tokio::spawn(async move { slow.create(request(1, "b", 0)).await });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!denied.is_finished());
+        assert_eq!(shared.watchers.load(Ordering::Relaxed), 0);
+
+        // Another stream still gets the last slot.
+        let (tx, mut output) = mpsc::channel(16);
+        let mut other = Stream::new(
+            tx,
+            false,
+            user("root"),
+            None,
+            f.feed.subscribe(),
+            shared.clone(),
+        );
+        other.create(request(1, "a", 0)).await.unwrap();
+        assert!(!output.recv().await.unwrap().unwrap().canceled);
+
+        // The denied create still ends its stream after the acknowledgment.
+        slow_output.recv().await.unwrap().unwrap();
+        assert!(slow_output.recv().await.unwrap().unwrap().created);
+        let error = denied.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert_eq!(shared.watchers.load(Ordering::Relaxed), 1);
+        f.close().await;
     }
 
     /// Zero limits mean no limit, so one stream holds more than the default stream limit.
