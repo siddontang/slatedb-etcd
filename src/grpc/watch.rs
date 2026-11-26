@@ -50,9 +50,23 @@ struct Stream {
     /// Watchers that store their start revision.
     pinned: BTreeSet<i64>,
     next_id: i64,
+    /// Storage reads that stopped a page in a row. See `Stream::storage_stopped`.
+    storage_stops: u32,
+    /// The next storage catch-up waits until this time.
+    retry_at: tokio::time::Instant,
     /// Runs once after the next journal scan, before the responses take a new view.
     #[cfg(test)]
     after_scan: Option<Box<dyn FnOnce() + Send>>,
+}
+
+/// The first wait after storage reads stopped two pages in a row. It doubles to `RETRY_CAP`.
+const RETRY_FIRST: Duration = Duration::from_millis(100);
+const RETRY_CAP: Duration = Duration::from_secs(5);
+
+/// Return true when a Watch read can succeed on a new view: the store failed, an object is
+/// gone, or the pin expired. Corrupt stored data ends the stream with `DataLoss`.
+fn retryable(status: &Status) -> bool {
+    status.code() == tonic::Code::Unavailable
 }
 
 fn unavailable() -> Status {
@@ -95,9 +109,25 @@ impl Stream {
             ranges: BTreeSet::new(),
             pinned: BTreeSet::new(),
             next_id: 0,
+            storage_stops: 0,
+            retry_at: tokio::time::Instant::now(),
             #[cfg(test)]
             after_scan: None,
         }
+    }
+
+    /// A storage read stopped a page, and the watchers resume on a new view. The first retry
+    /// runs at once, as for an expired pin. Each later stop in a row doubles the wait from
+    /// `RETRY_FIRST` to `RETRY_CAP`, so a failing store gets no busy loop.
+    fn storage_stopped(&mut self) {
+        let wait = match self.storage_stops {
+            0 => Duration::ZERO,
+            stops => RETRY_FIRST
+                .saturating_mul(1 << (stops - 1).min(16))
+                .min(RETRY_CAP),
+        };
+        self.storage_stops += 1;
+        self.retry_at = tokio::time::Instant::now() + wait;
     }
 
     /// Return the newest state. A leader-required stream fails without a leader.
@@ -253,6 +283,7 @@ impl Stream {
             let mut prepared = vec![];
             let mut bytes = 0;
             let mut stopped = None;
+            let mut storage = false;
             'rows: for (revision, journal) in journals {
                 self.candidates(journal, &mut ids);
                 let mut sent = vec![];
@@ -278,7 +309,8 @@ impl Stream {
                                 sent.push(*id);
                             }
                             Ok(None) => sent.push(*id),
-                            Err(status) if crate::state::view::expired(status.message()) => {
+                            Err(status) if retryable(&status) => {
+                                storage = true;
                                 stopped = Some((*revision, sent));
                                 break 'rows;
                             }
@@ -289,6 +321,9 @@ impl Stream {
             }
             // Release the view before any send. A slow client cannot hold the pin.
             drop((reads, state));
+            if storage {
+                self.storage_stopped();
+            }
             record_batch(bytes, prepared.len());
             for (id, response) in prepared {
                 let watcher = self.watchers.get_mut(&id).expect("prepared watcher");
@@ -421,16 +456,19 @@ impl Stream {
             permit(&view.auth, &credentials, &self.watchers[id].request)?;
         }
         // Each page is one read with its own pin deadline. An expired page resumes on a new
-        // view after the last revision that each watcher received.
+        // view after the last revision that each watcher received. A failed page delivers
+        // nothing, so the watchers resume at their own starts and skip no revision.
         let reads = view.read_state();
         let (rows, covered) = match crate::watch::scan(&reads, from, limit, PAGE_REVISIONS).await {
             Ok(page) => page,
-            Err(error) if crate::state::view::expired(&error.message) => return Ok(true),
             Err(error) => {
-                return Err(Status::unavailable(format!(
-                    "etcdserver: {}",
-                    error.message
-                )));
+                let status = error.status();
+                if !retryable(&status) {
+                    return Err(status);
+                }
+                drop((reads, view, state));
+                self.storage_stopped();
+                return Ok(true);
             }
         };
         // The scan used part of the pin. The responses read prev_kv history on a fresh view
@@ -458,6 +496,7 @@ impl Stream {
         let mut prepared = vec![];
         let mut bytes = 0;
         let mut stopped = None;
+        let mut storage = false;
         'rows: for (revision, journal) in &rows {
             self.candidates(journal, &mut ids);
             let mut sent = vec![];
@@ -484,7 +523,8 @@ impl Stream {
                             sent.push(*id);
                         }
                         Ok(None) => sent.push(*id),
-                        Err(status) if crate::state::view::expired(status.message()) => {
+                        Err(status) if retryable(&status) => {
+                            storage = true;
                             stopped = Some((*revision, sent));
                             break 'rows;
                         }
@@ -495,6 +535,11 @@ impl Stream {
         }
         // Release the view before any send. A slow client cannot hold the pin.
         drop((reads, rows, state));
+        if storage {
+            self.storage_stopped();
+        } else {
+            self.storage_stops = 0;
+        }
         record_batch(bytes, prepared.len());
         for (id, response) in prepared {
             let watcher = self.watchers.get_mut(&id).expect("prepared watcher");
@@ -523,7 +568,9 @@ impl Stream {
     }
 
     async fn catch_up_all(&mut self, through: Option<i64>) -> Result<(), Status> {
-        while self.catch_up(through).await? {}
+        while self.catch_up(through).await? {
+            tokio::time::sleep_until(self.retry_at).await;
+        }
         Ok(())
     }
 
@@ -725,7 +772,7 @@ async fn prepare(
         journal,
     )
     .await
-    .map_err(|e| Status::unavailable(format!("etcdserver: {}", e.message)))?;
+    .map_err(crate::mvcc::KvError::status)?;
     if events.is_empty() {
         return Ok(None);
     }
@@ -819,7 +866,7 @@ impl Service {
                     stream.state_changed()?;
                 }
                 _ = checks.tick() => stream.check().await?,
-                _ = std::future::ready(()), if unsynced => {
+                _ = tokio::time::sleep_until(stream.retry_at), if unsynced => {
                     stream.catch_up(None).await?;
                 }
                 applied = async { pending.as_mut().expect("waiting").1.as_mut().await }, if waiting => {

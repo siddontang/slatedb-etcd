@@ -771,24 +771,7 @@ pub(crate) fn applied_term_row(index: u64, term: u64) -> [u8; 16] {
     row
 }
 
-/// A stored object of the shared state that does not decode, or that contradicts another one.
-/// Each writer reads the same objects, so the error describes the shared store, not the applied
-/// state of one member. A writer task halts on it instead of stopping the member.
-#[derive(Debug)]
-pub(crate) struct StoredData(String);
-
-impl std::fmt::Display for StoredData {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for StoredData {}
-
-/// A `StoredData` error with `message`.
-pub(crate) fn stored(message: impl std::fmt::Display) -> anyhow::Error {
-    anyhow::Error::new(StoredData(message.to_string()))
-}
+pub(crate) use crate::mvcc::storage_fault::stored;
 
 /// Decode the `meta/applied` row. A state without the row has applied nothing.
 fn decode_applied(row: Option<bytes::Bytes>) -> Result<u64> {

@@ -975,27 +975,11 @@ async fn newest_base(admin: &slatedb::admin::Admin, source: &Source) -> Result<O
 }
 
 /// Return true when `error` comes from an object that the store no longer has, such as an SST
-/// that GC deleted under an old base. Other storage errors still stop the member.
-///
-/// A SlateDB error keeps its kind and its object store source, so the check uses them. Apply
-/// reports some storage errors as text through `KvError`, so the check also matches that text.
+/// that GC deleted under an old base. See `storage_fault::classify`. A read error that crossed a
+/// `KvError` keeps its class.
 pub(crate) fn missing_object(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        if let Some(error) = cause.downcast_ref::<slatedb::Error>() {
-            let mut source = std::error::Error::source(error);
-            while let Some(inner) = source {
-                if matches!(
-                    inner.downcast_ref::<slatedb::object_store::Error>(),
-                    Some(slatedb::object_store::Error::NotFound { .. })
-                ) {
-                    return error.kind() == slatedb::ErrorKind::Data;
-                }
-                source = inner.source();
-            }
-        }
-        let text = cause.to_string();
-        text.contains("Data error") && text.contains("not found")
-    })
+    crate::mvcc::storage_fault::classify(error)
+        == Some(crate::mvcc::storage_fault::StorageFault::Missing)
 }
 
 /// Bases that opened in the background, each with the index that its announcement certified.

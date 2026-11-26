@@ -74,11 +74,9 @@ impl StateMachine {
                     (Ok(reply), batch, revision, change, deletes)
                 }
                 Err(error) => {
-                    ensure!(
-                        error.code != tonic::Code::Internal as i32,
-                        "{}",
-                        error.message
-                    );
+                    if let Some(error) = error.unapplied() {
+                        return Err(error);
+                    }
                     (Err(error), WriteBatch::new(), self.revision, None, 0)
                 }
             };

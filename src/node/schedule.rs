@@ -401,7 +401,7 @@ impl Node {
                 let result = if require_leader && self.raw.raft.leader_id == 0 {
                     Err(self.error("no leader"))
                 } else {
-                    Ok(value)
+                    value
                 };
                 let _ = response.send(result);
             }

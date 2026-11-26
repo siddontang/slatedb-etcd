@@ -1,5 +1,7 @@
 use super::*;
 pub(super) mod executor;
+#[cfg(test)]
+pub(super) mod fault_tests;
 
 pub(super) struct PendingRead {
     request: Option<RequestOp>,

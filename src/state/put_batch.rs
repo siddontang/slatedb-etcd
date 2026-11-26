@@ -161,11 +161,9 @@ impl StateMachine {
                             Ok(reply)
                         }
                         Err(error) => {
-                            ensure!(
-                                error.code != tonic::Code::Internal as i32,
-                                "{}",
-                                error.message
-                            );
+                            if let Some(error) = error.unapplied() {
+                                return Err(error);
+                            }
                             Err(error)
                         }
                     }

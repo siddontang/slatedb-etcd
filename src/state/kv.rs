@@ -11,11 +11,9 @@ impl StateMachine {
         )
         .await;
         if let Err(error) = &result {
-            ensure!(
-                error.code != tonic::Code::Internal as i32,
-                "{}",
-                error.message
-            );
+            if let Some(error) = error.unapplied() {
+                return Err(error);
+            }
         }
         Ok(Outcome { result })
     }
@@ -76,11 +74,9 @@ impl StateMachine {
         {
             Ok((response, batch, revision, counts)) => (Ok(response), batch, revision, counts),
             Err(error) => {
-                ensure!(
-                    error.code != tonic::Code::Internal as i32,
-                    "{}",
-                    error.message
-                );
+                if let Some(error) = error.unapplied() {
+                    return Err(error);
+                }
                 (
                     Err(error),
                     WriteBatch::new(),

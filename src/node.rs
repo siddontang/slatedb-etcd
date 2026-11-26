@@ -654,6 +654,7 @@ impl Node {
         )?);
         crate::metrics::reads::READS.register(&state.metrics.registry)?;
         crate::object::bounded::LIMITER.register(&state.metrics.registry)?;
+        crate::mvcc::storage_fault::register(&state.metrics.registry)?;
         let handles = state.shared_handles();
         let writer = match &handles {
             Some(handles) => {

@@ -15,6 +15,7 @@ use crate::proto::state::Version;
 use crate::state::{StateRead, StateScan};
 
 mod put;
+pub(crate) mod storage_fault;
 #[cfg(test)]
 pub(crate) use put::DIRECT_TXNS;
 pub(crate) use put::{batchable_txn, prepare_put, prepare_txn_puts, CurrentView};
@@ -32,6 +33,9 @@ type Rows = BTreeMap<Vec<u8>, KeyValue>;
 pub struct KvError {
     pub code: i32,
     pub message: String,
+    /// The class of a storage error. It does not cross the wire, so a reply keeps only its code.
+    #[serde(skip)]
+    pub(crate) fault: Option<crate::mvcc::storage_fault::StorageFault>,
 }
 
 impl KvError {
@@ -39,6 +43,7 @@ impl KvError {
         Self {
             code: code as i32,
             message: format!("etcdserver: {message}"),
+            fault: None,
         }
     }
 
@@ -46,8 +51,69 @@ impl KvError {
         Self::new(Code::InvalidArgument, message)
     }
 
-    pub(crate) fn storage(error: impl std::fmt::Display) -> Self {
-        Self::new(Code::Internal, &format!("storage error: {error}"))
+    /// Classify a storage error of a read. A transient or missing object fails the request with
+    /// a retryable status. Stored data that does not decode fails it with `DataLoss`, and the
+    /// read counts it. The caller states that `error` comes from a storage call or from stored
+    /// data, so an error of no known class is corrupt data.
+    pub(crate) fn storage(error: impl Into<anyhow::Error>) -> Self {
+        use crate::mvcc::storage_fault::{StorageFault, CORRUPT_READS};
+        let error = error.into();
+        let fault = crate::mvcc::storage_fault::classify(&error).unwrap_or(StorageFault::Corrupt);
+        let (code, message) = match fault {
+            StorageFault::Transient => {
+                tracing::warn!(error = format!("{error:#}"), "a storage read failed");
+                (Code::Unavailable, "storage unavailable; retry".to_owned())
+            }
+            StorageFault::Missing => (
+                Code::Unavailable,
+                "a checkpoint object is missing; retry".to_owned(),
+            ),
+            StorageFault::Corrupt => {
+                CORRUPT_READS.inc();
+                tracing::error!(
+                    error = format!("{error:#}"),
+                    "a read met corrupt stored data"
+                );
+                (Code::DataLoss, format!("corrupt stored data: {error:#}"))
+            }
+        };
+        Self {
+            fault: Some(fault),
+            ..Self::new(code, &message)
+        }
+    }
+
+    /// The error of a read outside the KV path, such as a diagnostic. A classified storage
+    /// error keeps its class. Another error fails the request with `Unavailable`.
+    pub(crate) fn read_failure(error: anyhow::Error) -> Self {
+        match crate::mvcc::storage_fault::classify(&error) {
+            Some(_) => Self::storage(error),
+            None => Self::new(Code::Unavailable, &format!("{error:#}")),
+        }
+    }
+
+    /// A stored row that does not decode or contradicts another one.
+    pub(crate) fn corrupt(message: &str) -> Self {
+        Self::storage(crate::mvcc::storage_fault::stored(message))
+    }
+
+    /// An error of this member's own invariants, such as a write batch that cannot count its
+    /// bytes. It stops the member.
+    pub(crate) fn invariant(error: impl std::fmt::Display) -> Self {
+        Self::new(Code::Internal, &format!("invariant error: {error}"))
+    }
+
+    /// Return the error that stops apply instead of becoming the result of an entry: a storage
+    /// error, whose class survives, or an invariant error. Each member must reach the same
+    /// result, so a read that failed on this member cannot be one.
+    pub(crate) fn unapplied(&self) -> Option<anyhow::Error> {
+        if let Some(fault) = self.fault {
+            return Some(anyhow::Error::new(crate::mvcc::storage_fault::Classified {
+                fault,
+                message: self.message.clone(),
+            }));
+        }
+        (self.code == Code::Internal as i32).then(|| anyhow::anyhow!("{}", self.message))
     }
 
     pub fn status(self) -> Status {
@@ -556,7 +622,7 @@ impl<R: StateRead> View<'_, R> {
                 .checked_sub(8)
                 .filter(|&len| len > HISTORY.len())
             else {
-                return Err(KvError::storage("short history key"));
+                return Err(KvError::corrupt("short history key"));
             };
             let prefix = row.key.slice(..prefix_len);
             let row_len = row.key.len();
@@ -729,7 +795,7 @@ impl<R: StateRead> View<'_, R> {
                         .await?
                         .and_then(|version| version.value)
                         .ok_or_else(|| {
-                            KvError::storage("history has no live version that the journal names")
+                            KvError::corrupt("history has no live version that the journal names")
                         })?;
                     rows.push(then);
                 }

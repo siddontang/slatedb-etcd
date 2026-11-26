@@ -666,6 +666,7 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
 | Writes fail for all members | The writer retries with a capped backoff. Reads continue |
 | Writes fail for a long time | Proposals fail at the soft limit. Apply pauses at the hard limit |
 | The writer finds data that it cannot use | The writer halts, and leadership moves once |
+| A client read meets a storage error | Only that request fails. See [Read faults](#read-faults) |
 | An invariant of the member fails | The member stops |
 | A member stops reporting its base | Its base can be deleted. It rebases on a missing SST |
 | A checkpoint open fails | The member keeps its base and tries the next checkpoint |
@@ -675,6 +676,24 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
 | Writer opens in reverse term order | The current leader is fenced, then it opens again |
 | New leader's clock is behind | The writer waits, or refuses and then hands over the lead |
 | The shared `Db` is lost or corrupted | All members lose state together. Restore from a backup |
+
+### Read faults
+
+A storage error of a client read never stops the member. Range, Watch, HashKV, the local
+serializable read, and the diagnostic reads use one rule, which the writer rule below extends.
+
+- **Transient:** SlateDB `Unavailable` or a closed database, an object store error from a call
+  outside SlateDB, or a store call past its deadline. The request fails with `Unavailable`, and
+  the client retries.
+- **Missing:** a `Data` error with a missing object below it, or a read that held its view past
+  `--view-pin-max`. The request fails with `Unavailable`. The retry reads a newer view.
+- **Corrupt:** any other SlateDB kind, or a stored row that does not decode. The request fails
+  with `DataLoss`. The member logs an error and counts it in `slatedb_etcd_read_corrupt_total`.
+
+A Watch page that fails for a transient or missing object runs again on a new view. Each
+watcher resumes at its own next revision, so no revision is lost. The first retry runs at once,
+and later retries in a row wait from 100 ms up to 5 s. A corrupt page ends the stream with
+`DataLoss`.
 
 ### Writer faults
 

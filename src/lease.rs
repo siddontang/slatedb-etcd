@@ -194,7 +194,7 @@ pub(crate) async fn prepare_with_counts(
         if let Some(record) = record {
             batch.put(
                 key(*id),
-                crate::codec::encode(record).map_err(KvError::storage)?,
+                crate::codec::encode(record).map_err(KvError::invariant)?,
             );
         } else {
             batch.delete(key(*id));

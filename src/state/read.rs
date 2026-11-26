@@ -114,25 +114,13 @@ impl ReadView {
             };
             histogram.observe(start.elapsed().as_secs_f64());
         }
-        if let Err(error) = &result {
-            // A deleted checkpoint object or an expired pin fails only this read. The client
-            // retries on a new view.
-            if self.pin_max.is_some()
-                && (super::shared::missing_object(&anyhow::anyhow!("{}", error.message))
-                    || super::view::expired(&error.message))
-            {
-                return Ok(Some(Outcome {
-                    result: Err(mvcc::KvError::new(
-                        tonic::Code::Unavailable,
-                        "etcdserver: a checkpoint object is missing; retry",
-                    )),
-                }));
+        // A storage error fails only this read, and the client retries. A deleted checkpoint
+        // object or an expired pin is one, so the retry reads a new view. Only an error of the
+        // member's own invariants stops the member.
+        if let Some(error) = result.as_ref().err().filter(|error| error.fault.is_none()) {
+            if let Some(error) = error.unapplied() {
+                return Err(error);
             }
-            ensure!(
-                error.code != tonic::Code::Internal as i32,
-                "{}",
-                error.message
-            );
         }
         Ok(Some(Outcome { result }))
     }

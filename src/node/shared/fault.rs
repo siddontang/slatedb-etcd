@@ -60,36 +60,27 @@ impl Fault {
     }
 }
 
-/// Classify a writer error. The outermost SlateDB error decides, so a missing object that
-/// SlateDB reports as a data error is not a storage error. A stored object that does not decode
-/// is a data error too. An object store error with no SlateDB error around it comes from this
-/// crate's own storage calls.
+/// Classify a writer error. A fence and a lost open race come first. Then the rule of
+/// `storage_fault::classify` holds, so a missing object is a data error, as a stored object that
+/// does not decode is. A writer that SlateDB closed for another reason is a data error too: its
+/// flush failed, and the close hides the cause.
 pub(in crate::node) fn classify(error: &anyhow::Error) -> Fault {
+    use crate::mvcc::storage_fault::StorageFault;
     if fenced(error) || open_conflict(error) {
         return Fault::Fenced;
     }
-    if error
-        .chain()
-        .any(|cause| cause.is::<crate::state::StoredData>())
-    {
-        return Fault::Data;
-    }
-    if let Some(error) = error
+    let closed = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<slatedb::Error>())
-    {
-        return match error.kind() {
-            slatedb::ErrorKind::Unavailable => Fault::Unavailable,
-            _ => Fault::Data,
-        };
+        .is_some_and(|error| matches!(error.kind(), slatedb::ErrorKind::Closed(_)));
+    if closed {
+        return Fault::Data;
     }
-    if error
-        .chain()
-        .any(|cause| cause.is::<slatedb::object_store::Error>())
-    {
-        return Fault::Unavailable;
+    match crate::mvcc::storage_fault::classify(error) {
+        Some(StorageFault::Transient) => Fault::Unavailable,
+        Some(StorageFault::Missing | StorageFault::Corrupt) => Fault::Data,
+        None => Fault::Invariant,
     }
-    Fault::Invariant
 }
 
 /// Return true when `error` is a lost manifest race: another writer wrote the manifest version

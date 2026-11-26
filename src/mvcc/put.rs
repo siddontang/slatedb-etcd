@@ -284,7 +284,7 @@ pub(super) fn prev_event(old: Option<&Old>, revision: i64) -> KvResult<(Option<K
         }
         // A change earlier in the same revision has no history version yet.
         Some(Old::Full(kv)) => Ok((Some(kv.clone()), 0)),
-        Some(Old::Meta(_)) => Err(KvError::storage("indexed row has no older revision")),
+        Some(Old::Meta(_)) => Err(KvError::corrupt("indexed row has no older revision")),
     }
 }
 
@@ -321,7 +321,7 @@ pub(crate) async fn prepare_put(
     .encode_to_vec();
     batch
         .put_counted(crate::watch::key(next).into(), journal.into(), None, size)
-        .map_err(KvError::storage)?;
+        .map_err(KvError::invariant)?;
     put_revision_row(view, revision, batch, size).await?;
     Ok((response(Resp::ResponsePut(reply)), next))
 }
@@ -414,7 +414,7 @@ pub(crate) async fn prepare_txn_puts(
     .encode_to_vec();
     batch
         .put_counted(crate::watch::key(next).into(), journal.into(), None, size)
-        .map_err(KvError::storage)?;
+        .map_err(KvError::invariant)?;
     put_revision_row(view, revision, batch, size).await?;
     #[cfg(test)]
     DIRECT_TXNS.with(|count| count.set(count.get() + 1));
@@ -496,7 +496,7 @@ async fn put_rows(
                 let raw = view
                     .value(&key)
                     .await?
-                    .ok_or_else(|| KvError::storage("key index has no current row"))?;
+                    .ok_or_else(|| KvError::corrupt("key index has no current row"))?;
                 (Some(meta), Some(raw))
             }
         },
@@ -522,7 +522,7 @@ async fn put_rows(
         // Earlier group members have lower revisions, so this is not expected.
         Some(_) => match raw {
             Some(raw) => (Some(raw), 0),
-            None => return Err(KvError::storage("indexed row has no older revision")),
+            None => return Err(KvError::corrupt("indexed row has no older revision")),
         },
     };
     // The hash row holds a digest of the KeyValue, not its bytes.
@@ -545,7 +545,7 @@ async fn put_rows(
     for (key, value, old_len) in rows {
         batch
             .put_counted(key, value, old_len, size)
-            .map_err(KvError::storage)?;
+            .map_err(KvError::invariant)?;
     }
     Ok((
         PutResponse {
@@ -589,7 +589,7 @@ async fn put_revision_row(
             old_len,
             size,
         )
-        .map_err(KvError::storage)
+        .map_err(KvError::invariant)
 }
 
 #[cfg(test)]

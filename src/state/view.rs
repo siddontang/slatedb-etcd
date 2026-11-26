@@ -149,6 +149,12 @@ impl Base {
 /// The message of a read that held its view past the pin limit.
 pub(crate) const EXPIRED: &str = "read view expired; retry";
 
+/// The error of a read that held its view past the pin limit. Its source marks the class.
+fn expired_error() -> slatedb::Error {
+    slatedb::Error::unavailable(EXPIRED.to_owned())
+        .with_source(Box::new(crate::mvcc::storage_fault::Expired))
+}
+
 /// A base plus the overlay batches at or below `seq`.
 #[derive(Clone)]
 pub(crate) struct SharedView {
@@ -183,7 +189,7 @@ impl SharedView {
         match self.deadline {
             Some(deadline) => tokio::time::timeout_at(deadline.into(), read)
                 .await
-                .map_err(|_| slatedb::Error::unavailable(EXPIRED.to_owned()))?,
+                .map_err(|_| expired_error())?,
             None => read.await,
         }
     }
@@ -191,9 +197,7 @@ impl SharedView {
     /// Fail when the read holds the view past its deadline. Gets and each scan step check it.
     fn check(&self) -> Result<(), slatedb::Error> {
         match self.deadline {
-            Some(deadline) if std::time::Instant::now() >= deadline => {
-                Err(slatedb::Error::unavailable(EXPIRED.to_owned()))
-            }
+            Some(deadline) if std::time::Instant::now() >= deadline => Err(expired_error()),
             _ => Ok(()),
         }
     }
@@ -575,6 +579,7 @@ impl StateView {
 }
 
 /// Return true when an error message comes from a read that held its view too long.
+#[cfg(test)]
 pub(crate) fn expired(message: &str) -> bool {
     message.contains(EXPIRED)
 }

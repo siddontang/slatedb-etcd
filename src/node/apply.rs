@@ -254,7 +254,7 @@ pub(super) enum Output {
     Snapshot(Rebound),
     Query {
         response: Response,
-        value: Value,
+        value: std::result::Result<Value, ApiError>,
         require_leader: bool,
     },
     /// A test worker returns its checkpoint result inline to keep schedules deterministic.
@@ -422,10 +422,7 @@ impl Executor {
                         {
                             tracing::warn!(%error, "a maintenance read failed");
                             crate::mvcc::Outcome {
-                                result: Err(crate::mvcc::KvError::new(
-                                    tonic::Code::Unavailable,
-                                    &format!("etcdserver: {error}"),
-                                )),
+                                result: Err(crate::mvcc::KvError::read_failure(error)),
                             }
                         }
                         Err(error) => return Err(error),
@@ -433,7 +430,7 @@ impl Executor {
                     fill_value_header(work.header, &mut outcome)?;
                     Output::Query {
                         response,
-                        value: serde_json::to_value(outcome)?,
+                        value: Ok(serde_json::to_value(outcome)?),
                         require_leader: false,
                     }
                 }
@@ -457,18 +454,28 @@ impl Executor {
                 }
                 Query::AuthLookup(name, response) => Output::Query {
                     response,
-                    value: serde_json::to_value(self.state.auth.users.get(&name))?,
+                    value: Ok(serde_json::to_value(self.state.auth.users.get(&name))?),
                     require_leader: false,
                 },
                 Query::Linear(..) | Query::Read(..) => {
                     anyhow::bail!("read reached the apply worker")
                 }
                 Query::Local(key, response) => {
-                    let value = self.state.local_value(&key).await?;
+                    // A storage error of this diagnostic read fails only its request.
+                    let value = match self.state.local_value(&key).await {
+                        Ok(value) => Ok(json!({"value": value,
+                            "applied_index": self.state.applied})),
+                        Err(error) => {
+                            tracing::warn!(%error, "a local value read failed");
+                            Err(ApiError {
+                                error: crate::mvcc::KvError::read_failure(error).message,
+                                leader_id: 0,
+                            })
+                        }
+                    };
                     Output::Query {
                         response,
-                        value: json!({"value": value,
-                        "applied_index": self.state.applied}),
+                        value,
                         require_leader: false,
                     }
                 }
