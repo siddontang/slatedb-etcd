@@ -638,3 +638,81 @@ async fn a_cancel_of_a_waiting_create_replies_during_a_store_fault() {
     );
     server.shutdown().await.unwrap();
 }
+
+fn progress_request() -> crate::proto::etcdserverpb::WatchRequest {
+    use crate::proto::etcdserverpb::{watch_request::RequestUnion, WatchProgressRequest};
+    watch_request(RequestUnion::ProgressRequest(WatchProgressRequest {}))
+}
+
+/// A progress request that comes after a waiting create runs after that create, so it does not
+/// go before the create reply. The replies keep request order: progress, create, progress.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_later_progress_request_does_not_pass_a_waiting_create() {
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let dir = tempfile::tempdir().unwrap();
+    let (server, _) = flushed(dir.path(), &faults).await;
+    faults.set(FAIL_SST_GET);
+    let (requests, input) = tokio::sync::mpsc::channel(4);
+    let mut stream = watch_stream(&server, input).await;
+    requests.send(historical()).await.unwrap();
+    assert!(reply(&mut stream).await.created);
+    failed_read(&faults).await;
+    requests.send(progress_request()).await.unwrap();
+    requests.send(late_create(7, 0)).await.unwrap();
+    requests.send(progress_request()).await.unwrap();
+    let early = tokio::time::timeout(Duration::from_millis(500), stream.message()).await;
+    assert!(
+        early.is_err(),
+        "a reply came while the store failed: {early:?}"
+    );
+    faults.set(0);
+    let mut order = vec![];
+    while order.len() < 3 {
+        let reply = reply(&mut stream).await;
+        if reply.created {
+            order.push(format!("created {}", reply.watch_id));
+        } else if reply.watch_id == -1 {
+            order.push(format!("progress {}", reply.header.unwrap().revision));
+        }
+    }
+    let revision = order[0].clone();
+    assert_eq!(order, [revision.clone(), "created 7".to_owned(), revision]);
+    server.shutdown().await.unwrap();
+}
+
+/// Creates that wait behind a progress reply are bounded. A Cancel still gets its reply while
+/// they wait. One create above the bound ends the stream with `Unavailable`, so the client
+/// resumes its watches on a new stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn too_many_waiting_creates_end_the_stream() {
+    use crate::proto::etcdserverpb::{watch_request::RequestUnion, WatchCancelRequest};
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let dir = tempfile::tempdir().unwrap();
+    let (server, _) = flushed(dir.path(), &faults).await;
+    faults.set(FAIL_SST_GET);
+    let (requests, input) = tokio::sync::mpsc::channel(4);
+    let mut stream = watch_stream(&server, input).await;
+    requests.send(historical()).await.unwrap();
+    assert!(reply(&mut stream).await.created);
+    failed_read(&faults).await;
+    requests.send(progress_request()).await.unwrap();
+    for id in 100..164 {
+        requests.send(late_create(id, 0)).await.unwrap();
+    }
+    let cancel = RequestUnion::CancelRequest(WatchCancelRequest { watch_id: 163 });
+    requests.send(watch_request(cancel)).await.unwrap();
+    let canceled = reply(&mut stream).await;
+    assert!(
+        canceled.canceled && canceled.watch_id == 163,
+        "{canceled:?}"
+    );
+    requests.send(late_create(163, 0)).await.unwrap();
+    requests.send(late_create(164, 0)).await.unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(2), stream.message())
+        .await
+        .expect("the stream did not end");
+    let status = ended.expect_err("the stream sent a reply");
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+    faults.set(0);
+    server.shutdown().await.unwrap();
+}

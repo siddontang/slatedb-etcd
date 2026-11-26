@@ -754,14 +754,19 @@ closed client, or a closed request stream still ends the work while the store fa
 
 A progress request follows etcd in one case: a watcher of the stream that asked for a start
 revision above the current revision drops it, with no reply. A watcher with no start revision
-does not. etcd also drops a request while a watcher catches up.
-This member instead keeps such a request when the events through its revision exist but a failing
-store delays them. The reply then follows those events, so a client need not ask again. Until the
-reply, the stream takes no feed batch, so no later event goes before it. Later progress requests
-fold into one with the newest revision. A create that comes meanwhile waits until the reply goes
-out, because a client applies the reply to each watch that it knows. Its reply then follows in
-request order. A Cancel still gets its reply, and it removes a waiting create. At most 64 creates
-wait. The stream then reads no further request until the progress reply goes out.
+does not. etcd also drops a request while a watcher catches up. This member instead keeps such
+a request when the events through its revision exist but a failing store delays them. The reply
+then follows those events, so a client need not ask again. Until the reply, the stream takes no
+feed batch, so no later event goes before it.
+
+A client applies the reply to each watch that it knows. So the creates and progress requests that
+come while a reply waits wait in one queue, and they run in request order after it. A later
+progress request thus takes its revision after each earlier create reply. A create gets its
+decision when it comes: an empty range, an ID that a live or waiting watch holds, or the watch
+limit fails it. That decision stays, also when a later Cancel ends the watch with its ID. A
+Cancel takes effect and gets its reply at once, and it can end a waiting create with its own ID.
+Progress requests next to each other in the queue fold into one. At most 64 creates wait. One
+more ends the stream with `Unavailable`, and the client resumes its watches on a new stream.
 
 ### Writer faults
 
