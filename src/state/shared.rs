@@ -582,6 +582,23 @@ impl Source {
     }
 
     pub async fn open_writer_with(&self, settings: Settings) -> Result<Db> {
+        self.build_writer(settings, None).await
+    }
+
+    /// Open the writer of a leader with `clock` as its SlateDB clock. See
+    /// `node::shared::clock::Gate`.
+    pub async fn open_writer_on(
+        &self,
+        clock: Arc<dyn slatedb_common::clock::SystemClock>,
+    ) -> Result<Db> {
+        self.build_writer(slatedb_settings(), Some(clock)).await
+    }
+
+    async fn build_writer(
+        &self,
+        settings: Settings,
+        clock: Option<Arc<dyn slatedb_common::clock::SystemClock>>,
+    ) -> Result<Db> {
         #[cfg(test)]
         if let Some(error) = self.fail_writer.lock().unwrap().take() {
             return Err(error);
@@ -590,12 +607,14 @@ impl Source {
         if let Some(error) = *self.fail_writers.lock().unwrap() {
             return Err(error());
         }
-        Ok(Db::builder(self.state(), self.store.clone())
+        let mut builder = Db::builder(self.state(), self.store.clone())
             .with_db_cache(self.cache.clone(), 0)
             .with_settings(settings)
-            .with_block_cache_policy(block_cache_policy())
-            .build()
-            .await?)
+            .with_block_cache_policy(block_cache_policy());
+        if let Some(clock) = clock {
+            builder = builder.with_system_clock(clock);
+        }
+        Ok(builder.build().await?)
     }
 
     /// Return true after the first checkpoint was published.

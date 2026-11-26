@@ -39,7 +39,8 @@ pub(in crate::node) enum Fault {
     /// SlateDB cannot use the shared database, for example an object is missing or does not
     /// decode. Each later leader can meet the same error.
     Data,
-    /// The local clock is too far behind the clock of the shared writer.
+    /// The local clock is too far behind the clock of the shared writer, or ahead of a voter
+    /// majority. See `clock`.
     Clock,
     /// Due storage work made no durable progress for `STALL`.
     Stalled,
@@ -66,6 +67,9 @@ impl Fault {
 /// flush failed, and the close hides the cause.
 pub(in crate::node) fn classify(error: &anyhow::Error) -> Fault {
     use crate::mvcc::storage_fault::StorageFault;
+    if error.chain().any(|cause| cause.is::<clock::ClockAhead>()) {
+        return Fault::Clock;
+    }
     if fenced(error) || open_conflict(error) {
         return Fault::Fenced;
     }

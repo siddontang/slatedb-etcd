@@ -484,6 +484,7 @@ async fn a_follower_manual_checkpoint_completes_with_a_certified_base() {
         writer.db.as_ref().unwrap().clone(),
         queue,
         progress,
+        shared::Gate::unchecked(),
     ));
     let mut polls = 0;
     tokio::select! {

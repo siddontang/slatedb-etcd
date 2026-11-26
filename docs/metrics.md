@@ -116,7 +116,8 @@ A member in shared state mode also exports these gauges. Replicated members omit
 | `slatedb_etcd_shared_overlay_bytes` | Bytes of applied batches in the overlay above the base |
 | `slatedb_etcd_shared_apply_paused` | 1 while apply waits above twice `--overlay-max-bytes` |
 | `slatedb_etcd_shared_writer_running` | 1 while the writer database of this member is open |
-| `slatedb_etcd_shared_writer_clock_alarm` | 1 while the clock check keeps the writer closed |
+| `slatedb_etcd_shared_writer_clock_alarm` | 1 while the clock is too far behind or ahead |
+| `slatedb_etcd_shared_writer_clock_waiting` | 1 while the writer waits for its clock bound |
 | `slatedb_etcd_shared_writer_reopens` | Writer opens after a fence or a lost manifest race |
 | `slatedb_etcd_shared_writer_consecutive_failures` | Writer faults in a row, other than fences |
 | `slatedb_etcd_shared_writer_faults_total` | Counter of writer faults, clock refusals, and stalls |
@@ -127,8 +128,8 @@ A member in shared state mode also exports these gauges. Replicated members omit
 | `slatedb_etcd_shared_backup_streams` | Native backups that stream a pinned view |
 | `slatedb_etcd_shared_backup_retained_bytes` | Released overlay bytes that backups still keep |
 
-The member sets the first ten rows on each Raft tick. The leader sets the checkpoint count after
-each publication. The clock gauge changes at each writer open. The backup gauges change when a
+The member sets the first eleven rows on each Raft tick. The leader sets the checkpoint count
+after each publication. The clock skew gauge changes at each writer open. The backup gauges change when a
 backup starts or ends, and every 100 ms while one streams.
 
 - A base index that stops while the applied index grows means that no checkpoint reaches the

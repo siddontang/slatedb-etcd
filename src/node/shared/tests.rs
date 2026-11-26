@@ -59,7 +59,12 @@ async fn the_materializer_writes_whole_batches_with_their_sequences() {
     let mut replay = Overlay::new(1);
     replay.push(4, batch(4, &[("b", "2"), ("c", "3"), ("d", "4")]));
     let progress = Arc::new(Progress::new(db.manifest().last_l0_seq()));
-    let task = tokio::spawn(materialize(db.clone(), replay.queue(), progress.clone()));
+    let task = tokio::spawn(materialize(
+        db.clone(),
+        replay.queue(),
+        progress.clone(),
+        clock::Gate::unchecked(),
+    ));
     progress.wait_written(4).await.unwrap();
     assert_eq!(db.snapshot().unwrap().seq(), 4);
     assert_eq!(value(&db, "c").await, Some("3".into()));

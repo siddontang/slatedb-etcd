@@ -11,6 +11,7 @@
 
 use super::*;
 use serde::{Deserialize, Serialize};
+use slatedb_common::clock::{DefaultSystemClock, SystemClock, SystemClockTicker};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 /// Milliseconds of a clock: wall time since the Unix epoch, or monotonic time since a start.
@@ -26,6 +27,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// sample grows only with the rate difference of two clocks, some milliseconds per minute. A
 /// lost reply must not stop the writer, so several replies in a row can be lost.
 const FRESH_MS: i64 = 4_000;
+/// The longest wait of a writer before it reads the samples again.
+const RECHECK: Duration = Duration::from_millis(100);
 
 /// The body of a clock probe.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -331,6 +334,43 @@ impl Clock {
         self.waiting.load(Ordering::Relaxed)
     }
 
+    /// Set or clear the wait of the writer. Log the start of a wait.
+    fn set_waiting(&self, reason: Option<&str>) {
+        let was = self.waiting.swap(reason.is_some(), Ordering::Relaxed);
+        if let (false, Some(reason)) = (was, reason) {
+            // A new leader waits for its first samples. `/status` shows a longer wait.
+            tracing::info!(reason, "the shared writer waits for its clock bound");
+        }
+    }
+
+    /// Wait for a new sample, at most `most`.
+    async fn wait(&self, reason: &str, most: Duration) {
+        let sampled = self.sampled.notified();
+        self.set_waiting(Some(reason));
+        let _ = tokio::time::timeout(most, sampled).await;
+    }
+
+    /// Wait until the ahead check can decide, and return the SlateDB clock of a new writer. A
+    /// leader of several voters thus waits for the samples of a majority before its open, and
+    /// its `Db` never reads a time without a bound. Missing samples are no measured skew, so
+    /// the wait is no writer fault.
+    pub(super) async fn gate(&self) -> Arc<Gate> {
+        loop {
+            let start = match self.verdict() {
+                Verdict::Off => None,
+                Verdict::Waiting => {
+                    self.wait(NO_SAMPLES, RECHECK).await;
+                    continue;
+                }
+                Verdict::Ahead { cap, real, .. } | Verdict::Admit { cap, real } => {
+                    Some(real.min(cap))
+                }
+            };
+            self.set_waiting(None);
+            return Arc::new(Gate::new(Some(self.clone()), start));
+        }
+    }
+
     pub(in crate::node) fn status(&self) -> Value {
         let samples = self.voters.lock().unwrap().samples.len();
         json!({
@@ -340,6 +380,211 @@ impl Clock {
             "waiting": self.waiting(),
             "samples": samples,
         })
+    }
+}
+
+/// The lowest time of a new writer on `manifest`: its `last_l0_clock_tick`, or the time in the
+/// newest L0 SST ID when that is later. SlateDB 0.18.1 takes SST IDs from its clock, and it
+/// refuses a new L0 SST whose ID time is below the newest one (`manifest/invariants.rs:51-83`).
+/// A writer whose clock is behind that time thus cannot flush.
+pub(super) fn floor(manifest: &slatedb::VersionedManifest) -> i64 {
+    let newest = match manifest.l0().is_empty() {
+        true => manifest.last_compacted_l0_sst_view_id(),
+        false => manifest.l0().iter().map(|view| view.sst.id.value()).max(),
+    };
+    let newest = newest.map_or(i64::MIN, |id| id.timestamp_ms() as i64);
+    manifest.last_l0_clock_tick().max(newest)
+}
+
+/// The wait reason of a writer without the samples of a voter majority.
+const NO_SAMPLES: &str = "too few voters have a fresh clock sample";
+
+/// A batch refusal: the leader clock is ahead of a voter majority over the skew limit. The
+/// writer reports it as a `Fault::Clock`.
+#[derive(Debug)]
+pub(in crate::node) struct ClockAhead {
+    pub by_ms: i64,
+}
+
+impl std::fmt::Display for ClockAhead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the local clock is {} ms ahead of a voter majority over the skew limit",
+            self.by_ms
+        )
+    }
+}
+
+impl std::error::Error for ClockAhead {}
+
+/// The SlateDB clock of one writer `Db`.
+///
+/// `admit` fixes the tick of each batch before the materializer submits it:
+/// `max(last, min(now, cap))`. Until the batch completes, `now` returns exactly that tick, so
+/// the batch writer of SlateDB stamps the batch with it. A later step of the wall clock or a
+/// change of the samples cannot change it.
+///
+/// Flushes, checkpoints, the compactor, and GC read `now` too. Between batches it returns
+/// `max(last, min(now, cap))`, and without fresh samples it stays at `last`. So it never steps
+/// back. Sleeps and tickers use SlateDB's default clock, which follows the monotonic clock. A
+/// step of the wall clock thus does not move them. With one voter, `now` is the default clock.
+pub(in crate::node) struct Gate {
+    clock: Option<Clock>,
+    default: DefaultSystemClock,
+    ticks: Mutex<Ticks>,
+    /// Tests: each admitted batch notifies the first and waits for the second before SlateDB
+    /// gets it.
+    #[cfg(test)]
+    pub(super) hold: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+}
+
+#[derive(Debug)]
+struct Ticks {
+    /// The highest time that `now` returned. It is at or above the tick of each batch.
+    last: i64,
+    /// The tick of the batch that SlateDB writes now.
+    admitted: Option<i64>,
+}
+
+impl std::fmt::Debug for Gate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Gate")
+            .field("ticks", &*self.ticks.lock().unwrap())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Gate {
+    fn new(clock: Option<Clock>, start: Option<i64>) -> Self {
+        let default = DefaultSystemClock::new();
+        let last = start.unwrap_or_else(|| default.now().timestamp_millis());
+        Self {
+            clock,
+            default,
+            ticks: Mutex::new(Ticks {
+                last,
+                admitted: None,
+            }),
+            #[cfg(test)]
+            hold: Mutex::default(),
+        }
+    }
+
+    /// A clock with no ahead check, for tests that drive the materializer alone.
+    #[cfg(test)]
+    pub(in crate::node) fn unchecked() -> Arc<Self> {
+        Arc::new(Self::new(None, None))
+    }
+
+    /// The writer opened at the manifest tick `tick`. Each later tick is at or above it.
+    pub(super) fn floor(&self, tick: i64) {
+        let mut ticks = self.ticks.lock().unwrap();
+        ticks.last = ticks.last.max(tick);
+    }
+
+    /// The time that SlateDB reads now, in milliseconds.
+    fn read(&self) -> i64 {
+        let mut ticks = self.ticks.lock().unwrap();
+        if let Some(tick) = ticks.admitted {
+            return tick;
+        }
+        let verdict = self.clock.as_ref().map_or(Verdict::Off, Clock::verdict);
+        let next = match verdict {
+            Verdict::Off => self.default.now().timestamp_millis(),
+            Verdict::Waiting => ticks.last,
+            Verdict::Ahead { cap, real, .. } | Verdict::Admit { cap, real } => real.min(cap),
+        };
+        ticks.last = ticks.last.max(next);
+        ticks.last
+    }
+
+    /// Fix the tick of the next batch. Wait while too few voters have a fresh sample, or while
+    /// the cap is below the last tick, as after an open above the cap. Refuse the batch with a
+    /// `ClockAhead` error when the leader clock is ahead of a voter majority. The batch then
+    /// stays in the overlay, and the next writer writes it again.
+    pub(super) async fn admit(&self) -> Result<Admitted<'_>> {
+        let Some(clock) = &self.clock else {
+            return Ok(Admitted { gate: self });
+        };
+        loop {
+            let (cap, real) = match clock.verdict() {
+                Verdict::Off => {
+                    clock.set_waiting(None);
+                    return Ok(Admitted { gate: self });
+                }
+                Verdict::Waiting => {
+                    clock.wait(NO_SAMPLES, RECHECK).await;
+                    continue;
+                }
+                Verdict::Ahead { by, .. } => {
+                    clock.set_waiting(None);
+                    clock.note_ahead(Some(by));
+                    return Err(ClockAhead { by_ms: by }.into());
+                }
+                Verdict::Admit { cap, real } => (cap, real),
+            };
+            clock.note_ahead(None);
+            // The lock guard must not live across an await.
+            let above = {
+                let mut ticks = self.ticks.lock().unwrap();
+                let tick = ticks.last.max(real.min(cap));
+                if tick <= cap {
+                    ticks.last = tick;
+                    ticks.admitted = Some(tick);
+                }
+                tick.saturating_sub(cap)
+            };
+            if above > 0 {
+                let wait = Duration::from_millis(above as u64).min(RECHECK);
+                clock
+                    .wait("the last tick is above the clock bound", wait)
+                    .await;
+                continue;
+            }
+            clock.set_waiting(None);
+            return Ok(Admitted { gate: self });
+        }
+    }
+
+    /// Tests: hold an admitted batch before SlateDB gets it.
+    #[cfg(test)]
+    pub(super) async fn held(&self) {
+        let hold = self.hold.lock().unwrap().clone();
+        if let Some((reached, resume)) = hold {
+            reached.notify_one();
+            resume.notified().await;
+        }
+    }
+}
+
+/// The tick of one batch. A batch that does not complete keeps its tick: its writer stops,
+/// and its clock does not move again.
+pub(super) struct Admitted<'a> {
+    gate: &'a Gate,
+}
+
+impl Admitted<'_> {
+    /// SlateDB wrote the batch. Later reads follow the clock again.
+    pub(super) fn done(self) {
+        self.gate.ticks.lock().unwrap().admitted = None;
+    }
+}
+
+impl SystemClock for Gate {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp_millis(self.read()).unwrap_or_else(|| self.default.now())
+    }
+
+    fn sleep<'a>(
+        &'a self,
+        duration: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        self.default.sleep(duration)
+    }
+
+    fn ticker<'a>(&'a self, duration: Duration) -> SystemClockTicker<'a> {
+        SystemClockTicker::new(&self.default, duration)
     }
 }
 

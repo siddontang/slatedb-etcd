@@ -298,6 +298,7 @@ pub(super) struct Gauges {
     leading: prometheus::IntGauge,
     reopens: prometheus::IntGauge,
     clock_alarm: prometheus::IntGauge,
+    clock_waiting: prometheus::IntGauge,
     pub(super) failures: prometheus::IntGauge,
     pub(super) faults: prometheus::IntCounter,
     pub(super) pending_closes: prometheus::IntGauge,
@@ -335,7 +336,13 @@ impl Gauges {
             )?,
             clock_alarm: gauge(
                 "slatedb_etcd_shared_writer_clock_alarm",
-                "1 while the writer does not start because the local clock is too far behind.",
+                "1 while the local clock is too far behind the writer clock or ahead of a voter \
+                 majority.",
+            )?,
+            clock_waiting: gauge(
+                "slatedb_etcd_shared_writer_clock_waiting",
+                "1 while the writer waits for the clock samples of a voter majority or for its \
+                 clock bound.",
             )?,
             reopens: gauge(
                 "slatedb_etcd_shared_writer_reopens",
@@ -661,8 +668,11 @@ async fn attempt<T>(
 ///
 /// 1. The open increments the writer epoch, which fences an older writer.
 /// 2. After the open, the member must still lead the same term. Otherwise it closes the writer.
-/// 3. The local clock must pass the manifest's `last_l0_clock_tick`. Over the skew limit the
-///    writer does not start, and the task tries again after a backoff.
+/// 3. The local clock must pass the manifest's `last_l0_clock_tick` and the time of its newest
+///    L0 SST ID. Over the skew limit the writer does not start, and the task tries again after
+///    a backoff. Before the open, a leader of several voters waits for the clock samples of a
+///    majority. Each batch then gets a tick at or below the bound of `clock::Gate`. A leader
+///    clock ahead of a majority fails the materializer with a clock fault.
 /// 4. The materializer and the publisher start. After an error while this member still leads,
 ///    `fault::recover` decides. A fence opens the writer again at once. A storage or data error
 ///    abandons the writer, and the task opens it again after a backoff. The overlay keeps every
@@ -696,6 +706,16 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
                 _ = stop_requested(&mut stopped) => return Ok(()),
             }
         }
+        // A leader of several voters waits for the clock samples of a majority before its
+        // open. The wait is no writer fault, so no step timer runs. See `Clock::gate`.
+        let gate = match attempt(clock.gate(), &mut stopped, &mut health).await {
+            Attempt::Done(gate) => gate,
+            Attempt::Stopped => return Ok(()),
+            Attempt::Restarted => {
+                delay = health.restarted();
+                continue;
+            }
+        };
         // An ordinary start bootstraps an empty state only after it claims the one bootstrap
         // operation. A pending snapshot restore holds the claim, so the leader waits for it.
         // Each member meets the same wait, so it is not a writer fault. The reads are.
@@ -721,7 +741,11 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
                 continue;
             }
         }
-        let opened = attempt(publisher.source.open_writer(), &mut stopped, &mut health);
+        let opened = attempt(
+            publisher.source.open_writer_on(gate.clone()),
+            &mut stopped,
+            &mut health,
+        );
         let db = match opened.await {
             Attempt::Done(Ok(db)) => {
                 // The open wrote the manifest. The next step has its own timer.
@@ -758,7 +782,8 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
             close(db).await;
             return Ok(());
         }
-        let tick = db.manifest().last_l0_clock_tick();
+        // The floor also holds the time of the newest L0 SST ID. See `clock::floor`.
+        let tick = clock::floor(&db.manifest());
         let passed = match attempt(clock.pass(tick), &mut stopped, &mut health).await {
             Attempt::Done(passed) => passed,
             Attempt::Stopped => {
@@ -780,6 +805,7 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
             health.abandon(db);
             continue;
         }
+        gate.floor(tick);
         health.opened();
         // The open starts at `last_l0_seq`. Unflushed writes of an older writer are lost, and
         // the overlay holds them.
@@ -791,7 +817,7 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         let progress = publisher.progress.clone();
         let running = async {
             tokio::select! {
-                result = materialize(db.clone(), queue.clone(), progress) => result,
+                result = materialize(db.clone(), queue.clone(), progress, gate) => result,
                 result = publish(publisher, events.clone()) => result,
             }
         };
@@ -856,6 +882,7 @@ pub(super) async fn materialize(
     db: Arc<slatedb::Db>,
     queue: Arc<Queue>,
     progress: Arc<Progress>,
+    gate: Arc<clock::Gate>,
 ) -> Result<()> {
     let mut next = progress.written();
     let mut pushed = queue.subscribe();
@@ -868,8 +895,14 @@ pub(super) async fn materialize(
             continue;
         }
         for (seq, batch) in batches {
+            // The tick of the batch is fixed before SlateDB gets it. A refusal ends the task
+            // with a clock fault, and the batch stays in the overlay. See `clock::Gate`.
+            let admitted = gate.admit().await?;
+            #[cfg(test)]
+            gate.held().await;
             db.write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
                 .await?;
+            admitted.done();
             next = seq;
             progress.wrote(seq);
         }
@@ -1514,6 +1547,7 @@ impl Node {
             gauges
                 .clock_alarm
                 .set(writer.clock.alarm_name().is_some().into());
+            gauges.clock_waiting.set(writer.clock.waiting().into());
             gauges
                 .reopens
                 .set(writer.reopens.load(std::sync::atomic::Ordering::Relaxed) as i64);
@@ -1939,6 +1973,8 @@ mod demand;
 mod fault;
 mod rejected;
 pub(super) use clock::Clock;
+#[cfg(test)]
+pub(super) use clock::Gate;
 pub(crate) use clock::{Millis, ProbeReply, ProbeRequest, PROBE_ROUTE};
 use defragment::Defragment;
 #[cfg(test)]
