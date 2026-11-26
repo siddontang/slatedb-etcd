@@ -844,7 +844,7 @@ async fn newest_base(admin: &slatedb::admin::Admin, source: &Source) -> Result<O
 }
 
 /// Return true when `error` comes from an object that the store no longer has, such as an SST
-/// that GC deleted under an old base. Other storage errors still stop the member.
+/// that GC deleted under an old base.
 ///
 /// A SlateDB error keeps its kind and its object store source, so the check uses them. Apply
 /// reports some storage errors as text through `KvError`, so the check also matches that text.

@@ -5,7 +5,7 @@ pub(crate) struct ReadView {
     metrics: Arc<crate::metrics::StateMeters>,
     state: StateView,
     /// Keep the database open while the view reads it. A snapshot install replaces it.
-    _database: Option<Arc<Db>>,
+    database: Option<Arc<Db>>,
     rows: Arc<super::rows::RowCache>,
     pub revision: i64,
     pub compact_revision: i64,
@@ -23,7 +23,7 @@ impl StateMachine {
         Ok(Arc::new(ReadView {
             metrics: self.metrics.clone(),
             state: self.pinned_state()?,
-            _database: self.database.clone(),
+            database: self.database.clone(),
             rows: self.rows.clone(),
             revision: self.revision,
             compact_revision: self.compact_revision,
@@ -129,13 +129,21 @@ impl ReadView {
                 }));
             }
             // An unavailable object store fails only this read. The client retries. Data and
-            // decode errors still stop the member.
-            if error.transient() {
+            // decode errors still stop the member. A database that a background error closed
+            // returns that error to every later read, so it stops the member too.
+            let closed = self
+                .database
+                .as_ref()
+                .is_some_and(|database| database.status().close_reason.is_some());
+            if error.transient() && !closed {
+                // The backend error can name the object and hold the service's reply. Keep it in
+                // the server log.
+                tracing::warn!(error = %error.message, "a read failed on an unavailable object store");
                 return Ok(Some(Outcome {
-                    result: Err(mvcc::KvError {
-                        code: tonic::Code::Unavailable as i32,
-                        message: error.message.clone(),
-                    }),
+                    result: Err(mvcc::KvError::new(
+                        tonic::Code::Unavailable,
+                        "storage is unavailable; retry",
+                    )),
                 }));
             }
             ensure!(

@@ -1604,6 +1604,8 @@ async fn a_transient_read_error_fails_the_request_and_keeps_the_member() {
         .result
         .unwrap_err();
     assert_eq!(error.code, tonic::Code::Unavailable as i32, "{error:?}");
+    // The backend error stays in the server log.
+    assert!(!error.message.contains("injected"), "{error:?}");
 
     faults.set(0);
     let reply = read(&mut node);
@@ -1622,6 +1624,58 @@ async fn a_transient_read_error_fails_the_request_and_keeps_the_member() {
         panic!("expected a range response");
     };
     assert_eq!(range.kvs[0].value, first);
+}
+
+/// A failed flush closes the database, and later reads return the flush error, which SlateDB
+/// reports as unavailable. The store has recovered, but the database stays closed, so the read
+/// stops the member instead of failing every later read.
+#[tokio::test]
+async fn a_read_on_a_closed_database_stops_the_member() {
+    use crate::object::faults::{FaultStore, FAIL_PUT};
+    use crate::proto::etcdserverpb::request_op::Request as Op;
+    let dir = tempfile::tempdir().unwrap();
+    let faults = std::sync::Arc::new(FaultStore::new(std::sync::Arc::new(
+        slatedb::object_store::memory::InMemory::new(),
+    )));
+    let mut node = leader_node_with(dir.path(), |config| {
+        config.object_store = crate::object::Config::Test(faults.clone(), "root".into());
+    })
+    .await;
+    let put = crate::proto::etcdserverpb::PutRequest {
+        key: b"key".to_vec(),
+        value: b"value".to_vec(),
+        ..Default::default()
+    };
+    let etcd = RequestOp {
+        request: Some(Op::RequestPut(put)),
+    };
+    let (tx, _) = oneshot::channel();
+    node.propose(
+        RaftCommand::Etcd {
+            id: "put".into(),
+            origin: 1,
+            etcd,
+        },
+        tx,
+    )
+    .unwrap();
+    commit_with_peer(&mut node).await;
+    let database = node.worker.database();
+    faults.set(FAIL_PUT);
+    let memtable = slatedb::config::FlushOptions {
+        flush_type: slatedb::config::FlushType::MemTable,
+    };
+    assert!(database.flush_with_options(memtable).await.is_err());
+    faults.set(0);
+    assert!(database.status().close_reason.is_some());
+
+    let (tx, _reply) = oneshot::channel();
+    node.enqueue_query(Query::Read(range_request(), None, ClientResponse::Kv(tx)));
+    node.drive_ready().await.unwrap();
+    let Err(error) = node.read_executor.step().await else {
+        panic!("a read on a closed database kept the member");
+    };
+    assert!(error.to_string().contains("Unavailable error"), "{error:#}");
 }
 
 #[tokio::test]
