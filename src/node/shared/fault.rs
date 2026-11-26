@@ -565,6 +565,9 @@ pub(in crate::node) struct Candidate {
     pub matched: u64,
     /// The process of the voter's last transport frame.
     pub process: Option<u64>,
+    /// The voter's clock is above the `m`-th largest clock of the voters. A handoff prefers
+    /// another voter, because this one can meet the ahead check. See `Clock::above`.
+    pub clock_ahead: bool,
 }
 
 /// How well a voter suits a writer fault handoff.
@@ -684,8 +687,8 @@ impl Handoff {
         }
     }
 
-    /// Pick the target of a writer fault handoff: a healthy voter before a stale mark, and then
-    /// the longest matched log. The voter's report must come from after the start of the
+    /// Pick the target of a writer fault handoff: a healthy voter before a stale mark, then a
+    /// voter whose clock a majority supports, and then the longest matched log. The voter's report must come from after the start of the
     /// incident and from the current Raft term, so a voter that stopped or faulted since its
     /// last report is not a target. A voter that this incident tried is not a target either.
     fn pick(&self, tick: &Tick) -> Option<u64> {
@@ -700,7 +703,7 @@ impl Handoff {
             .filter(|candidate| !self.tried.contains(&candidate.id) && fresh(&candidate.id))
             .map(|candidate| (self.suit(candidate, tick.published), candidate))
             .filter(|(suit, _)| *suit != Suit::No)
-            .max_by_key(|(suit, candidate)| (*suit, candidate.matched))
+            .max_by_key(|(suit, candidate)| (*suit, !candidate.clock_ahead, candidate.matched))
             .map(|(_, candidate)| candidate.id)
     }
 
@@ -776,7 +779,7 @@ impl Handoff {
 }
 
 /// Order voters for a handoff that is not a writer fault. A voter that suits a writer handoff
-/// comes first, then the longest matched log. A voter whose apply holds is never a target.
+/// comes first, then a voter whose clock a majority supports, then the longest matched log. A voter whose apply holds is never a target.
 fn rank(
     handoff: Option<&Handoff>,
     published: Option<Instant>,
@@ -787,7 +790,7 @@ fn rank(
         .filter(|candidate| !handoff.is_some_and(|handoff| handoff.held(candidate.id)))
         .max_by_key(|candidate| {
             let suit = handoff.map_or(Suit::No, |handoff| handoff.suit(candidate, published));
-            (suit, candidate.matched)
+            (suit, !candidate.clock_ahead, candidate.matched)
         })
         .map(|candidate| candidate.id)
 }
@@ -812,10 +815,16 @@ impl Writer {
 }
 
 impl Node {
-    /// The voters other than this member, with their matched log and transport process.
+    /// The voters other than this member, with their matched log, transport process, and clock.
+    /// Raft election eligibility does not change: the clock only orders the targets.
     pub(in crate::node) fn handoff_candidates(&self) -> Vec<Candidate> {
         let id = self.options.id;
         let voters = self.raw.raft.prs().conf().voters();
+        let ahead = self
+            .writer
+            .as_ref()
+            .map(|writer| writer.clock.above())
+            .unwrap_or_default();
         self.raw
             .raft
             .prs()
@@ -825,6 +834,7 @@ impl Node {
                 id: peer,
                 matched: progress.matched,
                 process: self.raw.store().process(peer),
+                clock_ahead: ahead.contains(&peer),
             })
             .collect()
     }

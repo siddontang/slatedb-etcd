@@ -319,6 +319,38 @@ impl Clock {
         self.waiting.store(false, Ordering::Relaxed);
     }
 
+    /// The voters whose clock is above the `m`-th largest clock of the voters. The leader's own
+    /// clock is read now. A voter without a fresh sample is not in the set.
+    pub(in crate::node) fn above(&self) -> HashSet<u64> {
+        let held = self.voters.lock().unwrap();
+        let majority = held.voters.len() / 2 + 1;
+        let now = (self.mono_ms)();
+        let mut offsets: Vec<(u64, i64)> = held
+            .samples
+            .iter()
+            .filter(|(id, sample)| {
+                **id != held.me && held.voters.contains_key(id) && now - sample.at < FRESH_MS
+            })
+            .map(|(id, sample)| (*id, sample.low))
+            .collect();
+        if held.voters.contains_key(&held.me) {
+            offsets.push((held.me, (self.now_ms)() - now));
+        }
+        let me = held.me;
+        drop(held);
+        if offsets.len() < majority {
+            return HashSet::new();
+        }
+        let mut sorted: Vec<i64> = offsets.iter().map(|(_, offset)| *offset).collect();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        let mth = sorted[majority - 1];
+        offsets
+            .into_iter()
+            .filter(|(id, offset)| *id != me && *offset > mth)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
     /// The alarm of the clock checks: `behind`, `ahead`, or none.
     pub(in crate::node) fn alarm_name(&self) -> Option<&'static str> {
         if self.alarm.load(Ordering::Relaxed) {

@@ -463,3 +463,22 @@ async fn an_idle_leader_clock_advances_and_never_steps_back() {
     assert!(read(&gate) >= before + 3_000_000);
     db.close().await.unwrap();
 }
+
+/// The handoff set holds a voter whose clock is above the `m`-th largest clock. The leader reads
+/// its own clock now, so a fast leader never makes a correct voter suspect.
+#[test]
+fn only_a_voter_above_the_majority_clock_is_suspect() {
+    let (clock, time) = leader(&[1, 2, 3]);
+    assert!(reply(&clock, &time, 2, 0, 1));
+    assert!(reply(&clock, &time, 3, 20_000, 1));
+    assert_eq!(clock.above(), HashSet::from([3]));
+    // The leader is faster still. It and member 3 hold the two largest clocks, so no voter is
+    // above them, and the fast leader does not make member 2 suspect.
+    time.step(30_000);
+    assert!(clock.above().is_empty());
+    // With one sample of three voters, the leader and that peer are the majority.
+    let (clock, time) = leader(&[1, 2, 3]);
+    time.step(10_000);
+    assert!(reply(&clock, &time, 2, -10_000, 1));
+    assert!(clock.above().is_empty());
+}
