@@ -140,7 +140,9 @@ pub(super) fn recover(
 ) -> Result<Duration> {
     match classify(&error) {
         Fault::Fenced => {
-            // Two quick elections can open writers in reverse term order.
+            // Two quick elections can open writers in reverse term order. The step timer keeps
+            // running across this reopen on purpose, also across the bootstrap check of a
+            // fenced open: fences for 30 s are no durable progress. See `lead`.
             tracing::warn!(term, %error, "the shared writer was fenced; open it again");
             reopens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(Duration::ZERO)
@@ -212,6 +214,8 @@ struct Record {
     stalled: Option<Instant>,
     /// The start of the first due work that stalled since the last publication.
     stall_began: Option<Instant>,
+    /// The node asked the task to drop its stalled step. The end of the stall clears it.
+    restart: bool,
     /// The time of the newest fault, until this member's writer publishes again.
     mark: Option<Instant>,
     /// The time when this member's writer last created and announced a checkpoint.
@@ -223,6 +227,7 @@ impl Record {
     fn done(&mut self) {
         self.due = None;
         self.stalled = None;
+        self.restart = false;
     }
 
     /// Count a failure and return the wait before the next try. Only a publication starts a
@@ -273,8 +278,10 @@ impl Health {
         record.done();
     }
 
-    /// Ask the writer task to drop its stalled attempt and open the writer again.
+    /// Ask the writer task to drop its stalled attempt and open the writer again. The request
+    /// holds until the stall ends, so a task between two steps sees it at its next step.
     pub(super) fn restart(&self) {
+        self.record().restart = true;
         self.0.restart.send_modify(|restarts| *restarts += 1);
     }
 
@@ -498,6 +505,7 @@ impl TaskHealth {
         self.update(|record| {
             record.due = Some(Instant::now());
             record.stalled = None;
+            record.restart = false;
         });
     }
 
@@ -519,12 +527,17 @@ impl TaskHealth {
         });
     }
 
-    /// Wait until the node asks this task to drop its stalled attempt. A request from before
-    /// the call does not count.
+    /// Wait until the node asks this task to drop its stalled attempt. A request that the end
+    /// of the stall cleared does not count.
     pub(super) async fn restart_requested(&mut self) {
-        self.restart.borrow_and_update();
-        if self.restart.changed().await.is_err() {
-            std::future::pending::<()>().await;
+        loop {
+            self.restart.borrow_and_update();
+            if self.update(|record| record.restart) == Some(true) {
+                return;
+            }
+            if self.restart.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
         }
     }
 }

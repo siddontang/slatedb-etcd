@@ -18,7 +18,7 @@ pub(crate) struct FaultStore {
     pub release: Semaphore,
     /// Wakes stalled puts after a mode change.
     resumed: tokio::sync::Notify,
-    /// The delay of `DELAY_SST_GET`, in milliseconds.
+    /// The delay of `DELAY_SST_GET` and `DELAY_SHARED`, in milliseconds.
     delay_ms: std::sync::atomic::AtomicU64,
     /// The paths of puts and copy targets, and of reads, for access tests.
     pub written: std::sync::Mutex<std::collections::BTreeSet<String>>,
@@ -49,6 +49,9 @@ pub(crate) const STALL_BOOTSTRAP_READ: u8 = 13;
 pub(crate) const STALL_MANIFEST_READ: u8 = 14;
 /// Hold the next read of a manifest of the shared database until `release`.
 pub(crate) const PAUSE_MANIFEST_READ: u8 = 15;
+/// Delay every read and put of the shared objects, by 120 ms unless `set_delay` changes it, like
+/// the latency of S3.
+pub(crate) const DELAY_SHARED: u8 = 16;
 /// Report the next two SST reads as missing. A failed cache load in SlateDB falls back to one
 /// direct read, so only this mode fails a read that goes through the block cache.
 pub(crate) const LOSE_SST_TWICE: u8 = 10;
@@ -77,6 +80,14 @@ impl FaultStore {
     pub fn set_delay(&self, delay: std::time::Duration) {
         self.delay_ms
             .store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    /// Wait for the delay of `DELAY_SHARED` on a shared object.
+    async fn lag(&self, path: &Path) {
+        if self.mode.load(Ordering::SeqCst) == DELAY_SHARED && path.as_ref().contains("shared/") {
+            let delay = self.delay_ms.load(Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
     }
 
     /// Wait while the mode is `mode`.
@@ -130,6 +141,7 @@ impl ObjectStore for FaultStore {
     ) -> Result<PutResult> {
         self.written.lock().unwrap().insert(path.to_string());
         self.stall(path).await;
+        self.lag(path).await;
         if self.mode.load(Ordering::SeqCst) == FAIL_STATE_PUT && state(path) {
             self.entered.add_permits(1);
             return Err(error());
@@ -172,6 +184,7 @@ impl ObjectStore for FaultStore {
 
     async fn get_opts(&self, path: &Path, options: GetOptions) -> Result<GetResult> {
         self.read.lock().unwrap().insert(path.to_string());
+        self.lag(path).await;
         if path.as_ref().contains("shared/bootstrap") {
             self.hold(STALL_BOOTSTRAP_READ).await;
         }

@@ -104,15 +104,21 @@ impl Progress {
         self.inner.lock().unwrap().requested
     }
 
-    /// A publication served the requests that a pass took. A request that came later waits
-    /// from now.
-    fn served(&self) {
+    /// A pass ended. When it `covered` the requests that it took, a request that came later
+    /// waits from now. A pass that covered no request, for example one below the written batch,
+    /// keeps the wait of the pending request.
+    fn served(&self, covered: bool) {
         let mut inner = self.inner.lock().unwrap();
         let pending = inner.publish_through.is_some() || inner.republish;
-        inner.requested = pending.then(Instant::now);
+        if !pending {
+            inner.requested = None;
+        } else if covered {
+            inner.requested = Some(Instant::now());
+        }
     }
 
-    /// A new term starts the wait of the requests that an earlier term left.
+    /// A new writer starts the wait of the pending requests, so it has a whole interval to
+    /// reach them.
     fn rearm(&self) {
         let mut inner = self.inner.lock().unwrap();
         let pending = inner.publish_through.is_some() || inner.republish;
@@ -162,9 +168,8 @@ struct Demand<'a> {
 impl Demand<'_> {
     /// The pass published, or found nothing to publish.
     fn served(mut self) {
-        self.through = None;
-        self.republish = false;
-        self.progress.served();
+        let covered = self.through.take().is_some() || std::mem::take(&mut self.republish);
+        self.progress.served(covered);
     }
 }
 
@@ -407,7 +412,6 @@ impl Writer {
         self.term = term;
         let health = self.health.begin();
         self.handoff.lead(true);
-        self.progress.rearm();
         let (stop, stopped) = tokio::sync::watch::channel(false);
         self.stop = Some(stop);
         let task = lead(
@@ -709,6 +713,9 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
     } = leading;
     let current = || *leadership.borrow() == (true, term);
     let mut delay = Duration::ZERO;
+    // An open that a fence or a manifest race failed. The open step keeps its timer until an
+    // open succeeds, because these retries are no durable progress.
+    let mut fenced = false;
     loop {
         if !delay.is_zero() {
             tokio::select! {
@@ -722,8 +729,9 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         health.due();
         let checked = attempt(bootstrap_wait(&publisher.source), &mut stopped, &mut health);
         match checked.await {
-            // The open is a new step with its own timer.
-            Attempt::Done(Ok(None)) => health.progressed(),
+            // The open is a new step with its own timer, unless it retries a fenced open.
+            Attempt::Done(Ok(None)) if !fenced => health.progressed(),
+            Attempt::Done(Ok(None)) => {}
             Attempt::Done(Ok(Some(wait))) => {
                 health.done();
                 tracing::warn!(reason = %wait, "the shared writer waits for the bootstrap");
@@ -745,12 +753,14 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
             Attempt::Done(Ok(db)) => {
                 // The open wrote the manifest. The next step has its own timer.
                 health.progressed();
+                fenced = false;
                 Arc::new(db)
             }
             // A newer open fenced this one while the member still leads the same term.
             // Two opens can also race for the same manifest version. The open that loses must
             // read the new manifest and try again.
             Attempt::Done(Err(error)) if current() && !*stopped.borrow() => {
+                fenced = fault::classify(&error) == fault::Fault::Fenced;
                 delay = fault::recover(error, term, &health, &reopens)?;
                 continue;
             }
@@ -802,6 +812,7 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         // the overlay holds them.
         let mut publisher = publisher.clone();
         publisher.progress.reset(db.manifest().last_l0_seq());
+        publisher.progress.rearm();
         publisher.db = Some(db.clone());
         *open.lock().unwrap() = Some(db.clone());
         let progress = publisher.progress.clone();
@@ -1106,24 +1117,29 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
         demand.republish = progress.take_republish();
         if last <= published && !demand.republish {
             health.done();
-            demand.served();
-            // A request with no new checkpoint can wait for a stranded one.
+            // A request with no new checkpoint can wait for a stranded one. The request and
+            // its timer stay until the check finds the checkpoint or rules it out, so a hung or
+            // failing read of the check counts against the request.
             if requested.is_some() {
                 retry.now();
             }
-            if retry.due()
-                && !reannounce(
+            if retry.due() {
+                let checked = reannounce(
                     &admin,
                     &source,
                     &applied,
                     &mut retry,
                     &mut bootstrapped,
                     &events,
-                )
-                .await?
-            {
-                return Ok(());
+                );
+                match checked.await? {
+                    Recheck::Done => {}
+                    // The dropped demand gives the request back with its wait.
+                    Recheck::Failed => continue,
+                    Recheck::Closed => return Ok(()),
+                }
             }
+            demand.served();
             continue;
         }
         health.due();
@@ -1188,8 +1204,17 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
     }
 }
 
-/// Check the last announcement, and announce a stranded checkpoint. Return false when the node
-/// no longer takes events.
+/// The end of a `reannounce`.
+enum Recheck {
+    /// The check found and announced a checkpoint, or ruled one out.
+    Done,
+    /// The storage read failed. The retry stays due.
+    Failed,
+    /// The node no longer takes events.
+    Closed,
+}
+
+/// Check the last announcement, and announce a stranded checkpoint.
 ///
 /// A failed check keeps the retry due. A sent announcement stays due until applied state
 /// shows it, or until its base covers it.
@@ -1200,30 +1225,30 @@ async fn reannounce(
     retry: &mut Retry,
     bootstrapped: &mut bool,
     events: &mpsc::Sender<Event>,
-) -> Result<bool> {
+) -> Result<Recheck> {
     // A sent announcement counts when applied state shows it. Until then this publisher sends
     // its own checkpoint again. The usual case reads no storage.
     if let Some(id) = retry.awaiting {
         if *applied.announced.borrow() == Some(id.0) {
             retry.done();
-            return Ok(true);
+            return Ok(Recheck::Done);
         }
         let Some(accepted) = announce(events, id).await else {
-            return Ok(false);
+            return Ok(Recheck::Closed);
         };
         retry.sent(id, accepted);
-        return Ok(true);
+        return Ok(Recheck::Done);
     }
     let id = match stranded(admin, source, applied).await {
         Ok(Some(id)) => id,
         Ok(None) => {
             retry.done();
-            return Ok(true);
+            return Ok(Recheck::Done);
         }
         Err(error) => {
             tracing::warn!(%error, "cannot check for a stranded view checkpoint; retry");
             retry.again();
-            return Ok(true);
+            return Ok(Recheck::Failed);
         }
     };
     tracing::info!(checkpoint = %id.0, "announce a stranded view checkpoint");
@@ -1232,10 +1257,10 @@ async fn reannounce(
         *bootstrapped = true;
     }
     let Some(accepted) = announce(events, id).await else {
-        return Ok(false);
+        return Ok(Recheck::Closed);
     };
     retry.sent(id, accepted);
-    Ok(true)
+    Ok(Recheck::Done)
 }
 
 /// Send checkpoint `id` with its row `F` to the node for its announcement. Return whether Raft

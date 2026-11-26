@@ -257,6 +257,9 @@ pub(crate) struct Source {
     /// Tests: the next writer open fails with this error.
     #[cfg(test)]
     pub(crate) fail_writer: Mutex<Option<anyhow::Error>>,
+    /// Tests: each writer open fails with the error of this function.
+    #[cfg(test)]
+    pub(crate) fail_writers: Mutex<Option<fn() -> anyhow::Error>>,
 }
 
 /// The checkpoints that this member uses, and the ones that retention deletes.
@@ -491,6 +494,10 @@ impl Source {
         #[cfg(test)]
         if let Some(error) = self.fail_writer.lock().unwrap().take() {
             return Err(error);
+        }
+        #[cfg(test)]
+        if let Some(error) = *self.fail_writers.lock().unwrap() {
+            return Err(error());
         }
         Ok(Db::builder(self.state(), self.store.clone())
             .with_db_cache(self.cache.clone(), 0)
@@ -799,6 +806,8 @@ pub(crate) fn offline_source(
         fail_opens: Default::default(),
         #[cfg(test)]
         fail_writer: Default::default(),
+        #[cfg(test)]
+        fail_writers: Default::default(),
     }))
 }
 
@@ -1604,6 +1613,8 @@ impl StateMachine {
             fail_opens: Default::default(),
             #[cfg(test)]
             fail_writer: Default::default(),
+            #[cfg(test)]
+            fail_writers: Default::default(),
         });
         ensure!(
             state_root == source.state(),

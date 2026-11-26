@@ -491,11 +491,11 @@ async fn a_fenced_leader_opens_its_writer_again() {
 }
 
 /// The announcement events of a publisher. The test answers for the node.
-struct Announcements(mpsc::Receiver<Event>);
+pub(super) struct Announcements(pub(super) mpsc::Receiver<Event>);
 
 impl Announcements {
     /// Wait for the next announcement and reply whether Raft took it.
-    async fn next(&mut self, wait: Duration, accepted: bool) -> uuid::Uuid {
+    pub(super) async fn next(&mut self, wait: Duration, accepted: bool) -> uuid::Uuid {
         tokio::time::timeout(wait, async {
             loop {
                 if let Some(Event::ViewCheckpoint(id, _, reply)) = self.0.recv().await {
@@ -530,9 +530,22 @@ async fn stranded_checkpoint() -> (
     Announcements,
     uuid::Uuid,
 ) {
+    stranded_checkpoint_on(Arc::new(InMemory::new())).await
+}
+
+/// `stranded_checkpoint` over `store`.
+pub(super) async fn stranded_checkpoint_on(
+    store: Arc<dyn ObjectStore>,
+) -> (
+    StateMachine,
+    Handles,
+    mpsc::Sender<Event>,
+    Announcements,
+    uuid::Uuid,
+) {
     let options = voter_options(false);
     let mut state = StateMachine::open_shared(
-        Arc::new(InMemory::new()),
+        store,
         "root",
         "test",
         crate::state::StateCache::default(),
@@ -556,7 +569,7 @@ async fn stranded_checkpoint() -> (
     (state, handles, events, announcements, lost)
 }
 
-const STRANDED_AGE: Duration = Duration::from_millis(50);
+pub(super) const STRANDED_AGE: Duration = Duration::from_millis(50);
 
 fn clock() -> Clock {
     Clock::system(Duration::from_secs(5), None)
@@ -816,7 +829,7 @@ async fn a_manual_checkpoint_requests_its_publication_after_apply() {
 }
 
 /// Apply announcement `id` at the next index and switch to its base.
-async fn adopt_announced(state: &mut StateMachine, id: uuid::Uuid) {
+pub(super) async fn adopt_announced(state: &mut StateMachine, id: uuid::Uuid) {
     let index = state.applied + 1;
     state
         .apply_view_checkpoint(index, &id.to_string(), 0)

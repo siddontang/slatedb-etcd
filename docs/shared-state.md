@@ -710,10 +710,17 @@ Due storage work that makes no durable progress for 30 s also counts. Each step 
 task has its own timer: the read of the bootstrap marker and claim, the open, the first reads
 of the publisher, a flush, a checkpoint, and its read back. A step that ends restarts the timer
 for the next one. A failure or a restart stops the timer until the next try starts its I/O, so
-a long backoff is no stall. Without a running step, the timer starts when a flush reaches its
-age limit, or when a manual checkpoint, a snapshot, or a Defragment requests a publication. A
-request waits until a publication serves it. A buffered write before its age limit is not due.
-A pending snapshot restore is not a fault, because each member meets it.
+a long backoff is no stall. A fenced or racing open keeps the timer of the open across its
+retries until an open succeeds, because fences are no durable progress. One fence just before
+the limit can thus make the next try of that open stall early.
+
+Without a running step, the timer starts when a flush reaches its age limit, or when a manual
+checkpoint, a snapshot, or a Defragment requests a publication. A request keeps its wait until a
+publication covers it. A pass that covers no request keeps the wait, also one that finds no
+new checkpoint. The check for a stranded checkpoint that could serve the request counts against
+it. Each new writer starts the wait again, so it has a whole interval to reach the request. A
+buffered write before its age limit is not due. A pending snapshot restore is not a fault,
+because each member meets it.
 
 The leader hands its lead to another voter after three faults in a row, after one data fault,
 or after 30 s without durable progress. The target is the voter with the longest matched log

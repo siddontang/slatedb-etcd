@@ -4,8 +4,8 @@
 use super::super::tests::{eventually, status};
 use super::*;
 use crate::object::faults::{
-    FaultStore, CORRUPT_MANIFEST, FAIL_PUT, FAIL_STATE_PUT, PAUSE_MANIFEST_READ, PAUSE_PUT,
-    STALL_BOOTSTRAP_READ, STALL_MANIFEST_READ, STALL_STATE_PUT,
+    FaultStore, CORRUPT_MANIFEST, DELAY_SHARED, FAIL_PUT, FAIL_STATE_PUT, PAUSE_MANIFEST_READ,
+    PAUSE_PUT, STALL_BOOTSTRAP_READ, STALL_MANIFEST_READ, STALL_STATE_PUT,
 };
 use crate::proto::etcdserverpb::{
     kv_client::KvClient, maintenance_client::MaintenanceClient, MoveLeaderRequest, PutRequest,
@@ -1511,7 +1511,9 @@ async fn one_voter_publishes_within_a_backoff_after_a_long_outage() {
         health(&failing)["faults"],
         health(&failing)["consecutive_failures"]
     );
-    faults.set(0);
+    // The store recovers with the latency of S3, so each step spans several ticks.
+    faults.set_delay(Duration::from_millis(150));
+    faults.set(DELAY_SHARED);
     until(
         "a publication after the outage",
         RETRY_CAP + Duration::from_secs(10),
@@ -1540,8 +1542,10 @@ async fn the_last_leader_publishes_within_a_backoff_after_a_long_outage() {
     assert!(failures >= Some(6), "{failures:?}");
     // The 30 s waits of the backoff are no stall.
     assert_eq!(health(&failing)["stalled"], false);
+    // The store recovers with the latency of S3, so each step spans several ticks.
     for id in 1..=3 {
-        cluster.fault(id).set(0);
+        cluster.fault(id).set_delay(Duration::from_millis(150));
+        cluster.fault(id).set(DELAY_SHARED);
     }
     until(
         "a publication after the outage",
@@ -1555,4 +1559,181 @@ async fn the_last_leader_publishes_within_a_backoff_after_a_long_outage() {
     .await;
     cluster.all_up().await;
     cluster.shutdown().await;
+}
+
+/// A publication request for a batch that the materializer has not written stays pending. Each
+/// pass that serves nothing keeps the wait of the request, so the watchdog fires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_above_the_written_batch_keeps_its_timer() {
+    let store = Arc::new(InMemory::new());
+    let mut leader = Leader::open(store, Duration::from_millis(100), clock()).await;
+    leader.lead(2);
+    leader.covered(1, Duration::from_secs(10)).await;
+    // Answer each announcement, so the publisher keeps making passes.
+    let (_, idle) = mpsc::channel(1);
+    let mut announced = std::mem::replace(&mut leader.announced, idle);
+    let passes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let answered = passes.clone();
+    tokio::spawn(async move {
+        while let Some(event) = announced.recv().await {
+            if let Event::ViewCheckpoint(_, _, Some(reply)) = event {
+                answered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let _ = reply.send(true);
+            }
+        }
+    });
+    let requested = Instant::now();
+    let through = leader.state.applied + 1;
+    let writer = leader.writer.as_ref().unwrap();
+    writer.progress.request(through);
+    until("the stall", STALL + Duration::from_secs(5), async || {
+        // Wake the publisher, as later writes and requests do.
+        writer.progress.wake.notify_one();
+        writer.health.check(writer.waiting())
+    })
+    .await;
+    assert!(requested.elapsed() >= STALL);
+    // The publisher kept announcing in that time, so its passes did not reset the wait.
+    assert!(passes.load(std::sync::atomic::Ordering::Relaxed) > 5);
+    leader.close().await;
+}
+
+/// Opens that lose the manifest race again and again make no durable progress, also when each
+/// bootstrap check succeeds. The open step keeps its timer, so the watchdog fires, and a
+/// restart counts as a fault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_open_conflicts_raise_the_stall() {
+    let store = Arc::new(InMemory::new());
+    let mut leader = Leader::open(store, Duration::from_millis(100), clock()).await;
+    let conflict = || slatedb::Error::data("version already exists".into()).into();
+    *leader.handles.source.fail_writers.lock().unwrap() = Some(conflict);
+    leader.lead(2);
+    let health = leader.writer().health.clone();
+    let started = Instant::now();
+    until("the stall", STALL + Duration::from_secs(5), async || {
+        health.check(None)
+    })
+    .await;
+    assert!(started.elapsed() >= STALL - Duration::from_secs(1));
+    assert!(
+        leader
+            .writer()
+            .reopens
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 10
+    );
+    health.restart();
+    eventually("the restart", async || health.consecutive() > 0).await;
+    *leader.handles.source.fail_writers.lock().unwrap() = None;
+    leader.covered(1, Duration::from_secs(10)).await;
+    leader.close().await;
+}
+
+/// A request is overdue when the writer opens again. The new writer gets a whole interval to
+/// reach it. A writer that still cannot serve it in that interval trips the watchdog, and the
+/// request is served once its batch arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_writer_gets_a_fresh_interval_for_a_request() {
+    let store = Arc::new(InMemory::new());
+    let mut leader = Leader::open(store, Duration::from_millis(100), clock()).await;
+    leader.lead(2);
+    leader.covered(1, Duration::from_secs(10)).await;
+    let through = leader.state.applied + 1;
+    let writer = leader.writer.as_ref().unwrap();
+    writer.progress.request(through);
+    writer.progress.inner.lock().unwrap().requested =
+        Some(Instant::now() - STALL - Duration::from_secs(1));
+    let old = writer.open.lock().unwrap().clone().unwrap();
+    // The node asks for the restart on each tick, as for a stall with no target, until the
+    // task drops its step.
+    let before = writer.health.consecutive();
+    eventually("the restart", async || {
+        let restarted = writer.health.consecutive() > before;
+        if !restarted {
+            writer.health.restart();
+        }
+        restarted
+    })
+    .await;
+    let reopened = async || {
+        let open = writer.open.lock().unwrap().clone();
+        open.is_some_and(|open| !Arc::ptr_eq(&open, &old))
+    };
+    eventually("the replacement writer", reopened).await;
+    assert!(!writer.health.check(writer.waiting()));
+    let started = Instant::now();
+    until("the stall", STALL + Duration::from_secs(5), async || {
+        writer.progress.wake.notify_one();
+        writer.health.check(writer.waiting())
+    })
+    .await;
+    assert!(started.elapsed() >= STALL - Duration::from_secs(1));
+    assert_eq!(leader.put("late").await, through);
+    leader.covered(through, Duration::from_secs(10)).await;
+    let writer = leader.writer.as_ref().unwrap();
+    eventually("the served request", async || {
+        writer.progress.requested().is_none()
+    })
+    .await;
+    leader.close().await;
+}
+
+/// The requested index is in a stranded checkpoint. The request stays until the check finds
+/// that checkpoint, and its announcement serves the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stranded_checkpoint_serves_a_request() {
+    use super::super::tests::{stranded_checkpoint_on, STRANDED_AGE};
+    let (state, handles, events, mut announcements, lost) =
+        stranded_checkpoint_on(Arc::new(InMemory::new())).await;
+    let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+    writer.request_publication(1);
+    writer.sync(true, 3, &events);
+    let announced = tokio::time::timeout(Duration::from_secs(10), announcements.0.recv());
+    let Some(Event::ViewCheckpoint(id, _, Some(reply))) = announced.await.unwrap() else {
+        panic!("no announcement");
+    };
+    assert_eq!(id, lost);
+    assert!(
+        writer.progress.requested().is_some(),
+        "the check dropped the request"
+    );
+    reply.send(true).unwrap();
+    eventually("the served request", async || {
+        writer.progress.requested().is_none()
+    })
+    .await;
+    writer.sync(false, 3, &events);
+    writer.stop().await;
+    state.close().await.unwrap();
+}
+
+/// The check for a stranded checkpoint hangs on a manifest read while a request waits. The read
+/// counts against the request, so the watchdog fires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hung_stranded_check_trips_the_request_timer() {
+    use super::super::tests::{adopt_announced, stranded_checkpoint_on, STRANDED_AGE};
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let (mut state, handles, events, mut announcements, lost) =
+        stranded_checkpoint_on(faults.clone()).await;
+    let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+    writer.sync(true, 3, &events);
+    assert_eq!(
+        announcements.next(Duration::from_secs(10), true).await,
+        lost
+    );
+    adopt_announced(&mut state, lost).await;
+    // The publisher sees the announcement applied at its next check.
+    tokio::time::sleep(RETRY_MAX + Duration::from_millis(500)).await;
+    faults.set(STALL_MANIFEST_READ);
+    let requested = Instant::now();
+    writer.request_publication(1);
+    until("the stall", STALL + Duration::from_secs(5), async || {
+        writer.health.check(writer.waiting())
+    })
+    .await;
+    assert!(requested.elapsed() >= STALL - Duration::from_secs(1));
+    faults.set(0);
+    writer.sync(false, 3, &events);
+    writer.stop().await;
+    state.close().await.unwrap();
 }
