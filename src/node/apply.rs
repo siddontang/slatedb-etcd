@@ -379,7 +379,7 @@ impl Executor {
                 Output::Entries(Vec::new())
             }
             Job::AdoptBase { base, term } => {
-                self.state.adopt_opened(base, term).await?;
+                self.adopt_retrying(base, term).await?;
                 Output::Adopted(self.state.members.conf())
             }
             Job::RaiseBase(snapshot) => {
@@ -387,7 +387,7 @@ impl Executor {
                 Output::Entries(Vec::new())
             }
             Job::Snapshot(snapshot) => {
-                self.state.install_snapshot(&snapshot).await?;
+                self.install_retrying(&snapshot).await?;
                 // An object snapshot replaces the database. The node rebinds its handles.
                 Output::Snapshot(Rebound {
                     db: self.state.database(),

@@ -476,6 +476,22 @@ impl StateMachine {
         reads: StateView,
         shared: Option<shared::Shared>,
     ) -> Result<Self> {
+        let shared_mode = shared.is_some();
+        let mut state = Self::load_rows(db, admin, location, rows, reads, shared_mode).await?;
+        state.shared = shared;
+        Ok(state)
+    }
+
+    /// Build the derived state from `reads` without the shared-mode overlay. The caller adds
+    /// it. `shared_mode` skips the cluster quota, which only replicated mode stores.
+    async fn load_rows(
+        db: Option<Arc<Db>>,
+        admin: Arc<slatedb::admin::Admin>,
+        location: Arc<transfer::Location>,
+        rows: Arc<rows::RowCache>,
+        reads: StateView,
+        shared_mode: bool,
+    ) -> Result<Self> {
         let applied = decode_applied(reads.get(APPLIED).await?)?;
         let applied_term = read_applied_term(&reads, applied).await?;
         let revision = read_revision(&reads).await?;
@@ -499,9 +515,9 @@ impl StateMachine {
         // A shared base from an older binary has only the total in `shared::LOGICAL_BYTES`, and
         // its apply marker is past any counter row, so the open counts the split again.
         let logical_bytes = load_logical_size(&reads, applied).await?;
-        let (cluster_quota, quota_boundary) = match &shared {
-            Some(_) => (None, 0),
-            None => quota::load(&reads).await?,
+        let (cluster_quota, quota_boundary) = match shared_mode {
+            true => (None, 0),
+            false => quota::load(&reads).await?,
         };
         Ok(Self {
             members: Arc::new(members),
@@ -537,7 +553,7 @@ impl StateMachine {
             members_mismatch: None,
             members_checked: None,
             reads,
-            shared,
+            shared: None,
         })
     }
 

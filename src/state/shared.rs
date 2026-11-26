@@ -20,6 +20,7 @@ use super::overlay::Overlay;
 use super::view::{Base, SharedView, StateView};
 use super::*;
 
+mod adopt;
 mod restore;
 #[cfg(test)]
 pub(super) mod tests;
@@ -1605,104 +1606,6 @@ impl StateMachine {
         }
     }
 
-    /// Make `base` the state at its index `F` and drop the overlay. The Raft log must already
-    /// hold the matching boundary: a received snapshot, or a log that covers `F`.
-    ///
-    /// `term` is the Raft term at `F` when the caller knows it. A known checkpoint term must
-    /// match it.
-    pub(crate) async fn adopt_base(&mut self, base: Arc<Base>, term: u64) -> Result<()> {
-        let mut shared = self
-            .shared
-            .take()
-            .context("adopt needs shared state mode")?;
-        shared.reset(base);
-        let reads = shared.live();
-        let rows = Arc::new(rows::RowCache::new(self.location.cache.row_bytes));
-        let result = Self::load(
-            None,
-            self.admin.clone(),
-            self.location.clone(),
-            rows,
-            reads,
-            Some(shared),
-        )
-        .await;
-        let mut next = result?;
-        if next.applied_term != 0 && term != 0 {
-            ensure!(
-                next.applied_term == term,
-                "checkpoint term {} differs from Raft term {term}",
-                next.applied_term
-            );
-        }
-        if next.applied_term == 0 {
-            next.applied_term = term;
-            next.entry_term = term;
-        }
-        next.metrics = self.metrics.clone();
-        next.quota = self.quota;
-        next.quota_flag = self.quota_flag;
-        // A base before the seed has no row. The bootstrap membership then stays in memory.
-        if next.members_row.is_none() {
-            next.members = self.members.clone();
-        }
-        next.write_batches = self.write_batches;
-        next.row_marker = self.row_marker.take();
-        // The new rows reach watchers through storage catch-up.
-        next.watch_capture = self.watch_capture.take();
-        if let Some(capture) = &mut next.watch_capture {
-            capture.invalidate();
-        }
-        *self = next;
-        self.plan_compaction();
-        Ok(())
-    }
-
-    /// Rebuild the state from the newest checkpoint at or below `limit` after a missing object.
-    /// The caller replays the local log from the new `applied` to `limit`.
-    ///
-    /// The log can start above the newest checkpoint row: a member truncates through its base
-    /// index. If no newer checkpoint reaches that index, the rebase opens the current base again
-    /// and raises it to its index. `term` gives the Raft term at an index of the local log.
-    pub(crate) async fn rebase(
-        &mut self,
-        limit: u64,
-        term: impl FnOnce(u64) -> Result<u64>,
-    ) -> Result<()> {
-        let shared = self
-            .shared
-            .as_ref()
-            .context("rebase needs shared state mode")?;
-        let (current, row, index) = (
-            shared.base.checkpoint,
-            shared.base.applied,
-            shared.base_index,
-        );
-        let newest = newest_base_through(&self.admin, &shared.source, limit).await?;
-        let base = match (newest, current) {
-            (Some(base), _) if base.applied >= index => base,
-            (_, Some(current)) if index > row => {
-                reopen_above_row(&self.admin, &shared.source, current, Some(row), index).await?
-            }
-            (Some(base), _) => base,
-            (None, _) => {
-                bail!("the shared state has no view checkpoint at or below the rebase index")
-            }
-        };
-        tracing::warn!(
-            base = base.applied,
-            index,
-            applied = self.applied,
-            "rebase on a new checkpoint"
-        );
-        let extend = index > row && (row..index).contains(&base.applied);
-        self.adopt_base(base, 0).await?;
-        if extend {
-            self.extend_base(index, term(index)?)?;
-        }
-        Ok(())
-    }
-
     /// Store a batch that holds only the apply marker and the counters at the applied index.
     /// The next checkpoint then has its row at that index. An earlier binary installs a view
     /// snapshot only at its checkpoint row, and a leader uses this for such a member. The batch
@@ -1745,60 +1648,6 @@ impl StateMachine {
         self.entry_term = term;
         self.durable_applied = index;
         Ok(())
-    }
-
-    /// Adopt the opened base above the applied index. A paused member uses this when its log
-    /// commits the base index, so the Raft log needs no change. `term` is the log term there.
-    pub(crate) async fn adopt_opened(&mut self, base: Arc<Base>, term: u64) -> Result<()> {
-        ensure!(base.applied > self.applied, "the opened base is not ahead");
-        self.adopt_base(base, term).await
-    }
-
-    /// Install a format 6 snapshot: the checkpoint that Raft sent. The receive handler opened it.
-    pub(crate) async fn install_view(
-        &mut self,
-        descriptor: transfer::ViewDescriptor,
-        index: u64,
-        term: u64,
-    ) -> Result<()> {
-        let shared = self
-            .shared
-            .as_ref()
-            .context("a format 6 snapshot needs shared state mode")?;
-        let id = descriptor.checkpoint()?;
-        // Release the receipt on every path, also for a snapshot that applies nothing.
-        let received = shared.source.take_received(id);
-        if index <= self.applied {
-            // The member applied past the record, so it installs nothing. The checkpoint holds
-            // the state at `index`, so it can still raise the base there. The base index then
-            // stays at or above the record index.
-            if index > shared.base_index {
-                let base = match received {
-                    _ if shared.base.checkpoint == Some(id) => Ok(shared.base.clone()),
-                    Some(base) => Ok(base),
-                    None => shared.source.open_base(id).await,
-                };
-                match base {
-                    Ok(base) => shared.opened.offer(base, index),
-                    Err(error) => tracing::warn!(%error, %id, "cannot open a received checkpoint"),
-                }
-            }
-            return Ok(());
-        }
-        let base = match received {
-            Some(base) => base,
-            None => shared.source.open_base(id).await?,
-        };
-        // The record index can be above the checkpoint row: the leader certified that no entry
-        // in between changed state. The record gives the term at its own index only.
-        ensure!(
-            base.applied <= index,
-            "checkpoint index {} is above snapshot index {index}",
-            base.applied
-        );
-        let row_term = if base.applied == index { term } else { 0 };
-        self.adopt_base(base, row_term).await?;
-        self.extend_base(index, term)
     }
 
     /// The format 6 snapshot of the current base: its index, data, and ConfState. `None` before

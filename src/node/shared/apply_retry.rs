@@ -104,12 +104,64 @@ impl Executor {
             match retryable(&error) {
                 Some(StorageFault::Missing) if self.log.is_some() => {
                     tracing::warn!(%error, "an apply read lost its checkpoint object");
-                    Box::pin(self.rebase(header, self.state.applied)).await?;
+                    self.rebase_retrying(header, self.state.applied).await?;
                 }
                 Some(StorageFault::Transient) => {}
                 _ => return Err(error),
             }
             retry.wait(&mut self.stop, &error).await?;
+        }
+    }
+
+    /// Rebase the state at `applied`. A failed load leaves the state as it was, and a failed
+    /// replay leaves a state below `applied`. Both run the rebase again after a storage error
+    /// of a read. See `StateMachine::adopt_base`.
+    async fn rebase_retrying(&mut self, header: Header, applied: u64) -> Result<()> {
+        let mut retry = Retry::default();
+        loop {
+            let Err(error) = Box::pin(self.rebase(header, applied)).await else {
+                return Ok(());
+            };
+            if retryable(&error).is_none() {
+                return Err(error);
+            }
+            retry.wait(&mut self.stop, &error).await?;
+        }
+    }
+
+    /// Adopt an opened base. A transient storage error of the load leaves the state as it was,
+    /// so the adoption runs again.
+    pub(super) async fn adopt_retrying(
+        &mut self,
+        base: std::sync::Arc<crate::state::view::Base>,
+        term: u64,
+    ) -> Result<()> {
+        let mut retry = Retry::default();
+        loop {
+            match self.state.adopt_opened(base.clone(), term).await {
+                Err(error) if retryable(&error) == Some(StorageFault::Transient) => {
+                    retry.wait(&mut self.stop, &error).await?;
+                }
+                adopted => return adopted,
+            }
+        }
+    }
+
+    /// Install a snapshot. In shared mode a transient storage error of the base load leaves the
+    /// state as it was, so the install runs again. A replicated install is not staged, so its
+    /// errors stop apply.
+    pub(super) async fn install_retrying(&mut self, snapshot: &Snapshot) -> Result<()> {
+        let mut retry = Retry::default();
+        loop {
+            match Box::pin(self.state.install_snapshot(snapshot)).await {
+                Err(error)
+                    if self.state.is_shared()
+                        && retryable(&error) == Some(StorageFault::Transient) =>
+                {
+                    retry.wait(&mut self.stop, &error).await?;
+                }
+                installed => return installed,
+            }
         }
     }
 

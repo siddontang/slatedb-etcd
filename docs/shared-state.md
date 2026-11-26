@@ -698,6 +698,11 @@ at the applied index first. A shutdown ends the retry at once. A membership chan
 only after its batch is stored. Base readers stop after the retries of the member database, so
 a read fails instead of waiting forever. Corrupt data and invariant errors still stop apply.
 
+A rebase, the adoption of an opened base, and a snapshot install load the new base and check
+it first: the Auth store, the leases, the counters, and the members row. Only then does the
+member drop its overlay and its materializer queue. A failed read leaves the state as it was,
+and apply runs the step again after the same backoff.
+
 An early Put reply evaluates its entries before the state write, and they can be uncommitted. A
 storage error there does not retry, because a new leader can replace the entries. Early replies
 stop until apply passes those entries, and the entries apply on the committed path above.
