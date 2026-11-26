@@ -28,12 +28,36 @@ const MAX_LOCAL_READS: usize = 1024;
 
 pub const DEFAULT_WATCH_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Watch settings of a member. A zero limit means no limit, as in etcd.
+#[derive(Clone, Copy, Debug)]
+pub struct WatchOptions {
+    /// Interval between idle progress responses. Zero uses the default.
+    pub progress_interval: Duration,
+    /// Watchers across all streams of the member.
+    pub max_watchers: usize,
+    /// Watchers on one stream.
+    pub max_watchers_per_stream: usize,
+    /// Streams that read history for catch-up at the same time.
+    pub max_catch_ups: usize,
+}
+
+impl Default for WatchOptions {
+    fn default() -> Self {
+        Self {
+            progress_interval: DEFAULT_WATCH_PROGRESS_INTERVAL,
+            max_watchers: 0,
+            max_watchers_per_stream: 0,
+            max_catch_ups: 0,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Service {
     events: mpsc::Sender<Event>,
     read_admission: std::sync::Arc<admission::ReadAdmission>,
     revision_admission: std::sync::Arc<admission::ReadAdmission>,
-    watch_progress_interval: Duration,
+    watch: std::sync::Arc<watch::Limits>,
     forwarding: std::sync::Arc<forwarding::Forwarding>,
     /// Serializable point reads that run on the published applied view at once.
     local_reads: std::sync::Arc<tokio::sync::Semaphore>,
@@ -48,25 +72,25 @@ pub fn service(
     tokens: crate::auth::TokenIssuer,
     transport: crate::tls::Transport,
 ) -> anyhow::Result<axum::Router> {
-    service_with_watch_interval(
+    service_with_watch_options(
         member,
         events,
         peers,
         tokens,
         transport,
-        DEFAULT_WATCH_PROGRESS_INTERVAL,
+        WatchOptions::default(),
     )
 }
 
-pub(crate) fn service_with_watch_interval(
+pub(crate) fn service_with_watch_options(
     member: u64,
     events: mpsc::Sender<Event>,
     peers: &BTreeMap<u64, String>,
     tokens: crate::auth::TokenIssuer,
     transport: crate::tls::Transport,
-    interval: Duration,
+    watch: WatchOptions,
 ) -> anyhow::Result<axum::Router> {
-    Ok(Servers::new(member, events, peers, tokens, transport, interval)?.router())
+    Ok(Servers::new(member, events, peers, tokens, transport, watch)?.router())
 }
 
 /// The tonic servers for one member, configured once and shared by every listener.
@@ -92,9 +116,9 @@ impl Servers {
         peers: &BTreeMap<u64, String>,
         tokens: crate::auth::TokenIssuer,
         transport: crate::tls::Transport,
-        interval: Duration,
+        watch: WatchOptions,
     ) -> anyhow::Result<Self> {
-        let service = Service::new(member, events, peers, tokens, transport, interval)?;
+        let service = Service::new(member, events, peers, tokens, transport, watch)?;
         Ok(Self {
             cluster: cluster_server::ClusterServer::new(service.clone()),
             health: tonic_health::pb::health_server::HealthServer::new(service.clone()),
@@ -130,17 +154,13 @@ impl Service {
         peers: &BTreeMap<u64, String>,
         tokens: crate::auth::TokenIssuer,
         transport: crate::tls::Transport,
-        interval: Duration,
+        watch: WatchOptions,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             events,
             read_admission: std::sync::Arc::new(admission::ReadAdmission::reads()),
             revision_admission: std::sync::Arc::new(admission::ReadAdmission::barriers()),
-            watch_progress_interval: if interval.is_zero() {
-                DEFAULT_WATCH_PROGRESS_INTERVAL
-            } else {
-                interval.max(Duration::from_millis(100))
-            },
+            watch: std::sync::Arc::new(watch::Limits::new(watch)),
             forwarding: std::sync::Arc::new(forwarding::Forwarding::new(peers, transport)?),
             local_reads: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_LOCAL_READS)),
             member,

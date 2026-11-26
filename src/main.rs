@@ -137,6 +137,15 @@ struct Args {
     #[arg(long, alias = "experimental-watch-progress-notify-interval", default_value = "10s",
           value_parser = humantime::parse_duration)]
     watch_progress_notify_interval: std::time::Duration,
+    /// Watchers across all Watch streams of this member. Zero means no limit, as in etcd.
+    #[arg(long, default_value_t = 0)]
+    max_watchers: usize,
+    /// Watchers on one Watch stream. Zero means no limit, as in etcd.
+    #[arg(long, default_value_t = 0)]
+    max_watchers_per_stream: usize,
+    /// Watch streams that read history pages for catch-up at the same time. Zero means no limit.
+    #[arg(long, default_value_t = 0)]
+    max_watch_catch_ups: usize,
     /// Automatic snapshots also wait for this many appended log bytes. Zero uses only the entry interval.
     #[arg(long, default_value_t = slatedb_etcd::node::DEFAULT_SNAPSHOT_MIN_BYTES)]
     snapshot_min_bytes: u64,
@@ -339,7 +348,12 @@ async fn run(args: Args) -> Result<()> {
         },
         object_store: args.object_store.config()?,
         snapshot_every: args.snapshot_every,
-        watch_progress_notify_interval: args.watch_progress_notify_interval,
+        watch: slatedb_etcd::grpc::WatchOptions {
+            progress_interval: args.watch_progress_notify_interval,
+            max_watchers: args.max_watchers,
+            max_watchers_per_stream: args.max_watchers_per_stream,
+            max_catch_ups: args.max_watch_catch_ups,
+        },
         snapshot_min_bytes: args.snapshot_min_bytes,
         log_file_bytes: args.log_file_bytes,
         log_memory: LogMemory {

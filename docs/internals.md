@@ -341,7 +341,8 @@ journal from the newest pinned view. That scan runs in the stream task, not on t
 One scan page serves all such watchers of the stream and contains at most 32 revisions.
 Each delivered revision advances the watcher start revision, so the feed handoff has no duplicates.
 The output channel buffers 32 responses.
-Each stream supports at most 1,024 watches.
+Watcher counts have no limit by default, as in etcd. `--max-watchers`, `--max-watchers-per-stream`
+and `--max-watch-catch-ups` can bound the watchers and the concurrent history page reads.
 Automatic progress uses the configured progress interval, 10 seconds by default.
 A stream check runs at that interval, or every second if shorter. It sends automatic progress and
 rechecks token expiry.

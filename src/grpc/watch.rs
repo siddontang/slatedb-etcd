@@ -1,6 +1,7 @@
 use super::*;
 use crate::watch::{Batch, FeedState, PAGE_REVISIONS};
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 use tokio_stream::wrappers::ReceiverStream;
@@ -9,10 +10,58 @@ use watch_server::Watch;
 
 /// Longest interval between token expiry checks. Events do not use it.
 const CHECK_INTERVAL: Duration = Duration::from_secs(1);
-const MAX_WATCHERS: usize = 1024;
+
+/// The Watch limits of a member, shared by its streams. A zero limit means no limit.
+pub(crate) struct Limits {
+    progress_interval: Duration,
+    max_watchers: usize,
+    per_stream: usize,
+    watchers: AtomicUsize,
+    /// Permits for history reads of catch-up pages.
+    catch_ups: Option<tokio::sync::Semaphore>,
+}
+
+impl Limits {
+    pub(crate) fn new(options: WatchOptions) -> Self {
+        Self {
+            progress_interval: if options.progress_interval.is_zero() {
+                DEFAULT_WATCH_PROGRESS_INTERVAL
+            } else {
+                options.progress_interval.max(Duration::from_millis(100))
+            },
+            max_watchers: options.max_watchers,
+            per_stream: options.max_watchers_per_stream,
+            watchers: AtomicUsize::new(0),
+            catch_ups: (options.max_catch_ups > 0)
+                .then(|| tokio::sync::Semaphore::new(options.max_catch_ups)),
+        }
+    }
+
+    /// Count one more watcher of the member. `Err` means the member is at its limit.
+    fn admit(self: &Arc<Self>) -> Result<Option<Slot>, ()> {
+        if self.max_watchers == 0 {
+            return Ok(None);
+        }
+        if self.watchers.fetch_add(1, Ordering::Relaxed) >= self.max_watchers {
+            self.watchers.fetch_sub(1, Ordering::Relaxed);
+            return Err(());
+        }
+        Ok(Some(Slot(self.clone())))
+    }
+}
+
+/// One watcher counted against `Limits::max_watchers`.
+struct Slot(Arc<Limits>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.watchers.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 struct Watcher {
     _active: Option<crate::metrics::Active>,
+    _slot: Option<Slot>,
     /// The create request. `Stream` keeps its start revision in `start`.
     request: WatchCreateRequest,
     /// The next revision that this watcher can receive.
@@ -39,7 +88,7 @@ struct Stream {
     credentials: crate::auth::Credentials,
     meters: Option<Arc<crate::metrics::WatchMeters>>,
     state: watch::Receiver<FeedState>,
-    progress_interval: Duration,
+    limits: Arc<Limits>,
     checked_auth: Arc<crate::auth::Store>,
     position: i64,
     watchers: BTreeMap<i64, Watcher>,
@@ -75,7 +124,7 @@ impl Stream {
         credentials: crate::auth::Credentials,
         meters: Option<Arc<crate::metrics::WatchMeters>>,
         state: watch::Receiver<FeedState>,
-        progress_interval: Duration,
+        limits: Arc<Limits>,
     ) -> Self {
         let (position, checked_auth) = {
             let current = state.borrow();
@@ -87,7 +136,7 @@ impl Stream {
             credentials,
             meters,
             state,
-            progress_interval,
+            limits,
             checked_auth,
             position,
             watchers: BTreeMap::new(),
@@ -361,12 +410,23 @@ impl Stream {
     /// `None` serves unsynced watchers. `Some(goal)` serves every watcher at or below `goal`.
     /// Returns true while those watchers still need more pages.
     async fn catch_up(&mut self, through: Option<i64>) -> Result<bool, Status> {
-        let more = self.catch_up_page(through).await;
+        // A limited member reads history pages for a bounded number of streams at once. The
+        // wait holds no view, and the page returns the permit before it sends anything.
+        let limits = self.limits.clone();
+        let reading = match &limits.catch_ups {
+            Some(catch_ups) => Some(catch_ups.acquire().await.expect("never closed")),
+            None => None,
+        };
+        let more = self.catch_up_page(through, reading).await;
         self.unpin();
         more
     }
 
-    async fn catch_up_page(&mut self, through: Option<i64>) -> Result<bool, Status> {
+    async fn catch_up_page(
+        &mut self,
+        through: Option<i64>,
+        reading: Option<tokio::sync::SemaphorePermit<'_>>,
+    ) -> Result<bool, Status> {
         let state = self.current(through.is_none())?;
         let view = state.view.clone();
         let limit = through.map_or(view.revision, |t| t.min(view.revision));
@@ -407,7 +467,7 @@ impl Stream {
                     ..Default::default()
                 });
             }
-            drop((state, view));
+            drop((state, view, reading));
             for response in responses {
                 send(&self.tx, response).await?;
             }
@@ -494,7 +554,7 @@ impl Stream {
             }
         }
         // Release the view before any send. A slow client cannot hold the pin.
-        drop((reads, rows, state));
+        drop((reads, rows, state, reading));
         record_batch(bytes, prepared.len());
         for (id, response) in prepared {
             let watcher = self.watchers.get_mut(&id).expect("prepared watcher");
@@ -541,7 +601,7 @@ impl Stream {
             .filter(|(_, watcher)| {
                 watcher.request.progress_notify
                     && watcher.start.unwrap_or(next) == next
-                    && watcher.progress.elapsed() >= self.progress_interval
+                    && watcher.progress.elapsed() >= self.limits.progress_interval
             })
             .map(|(&id, _)| id)
             .collect();
@@ -578,10 +638,19 @@ impl Stream {
             "mvcc: watcher range is empty"
         } else if request.watch_id != 0 && self.watchers.contains_key(&request.watch_id) {
             "mvcc: duplicate watch ID provided on the WatchStream"
-        } else if self.watchers.len() >= MAX_WATCHERS {
+        } else if self.limits.per_stream > 0 && self.watchers.len() >= self.limits.per_stream {
             "watch limit exceeded"
         } else {
             ""
+        };
+        let slot = match reason {
+            "" => self.limits.admit(),
+            _ => Ok(None),
+        };
+        let reason = if slot.is_err() {
+            "watch limit exceeded"
+        } else {
+            reason
         };
         if reason.is_empty() && request.watch_id == 0 {
             while self.watchers.contains_key(&self.next_id) {
@@ -622,6 +691,7 @@ impl Stream {
                 .meters
                 .as_ref()
                 .map(|m| crate::metrics::Active::new(&m.watchers)),
+            _slot: slot.unwrap_or_default(),
             start: None,
             request,
             progress: tokio::time::Instant::now(),
@@ -793,10 +863,10 @@ impl Service {
             credentials,
             meters,
             changes.clone(),
-            self.watch_progress_interval,
+            self.watch.clone(),
         );
         // Automatic progress uses the configured interval. Token expiry needs at least 1 s.
-        let mut checks = tokio::time::interval(self.watch_progress_interval.min(CHECK_INTERVAL));
+        let mut checks = tokio::time::interval(self.watch.progress_interval.min(CHECK_INTERVAL));
         checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // A create waits here for the apply barrier. The stream keeps serving its watchers,
         // leader loss and checks, and reads the next request only after the create.
@@ -947,7 +1017,7 @@ mod tests {
                 Default::default(),
                 None,
                 changes,
-                DEFAULT_WATCH_PROGRESS_INTERVAL,
+                Arc::new(Limits::new(WatchOptions::default())),
             );
             Self {
                 _dir: dir,
@@ -1048,7 +1118,7 @@ mod tests {
             Default::default(),
             None,
             f.feed.subscribe(),
-            DEFAULT_WATCH_PROGRESS_INTERVAL,
+            f.stream.limits.clone(),
         );
         let queued = [f.put("k", "3").await, f.put("k", "4").await];
         f.watch(request(1, "k", 2)).await;
@@ -1295,6 +1365,105 @@ mod tests {
         f.close().await;
     }
 
+    fn limits(options: WatchOptions) -> Arc<Limits> {
+        Arc::new(Limits::new(options))
+    }
+
+    async fn refused(
+        stream: &mut Stream,
+        output: &mut mpsc::Receiver<Result<WatchResponse, Status>>,
+        id: i64,
+    ) {
+        stream.create(request(id, "k", 0)).await.unwrap();
+        let response = output.recv().await.unwrap().unwrap();
+        assert!(response.created && response.canceled);
+        assert_eq!(response.watch_id, -1);
+        assert_eq!(response.cancel_reason, "watch limit exceeded");
+    }
+
+    #[tokio::test]
+    async fn watcher_limits_refuse_creates_until_a_watcher_ends() {
+        let mut f = Fixture::new().await;
+        let shared = limits(WatchOptions {
+            max_watchers: 2,
+            ..Default::default()
+        });
+        f.stream = Stream::new(
+            f.stream.tx.clone(),
+            false,
+            Default::default(),
+            None,
+            f.feed.subscribe(),
+            shared.clone(),
+        );
+        let (tx, mut output) = mpsc::channel(16);
+        let mut other = Stream::new(
+            tx,
+            false,
+            Default::default(),
+            None,
+            f.feed.subscribe(),
+            shared.clone(),
+        );
+        f.watch(request(1, "k", 0)).await;
+        f.watch(request(2, "k", 0)).await;
+        // The member limit counts the watchers of every stream.
+        refused(&mut other, &mut output, 1).await;
+        f.stream.cancel(1).await.unwrap();
+        assert!(f.responses()[0].canceled);
+        other.create(request(1, "k", 0)).await.unwrap();
+        assert!(!output.recv().await.unwrap().unwrap().canceled);
+        // A closed stream returns its watchers to the member.
+        drop(other);
+        f.watch(request(3, "k", 0)).await;
+        assert_eq!(shared.watchers.load(Ordering::Relaxed), 2);
+
+        // The stream limit counts only its own watchers.
+        f.stream = Stream::new(
+            f.stream.tx.clone(),
+            false,
+            Default::default(),
+            None,
+            f.feed.subscribe(),
+            limits(WatchOptions {
+                max_watchers_per_stream: 1,
+                ..Default::default()
+            }),
+        );
+        f.watch(request(1, "k", 0)).await;
+        let Fixture { stream, output, .. } = &mut f;
+        refused(stream, output, 2).await;
+        f.close().await;
+    }
+
+    /// A stream waits for a history read permit without a view, and then catches up as before.
+    #[tokio::test]
+    async fn catch_up_waits_for_a_history_read_permit() {
+        let mut f = Fixture::new().await;
+        for n in 0..3 {
+            let batch = f.put("k", &n.to_string()).await;
+            f.stream.batch(&batch).await.unwrap();
+        }
+        let shared = limits(WatchOptions {
+            max_catch_ups: 1,
+            ..Default::default()
+        });
+        f.stream.limits = shared.clone();
+        let held = shared.catch_ups.as_ref().unwrap().try_acquire().unwrap();
+        let create = f.stream.create(request(1, "k", 2));
+        assert!(tokio::time::timeout(Duration::from_millis(100), create)
+            .await
+            .is_err());
+        let created = f.responses();
+        assert!(created.len() == 1 && created[0].created);
+        assert!(f.stream.unsynced());
+        drop(held);
+        f.stream.catch_up_all(None).await.unwrap();
+        assert_eq!(f.events(), vec![(1, 2, 0), (1, 3, 0), (1, 4, 0)]);
+        assert!(!f.stream.unsynced());
+        f.close().await;
+    }
+
     #[tokio::test]
     async fn compaction_cancels_historical_watchers() {
         let mut f = Fixture::new().await;
@@ -1448,7 +1617,7 @@ mod tests {
                 &Default::default(),
                 crate::auth::TokenIssuer::parse("simple").unwrap(),
                 Default::default(),
-                DEFAULT_WATCH_PROGRESS_INTERVAL,
+                WatchOptions::default(),
             )
             .unwrap()
             .router();

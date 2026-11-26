@@ -51,8 +51,8 @@ pub struct ServerConfig {
     pub peer_tls: crate::tls::Options,
     pub object_store: crate::object::Config,
     pub snapshot_every: u64,
-    /// Interval between idle Watch progress responses.
-    pub watch_progress_notify_interval: Duration,
+    /// Watch progress interval and limits.
+    pub watch: crate::grpc::WatchOptions,
     /// Automatic log truncation waits for this many appended log bytes.
     pub snapshot_min_bytes: u64,
     /// Size of one Raft log file.
@@ -131,7 +131,7 @@ impl ServerConfig {
             client_tls: crate::tls::Options::default(),
             peer_tls: crate::tls::Options::default(),
             object_store: crate::object::Config::Local,
-            watch_progress_notify_interval: crate::grpc::DEFAULT_WATCH_PROGRESS_INTERVAL,
+            watch: crate::grpc::WatchOptions::default(),
             snapshot_every: 10_000,
             snapshot_min_bytes: crate::node::DEFAULT_SNAPSHOT_MIN_BYTES,
             log_file_bytes: crate::storage::DEFAULT_LOG_FILE_BYTES,
@@ -342,7 +342,7 @@ impl Server {
             &config.peers,
             tokens,
             transport.clone(),
-            config.watch_progress_notify_interval,
+            config.watch,
         )?;
         let node = Node::open(
             NodeOptions {

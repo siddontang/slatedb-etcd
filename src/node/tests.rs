@@ -1573,7 +1573,7 @@ async fn forwarding_uses_live_membership_and_stops_with_its_owner() {
         &config.peers,
         crate::auth::TokenIssuer::parse("simple").unwrap(),
         config.transport.clone(),
-        crate::grpc::DEFAULT_WATCH_PROGRESS_INTERVAL,
+        Default::default(),
     )
     .unwrap();
     let mut node = Node::open_with_transport(config, events, Some(BTreeMap::new()))

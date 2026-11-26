@@ -80,6 +80,21 @@ Use `--watch-progress-notify-interval` to set the interval for idle watches with
 The default is 10 seconds. Zero selects the default. Positive values below 100 ms select 100 ms.
 For example, use `--watch-progress-notify-interval=200ms` for the upstream client examples.
 
+## Watch limits
+
+These limits are off by default, as in etcd. Zero means no limit.
+
+| Flag | Default | Meaning |
+| --- | ---: | --- |
+| `--max-watchers` | 0 | Watchers across all Watch streams of the member. |
+| `--max-watchers-per-stream` | 0 | Watchers on one Watch stream. |
+| `--max-watch-catch-ups` | 0 | Streams that read history pages for catch-up at once. |
+
+A create over a watcher limit gets a created and canceled response with watch ID -1 and the reason
+`watch limit exceeded`. The stream stays open. A stream over the catch-up limit waits for a turn
+before it reads its next history page. It holds no read view while it waits, and it gives up its
+turn before it sends the page.
+
 ## Storage and log memory
 
 | Flag | Default | Meaning |
