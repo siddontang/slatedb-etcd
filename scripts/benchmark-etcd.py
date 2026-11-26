@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 from reporting import write_report
-from rustfs_fixture import shared_args, shared_store, unique_prefix
+from rustfs_fixture import delete_prefix, shared_args, shared_store, unique_prefix
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -232,6 +232,10 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
                 process.wait()
             for log in logs:
                 log.close()
+            # The data directory goes away now, so the objects of the cluster go too.
+            if kind != "etcd" and members > 1 and getattr(args, "delete_prefixes", False) and \
+                    os.environ.get("SLATEDB_KEEP_DATA") != "1":
+                delete_prefix(prefix)
             if not sample["passed"]:
                 sample["logs"] = {p.name: p.read_text(errors="replace")[-4000:] for p in root.glob("*.log")}
         return sample
@@ -335,6 +339,8 @@ def object_store(args, kinds):
         args.s3_bucket = os.environ["SLATEDB_S3_TEST_BUCKET"]
         args.s3_endpoint = os.environ["SLATEDB_S3_TEST_ENDPOINT"]
         args.s3_allow_http = True
+        # The cluster objects on this RustFS server go with the cluster.
+        args.delete_prefixes = True
         yield store
 
 

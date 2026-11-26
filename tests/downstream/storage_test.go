@@ -82,6 +82,18 @@ func backend(t *testing.T, kind string) *clientv3.Client {
 			_, err = rand.Read(random)
 			require.NoError(t, err)
 			prefix := "downstream/" + hex.EncodeToString(random)
+			// Go removes the temporary directory after each test, also after a failure. After the
+			// members stop, remove the objects of the cluster too, unless SLATEDB_KEEP_DATA=1.
+			t.Cleanup(func() {
+				if os.Getenv("SLATEDB_KEEP_DATA") == "1" {
+					return
+				}
+				output, err := exec.Command("python3", "../../scripts/rustfs_fixture.py",
+					"--delete-prefix", prefix).CombinedOutput()
+				if err != nil {
+					t.Errorf("delete the RustFS prefix %s: %v: %s", prefix, err, output)
+				}
+			})
 			// This module cannot import the compat test package. Its flags copy `storeFlags` in
 			// tests/compat/compat_test.go and `shared_args` in scripts/rustfs_fixture.py.
 			flags := []string{"--state-mode", "shared", "--s3-bucket", bucket, "--s3-prefix", prefix,

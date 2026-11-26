@@ -23,7 +23,23 @@ Use `SLATEDB_ETCD_BINARY` for direct Go runs, or `--binary` for Python runners.
 A cluster of several members runs in shared state mode on RustFS, as production runs on S3.
 The runners start one pinned RustFS server and give each cluster its own S3 prefix. A runner reuses
 the server that `SLATEDB_S3_TEST_ENDPOINT` and the other fixture settings name. A single member
-keeps its state on the local disk. Run a direct Go test through the fixture:
+keeps its state on the local disk.
+
+A launcher deletes the prefix of a cluster when it deletes the local directories of that cluster:
+
+| Case | Local directories and S3 prefix |
+| --- | --- |
+| The cluster ends cleanly | Deleted |
+| A Go compat test fails, or `TestRobustness` runs | Kept |
+| A `harness.py bench` run fails | Kept |
+| A downstream, upstream, or benchmark cluster fails | Deleted, like its directories |
+| `SLATEDB_KEEP_DATA=1` | Kept |
+
+`harness.py` always keeps its run directory for the logs.
+The kept objects survive only as long as their server. A runner that starts its own server deletes
+the server data when the run ends, also the kept prefixes. A reused server, such as the one of
+`rustfs_fixture.py --env-file` or of a CI job, keeps them until that server stops.
+Run a direct Go test through the fixture:
 
 ```sh
 python3 scripts/rustfs_fixture.py -- sh -c 'cd tests/compat && go test -run TestDifferentialKV'

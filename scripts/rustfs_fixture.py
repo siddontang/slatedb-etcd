@@ -8,6 +8,7 @@ settings as shell exports for other terminals. The server deletes its objects wh
 """
 
 import argparse
+import base64
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
@@ -27,6 +28,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from xml.etree import ElementTree
+from xml.sax.saxutils import escape
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,8 +81,11 @@ def install(directory):
     return binary
 
 
-def signed_request(endpoint, method, path, access, secret, query=None, body=b"", timeout=10):
+def signed_request(endpoint, method, path, access, secret, query=None, body=b"", timeout=10,
+                   headers=None):
     """Send one request signed with AWS Signature Version 4, and return the response.
+
+    The request signs each header in `headers`, as well as the host, date, and content digest.
 
     Raise `urllib.error.HTTPError` for an error status, as `urllib.request.urlopen` does.
     """
@@ -90,9 +96,11 @@ def signed_request(endpoint, method, path, access, secret, query=None, body=b"",
     path = quote(path, "/")
     params = "&".join(f"{quote(k)}={quote(v)}" for k, v in sorted((query or {}).items()))
     digest = hashlib.sha256(body).hexdigest()
-    headers = f"host:{host}\nx-amz-content-sha256:{digest}\nx-amz-date:{timestamp}\n"
-    names = "host;x-amz-content-sha256;x-amz-date"
-    canonical = f"{method}\n{path}\n{params}\n{headers}\n{names}\n{digest}"
+    extra = {name.lower(): value for name, value in (headers or {}).items()}
+    signed = dict(extra, **{"host": host, "x-amz-content-sha256": digest, "x-amz-date": timestamp})
+    names = ";".join(sorted(signed))
+    lines = "".join(f"{name}:{signed[name]}\n" for name in sorted(signed))
+    canonical = f"{method}\n{path}\n{params}\n{lines}\n{names}\n{digest}"
     scope = f"{date}/us-east-1/s3/aws4_request"
     string = f"AWS4-HMAC-SHA256\n{timestamp}\n{scope}\n"
     string += hashlib.sha256(canonical.encode()).hexdigest()
@@ -103,7 +111,7 @@ def signed_request(endpoint, method, path, access, secret, query=None, body=b"",
     url = endpoint + path + (f"?{params}" if params else "")
     request = urllib.request.Request(url, data=body if method in ("PUT", "POST") else None,
                                      method=method, headers={
-        "x-amz-date": timestamp, "x-amz-content-sha256": digest,
+        **extra, "x-amz-date": timestamp, "x-amz-content-sha256": digest,
         "Authorization": f"AWS4-HMAC-SHA256 Credential={access}/{scope}, "
                          f"SignedHeaders={names}, Signature={signature}",
     })
@@ -222,13 +230,46 @@ def shared_args(prefix, env=None):
     return flags
 
 
+def delete_prefix(prefix, env=None):
+    """Delete each object under `prefix` on the server of `env`. Return the number of objects."""
+    env = os.environ if env is None else env
+    endpoint, bucket = env["SLATEDB_S3_TEST_ENDPOINT"], env["SLATEDB_S3_TEST_BUCKET"]
+    access, secret = env["AWS_ACCESS_KEY_ID"], env["AWS_SECRET_ACCESS_KEY"]
+    deleted = 0
+    while True:
+        # Each round lists the first keys that remain, so it needs no continuation token.
+        query = {"list-type": "2", "prefix": prefix.rstrip("/") + "/", "max-keys": "200"}
+        with signed_request(endpoint, "GET", "/" + bucket, access, secret, query) as response:
+            listing = ElementTree.fromstring(response.read())
+        keys = [element.text for element in listing.iter() if element.tag.rsplit("}")[-1] == "Key"]
+        if not keys:
+            return deleted
+        body = "".join(f"<Object><Key>{escape(key)}</Key></Object>" for key in keys)
+        body = f"<Delete><Quiet>true</Quiet>{body}</Delete>".encode()
+        md5 = base64.b64encode(hashlib.md5(body).digest()).decode()
+        # RustFS deletes the objects of a batch one by one, so the batch has a longer deadline.
+        with signed_request(endpoint, "POST", "/" + bucket, access, secret, {"delete": ""}, body,
+                            timeout=60, headers={"Content-MD5": md5}) as response:
+            result = ElementTree.fromstring(response.read())
+        errors = [element for element in result.iter() if element.tag.endswith("Error")]
+        if errors:
+            raise RuntimeError(f"RustFS did not delete {len(errors)} objects under {prefix}")
+        deleted += len(keys)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--env-file", type=Path, help="Write the server settings as shell exports")
+    parser.add_argument("--delete-prefix", metavar="PREFIX",
+                        help="Delete the objects of one cluster on the server of the environment")
     parser.add_argument("command", nargs="*", help="Command to run with the server environment")
     args = parser.parse_args()
+    if args.delete_prefix:
+        if args.env_file or args.command:
+            parser.error("--delete-prefix takes no command and no settings file")
+        delete_prefix(args.delete_prefix)
+        return
     # Stop the server on SIGTERM too.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     with shared_store():
