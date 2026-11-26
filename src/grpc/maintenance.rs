@@ -1,7 +1,6 @@
 use super::*;
 use crate::maintenance::Command;
 use serde_json::Value;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 impl Service {
@@ -139,13 +138,16 @@ impl maintenance_server::Maintenance for Service {
             ))
             .await
             .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?;
-        let backup = tokio::time::timeout(Duration::from_secs(10), rx)
+        let mut backup = tokio::time::timeout(Duration::from_secs(10), rx)
             .await
             .map_err(|_| Status::deadline_exceeded("etcdserver: maintenance timed out"))?
             .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?
             .map_err(|error| error.status())?;
-        let header = backup.header;
-        let stream = ReceiverStream::new(backup.chunks).map(move |chunk| match chunk {
+        let header = backup.header.take();
+        let chunks = futures::stream::unfold(backup, |mut backup| async move {
+            Some((backup.recv().await?, backup))
+        });
+        let stream = chunks.map(move |chunk| match chunk {
             Ok(chunk) => Ok(SnapshotResponse {
                 header,
                 remaining_bytes: chunk.remaining,

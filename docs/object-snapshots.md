@@ -146,8 +146,8 @@ bootstrap membership exists only in memory until then.
 
 - The legacy image format stays readable. A node never builds it for Raft any more.
 - Native backups and `Maintenance.Snapshot` stream a logical image from a pinned checkpoint.
-  The image has no size limit, but each row has a 64 MiB limit. In shared state mode, the image
-  is limited to 64 MiB. See [administration](administration.md#maintenance-and-storage).
+  The image has no size limit, but each row has a 64 MiB limit. A shared-mode backup streams a
+  pinned view with the same limits. See [administration](administration.md#maintenance-and-storage).
 - The HTTP copy reads one object at a time per request. It uses eight parallel copies.
 - A copy slower than the checkpoint lifetime fails. The next retry continues from copied SSTs.
 - Old binaries cannot install format 5. Upgrade followers first, as for earlier format changes.

@@ -64,6 +64,11 @@ impl Segment {
         self.last.store(seq, Ordering::Release);
     }
 
+    /// Key and value bytes of all versions.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
     /// The sequence of the newest batch, or zero for an empty segment.
     pub(crate) fn last(&self) -> u64 {
         self.last.load(Ordering::Acquire)
@@ -308,10 +313,7 @@ impl Overlay {
 
     /// Key and value bytes in the segments that the overlay still holds.
     pub(crate) fn bytes(&self) -> u64 {
-        self.segments
-            .iter()
-            .map(|segment| segment.bytes.load(Ordering::Relaxed))
-            .sum()
+        self.segments.iter().map(|segment| segment.bytes()).sum()
     }
 }
 

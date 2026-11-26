@@ -116,14 +116,19 @@ A member in shared state mode also exports these gauges. Replicated members omit
 | `slatedb_etcd_shared_writer_reopens` | Writer opens after a fence or a lost manifest race |
 | `slatedb_etcd_shared_view_checkpoints` | `view-` checkpoints after the last publication |
 | `slatedb_etcd_shared_clock_skew_milliseconds` | Local clock lag behind the writer clock |
+| `slatedb_etcd_shared_backup_streams` | Native backups that stream a pinned view |
+| `slatedb_etcd_shared_backup_retained_bytes` | Overlay bytes that the streaming backups pin |
 
 The member sets the first six gauges on each Raft tick. The leader sets the checkpoint count
-after each publication. The clock gauge changes at each writer open.
+after each publication. The clock gauge changes at each writer open. The backup gauges change
+when a backup starts or ends, and every 100 ms while one streams.
 
 - A base index that stops while the applied index grows means that no checkpoint reaches the
   member. Check S3 access and the leader's writer.
 - Overlay bytes near `--overlay-max-bytes` mean that checkpoints are slow. The leader then
   rejects proposals.
+- Backup bytes near `--overlay-max-bytes` mean that a backup client reads slowly. New backups then
+  fail, and the oldest one ends. See [backups](shared-state.md#backups).
 - A growing checkpoint count with `--view-retention off` means growing storage. See the manual
   cleanup in the guide.
 

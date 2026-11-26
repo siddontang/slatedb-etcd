@@ -60,7 +60,8 @@ The older restore rejects the row. Restore such a backup with the newer binary, 
 Do not copy a live `objects/` directory as a complete backup.
 Unflushed state can still depend on Raft logs. Native export preserves one applied state boundary.
 Backups stream from a pinned checkpoint with bounded memory. The image has no size limit, but each
-row has a 64 MiB limit. In shared state mode, a backup image is limited to 64 MiB.
+row has a 64 MiB limit. In shared state mode, a backup streams a pinned view with the same limits.
+A restore into shared mode accepts at most 64 MiB.
 
 ## Disk use and quota
 

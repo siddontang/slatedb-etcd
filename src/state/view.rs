@@ -69,6 +69,31 @@ impl Base {
             .with_db_cache(cache, 0)
             .build()
             .await?;
+        Self::of(reader, id).await
+    }
+
+    /// Open checkpoint `id` for one sequential scan, as a backup does. The reader keeps no
+    /// cache, and it ends a read after the retries of the member's database. The default
+    /// retries forever while a member pins the checkpoint.
+    pub(crate) async fn open_for_scan(
+        store: Arc<dyn slatedb::object_store::ObjectStore>,
+        root: &str,
+        id: uuid::Uuid,
+    ) -> anyhow::Result<Self> {
+        let reader = DbReader::builder(root.to_owned(), store)
+            .with_reader_mode(DbReaderMode::Checkpoint(id))
+            .with_options(DbReaderOptions {
+                skip_wal_replay: true,
+                object_store_max_retries: super::slatedb_settings().object_store_max_retries,
+                ..Default::default()
+            })
+            .with_db_cache_disabled()
+            .build()
+            .await?;
+        Self::of(reader, id).await
+    }
+
+    async fn of(reader: DbReader, id: uuid::Uuid) -> anyhow::Result<Self> {
         let applied = super::decode_applied(reader.get(super::APPLIED).await?)?;
         let manifest = reader.manifest();
         let l0 = manifest.l0().iter().map(|view| (view.sst.id, true));

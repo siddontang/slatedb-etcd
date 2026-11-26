@@ -653,6 +653,10 @@ impl Node {
                 writer.retention = options.view_retention;
                 writer.retained = Some(retained);
                 writer.gauges = Some(shared::Gauges::register(&state.metrics.registry)?);
+                if let Some(backups) = state.backups() {
+                    // Backups pin overlay segments on this member. See `state::backup::view`.
+                    backups.configure(options.overlay_max_bytes, &state.metrics.registry)?;
+                }
                 Some(writer)
             }
             None => None,

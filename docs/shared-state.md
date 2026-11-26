@@ -306,7 +306,7 @@ cluster with no leader therefore keep their checkpoints.
   stream (`ViewAck`). A long read or Watch scan on an old view therefore keeps its checkpoint.
 - A view can pin a checkpoint for at most `--view-pin-max` (default 5 minutes). After that the
   read fails with a retryable error, and a Watch stream resumes from its last delivered revision
-  on a new view.
+  on a new view. A native backup is the one exception. See [Backups](#backups).
 - The publisher keeps the two newest checkpoints and every checkpoint that a member reported in
   the last 10 minutes. It deletes the rest.
 - A member that has not reported for 10 minutes loses this protection. It can then hit a missing
@@ -317,6 +317,36 @@ cluster with no leader therefore keep their checkpoints.
 - `list_checkpoints` matches names exactly (`admin.rs:262-290`). The publisher lists all
   checkpoints and filters the `view-` prefix itself. It never deletes the compactor's
   checkpoints.
+
+## Backups
+
+A native backup (`Maintenance.Snapshot`) streams the image of one view. It creates no checkpoint.
+
+1. Apply pins the view at the covered index: the base and the overlay segments. It reads the
+   revision and the membership in memory. It then returns the stream at once.
+2. A task reads the view twice. The first pass counts the rows and checks that each row has at
+   most 64 MiB, before the first message. The second pass sends the rows in 64 KiB messages.
+3. The task reads the base through a reader of its own, without the member cache and with the
+   bounded retries of the member's database. A missing SST ends the stream with Unavailable.
+4. The pinned base keeps its checkpoint in `ViewAck`, so retention keeps it.
+
+The image holds the same bytes as the image of the pinned view in memory, plus its digest. It
+leaves out the derived rows and the cluster quota row, and it ends with the padded membership row.
+
+A backup view is exempt from `--view-pin-max`, because a large image streams for longer. Instead,
+the stream ends with Unavailable when the client takes no message for 60 s. The first pass does
+not count as idle time.
+
+A slow backup keeps the segments that later base switches release. Each member bounds this:
+
+- At most 4 backups stream at one time.
+- The segments that the backups pin count against `--overlay-max-bytes`. A segment that several
+  backups pin counts once.
+- A new backup above either limit fails with ResourceExhausted. Retry it later.
+- When pinned segments grow above the limit, the oldest backup ends with Unavailable
+  (`backup too slow`). Its pin and its share of the budget end at once. The client reads the
+  error before the messages that it did not read.
+- This budget does not change the write admission of the leader.
 
 ## Base switch
 
@@ -610,7 +640,7 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
 | Defragment | Leader only, because it needs the writer and compactor. Followers forward it |
 | Status `db_size` | Read from the view's manifest. All members report the same value |
 | HashKV and Hash | Computed from the view, as today from the local `Db` |
-| Backup export | Scan a view. It needs no flush, so any member can export |
+| Backup export | Stream a pinned view. It needs no flush, so any member can export |
 | Alarms and quota | Unchanged. The counter and the quota are cluster-wide |
 
 ## Failure cases
@@ -698,8 +728,9 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
   full overlay. Do not claim one-election failover before this passes.
 - **View age:** compare 10 s and 30 s under light writes and bursts. Choose the release default
   from follower peak memory, retained log bytes, S3 requests, compaction bytes, and write p99.
-- **Recovery:** restore a cluster after loss of the shared prefix at the target data size. The
-  native backup limit is 64 MiB today, so production use needs a larger backup path.
+- **Recovery:** restore a cluster after loss of the shared prefix at the target data size. A
+  backup has no image size limit. A restore into shared mode accepts at most 64 MiB today, so
+  production use needs a larger restore path.
 
 ## Decisions
 
