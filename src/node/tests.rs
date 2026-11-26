@@ -1534,6 +1534,96 @@ async fn independent_reads_pin_their_view_and_do_not_wait_for_apply() {
     );
 }
 
+/// A transient object-store error on an owner read fails only that read with a retryable
+/// status. The member keeps serving, and the same read then succeeds.
+#[tokio::test]
+async fn a_transient_read_error_fails_the_request_and_keeps_the_member() {
+    use crate::object::faults::{FaultStore, RETRYABLE_SST_GET};
+    use crate::proto::etcdserverpb::request_op::Request as Op;
+    let dir = tempfile::tempdir().unwrap();
+    let faults = std::sync::Arc::new(FaultStore::new(std::sync::Arc::new(
+        slatedb::object_store::memory::InMemory::new(),
+    )));
+    let mut node = leader_node_with(dir.path(), |config| {
+        config.object_store = crate::object::Config::Test(faults.clone(), "root".into());
+    })
+    .await;
+    async fn put(node: &mut Node, key: &[u8], value: &[u8]) {
+        let put = crate::proto::etcdserverpb::PutRequest {
+            key: key.to_vec(),
+            value: value.to_vec(),
+            ..Default::default()
+        };
+        let etcd = RequestOp {
+            request: Some(Op::RequestPut(put)),
+        };
+        let (tx, _) = oneshot::channel();
+        let id = format!("{}-{}", String::from_utf8_lossy(key), value.len());
+        node.propose(
+            RaftCommand::Etcd {
+                id,
+                origin: 1,
+                etcd,
+            },
+            tx,
+        )
+        .unwrap();
+        commit_with_peer(node).await;
+    }
+    // The first value fills its own SST block. A flush caches the blocks of current rows only,
+    // so a read of the first revision loads that block from the store.
+    let first = vec![b'a'; 16 * 1024];
+    put(&mut node, b"key", &first).await;
+    put(&mut node, b"key", b"second").await;
+    let memtable = slatedb::config::FlushOptions {
+        flush_type: slatedb::config::FlushType::MemTable,
+    };
+    let database = node.worker.database();
+    database.flush_with_options(memtable).await.unwrap();
+    // The view of a later apply no longer holds the flushed memtable.
+    put(&mut node, b"other", b"third").await;
+    let mut request = range_request();
+    if let Some(Op::RequestRange(range)) = &mut request.request {
+        range.revision = 2;
+    }
+    let read = |node: &mut Node| {
+        let (tx, reply) = oneshot::channel();
+        node.enqueue_query(Query::Read(request.clone(), None, ClientResponse::Kv(tx)));
+        reply
+    };
+    faults.set(RETRYABLE_SST_GET);
+    let reply = read(&mut node);
+    node.drive_ready().await.unwrap();
+    let output = node.read_executor.step().await.unwrap().unwrap();
+    node.complete_read(output).unwrap();
+    let error = reply
+        .await
+        .unwrap()
+        .unwrap()
+        .into_outcome()
+        .result
+        .unwrap_err();
+    assert_eq!(error.code, tonic::Code::Unavailable as i32, "{error:?}");
+
+    faults.set(0);
+    let reply = read(&mut node);
+    node.drive_ready().await.unwrap();
+    let output = node.read_executor.step().await.unwrap().unwrap();
+    node.complete_read(output).unwrap();
+    let Some(crate::proto::etcdserverpb::response_op::Response::ResponseRange(range)) = reply
+        .await
+        .unwrap()
+        .unwrap()
+        .into_outcome()
+        .result
+        .unwrap()
+        .response
+    else {
+        panic!("expected a range response");
+    };
+    assert_eq!(range.kvs[0].value, first);
+}
+
 #[tokio::test]
 async fn independent_read_jobs_and_queue_have_separate_bounds() {
     let dir = tempfile::tempdir().unwrap();

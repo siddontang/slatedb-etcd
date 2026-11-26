@@ -128,6 +128,16 @@ impl ReadView {
                     )),
                 }));
             }
+            // An unavailable object store fails only this read. The client retries. Data and
+            // decode errors still stop the member.
+            if error.transient() {
+                return Ok(Some(Outcome {
+                    result: Err(mvcc::KvError {
+                        code: tonic::Code::Unavailable as i32,
+                        message: error.message.clone(),
+                    }),
+                }));
+            }
             ensure!(
                 error.code != tonic::Code::Internal as i32,
                 "{}",

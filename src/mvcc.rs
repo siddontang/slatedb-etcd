@@ -50,6 +50,16 @@ impl KvError {
         Self::new(Code::Internal, &format!("storage error: {error}"))
     }
 
+    /// A storage error that SlateDB reports as unavailable: the object store still failed after
+    /// SlateDB's retries. A read leaves no uncertain state, so it fails only that read. Apply
+    /// paths keep the `Internal` code and stop.
+    pub(crate) fn transient(&self) -> bool {
+        self.code == Code::Internal as i32
+            && self
+                .message
+                .starts_with("etcdserver: storage error: Unavailable error: ")
+    }
+
     pub fn status(self) -> Status {
         Status::new(Code::from_i32(self.code), self.message)
     }
