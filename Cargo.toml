@@ -26,7 +26,7 @@ humantime = "2"
 jsonwebtoken = { version = "12", features = ["aws_lc_rs"] }
 clap = { version = "4", features = ["derive"] }
 raft = { git = "https://github.com/siddontang/raft-rs", branch = "codex/prost-0-14", default-features = false, features = ["prost-codec"] }
-raft-engine = { git = "https://github.com/siddontang/raft-engine", branch = "codex/cache-identity", default-features = false, features = ["prost-codec"] }
+raft-engine = { git = "https://github.com/tikv/raft-engine", rev = "32b68d36ca", default-features = false, features = ["prost-codec"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
