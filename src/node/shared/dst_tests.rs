@@ -147,22 +147,25 @@ impl Simulation {
         }
     }
 
-    /// Shared mode: compare the loaded fields of each member with the first member seen at its
-    /// index. A member that opens or installs a base above its row must equal one that applied.
-    pub(super) fn check_loaded(&mut self) {
-        if self.shared.is_none() {
-            return;
-        }
+    /// Shared mode: compare the loaded fields of each member with the in-memory reference at
+    /// its index. A member that opens or installs a base above its row must also equal it.
+    pub(super) fn check_loaded(&self) -> Result<(), String> {
+        let Some(reference) = self.reference.as_ref().filter(|_| self.shared.is_some()) else {
+            return Ok(());
+        };
         for (&id, node) in &self.nodes {
             let state = node.worker.state();
-            let fields = state.loaded_fields();
-            let first = self.loaded.entry(state.applied).or_insert(fields.clone());
-            assert_eq!(
-                *first, fields,
-                "seed {}: member {id} loaded other fields at {}",
-                self.seed, state.applied
-            );
+            let Some(expected) = reference.loaded(state.applied) else {
+                continue;
+            };
+            if state.loaded_fields() != *expected {
+                return Err(format!(
+                    "member {id} loaded other fields at {}",
+                    state.applied
+                ));
+            }
         }
+        Ok(())
     }
 
     /// Propose a Put on the leader that no client waits for. With `ignore_value` on a missing
@@ -717,7 +720,8 @@ async fn a_member_restarts_at_a_record_above_its_checkpoint_row() {
     let state = sim.nodes[&member].worker.state();
     assert_eq!((state.applied, state.applied_term), (c, term2));
     assert_eq!(state.base_checkpoint(), Some(x));
-    assert_eq!(Some(&state.loaded_fields()), sim.loaded.get(&c));
+    let reference = sim.reference.as_ref().unwrap();
+    assert_eq!(Some(&state.loaded_fields()), reference.loaded(c));
     sim.settle(4).await;
     sim.propose().await;
     sim.settle(4).await;

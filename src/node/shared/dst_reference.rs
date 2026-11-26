@@ -4,21 +4,29 @@ use super::*;
 
 /// The state that each member view must equal at its applied index.
 ///
-/// The reference applies each committed entry in order with `apply::apply_entries`, the apply
-/// function of the members. In shared mode it applies them to an in-memory state from
-/// `StateMachine::open_memory`. That state shares only the apply function with the members. It
-/// has no overlay, no base, no base switch, no materializer, and no checkpoint, so an error in
-/// that code of the members cannot also be in the reference.
+/// The reference applies each committed entry in order with `apply::apply_entries`. In shared
+/// mode it applies them to an in-memory state from `StateMachine::open_memory`. That state is a
+/// whole `StateMachine`, as in the members. It shares the apply rules with them: MVCC prepare,
+/// the lease and membership rules, the key index, and the size counters. It leaves out the
+/// storage side of shared mode: the overlay, the base and its switch, the materializer, and the
+/// checkpoints. So the view check finds an error in the storage side of the members. It does
+/// not check the apply rules, because the members and the reference use the same rules.
 ///
 /// A replicated state with no flags also applies each entry. Its quota flag disables the check,
 /// unlike the flag of any member. Replicated simulations use only this state, because their
 /// quota rules differ from shared mode. In shared mode the two states must have equal rows and
-/// equal loaded fields after each index, so an error in the in-memory state shows.
+/// equal loaded fields after each index. The replicated state has its own storage and the
+/// replicated branches of the apply rules, so the comparison finds an error in the in-memory
+/// state or in the shared branches of the rules.
 pub(super) struct Reference {
     memory: Option<StateMachine>,
     replicated: StateMachine,
     /// The indexes at which the in-memory state and the replicated state were equal.
     pub(super) compared: u64,
+    /// The compared entries of each kind. See `entry_kind`.
+    kinds: BTreeMap<String, u64>,
+    /// Shared mode: the loaded fields of the in-memory state after each index.
+    loaded: BTreeMap<u64, String>,
 }
 
 impl Reference {
@@ -30,10 +38,16 @@ impl Reference {
         } else {
             None
         };
+        let loaded = memory
+            .iter()
+            .map(|m| (m.applied, m.loaded_fields()))
+            .collect();
         Self {
             memory,
             replicated: StateMachine::open(dir).await.unwrap(),
             compared: 0,
+            kinds: BTreeMap::new(),
+            loaded,
         }
     }
 
@@ -41,7 +55,12 @@ impl Reference {
         self.replicated.applied
     }
 
-    /// Apply `entry`, the next committed entry. Return the digest of the `etcd/` rows after it.
+    /// The loaded fields of the in-memory state after `index`, in shared mode.
+    pub(super) fn loaded(&self, index: u64) -> Option<&String> {
+        self.loaded.get(&index)
+    }
+
+    /// Apply `entry`, the next committed entry. Return the digest of the rows after it.
     async fn apply(&mut self, entry: Entry) -> u32 {
         let header = Header {
             cluster: 0,
@@ -56,37 +75,102 @@ impl Reference {
         let Some(memory) = &mut self.memory else {
             return expected;
         };
+        let kind = entry_kind(&entry);
         apply::apply_entries(memory, vec![entry], header)
             .await
             .unwrap();
         let digest = rows_digest(memory.applied_state()).await.unwrap();
         let index = memory.applied;
         assert_eq!(digest, expected, "the reference rows differ at {index}");
+        let fields = memory.loaded_fields();
         assert_eq!(
-            memory.loaded_fields(),
+            fields,
             replicated.loaded_fields(),
             "the reference fields differ at {index}"
         );
+        self.loaded.insert(index, fields);
         self.compared += 1;
+        *self.kinds.entry(kind).or_default() += 1;
         digest
+    }
+
+    /// The compared entries of each kind, as `kind=count` items.
+    pub(super) fn kinds(&self) -> String {
+        let kinds = self
+            .kinds
+            .iter()
+            .map(|(kind, count)| format!("{kind}={count}"));
+        kinds.collect::<Vec<_>>().join(", ")
     }
 }
 
-/// The member state that one view check covered: the applied index and the base of the
-/// published view. A base switch changes the view but keeps the applied index.
+/// The kind of a committed entry: its command and the operation in it.
+fn entry_kind(entry: &Entry) -> String {
+    if entry.data.is_empty() {
+        return "empty".into();
+    }
+    if entry.entry_type == EntryType::EntryConfChange as i32 {
+        let change = raft::eraftpb::ConfChange::decode(entry.data.as_slice()).unwrap();
+        let command = RaftCommand::decode(&change.context).unwrap();
+        return format!(
+            "conf change {:?} {}",
+            change.change_type(),
+            command_kind(&command)
+        );
+    }
+    command_kind(&RaftCommand::decode(&entry.data).unwrap())
+}
+
+fn command_kind(command: &RaftCommand) -> String {
+    // The name of an enum variant is the start of its debug text.
+    let variant = |value: &dyn std::fmt::Debug| {
+        let text = format!("{value:?}");
+        text.split([' ', '(', '{'])
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    match command {
+        RaftCommand::Etcd { etcd, .. } => match &etcd.request {
+            Some(Op::RequestPut(_)) => "put".into(),
+            Some(Op::RequestTxn(_)) => "txn".into(),
+            Some(Op::RequestDeleteRange(_)) => "delete range".into(),
+            Some(Op::RequestRange(_)) => "range".into(),
+            None => "etcd without request".into(),
+        },
+        RaftCommand::Lease { lease, .. } => format!("lease {}", variant(lease)),
+        RaftCommand::Compact { compact, .. } if compact.physical => "physical compact".into(),
+        RaftCommand::Compact { .. } => "compact".into(),
+        RaftCommand::CompactStep { .. } => "compact step".into(),
+        RaftCommand::ViewCheckpoint { .. } => "view checkpoint".into(),
+        RaftCommand::SetQuota { .. } => "set quota".into(),
+        RaftCommand::SeedMembers(_) => "seed members".into(),
+        RaftCommand::Cluster { request, .. } => format!("member {}", variant(request)),
+        RaftCommand::Maintenance { request, .. } => format!("maintenance {}", variant(request)),
+        RaftCommand::Auth { auth, .. } => format!("auth {}", variant(auth)),
+        RaftCommand::Secured { command, .. } => format!("secured {}", command_kind(command)),
+        RaftCommand::Diagnostic(_) => "diagnostic".into(),
+    }
+}
+
+/// The member state that one view check covered: the applied index, the base of the published
+/// view, and the process of the member. A base switch changes the view but keeps the applied
+/// index. A restart builds a new view, also at the same index and base.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ViewPoint {
     applied: u64,
     checkpoint: Option<uuid::Uuid>,
     base_index: Option<u64>,
+    process: Option<u64>,
 }
 
 impl ViewPoint {
-    fn of(state: &apply::AppliedState) -> Self {
+    fn of(state: &apply::AppliedState, process: Option<u64>) -> Self {
         Self {
             applied: state.applied,
             checkpoint: state.base_checkpoint,
             base_index: state.view.map(|(index, _, _)| index),
+            process,
         }
     }
 }
@@ -101,8 +185,8 @@ impl Simulation {
 
     /// Apply the new committed entries to the reference. Then compare each member view with the
     /// reference at the applied index of the member. The check runs again on a member when its
-    /// applied index or its base changes. A view can fail on a deleted object, but it never
-    /// returns other data.
+    /// applied index, its base, or its process changes. A view can fail on a deleted object, but
+    /// it never returns other data.
     pub(super) async fn check_views(&mut self) -> Result<(), String> {
         let reference = self.reference.as_mut().unwrap();
         while let Some(bytes) = self.committed_entries.get(&(reference.applied() + 1)) {
@@ -110,9 +194,9 @@ impl Simulation {
             let digest = reference.apply(entry).await;
             self.digests.insert(reference.applied(), digest);
         }
-        self.check_loaded();
+        self.check_loaded()?;
         for (&id, node) in &self.nodes {
-            let point = ViewPoint::of(&node.state);
+            let point = ViewPoint::of(&node.state, self.processes.get(&id).copied());
             let last = self.checked.get(&id).copied();
             if last == Some(point) {
                 continue;
@@ -181,4 +265,379 @@ async fn the_view_check_finds_a_wrong_base_switch_in_an_idle_cluster() {
         format!("member {follower} view at {applied} differs from the reference")
     );
     assert_eq!(sim.base_checks, checks);
+}
+
+/// A restart builds a new view. A follower in an idle cluster restarts at a recorded base, so the
+/// new process opens the same checkpoint at the same applied index and base index. Its view is
+/// wrong: it is a view of an earlier index. The check must run again for the new process.
+#[tokio::test]
+async fn the_view_check_runs_again_after_a_restart_at_the_same_base() {
+    let mut sim = Simulation::with_mode(101, true).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    let mut writers = BTreeMap::new();
+    sim.write(2).await;
+    let follower = sim.follower(0);
+    let earlier = sim.nodes[&follower].state.read.clone();
+    sim.write(2).await;
+    sim.publish_view(&mut writers).await;
+    sim.settle(10).await;
+    // The leader certifies its base at the last index and records it there for the follower.
+    let node = sim.nodes.get_mut(&follower).unwrap();
+    node.raw.request_snapshot().unwrap();
+    sim.settle(30).await;
+    let before = sim.checked[&follower];
+    // From here the test runs the check, so it sees the result.
+    let reference = sim.reference.take();
+    sim.stop(follower);
+    sim.start(follower).await;
+    sim.settle(4).await;
+    let process = sim.processes.get(&follower).copied();
+    let after = ViewPoint::of(&sim.nodes[&follower].state, process);
+    assert_eq!(after, ViewPoint { process, ..before });
+    assert_ne!(process, before.process);
+    sim.nodes.get_mut(&follower).unwrap().state.read = earlier;
+    sim.reference = reference;
+    let error = sim.check_views().await.unwrap_err();
+    assert_eq!(
+        error,
+        format!(
+            "member {follower} view at {} differs from the reference",
+            before.applied
+        )
+    );
+}
+
+/// Every member loads the same wrong revision at a new index. The members agree, so only the
+/// comparison with the fields of the reference finds it.
+#[tokio::test]
+async fn the_loaded_check_compares_each_member_with_the_reference() {
+    let mut sim = Simulation::with_mode(103, true).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    // From here the test runs the check, so it sees the result.
+    let reference = sim.reference.take();
+    sim.write(1).await;
+    let applied = sim.nodes[&1].state.applied;
+    for node in sim.nodes.values_mut() {
+        assert_eq!(node.state.applied, applied);
+        node.worker.state_mut().revision += 7;
+    }
+    sim.reference = reference;
+    let error = sim.check_views().await.unwrap_err();
+    assert_eq!(error, format!("member 1 loaded other fields at {applied}"));
+}
+
+/// Only the in-memory reference stores a wrong diagnostic value of the same length. The digest
+/// covers the `data/` rows with their lengths, so the comparison of the references finds it.
+#[tokio::test]
+#[should_panic(expected = "the reference rows differ at 2")]
+async fn the_reference_comparison_covers_diagnostic_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut reference = Reference::open(dir.path(), true).await;
+    let put = RaftCommand::Diagnostic(crate::Command {
+        id: "put".into(),
+        request: crate::Request {
+            operations: vec![crate::Operation::Put {
+                key: "k".into(),
+                value: "right".into(),
+            }],
+        },
+    });
+    let entry = |index, data: Vec<u8>| Entry {
+        index,
+        term: 1,
+        data,
+        ..Default::default()
+    };
+    reference.apply(entry(1, put.encode().unwrap())).await;
+    let mut wrong = crate::WriteBatch::new();
+    wrong.put(b"data/k", b"wrong");
+    reference.memory.as_mut().unwrap().write_memory(&wrong);
+    reference.apply(entry(2, vec![])).await;
+}
+
+/// Two states whose rows join to the same bytes have other digests, because the length of each
+/// key and value comes before it.
+#[tokio::test]
+async fn the_row_digest_frames_each_key_and_value() {
+    let mut digests = vec![];
+    for (key, value) in [("data/ab", "c"), ("data/a", "bc")] {
+        let mut state = StateMachine::open_memory().await.unwrap();
+        let mut batch = crate::WriteBatch::new();
+        batch.put(key, value);
+        state.write_memory(&batch);
+        digests.push(rows_digest(state.applied_state()).await.unwrap());
+    }
+    assert_ne!(digests[0], digests[1]);
+}
+
+impl Simulation {
+    /// Propose `command` on the leader and deliver messages until it replies. The reply can be an
+    /// error, but the entry must commit.
+    async fn commit(&mut self, command: RaftCommand) {
+        let leader = self.leader().unwrap();
+        self.trace.push(format!("commit {}", command.id()));
+        let (tx, mut rx) = oneshot::channel();
+        self.nodes
+            .get_mut(&leader)
+            .unwrap()
+            .propose(command, tx)
+            .unwrap();
+        self.drive().await;
+        for _ in 0..500 {
+            self.deliver(false).await;
+            if let Ok(reply) = rx.try_recv() {
+                reply.unwrap();
+                return;
+            }
+        }
+        panic!("the command did not commit");
+    }
+}
+
+/// A shared cluster commits each entry kind that shared mode applies. The random shared schedules
+/// write only puts, lease grants, and view checkpoints. Here the view check and the comparison of
+/// the two references also cover transactions, deletes, the lease rules, compaction, maintenance,
+/// membership changes, auth, and diagnostic writes.
+#[tokio::test]
+async fn every_entry_kind_matches_in_a_shared_cluster() {
+    use crate::auth::{Command as A, Credentials};
+    use crate::proto::etcdserverpb::*;
+    let mut sim = Simulation::with_mode(107, true).await;
+    sim.settle(4).await;
+    let mut writers = BTreeMap::new();
+    let leader = sim.leader().unwrap();
+    let follower = sim.follower(0);
+    let etcd = |id: &str, request| RaftCommand::Etcd {
+        id: id.into(),
+        origin: leader,
+        etcd: RequestOp {
+            request: Some(request),
+        },
+    };
+    let put = |key: &str, lease| {
+        Op::RequestPut(PutRequest {
+            key: key.into(),
+            value: b"value".to_vec(),
+            lease,
+            ..Default::default()
+        })
+    };
+    let op = |request| RequestOp {
+        request: Some(request),
+    };
+    // Leases: a renewal, a revoke that deletes a key, and an expiry.
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.lease(LeaseCommand::KeepAlive { id: 77 }).await;
+    sim.lease(LeaseCommand::Grant { id: 78, ttl: 3600 }).await;
+    sim.commit(etcd("put-78", put("lease/78", 78))).await;
+    sim.lease(LeaseCommand::Revoke { id: 78 }).await;
+    sim.lease(LeaseCommand::Grant { id: 79, ttl: 3600 }).await;
+    sim.commit(etcd("put-79", put("lease/79", 79))).await;
+    let generation = sim.nodes[&leader].state.leases[&79].generation;
+    sim.lease(LeaseCommand::Expire { id: 79, generation }).await;
+    // Puts, a transaction, and a delete range.
+    for key in ["a/1", "a/2", "a/3", "b/1"] {
+        sim.commit(etcd(key, put(key, 0))).await;
+    }
+    let txn = TxnRequest {
+        success: vec![
+            op(put("a/4", 0)),
+            op(Op::RequestDeleteRange(DeleteRangeRequest {
+                key: b"a/1".to_vec(),
+                ..Default::default()
+            })),
+            op(Op::RequestRange(RangeRequest {
+                key: b"a/".to_vec(),
+                range_end: b"a0".to_vec(),
+                ..Default::default()
+            })),
+        ],
+        ..Default::default()
+    };
+    sim.commit(etcd("txn", Op::RequestTxn(txn))).await;
+    let delete = DeleteRangeRequest {
+        key: b"a/".to_vec(),
+        range_end: b"a0".to_vec(),
+        ..Default::default()
+    };
+    sim.commit(etcd("delete", Op::RequestDeleteRange(delete)))
+        .await;
+    sim.publish_view(&mut writers).await;
+    sim.settle(4).await;
+    // Diagnostic writes.
+    for (id, operation) in [
+        (
+            "diagnostic-put",
+            crate::Operation::Put {
+                key: "k".into(),
+                value: "v".into(),
+            },
+        ),
+        (
+            "diagnostic-delete",
+            crate::Operation::Delete { key: "k".into() },
+        ),
+    ] {
+        let request = crate::Request {
+            operations: vec![operation],
+        };
+        let command = crate::Command {
+            id: id.into(),
+            request,
+        };
+        sim.commit(RaftCommand::Diagnostic(command)).await;
+    }
+    // A logical compaction, then a physical one with its steps.
+    for _ in 0..4 {
+        sim.commit(etcd("b/1", put("b/1", 0))).await;
+    }
+    let revision = sim.nodes[&leader].state.revision;
+    let compact = |id: &str, revision, physical| RaftCommand::Compact {
+        id: id.into(),
+        compact: CompactionRequest { revision, physical },
+    };
+    sim.commit(compact("logical", revision - 2, false)).await;
+    let (tx, _reply) = oneshot::channel();
+    let node = sim.nodes.get_mut(&leader).unwrap();
+    node.propose(compact("physical", revision, true), tx)
+        .unwrap();
+    for _ in 0..6 {
+        sim.settle(2).await;
+        sim.publish_view(&mut writers).await;
+    }
+    // Maintenance.
+    let maintenance = |id: &str, request| RaftCommand::Maintenance {
+        id: id.into(),
+        request,
+        credentials: Default::default(),
+    };
+    let alarm = |action| AlarmRequest {
+        action,
+        member_id: leader,
+        alarm: 1,
+    };
+    use crate::maintenance::Command as M;
+    for (id, request) in [
+        ("status", M::Status),
+        ("hash", M::Hash(0)),
+        ("hash-all", M::HashAll),
+        ("alarm-on", M::Alarm(alarm(1))),
+        ("alarm-off", M::Alarm(alarm(2))),
+        ("defragment", M::Defragment),
+    ] {
+        sim.commit(maintenance(id, request)).await;
+    }
+    // Membership: an update, a publish, and a learner that joins and leaves.
+    let cluster = |id: &str, request| RaftCommand::Cluster {
+        id: id.into(),
+        request,
+        credentials: Default::default(),
+    };
+    use crate::cluster::Command as C;
+    let url = format!("http://127.0.0.1:{}", 2379 + follower);
+    let update = MemberUpdateRequest {
+        id: follower,
+        peer_ur_ls: vec![url.clone()],
+    };
+    let learner = Member {
+        id: 4,
+        peer_ur_ls: vec!["http://127.0.0.1:2383".into()],
+        is_learner: true,
+        ..Default::default()
+    };
+    for (id, request) in [
+        ("update", C::Update(update)),
+        (
+            "publish",
+            C::Publish {
+                id: follower,
+                client_urls: vec![url],
+            },
+        ),
+        ("add", C::Add(learner)),
+        ("remove", C::Remove(4)),
+    ] {
+        sim.commit(cluster(id, request)).await;
+        sim.settle(2).await;
+    }
+    // Auth: enable it, write with credentials, and disable it.
+    let root = Credentials {
+        user: Some("root".into()),
+        time: 100,
+        ..Default::default()
+    };
+    let auth = |id: &str, auth| RaftCommand::Auth {
+        id: id.into(),
+        auth,
+        credentials: root.clone(),
+    };
+    for (id, command) in [
+        (
+            "user",
+            A::UserAdd(AuthUserAddRequest {
+                name: "root".into(),
+                ..Default::default()
+            }),
+        ),
+        (
+            "grant",
+            A::UserGrantRole(AuthUserGrantRoleRequest {
+                user: "root".into(),
+                role: "root".into(),
+            }),
+        ),
+        ("enable", A::Enable(AuthEnableRequest {})),
+    ] {
+        sim.commit(auth(id, command)).await;
+    }
+    let secured = etcd("secured", put("b/2", 0)).secure(Some(root.clone()));
+    sim.commit(secured).await;
+    sim.commit(auth("disable", A::Disable(AuthDisableRequest {})))
+        .await;
+    sim.publish_view(&mut writers).await;
+    sim.settle(10).await;
+    // The commands changed state, so their kinds cover more than error replies.
+    for node in sim.nodes.values() {
+        let state = &node.state;
+        assert_eq!(state.compact_revision, revision);
+        assert_eq!(state.leases.keys().collect::<Vec<_>>(), [&77]);
+        assert!(!state.members.members.contains_key(&4));
+    }
+    let kinds = sim.reference.as_ref().unwrap().kinds();
+    for kind in [
+        "put",
+        "txn",
+        "delete range",
+        "lease Grant",
+        "lease KeepAlive",
+        "lease Revoke",
+        "lease Expire",
+        "compact",
+        "physical compact",
+        "compact step",
+        "diagnostic",
+        "maintenance Status",
+        "maintenance Hash",
+        "maintenance HashAll",
+        "maintenance Alarm",
+        "maintenance Defragment",
+        "member Update",
+        "member Publish",
+        "conf change AddLearnerNode member Add",
+        "conf change RemoveNode member Remove",
+        "auth UserAdd",
+        "auth UserGrantRole",
+        "auth Enable",
+        "secured put",
+        "auth Disable",
+        "view checkpoint",
+        "seed members",
+    ] {
+        assert!(
+            kinds.contains(&format!("{kind}=")),
+            "no {kind} entry in {kinds}"
+        );
+    }
 }

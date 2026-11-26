@@ -604,6 +604,16 @@ impl StateMachine {
         matches!(self.reads, StateView::Memory(_))
     }
 
+    /// Write `batch` into a state from `open_memory`, outside apply. A test changes the rows
+    /// with this.
+    #[cfg(test)]
+    pub(crate) fn write_memory(&mut self, batch: &WriteBatch) {
+        let StateView::Memory(rows) = &mut self.reads else {
+            panic!("the state is not in memory");
+        };
+        rows.write(batch);
+    }
+
     /// Pin the applied state for a read that runs outside apply.
     pub(crate) fn pinned_state(&self) -> Result<StateView> {
         if let Some(shared) = &self.shared {
