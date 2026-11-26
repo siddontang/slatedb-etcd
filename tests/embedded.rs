@@ -357,6 +357,56 @@ async fn fault_controls_are_off_by_default() {
     server.shutdown().await.unwrap();
 }
 
+/// The CLI, like `ServerConfig`, leaves the fault routes off unless the flag is given.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_serves_no_fault_controls_without_the_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let addr = format!("127.0.0.1:{port}");
+    struct Member(std::process::Child);
+    impl Drop for Member {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut member = Member(
+        std::process::Command::new(env!("CARGO_BIN_EXE_slatedb-etcd"))
+            .args([
+                "--id",
+                "1",
+                "--listen",
+                &addr,
+                "--peer",
+                &format!("1={addr}"),
+                "--dir",
+            ])
+            .arg(dir.path().join("member"))
+            .spawn()
+            .unwrap(),
+    );
+    let http = reqwest::Client::new();
+    let url = format!("http://{addr}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !matches!(http.get(format!("{url}/status")).send().await, Ok(r) if r.status().is_success())
+    {
+        assert!(member.0.try_wait().unwrap().is_none(), "member exited");
+        assert!(tokio::time::Instant::now() < deadline, "member not ready");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let response = http
+        .post(format!("{url}/debug/partition"))
+        .json(&serde_json::json!({"blocked": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn restore_precedes_autotls_and_preserves_the_nonempty_directory_guard() {
     use slatedb_etcd::proto::etcdserverpb::SnapshotRequest;

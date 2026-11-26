@@ -82,8 +82,7 @@ class Cluster:
         log = (self.root / f"node-{node}.log").open("ab")
         command = [str(self.binary), "--id", str(node), "--listen",
                    f"127.0.0.1:{self.ports[node]}", "--dir", str(self.root / f"node-{node}"),
-                   "--cluster-id", self.cluster_id, "--snapshot-every", str(self.snapshot_every),
-                   "--enable-fault-controls"]
+                   "--cluster-id", self.cluster_id, "--snapshot-every", str(self.snapshot_every)]
         command.extend(self.extra)
         for peer, port in self.ports.items():
             command.extend(["--peer", f"{peer}=127.0.0.1:{port}"])
@@ -360,7 +359,9 @@ def main():
     root = Path(tempfile.mkdtemp(prefix="slatedb-raft-poc-"))
     print(f"Run directory: {root}", flush=True)
     # In tests, small log files let the log truncation check reclaim whole files.
-    extra = ["--log-file-bytes", str(256 * 1024)] if args.mode == "test" else []
+    # Only tests use the fault routes; bench mode must also run binaries that predate the flag.
+    extra = (["--log-file-bytes", str(256 * 1024), "--enable-fault-controls"]
+             if args.mode == "test" else [])
     cluster = Cluster(args.binary.resolve(), root, args.snapshot_every, extra)
     report = {"mode": args.mode, "host": platform.platform(), "machine": platform.machine(),
               "created_at": datetime.now(timezone.utc).isoformat(), "logical_cpus": os.cpu_count(),
