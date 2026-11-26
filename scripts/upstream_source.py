@@ -2,13 +2,12 @@
 
 from contextlib import ExitStack
 import json
-import os
 from pathlib import Path
 import socket
 import subprocess
 import time
 
-from rustfs_fixture import delete_prefix, shared_args, shared_store, unique_prefix
+from rustfs_fixture import shared_args, shared_store, unique_prefix
 
 ROOT = Path(__file__).resolve().parents[1]
 INVENTORY = ROOT / "tests/upstream/etcd-inventory.json"
@@ -59,11 +58,7 @@ def start_cluster(stack, directory, executable, target, members, ctl, snapshot, 
         # Several members run in shared state mode on RustFS. An outer `shared_store` supplies one
         # server for all clusters of a run.
         stack.enter_context(shared_store())
-        prefix = unique_prefix("upstream")
-        store = shared_args(prefix)
-        # The caller removes the data directories. After the members stop, remove the objects too.
-        if os.environ.get("SLATEDB_KEEP_DATA") != "1":
-            stack.callback(delete_prefix, prefix)
+        store = shared_args(unique_prefix("upstream"))
     processes = []
     for i, (client, peer) in enumerate(zip(clients, peers)):
         data = directory / f"data-{i}"

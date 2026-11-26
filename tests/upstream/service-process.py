@@ -33,7 +33,7 @@ def shared_store(store, cluster):
 
     The members run in shared state mode on RustFS. `cluster` is the first member's data directory.
     It names one cluster and stays the same when the members restart. The prefix of the cluster is
-    below the prefix of the run, which check-upstream-go.py removes after each test.
+    below the prefix of the run.
     """
     if store is None:
         raise ValueError("A cluster of several members needs RustFS. Run check-upstream-go.py")

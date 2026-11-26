@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 from reporting import write_report
-from rustfs_fixture import delete_prefix, shared_args, shared_store, unique_prefix
+from rustfs_fixture import shared_args, shared_store, unique_prefix
 
 
 class ApiFailure(Exception):
@@ -372,12 +372,8 @@ def main():
         return
     # The three benchmark members run in shared state mode on one RustFS server. A failed start
     # must not leave an earlier passed report.
-    prefix = unique_prefix("harness")
     with shared_store(args.output or root / "report.json", {"mode": args.mode}) as store:
-        run_cluster(args, root, extra + shared_args(prefix), store)
-        # The run directory stays for the logs. A failed run raises above and keeps its objects.
-        if os.environ.get("SLATEDB_KEEP_DATA") != "1":
-            delete_prefix(prefix)
+        run_cluster(args, root, extra + shared_args(unique_prefix("harness")), store)
 
 
 def run_cluster(args, root, extra, store):

@@ -102,29 +102,6 @@ class SharedStore(unittest.TestCase):
             self.assertIn("export SLATEDB_S3_TEST_BUCKET=bucket\n", copy.read_text())
             self.assertFalse(settings.exists())
 
-    def test_prefix_deletion_lists_and_deletes_until_no_key_remains(self):
-        listing = (b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
-                   b'<Contents><Key>p/a</Key></Contents><Contents><Key>p/b&amp;c</Key></Contents>'
-                   b'</ListBucketResult>')
-        empty = b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>'
-        done = b'<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>'
-        calls = []
-
-        def answer(endpoint, method, path, access, secret, query=None, body=b"", **options):
-            calls.append((method, query, body, options.get("headers")))
-            reply = {0: listing, 1: done}.get(len(calls) - 1, empty)
-            response = Mock()
-            response.__enter__ = Mock(return_value=Mock(read=Mock(return_value=reply)))
-            response.__exit__ = Mock(return_value=False)
-            return response
-
-        with patch.object(s3, "signed_request", side_effect=answer):
-            self.assertEqual(s3.delete_prefix("p", self.SERVER), 2)
-        self.assertEqual(calls[0][1]["prefix"], "p/")
-        self.assertEqual(calls[1][0], "POST")
-        self.assertIn(b"<Key>p/b&amp;c</Key>", calls[1][2])
-        self.assertIn("Content-MD5", calls[1][3])
-        self.assertEqual(len(calls), 3)
 
 
 class StaleReports(unittest.TestCase):

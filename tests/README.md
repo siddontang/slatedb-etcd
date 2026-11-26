@@ -25,20 +25,9 @@ The runners start one pinned RustFS server and give each cluster its own S3 pref
 the server that `SLATEDB_S3_TEST_ENDPOINT` and the other fixture settings name. A single member
 keeps its state on the local disk.
 
-A launcher deletes the prefix of a cluster when it deletes the local directories of that cluster:
-
-| Case | Local directories and S3 prefix |
-| --- | --- |
-| The cluster ends cleanly | Deleted |
-| A Go compat test fails, or `TestRobustness` runs | Kept |
-| A `harness.py bench` run fails | Kept |
-| A downstream, upstream, or benchmark cluster fails | Deleted, like its directories |
-| `SLATEDB_KEEP_DATA=1` | Kept |
-
-`harness.py` always keeps its run directory for the logs.
-The kept objects survive only as long as their server. A runner that starts its own server deletes
-the server data when the run ends, also the kept prefixes. A reused server, such as the one of
-`rustfs_fixture.py --env-file` or of a CI job, keeps them until that server stops.
+No runner deletes the prefix of a cluster. On a RustFS server that the fixture starts, also with
+`--env-file` or in a CI job, the prefixes disappear with its temporary data directory. Another
+reused server keeps them until its operator removes them, also across a restart of the server.
 Run a direct Go test through the fixture:
 
 ```sh

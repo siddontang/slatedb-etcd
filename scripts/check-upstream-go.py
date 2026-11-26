@@ -12,7 +12,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-from rustfs_fixture import STORE_ENV, delete_prefix, shared_store, unique_prefix
+from rustfs_fixture import STORE_ENV, shared_store, unique_prefix
 from upstream_source import ROOT, INVENTORY, build_tool, checked_source, start_cluster
 
 
@@ -247,7 +247,6 @@ def run_suite(source, cases, args, process_suite, required):
     summary.write_text("")
     passed = True
     any_match = False
-    store_prefix = None
     with tempfile.TemporaryDirectory() as temp:
         directory = Path(temp).resolve()
         go_flags = ["-count=1", "-json", "-p=1", "-timeout=" + args.timeout]
@@ -295,10 +294,6 @@ def run_suite(source, cases, args, process_suite, required):
                 name = f"{args.target}-{args.suite}-{label}"
                 log_path = args.output / (name + ".jsonl.gz")
                 result = run_go(command, cwd, log_path, args.run, args.suite, required=required)
-                # The upstream fixture removes the data directories of each test, also after a
-                # failure. Remove the objects of its clusters too.
-                if store_prefix and os.environ.get("SLATEDB_KEEP_DATA") != "1":
-                    delete_prefix(store_prefix)
                 if args.suite == "go-bench":
                     tests = json.loads(INVENTORY.read_text())["tests"]
                     expected = {t["name"] for t in tests if t["name"].startswith("Benchmark")

@@ -47,8 +47,6 @@ type cluster struct {
 	sharedStore bool
 	// storeArgs holds the shared state flags of every member, also of a member that joins later.
 	storeArgs []string
-	// storePrefix is the S3 prefix of the cluster on RustFS, or empty for local state.
-	storePrefix string
 }
 
 func listenLocal(t *testing.T) net.Listener {
@@ -124,7 +122,7 @@ func newClusterConfigured(t *testing.T, size int, configure func(*cluster), extr
 		configure(c)
 	}
 	if size > 1 || c.sharedStore {
-		c.storePrefix, c.storeArgs = sharedStoreArgs(t, root, extraArgs)
+		c.storeArgs = sharedStoreArgs(t, root, extraArgs)
 	}
 	t.Log("Process logs and data:", root)
 	t.Cleanup(func() {
@@ -140,11 +138,7 @@ func newClusterConfigured(t *testing.T, size int, configure func(*cluster), extr
 				t.Logf("node %d: %s", i, data)
 			}
 		} else if os.Getenv("SLATEDB_KEEP_DATA") != "1" && t.Name() != "TestRobustness" {
-			// The objects of the cluster stay exactly when its local directories stay.
 			os.RemoveAll(root)
-			if c.storePrefix != "" {
-				deleteStorePrefix(t, "../../scripts/rustfs_fixture.py", c.storePrefix)
-			}
 		}
 	})
 	if c.deferStart {
@@ -157,14 +151,14 @@ func newClusterConfigured(t *testing.T, size int, configure func(*cluster), extr
 	return c
 }
 
-// sharedStoreArgs returns the S3 prefix and the flags that put every member of the cluster in
-// `root` in shared state mode on the RustFS server of scripts/check-compat.py. Each cluster has
-// its own S3 prefix. A test that sets `--state-mode` itself keeps its own storage flags.
-func sharedStoreArgs(t *testing.T, root string, args []string) (string, []string) {
+// sharedStoreArgs returns the flags that put every member of the cluster in `root` in shared state
+// mode on the RustFS server of scripts/check-compat.py. Each cluster has its own S3 prefix. A test
+// that sets `--state-mode` itself keeps its own storage flags.
+func sharedStoreArgs(t *testing.T, root string, args []string) []string {
 	t.Helper()
 	for _, arg := range args {
 		if arg == "--state-mode" || strings.HasPrefix(arg, "--state-mode=") {
-			return "", nil
+			return nil
 		}
 	}
 	endpoint, bucket := os.Getenv("SLATEDB_S3_TEST_ENDPOINT"), os.Getenv("SLATEDB_S3_TEST_BUCKET")
@@ -172,8 +166,7 @@ func sharedStoreArgs(t *testing.T, root string, args []string) (string, []string
 		t.Fatal("A cluster of several members needs RustFS. Run scripts/check-compat.py, or " +
 			"run go test through scripts/rustfs_fixture.py")
 	}
-	prefix := "compat/" + filepath.Base(root)
-	return prefix, storeFlags(endpoint, bucket, prefix)
+	return storeFlags(endpoint, bucket, "compat/"+filepath.Base(root))
 }
 
 // storeFlags returns the shared state flags of one member. The Python launchers build the same
@@ -188,15 +181,6 @@ func storeFlags(endpoint, bucket, prefix string) []string {
 		}
 	}
 	return flags
-}
-
-// deleteStorePrefix removes the objects of one cluster from the RustFS server of the environment.
-func deleteStorePrefix(t *testing.T, fixture, prefix string) {
-	t.Helper()
-	output, err := exec.Command("python3", fixture, "--delete-prefix", prefix).CombinedOutput()
-	if err != nil {
-		t.Errorf("delete the RustFS prefix %s: %v: %s", prefix, err, output)
-	}
 }
 
 func (c *cluster) start(id int) {
