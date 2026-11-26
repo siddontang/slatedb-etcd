@@ -71,6 +71,9 @@ pub type LeaseResponse = oneshot::Sender<Result<crate::mvcc::Outcome<LeaseReply>
 
 pub enum Event {
     SubscribeWatch(oneshot::Sender<crate::watch::Subscription>),
+    /// Answer once this member applied every Put it already answered. A Watch create without a
+    /// start revision waits for it, then drains the feed, so that it starts after such a Put.
+    WatchBarrier(oneshot::Sender<()>),
     WaitRevision(i64, Response),
     Authenticated(crate::auth::Credentials, Box<Event>),
     Auth(crate::auth::Command, Response),
@@ -299,7 +302,7 @@ pub struct Node {
     prepare_term: u64,
     quorum_reply_index: u64,
     /// Watch creations that wait while a Put reply runs ahead of the local apply.
-    watch_waiters: Vec<oneshot::Sender<crate::watch::Subscription>>,
+    watch_waiters: Vec<oneshot::Sender<()>>,
     queries: VecDeque<Query>,
     prefer_query: bool,
     apply_delay_ms: u64,
@@ -1201,12 +1204,17 @@ impl Node {
                 }
             }
             Event::SubscribeWatch(response) => {
+                let _ = response.send(self.watch_feed.subscribe());
+            }
+            Event::WatchBarrier(response) => {
                 // etcd starts a Watch without a start revision after the local revision. Wait
                 // like a read so that it starts after a Put this member already answered.
                 if self.reply_ahead() {
+                    // A stream that closed while it waited drops its receiver.
+                    self.watch_waiters.retain(|waiter| !waiter.is_closed());
                     self.watch_waiters.push(response);
                 } else {
-                    let _ = response.send(self.watch_feed.subscribe());
+                    let _ = response.send(());
                 }
             }
             Event::Metrics(response) => {

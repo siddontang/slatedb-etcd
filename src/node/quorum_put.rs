@@ -498,15 +498,33 @@ mod tests {
         };
         let revision = put.header.unwrap().revision;
         assert!(node.state.applied < index);
-        let (tx, mut subscription) = oneshot::channel();
-        node.handle(crate::node::Event::SubscribeWatch(tx), &mut Vec::new())
+        let (subscribe, subscription) = oneshot::channel();
+        node.handle(
+            crate::node::Event::SubscribeWatch(subscribe),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        let mut subscription = subscription.await.unwrap();
+        assert_eq!(subscription.state.borrow().view.revision, revision - 1);
+        // A stream that closed while it waited frees its place.
+        let (gone, closed) = oneshot::channel();
+        node.handle(crate::node::Event::WatchBarrier(gone), &mut Vec::new())
             .await
             .unwrap();
+        drop(closed);
+        let (tx, mut barrier) = oneshot::channel();
+        node.handle(crate::node::Event::WatchBarrier(tx), &mut Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(node.watch_waiters.len(), 1);
         node.drive_ready().await.unwrap();
-        assert!(subscription.try_recv().is_err());
+        assert!(barrier.try_recv().is_err());
         node.drain_log().await.unwrap();
         node.drain_apply().await.unwrap();
-        let subscription = subscription.try_recv().unwrap();
+        barrier.try_recv().unwrap();
+        // The replied Put is on the feed before the barrier clears.
+        assert_eq!(subscription.events.try_recv().unwrap().revision, revision);
         assert_eq!(subscription.state.borrow().view.revision, revision);
     }
 
