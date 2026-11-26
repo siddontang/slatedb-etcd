@@ -181,6 +181,8 @@ pub(crate) struct Hooks {
     pub rehash_delay: Duration,
     /// The time that each write batch takes.
     pub batch_delay: Duration,
+    /// The largest file read of the write pass, and the wait before each read.
+    pub read_throttle: Option<(usize, Duration)>,
     /// The progress ordinal of the last write start of this restore.
     pub started_after: std::sync::Mutex<Option<u64>>,
 }
@@ -321,6 +323,21 @@ pub(super) struct Facts {
     checkpoint: Option<(uuid::Uuid, u64)>,
     /// The stored rows, after this member opened the writer.
     rows: Option<Rows>,
+}
+
+impl Facts {
+    /// The facts of a bootstrapped cluster. Only the marker, with its digest, is known.
+    fn marked(digest: Option<String>) -> Self {
+        Self {
+            marker: Some(digest),
+            claim: None,
+            stored: false,
+            input: None,
+            lease: Lease::Absent { stale: false },
+            checkpoint: None,
+            rows: None,
+        }
+    }
 }
 
 /// The next step of a member.
@@ -648,15 +665,19 @@ impl Advance {
 }
 
 /// Read the facts. `writer` is the open writer of the lease owner.
+///
+/// The bootstrap marker decides the outcome alone. With a marker, the function reads nothing
+/// else: a restart then needs neither the restore objects nor the restore checkpoint.
 async fn observe(
     source: &Source,
     admin: &slatedb::admin::Admin,
     watch: &mut Watch,
     writer: Option<&Db>,
 ) -> Result<Facts> {
-    let marker = get_json::<serde_json::Value>(source, BOOTSTRAP)
-        .await?
-        .map(|(marker, _)| marker["restore"].as_str().map(str::to_owned));
+    let marker = get_json::<serde_json::Value>(source, BOOTSTRAP).await?;
+    if let Some((marker, _)) = marker {
+        return Ok(Facts::marked(marker["restore"].as_str().map(str::to_owned)));
+    }
     let claim = bootstrap_op(source).await?;
     let stored = admin.read_manifest(None).await?.is_some();
     let input: Option<Input> = get_json(source, INPUT).await?.map(|(input, _)| input);
@@ -679,7 +700,7 @@ async fn observe(
         None => None,
     };
     Ok(Facts {
-        marker,
+        marker: None,
         claim,
         stored,
         input,
@@ -760,15 +781,22 @@ pub(crate) async fn seed(
                 let Err(error) = own(source, admin, restore, &mut watch).await else {
                     continue;
                 };
-                // The writer of a member that took the lease fences this one.
-                if watch.observe(source).await? == Lease::Ours {
-                    return Err(error.context(
-                        "the restore of this snapshot did not complete; start it again, or stop \
-                         every member and delete shared/ under the cluster prefix (see \
-                         docs/shared-state-guide.md)",
-                    ));
+                // The writer of a member that took the lease fences this one. A member that
+                // lost the lease while its open was in flight can also fence the owner. The
+                // owner then opens again and continues after the durable rows.
+                match watch.observe(source).await? {
+                    Lease::Ours if fenced(&error) => {
+                        tracing::warn!(%error, "a stale restore writer fenced this one; open again")
+                    }
+                    Lease::Ours => {
+                        return Err(error.context(
+                            "the restore of this snapshot did not complete; start it again, or \
+                             stop every member and delete shared/ under the cluster prefix (see \
+                             docs/shared-state-guide.md)",
+                        ))
+                    }
+                    _ => tracing::warn!(%error, "another member took over the snapshot restore"),
                 }
-                tracing::warn!(%error, "another member took over the snapshot restore");
             }
             step => bail!("unexpected snapshot restore step {step:?} without a writer"),
         }
@@ -858,9 +886,19 @@ async fn write(
     }
     let mut ordinal = from.as_ref().map_or(0, |from| from.ordinal);
     let mut usage = from.as_ref().map_or_else(Default::default, Progress::usage);
-    let image = {
+    let mut reopening = {
         let (restore, counted) = (restore.clone(), advance.hashed.clone());
-        tokio::task::spawn_blocking(move || reopen(&restore, from.as_ref(), counted)).await??
+        tokio::task::spawn_blocking(move || reopen(&restore, from.as_ref(), counted))
+    };
+    let image = loop {
+        tokio::select! {
+            image = &mut reopening => break image??,
+            () = tokio::time::sleep(LOG_INTERVAL) => tracing::info!(
+                bytes = advance.hashed.load(Ordering::Relaxed),
+                of_bytes = restore.bytes,
+                "verify the prefix of the partial snapshot restore"
+            ),
+        }
     };
     if ordinal > 0 {
         tracing::info!(rows = ordinal, "continue the partial snapshot restore");
@@ -965,6 +1003,10 @@ fn reopen(
 ) -> Result<ImageFile> {
     let mut image = ImageFile::open(&restore.path, not_restored)?;
     image.count_in(counted);
+    #[cfg(test)]
+    if let Some((bytes, delay)) = restore.hooks.read_throttle {
+        image.throttle(bytes, delay);
+    }
     image.header()?;
     let Some(from) = from else {
         return Ok(image);
@@ -1003,15 +1045,18 @@ async fn complete(db: &Db, input: &Input, mut usage: crate::batch::Usage) -> Res
     Ok(())
 }
 
-/// Resolve the bootstrap operation before an ordinary start selects its base and admits clients.
+/// Resolve the bootstrap operation before a start without a snapshot selects its base and admits
+/// clients.
 ///
-/// A bootstrapped cluster needs nothing. Otherwise the start claims an empty bootstrap. A pending
-/// restore claim holds the start while the restore makes progress. Once the restore created its
-/// checkpoint, the start can complete the marker. A restore without progress for `STALE` fails
-/// the start, so it never serves an empty base while a restore claim exists.
+/// A bootstrapped cluster needs nothing. Otherwise an ordinary start claims an empty bootstrap. A
+/// `join` start never claims it: its Raft log decides its base. A pending restore claim holds
+/// either start while the restore makes progress. Once the restore created its checkpoint, the
+/// start can complete the marker. A restore without progress for `STALE` fails the start, so it
+/// never serves an empty base while a restore claim exists.
 pub(super) async fn resolve_bootstrap(
     source: &Source,
     admin: &slatedb::admin::Admin,
+    join: bool,
 ) -> Result<()> {
     let mut watch = Watch::new(0);
     let mut log = Every(None);
@@ -1023,6 +1068,7 @@ pub(super) async fn resolve_bootstrap(
         };
         match next(&facts, None) {
             Step::Done => return Ok(()),
+            Step::Claim if join => return Ok(()),
             Step::Claim => {
                 claim_bootstrap(source, &BootstrapOp::Empty).await?;
             }

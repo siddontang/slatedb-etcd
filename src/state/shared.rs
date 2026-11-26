@@ -588,6 +588,18 @@ impl Source {
     }
 }
 
+/// Return true when `error` comes from a writer that a newer writer fenced.
+pub(crate) fn fenced(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<slatedb::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced)
+            )
+        })
+    })
+}
+
 /// The checkpoint name for a publication that started at `last_l0_seq`.
 pub(crate) fn view_name(seq: u64) -> String {
     format!("{VIEW}{seq:020}")
@@ -1375,9 +1387,8 @@ impl StateMachine {
         let admin = Arc::new(slatedb::admin::Admin::builder(state_root.as_str(), store).build());
         match &options.restore {
             Some(restore) => restore::seed(&source, &admin, restore).await?,
-            // A joining member finds a bootstrapped cluster. Its Raft log decides its base.
-            None if !options.join => restore::resolve_bootstrap(&source, &admin).await?,
-            None => {}
+            // A joining member never claims the bootstrap, but it waits for a pending restore.
+            None => restore::resolve_bootstrap(&source, &admin, options.join).await?,
         }
         // A joining member with no log waits for Raft: entries from index 1 or a snapshot.
         let base = match newest_base(&admin, &source).await? {

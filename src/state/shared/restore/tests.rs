@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::object::faults::{FaultStore, STALL_STATE_PUT};
-use crate::state::shared::tests::{open_shared, put};
+use crate::state::shared::tests::{checkpoint, open_shared, options, put, writer};
 use slatedb::object_store::memory::InMemory;
 use std::path::Path as FilePath;
 
@@ -58,6 +58,36 @@ fn next_maps_each_observation_to_one_step() {
     };
     type Case = (&'static str, Facts, Option<Step>, Step);
     let cases: Vec<Case> = vec![
+        (
+            "marked facts of this snapshot",
+            Facts::marked(Some("aa".into())),
+            Some(Step::Done),
+            Step::Done,
+        ),
+        (
+            "marked facts of another snapshot",
+            Facts::marked(Some("cc".into())),
+            Some(Step::FreshPrefix),
+            Step::Done,
+        ),
+        (
+            "marked facts of an ordinary start",
+            Facts::marked(None),
+            Some(Step::FreshPrefix),
+            Step::Done,
+        ),
+        (
+            "marker beside a stale lease and an early checkpoint",
+            Facts {
+                marker: Some(Some("aa".into())),
+                lease: Lease::Other { stale: true },
+                checkpoint: Some((id, 0)),
+                rows: Some(Rows::Other),
+                ..owner()
+            },
+            Some(Step::Done),
+            Step::Done,
+        ),
         (
             "marker of this snapshot",
             Facts {
@@ -577,7 +607,7 @@ async fn rows_without_their_completion_never_bootstrap() {
     let member = member(store());
     member.restore(&restore).await.unwrap_err();
     let started = Instant::now();
-    let error = resolve_bootstrap(&member.source, &member.admin)
+    let error = resolve_bootstrap(&member.source, &member.admin, false)
         .await
         .unwrap_err();
     assert!(started.elapsed() >= STALE);
@@ -594,7 +624,7 @@ async fn rows_without_their_completion_never_bootstrap() {
         .await
         .unwrap();
     db.close().await.unwrap();
-    let error = resolve_bootstrap(&member.source, &member.admin)
+    let error = resolve_bootstrap(&member.source, &member.admin, false)
         .await
         .unwrap_err();
     assert!(
@@ -950,4 +980,351 @@ async fn a_restore_into_an_ordinary_state_fails() {
         error.to_string().contains("new cluster prefix"),
         "{error:#}"
     );
+}
+
+/// A store whose reads fail for each path that contains one of `failing`.
+#[derive(Debug)]
+struct FailingReads {
+    inner: Arc<dyn ObjectStore>,
+    failing: Vec<String>,
+}
+
+impl std::fmt::Display for FailingReads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FailingReads({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for FailingReads {
+    async fn put_opts(
+        &self,
+        path: &Path,
+        payload: slatedb::object_store::PutPayload,
+        options: slatedb::object_store::PutOptions,
+    ) -> slatedb::object_store::Result<slatedb::object_store::PutResult> {
+        self.inner.put_opts(path, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        path: &Path,
+        options: slatedb::object_store::PutMultipartOptions,
+    ) -> slatedb::object_store::Result<Box<dyn slatedb::object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(path, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        path: &Path,
+        options: slatedb::object_store::GetOptions,
+    ) -> slatedb::object_store::Result<slatedb::object_store::GetResult> {
+        if self.failing.iter().any(|part| path.as_ref().contains(part)) {
+            return Err(slatedb::object_store::Error::Generic {
+                store: "failing",
+                source: std::io::Error::other("an injected read failure").into(),
+            });
+        }
+        self.inner.get_opts(path, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        paths: futures::stream::BoxStream<'static, slatedb::object_store::Result<Path>>,
+    ) -> futures::stream::BoxStream<'static, slatedb::object_store::Result<Path>> {
+        self.inner.delete_stream(paths)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, slatedb::object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> slatedb::object_store::Result<slatedb::object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: slatedb::object_store::CopyOptions,
+    ) -> slatedb::object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// A restore completes, and a later checkpoint holds a put. Then reads of the restore lease, or
+/// of the restore checkpoint, fail. The marker decides the bootstrap, so an ordinary restart and
+/// a retry of the same file both open the newer base.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bootstrapped_cluster_needs_no_restore_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snapshot");
+    fixture(&path, 10).await;
+    let store = store();
+    let first = member(store.clone());
+    first
+        .restore(&checked(&path, URL, Hooks::default()))
+        .await
+        .unwrap();
+    let (_, restored) = view_checkpoints(&first.admin).await.unwrap().pop().unwrap();
+    let mut state = open_shared(store.clone()).await;
+    let mut written = state.applied;
+    let index = written + 1;
+    let outcome = state.apply_etcd(index, &put("key/after", "restore")).await;
+    outcome.unwrap().result.unwrap();
+    let db = writer(&state).await;
+    drop(checkpoint(&state, &db, &mut written).await);
+    db.close().await.unwrap();
+    state.close().await.unwrap();
+    let manifest = format!("manifest/{:020}.manifest", restored.manifest_id);
+    use futures::TryStreamExt;
+    let listed = store.list(None).map_ok(|meta| meta.location.to_string());
+    let listed: Vec<String> = listed.try_collect().await.unwrap();
+    assert!(
+        listed.iter().any(|path| path.ends_with(&manifest)),
+        "{listed:?}"
+    );
+    for failing in [LEASE.to_owned(), manifest] {
+        let faulty: Arc<dyn ObjectStore> = Arc::new(FailingReads {
+            inner: store.clone(),
+            failing: vec![failing.clone()],
+        });
+        // The injected failure reaches the restore objects. An open of the restore checkpoint
+        // retries the failed read and does not return.
+        let source = member(faulty.clone()).source;
+        let lease = get_json::<LeaseBody>(&source, LEASE).await;
+        let open = open_present(&source, restored.id);
+        let base = tokio::time::timeout(Duration::from_secs(3), open).await;
+        assert!(lease.is_err() || !matches!(base, Ok(Ok(_))), "{failing}");
+        // A start that reads the restore objects fails, or retries the read without an end.
+        let limit = Duration::from_secs(20);
+        let state = tokio::time::timeout(limit, open_shared(faulty.clone())).await;
+        let state = state.expect("the restart read a restore object");
+        assert_eq!(state.applied, index, "{failing}");
+        state.close().await.unwrap();
+        let retry = checked(&path, URL, Hooks::default());
+        let retrying = member(faulty.clone());
+        let retried = retrying.restore(&retry);
+        tokio::time::timeout(limit, retried).await.unwrap().unwrap();
+        let options = shared::Options {
+            restore: Some(retry),
+            ..options()
+        };
+        let opening = StateMachine::open_shared(
+            faulty,
+            "cluster",
+            "test",
+            StateCache::default(),
+            &options,
+            transfer::Backend::Local,
+        );
+        let state = tokio::time::timeout(limit, opening).await.unwrap().unwrap();
+        assert_eq!(state.applied, index, "{failing}");
+        state.close().await.unwrap();
+    }
+}
+
+/// A member pauses just before its writer opens, and its lease goes stale. Another member takes
+/// over and writes rows. The paused open then fences the new owner. The owner still holds the
+/// lease, so it opens again and completes without a restart. The paused member writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_open_does_not_stop_the_lease_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snapshot");
+    fixture(&path, 40).await;
+    let store = store();
+    let (reached, resume) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let paused = checked(
+        &path,
+        URL,
+        Hooks {
+            before_open: Some((reached.clone(), resume.clone())),
+            ..Default::default()
+        },
+    );
+    let stale = member(store.clone()).spawn(&paused);
+    reached.notified().await;
+    let owner = checked(
+        &path,
+        URL,
+        Hooks {
+            batch_delay: Duration::from_millis(30),
+            ..Default::default()
+        },
+    );
+    let owning = member(store.clone()).spawn(&owner);
+    while owner.hooks.started_after.lock().unwrap().is_none() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    resume.notify_one();
+    owning.await.unwrap().unwrap();
+    stale.await.unwrap().unwrap();
+    assert!(paused.hooks.started_after.lock().unwrap().is_none());
+    let resumed = owner.hooks.started_after.lock().unwrap().unwrap();
+    assert!(resumed > 0, "the owner continued after its durable rows");
+    assert_eq!(contents(store).await, single(&path).await);
+}
+
+/// A joining member with an empty log, opened on `store`.
+async fn open_join(store: Arc<dyn ObjectStore>) -> Result<StateMachine> {
+    let options = shared::Options {
+        join: true,
+        empty_log: true,
+        ..options()
+    };
+    let local = transfer::Backend::Local;
+    StateMachine::open_shared(
+        store,
+        "cluster",
+        "test",
+        StateCache::default(),
+        &options,
+        local,
+    )
+    .await
+}
+
+/// A restore stops after its first durable rows. A joining member with an empty log does not
+/// open before the restore completes. It waits while the lease changes, fails once the lease is
+/// stale, and claims nothing. With a restore that makes progress, it opens after the completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_waits_for_a_pending_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snapshot");
+    fixture(&path, 20).await;
+    let store = store();
+    shared::claim(store.as_ref(), "cluster", "test", 0, &[1])
+        .await
+        .unwrap();
+    let stopped = member(store.clone());
+    stopped
+        .restore(&checked(&path, URL, stopping(Stop::AfterFlush(1))))
+        .await
+        .unwrap_err();
+    let started = Instant::now();
+    let error = open_join(store.clone()).await.err().unwrap();
+    assert!(started.elapsed() >= STALE);
+    assert!(format!("{error:#}").contains("pending"), "{error:#}");
+    assert_eq!(stopped.marker().await, None);
+    let claim = bootstrap_op(&stopped.source).await.unwrap();
+    assert!(
+        matches!(claim, Some(BootstrapOp::Restore { .. })),
+        "{claim:?}"
+    );
+
+    let store = self::store();
+    shared::claim(store.as_ref(), "cluster", "test", 0, &[1])
+        .await
+        .unwrap();
+    let slow = checked(
+        &path,
+        URL,
+        Hooks {
+            batch_delay: Duration::from_millis(100),
+            ..Default::default()
+        },
+    );
+    let started = Instant::now();
+    let restoring = member(store.clone()).spawn(&slow);
+    while slow.hooks.started_after.lock().unwrap().is_none() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let joined = open_join(store.clone()).await.unwrap();
+    assert!(started.elapsed() > STALE * 2);
+    let marker = member(store).marker().await;
+    assert_eq!(marker, Some(Some(slow.input.digest.clone())));
+    restoring.await.unwrap().unwrap();
+    joined.close().await.unwrap();
+}
+
+/// The source lease has a generation above the restored index. The restore resets it, so a
+/// renewal at an index equal to the source generation does not make an expiration that was
+/// queued before the renewal match the lease.
+#[tokio::test]
+async fn a_restored_lease_survives_a_stale_expiration() {
+    use crate::lease::LeaseCommand;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snapshot");
+    let mut rows = fixture(&path, 2).await;
+    let id = 7_i64;
+    let key = [b"etcd/leases/".as_slice(), &id.to_be_bytes()].concat();
+    rows.push((key.clone(), vec![]));
+    rows.sort_by(|a, b| {
+        let members = |key: &[u8]| key == crate::cluster::KEY;
+        (members(&a.0), &a.0).cmp(&(members(&b.0), &b.0))
+    });
+    let index = rows.iter().filter(|(key, _)| !not_restored(key)).count() as u64 + 1;
+    let source = index + 5;
+    let record = crate::lease::LeaseRecord {
+        ttl: 60,
+        generation: source,
+    };
+    let row = rows.iter_mut().find(|(row, _)| *row == key).unwrap();
+    row.1 = crate::codec::encode(&record).unwrap();
+    backup::write_image(&path, rows);
+    let store = store();
+    member(store.clone())
+        .restore(&checked(&path, URL, Hooks::default()))
+        .await
+        .unwrap();
+    let mut state = open_shared(store).await;
+    assert_eq!(state.applied, index);
+    let queued = state.leases[&id].generation;
+    assert_eq!(queued, crate::lease::RESTORED_GENERATION);
+    for empty in index + 1..source {
+        state.apply(empty, None).await.unwrap();
+    }
+    state
+        .apply_lease(source, &LeaseCommand::KeepAlive { id })
+        .await
+        .unwrap();
+    assert_eq!(state.leases[&id].generation, source);
+    let expire = LeaseCommand::Expire {
+        id,
+        generation: queued,
+    };
+    state.apply_lease(source + 1, &expire).await.unwrap();
+    assert!(state.leases.contains_key(&id), "the renewed lease expired");
+    state.close().await.unwrap();
+}
+
+/// The write pass reads one large row slowly, for longer than `STALE`. Each read that returns
+/// bytes counts as progress, so the owner keeps the lease and a competitor waits. A read that
+/// returns nothing loses the lease. See `a_hung_owner_loses_the_lease`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_large_row_keeps_the_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snapshot");
+    backup::write_image(&path, vec![(b"etcd/large".to_vec(), vec![b'v'; 2 << 20])]);
+    let store = store();
+    let slow = checked(
+        &path,
+        URL,
+        Hooks {
+            read_throttle: Some((16 << 10, Duration::from_millis(20))),
+            ..Default::default()
+        },
+    );
+    let started = Instant::now();
+    let owning = member(store.clone()).spawn(&slow);
+    while slow.hooks.started_after.lock().unwrap().is_none() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let competing = checked(&path, URL, Hooks::default());
+    let waiting = member(store.clone()).spawn(&competing);
+    owning.await.unwrap().unwrap();
+    waiting.await.unwrap().unwrap();
+    assert!(competing.hooks.started_after.lock().unwrap().is_none());
+    assert!(started.elapsed() > STALE);
 }

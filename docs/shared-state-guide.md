@@ -177,10 +177,13 @@ file in one pass. The image has no size limit. Each row has the 64 MiB limit of 
 5. The owner renews the lease every 10 s, but only after it read file bytes or flushed rows.
    Another member with the same file takes over a lease that stays unchanged for 60 s. It reads
    the file through the last stored row, compares the digest, and continues after that row.
-6. A member without the restore flag waits while the lease changes, and fails after 60 s without
-   a change. If the restore already created its checkpoint, the member writes the marker and
-   opens on that checkpoint. Otherwise an ordinary start claims an empty bootstrap.
-7. A restore into a cluster that an ordinary start or another snapshot created fails. A file
+6. A member without the restore flag, also a joining member, waits while the lease changes. It
+   fails after 60 s without a change. If the restore already created its checkpoint, the member
+   writes the marker and opens on that checkpoint. Otherwise an ordinary start claims an empty
+   bootstrap. A joining member never claims it.
+7. Once the marker exists, a start reads only the marker. It does not read the restore objects
+   or open the first checkpoint again.
+8. A restore into a cluster that an ordinary start or another snapshot created fails. A file
    that differs from the stored rows also fails. Use a new cluster prefix.
 
 The restored Raft log starts at N. Endpoint status can show a higher applied index after the
@@ -191,8 +194,15 @@ to write, so give startup probes and service start timeouts that time. A stopped
 the same restore again while its Raft log is empty. It waits up to 60 s for the lease of its
 stopped attempt to go stale.
 
-To abandon a partial restore, stop every member and check that `shared/bootstrap.json` is
-missing. Then delete `shared/` under the cluster prefix and start the restore again. Never delete
+To abandon a partial restore, make these checks first:
+
+1. Every member process of the cluster is stopped.
+2. `shared/bootstrap-op.json` has `"kind":"restore"` and the SHA-256 of your snapshot file. An
+   ordinary bootstrap also has no marker before its first checkpoint. Only this check tells the
+   two apart.
+3. `shared/bootstrap.json` is missing.
+
+Then delete `shared/` under the cluster prefix and start the restore again. Never delete
 `shared/` of a cluster that has a bootstrap marker: it holds the state of all members.
 
 ## Convert a replicated cluster

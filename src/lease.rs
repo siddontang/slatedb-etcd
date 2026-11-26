@@ -48,6 +48,24 @@ impl LeaseReply {
     }
 }
 
+/// The generation of every lease of a restored state. The restored Raft log starts above it, so
+/// no later entry gives a lease this generation. An expiration that the restored cluster queued
+/// before a renewal then cannot match the renewed lease.
+pub(crate) const RESTORED_GENERATION: u64 = 1;
+
+/// The value that a restored state stores for the row `key`, if it is a lease row. The source
+/// generation is a Raft index of the source cluster, so a restore replaces it.
+pub(crate) fn restored(key: &[u8], value: &[u8]) -> Option<anyhow::Result<Vec<u8>>> {
+    if !key.starts_with(PREFIX) {
+        return None;
+    }
+    Some((|| {
+        let mut record: LeaseRecord = crate::codec::decode(value)?;
+        record.generation = RESTORED_GENERATION;
+        Ok(crate::codec::encode(&record)?)
+    })())
+}
+
 fn key(id: i64) -> Vec<u8> {
     [PREFIX, &id.to_be_bytes()].concat()
 }

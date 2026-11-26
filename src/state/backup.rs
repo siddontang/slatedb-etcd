@@ -451,8 +451,6 @@ pub(super) struct ImageFile {
     skip: fn(&[u8]) -> bool,
     /// The digest state after the last copied row.
     copied: Sha256,
-    /// The file bytes read, if set.
-    progress: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl ImageFile {
@@ -464,6 +462,9 @@ impl ImageFile {
             inner: BufReader::with_capacity(1024 * 1024, file).take(len - DIGEST),
             hash: Sha256::new(),
             bytes: 0,
+            progress: None,
+            #[cfg(test)]
+            throttle: None,
         };
         Ok(Self {
             payload,
@@ -472,13 +473,19 @@ impl ImageFile {
             read: 0,
             skip,
             copied: Sha256::new(),
-            progress: None,
         })
     }
 
-    /// Store the number of file bytes read in `progress` after each row.
+    /// Store the number of file bytes read in `progress` after each read. A slow read of a large
+    /// row then still shows progress, and a read that hangs shows none.
     pub(super) fn count_in(&mut self, progress: Arc<std::sync::atomic::AtomicU64>) {
-        self.progress = Some(progress);
+        self.payload.progress = Some(progress);
+    }
+
+    /// Return at most `bytes` from each read, and wait `delay` before it, as a slow disk does.
+    #[cfg(test)]
+    pub(super) fn throttle(&mut self, bytes: usize, delay: Duration) {
+        self.payload.throttle = Some((bytes, delay));
     }
 
     pub(super) fn header(&mut self) -> Result<()> {
@@ -502,9 +509,6 @@ impl ImageFile {
             let (key, value): (Bytes, Bytes) =
                 crate::codec::read::<_, MAX_ROW_BYTES>(&mut self.payload)
                     .context("invalid native snapshot")?;
-            if let Some(progress) = &self.progress {
-                progress.store(self.payload.bytes, std::sync::atomic::Ordering::Relaxed);
-            }
             if !(self.skip)(&key) {
                 self.copied = self.payload.hash.clone();
                 return Ok(Some((key, value)));
@@ -538,13 +542,29 @@ struct Hashing<R> {
     inner: R,
     hash: Sha256,
     bytes: u64,
+    /// Gets `bytes` after each read, if set.
+    progress: Option<Arc<std::sync::atomic::AtomicU64>>,
+    #[cfg(test)]
+    throttle: Option<(usize, Duration)>,
 }
 
 impl<R: Read> Read for Hashing<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(test)]
+        let buf = match self.throttle {
+            Some((bytes, delay)) => {
+                std::thread::sleep(delay);
+                let len = buf.len().min(bytes);
+                &mut buf[..len]
+            }
+            None => buf,
+        };
         let n = self.inner.read(buf)?;
         self.hash.update(&buf[..n]);
         self.bytes += n as u64;
+        if let Some(progress) = &self.progress {
+            progress.store(self.bytes, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(n)
     }
 }
@@ -643,6 +663,9 @@ pub(super) fn restored(key: &[u8], value: Bytes, member: u64) -> Result<Bytes> {
         let mut auth: crate::auth::Store = serde_json::from_slice(&value)?;
         auth.reset_tokens();
         return Ok(serde_json::to_vec(&auth)?.into());
+    }
+    if let Some(lease) = crate::lease::restored(key, &value) {
+        return Ok(lease?.into());
     }
     if key == crate::maintenance::ALARMS {
         let mut alarms: Vec<crate::proto::etcdserverpb::AlarmMember> =

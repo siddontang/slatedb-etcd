@@ -106,6 +106,7 @@ Use new, empty data directories, a new cluster ID, and the same new peer map on 
 members.
 The restore path verifies the checksum, replaces membership, and invalidates old auth tokens.
 It retains KV revisions, compaction, leases, users, roles, and alarm types.
+Each lease gets generation 1. The source generation is a Raft index of the old log.
 Remove `--restore-snapshot` when restarting the restored cluster. Existing directories are never
 replaced. A damaged checksum stops restoration before any data directory is created.
 The member pins its applied state in a SlateDB checkpoint and streams the image from it.

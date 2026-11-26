@@ -104,17 +104,7 @@ pub(in crate::node) fn open_conflict(error: &anyhow::Error) -> bool {
     })
 }
 
-/// Return true when `error` comes from a writer that a newer writer fenced.
-pub(in crate::node) fn fenced(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause.downcast_ref::<slatedb::Error>().is_some_and(|error| {
-            matches!(
-                error.kind(),
-                slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced)
-            )
-        })
-    })
-}
+pub(in crate::node) use crate::state::shared::fenced;
 
 /// Return the stored error of a writer that SlateDB closed. A failed background flush closes
 /// the `Db`, and the status then reports `Panic` for every kind of error. A call on the closed
