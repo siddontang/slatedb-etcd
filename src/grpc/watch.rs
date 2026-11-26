@@ -223,6 +223,14 @@ impl Stream {
     fn remove(&mut self, id: i64) -> Option<Watcher> {
         let watcher = self.watchers.remove(&id)?;
         self.pinned.remove(&id);
+        // A waiting progress request forgets the watcher. So its ID set stays bounded, and a
+        // later watcher with the same ID cannot hold back the reply.
+        for progress in [&mut self.progress, &mut self.next_progress]
+            .into_iter()
+            .flatten()
+        {
+            progress.watchers.remove(&id);
+        }
         if watcher.request.range_end.is_empty() {
             if let Some(ids) = self.keys.get_mut(&watcher.request.key) {
                 ids.remove(&id);
@@ -1855,6 +1863,51 @@ mod tests {
             .flat_map(|r| r.events.iter().map(|e| e.kv.as_ref().unwrap().mod_revision))
             .collect();
         assert_eq!(events, [2, 3]);
+        f.close().await;
+    }
+
+    /// A watcher that is created and canceled while progress requests wait leaves no ID in
+    /// them. After many such watchers, each request holds only the live watcher.
+    #[tokio::test]
+    async fn canceled_watchers_leave_the_waiting_progress_requests() {
+        let mut f = Fixture::new().await;
+        f.watch(request(1, "k", 0)).await;
+        f.stream.progress().unwrap();
+        for id in 2..=101 {
+            f.stream.create(request(id, "k", 0)).await.unwrap();
+            f.stream.progress().unwrap();
+            f.stream.cancel(id).await.unwrap();
+            f.put("k", "v").await;
+            f.responses();
+        }
+        let watchers = |progress: &Option<Progress>| progress.as_ref().unwrap().watchers.clone();
+        assert_eq!(watchers(&f.stream.progress), BTreeSet::from([1]));
+        assert_eq!(watchers(&f.stream.next_progress), BTreeSet::from([1]));
+        f.close().await;
+    }
+
+    /// Watcher 5 is canceled while a progress request at revision 2 waits, and a new watcher
+    /// takes ID 5 after revision 3. The new watcher does not hold back the earlier reply.
+    #[tokio::test]
+    async fn a_reused_watch_id_does_not_hold_back_an_earlier_progress_reply() {
+        let mut f = Fixture::new().await;
+        f.watch(request(1, "k", 0)).await;
+        f.watch(request(5, "k", 0)).await;
+        let two = f.put("k", "2").await;
+        f.stream.batch(&two).await.unwrap();
+        assert_eq!(f.events(), [(1, 2, 0), (5, 2, 0)]);
+        f.stream.progress().unwrap();
+        f.stream.cancel(5).await.unwrap();
+        f.put("k", "3").await;
+        f.stream.create(request(5, "k", 0)).await.unwrap();
+        let responses = f.responses();
+        assert!(responses[0].canceled && responses[0].watch_id == 5);
+        assert!(responses[1].created && responses[1].watch_id == 5);
+        f.stream.settle().await.unwrap();
+        let progress = f.responses();
+        assert_eq!(progress.len(), 1, "{progress:?}");
+        assert_eq!(progress[0].watch_id, -1);
+        assert_eq!(progress[0].header.unwrap().revision, 2);
         f.close().await;
     }
 

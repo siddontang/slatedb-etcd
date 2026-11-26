@@ -746,7 +746,8 @@ closed client, or a closed request stream still ends the work while the store fa
 request waits until its watchers have every event through its revision. Until its reply, the
 stream takes no feed batch, so no later event goes before it. Later progress requests fold into
 one with the newest revision. A watcher created meanwhile starts after the published revision,
-and it does not hold back the earlier reply.
+and it does not hold back the earlier reply. A canceled watcher leaves the waiting requests, so
+their ID sets stay bounded, and a later watcher with its ID does not hold them back either.
 
 ### Writer faults
 
