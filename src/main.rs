@@ -141,7 +141,7 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     max_watchers: usize,
     /// Watchers on one Watch stream. Zero means no limit, as in etcd.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = slatedb_etcd::grpc::DEFAULT_MAX_WATCHERS_PER_STREAM)]
     max_watchers_per_stream: usize,
     /// Watch streams that read history pages for catch-up at the same time. Zero means no limit.
     #[arg(long, default_value_t = 0)]

@@ -28,6 +28,9 @@ const MAX_LOCAL_READS: usize = 1024;
 
 pub const DEFAULT_WATCH_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 
+/// The default limit of watchers on one Watch stream. etcd has no such limit.
+pub const DEFAULT_MAX_WATCHERS_PER_STREAM: usize = 1024;
+
 /// Watch settings of a member. A zero limit means no limit, as in etcd.
 #[derive(Clone, Copy, Debug)]
 pub struct WatchOptions {
@@ -46,7 +49,7 @@ impl Default for WatchOptions {
         Self {
             progress_interval: DEFAULT_WATCH_PROGRESS_INTERVAL,
             max_watchers: 0,
-            max_watchers_per_stream: 0,
+            max_watchers_per_stream: DEFAULT_MAX_WATCHERS_PER_STREAM,
             max_catch_ups: 0,
         }
     }

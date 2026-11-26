@@ -82,12 +82,12 @@ For example, use `--watch-progress-notify-interval=200ms` for the upstream clien
 
 ## Watch limits
 
-These limits are off by default, as in etcd. Zero means no limit.
+Zero means no limit, as in etcd. Only the stream limit is on by default.
 
 | Flag | Default | Meaning |
 | --- | ---: | --- |
 | `--max-watchers` | 0 | Watchers across all Watch streams of the member. |
-| `--max-watchers-per-stream` | 0 | Watchers on one Watch stream. |
+| `--max-watchers-per-stream` | 1024 | Watchers on one Watch stream. |
 | `--max-watch-catch-ups` | 0 | Streams that read history pages for catch-up at once. |
 
 A create over a watcher limit gets a created and canceled response with watch ID -1 and the reason
