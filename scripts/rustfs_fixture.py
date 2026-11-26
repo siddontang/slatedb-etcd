@@ -1,5 +1,13 @@
-"""Start a pinned RustFS server for local S3 tests and benchmarks."""
+#!/usr/bin/env python3
+"""Start a pinned RustFS server for local S3 tests, benchmarks, and clusters of several members.
 
+A cluster of several members runs in shared state mode on RustFS, as production runs on S3.
+`python3 scripts/rustfs_fixture.py -- COMMAND...` runs a command with one server, for example a
+direct `go test` run. Without a command, the server runs until Ctrl-C. `--env-file` writes its
+settings as shell exports for other terminals. The server deletes its objects when it stops.
+"""
+
+import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
@@ -8,9 +16,12 @@ import os
 from pathlib import Path
 import platform
 import secrets
+import shlex
 import shutil
+import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -19,6 +30,9 @@ import urllib.request
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
+# The server environment that `shared_store` exports, and that nested runners reuse.
+STORE_ENV = ("SLATEDB_S3_TEST_ENDPOINT", "SLATEDB_S3_TEST_BUCKET", "AWS_ACCESS_KEY_ID",
+             "AWS_SECRET_ACCESS_KEY")
 VERSION = "1.0.6"
 PACKAGES = {
     ("Darwin", "arm64"): ("macos-aarch64",
@@ -154,3 +168,88 @@ def local_rustfs():
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
+
+
+@contextmanager
+def shared_store():
+    """Supply one RustFS server to the clusters of several members in this process and its children.
+
+    If the environment already names a server, for example from an outer runner, use that server.
+    Otherwise start one and export its settings to `os.environ` until the context ends. Yield the
+    store description for reports.
+    """
+    if all(os.environ.get(name) for name in STORE_ENV):
+        yield {"name": "RustFS", "version": VERSION, "reused": True}
+        return
+    with local_rustfs() as (env, store):
+        saved = {name: os.environ.get(name) for name in (*STORE_ENV, "AWS_EC2_METADATA_DISABLED",
+                                                         "AWS_SESSION_TOKEN")}
+        os.environ.pop("AWS_SESSION_TOKEN", None)
+        os.environ.update({name: env[name] for name in (*STORE_ENV, "AWS_EC2_METADATA_DISABLED")})
+        try:
+            yield store
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+
+def unique_prefix(kind):
+    """Return a new S3 prefix for one cluster, so that clusters on one server do not collide."""
+    return f"{kind}/{secrets.token_hex(8)}"
+
+
+def shared_args(prefix, env=None):
+    """Return the flags that start one member in shared state mode on the server of `env`.
+
+    All members of one cluster use the same `prefix`, also after a restart.
+    """
+    env = os.environ if env is None else env
+    endpoint, bucket = env.get("SLATEDB_S3_TEST_ENDPOINT"), env.get("SLATEDB_S3_TEST_BUCKET")
+    if not endpoint or not bucket:
+        raise RuntimeError("A cluster of several members needs RustFS. Use shared_store, or run "
+                           "the command through scripts/rustfs_fixture.py")
+    return ["--state-mode", "shared", "--s3-bucket", bucket, "--s3-endpoint", endpoint,
+            "--s3-allow-http", "--s3-prefix", prefix]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--env-file", type=Path, help="Write the server settings as shell exports")
+    parser.add_argument("command", nargs="*", help="Command to run with the server environment")
+    args = parser.parse_args()
+    # Stop the server on SIGTERM too.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    with shared_store():
+        try:
+            serve(args)
+        finally:
+            # The settings name a server that no longer runs.
+            if args.env_file:
+                args.env_file.unlink(missing_ok=True)
+
+
+def serve(args):
+    if args.env_file:
+        names = (*STORE_ENV, "AWS_EC2_METADATA_DISABLED")
+        args.env_file.parent.mkdir(parents=True, exist_ok=True)
+        args.env_file.touch(mode=0o600)
+        args.env_file.chmod(0o600)
+        args.env_file.write_text("".join(f"export {name}={shlex.quote(os.environ[name])}\n"
+                                         for name in names))
+        print("Server settings:", args.env_file, flush=True)
+    if args.command:
+        raise SystemExit(subprocess.run(args.command).returncode)
+    print("RustFS runs at", os.environ["SLATEDB_S3_TEST_ENDPOINT"], "until Ctrl-C", flush=True)
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
