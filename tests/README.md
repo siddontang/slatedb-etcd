@@ -20,6 +20,15 @@ Run more campaigns with `--seeds 1,2,3,4,5,6,7,8`.
 Each seed sets client choices. Operating system scheduling still changes process histories.
 Use `SLATEDB_ETCD_BINARY` for direct Go runs, or `--binary` for Python runners.
 
+A cluster of several members runs in shared state mode on RustFS, as production runs on S3.
+The runners start one pinned RustFS server and give each cluster its own S3 prefix. A runner reuses
+the server that `SLATEDB_S3_TEST_ENDPOINT` and the other fixture settings name. A single member
+keeps its state on the local disk. Run a direct Go test through the fixture:
+
+```sh
+python3 scripts/rustfs_fixture.py -- sh -c 'cd tests/compat && go test -run TestDifferentialKV'
+```
+
 The runners retain JSON reports and Go logs. Fault results stay in `tmp/test-results/robustness-N/`:
 
 - `operations.json`: typed etcd model history, including unknown writes.

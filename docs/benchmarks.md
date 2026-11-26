@@ -36,8 +36,10 @@ This is a closed-loop Python client. Client scheduling and the GIL can affect co
 The default harness disables automatic snapshots to measure the hot write path. The second command
 includes periodic snapshots. Compare both results before drawing conclusions about tail latency.
 
-All replicas and the client share one host and disk. SlateDB uses `LocalFileSystem` as its object
-store. These measurements are not S3, cross-host, or cross-AZ results. SIGKILL tests cover process
+All members and the client share one host and disk. The benchmark members run in shared state
+mode on one local RustFS server, and the leader writes the SSTs. The `test` mode keeps replicated
+state mode, because its checks need member-local checkpoints and Raft snapshot installs. These
+measurements are not S3, cross-host, or cross-AZ results. SIGKILL tests cover process
 crashes. They do not verify power-loss behavior, failed disks, or independent failure domains.
 
 ## Compare the real gRPC path with etcd
@@ -52,6 +54,8 @@ python3 scripts/benchmark-etcd.py --requests 10000 --keys 1000 \
 The driver builds etcd v3.6.5 from the pinned Go module and calls its original command entry point.
 Each backend uses three separate server processes by default. Use `--members 1` for one member.
 Run the one-member and three-member comparisons separately.
+Three service members run in shared state mode on a temporary local RustFS server, with a new
+prefix for each cluster. One member keeps its state on the local disk.
 Each workload starts with a fresh cluster.
 Both use the same official gRPC client, key count, value size, request count, and concurrency.
 All reads are linearizable. Both retain normal Raft sync behavior.
@@ -103,8 +107,9 @@ The caller waits for Compact. Other workers continue to issue requests.
 The report includes completed compactions and their durations. Put latency includes these waits.
 macOS sampling reads `ps` counters. Both exclude child processes and the controller.
 
-Use `--rustfs` for a temporary local RustFS server. The report records its version and binary hash.
-The client uses HTTP over loopback. CPU and RSS cover the etcd-compatible servers.
+Use `--rustfs` to put one member on a temporary local RustFS server too. The report records the
+RustFS version and binary hash. The client uses HTTP over loopback. CPU and RSS cover the
+etcd-compatible servers.
 They exclude the RustFS process. The fixture removes its data after the run.
 Linux CI compares the base and head at 300 puts/s. It also checks the head at 1,000 puts/s.
 
@@ -115,6 +120,7 @@ python3 scripts/benchmark-etcd.py --rustfs --requests 6000 --keys 1000 --repeat 
 ```
 
 Use `--s3-bucket`, `--s3-endpoint`, and optional `--s3-allow-http` to measure remote state storage.
+Three members then use shared state mode on that bucket instead of RustFS.
 Create the bucket first and supply credentials through the supported AWS environment settings.
 The etcd reference still uses local disks. The service keeps its local Raft logs in this profile.
 Object request counts, remote bytes, and provider charges require separate S3 telemetry.
