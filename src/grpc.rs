@@ -40,8 +40,6 @@ pub struct WatchOptions {
     pub max_watchers: usize,
     /// Watchers on one stream.
     pub max_watchers_per_stream: usize,
-    /// Streams that read history for catch-up at the same time.
-    pub max_catch_ups: usize,
 }
 
 impl Default for WatchOptions {
@@ -50,7 +48,6 @@ impl Default for WatchOptions {
             progress_interval: DEFAULT_WATCH_PROGRESS_INTERVAL,
             max_watchers: 0,
             max_watchers_per_stream: DEFAULT_MAX_WATCHERS_PER_STREAM,
-            max_catch_ups: 0,
         }
     }
 }

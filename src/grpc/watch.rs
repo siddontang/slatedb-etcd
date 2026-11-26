@@ -17,8 +17,6 @@ pub(crate) struct Limits {
     max_watchers: usize,
     per_stream: usize,
     watchers: AtomicUsize,
-    /// Permits for history reads of catch-up pages.
-    catch_ups: Option<tokio::sync::Semaphore>,
 }
 
 impl Limits {
@@ -32,8 +30,6 @@ impl Limits {
             max_watchers: options.max_watchers,
             per_stream: options.max_watchers_per_stream,
             watchers: AtomicUsize::new(0),
-            catch_ups: (options.max_catch_ups > 0)
-                .then(|| tokio::sync::Semaphore::new(options.max_catch_ups)),
         }
     }
 
@@ -42,10 +38,13 @@ impl Limits {
         if self.max_watchers == 0 {
             return Ok(None);
         }
-        if self.watchers.fetch_add(1, Ordering::Relaxed) >= self.max_watchers {
-            self.watchers.fetch_sub(1, Ordering::Relaxed);
-            return Err(());
-        }
+        // Count only below the limit. A refused create never changes the count, so it cannot
+        // make a slot that another stream frees in the meantime appear taken.
+        self.watchers
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < self.max_watchers).then_some(n + 1)
+            })
+            .map_err(|_| ())?;
         Ok(Some(Slot(self.clone())))
     }
 }
@@ -410,23 +409,12 @@ impl Stream {
     /// `None` serves unsynced watchers. `Some(goal)` serves every watcher at or below `goal`.
     /// Returns true while those watchers still need more pages.
     async fn catch_up(&mut self, through: Option<i64>) -> Result<bool, Status> {
-        // A limited member reads history pages for a bounded number of streams at once. The
-        // wait holds no view, and the page returns the permit before it sends anything.
-        let limits = self.limits.clone();
-        let reading = match &limits.catch_ups {
-            Some(catch_ups) => Some(catch_ups.acquire().await.expect("never closed")),
-            None => None,
-        };
-        let more = self.catch_up_page(through, reading).await;
+        let more = self.catch_up_page(through).await;
         self.unpin();
         more
     }
 
-    async fn catch_up_page(
-        &mut self,
-        through: Option<i64>,
-        reading: Option<tokio::sync::SemaphorePermit<'_>>,
-    ) -> Result<bool, Status> {
+    async fn catch_up_page(&mut self, through: Option<i64>) -> Result<bool, Status> {
         let state = self.current(through.is_none())?;
         let view = state.view.clone();
         let limit = through.map_or(view.revision, |t| t.min(view.revision));
@@ -467,7 +455,7 @@ impl Stream {
                     ..Default::default()
                 });
             }
-            drop((state, view, reading));
+            drop((state, view));
             for response in responses {
                 send(&self.tx, response).await?;
             }
@@ -554,7 +542,7 @@ impl Stream {
             }
         }
         // Release the view before any send. A slow client cannot hold the pin.
-        drop((reads, rows, state, reading));
+        drop((reads, rows, state));
         record_batch(bytes, prepared.len());
         for (id, response) in prepared {
             let watcher = self.watchers.get_mut(&id).expect("prepared watcher");
@@ -1436,32 +1424,28 @@ mod tests {
         f.close().await;
     }
 
-    /// A stream waits for a history read permit without a view, and then catches up as before.
-    #[tokio::test]
-    async fn catch_up_waits_for_a_history_read_permit() {
-        let mut f = Fixture::new().await;
-        for n in 0..3 {
-            let batch = f.put("k", &n.to_string()).await;
-            f.stream.batch(&batch).await.unwrap();
-        }
+    /// A refused create never raises the count over the limit, even for a moment. A moment over
+    /// it would refuse a create that races with the end of the last watcher.
+    #[test]
+    fn refused_creates_never_count_over_the_limit() {
         let shared = limits(WatchOptions {
-            max_catch_ups: 1,
+            max_watchers: 1,
             ..Default::default()
         });
-        f.stream.limits = shared.clone();
-        let held = shared.catch_ups.as_ref().unwrap().try_acquire().unwrap();
-        let create = f.stream.create(request(1, "k", 2));
-        assert!(tokio::time::timeout(Duration::from_millis(100), create)
-            .await
-            .is_err());
-        let created = f.responses();
-        assert!(created.len() == 1 && created[0].created);
-        assert!(f.stream.unsynced());
-        drop(held);
-        f.stream.catch_up_all(None).await.unwrap();
-        assert_eq!(f.events(), vec![(1, 2, 0), (1, 3, 0), (1, 4, 0)]);
-        assert!(!f.stream.unsynced());
-        f.close().await;
+        let _live = shared.admit().unwrap();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let refuser = std::thread::spawn({
+            let (shared, done) = (shared.clone(), done.clone());
+            move || {
+                while !done.load(Ordering::Relaxed) {
+                    assert!(shared.admit().is_err());
+                }
+            }
+        });
+        let over = (0..1_000_000).any(|_| shared.watchers.load(Ordering::Relaxed) > 1);
+        done.store(true, Ordering::Relaxed);
+        refuser.join().unwrap();
+        assert!(!over);
     }
 
     #[tokio::test]
