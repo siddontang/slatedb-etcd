@@ -22,6 +22,7 @@ async fn a_restart_opens_the_record_checkpoint_above_its_row() {
                 join: false,
                 empty_log: false,
                 pin_max: Duration::from_secs(300),
+                overlay_max_bytes: 1 << 30,
                 restore: None,
                 record,
             };
@@ -197,6 +198,7 @@ async fn open_at(
         join: false,
         empty_log: false,
         pin_max: Duration::from_secs(300),
+        overlay_max_bytes: 1 << 30,
         restore: None,
         record,
     };

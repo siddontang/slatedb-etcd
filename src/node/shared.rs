@@ -1857,6 +1857,20 @@ mod record_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shared-mode options of one test voter.
+    fn voter_options(empty_log: bool) -> crate::state::shared::Options {
+        crate::state::shared::Options {
+            quota: 0,
+            voters: vec![1],
+            join: false,
+            empty_log,
+            pin_max: Duration::from_secs(300),
+            overlay_max_bytes: 1 << 30,
+            restore: None,
+            record: None,
+        }
+    }
     use crate::state::overlay::Overlay;
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::ObjectStore;
@@ -2124,15 +2138,7 @@ mod tests {
             .encode()
             .unwrap();
         storage.adopt(&snapshot).unwrap();
-        let options = crate::state::shared::Options {
-            quota: 0,
-            voters: vec![1],
-            join: false,
-            empty_log: false,
-            pin_max: Duration::from_secs(300),
-            restore: None,
-            record: None,
-        };
+        let options = voter_options(false);
         let mut state = StateMachine::open_shared(
             Arc::new(InMemory::new()),
             "root",
@@ -2270,15 +2276,7 @@ mod tests {
     /// current leader opens its writer again, and its overlay batches still reach a checkpoint.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_fenced_leader_opens_its_writer_again() {
-        let options = crate::state::shared::Options {
-            quota: 0,
-            voters: vec![1],
-            join: false,
-            empty_log: false,
-            pin_max: Duration::from_secs(300),
-            restore: None,
-            record: None,
-        };
+        let options = voter_options(false);
         let mut state = StateMachine::open_shared(
             Arc::new(InMemory::new()),
             "root",
@@ -2388,15 +2386,7 @@ mod tests {
         Announcements,
         uuid::Uuid,
     ) {
-        let options = crate::state::shared::Options {
-            quota: 0,
-            voters: vec![1],
-            join: false,
-            empty_log: false,
-            pin_max: Duration::from_secs(300),
-            restore: None,
-            record: None,
-        };
+        let options = voter_options(false);
         let mut state = StateMachine::open_shared(
             Arc::new(InMemory::new()),
             "root",
@@ -2502,15 +2492,7 @@ mod tests {
     async fn a_failed_base_open_is_retried_on_an_idle_member() {
         use crate::object::faults::{FaultStore, FAIL_GET};
         let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
-        let options = crate::state::shared::Options {
-            quota: 0,
-            voters: vec![1],
-            join: false,
-            empty_log: false,
-            pin_max: Duration::from_secs(300),
-            restore: None,
-            record: None,
-        };
+        let options = voter_options(false);
         // A tiny cache, so the open reads the store.
         let cache = crate::state::StateCache {
             block_bytes: 1,
@@ -2577,15 +2559,7 @@ mod tests {
     async fn the_base_advances_under_a_stream_of_announcements() {
         use crate::object::faults::{FaultStore, DELAY_SST_GET};
         let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
-        let options = crate::state::shared::Options {
-            quota: 0,
-            voters: vec![1],
-            join: false,
-            empty_log: false,
-            pin_max: Duration::from_secs(300),
-            restore: None,
-            record: None,
-        };
+        let options = voter_options(false);
         // A tiny cache, so each open reads the store.
         let cache = crate::state::StateCache {
             block_bytes: 1,
@@ -2774,15 +2748,7 @@ mod tests {
 
     /// A one-voter shared state on `store`, opened without a restore, with its handles.
     async fn ordinary(store: Arc<dyn ObjectStore>) -> (StateMachine, Handles) {
-        let options = crate::state::shared::Options {
-            quota: 0,
-            voters: vec![1],
-            join: false,
-            empty_log: true,
-            pin_max: Duration::from_secs(300),
-            restore: None,
-            record: None,
-        };
+        let options = voter_options(true);
         let mut state = StateMachine::open_shared(
             store,
             "root",
@@ -3268,15 +3234,7 @@ mod tests {
     /// normal end is not a failure of the new term.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_old_term_task_end_is_not_a_failure() {
-        let options = crate::state::shared::Options {
-            quota: 0,
-            voters: vec![1],
-            join: false,
-            empty_log: false,
-            pin_max: Duration::from_secs(300),
-            restore: None,
-            record: None,
-        };
+        let options = voter_options(false);
         let mut state = StateMachine::open_shared(
             Arc::new(InMemory::new()),
             "root",

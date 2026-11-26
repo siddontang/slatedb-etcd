@@ -134,10 +134,17 @@ namespace only when they name the same owner. A different owner means that anoth
 directory, possibly a running member, uses the namespace: the restore wrote nothing there.
 When they differ, or the directory is already gone, restore all members with a new cluster ID or
 `--s3-prefix`.
-In [shared state mode](shared-state.md) the member still builds the image of its pinned view
-in memory and sends it in the same messages. That image, with its padding and digest, is limited
-to 64 MiB. A larger one returns ResourceExhausted.
-A restore into shared mode also reads the whole file in memory, so it accepts at most 64 MiB.
+In [shared state mode](shared-state.md) the member pins its applied view instead and creates no
+checkpoint. The stream reads the view twice, as above, so the image has no size limit. Each row
+has the same 64 MiB limit.
+The backup view is exempt from `--view-pin-max`. The stream ends with Unavailable when the client
+takes no message for 60 s. The first pass does not count.
+A member streams at most 4 backups. The overlay segments that they keep after a base switch
+count against `--overlay-max-bytes`. So a backup of a full overlay can start.
+A backup above a limit returns ResourceExhausted; retry it later. When base switches leave the
+kept segments above the limit, the oldest backup ends with Unavailable.
+See [backups](shared-state.md#backups).
+A restore into shared mode still reads the whole file in memory, so it accepts at most 64 MiB.
 That limit applies to every file it restores, including one saved from a replicated member.
 
 Downgrade authenticates the administrator and returns Unimplemented.

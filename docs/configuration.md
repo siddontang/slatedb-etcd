@@ -125,8 +125,8 @@ A negative quota value disables the quota. The quota is cluster state, so a flag
 effect only when that member leads; see [quota changes](operations.md#change-the-quota).
 The quota can be exceeded by one operation and does not reserve free disk space.
 Native backups and `Maintenance.Snapshot` stream from a pinned checkpoint with bounded memory.
-The image has no size limit, but each row has a 64 MiB limit. In shared state mode, the image
-is built in memory and limited to 64 MiB; see
+The image has no size limit, but each row has a 64 MiB limit. In shared state mode, the overlay
+segments that backups keep after a base switch count against `--overlay-max-bytes`; see
 [administration](administration.md#maintenance-and-storage).
 Peer snapshots copy SlateDB checkpoint objects and have no size limit; see
 [object storage Raft snapshots](object-snapshots.md).
@@ -187,6 +187,9 @@ checkpoint of it, its base, under an in-memory overlay of the newer applied batc
 Rules and limits:
 
 - All members use one S3 bucket and prefix. Learners and `--join` members are supported.
+- A native backup is exempt from `--view-pin-max`. The overlay segments that backups keep after a
+  base switch count against `--overlay-max-bytes` on each member. See
+  [backups](shared-state.md#backups).
 - The cluster claim `shared/owner.json` stores the mode, the quota, and the initial voters.
   Later starts use that quota. A member with other initial voters refuses to open the writer.
 - On S3, `mode.json` under the cluster prefix fixes the mode before any state write. A shared start

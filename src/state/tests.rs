@@ -1475,7 +1475,7 @@ pub(super) async fn restore(dir: &std::path::Path, backup: Vec<u8>) -> StateMach
 pub(super) async fn streamed_backup(state: &StateMachine) -> Vec<u8> {
     let mut stream = state.backup().await.unwrap();
     let mut data = vec![];
-    while let Some(chunk) = stream.chunks.recv().await {
+    while let Some(chunk) = stream.recv().await {
         data.extend_from_slice(&chunk.unwrap().blob);
     }
     data

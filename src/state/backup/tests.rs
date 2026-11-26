@@ -1,5 +1,5 @@
-use super::backup::{Stream, MAX_ROW_BYTES, RESTORE_MARKER};
-use super::*;
+use super::{Stream, MAX_ROW_BYTES, RESTORE_MARKER};
+use crate::state::*;
 use crate::{Command, Operation};
 use sha2::{Digest, Sha256};
 
@@ -24,7 +24,7 @@ async fn put(state: &mut StateMachine, index: u64, key: &str, value: &str) {
 async fn collect(mut stream: Stream) -> Vec<u8> {
     let mut data = vec![];
     let mut last = None;
-    while let Some(chunk) = stream.chunks.recv().await {
+    while let Some(chunk) = stream.recv().await {
         let chunk = chunk.unwrap();
         assert!(!chunk.blob.is_empty() && chunk.blob.len() <= 64 * 1024);
         if let Some(last) = last {
@@ -98,7 +98,7 @@ async fn a_backup_streams_its_applied_boundary_while_writes_continue() {
     // etcd keys give the source a logical size.
     for index in 301..=320 {
         let key = format!("etcd-{index}");
-        let request = super::quota_tests::put(key.as_bytes(), value.as_bytes(), 0);
+        let request = crate::state::quota_tests::put(key.as_bytes(), value.as_bytes(), 0);
         state
             .apply_etcd(index, &request)
             .await
@@ -177,7 +177,7 @@ async fn an_interrupted_backup_releases_its_checkpoint() {
         put(&mut state, index, &format!("key-{index}"), &value).await;
     }
     let mut stream = state.backup().await.unwrap();
-    let first = stream.chunks.recv().await.unwrap().unwrap();
+    let first = stream.recv().await.unwrap().unwrap();
     assert!(first.remaining > 0);
     drop(stream);
     released(&state).await;
@@ -211,7 +211,7 @@ async fn a_backup_stalled_in_an_object_read_ends_when_its_client_goes_away() {
     store.set_delay(Duration::from_secs(3600));
     store.set(DELAY_SST_GET);
     let mut stream = state.backup().await.unwrap();
-    let stalled = tokio::time::timeout(Duration::from_millis(500), stream.chunks.recv()).await;
+    let stalled = tokio::time::timeout(Duration::from_millis(500), stream.recv()).await;
     assert!(stalled.is_err(), "the stream did not stall");
     drop(stream);
     released(&state).await;
@@ -236,13 +236,13 @@ async fn a_backup_with_a_failing_object_read_ends_for_a_connected_client() {
     state.db().flush().await.unwrap();
     store.set(RETRYABLE_SST_GET);
     let mut stream = state.backup().await.unwrap();
-    let error = tokio::time::timeout(Duration::from_secs(30), stream.chunks.recv())
+    let error = tokio::time::timeout(Duration::from_secs(30), stream.recv())
         .await
         .expect("the stream kept retrying")
         .expect("the stream ended without an error")
         .err()
         .expect("the stream sent a chunk");
-    let error = super::backup::backup_error(error);
+    let error = super::backup_error(error);
     assert_eq!(error.code, tonic::Code::Unavailable as i32, "{error:?}");
     released(&state).await;
     store.set(0);
@@ -306,7 +306,7 @@ async fn a_restore_rejects_an_image_replaced_after_its_check() {
     };
     let path = dir.path().join("native.snapshot");
     std::fs::write(&path, image(b"checked")).unwrap();
-    let checked = super::backup::check(&path).unwrap();
+    let checked = super::check(&path).unwrap();
     // Between the passes, a valid image with as many rows replaces the checked file.
     std::fs::write(&path, image(b"replaced")).unwrap();
     let target = dir.path().join("restored");
@@ -341,7 +341,7 @@ async fn a_paused_client_keeps_the_backup_checkpoint() {
     }
     let lifetime = Duration::from_secs(2);
     let mut stream = state.backup_with_lifetime(lifetime).await.unwrap();
-    let first = stream.chunks.recv().await.unwrap().unwrap();
+    let first = stream.recv().await.unwrap().unwrap();
     // The client stops reading while the image is larger than the chunks buffered ahead.
     tokio::time::sleep(lifetime * 3).await;
     let checkpoints = state
@@ -387,7 +387,7 @@ async fn restore_checked(
     cluster: &str,
     objects: &crate::object::Config,
 ) -> Result<()> {
-    let checked = super::backup::check(path)?;
+    let checked = super::check(path)?;
     StateMachine::restore_checked(
         &checked,
         dir,
@@ -406,11 +406,9 @@ async fn restore_checked(
 #[test]
 fn a_failed_backup_read_is_retryable() {
     let read = anyhow::Error::from(std::io::Error::other("an SST went away"));
-    let error = super::backup::backup_error(read);
+    let error = super::backup_error(read);
     assert_eq!(error.code, tonic::Code::Unavailable as i32, "{error:?}");
-    let error = super::backup::backup_error(
-        super::backup::row_size(b"k", &vec![0; MAX_ROW_BYTES]).unwrap_err(),
-    );
+    let error = super::backup_error(super::row_size(b"k", &vec![0; MAX_ROW_BYTES]).unwrap_err());
     assert_eq!(
         error.code,
         tonic::Code::ResourceExhausted as i32,
@@ -426,14 +424,11 @@ async fn a_backup_rejects_a_row_that_restore_cannot_read() {
     // The largest accepted row restores.
     let key = b"etcd/large".to_vec();
     let value = vec![b'v'; MAX_ROW_BYTES - 16 - key.len()];
-    assert_eq!(
-        super::backup::row_size(&key, &value).unwrap(),
-        MAX_ROW_BYTES as u64
-    );
+    assert_eq!(super::row_size(&key, &value).unwrap(), MAX_ROW_BYTES as u64);
     let mut larger = value.clone();
     larger.push(b'v');
-    let error = super::backup::row_size(&key, &larger).unwrap_err();
-    let error = super::backup::backup_error(error);
+    let error = super::row_size(&key, &larger).unwrap_err();
+    let error = super::backup_error(error);
     assert_eq!(error.code, tonic::Code::ResourceExhausted as i32);
     let path = dir.path().join("largest.snapshot");
     write_image(&path, vec![(key, value)]);
@@ -445,17 +440,17 @@ async fn a_backup_rejects_a_row_that_restore_cannot_read() {
     put(&mut state, 1, "large", &large).await;
     drop(large);
     let mut stream = state.backup().await.unwrap();
-    let error = match stream.chunks.recv().await.unwrap() {
+    let error = match stream.recv().await.unwrap() {
         Ok(_) => panic!("the backup sent a row that restore rejects"),
         Err(error) => error,
     };
-    let error = super::backup::backup_error(error);
+    let error = super::backup_error(error);
     assert_eq!(
         error.code,
         tonic::Code::ResourceExhausted as i32,
         "{error:?}"
     );
-    assert!(stream.chunks.recv().await.is_none());
+    assert!(stream.recv().await.is_none());
     released(&state).await;
     state.close().await.unwrap();
 }
@@ -516,7 +511,7 @@ async fn a_restore_does_not_index_the_copied_keys() {
         .unwrap();
     for index in 1..=2000 {
         let key = format!("key-{index}");
-        let request = super::quota_tests::put(key.as_bytes(), b"small", 0);
+        let request = crate::state::quota_tests::put(key.as_bytes(), b"small", 0);
         source
             .apply_etcd(index, &request)
             .await
@@ -529,7 +524,7 @@ async fn a_restore_does_not_index_the_copied_keys() {
     released(&source).await;
     let path = dir.path().join("native.snapshot");
     std::fs::write(&path, &data).unwrap();
-    let checked = super::backup::check(&path).unwrap();
+    let checked = super::check(&path).unwrap();
     let mut state = StateMachine::open(&dir.path().join("restore"))
         .await
         .unwrap();
@@ -548,7 +543,7 @@ async fn a_restore_does_not_index_the_copied_keys() {
     // The copy counted the logical size that startup reads.
     assert_eq!(
         restored.logical_bytes,
-        super::maintenance::count_logical_usage(restored.applied_state())
+        crate::state::maintenance::count_logical_usage(restored.applied_state())
             .await
             .unwrap()
     );
@@ -618,7 +613,7 @@ async fn a_restore_check_does_not_stall_a_single_worker_runtime() {
     *bytes.last_mut().unwrap() ^= 1;
     std::fs::write(&path, bytes).unwrap();
     let started = std::time::Instant::now();
-    assert!(super::backup::check(&path).is_err());
+    assert!(super::check(&path).is_err());
     let pass = started.elapsed();
 
     let gap = Arc::new(AtomicU64::new(0));
@@ -674,7 +669,7 @@ async fn an_interrupted_s3_restore_retries_after_its_namespace_is_cleared() {
     let objects = crate::object::Config::TestS3(store.clone(), s3.clone());
     // The image changes during the restore, after the member claimed its namespace.
     write_image(&path, rows(b"checked"));
-    let checked = super::backup::check(&path).unwrap();
+    let checked = super::check(&path).unwrap();
     write_image(&path, rows(b"replaced"));
     let target = dir.path().join("member");
     let error = StateMachine::restore_checked(

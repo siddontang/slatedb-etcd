@@ -423,6 +423,7 @@ impl Node {
             join: options.join,
             empty_log,
             pin_max: options.view_pin_max,
+            overlay_max_bytes: options.overlay_max_bytes,
             restore: options.restore.clone(),
             record: crate::state::shared::Record::of(storage.recovery_snapshot())?,
         };

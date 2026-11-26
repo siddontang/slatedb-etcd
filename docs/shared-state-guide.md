@@ -126,7 +126,9 @@ Keep host clocks synchronized with NTP.
 - The leader also holds the memtable of the writer. Expect about two times the unflushed data on
   the leader.
 - A read view keeps its base for at most `--view-pin-max`. A longer read fails with a retryable
-  error.
+  error. A native backup is exempt. It ends when its client takes no message for 60 s.
+- Native backups keep the overlay segments of their views after a base switch. These count
+  against `--overlay-max-bytes`, and at most 4 backups stream on a member.
 
 ## Operations
 
@@ -138,7 +140,7 @@ Keep host clocks synchronized with NTP.
 | Manual checkpoint, `POST /checkpoint` | Returns when the member's base covers the commit index |
 | Status `db_size` | Read from the shared manifest. All members report about the same value |
 | HashKV and Hash | Computed from the member's view, as in replicated mode |
-| Native backup | Scans the member's view. It needs no flush |
+| Native backup | Streams the member's view. See [backups](shared-state.md#backups) |
 | `--restore-snapshot` | Seeds a new shared cluster at index 1 |
 | MoveLeader | Requests a checkpoint first, then transfers the lead within 3 s |
 
@@ -175,7 +177,7 @@ A restore that keeps failing logs the error and names the snapshot. Only for tha
 that `shared/bootstrap-op.json` names your snapshot, that `shared/bootstrap.json` is missing,
 and that no member process runs. Then delete `shared/` under the cluster prefix and start the
 restore again. Never delete `shared/` of a cluster that has a bootstrap marker: it holds the
-state of all members. The native backup limit is 64 MiB.
+state of all members. A restore into shared mode accepts a backup of at most 64 MiB.
 
 ## Convert a replicated cluster
 

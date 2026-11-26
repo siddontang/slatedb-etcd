@@ -12,7 +12,7 @@ use std::ops::Range;
 
 use bytes::Bytes;
 use slatedb::config::ScanOptions;
-use slatedb::{Db, DbIterator, DbSnapshot};
+use slatedb::{Db, DbIterator, DbReader, DbSnapshot};
 
 /// One stored row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,6 +116,31 @@ impl StateRead for DbSnapshot {
         options: &ScanOptions,
     ) -> Result<DbIterator, slatedb::Error> {
         DbSnapshot::scan_prefix_with_options(self, prefix, .., options).await
+    }
+}
+
+/// A checkpoint reader. A replicated backup scans its checkpoint through this.
+impl StateRead for DbReader {
+    type Scan<'a> = DbIterator;
+
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, slatedb::Error> {
+        DbReader::get(self, key).await
+    }
+
+    async fn scan_range(
+        &self,
+        range: Range<Vec<u8>>,
+        options: &ScanOptions,
+    ) -> Result<DbIterator, slatedb::Error> {
+        DbReader::scan_with_options(self, range, options).await
+    }
+
+    async fn scan_under(
+        &self,
+        prefix: &[u8],
+        options: &ScanOptions,
+    ) -> Result<DbIterator, slatedb::Error> {
+        DbReader::scan_prefix_with_options(self, prefix, .., options).await
     }
 }
 

@@ -952,6 +952,8 @@ pub(crate) struct Options {
     pub empty_log: bool,
     /// The longest time that a read view may pin its base.
     pub pin_max: Duration,
+    /// The budget of released overlay segments that long holders keep. See `overlay::Holders`.
+    pub overlay_max_bytes: u64,
     /// Rows of a native snapshot that seed a new cluster.
     pub restore: Option<Restore>,
     /// The checkpoint that the durable Raft snapshot record names, if any.
@@ -1271,6 +1273,8 @@ pub(crate) struct Shared {
     /// The `base_index` of the current base. Physical Compact replies wait for a covering base.
     based: Arc<tokio::sync::watch::Sender<u64>>,
     pub(crate) pin_max: Duration,
+    /// The native backups that keep overlay segments of this member.
+    pub(crate) holders: Arc<super::overlay::Holders>,
 }
 
 /// The longest time that a follower warms the cache for a new base before it offers the base.
@@ -1368,7 +1372,7 @@ async fn open_once(source: Arc<Source>, opened: Arc<Opened>, id: uuid::Uuid, cov
 }
 
 impl Shared {
-    fn new(base: Arc<Base>, source: Arc<Source>, pin_max: Duration) -> Self {
+    fn new(base: Arc<Base>, source: Arc<Source>, options: &Options) -> Self {
         Self {
             overlay: Overlay::new(base.applied),
             based: Arc::new(tokio::sync::watch::channel(base.applied).0),
@@ -1383,7 +1387,8 @@ impl Shared {
             extensions: 0,
             retry_opens: true,
             pending: Arc::default(),
-            pin_max,
+            pin_max: options.pin_max,
+            holders: Arc::new(super::overlay::Holders::new(options.overlay_max_bytes)),
         }
     }
 
@@ -1615,9 +1620,11 @@ impl StateMachine {
             }
             _ => base,
         };
-        let shared = Shared::new(base, source, options.pin_max);
+        let shared = Shared::new(base, source, options);
+        let holders = shared.holders.clone();
         let reads = shared.live();
         let mut state = Self::load(None, admin, location, rows, reads, Some(shared)).await?;
+        holders.register(&state.metrics.registry)?;
         // The state loads at the row, so its counter and term rows match. The record gives the
         // index and the term of the extension.
         if let Some(record) = record {

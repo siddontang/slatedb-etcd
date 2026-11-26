@@ -1,8 +1,10 @@
-//! Native backups: stream a pinned checkpoint as a native image, and restore an image with
-//! bounded memory. See `docs/administration.md#maintenance-and-storage`.
+//! Native backups: stream a pinned state as a native image, and restore an image with bounded
+//! memory. See `docs/administration.md#maintenance-and-storage`.
 //!
 //! The image is the legacy Raft snapshot format, `SnapshotData` in `codec` encoding, followed by
 //! its SHA-256 digest. Its rows are in key order, and the membership row comes last.
+//!
+//! A replicated backup pins a SlateDB checkpoint. A shared-mode backup pins a view. See `view`.
 
 use super::*;
 use bytes::Bytes;
@@ -11,7 +13,13 @@ use slatedb::config::{CheckpointOptions, CheckpointScope, DbReaderOptions, ScanO
 use slatedb::{DbReader, DbReaderMode};
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+
+#[cfg(test)]
+mod tests;
+mod view;
+#[cfg(test)]
+mod view_tests;
 
 /// The bytes of one Snapshot response message.
 const CHUNK_BYTES: usize = 64 * 1024;
@@ -23,8 +31,8 @@ const CHECKPOINT_NAME: &str = "native-backup";
 /// `etcdctl snapshot save` accepts a file of a multiple of this size plus the digest.
 const ALIGN: u64 = 512;
 const DIGEST: u64 = 32;
-/// The largest image that a shared-mode backup builds in memory.
-const MAX_VIEW_BACKUP_BYTES: usize = 64 * 1024 * 1024;
+/// The largest image that a shared-mode restore reads into memory.
+const MAX_SHARED_RESTORE_BYTES: usize = 64 * 1024 * 1024;
 /// The largest encoded row of an image. A restore decodes rows up to this size, and a backup
 /// rejects a larger row before it publishes the image. A Raft entry holds at most 8 MiB, but
 /// the auth row holds every user and role and can grow beyond that.
@@ -43,7 +51,8 @@ pub struct Chunk {
     pub remaining: u64,
 }
 
-/// A backup above a size limit. The Snapshot RPC returns ResourceExhausted for it.
+/// A backup above a limit: the row size, or the holder limits of `overlay::Holders`. The
+/// Snapshot RPC returns ResourceExhausted for it.
 #[derive(Debug)]
 pub(crate) struct TooLarge(String);
 
@@ -82,7 +91,72 @@ pub(super) fn pad_members(members: &mut Vec<u8>, before: u64) -> Result<()> {
 /// A started backup: the response header of its applied boundary and the image chunks.
 pub struct Stream {
     pub header: Option<crate::proto::etcdserverpb::ResponseHeader>,
-    pub chunks: mpsc::Receiver<Result<Chunk>>,
+    chunks: mpsc::Receiver<Chunk>,
+    /// The end of the image: `Ok` after its last chunk, or the error that ended it early. The
+    /// sender sets it before it closes `chunks`. `None` after a successful end arrived.
+    end: Option<oneshot::Receiver<Result<()>>>,
+    ended: bool,
+}
+
+/// The sending side of a `Stream`.
+type Sender = (mpsc::Sender<Chunk>, oneshot::Sender<Result<()>>);
+
+impl Stream {
+    fn new(header: Option<crate::proto::etcdserverpb::ResponseHeader>) -> (Self, Sender) {
+        let (tx, chunks) = mpsc::channel(CHUNKS_AHEAD);
+        let (end_tx, end) = oneshot::channel();
+        let stream = Self {
+            header,
+            chunks,
+            end: Some(end),
+            ended: false,
+        };
+        (stream, (tx, end_tx))
+    }
+
+    /// Return the next chunk, the error that ended the stream, or `None` after the image.
+    ///
+    /// An error comes before the chunks that are still buffered. So a stream that ended early
+    /// never looks like a complete image, also to a client that reads it later. A sender that
+    /// went away without an end also ended the stream early.
+    pub async fn recv(&mut self) -> Option<Result<Chunk>> {
+        if self.ended {
+            return None;
+        }
+        let next = match &mut self.end {
+            Some(end) => tokio::select! {
+                biased;
+                end = end => match end {
+                    Ok(Ok(())) => {
+                        self.end = None;
+                        self.chunks.recv().await
+                    }
+                    end => return Some(Err(self.fail(end))),
+                },
+                chunk = self.chunks.recv() => chunk,
+            },
+            None => self.chunks.recv().await,
+        };
+        if let Some(chunk) = next {
+            return Some(Ok(chunk));
+        }
+        self.ended = true;
+        match self.end.take().map(|mut end| end.try_recv()) {
+            None | Some(Ok(Ok(()))) => None,
+            Some(Ok(Err(error))) => Some(Err(error)),
+            Some(Err(_)) => Some(Err(anyhow::anyhow!("the backup stream stopped early"))),
+        }
+    }
+
+    fn fail(&mut self, end: Result<Result<()>, oneshot::error::RecvError>) -> anyhow::Error {
+        self.ended = true;
+        self.end = None;
+        self.chunks.close();
+        match end {
+            Ok(Err(error)) => error,
+            _ => anyhow::anyhow!("the backup stream stopped early"),
+        }
+    }
 }
 
 impl StateMachine {
@@ -96,8 +170,8 @@ impl StateMachine {
 
     /// Like `backup`, with a checkpoint that expires after `lifetime` unless refreshed.
     pub(super) async fn backup_with_lifetime(&self, lifetime: Duration) -> Result<Stream> {
-        if self.is_shared() {
-            return self.view_backup(MAX_VIEW_BACKUP_BYTES).await;
+        if let Some(shared) = &self.shared {
+            return self.shared_backup(shared);
         }
         ensure!(
             self.db().snapshot()?.seq() == self.applied,
@@ -122,15 +196,18 @@ impl StateMachine {
             admin: self.admin.clone(),
             store: self.location.store(),
             root: self.location.root(),
-            applied: self.applied,
-            members,
+            image: Rows {
+                applied: self.applied,
+                members,
+                omit: omitted,
+            },
         };
-        let (tx, rx) = mpsc::channel(CHUNKS_AHEAD);
+        let (stream, (tx, end)) = Stream::new(mvcc::header(self.revision));
         tokio::spawn(async move {
             let checkpoint = match handle.wait().await {
                 Ok(checkpoint) => checkpoint.id,
                 Err(error) => {
-                    let _ = tx.send(Err(error.into())).await;
+                    let _ = end.send(Err(error.into()));
                     return;
                 }
             };
@@ -148,11 +225,9 @@ impl StateMachine {
             } else {
                 timer.stop_and_discard();
             }
-            if let Err(error) = result {
-                let _ = tx.send(Err(error)).await;
-            }
             // End the response before the cleanup. The checkpoint expires by itself after
             // `lifetime`, so the deletion stops retrying then.
+            let _ = end.send(result);
             drop(tx);
             match tokio::time::timeout(lifetime, source.admin.delete_checkpoint(checkpoint)).await {
                 Ok(Ok(())) => {}
@@ -160,44 +235,7 @@ impl StateMachine {
                 Err(_) => tracing::warn!("timed out deleting a backup checkpoint"),
             }
         });
-        Ok(Stream {
-            header: mvcc::header(self.revision),
-            chunks: rx,
-        })
-    }
-}
-
-impl StateMachine {
-    /// Shared mode keeps applied rows in view checkpoints and in memory, not in `db`. Build the
-    /// image from the pinned view in memory, as before streaming backups, and send it in chunks.
-    /// The image with its padding and digest can hold at most `limit` bytes.
-    pub(super) async fn view_backup(&self, limit: usize) -> Result<Stream> {
-        let timer = self.metrics.snapshot.start_timer();
-        let mut bytes = self.image_job(true)?.await?;
-        if bytes.len() + DIGEST as usize > limit {
-            return Err(TooLarge(format!("native snapshot exceeds {} MiB", limit >> 20)).into());
-        }
-        timer.observe_duration();
-        let digest = Sha256::digest(&bytes);
-        bytes.extend_from_slice(&digest);
-        let (tx, rx) = mpsc::channel(CHUNKS_AHEAD);
-        tokio::spawn(async move {
-            let mut remaining = bytes.len() as u64;
-            for part in bytes.chunks(CHUNK_BYTES) {
-                remaining -= part.len() as u64;
-                let chunk = Chunk {
-                    blob: part.to_vec(),
-                    remaining,
-                };
-                if tx.send(Ok(chunk)).await.is_err() {
-                    break;
-                }
-            }
-        });
-        Ok(Stream {
-            header: mvcc::header(self.revision),
-            chunks: rx,
-        })
+        Ok(stream)
     }
 }
 
@@ -207,12 +245,11 @@ struct Source {
     admin: Arc<slatedb::admin::Admin>,
     store: Arc<dyn slatedb::object_store::ObjectStore>,
     root: String,
-    applied: u64,
-    members: Vec<u8>,
+    image: Rows,
 }
 
 impl Source {
-    async fn stream(&self, checkpoint: uuid::Uuid, tx: &mpsc::Sender<Result<Chunk>>) -> Result<()> {
+    async fn stream(&self, checkpoint: uuid::Uuid, tx: &mpsc::Sender<Chunk>) -> Result<()> {
         let reader = DbReader::builder(self.root.as_str(), self.store.clone())
             .with_reader_mode(DbReaderMode::Checkpoint(checkpoint))
             .with_options(DbReaderOptions {
@@ -226,19 +263,41 @@ impl Source {
             .with_db_cache_disabled()
             .build()
             .await?;
-        let result = self.copy(&reader, tx).await;
+        let result = self.image.copy(&reader, tx, None).await;
         let _ = reader.close().await;
         result
     }
+}
 
-    async fn copy(&self, reader: &DbReader, tx: &mpsc::Sender<Result<Chunk>>) -> Result<()> {
+/// The parts of an image that do not come from the stored rows.
+struct Rows {
+    applied: u64,
+    /// The membership JSON in memory. The image writes it as its last row.
+    members: Vec<u8>,
+    /// Return true for a stored row that the image leaves out.
+    omit: fn(&[u8]) -> bool,
+}
+
+impl Rows {
+    /// Send the image of `state` in two passes. The row count precedes the rows, so the first
+    /// pass counts them and checks their sizes before the first chunk. The caller pins `state`,
+    /// so it does not change. With `idle`, the stream ends when a chunk waits that long for the
+    /// client.
+    async fn copy(
+        &self,
+        state: &impl StateRead,
+        tx: &mpsc::Sender<Chunk>,
+        idle: Option<Duration>,
+    ) -> Result<()> {
         let header = (crate::SNAPSHOT_FORMAT, self.applied);
-        // The row count precedes the rows. Count them first; the checkpoint does not change.
         let mut rows = 0_u64;
         let mut size = encoded_size(&header)? + encoded_size(&0_u64)?;
-        let mut scan = rows_of(reader).await?;
+        let mut scan = rows_of(state).await?;
+        let mut read = 0_u64;
         while let Some(row) = scan.next().await? {
-            if !omitted(&row.key) {
+            read += 1;
+            cooperate(read).await;
+            if !(self.omit)(&row.key) {
                 rows += 1;
                 size += row_size(&row.key, &row.value)?;
             }
@@ -248,35 +307,44 @@ impl Source {
         size += row_size(crate::cluster::KEY, &members)?;
         let mut image = Image {
             tx,
+            idle,
             buffer: Vec::with_capacity(2 * CHUNK_BYTES),
             hash: Sha256::new(),
             remaining: size + DIGEST,
         };
         image.write(&header).await?;
         image.write(&(rows + 1)).await?;
-        let mut scan = rows_of(reader).await?;
+        let mut scan = rows_of(state).await?;
         let mut written = 0_u64;
+        let mut read = 0_u64;
         while let Some(row) = scan.next().await? {
-            if !omitted(&row.key) {
+            read += 1;
+            cooperate(read).await;
+            if !(self.omit)(&row.key) {
                 written += 1;
                 image.write(&(row.key, row.value)).await?;
             }
         }
-        ensure!(
-            written == rows,
-            "backup checkpoint changed during the stream"
-        );
+        ensure!(written == rows, "backup state changed during the stream");
         image.write(&(crate::cluster::KEY, members)).await?;
         image.finish().await
     }
 }
 
-async fn rows_of(reader: &DbReader) -> Result<slatedb::DbIterator> {
+/// Yield to the runtime every 1024 rows. Rows that come from memory or cached blocks never wait,
+/// so without this a pass would hold the thread, and a cancelled stream would run on.
+async fn cooperate(rows: u64) {
+    if rows.is_multiple_of(1024) {
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn rows_of(state: &impl StateRead) -> Result<impl StateScan + '_> {
     let options = ScanOptions {
         cache_blocks: false,
         ..Default::default()
     };
-    Ok(reader.scan_prefix_with_options(b"", .., &options).await?)
+    Ok(state.scan_under(b"", &options).await?)
 }
 
 /// Return true for the rows that the image leaves out. The membership row is written last, and
@@ -319,7 +387,9 @@ async fn keep(
 
 /// Encode the image into chunks, then send its digest.
 struct Image<'a> {
-    tx: &'a mpsc::Sender<Result<Chunk>>,
+    tx: &'a mpsc::Sender<Chunk>,
+    /// The longest time that a chunk waits for the client, if any.
+    idle: Option<Duration>,
     buffer: Vec<u8>,
     hash: Sha256,
     remaining: u64,
@@ -345,11 +415,18 @@ impl Image<'_> {
             .remaining
             .checked_sub(blob.len() as u64)
             .context("backup image exceeds its counted size")?;
-        let remaining = self.remaining;
-        self.tx
-            .send(Ok(Chunk { blob, remaining }))
-            .await
-            .map_err(|_| anyhow::anyhow!("the snapshot client went away"))
+        let chunk = Chunk {
+            blob,
+            remaining: self.remaining,
+        };
+        let send = self.tx.send(chunk);
+        let sent = match self.idle {
+            Some(idle) => tokio::time::timeout(idle, send).await.map_err(|_| {
+                anyhow::anyhow!("the snapshot client took no chunk for {idle:?}; backup too slow")
+            })?,
+            None => send.await,
+        };
+        sent.map_err(|_| anyhow::anyhow!("the snapshot client went away"))
     }
 
     async fn finish(mut self) -> Result<()> {
@@ -620,6 +697,7 @@ impl StateMachine {
                     join: false,
                     empty_log: false,
                     pin_max: std::time::Duration::from_secs(300),
+                    overlay_max_bytes: u64::MAX,
                     restore: None,
                     record: None,
                 },
@@ -751,10 +829,10 @@ fn check_restore_target(dir: &Path, id: u64, members: &crate::cluster::Store) ->
 fn restored_data(backup: &Path, members: &crate::cluster::Store) -> Result<(SnapshotData, String)> {
     let mut bytes = vec![];
     std::fs::File::open(backup)?
-        .take(MAX_VIEW_BACKUP_BYTES as u64 + 1)
+        .take(MAX_SHARED_RESTORE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
     ensure!(
-        bytes.len() <= MAX_VIEW_BACKUP_BYTES,
+        bytes.len() <= MAX_SHARED_RESTORE_BYTES,
         "snapshot exceeds 64 MiB"
     );
     ensure!(bytes.len() > 32, "snapshot is missing its checksum");
@@ -765,7 +843,7 @@ fn restored_data(backup: &Path, members: &crate::cluster::Store) -> Result<(Snap
     );
     let (mut data, consumed): (SnapshotData, _) = bincode::serde::decode_from_slice(
         payload,
-        bincode::config::legacy().with_limit::<MAX_VIEW_BACKUP_BYTES>(),
+        bincode::config::legacy().with_limit::<MAX_SHARED_RESTORE_BYTES>(),
     )
     .context("invalid native snapshot")?;
     ensure!(consumed == payload.len(), "trailing native snapshot data");

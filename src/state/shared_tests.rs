@@ -7,19 +7,20 @@ use slatedb::config::{CheckpointOptions, CheckpointScope, ScanOptions};
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
 
-fn options() -> shared::Options {
+pub(super) fn options() -> shared::Options {
     shared::Options {
         quota: 0,
         voters: vec![1],
         join: false,
         empty_log: false,
         pin_max: Duration::from_secs(300),
+        overlay_max_bytes: 1 << 30,
         restore: None,
         record: None,
     }
 }
 
-async fn open_shared(store: Arc<dyn ObjectStore>) -> StateMachine {
+pub(super) async fn open_shared(store: Arc<dyn ObjectStore>) -> StateMachine {
     StateMachine::open_shared(
         store,
         "cluster",
@@ -32,7 +33,7 @@ async fn open_shared(store: Arc<dyn ObjectStore>) -> StateMachine {
     .unwrap()
 }
 
-fn put(key: &str, value: &str) -> RequestOp {
+pub(super) fn put(key: &str, value: &str) -> RequestOp {
     RequestOp {
         request: Some(Op::RequestPut(PutRequest {
             key: key.as_bytes().to_vec(),
@@ -42,7 +43,7 @@ fn put(key: &str, value: &str) -> RequestOp {
     }
 }
 
-fn delete(key: &str, end: &str) -> RequestOp {
+pub(super) fn delete(key: &str, end: &str) -> RequestOp {
     RequestOp {
         request: Some(Op::RequestDeleteRange(DeleteRangeRequest {
             key: key.as_bytes().to_vec(),
@@ -260,7 +261,7 @@ async fn no_op_entries_write_no_batch_after_the_membership_seed() {
 }
 
 /// Open the shared writer, as the leader task does.
-async fn writer(state: &StateMachine) -> slatedb::Db {
+pub(super) async fn writer(state: &StateMachine) -> slatedb::Db {
     let source = state.shared.as_ref().unwrap().source.clone();
     source.open_writer().await.unwrap()
 }
@@ -279,7 +280,7 @@ async fn flush(state: &StateMachine, writer: &slatedb::Db, written: &mut u64) {
 }
 
 /// Write the overlay batches into the shared database, flush, and open a checkpoint of it.
-async fn checkpoint(
+pub(super) async fn checkpoint(
     state: &StateMachine,
     writer: &slatedb::Db,
     written: &mut u64,
@@ -613,14 +614,6 @@ async fn a_shared_backup_restores_into_a_replicated_cluster() {
     let mut stored = data.rows.clone();
     stored.retain(|(key, _)| key != crate::cluster::KEY);
     assert_eq!(padded.rows, stored);
-    // A shared image above the limit returns ResourceExhausted, as before streaming backups.
-    let error = state.view_backup(1024).await.err().unwrap();
-    let error = super::backup::backup_error(error);
-    assert_eq!(
-        error.code,
-        tonic::Code::ResourceExhausted as i32,
-        "{error:?}"
-    );
     let reference_backup = super::tests::backup_bytes(reference.snapshot_data().await.unwrap());
 
     let restored = {

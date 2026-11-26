@@ -18,8 +18,6 @@ use crate::{Command, Operation, Reply};
 
 mod auth;
 pub(crate) mod backup;
-#[cfg(test)]
-mod backup_tests;
 mod checkpoint;
 pub(crate) mod cluster;
 pub(crate) mod compaction;
