@@ -720,12 +720,16 @@ waiting job ends with the entries that it applied. Their replies go out once, an
 below the snapshot are dropped. Raft already took the ConfState of the snapshot, so the
 membership changes of those entries do not reach Raft again. The install then skips the held
 entry. `slatedb_etcd_apply_held_entries` counts the log entries above the held entry. Above
-100,000 the member logs an alarm, because the log cannot shrink.
+100,000 the member logs an alarm, because the log cannot shrink. After Raft accepts a snapshot,
+apply starts no other job until the snapshot record is stored and the install runs.
 
 A rebase, the adoption of an opened base, and a snapshot install load the new base and check
 it first: the Auth store, the leases, the counters, and the members row. Only then does the
 member drop its overlay and its materializer queue. A failed read leaves the state as it was,
-and apply runs the step again after the same backoff.
+and apply runs the step again after the same backoff. A rebase replay that fails leaves the state
+below the index that the member published. If a snapshot then ends the job, each later job
+reports that index and no state. Queued entries end early, and a state read such as Status,
+HashKV, or a backup fails with `Unavailable`. The install of the snapshot ends this.
 
 An early Put reply evaluates its entries before the state write, and they can be uncommitted. A
 storage error there does not retry, because a new leader can replace the entries. Early replies

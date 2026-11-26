@@ -290,6 +290,9 @@ pub(super) struct Completion {
     pub early: bool,
 }
 
+/// The message of a state read that waits for a snapshot after a failed rebase replay.
+const RECOVERING: &str = "storage unavailable; apply waits for a snapshot; retry";
+
 struct Executor {
     state: StateMachine,
     events: mpsc::Sender<Event>,
@@ -299,6 +302,10 @@ struct Executor {
     log: Option<crate::storage::LogReader>,
     /// The stop and preemption of a job that waits on a storage error, and its pause report.
     signals: retry::Signals,
+    /// The applied index that the node already published, while the state is below it. A
+    /// rebase replay that failed sets it, and only the install of a covering snapshot ends it.
+    /// See `recovering_job`.
+    recovering: Option<u64>,
     /// Runs once after a rebase adopted its base and before it replays, for tests. Its error
     /// fails the replay.
     #[cfg(test)]
@@ -324,7 +331,8 @@ impl Executor {
     /// log to `applied`. No view is published until the replay ends, so reads see no older
     /// state. Earlier jobs already sent the replies of the replayed entries, and Raft already
     /// applied their membership changes. A replay that fails leaves the state below `applied`.
-    /// A job that a snapshot then ends sends no state. See `apply_retrying`.
+    /// If a snapshot then ends the job, the executor recovers until the snapshot installs. See
+    /// `recovering_job`.
     async fn rebase(&mut self, header: Header, applied: u64) -> Result<()> {
         let log = self.log.clone().context("rebase needs the log")?;
         self.state.rebase(applied, |index| log.term(index)).await?;
@@ -349,6 +357,9 @@ impl Executor {
             }
             _ => {}
         }
+        if self.recovering.is_some() && !matches!(work.job, Job::Snapshot(_)) {
+            return self.recovering_job(work.job);
+        }
         let changes_state = matches!(
             work.job,
             Job::Entries(_)
@@ -361,7 +372,6 @@ impl Executor {
         let copy_state = changes_state || matches!(work.job, Job::Query(Query::Maintenance(..)));
         let previous_revision = self.state.revision;
         let mut early = false;
-        let mut prefix = None;
         // A checkpoint that opened in the background becomes the base of the next view.
         if changes_state {
             self.state.switch_base();
@@ -384,9 +394,9 @@ impl Executor {
             Job::Entries(entries) => {
                 let (replies, ended) = Box::pin(self.apply_retrying(entries, work.header)).await?;
                 early = ended.is_some();
-                // A rebase replay that failed left the state below the applied prefix. The
-                // snapshot replaces it, so the node gets only the prefix boundary.
-                prefix = ended.filter(|prefix| *prefix > self.state.applied);
+                // A rebase replay that failed left the state below the applied prefix, which the
+                // node publishes with this job. Only the snapshot can replace that state.
+                self.recovering = ended.filter(|prefix| *prefix > self.state.applied);
                 Output::Entries(replies)
             }
             Job::PreparePuts { commands, term } => {
@@ -419,23 +429,21 @@ impl Executor {
                 self.state.raise_to_record(&snapshot).await?;
                 Output::Entries(Vec::new())
             }
-            Job::Snapshot(snapshot) => {
-                if self.install_retrying(&snapshot).await? == Waited::Covered {
-                    // A newer snapshot replaces this one. The state did not change.
+            Job::Snapshot(snapshot) => match self.install_retrying(&snapshot).await? {
+                // A newer snapshot replaces this one. The state did not change.
+                Waited::Covered => {
                     early = true;
-                    return Ok(Completion {
-                        applied: self.state.applied,
-                        state: Some(AppliedState::new(&self.state)?),
-                        output: Output::Entries(Vec::new()),
-                        early,
-                    });
+                    Output::Entries(Vec::new())
                 }
                 // An object snapshot replaces the database. The node rebinds its handles.
-                Output::Snapshot(Rebound {
-                    db: self.state.database(),
-                    admin: self.state.admin.clone(),
-                })
-            }
+                Waited::Again => {
+                    self.recovering = None;
+                    Output::Snapshot(Rebound {
+                        db: self.state.database(),
+                        admin: self.state.admin.clone(),
+                    })
+                }
+            },
             Job::Query(query) => match query {
                 Query::Maintenance(command, credentials, status, response) => {
                     let result = self
@@ -542,8 +550,24 @@ impl Executor {
                 }
             }
         };
-        let state = match copy_state && prefix.is_none() {
-            true => {
+        self.completion(output, early, copy_state.then_some(previous_revision))
+    }
+
+    /// Build the completion of each job. `copy` gives the revision before the job when the
+    /// node takes a copy of the state. While the executor recovers, the state is below the
+    /// published index. The completion then reports that index and no state, so the node keeps
+    /// its published view.
+    fn completion(&mut self, output: Output, early: bool, copy: Option<i64>) -> Result<Completion> {
+        if let Some(published) = self.recovering {
+            return Ok(Completion {
+                applied: published,
+                state: None,
+                output,
+                early: true,
+            });
+        }
+        let state = match copy {
+            Some(previous_revision) => {
                 let mut state = AppliedState::new(&self.state)?;
                 state.watch = self
                     .state
@@ -551,14 +575,42 @@ impl Executor {
                     .map(std::sync::Arc::new);
                 Some(state)
             }
-            false => None,
+            None => None,
         };
         Ok(Completion {
-            applied: prefix.unwrap_or(self.state.applied),
+            applied: self.state.applied,
             state,
             output,
             early,
         })
+    }
+
+    /// Run a job while the state is below the published index. Only the install of a snapshot
+    /// changes the state then, and no job reads it. Committed entries end early, because the
+    /// snapshot covers them. A state read fails with a retryable error. Other jobs do nothing.
+    fn recovering_job(&mut self, job: Job) -> Result<Completion> {
+        let output = match job {
+            Job::Query(Query::Linear(..) | Query::Read(..)) => {
+                anyhow::bail!("read reached the apply worker")
+            }
+            Job::Query(query) => {
+                query.reject(ApiError {
+                    error: RECOVERING.to_owned(),
+                    leader_id: 0,
+                });
+                Output::Reads(Vec::new())
+            }
+            Job::PreparePuts { commands, .. } => {
+                Output::Unprepared(commands.last().map_or(0, |(index, _)| *index))
+            }
+            // A checkpoint result would set the record. The node starts none while Raft holds a
+            // snapshot that apply did not install.
+            Job::Checkpoint { .. } => {
+                anyhow::bail!("a checkpoint reached apply while it waits for a snapshot")
+            }
+            _ => Output::Entries(Vec::new()),
+        };
+        self.completion(output, true, None)
     }
 }
 
@@ -600,6 +652,7 @@ impl Worker {
             inline_checkpoints: manual,
             log,
             signals,
+            recovering: None,
             #[cfg(test)]
             before_replay: None,
         };

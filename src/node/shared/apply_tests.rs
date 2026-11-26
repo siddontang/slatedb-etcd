@@ -48,7 +48,8 @@ async fn covering_snapshots_preempt_a_rebase_and_an_install_that_retry() {
 
 /// A read loses its object. The rebase adopts its checkpoint, but its replay then fails on the
 /// store. A covering snapshot ends the job. The node gets the prefix boundary and no state
-/// below it, and the snapshot installs.
+/// below it. A queued job behind it also reports the boundary, and a state read fails with a
+/// retryable error. Then the snapshot installs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_covering_snapshot_preempts_a_failed_rebase_replay() {
     lose_a_checkpoint_object(Lose::Replay).await;
@@ -290,6 +291,7 @@ async fn lose_a_checkpoint_object(lose: Lose) {
         inline_checkpoints: true,
         log: Some(storage.reader()),
         signals,
+        recovering: None,
         before_replay: None,
     };
     if lose == Lose::Deleted {
@@ -381,9 +383,79 @@ async fn lose_a_checkpoint_object(lose: Lose) {
         if lose == Lose::Replay {
             // The replay left the state at 20. The snapshot replaces it.
             assert_eq!(executor.state.applied, 20);
+            // The node published 22. A queued job that the snapshot supersedes must not report
+            // a lower index, or the node stops on a regressed apply position.
+            let queued = executor
+                .execute(Work {
+                    job: Job::Entries(entries[22..].to_vec()),
+                    header,
+                    delay: Duration::ZERO,
+                })
+                .await
+                .unwrap();
+            assert!(queued.early);
+            assert_eq!(queued.applied, 22);
+            assert!(queued.state.is_none());
+            // No state read sees the state below 22.
+            let (tx, local) = tokio::sync::oneshot::channel();
+            let read = executor
+                .execute(Work {
+                    job: Job::Query(Query::Local("k1".into(), tx)),
+                    header,
+                    delay: Duration::ZERO,
+                })
+                .await
+                .unwrap();
+            assert_eq!(read.applied, 22);
+            assert!(read.state.is_none());
+            let error = local.await.unwrap().unwrap_err();
+            assert!(
+                error.error.contains("storage unavailable"),
+                "{}",
+                error.error
+            );
+            // A maintenance read publishes the state otherwise.
+            let (tx, hash) = tokio::sync::oneshot::channel();
+            let command = crate::maintenance::Command::Hash(0);
+            let read = executor
+                .execute(Work {
+                    job: Job::Query(Query::Maintenance(
+                        command,
+                        Default::default(),
+                        Default::default(),
+                        tx,
+                    )),
+                    header,
+                    delay: Duration::ZERO,
+                })
+                .await
+                .unwrap();
+            assert_eq!(read.applied, 22);
+            assert!(read.state.is_none());
+            let error = hash.await.unwrap().unwrap_err();
+            assert!(
+                error.error.contains("storage unavailable"),
+                "{}",
+                error.error
+            );
             let installed = executor.execute(record(24)).await.unwrap();
             assert!(!installed.early);
             assert_eq!(installed.applied, 24);
+            assert!(installed.state.is_some());
+            let (tx, _) = tokio::sync::oneshot::channel();
+            let read = executor
+                .execute(Work {
+                    job: Job::Query(Query::Local("k1".into(), tx)),
+                    header,
+                    delay: Duration::ZERO,
+                })
+                .await
+                .unwrap();
+            let Output::Query { value, .. } = read.output else {
+                panic!("expected a query reply");
+            };
+            let value = value.unwrap();
+            assert_eq!(value["applied_index"], 24, "{value}");
         } else {
             let (preempt, mut paused) = control.handles();
             let newer = tokio::spawn(async move {

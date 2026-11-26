@@ -264,3 +264,38 @@ async fn a_held_member_fences_linearizable_reads() {
     assert_eq!(reply["kvs"][0]["value"], json!(b"new"), "{value}");
     assert_eq!(reply["header"]["revision"], revision + 1, "{value}");
 }
+
+/// Raft accepts a snapshot, and a full log queue keeps it unstable. Apply then runs no other
+/// work, such as a queued state read. After the log cache stages the record and stores it, the
+/// install runs first, and the read sees the installed state.
+#[tokio::test]
+async fn apply_waits_for_the_record_of_an_accepted_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = tempfile::tempdir().unwrap();
+    let (events, _) = mpsc::channel(256);
+    let options = super::super::tests::options(dir.path());
+    let mut node = Node::open_with_transport(options, events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    node.raw
+        .step(covering_snapshot(source.path()).await)
+        .unwrap();
+    assert_eq!(node.accepted_snapshot(), 200);
+    assert_eq!(node.raw.store().staged_snapshot_index(), 0);
+    let (tx, reply) = oneshot::channel();
+    node.enqueue_query(Query::Local("absent".into(), tx));
+    node.schedule_apply().unwrap();
+    assert!(!node.apply_busy, "apply ran work before the snapshot");
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    node.schedule_apply().unwrap();
+    let install = node.worker.step().await.unwrap().unwrap();
+    assert!(matches!(install.output, Output::Snapshot(_)));
+    node.complete_apply(install).unwrap();
+    assert_eq!(node.state.applied, 200);
+    node.drain_apply().await.unwrap();
+    node.schedule_apply().unwrap();
+    node.drain_apply().await.unwrap();
+    let value = reply.await.unwrap().unwrap();
+    assert_eq!(value["applied_index"], 200, "{value}");
+}

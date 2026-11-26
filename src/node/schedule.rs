@@ -125,7 +125,7 @@ impl Node {
                 || self.apply_paused()
                 || self.quota_guarded()
                 || self.raw.store().snapshot_pending()
-                || last < self.raw.store().snapshot_index()
+                || self.installing()
                 || self.prepared_puts.is_some()
                 || !self.queries.is_empty()
                 || (!self.checkpoint_running && self.checkpoint_due(last).is_some())
@@ -162,10 +162,13 @@ impl Node {
         if self.apply_busy {
             return self.pipeline_apply();
         }
-        if self.raw.store().snapshot_pending() {
+        // Raft can hold an accepted snapshot as unstable while the log queue is full, and the log
+        // cache then stages it. Other apply work waits until the record is durable, so the
+        // install goes first.
+        let snapshot_index = self.raw.store().snapshot_index();
+        if self.raw.store().snapshot_pending() || self.accepted_snapshot() > snapshot_index {
             return Ok(());
         }
-        let snapshot_index = self.raw.store().snapshot_index();
         if self.state.applied < snapshot_index {
             // The incoming snapshot covers the prepared prefix or establishes a new base.
             // Apply any remaining suffix through the normal committed log path.
