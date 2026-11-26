@@ -208,11 +208,13 @@ def unique_prefix(kind):
     return f"{kind}/{secrets.token_hex(8)}"
 
 
-def shared_args(prefix, env=None):
+def shared_args(prefix, env=None, allow_http=None):
     """Return the flags that start one member in shared state mode on the store of `env`.
 
     All members of one cluster use the same `prefix`, also after a restart. Without
-    `SLATEDB_S3_TEST_ENDPOINT`, the member uses the AWS endpoint of the bucket.
+    `SLATEDB_S3_TEST_ENDPOINT`, the member uses the AWS endpoint of the bucket. By default, an
+    HTTP endpoint gets `--s3-allow-http`, because the fixture's own RustFS server uses HTTP. For
+    an endpoint that a caller supplies, pass the caller's choice as `allow_http`.
     Each Python launcher builds the flags here. The Go tests build the same flags in
     `tests/compat/compat_test.go` (`storeFlags`) and `tests/downstream/storage_test.go`.
     """
@@ -224,7 +226,7 @@ def shared_args(prefix, env=None):
     flags = ["--state-mode", "shared", "--s3-bucket", bucket, "--s3-prefix", prefix]
     if endpoint:
         flags += ["--s3-endpoint", endpoint]
-        if endpoint.startswith("http://"):
+        if endpoint.startswith("http://") if allow_http is None else allow_http:
             flags.append("--s3-allow-http")
     return flags
 

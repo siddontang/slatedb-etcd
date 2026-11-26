@@ -146,8 +146,11 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
                     if kind == "service" and workers is not None:
                         command += ["--runtime-workers", str(workers)]
                     if members > 1:
-                        command += shared_args(prefix, {"SLATEDB_S3_TEST_BUCKET": args.s3_bucket,
-                                                        "SLATEDB_S3_TEST_ENDPOINT": args.s3_endpoint})
+                        # Only the fixture's RustFS server sets `s3_allow_http` on its own. For
+                        # a caller's endpoint, the caller's flag stays.
+                        store = {"SLATEDB_S3_TEST_BUCKET": args.s3_bucket,
+                                 "SLATEDB_S3_TEST_ENDPOINT": args.s3_endpoint}
+                        command += shared_args(prefix, store, allow_http=args.s3_allow_http)
                     else:
                         if args.s3_bucket:
                             command += ["--s3-bucket", args.s3_bucket]
