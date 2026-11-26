@@ -298,6 +298,8 @@ pub struct Node {
     /// The term of the entries in the last submitted PreparePuts job.
     prepare_term: u64,
     quorum_reply_index: u64,
+    /// Watch creations that wait while a Put reply runs ahead of the local apply.
+    watch_waiters: Vec<oneshot::Sender<crate::watch::Subscription>>,
     queries: VecDeque<Query>,
     prefer_query: bool,
     apply_delay_ms: u64,
@@ -722,6 +724,7 @@ impl Node {
             held_puts: None,
             prepare_term: 0,
             quorum_reply_index: 0,
+            watch_waiters: Vec::new(),
             state: applied,
             worker,
             apply_busy: false,
@@ -1198,7 +1201,13 @@ impl Node {
                 }
             }
             Event::SubscribeWatch(response) => {
-                let _ = response.send(self.watch_feed.subscribe());
+                // etcd starts a Watch without a start revision after the local revision. Wait
+                // like a read so that it starts after a Put this member already answered.
+                if self.reply_ahead() {
+                    self.watch_waiters.push(response);
+                } else {
+                    let _ = response.send(self.watch_feed.subscribe());
+                }
             }
             Event::Metrics(response) => {
                 let id = self.options.id;
@@ -1498,13 +1507,19 @@ impl Node {
         );
     }
 
+    /// A prepared Put reply runs ahead of the local apply. Reads and Watch creation wait until
+    /// the replied entries are applied here.
+    fn reply_ahead(&self) -> bool {
+        self.state.applied < self.quorum_reply_index
+    }
+
     /// Publish the applied view for serializable point reads outside the owner.
     ///
     /// While a prepared Put reply runs ahead of the local apply (`quorum_reply_index`), reads
     /// wait in the owner so that a client that saw the reply also reads its effect here.
     fn publish_local_reads(&self) {
-        let local = (self.state.applied >= self.quorum_reply_index)
-            .then(|| LocalRead::new(self.state.read.clone(), self.header()));
+        let local =
+            (!self.reply_ahead()).then(|| LocalRead::new(self.state.read.clone(), self.header()));
         self.forwarding.publish_local(local);
     }
 

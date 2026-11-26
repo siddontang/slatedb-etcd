@@ -158,8 +158,11 @@ impl Node {
     }
 
     pub(super) fn schedule_reads(&mut self) {
-        if self.state.applied < self.quorum_reply_index {
+        if self.reply_ahead() {
             return;
+        }
+        for response in self.watch_waiters.drain(..) {
+            let _ = response.send(self.watch_feed.subscribe());
         }
         for (id, read) in &mut self.reads {
             if self.read_queries.len() >= apply::MAX_QUERIES {
