@@ -143,8 +143,34 @@ impl Retry {
         fault: StorageFault,
         error: &anyhow::Error,
     ) -> Result<Waited> {
-        self.tries += 1;
         let held = fault == StorageFault::Corrupt;
+        self.pause(signals, index, held, error).await
+    }
+
+    /// Wait before the next try of a base load after `fault`. A transient error retries. A
+    /// missing object or corrupt data holds, because a retry of the same base most likely fails
+    /// again. Apply checks it again every `HOLD_RECHECK`, and a newer snapshot ends the hold.
+    async fn wait_base(
+        &mut self,
+        signals: &mut Signals,
+        index: u64,
+        fault: StorageFault,
+        error: &anyhow::Error,
+    ) -> Result<Waited> {
+        let held = fault != StorageFault::Transient;
+        self.pause(signals, index, held, error).await
+    }
+
+    /// Report the wait on entry `index`, and wait until the next try, a covering snapshot, or
+    /// the stop of the worker. A held wait checks again after `HOLD_RECHECK`.
+    async fn pause(
+        &mut self,
+        signals: &mut Signals,
+        index: u64,
+        held: bool,
+        error: &anyhow::Error,
+    ) -> Result<Waited> {
+        self.tries += 1;
         let delay = match held {
             true => HOLD_RECHECK,
             false => RETRY_FIRST
@@ -156,7 +182,7 @@ impl Retry {
             tracing::error!(
                 index,
                 error = error_text,
-                "apply holds on corrupt stored data; the member serves its earlier state"
+                "apply holds on stored data that it cannot read; the member serves its earlier state"
             );
         } else if self.tries == 1 {
             tracing::warn!(
@@ -320,8 +346,9 @@ impl Executor {
         }
     }
 
-    /// Adopt an opened base. A transient storage error of the load leaves the state as it was,
-    /// so the adoption runs again. A snapshot above the base ends the wait with
+    /// Adopt an opened base. A storage error of the load leaves the state as it was. A
+    /// transient error runs the adoption again. A missing object or corrupt data holds it, and
+    /// apply checks it again every `HOLD_RECHECK`. A snapshot above the base ends the wait with
     /// `Waited::Covered`, and the state stays as it was.
     pub(super) async fn adopt_retrying(
         &mut self,
@@ -331,46 +358,52 @@ impl Executor {
         let mut retry = Retry::default();
         let index = base.applied + 1;
         loop {
-            match self.state.adopt_opened(base.clone(), term).await {
-                Err(error) if retryable(&error) == Some(StorageFault::Transient) => {
-                    let fault = StorageFault::Transient;
-                    if retry.wait(&mut self.signals, index, fault, &error).await? == Waited::Covered
-                    {
-                        retry.done(&self.signals);
-                        return Ok(Waited::Covered);
-                    }
-                }
+            let adopted = self.state.adopt_opened(base.clone(), term).await;
+            let (fault, error) = match adopted.map_err(|error| (retryable(&error), error)) {
+                Err((Some(fault), error)) => (fault, error),
                 adopted => {
                     retry.done(&self.signals);
-                    return adopted.map(|()| Waited::Again);
+                    return adopted.map(|()| Waited::Again).map_err(|(_, error)| error);
                 }
+            };
+            if retry
+                .wait_base(&mut self.signals, index, fault, &error)
+                .await?
+                == Waited::Covered
+            {
+                retry.done(&self.signals);
+                return Ok(Waited::Covered);
             }
         }
     }
 
-    /// Install a snapshot. In shared mode a transient storage error of the base load leaves the
-    /// state as it was, so the install runs again. A newer snapshot ends the wait with
-    /// `Waited::Covered`. A replicated install is not staged, so its errors stop apply.
+    /// Install a snapshot. Raft already accepted it, so only a newer snapshot can replace it. In
+    /// shared mode a storage error of the base load leaves the state as it was. A transient
+    /// error runs the install again. A missing object or corrupt data holds it, as for an
+    /// adoption. A newer snapshot ends the wait with `Waited::Covered`. A replicated install is
+    /// not staged, so its errors stop apply.
     pub(super) async fn install_retrying(&mut self, snapshot: &Snapshot) -> Result<Waited> {
         let mut retry = Retry::default();
         let index = snapshot.get_metadata().index + 1;
         loop {
-            match Box::pin(self.state.install_snapshot(snapshot)).await {
-                Err(error)
-                    if self.state.is_shared()
-                        && retryable(&error) == Some(StorageFault::Transient) =>
-                {
-                    let fault = StorageFault::Transient;
-                    if retry.wait(&mut self.signals, index, fault, &error).await? == Waited::Covered
-                    {
-                        retry.done(&self.signals);
-                        return Ok(Waited::Covered);
-                    }
-                }
+            let installed = Box::pin(self.state.install_snapshot(snapshot)).await;
+            let staged = self.state.is_shared();
+            let (fault, error) = match installed.map_err(|error| (retryable(&error), error)) {
+                Err((Some(fault), error)) if staged => (fault, error),
                 installed => {
                     retry.done(&self.signals);
-                    return installed.map(|()| Waited::Again);
+                    return installed
+                        .map(|()| Waited::Again)
+                        .map_err(|(_, error)| error);
                 }
+            };
+            if retry
+                .wait_base(&mut self.signals, index, fault, &error)
+                .await?
+                == Waited::Covered
+            {
+                retry.done(&self.signals);
+                return Ok(Waited::Covered);
             }
         }
     }

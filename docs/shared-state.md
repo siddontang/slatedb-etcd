@@ -443,8 +443,8 @@ checkpoint is gone, it takes a checkpoint in the same range as a restart does.
   checkpoint at once. It builds no image.
 - **Receive:** the HTTP handler opens `reader(C)` before it steps `MsgSnapshot` into Raft, as
   today's handler copies objects first (`api.rs:103-117`). A failed open fails the request, and
-  Raft retries. The handler keeps the reader until the install finishes, and the member reports
-  `C` in `ViewAck`.
+  Raft retries. The member keeps the reader until the install succeeds or a newer snapshot
+  replaces it, also while the install retries. The member reports `C` in `ViewAck`.
 - The record index can be above `F(C)`. The record keeps the two apart: the checkpoint gives `F`
   and its term, and the record metadata gives the index and the term there. Install loads the
   state at `F`, so the counter and term rows match. It then raises the applied index, the
@@ -726,7 +726,10 @@ apply starts no other job until the snapshot record is stored and the install ru
 A rebase, the adoption of an opened base, and a snapshot install load the new base and check
 it first: the Auth store, the leases, the counters, and the members row. Only then does the
 member drop its overlay and its materializer queue. A failed read leaves the state as it was,
-and apply runs the step again after the same backoff. A rebase replay that fails leaves the state
+and apply runs the step again after the same backoff. A row of the new base that does not
+decode or contradicts another row is corrupt data. A missing object or corrupt data in the base
+of an install or an adoption holds apply, as corrupt data in an entry does, and a newer snapshot
+ends the hold. A rebase replay that fails leaves the state
 below the index that the member published. If a snapshot then ends the job, each later job
 reports that index and no state. Queued entries end early, and a state read such as Status,
 HashKV, or a backup fails with `Unavailable`. The install of the snapshot ends this.

@@ -7,7 +7,7 @@ use slatedb::config::{CheckpointOptions, CheckpointScope, ScanOptions};
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
 
-pub(in crate::state) fn options() -> shared::Options {
+pub(crate) fn options() -> shared::Options {
     shared::Options {
         quota: 0,
         voters: vec![1],
@@ -34,7 +34,7 @@ pub(in crate::state) async fn open_shared(store: Arc<dyn ObjectStore>) -> StateM
     .unwrap()
 }
 
-pub(in crate::state) fn put(key: &str, value: &str) -> RequestOp {
+pub(crate) fn put(key: &str, value: &str) -> RequestOp {
     RequestOp {
         request: Some(Op::RequestPut(PutRequest {
             key: key.as_bytes().to_vec(),
@@ -262,7 +262,7 @@ async fn no_op_entries_write_no_batch_after_the_membership_seed() {
 }
 
 /// Open the shared writer, as the leader task does.
-pub(in crate::state) async fn writer(state: &StateMachine) -> slatedb::Db {
+pub(crate) async fn writer(state: &StateMachine) -> slatedb::Db {
     let source = state.shared.as_ref().unwrap().source.clone();
     source.open_writer().await.unwrap()
 }
@@ -281,7 +281,7 @@ async fn flush(state: &StateMachine, writer: &slatedb::Db, written: &mut u64) {
 }
 
 /// Write the overlay batches into the shared database, flush, and open a checkpoint of it.
-pub(in crate::state) async fn checkpoint(
+pub(crate) async fn checkpoint(
     state: &StateMachine,
     writer: &slatedb::Db,
     written: &mut u64,

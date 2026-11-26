@@ -13,7 +13,8 @@ impl StateMachine {
     /// The candidate loads and passes its checks on a view of the base alone first. Only then
     /// does the state drop its overlay and its materializer queue. A failed read leaves the
     /// state as it was, so the caller can try again. A storage error of a load read keeps its
-    /// class, because the load changes nothing.
+    /// class, because the load changes nothing. Any other load error comes from the rows of the
+    /// base, so it is corrupt stored data.
     pub(crate) async fn adopt_base(&mut self, base: Arc<Base>, term: u64) -> Result<()> {
         ensure!(self.shared.is_some(), "adopt needs shared state mode");
         let reads = StateView::Shared(SharedView::new(
@@ -26,7 +27,7 @@ impl StateMachine {
         let location = self.location.clone();
         let mut next = Self::load_rows(None, admin, location, rows, reads, true)
             .await
-            .map_err(crate::mvcc::storage_fault::read_cause)?;
+            .map_err(candidate_fault)?;
         if next.applied_term != 0 && term != 0 {
             ensure!(
                 next.applied_term == term,
@@ -135,9 +136,9 @@ impl StateMachine {
             .as_ref()
             .context("a format 6 snapshot needs shared state mode")?;
         let id = descriptor.checkpoint()?;
-        // Release the receipt on every path, also for a snapshot that applies nothing.
-        let received = shared.source.take_received(id);
         if index <= self.applied {
+            // Release the receipt, also for a snapshot that applies nothing.
+            let received = shared.source.take_received(id);
             // The member applied past the record, so it installs nothing. The checkpoint holds
             // the state at `index`, so it can still raise the base there. The base index then
             // stays at or above the record index.
@@ -154,15 +155,20 @@ impl StateMachine {
             }
             return Ok(());
         }
-        let base = match received {
+        // The receipt pins the checkpoint until the install succeeds, so a retry that follows
+        // a failed load still finds it. See "Receive" in `docs/shared-state.md`.
+        let base = match shared.source.received(id) {
             Some(base) => base,
-            // An install that runs again opens the checkpoint again. A storage error keeps its
-            // class, so apply can retry.
-            None => shared
-                .source
-                .open_base(id)
-                .await
-                .map_err(crate::mvcc::storage_fault::read_cause)?,
+            // A storage error of the open keeps its class, so apply can retry.
+            None => {
+                let base = shared
+                    .source
+                    .open_base(id)
+                    .await
+                    .map_err(crate::mvcc::storage_fault::read_cause)?;
+                shared.source.keep_received(id, &base);
+                base
+            }
         };
         // The record index can be above the checkpoint row: the leader certified that no entry
         // in between changed state. The record gives the term at its own index only.
@@ -173,7 +179,22 @@ impl StateMachine {
         );
         let row_term = if base.applied == index { term } else { 0 };
         self.adopt_base(base, row_term).await?;
+        // The state holds the base now, and the base pins its checkpoint.
+        if let Some(shared) = &self.shared {
+            shared.source.take_received(id);
+        }
         self.extend_base(index, term)
+    }
+}
+
+/// Mark an error of the load of a new base. A storage error keeps its class. Any other error is
+/// a row of the base that does not decode or contradicts another row.
+fn candidate_fault(error: anyhow::Error) -> anyhow::Error {
+    match crate::mvcc::storage_fault::classify(&error) {
+        Some(_) => crate::mvcc::storage_fault::read_cause(error),
+        None => {
+            crate::mvcc::storage_fault::stored(format!("the new base does not load: {error:#}"))
+        }
     }
 }
 

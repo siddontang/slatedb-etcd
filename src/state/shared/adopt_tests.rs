@@ -1,4 +1,4 @@
-//! A failed load of a new base leaves the current state for a retry.
+//! A failed load of a new base leaves the current state and the snapshot receipt for a retry.
 
 use super::*;
 use crate::object::faults::{FaultStore, FAIL_SST_GET};
@@ -90,6 +90,69 @@ async fn a_failed_base_load_keeps_the_state() {
         rows(behind.applied_state(), b"etcd/").await,
         rows(ahead.applied_state(), b"etcd/").await
     );
+    for state in [ahead, behind] {
+        state.close().await.unwrap();
+    }
+    writer.close().await.unwrap();
+}
+
+/// The install of a received snapshot fails on a read of its base. The receipt stays and pins
+/// the checkpoint, so retention cannot delete it before the retry. The retry installs the
+/// snapshot, and then the receipt goes.
+#[tokio::test]
+async fn a_failed_install_keeps_the_receipt() {
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let options = options();
+    let open = |cache| {
+        let store: Arc<dyn ObjectStore> = faults.clone();
+        let options = &options;
+        async move {
+            StateMachine::open_shared(
+                store,
+                "cluster",
+                "test",
+                cache,
+                options,
+                transfer::Backend::Local,
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let mut ahead = open(StateCache::default()).await;
+    let mut behind = open(COLD).await;
+    for state in [&mut ahead, &mut behind] {
+        state.entry_term = 4;
+    }
+    let writer = writer(&ahead).await;
+    let mut written = 0;
+    for n in 1..=4 {
+        ahead.apply_etcd(n, &large(&format!("k{n}"))).await.unwrap();
+    }
+    let id = checkpoint(&ahead, &writer, &mut written)
+        .await
+        .checkpoint
+        .unwrap();
+    behind.apply_etcd(1, &large("k1")).await.unwrap();
+    let source = behind.shared.as_ref().unwrap().source.clone();
+    source.receive(id).await.unwrap();
+    let mut snapshot = raft::eraftpb::Snapshot::default();
+    snapshot.mut_metadata().index = 4;
+    snapshot.mut_metadata().term = 4;
+    snapshot.data = transfer::ViewDescriptor::new(id).encode().unwrap();
+    faults.set(FAIL_SST_GET);
+    behind.install_snapshot(&snapshot).await.unwrap_err();
+    faults.set(0);
+    assert!(faults.entered.available_permits() > 0, "no read failed");
+    assert_eq!(behind.applied, 1);
+    assert!(
+        source.pinned().contains(&id),
+        "the failed install lost the pin"
+    );
+    behind.install_snapshot(&snapshot).await.unwrap();
+    assert_eq!(behind.applied, 4);
+    assert_eq!(behind.base_checkpoint(), Some(id));
+    assert!(source.take_received(id).is_none(), "the receipt stayed");
     for state in [ahead, behind] {
         state.close().await.unwrap();
     }
