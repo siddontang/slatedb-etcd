@@ -234,7 +234,9 @@ to write, so give startup probes and service start timeouts that time. A stopped
 the same restore again while its Raft log is empty. It waits up to 60 s for the lease of its
 stopped attempt to go stale.
 
-To abandon a partial restore, make these checks first:
+### Abandon a partial restore
+
+Make these checks first:
 
 1. Every member process of the cluster is stopped.
 2. `shared/bootstrap-op.json` has `"kind":"restore"`, and its `snapshot` field names your file.

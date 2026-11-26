@@ -181,11 +181,7 @@ pub(crate) async fn has_replicated_member(store: &dyn ObjectStore, root: &str) -
 }
 
 /// Read and check an existing claim. Return `None` when the store has no claim.
-pub(crate) async fn claimed(
-    store: &dyn ObjectStore,
-    root: &str,
-    cluster: &str,
-) -> Result<Option<Claimed>> {
+async fn read_claim(store: &dyn ObjectStore, root: &str, cluster: &str) -> Result<Option<Claim>> {
     let data = match store.get(&Path::from(join(root, CLAIM))).await {
         Ok(result) => result.bytes().await?,
         Err(slatedb::object_store::Error::NotFound { .. }) => return Ok(None),
@@ -196,10 +192,58 @@ pub(crate) async fn claimed(
         existing.version == 1 && existing.cluster == cluster && existing.mode == StateMode::Shared,
         "the shared state belongs to another cluster"
     );
-    Ok(Some(Claimed {
+    Ok(Some(existing))
+}
+
+/// Read and check an existing claim. Return `None` when the store has no claim.
+pub(crate) async fn claimed(
+    store: &dyn ObjectStore,
+    root: &str,
+    cluster: &str,
+) -> Result<Option<Claimed>> {
+    Ok(read_claim(store, root, cluster)
+        .await?
+        .map(|existing| Claimed {
+            quota: existing.quota,
+            store_id: existing.store_id,
+        }))
+}
+
+/// Read the claim of the store that a data directory is bound to. Refuse a claim with another
+/// store ID, and for an initial voter, a claim with other voters.
+///
+/// This never creates the claim. A claim that disappears during a start stays absent, and the
+/// start fails.
+pub(crate) async fn bound(
+    store: &dyn ObjectStore,
+    root: &str,
+    cluster: &str,
+    store_id: uuid::Uuid,
+    voters: Option<&[u64]>,
+) -> Result<Claimed> {
+    let existing = read_claim(store, root, cluster).await?;
+    let found = existing.as_ref().map(|claim| claim.store_id);
+    let Some(existing) = existing.filter(|claim| claim.store_id == store_id) else {
+        bail!(
+            "the data directory belongs to shared store {store_id}, but the store at this \
+             location has {}: the store was replaced. Use the original store, or a new data \
+             directory",
+            found.map_or("no cluster claim".to_owned(), |id| format!("store ID {id}"))
+        );
+    };
+    if let Some(voters) = voters {
+        let mut voters = voters.to_vec();
+        voters.sort_unstable();
+        ensure!(
+            existing.voters == voters,
+            "the shared state belongs to other initial voters {:?}",
+            existing.voters
+        );
+    }
+    Ok(Claimed {
         quota: existing.quota,
-        store_id: existing.store_id,
-    }))
+        store_id,
+    })
 }
 
 /// Read the claim for a joining member. It is not one of the initial voters, so it never creates
@@ -1045,6 +1089,9 @@ pub(crate) struct Options {
     pub restore: Option<Restore>,
     /// The checkpoint that the durable Raft snapshot record names, if any.
     pub record: Option<Record>,
+    /// The store ID that the data directory is bound to. With it, the open only reads the claim
+    /// and refuses another ID. A data directory gets it at its first open.
+    pub store_id: Option<uuid::Uuid>,
 }
 
 /// A format 6 Raft snapshot record: a checkpoint, the record index, and the term there. The
@@ -1384,17 +1431,22 @@ impl StateMachine {
         backend: transfer::Backend,
     ) -> Result<Self> {
         cache.validate()?;
-        let claimed = if options.join {
-            joined(store.as_ref(), root, cluster).await?
-        } else {
-            claim(
-                store.as_ref(),
-                root,
-                cluster,
-                options.quota,
-                &options.voters,
-            )
-            .await?
+        // The state and the peer identity use the store ID of this one read. A bound data
+        // directory reads the claim only, before any restore or base selection.
+        let voters = (!options.join).then_some(options.voters.as_slice());
+        let claimed = match options.store_id {
+            Some(id) => bound(store.as_ref(), root, cluster, id, voters).await?,
+            None if options.join => joined(store.as_ref(), root, cluster).await?,
+            None => {
+                claim(
+                    store.as_ref(),
+                    root,
+                    cluster,
+                    options.quota,
+                    &options.voters,
+                )
+                .await?
+            }
         };
         let location = transfer::Location::open(
             store.clone(),

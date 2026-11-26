@@ -13,6 +13,7 @@ pub(super) fn voter_options(empty_log: bool) -> crate::state::shared::Options {
         overlay_max_bytes: 1 << 30,
         restore: None,
         record: None,
+        store_id: None,
     }
 }
 use crate::state::overlay::Overlay;

@@ -442,6 +442,7 @@ impl Node {
             overlay_max_bytes: options.overlay_max_bytes,
             restore: options.restore.clone(),
             record: crate::state::shared::Record::of(storage.recovery_snapshot())?,
+            store_id: None,
         };
         let mut state = options
             .object_store

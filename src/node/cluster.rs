@@ -469,6 +469,7 @@ mod tests {
             overlay_max_bytes: 1 << 30,
             restore: None,
             record: None,
+            store_id: None,
         };
         let mut results = vec![];
         for host in ["127.0.0.1".to_owned(), long_host()] {

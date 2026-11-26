@@ -1476,7 +1476,11 @@ async fn an_abandoned_restore_keeps_the_store_id_and_restores_another_image() {
     };
     let store = store();
     let stopped = checked(&first, URL, stopping(Stop::AfterFlush(1)));
-    open(store.clone(), stopped).await.err().unwrap();
+    let error = open(store.clone(), stopped).await.err().unwrap();
+    // The error names the guide steps that keep the claim.
+    let error = format!("{error:#}");
+    assert!(error.contains("\"Abandon a partial restore\""), "{error}");
+    assert!(error.contains("keep shared/owner.json"), "{error}");
 
     // The guide: delete every object under `shared/` except `shared/owner.json`.
     let kept = format!("{root}/shared/owner.json");

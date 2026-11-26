@@ -17,6 +17,7 @@ pub(in crate::state) fn options() -> shared::Options {
         overlay_max_bytes: 1 << 30,
         restore: None,
         record: None,
+        store_id: None,
     }
 }
 
