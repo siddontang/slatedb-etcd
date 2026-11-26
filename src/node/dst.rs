@@ -9,19 +9,26 @@ use crate::proto::etcdserverpb::{PutRequest, RangeRequest, WatchCreateRequest};
 use crate::state::shared::Record;
 use crate::state::{StateRead, StateScan};
 
-/// A digest of every `etcd/` row of a state.
+/// A digest of every `data/` and `etcd/` row of a state. The length of each key and value comes
+/// before it. Derived meta rows differ between storage modes, so the digest leaves them out.
 async fn rows_digest(state: &impl StateRead) -> std::result::Result<u32, slatedb::Error> {
-    let mut scan = state.scan_under(b"etcd/", &Default::default()).await?;
     let mut digest = 0;
-    while let Some(row) = scan.next().await? {
-        digest = crc32c::crc32c_append(digest, &row.key);
-        digest = crc32c::crc32c_append(digest, &row.value);
+    for prefix in [&b"data/"[..], b"etcd/"] {
+        let mut scan = state.scan_under(prefix, &Default::default()).await?;
+        while let Some(row) = scan.next().await? {
+            for part in [&row.key, &row.value] {
+                digest = crc32c::crc32c_append(digest, &(part.len() as u64).to_be_bytes());
+                digest = crc32c::crc32c_append(digest, part);
+            }
+        }
     }
     Ok(digest)
 }
 
 #[path = "shared/dst_tests.rs"]
 mod coverage;
+#[path = "shared/dst_reference.rs"]
+mod reference;
 
 struct ClientRequest {
     key: String,
@@ -74,18 +81,17 @@ struct Simulation {
     proposed: BTreeSet<(String, String)>,
     /// Shared mode: the one object store of all members.
     shared: Option<std::sync::Arc<crate::object::faults::FaultStore>>,
-    /// Shared mode and quota checks: a replicated state that applies the committed entries in
-    /// order. Its quota flag disables the check, unlike the flag of any member.
-    reference: Option<StateMachine>,
-    /// The reference digest of the `etcd/` rows after each index.
+    /// Shared mode and quota checks: the state that applies the committed entries in order.
+    reference: Option<reference::Reference>,
+    /// The reference digest of the `data/` and `etcd/` rows after each index.
     digests: BTreeMap<u64, u32>,
-    /// Shared mode: the loaded fields of the first member seen at each index. A member that
-    /// opens or installs a base above its row must give the same fields as one that applied.
-    loaded: BTreeMap<u64, String>,
-    /// The last applied index that the view check covered on each member.
-    checked: BTreeMap<u64, u64>,
-    /// Member views that matched the reference.
+    /// The last applied index, base, and process that the view check covered on each member.
+    checked: BTreeMap<u64, reference::ViewPoint>,
+    /// Member views that matched the reference at a new applied index.
     view_checks: u64,
+    /// Member views that matched the reference again at the same index, after a base change or a
+    /// restart.
+    base_checks: u64,
     /// The `--quota-backend-bytes` value of each member. Zero selects 2 GiB.
     quotas: BTreeMap<u64, i64>,
     /// Started members are directories of an earlier binary that propose no `SetQuota`.
@@ -112,6 +118,13 @@ struct Simulation {
 
 impl Drop for Simulation {
     fn drop(&mut self) {
+        if let Some(reference) = self.reference.as_ref().filter(|r| r.compared > 0) {
+            eprintln!(
+                "DST reference kinds of seed {}: {}",
+                self.seed,
+                reference.kinds()
+            );
+        }
         // Keep the partial schedule when an invariant fails.
         let dir = std::env::var("SLATEDB_DST_TRACE_DIR").unwrap_or_else(|_| "target/dst".into());
         if std::fs::create_dir_all(&dir).is_ok() {
@@ -189,12 +202,7 @@ impl Simulation {
     ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let reference = if reference {
-            // The reference has no flags. The seed entry of the first leader gives it the
-            // membership row.
-            let reference = StateMachine::open(&root.path().join("reference"))
-                .await
-                .unwrap();
-            Some(reference)
+            Some(reference::Reference::open(&root.path().join("reference"), shared).await)
         } else {
             None
         };
@@ -234,9 +242,9 @@ impl Simulation {
             }),
             reference,
             digests: BTreeMap::new(),
-            loaded: BTreeMap::new(),
             checked: BTreeMap::new(),
             view_checks: 0,
+            base_checks: 0,
             quotas,
             upgraded,
             hold_members,
@@ -405,8 +413,16 @@ impl Simulation {
                 node.drain_reads().await.unwrap();
             }
             if self.paused_flush != Some(id) && node.compaction.active() {
-                let completed = node.compaction.next().await.unwrap();
-                node.finish_compaction_flush(completed).unwrap();
+                // A shared flush only waits for a covering base, which a later writer step
+                // publishes. So a shared simulation polls it once and goes on.
+                let completed = if self.shared.is_some() {
+                    futures::FutureExt::now_or_never(node.compaction.next())
+                } else {
+                    Some(node.compaction.next().await)
+                };
+                if let Some(completed) = completed {
+                    node.finish_compaction_flush(completed.unwrap()).unwrap();
+                }
             }
         }
         for id in failed {
@@ -597,46 +613,6 @@ impl Simulation {
             node.worker.state_mut().settle_opens().await;
             // An announcement of the current base offers it at once, with no open.
             node.note_offers();
-        }
-    }
-
-    /// The reference applies the committed entries in order. Each member's view at its applied
-    /// index must equal the reference at that index. A view can fail on a deleted object, but it
-    /// never returns other data.
-    async fn check_reference(&mut self) {
-        let reference = self.reference.as_mut().unwrap();
-        while let Some(bytes) = self.committed_entries.get(&(reference.applied + 1)) {
-            let entry = Entry::decode(bytes.as_slice()).unwrap();
-            let header = Header {
-                cluster: 0,
-                member: 0,
-                term: entry.term,
-            };
-            apply::apply_entries(reference, vec![entry], header)
-                .await
-                .unwrap();
-            let digest = rows_digest(reference.applied_state()).await.unwrap();
-            self.digests.insert(reference.applied, digest);
-        }
-        self.check_loaded();
-        for (&id, node) in &self.nodes {
-            let applied = node.state.applied;
-            if self.checked.get(&id) == Some(&applied) {
-                continue;
-            }
-            let Some(&expected) = self.digests.get(&applied) else {
-                continue;
-            };
-            let Ok(actual) = rows_digest(node.state.read.state()).await else {
-                continue;
-            };
-            assert_eq!(
-                actual, expected,
-                "seed {}: member {id} view at {applied} differs from the reference",
-                self.seed
-            );
-            self.checked.insert(id, applied);
-            self.view_checks += 1;
         }
     }
 
@@ -3141,6 +3117,12 @@ impl Simulation {
             sim.acknowledged.len(),
             sim.view_checks
         ));
+        let compared = sim.reference.as_ref().unwrap().compared;
+        eprintln!(
+            "shared DST seed {seed}: {compared} reference indexes equal, {} views checked again \
+             at an index",
+            sim.base_checks
+        );
         sim.trace.clone()
     }
 }

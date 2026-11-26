@@ -1529,8 +1529,13 @@ impl StateMachine {
         Ok(state)
     }
 
-    /// Return true in shared state mode.
+    /// Return true in shared state mode. The in-memory state of a test applies entries as a
+    /// shared member does.
     pub(crate) fn is_shared(&self) -> bool {
+        #[cfg(test)]
+        if self.is_memory() {
+            return true;
+        }
         self.shared.is_some()
     }
 
@@ -1844,6 +1849,13 @@ impl StateMachine {
     #[cfg(test)]
     pub(crate) fn extensions(&self) -> u64 {
         self.shared.as_ref().map_or(0, |shared| shared.extensions)
+    }
+
+    /// Offer `base` for a switch through `covers`, as if an announcement certified it there. A
+    /// test switches a member to a wrong base with this.
+    #[cfg(test)]
+    pub(crate) fn offer_base(&self, base: Arc<Base>, covers: u64) {
+        self.shared.as_ref().unwrap().opened.offer(base, covers);
     }
 
     /// The checkpoint of the base, if any.
