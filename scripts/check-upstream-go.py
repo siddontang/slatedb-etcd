@@ -2,7 +2,7 @@
 """Run the original etcd Go suites from the pinned source tree."""
 
 import argparse
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 import gzip
 import json
 import os
@@ -12,10 +12,15 @@ from pathlib import Path
 import subprocess
 import tempfile
 
+from rustfs_fixture import shared_store
 from upstream_source import ROOT, INVENTORY, build_tool, checked_source, start_cluster
 
 
 RECIPES = "tests/integration/clientv3/experimental/recipes"
+# These examples keep replicated state mode. Right after startup, a shared state leader refuses
+# Defragment with Unavailable until its writer opens, and the example does not retry. The removal
+# of replicated mode must handle these examples.
+REPLICATED_EXAMPLES = {"ExampleMaintenance_defragment"}
 
 
 def fixture_overlay(source, directory, patch, files):
@@ -166,7 +171,8 @@ def run_examples(source, args):
             with tempfile.TemporaryDirectory() as data, ExitStack() as stack:
                 endpoints = start_cluster(stack, Path(data), binary, args.target, 3, ctl, 1000,
                                           2 * 1024**3, ["--strict-reconfig-check=false",
-                                                         "--watch-progress-notify-interval=200ms"])
+                                                         "--watch-progress-notify-interval=200ms"],
+                                          shared=name not in REPLICATED_EXAMPLES)
                 env = dict(os.environ, TEST_URLS=endpoints)
                 command = ["go", "tool", "test2json", "-t", executable, "-test.v=test2json",
                            "-test.run=^" + name + "$", "-test.timeout=" + args.timeout]
@@ -226,6 +232,12 @@ def main():
         if not cases:
             parser.error("No Go benchmark package matched " + args.package)
     args.output.mkdir(parents=True, exist_ok=True)
+    # Service clusters of several members run in shared state mode on one RustFS server.
+    with shared_store() if args.target == "service" else nullcontext():
+        run_suite(source, cases, args, process_suite, required)
+
+
+def run_suite(source, cases, args, process_suite, required):
     if args.suite == "examples":
         raise SystemExit(not run_examples(source, args))
     summary = args.output / f"{args.target}-{args.suite}-{args.shard_index}-summary.jsonl"
@@ -243,6 +255,14 @@ def main():
             if args.target == "service":
                 (binaries / "slatedb-etcd").symlink_to(args.binary.resolve(strict=True))
                 (binaries / "etcd").symlink_to(ROOT / "tests/upstream/service-process.py")
+                # The fixture runs clusters of several members in shared state mode on RustFS.
+                settings = binaries / "shared-store.json"
+                settings.touch(mode=0o600)
+                settings.write_text(json.dumps({
+                    "endpoint": os.environ["SLATEDB_S3_TEST_ENDPOINT"],
+                    "bucket": os.environ["SLATEDB_S3_TEST_BUCKET"],
+                    "access_key": os.environ["AWS_ACCESS_KEY_ID"],
+                    "secret_key": os.environ["AWS_SECRET_ACCESS_KEY"]}))
                 files = ["tests/framework/e2e/" + name for name in ("cluster.go", "etcd_process.go")]
                 overlay = fixture_overlay(source, directory, "process-fixture.patch", files)
                 go_flags.append("-overlay=" + str(overlay))

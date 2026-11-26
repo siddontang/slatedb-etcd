@@ -62,6 +62,38 @@ class BenchResults(unittest.TestCase):
         cells = list(bench.heatmap_cases())
         self.assertEqual(len({c.name for c in cells}), 392)
 
+    def test_fixture_puts_several_members_on_rustfs(self):
+        store = {"endpoint": "http://127.0.0.1:9", "bucket": "b", "access_key": "k",
+                 "secret_key": "s"}
+
+        def member(count, cluster="/tmp/cluster/0", settings=store):
+            names = [f"m{i}" for i in range(count)]
+            peers = ",".join(f"{name}=http://127.0.0.1:{2380 + i}" for i, name in enumerate(names))
+            argv = ["--name", "m0", "--initial-cluster", peers,
+                    "--listen-client-urls", "http://127.0.0.1:2379",
+                    "--advertise-client-urls", "http://127.0.0.1:2379",
+                    "--listen-peer-urls", "http://127.0.0.1:2380",
+                    "--initial-advertise-peer-urls", "http://127.0.0.1:2380",
+                    "--data-dir", "/tmp/m0", "--fixture-cluster", cluster]
+            for i, name in enumerate(names[1:], 1):
+                argv += ["--fixture-client", f"{name}=http://127.0.0.1:{2390 + i}"]
+            return adapter.service_args(argv, settings)
+
+        def prefix(command):
+            return command[command.index("--s3-prefix") + 1]
+
+        command, env = member(3)
+        self.assertEqual(command[command.index("--state-mode") + 1], "shared")
+        self.assertEqual(env["AWS_SECRET_ACCESS_KEY"], "s")
+        # A restart keeps the prefix. Another cluster gets another prefix.
+        self.assertEqual(prefix(command), prefix(member(3)[0]))
+        self.assertNotEqual(prefix(command), prefix(member(3, "/tmp/other/0")[0]))
+        single, env = member(1)
+        self.assertNotIn("--state-mode", single)
+        self.assertEqual(env, {})
+        with self.assertRaises(ValueError):
+            member(3, settings=None)
+
     def test_fixture_rejects_unknown_semantics(self):
         with self.assertRaises(ValueError):
             adapter.local_url("unix://localhost:21379")

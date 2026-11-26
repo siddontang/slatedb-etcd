@@ -2,7 +2,7 @@
 """Compare services with one gRPC workload and separate resource phases."""
 
 import argparse
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 from reporting import write_report
-from rustfs_fixture import local_rustfs
+from rustfs_fixture import shared_store, unique_prefix
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -116,6 +116,9 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
         ports = addresses(members * 2)
         clients, peers = ports[:members], ports[members:]
         processes, logs = [], []
+        # Several service members share one state on the object store. Each cluster has its own
+        # prefix.
+        prefix = unique_prefix("bench")
         driver = None
         stop = threading.Event()
         sampler = None
@@ -148,12 +151,13 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
                         command += ["--s3-endpoint", args.s3_endpoint]
                     if args.s3_allow_http:
                         command += ["--s3-allow-http"]
+                    if members > 1:
+                        command += ["--state-mode", "shared", "--s3-prefix", prefix]
                     for j in range(members):
                         command += ["--peer", f"{j+1}={peers[j]}", "--client-peer", f"{j+1}={clients[j]}"]
                 log = open(root / f"node{i+1}.log", "w")
                 logs.append(log)
-                env = getattr(args, "service_env", None) if kind != "etcd" else None
-                processes.append(subprocess.Popen(command, stdout=log, stderr=log, env=env))
+                processes.append(subprocess.Popen(command, stdout=log, stderr=log))
             log = open(root / "client.log", "w")
             logs.append(log)
             result_path = root / "sample.json"
@@ -310,14 +314,26 @@ def main():
         parser.error("--rustfs supplies its own bucket, endpoint, and HTTP settings")
     if args.rustfs and kinds == ["etcd"]:
         parser.error("--rustfs requires a service or baseline backend")
-    with local_rustfs() if args.rustfs else nullcontext() as fixture:
-        store = None
-        if fixture:
-            args.service_env, store = fixture
-            args.s3_bucket = args.service_env["SLATEDB_S3_TEST_BUCKET"]
-            args.s3_endpoint = args.service_env["SLATEDB_S3_TEST_ENDPOINT"]
-            args.s3_allow_http = True
+    with object_store(args, kinds) as store:
         benchmark(args, kinds, store)
+
+
+@contextmanager
+def object_store(args, kinds):
+    """Start RustFS for `--rustfs`, and for service clusters of several members without a bucket.
+
+    Several service members run in shared state mode, as production runs on S3. Yield the store
+    description, or None for local state.
+    """
+    several = args.members > 1 and any(kind != "etcd" for kind in kinds)
+    if not args.rustfs and (args.s3_bucket or not several):
+        yield None
+        return
+    with shared_store() as store:
+        args.s3_bucket = os.environ["SLATEDB_S3_TEST_BUCKET"]
+        args.s3_endpoint = os.environ["SLATEDB_S3_TEST_ENDPOINT"]
+        args.s3_allow_http = True
+        yield store
 
 
 def benchmark(args, kinds, store):
@@ -333,6 +349,7 @@ def benchmark(args, kinds, store):
               "client_target": args.client_target,
               "deployment": f"{args.members} processes per backend; shared host and disk; loopback plaintext",
               "reference_etcd": "v3.6.5", "state_backend": "s3" if args.s3_bucket else "local",
+              "state_mode": "shared" if args.members > 1 else "replicated",
               "raft_snapshot_entries": args.snapshot_entries, "quota_bytes": args.quota_bytes,
               "order_seed": args.seed, "binaries": {},
               "resource_phases": "CPU deltas and peak RSS cover only the measured phase; retained preload memory remains",
