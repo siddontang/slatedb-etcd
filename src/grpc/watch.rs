@@ -756,15 +756,15 @@ async fn send_prepared(
 }
 
 impl Service {
-    /// Ask the node to answer once this member applied every Put that it already answered.
-    /// Its batches are then on the feed.
-    async fn apply_barrier(&self) -> Result<oneshot::Receiver<()>, Status> {
+    /// Wait until this member applied every Put that it already answered. Its batches are
+    /// then on the feed.
+    async fn apply_barrier(&self) -> Result<(), Status> {
         let (response, applied) = oneshot::channel();
         self.events
             .send(Event::WatchBarrier(response))
             .await
             .map_err(|_| unavailable())?;
-        Ok(applied)
+        applied.await.map_err(|_| unavailable())
     }
 
     async fn watch_stream(
@@ -798,12 +798,19 @@ impl Service {
         // Automatic progress uses the configured interval. Token expiry needs at least 1 s.
         let mut checks = tokio::time::interval(self.watch_progress_interval.min(CHECK_INTERVAL));
         checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // A create waits here for the apply barrier. The stream keeps serving its watchers,
-        // leader loss and checks, and reads the next request only after the create.
-        let mut pending: Option<(WatchCreateRequest, oneshot::Receiver<()>)> = None;
+        // A create waits here for the apply barrier, including a slot in the node queue. The
+        // stream keeps serving its watchers, leader loss and checks, and reads the next request
+        // only after the create.
+        type Barrier<'a> =
+            std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Status>> + Send + 'a>>;
+        let mut pending: Option<(WatchCreateRequest, Barrier<'_>)> = None;
         loop {
             let unsynced = stream.unsynced();
             let waiting = pending.is_some();
+            if waiting {
+                // The create fails without a leader. The stream may have no watcher yet.
+                stream.current(false)?;
+            }
             tokio::select! {
                 _ = tx.closed() => return Ok(()),
                 received = events.recv() => stream.receive(received).await?,
@@ -815,8 +822,8 @@ impl Service {
                 _ = std::future::ready(()), if unsynced => {
                     stream.catch_up(None).await?;
                 }
-                applied = async { (&mut pending.as_mut().expect("waiting").1).await }, if waiting => {
-                    applied.map_err(|_| unavailable())?;
+                applied = async { pending.as_mut().expect("waiting").1.as_mut().await }, if waiting => {
+                    applied?;
                     let (request, _) = pending.take().expect("waiting");
                     // The create observes every batch through the replied Puts.
                     stream.drain(&mut events).await?;
@@ -827,7 +834,7 @@ impl Service {
                     // Requests observe all batches that the node published before them.
                     match message.request_union {
                         Some(RequestUnion::CreateRequest(request)) => {
-                            pending = Some((request, self.apply_barrier().await?));
+                            pending = Some((request, Box::pin(self.apply_barrier())));
                         }
                         Some(RequestUnion::CancelRequest(request)) => {
                             stream.drain(&mut events).await?;
@@ -1419,6 +1426,7 @@ mod tests {
     struct EarlyReply {
         batches: broadcast::Sender<Arc<Batch>>,
         barriers: mpsc::Receiver<oneshot::Sender<()>>,
+        node: mpsc::Sender<Event>,
         client: crate::proto::etcdserverpb::watch_client::WatchClient<tonic::transport::Channel>,
     }
 
@@ -1442,6 +1450,7 @@ mod tests {
                     }
                 }
             });
+            let node_events = events.clone();
             let router = crate::grpc::Servers::new(
                 1,
                 events,
@@ -1461,6 +1470,7 @@ mod tests {
             Self {
                 batches,
                 barriers,
+                node: node_events,
                 client,
             }
         }
@@ -1564,6 +1574,55 @@ mod tests {
             .expect("leader loss ends the stream while the barrier is held")
             .unwrap_err();
         assert!(error.message().contains("no leader"));
+        f.close().await;
+    }
+
+    /// The first create on a stream has no watcher yet, and leader loss still fails it while
+    /// it waits for the apply barrier.
+    #[tokio::test]
+    async fn leader_loss_fails_the_first_create_while_it_waits_for_the_apply_barrier() {
+        let f = Fixture::new().await;
+        let mut member = EarlyReply::start(&f).await;
+        let (requests, mut output) = member.open_with(true).await;
+        requests.send(create(request(1, "k", 0))).await.unwrap();
+        let _held = member.barrier().await;
+        let mut state = feed_state(&f.state);
+        state.leader = 0;
+        f.feed.send_replace(state);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), output.message())
+            .await
+            .expect("leader loss ends the stream while the first barrier is held")
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().contains("no leader"));
+        f.close().await;
+    }
+
+    /// A create that waits for a slot in a full node queue does not pause delivery to the
+    /// stream's existing watchers.
+    #[tokio::test]
+    async fn a_full_node_queue_does_not_pause_delivery_to_existing_watchers() {
+        let mut f = Fixture::new().await;
+        let mut member = EarlyReply::start(&f).await;
+        let (requests, mut output) = member.open().await;
+        requests.send(create(request(1, "k", 0))).await.unwrap();
+        member.barrier().await.send(()).unwrap();
+        assert!(next(&mut output).await.created);
+        // 16 barriers fill the test's barrier queue, the node holds one, and 16 fill its queue.
+        let mut held = vec![];
+        for _ in 0..33 {
+            let (response, applied) = oneshot::channel();
+            held.push(applied);
+            member
+                .node
+                .send(Event::WatchBarrier(response))
+                .await
+                .unwrap();
+        }
+        requests.send(create(request(2, "k", 0))).await.unwrap();
+        member.batches.send(f.put("k", "1").await).unwrap();
+        let event = next(&mut output).await;
+        assert_eq!((event.watch_id, event.events.len()), (1, 1));
         f.close().await;
     }
 
