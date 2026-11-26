@@ -13,15 +13,17 @@
 //!   until it ends. Entering is two atomic operations on a striped counter.
 //! - [`LiveSstFilter`], a SlateDB `GcFilter`, keeps every candidate SST that the database's
 //!   in-memory manifest still lists. A read that starts later cannot get any other candidate.
-//! - Then it waits for a grace period, as RCU does: it starts a new epoch and waits until every
-//!   read of the previous epoch has ended. If a long read is still running, it deletes nothing
-//!   now and tries again at the next GC run.
+//! - Then it waits for a grace period, as RCU does. The filter gives each such SST the current
+//!   epoch as its ticket, and GC deletes the SST after every read of that epoch has ended. A
+//!   ticket stays across GC runs, and each run moves the epochs forward when the older reads have
+//!   ended. Reads that start later do not delay a ticket, so GC makes progress while bounded
+//!   reads overlap without a break. A read that runs for minutes delays only the deletion.
 //!
 //! The compactor checkpoint stays as a second line of defense for reads that hold no guard.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use slatedb::Db;
@@ -31,8 +33,8 @@ use slatedb_common::ObjectMetadata;
 /// share a cache line.
 const STRIPES: usize = 16;
 
-/// How long one GC run waits for the reads of the previous epoch. Point reads and paged scans
-/// end in milliseconds. A longer read makes GC skip this run.
+/// How long one GC run waits for reads to end. Point reads and paged scans end in milliseconds.
+/// SSTs that wait for a longer read stay for a later GC run.
 const GRACE_WAIT: Duration = Duration::from_secs(2);
 
 #[repr(align(128))]
@@ -41,9 +43,11 @@ struct Stripe([AtomicUsize; 2]);
 struct Readers {
     /// The current epoch. A read counts in the half `epoch % 2` of its stripe.
     epoch: AtomicUsize,
+    /// Every read that started in an epoch below this value has ended.
+    completed: AtomicUsize,
     stripes: [Stripe; STRIPES],
-    /// One grace period at a time. Two GC tasks of different databases may call the filter.
-    grace: tokio::sync::Mutex<()>,
+    /// Serializes `advance`. The GC tasks of two databases may call it at the same time.
+    advancing: Mutex<()>,
 }
 
 static READERS: Readers = Readers::new();
@@ -80,8 +84,9 @@ impl Readers {
     const fn new() -> Self {
         Self {
             epoch: AtomicUsize::new(0),
+            completed: AtomicUsize::new(0),
             stripes: [const { Stripe([AtomicUsize::new(0), AtomicUsize::new(0)]) }; STRIPES],
-            grace: tokio::sync::Mutex::const_new(()),
+            advancing: Mutex::new(()),
         }
     }
 
@@ -111,23 +116,36 @@ impl Readers {
             .all(|stripe| stripe.0[half].load(SeqCst) == 0)
     }
 
-    /// Wait until every read that started before this call has ended, for at most `wait`.
-    /// Return false if a read may still be running.
-    async fn grace_period(&self, wait: Duration) -> bool {
-        let _one = self.grace.lock().await;
+    /// Move the epochs forward if the reads of the previous epoch have ended, and return
+    /// `completed`.
+    ///
+    /// In epoch `e`, the other half holds only reads of epoch `e - 1`: the step to `e` waited
+    /// for the reads of `e - 2`, which used the same half. When that half is empty, every read
+    /// below `e` has ended, and epoch `e + 1` can reuse it.
+    fn advance(&self) -> usize {
+        let _one = self.advancing.lock().unwrap();
         let epoch = self.epoch.load(SeqCst);
-        // Reads of the epoch before `epoch` must end before their half is reused.
-        if !self.drained((epoch + 1) % 2) {
-            return false;
+        if self.drained((epoch + 1) % 2) {
+            self.completed.store(epoch, SeqCst);
+            self.epoch.store(epoch + 1, SeqCst);
         }
-        self.epoch.store(epoch + 1, SeqCst);
+        self.completed.load(SeqCst)
+    }
+
+    /// The ticket for an SST that no read can take from now on: the reads that may still use it
+    /// started in this epoch or earlier.
+    fn ticket(&self) -> usize {
+        self.epoch.load(SeqCst)
+    }
+
+    /// Wait for at most `wait` until every read of the epoch `ticket` or earlier has ended.
+    /// Return the `completed` value at the end.
+    async fn wait_for(&self, ticket: usize, wait: Duration) -> usize {
         let deadline = Instant::now() + wait;
         loop {
-            if self.drained(epoch % 2) {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
+            let completed = self.advance();
+            if completed > ticket || Instant::now() >= deadline {
+                return completed;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -138,6 +156,8 @@ impl Readers {
 #[derive(Default)]
 pub(crate) struct LiveSstFilter {
     db: OnceLock<Weak<Db>>,
+    /// Unlisted SSTs that wait for the reads of their ticket's epoch to end, by SST ID.
+    tickets: Mutex<HashMap<String, usize>>,
 }
 
 impl LiveSstFilter {
@@ -147,14 +167,23 @@ impl LiveSstFilter {
     }
 
     async fn allowed(&self, candidates: HashSet<ObjectMetadata>) -> HashSet<ObjectMetadata> {
-        let (ssts, others): (HashSet<_>, HashSet<_>) = candidates
+        self.allowed_with(&READERS, candidates, GRACE_WAIT).await
+    }
+
+    async fn allowed_with(
+        &self,
+        readers: &Readers,
+        candidates: HashSet<ObjectMetadata>,
+        wait: Duration,
+    ) -> HashSet<ObjectMetadata> {
+        let (ssts, mut allowed): (HashSet<_>, HashSet<_>) = candidates
             .into_iter()
             .partition(|object| compacted_sst(object).is_some());
         if ssts.is_empty() {
-            return others;
+            return allowed;
         }
         let Some(db) = self.db.get().and_then(Weak::upgrade) else {
-            return others;
+            return allowed;
         };
         // Reads that start after this point take this SST list or a later one.
         let listed: HashSet<String> = db
@@ -163,20 +192,45 @@ impl LiveSstFilter {
             .map(|view| view.sst.id.value().to_string())
             .collect();
         drop(db);
-        let unlisted: HashSet<_> = ssts
+        let unlisted: Vec<_> = ssts
             .into_iter()
             .filter(|object| compacted_sst(object).is_some_and(|id| !listed.contains(id)))
             .collect();
-        if unlisted.is_empty() || !READERS.grace_period(GRACE_WAIT).await {
-            if !unlisted.is_empty() {
-                tracing::debug!(
-                    count = unlisted.len(),
-                    "a running read delays the deletion of replaced SSTs"
-                );
-            }
-            return others;
+        if unlisted.is_empty() {
+            return allowed;
         }
-        others.into_iter().chain(unlisted).collect()
+        // Read the epoch after the list: a read that took an older list holds a guard of this
+        // epoch or an earlier one. An SST keeps the ticket of the first run that saw it unlisted.
+        let ticket = readers.ticket();
+        let tickets: HashMap<String, usize> = {
+            let mut pending = self.tickets.lock().unwrap();
+            let tickets: HashMap<_, _> = unlisted
+                .iter()
+                .filter_map(compacted_sst)
+                .map(|id| (id.to_owned(), pending.get(id).copied().unwrap_or(ticket)))
+                .collect();
+            // Forget SSTs that GC no longer offers, for example because it deleted them.
+            *pending = tickets.clone();
+            tickets
+        };
+        let newest = tickets.values().copied().max().unwrap_or(ticket);
+        let completed = readers.wait_for(newest, wait).await;
+        let mut waiting = 0;
+        for object in unlisted {
+            let id = compacted_sst(&object).expect("a compacted SST");
+            if tickets[id] < completed {
+                allowed.insert(object);
+            } else {
+                waiting += 1;
+            }
+        }
+        if waiting > 0 {
+            tracing::debug!(
+                count = waiting,
+                "running reads delay the deletion of replaced SSTs"
+            );
+        }
+        allowed
     }
 }
 
@@ -204,52 +258,47 @@ mod tests {
         Box::leak(Box::new(Readers::new()))
     }
 
-    const NO_WAIT: Duration = Duration::from_millis(20);
+    const NO_WAIT: Duration = Duration::from_millis(1);
 
-    /// A grace period waits for reads that started before it, not for later ones.
+    /// A ticket waits for the reads of its epoch and earlier ones, not for later reads.
     #[tokio::test]
-    async fn grace_period_waits_only_for_earlier_reads() {
+    async fn a_ticket_waits_only_for_earlier_reads() {
         let readers = readers();
-        assert!(readers.grace_period(NO_WAIT).await);
-
         let early = readers.enter();
-        assert!(!readers.grace_period(NO_WAIT).await);
-        // The early read still blocks the next grace periods, and a later read does not
-        // unblock them.
+        let ticket = readers.ticket();
+        assert!(readers.wait_for(ticket, NO_WAIT).await <= ticket);
+        // This read starts after GC moved to the next epoch.
         let later = readers.enter();
-        assert!(!readers.grace_period(NO_WAIT).await);
+        assert!(readers.wait_for(ticket, NO_WAIT).await <= ticket);
         drop(early);
-        let after = readers.enter();
         assert!(
-            !readers.grace_period(NO_WAIT).await,
-            "`later` started before"
+            readers.wait_for(ticket, NO_WAIT).await > ticket,
+            "`later` must not block"
         );
         drop(later);
-        // `after` started before this grace period too.
-        assert!(!readers.grace_period(NO_WAIT).await);
-        drop(after);
-        assert!(readers.grace_period(NO_WAIT).await);
     }
 
-    /// A read that ends during the wait lets the grace period finish.
+    /// A read that ends during the wait lets the wait finish.
     #[tokio::test]
-    async fn grace_period_ends_when_the_read_ends() {
+    async fn a_wait_ends_when_the_read_ends() {
         let readers = readers();
         let read = readers.enter();
+        let ticket = readers.ticket();
         let end = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             drop(read);
         });
-        assert!(readers.grace_period(Duration::from_secs(10)).await);
+        assert!(readers.wait_for(ticket, Duration::from_secs(10)).await > ticket);
         end.await.unwrap();
     }
 
-    /// Model of GC against concurrent reads. The SST list has a version; SST `k` is listed
-    /// only in version `k`. GC unlists SST `k` (the version moves to `k + 1`), waits for a grace
-    /// period, and frees SST `k`. A read takes the version under its guard and checks, while it
-    /// holds the guard, that its SST is never freed.
+    /// Model of GC against reads that overlap without a break, each longer than the GC wait, as
+    /// with busy keys-only Range requests. The SST list has a version; SST `k` is listed only in
+    /// version `k`. GC unlists SST `k` and takes a ticket. Each run frees the SSTs whose ticket
+    /// has completed. A read takes the version under its guard and checks, while it holds the
+    /// guard, that its SST is never freed. GC must still free SSTs.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_freed_sst_is_never_in_use() {
+    async fn overlapping_reads_never_lose_an_sst_and_never_stop_gc() {
         use std::sync::atomic::{AtomicBool, AtomicI64};
         let readers = readers();
         let listed = Arc::new(AtomicI64::new(0));
@@ -257,33 +306,43 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let reads = Arc::new(AtomicI64::new(0));
         let mut tasks = vec![];
-        for _ in 0..4 {
+        for task in 0..4u64 {
             let (listed, freed, stop, reads) =
                 (listed.clone(), freed.clone(), stop.clone(), reads.clone());
             tasks.push(tokio::spawn(async move {
+                // Start the readers at different times, so one is always running.
+                tokio::time::sleep(Duration::from_millis(5 * task)).await;
                 while !stop.load(SeqCst) {
                     let _read = readers.enter();
                     let sst = listed.load(SeqCst);
-                    for _ in 0..3 {
+                    for _ in 0..4 {
                         assert!(freed.load(SeqCst) < sst, "SST {sst} freed during a read");
-                        tokio::task::yield_now().await;
+                        tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                     reads.fetch_add(1, SeqCst);
                 }
             }));
         }
+        let mut pending = std::collections::VecDeque::new();
         let mut freed_count = 0;
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while freed_count < 300 || reads.load(SeqCst) < 10_000 {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while freed_count < 100 || reads.load(SeqCst) < 400 {
             assert!(
                 Instant::now() < deadline,
                 "freed {freed_count}, reads {reads:?}"
             );
-            let sst = listed.fetch_add(1, SeqCst);
-            if readers.grace_period(Duration::from_millis(100)).await {
+            // Unlist an SST, then take its ticket.
+            pending.push_back((listed.fetch_add(1, SeqCst), readers.ticket()));
+            let completed = readers.wait_for(pending[0].1, NO_WAIT).await;
+            while pending
+                .front()
+                .is_some_and(|(_, ticket)| *ticket < completed)
+            {
+                let (sst, _) = pending.pop_front().unwrap();
                 freed.fetch_max(sst, SeqCst);
                 freed_count += 1;
             }
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
         stop.store(true, SeqCst);
         for task in tasks {
@@ -321,5 +380,45 @@ mod tests {
             None
         );
         assert_eq!(compacted_sst(&object(&format!("{id}.sst"))), None);
+    }
+
+    /// The filter keeps an SST that the database's in-memory manifest still lists, even with no
+    /// running read: a read that starts later could take it. It passes an unlisted SST once
+    /// its ticket completes, and every object that is not a compacted SST.
+    #[tokio::test]
+    async fn the_filter_keeps_listed_ssts() {
+        let readers = readers();
+        let store = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let db = Arc::new(Db::builder("db", store).build().await.unwrap());
+        db.put(b"k", b"v").await.unwrap();
+        db.flush_with_options(slatedb::config::FlushOptions {
+            flush_type: slatedb::config::FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        let listed: Vec<String> = db
+            .manifest()
+            .all_sst_views()
+            .map(|view| view.sst.id.value().to_string())
+            .collect();
+        assert!(!listed.is_empty());
+        let listed = object(&format!("db/compacted/{}.sst", listed[0]));
+        let unlisted = object("db/compacted/01KB0000000000000000000000.sst");
+        let wal = object("db/wal/00000000000000000001.sst");
+        let candidates = HashSet::from([listed.clone(), unlisted.clone(), wal.clone()]);
+
+        let filter = LiveSstFilter::default();
+        // An unbound filter keeps every compacted SST.
+        let allowed = filter
+            .allowed_with(readers, candidates.clone(), NO_WAIT)
+            .await;
+        assert_eq!(allowed, HashSet::from([wal.clone()]));
+
+        filter.bind(&db);
+        let allowed = filter
+            .allowed_with(readers, candidates, Duration::from_secs(10))
+            .await;
+        assert_eq!(allowed, HashSet::from([unlisted, wal]));
+        db.close().await.unwrap();
     }
 }

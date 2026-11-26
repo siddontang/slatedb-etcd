@@ -20,4 +20,12 @@ disallowed-methods = [
   { path = "slatedb::DbSnapshot::scan_with_options", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
   { path = "slatedb::DbSnapshot::scan_prefix", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
   { path = "slatedb::DbSnapshot::scan_prefix_with_options", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::DbReadOps::get", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::DbReadOps::get_with_options", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::DbReadOps::get_key_value", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::DbReadOps::get_key_value_with_options", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::DbReadOps::scan", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::DbReadOps::scan_with_options", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::DbReadOps::scan_prefix", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::DbReadOps::scan_prefix_with_options", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
 ]
