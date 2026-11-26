@@ -131,7 +131,8 @@ single-read bound: its result size, up to the logical data size. The two cases n
 The response assembly keeps at most `limit` rows: key order streams them, and other sort orders
 keep the best `limit` rows in a heap. A sorted Range without a limit keeps every row, as before.
 As in etcd, a sort target without a sort order or revision filters sorts only the first
-`limit + 1` keys, and the scan stops there.
+`limit + 1` keys. A pinned current scan stops there because its key order holds the count;
+a historical scan still reads the rest of the interval to count it.
 Some sources hold more before the assembly: a journal page holds `limit + 1` rows, and a Range
 after a write in the same transaction loads the whole interval into the overlay merge.
 Current scans and history scans decode only the key and revision fields for counts, revision

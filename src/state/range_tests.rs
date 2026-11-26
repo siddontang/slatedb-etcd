@@ -325,3 +325,54 @@ async fn complete_pages_stop_before_the_next_row() {
     drop(view);
     state.close().await.unwrap();
 }
+
+/// Keys-only scans decode only the row metadata; it keeps the lease of current and historical
+/// rows.
+#[tokio::test]
+async fn keys_only_scans_keep_the_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    state
+        .apply_lease(1, &crate::lease::LeaseCommand::Grant { id: 7, ttl: 30 })
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    let put = RequestOp {
+        request: Some(Op::RequestPut(PutRequest {
+            key: b"k1".to_vec(),
+            value: b"v".to_vec(),
+            lease: 7,
+            ..Default::default()
+        })),
+    };
+    state.apply_etcd(2, &put).await.unwrap().result.unwrap();
+    let revision = state.revision;
+    let view = state.read_view().unwrap();
+    // A current scan, then an unlimited historical scan that reads history rows, not the journal.
+    for revision in [0, revision] {
+        let reply = read_range(
+            &view,
+            &RangeRequest {
+                key: b"k".to_vec(),
+                range_end: b"l".to_vec(),
+                revision,
+                keys_only: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                reply.kvs[0].key.as_slice(),
+                reply.kvs[0].lease,
+                reply.kvs[0].value.len()
+            ),
+            (b"k1".as_slice(), 7, 0),
+            "revision {revision}"
+        );
+    }
+    drop(view);
+    state.close().await.unwrap();
+}
