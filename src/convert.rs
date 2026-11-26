@@ -554,27 +554,8 @@ mod tests {
     }
 
     /// A free local port below the Linux ephemeral range, never given out twice in this process.
-    /// A port 0 listener returns its port to the pool, and a parallel test can take it.
-    fn port() -> String {
-        use std::sync::atomic::{AtomicU16, Ordering};
-        static NEXT: AtomicU16 = AtomicU16::new(0);
-        let _ = NEXT.compare_exchange(
-            0,
-            21_000 + (std::process::id() % 1_000) as u16 * 10,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
-        loop {
-            let port = NEXT.fetch_add(1, Ordering::Relaxed);
-            assert!(port < 32_000, "no free test port");
-            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-                return format!("127.0.0.1:{port}");
-            }
-        }
-    }
-
     async fn addresses() -> std::collections::BTreeMap<u64, String> {
-        (1..=3).map(|id| (id, port())).collect()
+        (1..=3).map(|id| (id, crate::server::test_port())).collect()
     }
 
     fn config(
@@ -883,7 +864,7 @@ mod tests {
         let configs = replicated(dir.path(), &peers, &store);
         let mut servers = start(&configs).await;
         write(&servers, 20).await;
-        let address = port();
+        let address = crate::server::test_port();
         let lead = leader(&servers).await;
         let id = ClusterClient::new(client(&servers[lead]).await)
             .member_add(MemberAddRequest {

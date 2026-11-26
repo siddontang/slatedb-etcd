@@ -90,6 +90,27 @@ pub struct ServerConfig {
     pub view_retention: crate::state::ViewRetention,
 }
 
+/// A free local port for a test member. A port 0 listener returns its port to the pool, and a
+/// parallel test can take it. This process never gives out one port twice.
+#[cfg(test)]
+pub(crate) fn test_port() -> String {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let _ = NEXT.compare_exchange(
+        0,
+        21_000 + (std::process::id() % 1_000) as u16 * 10,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+    loop {
+        let port = NEXT.fetch_add(1, Ordering::Relaxed);
+        assert!(port < 32_000, "no free test port");
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return format!("127.0.0.1:{port}");
+        }
+    }
+}
+
 impl ServerConfig {
     /// Create a local, single-member configuration with an assigned loopback port.
     pub fn single_node(dir: impl Into<PathBuf>) -> Self {

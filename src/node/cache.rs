@@ -506,6 +506,10 @@ impl Cache {
             }
         }
     }
+    /// The process of the last transport frame of `peer`.
+    pub fn process(&self, peer: u64) -> Option<u64> {
+        self.peers.borrow().get(&peer)?.process
+    }
     /// Return true when the current process of `peer` advertised the coverage capability.
     pub fn coverage_capable(&self, peer: u64) -> bool {
         self.peers

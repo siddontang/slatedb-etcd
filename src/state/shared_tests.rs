@@ -913,20 +913,42 @@ async fn an_open_after_the_retention_choice_fails() {
     let views = five_checkpoints(&mut state).await;
     let source = state.shared.as_ref().unwrap().source.clone();
     let oldest = views[0].1;
-    let candidates = source.begin_retire(&views, &Default::default(), 2);
-    assert_eq!(candidates, [views[0].1, views[1].1, views[2].1]);
+    let retiring = source.begin_retire(&views, &Default::default(), 2);
+    assert_eq!(retiring.ids, [views[0].1, views[1].1, views[2].1]);
     // The open runs between the choice and the deletion.
     let error = source.open_base(oldest).await.err().unwrap();
     assert!(error.to_string().contains("being deleted"), "{error}");
     assert!(!source.pinned().contains(&oldest));
-    for id in &candidates {
+    for id in &retiring.ids {
         state.admin.delete_checkpoint(*id).await.unwrap();
     }
-    source.end_retire(&candidates);
+    drop(retiring);
     assert_eq!(
         shared::view_checkpoints(&state.admin).await.unwrap().len(),
         2
     );
+    state.close().await.unwrap();
+}
+
+/// The writer task can stop in the middle of retention. The stopped retention ends its marks, so
+/// a later open of a checkpoint that it did not delete succeeds.
+#[tokio::test]
+async fn a_stopped_retention_releases_its_choice() {
+    use crate::object::faults::{FaultStore, STALL_STATE_PUT};
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let mut state = open_shared(faults.clone()).await;
+    let views = five_checkpoints(&mut state).await;
+    let source = state.shared.as_ref().unwrap().source.clone();
+    // The first deletion writes the manifest and waits there, after the choice.
+    faults.set(STALL_STATE_PUT);
+    let reported = std::collections::HashSet::new();
+    let retention = shared::retain(&state.admin, &source, &reported, 2, None);
+    let stopped = tokio::time::timeout(Duration::from_millis(500), retention).await;
+    assert!(stopped.is_err(), "retention did not wait at its deletion");
+    faults.set(0);
+    let base = source.open_base(views[0].1).await.unwrap();
+    assert_eq!(base.applied, views[0].0);
+    drop(base);
     state.close().await.unwrap();
 }
 

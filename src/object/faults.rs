@@ -18,7 +18,7 @@ pub(crate) struct FaultStore {
     pub release: Semaphore,
     /// Wakes stalled puts after a mode change.
     resumed: tokio::sync::Notify,
-    /// The delay of `DELAY_SST_GET`, in milliseconds.
+    /// The delay of `DELAY_SST_GET` and `DELAY_SHARED`, in milliseconds.
     delay_ms: std::sync::atomic::AtomicU64,
     /// The paths of puts and copy targets, and of reads, for access tests.
     pub written: std::sync::Mutex<std::collections::BTreeSet<String>>,
@@ -38,6 +38,20 @@ pub(crate) const STALL_STATE_PUT: u8 = 8;
 pub(crate) const DELAY_SST_GET: u8 = 9;
 /// Report the next SST read as missing, like an SST that GC deleted.
 pub(crate) const LOSE_SST_ONCE: u8 = 7;
+/// Fail every put of the shared database, like a bucket that denies writes. Claims beside it
+/// still succeed.
+pub(crate) const FAIL_STATE_PUT: u8 = 11;
+/// Return manifests of the shared database that do not decode, like a newer manifest format.
+pub(crate) const CORRUPT_MANIFEST: u8 = 12;
+/// Hold every read of the bootstrap marker and claim until the mode changes.
+pub(crate) const STALL_BOOTSTRAP_READ: u8 = 13;
+/// Hold every read of a manifest of the shared database until the mode changes.
+pub(crate) const STALL_MANIFEST_READ: u8 = 14;
+/// Hold the next read of a manifest of the shared database until `release`.
+pub(crate) const PAUSE_MANIFEST_READ: u8 = 15;
+/// Delay every read and put of the shared objects, by 120 ms unless `set_delay` changes it, like
+/// the latency of S3.
+pub(crate) const DELAY_SHARED: u8 = 16;
 /// Report the next two SST reads as missing. A failed cache load in SlateDB falls back to one
 /// direct read, so only this mode fails a read that goes through the block cache.
 pub(crate) const LOSE_SST_TWICE: u8 = 10;
@@ -68,17 +82,41 @@ impl FaultStore {
             .store(delay.as_millis() as u64, Ordering::SeqCst);
     }
 
+    /// Wait for the delay of `DELAY_SHARED` on a shared object.
+    async fn lag(&self, path: &Path) {
+        if self.mode.load(Ordering::SeqCst) == DELAY_SHARED && path.as_ref().contains("shared/") {
+            let delay = self.delay_ms.load(Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+    }
+
+    /// Wait while the mode is `mode`.
+    async fn hold(&self, mode: u8) {
+        loop {
+            let resumed = self.resumed.notified();
+            if self.mode.load(Ordering::SeqCst) != mode {
+                return;
+            }
+            resumed.await;
+        }
+    }
+
     async fn stall(&self, path: &Path) {
         loop {
             let resumed = self.resumed.notified();
             match self.mode.load(Ordering::SeqCst) {
                 STALL_PUT => {}
-                STALL_STATE_PUT if path.as_ref().contains("shared/state/") => {}
+                STALL_STATE_PUT if state(path) => {}
                 _ => return,
             }
             resumed.await;
         }
     }
+}
+
+/// Return true for an object of the shared database.
+fn state(path: &Path) -> bool {
+    path.as_ref().contains("shared/state/")
 }
 
 fn error() -> Error {
@@ -103,6 +141,11 @@ impl ObjectStore for FaultStore {
     ) -> Result<PutResult> {
         self.written.lock().unwrap().insert(path.to_string());
         self.stall(path).await;
+        self.lag(path).await;
+        if self.mode.load(Ordering::SeqCst) == FAIL_STATE_PUT && state(path) {
+            self.entered.add_permits(1);
+            return Err(error());
+        }
         if path.as_ref().ends_with(".sst") {
             match self.mode.load(Ordering::SeqCst) {
                 FAIL_PUT => {
@@ -141,6 +184,22 @@ impl ObjectStore for FaultStore {
 
     async fn get_opts(&self, path: &Path, options: GetOptions) -> Result<GetResult> {
         self.read.lock().unwrap().insert(path.to_string());
+        self.lag(path).await;
+        if path.as_ref().contains("shared/bootstrap") {
+            self.hold(STALL_BOOTSTRAP_READ).await;
+        }
+        if state(path) && path.as_ref().ends_with(".manifest") {
+            self.hold(STALL_MANIFEST_READ).await;
+            let pause = Ordering::SeqCst;
+            if self
+                .mode
+                .compare_exchange(PAUSE_MANIFEST_READ, 0, pause, pause)
+                .is_ok()
+            {
+                self.entered.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+            }
+        }
         let mode = self.mode.load(Ordering::SeqCst);
         if (mode == LOSE_SST_ONCE || mode == LOSE_SST_TWICE) && path.as_ref().ends_with(".sst") {
             let next = if mode == LOSE_SST_TWICE {
@@ -168,6 +227,15 @@ impl ObjectStore for FaultStore {
         if mode == FAIL_GET || (mode == FAIL_SST_GET && path.as_ref().ends_with(".sst")) {
             self.entered.add_permits(1);
             return Err(error());
+        }
+        if mode == CORRUPT_MANIFEST && state(path) && path.as_ref().ends_with(".manifest") {
+            let mut result = self.inner.get_opts(path, options).await?;
+            let garbage = bytes::Bytes::from_static(b"not a manifest");
+            result.range = 0..garbage.len() as u64;
+            result.meta.size = garbage.len() as u64;
+            result.payload =
+                GetResultPayload::Stream(Box::pin(futures::stream::once(async { Ok(garbage) })));
+            return Ok(result);
         }
         self.inner.get_opts(path, options).await
     }

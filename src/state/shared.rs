@@ -254,6 +254,12 @@ pub(crate) struct Source {
     /// DST: every open fails, as for a checkpoint that cannot open.
     #[cfg(test)]
     pub(crate) fail_opens: std::sync::atomic::AtomicBool,
+    /// Tests: the next writer open fails with this error.
+    #[cfg(test)]
+    pub(crate) fail_writer: Mutex<Option<anyhow::Error>>,
+    /// Tests: each writer open fails with the error of this function.
+    #[cfg(test)]
+    pub(crate) fail_writers: Mutex<Option<fn() -> anyhow::Error>>,
 }
 
 /// The checkpoints that this member uses, and the ones that retention deletes.
@@ -292,6 +298,21 @@ struct Prune<'a>(&'a Source);
 impl Drop for Prune<'_> {
     fn drop(&mut self) {
         self.0.prune_warmed();
+    }
+}
+
+/// Checkpoints that retention selected for deletion. Dropping it ends the marks.
+pub(crate) struct Retiring<'a> {
+    source: &'a Source,
+    pub ids: Vec<uuid::Uuid>,
+}
+
+impl Drop for Retiring<'_> {
+    fn drop(&mut self) {
+        let mut pins = self.source.pins.lock().unwrap();
+        for id in &self.ids {
+            pins.retiring.remove(id);
+        }
     }
 }
 
@@ -428,25 +449,19 @@ impl Source {
     }
 
     /// Select the checkpoints to delete and mark them, under the lock that opens take. A later
-    /// open of a marked checkpoint fails. Call `end_retire` after the deletions.
+    /// open of a marked checkpoint fails. The marks end when the returned value drops, also when
+    /// the caller stops before its deletions end.
     pub(crate) fn begin_retire(
         &self,
         views: &[(u64, uuid::Uuid)],
         reported: &HashSet<uuid::Uuid>,
         keep: usize,
-    ) -> Vec<uuid::Uuid> {
+    ) -> Retiring<'_> {
         let mut pins = self.pins.lock().unwrap();
         let pinned = pins.pinned();
-        let candidates = retired(views, &pinned, reported, keep);
-        pins.retiring.extend(candidates.iter().copied());
-        candidates
-    }
-
-    pub(crate) fn end_retire(&self, ids: &[uuid::Uuid]) {
-        let mut pins = self.pins.lock().unwrap();
-        for id in ids {
-            pins.retiring.remove(id);
-        }
+        let ids = retired(views, &pinned, reported, keep);
+        pins.retiring.extend(ids.iter().copied());
+        Retiring { source: self, ids }
     }
 
     /// Open the checkpoint of a received snapshot before Raft accepts it. A failed open fails the
@@ -476,6 +491,14 @@ impl Source {
     }
 
     pub async fn open_writer_with(&self, settings: Settings) -> Result<Db> {
+        #[cfg(test)]
+        if let Some(error) = self.fail_writer.lock().unwrap().take() {
+            return Err(error);
+        }
+        #[cfg(test)]
+        if let Some(error) = *self.fail_writers.lock().unwrap() {
+            return Err(error());
+        }
         Ok(Db::builder(self.state(), self.store.clone())
             .with_db_cache(self.cache.clone(), 0)
             .with_settings(settings)
@@ -517,7 +540,8 @@ impl Source {
             .await?
             .bytes()
             .await?;
-        let marker: serde_json::Value = serde_json::from_slice(&data)?;
+        let marker: serde_json::Value = serde_json::from_slice(&data)
+            .map_err(|error| super::stored(format!("invalid bootstrap marker: {error}")))?;
         Ok(marker["restore"].as_str().map(str::to_owned))
     }
 
@@ -544,10 +568,11 @@ impl Source {
             // Another member wrote the marker first. It must name the same bootstrap.
             Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
                 let existing = self.restored_snapshot().await?;
-                ensure!(
-                    existing.as_deref() == restore,
-                    "the bootstrap marker records another bootstrap"
-                );
+                if existing.as_deref() != restore {
+                    return Err(super::stored(
+                        "the bootstrap marker records another bootstrap",
+                    ));
+                }
                 Ok(())
             }
             Err(error) => Err(error.into()),
@@ -629,9 +654,10 @@ pub(crate) async fn retain(
         .into_iter()
         .map(|(seq, checkpoint)| (seq, checkpoint.id))
         .collect();
-    let candidates = source.begin_retire(&views, reported, keep);
+    // A stopped writer task drops this future at an await. `retiring` then ends the marks.
+    let retiring = source.begin_retire(&views, reported, keep);
     let mut result = Ok(());
-    for id in &candidates {
+    for id in &retiring.ids {
         if let Some(epoch) = epoch {
             let current = admin.read_manifest(None).await.map_err(anyhow::Error::from);
             match current.map(|manifest| manifest.map(|manifest| manifest.writer_epoch())) {
@@ -651,7 +677,7 @@ pub(crate) async fn retain(
             break;
         }
     }
-    source.end_retire(&candidates);
+    drop(retiring);
     result
 }
 
@@ -778,6 +804,10 @@ pub(crate) fn offline_source(
         received: Mutex::default(),
         #[cfg(test)]
         fail_opens: Default::default(),
+        #[cfg(test)]
+        fail_writer: Default::default(),
+        #[cfg(test)]
+        fail_writers: Default::default(),
     }))
 }
 
@@ -1033,7 +1063,8 @@ async fn bootstrap_op(source: &Source) -> Result<Option<BootstrapOp>> {
         .await
     {
         Ok(result) => Ok(Some(
-            serde_json::from_slice(&result.bytes().await?).context("invalid bootstrap claim")?,
+            serde_json::from_slice(&result.bytes().await?)
+                .map_err(|error| super::stored(format!("invalid bootstrap claim: {error}")))?,
         )),
         Err(slatedb::object_store::Error::NotFound { .. }) => Ok(None),
         Err(error) => Err(error.into()),
@@ -1580,6 +1611,10 @@ impl StateMachine {
             received: Mutex::default(),
             #[cfg(test)]
             fail_opens: Default::default(),
+            #[cfg(test)]
+            fail_writer: Default::default(),
+            #[cfg(test)]
+            fail_writers: Default::default(),
         });
         ensure!(
             state_root == source.state(),

@@ -212,6 +212,10 @@ struct ViewAck {
     /// binary sends none.
     #[serde(default)]
     coverage: Option<u64>,
+    /// The health of the member's shared writer. An earlier binary sends none, and the leader
+    /// then does not hand it the writer after a writer fault.
+    #[serde(default)]
+    writer: Option<crate::node::WriterReport>,
 }
 
 /// Receive the checkpoints that a shared-mode member pins. The leader keeps them for a time.
@@ -232,6 +236,7 @@ async fn view_ack(
         checkpoints: report.checkpoints,
         publish: report.publish,
         coverage: report.coverage,
+        writer: report.writer,
     };
     match state.events.try_send(event) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),

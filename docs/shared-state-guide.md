@@ -114,8 +114,8 @@ SlateDB starts a writer's clock at the `last_l0_clock_tick` of the manifest. A n
 until its local clock passes that tick. If the local clock is behind by more than
 `--max-clock-skew`, 5 s by default, the writer does not start. The member logs an error, sets
 `clock_alarm` in `/status`, sets `slatedb_etcd_shared_clock_skew_milliseconds`, and tries again
-each second. The cluster then accepts no writes until the skew drops or another member leads.
-Keep host clocks synchronized with NTP.
+with a backoff. After three refusals it hands the lead to a voter without a writer fault. Keep
+host clocks synchronized with NTP.
 
 ## Memory
 
@@ -224,12 +224,23 @@ place. Delete them after you check the converted cluster.
 | The leader stops with unflushed writes | The new leader materializes them from its overlay |
 | The old leader is partitioned | Its writer is fenced. It cannot change the manifest |
 | S3 is slow or down | New proposals fail at the overlay limit. Apply pauses at 2x |
+| One member cannot write to S3 | Its writer retries. The lead moves once to a healthy voter |
+| No member can write to S3 | Each writer retries after at most 30 s. Reads continue |
+| The writer cannot use the data | The writer halts and retries after at most 5 minutes |
+| A writer step hangs for 30 s | The lead moves, or the writer drops the step and opens again |
 | A checkpoint open fails | The member tries again with a backoff from 100 ms to 2 s |
 | An announcement is lost | The writer announces the checkpoint again with the same backoff |
 | A member reads a deleted SST | The read fails and can retry. Apply rebuilds from a newer base |
 | The new leader's clock is behind | The writer waits, or refuses above `--max-clock-skew` |
 | All members restart | Each member opens the newest checkpoint and replays its log |
 | The shared database is lost | All members lose state together. Restore from a backup |
+
+`/status` reports the writer health under `shared_state.writer.health`: the failures in a row,
+the time since the first one, the class and text of the last error, the fault mark, and the
+pending close of a failed writer. A marked member is not an automatic handoff target until it
+leads again and its writer publishes. Use MoveLeader to move the lead to it before that.
+`shared_state.writer.handoff` names the target of a handoff in flight and the voters that the
+incident tried.
 
 ## Metrics
 

@@ -658,14 +658,94 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
 | Leader crashes with unflushed batches | The new leader materializes them from its overlay |
 | Old leader is partitioned | It cannot commit L0 changes. Its uploads are orphans |
 | S3 is slow or down | New proposals fail at the soft limit. Apply pauses at the hard limit |
+| The leader's own path to S3 fails | Leadership moves once to a healthy voter, which publishes |
+| Writes fail for all members | The writer retries with a capped backoff. Reads continue |
+| Writes fail for a long time | Proposals fail at the soft limit. Apply pauses at the hard limit |
+| The writer finds data that it cannot use | The writer halts, and leadership moves once |
+| An invariant of the member fails | The member stops |
 | A member stops reporting its base | Its base can be deleted. It rebases on a missing SST |
 | A checkpoint open fails | The member keeps its base and tries the next checkpoint |
 | No writes for a long time | Checkpoints have no lifetime, so all bases stay valid |
 | No leader for a long time | No process deletes anything |
 | All members restart | Each member installs its base and replays its log |
 | Writer opens in reverse term order | The current leader is fenced, then it opens again |
-| New leader's clock is behind | The writer waits, or refuses over the skew limit |
+| New leader's clock is behind | The writer waits, or refuses and then hands over the lead |
 | The shared `Db` is lost or corrupted | All members lose state together. Restore from a backup |
+
+### Writer faults
+
+The leader classifies each writer error. The outer SlateDB error kind decides.
+
+- **Fence or lost manifest race:** the writer opens again at once.
+- **Storage fault:** SlateDB `Unavailable`, or an object store error from a call outside SlateDB.
+  The writer opens again after 1 s. The wait doubles up to 30 s.
+- **Data fault:** any other SlateDB kind, also a `Data` error with a missing object below it. A
+  stored object of the shared state that does not decode is a data fault too: an applied row, a
+  bootstrap claim, or a bootstrap marker. Each later leader can meet it. The writer halts, and
+  the wait starts at 30 s and doubles up to 5 minutes.
+- **Invariant error:** an error with no SlateDB or object store cause, about this member's own
+  state. The member's applied state is in doubt, so the member stops.
+
+Only a checkpoint that the writer creates and announces starts a new count of faults. It counts
+also when Raft drops the announcement, because the checkpoint proves the storage path. An idle
+cluster keeps its count until its next write publishes.
+
+A new writer fences the failed one. It starts at `last_l0_seq` and writes the overlay batches
+again, as after a leader change. A publication request and a Defragment republish stay until a
+checkpoint serves them. A `Db` that SlateDB closes after a failed background flush ends the
+writer also on an idle member. Apply, replies, and reads continue during the fault. A retention
+error only skips that round of retention.
+
+The task does not wait for the close of a failed writer. A close joins the SST uploads, so it
+runs in the background until its I/O ends. At most one such close is pending: a newer one
+aborts the older one, whose writer later epochs fenced. A shutdown waits for it at most 5 s. A
+backend whose calls hang forever with no error can keep old SlateDB workers, because the fence
+cannot end a pending put. Only a timeout at the object store call bounds them. S3 calls time out
+after 10 s.
+
+A clock over `--max-clock-skew` counts as a storage fault at once. The task does not wait for
+the close of that writer either.
+
+Due storage work that makes no durable progress for 30 s also counts. Each step of the writer
+task has its own timer: the read of the bootstrap marker and claim, the open, the first reads
+of the publisher, a flush, a checkpoint, and its read back. A step that ends restarts the timer
+for the next one. A failure or a restart stops the timer until the next try starts its I/O, so
+a long backoff is no stall. A fenced or racing open keeps the timer of the open across its
+retries until an open succeeds, because fences are no durable progress. One fence just before
+the limit can thus make the next try of that open stall early.
+
+Without a running step, the timer starts when a flush reaches its age limit, or when a manual
+checkpoint, a snapshot, or a Defragment requests a publication. A request keeps its wait until a
+publication covers it. A pass that covers no request keeps the wait, also one that finds no
+new checkpoint. A Defragment republish has its own wait, so a republish does not end the wait
+of a request. The check for a stranded checkpoint that could serve the request counts against
+it. After a failed check, the request retries at the backoff of the check. Each new writer
+starts the wait again, so it has a whole interval to reach the request. A buffered write before
+its age limit is not due. A pending snapshot restore is not a fault, because each member meets
+it.
+
+The leader hands its lead to another voter after three faults in a row, after one data fault,
+or after 30 s without durable progress. The target is the voter with the longest matched log
+and no writer fault mark. Its report must come from its current process, arrive after the start
+of the incident, and carry the leader's current Raft term. So a voter that stopped, or that led
+and failed in a term between, is not a target.
+
+A member sets its mark at each fault and clears it only when its own writer publishes again. It
+sends the age of the mark in each `ViewAck`. An earlier binary sends none and is never a target.
+A mark older than the leader's last publication is a last resort, because another writer
+published after it. The leader tries each voter once per incident, and only its own
+publication ends the incident. Raft ends a transfer that does not complete within an election
+timeout, and the handoff record ends with it. The leader then tries the next voter. If Raft
+still holds the handoff's own transfer after two election timeouts, the leader aborts it, so
+Raft takes proposals again. A MoveLeader transfer is never aborted.
+
+With no target left the leader keeps the lead. After a stall it drops the stalled step and
+opens the writer again, so the writer recovers within 30 s plus the backoff, also when the
+stalled I/O never returns. Other faults retry with the backoff.
+
+So a fault on one member's path moves the lead once. A fault of the whole backend moves it at
+most once per member. A marked member stays out of automatic handoffs until it leads again and
+its writer publishes. MoveLeader can still move the lead to it.
 
 ## Costs and trade-offs
 

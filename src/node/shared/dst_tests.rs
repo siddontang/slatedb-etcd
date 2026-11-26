@@ -47,10 +47,18 @@ impl Simulation {
         }
         let pins = self.nodes[&id].dst_pins();
         let coverage = self.process(id);
+        // An earlier binary sends no writer report.
+        let node = &self.nodes[&id];
+        let term = node.raw.raft.term;
+        let health = node
+            .writer
+            .as_ref()
+            .map(|writer| writer.health.report(term));
+        let health = coverage.and(health);
         self.nodes
             .get_mut(&leader)
             .unwrap()
-            .view_ack(id, pins, None, coverage);
+            .view_ack(id, pins, None, coverage, health);
     }
 
     /// The HTTP routes of a snapshot. A view snapshot above its row goes to its own route with
@@ -477,7 +485,7 @@ async fn a_follower_manual_checkpoint_completes_with_a_certified_base() {
     let pins = sim.nodes[&grouped].dst_pins();
     let coverage = sim.process(grouped);
     let node = sim.nodes.get_mut(&leader).unwrap();
-    node.view_ack(grouped, pins, Some(index), coverage);
+    node.view_ack(grouped, pins, Some(index), coverage, None);
     sim.settle(4).await;
     sim.finish_checkpoints(grouped);
     assert!(rx.try_recv().unwrap().is_ok());
@@ -1274,7 +1282,7 @@ async fn a_follower_manual_checkpoint_beside_an_earlier_binary_gets_a_row_checkp
     let pins = sim.nodes[&grouped].dst_pins();
     let coverage = sim.process(grouped);
     let node = sim.nodes.get_mut(&leader).unwrap();
-    node.view_ack(grouped, pins, Some(index), coverage);
+    node.view_ack(grouped, pins, Some(index), coverage, None);
     sim.settle(4).await;
     sim.finish_checkpoints(grouped);
     assert!(rx.try_recv().is_err());

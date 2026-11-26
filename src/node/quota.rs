@@ -698,22 +698,13 @@ impl Node {
         true
     }
 
-    /// Hand leadership to the voter with the longest matched log.
+    /// Hand leadership to the voter with the longest matched log. In shared mode a voter that
+    /// can take over the writer comes first. See `Node::rank_voters`.
     fn yield_leadership(&mut self) {
         if self.raw.raft.lead_transferee.is_some() {
             return;
         }
-        let id = self.options.id;
-        let target = self
-            .raw
-            .raft
-            .prs()
-            .iter()
-            .filter(|(&peer, _)| peer != id)
-            .filter(|(&peer, _)| self.raw.raft.prs().conf().voters().contains(peer))
-            .max_by_key(|(_, progress)| progress.matched)
-            .map(|(&peer, _)| peer);
-        if let Some(target) = target {
+        if let Some(target) = self.rank_voters() {
             tracing::warn!(
                 target,
                 "hand over leadership while apply waits for a snapshot"
