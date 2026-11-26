@@ -101,6 +101,17 @@ fn scan_bounds<'a>(firsts: impl IntoIterator<Item = &'a [u8]>, parts: usize) -> 
     bounds
 }
 
+/// The scan bounds of a live database: `scan_bounds` over the first keys of its compacted SSTs.
+fn live_bounds(db: &slatedb::Db, parts: usize) -> Vec<Vec<u8>> {
+    let manifest = db.manifest();
+    let firsts = manifest
+        .compacted()
+        .iter()
+        .flat_map(|run| run.sst_views())
+        .filter_map(|view| view.sst.info.first_entry.as_deref());
+    scan_bounds(firsts, parts)
+}
+
 /// Scan the ranges between consecutive `bounds` of one snapshot in parallel tasks, and return
 /// the rows of each range in order.
 async fn scan_parts_of(
@@ -164,13 +175,7 @@ impl KeyIndex {
         let started = std::time::Instant::now();
         let parts = match reads {
             StateView::Live(db) => {
-                let manifest = db.manifest();
-                let firsts = manifest
-                    .compacted()
-                    .iter()
-                    .flat_map(|run| run.sst_views())
-                    .filter_map(|view| view.sst.info.first_entry.as_deref());
-                let bounds = scan_bounds(firsts, scan_parts());
+                let bounds = live_bounds(db, scan_parts());
                 // One snapshot gives every part the same sequence.
                 scan_parts_of(db.snapshot()?, &bounds).await?
             }
@@ -690,6 +695,40 @@ mod tests {
             .unwrap();
         assert!(parts[1..4].iter().all(|part| !part.is_empty()));
         assert_eq!(parts.concat(), full);
+        db.close().await.unwrap();
+    }
+
+    /// The live load takes its split keys from the compacted SSTs of the manifest.
+    #[tokio::test]
+    async fn live_bounds_split_at_compacted_ssts() {
+        use slatedb::object_store::memory::InMemory;
+        let db = slatedb::Db::builder("db", Arc::new(InMemory::new()))
+            .with_settings(crate::state::slatedb_settings())
+            .build()
+            .await
+            .unwrap();
+        let memtable = slatedb::config::FlushOptions {
+            flush_type: slatedb::config::FlushType::MemTable,
+        };
+        // Enough L0 SSTs for the compactor to merge them into one sorted run. The smallest row
+        // key, the first key of the compacted SST, lies inside `etcd/current/`.
+        let boundary = [CURRENT, b"key/00100"].concat();
+        for flush in 0..8u32 {
+            for i in 100..200u32 {
+                let row_key = [CURRENT, format!("key/{i:05}").as_bytes()].concat();
+                db.put(&row_key, &flush.to_be_bytes()).await.unwrap();
+            }
+            db.flush_with_options(memtable.clone()).await.unwrap();
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        while db.manifest().compacted().is_empty() {
+            assert!(tokio::time::Instant::now() < deadline, "no compaction");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            live_bounds(&db, 2),
+            vec![CURRENT.to_vec(), boundary, CURRENT_END.to_vec()]
+        );
         db.close().await.unwrap();
     }
 

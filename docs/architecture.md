@@ -377,8 +377,10 @@ The HashKV row stores their CRC and length, and the Watch journal omits the valu
 
 The apply owner keeps an in-memory index of every current etcd key, like etcd's `treeIndex`.
 Each entry holds the create revision, modification revision, version, lease, and row length.
-Startup builds it with one scan of `etcd/current/`. The scan reads several SST blocks per
-request, and the ordered key set is built in bulk from the sorted rows.
+Startup builds it with one pass over the `etcd/current/` rows. On a live member the pass splits
+the prefix at the first keys of the compacted SSTs, up to one part per CPU (at most 8), and runs
+disjoint scans of one snapshot in parallel. Shared mode uses one scan. Each scan reads several SST
+blocks per request, and the ordered key set is built in bulk from the sorted rows.
 Every state write updates it after SlateDB accepts the batch.
 Snapshot installation, compaction, deletes, transactions, and lease revocation use this path.
 

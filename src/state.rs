@@ -257,9 +257,10 @@ pub(crate) fn slatedb_settings() -> Settings {
 /// each GC run lists the SSTs of the store.
 ///
 /// The checkpoint lifetime stays at SlateDB's default on every store. A read fails if it still
-/// iterates an input SST after the checkpoint expires and GC deletes it. Several reads scan once
-/// with one iterator: the index rebuild at open, a committed DeleteRange, HashKV, export and the
-/// usage count of an older directory. On a cold, busy volume such a scan can run for minutes.
+/// iterates an input SST after the checkpoint expires and GC deletes it. Several reads iterate for
+/// the whole of one long pass: the index rebuild at open (disjoint scans of one snapshot), a
+/// committed DeleteRange, HashKV, export and the usage count of an older directory. On a cold,
+/// busy volume such a pass can run for minutes.
 pub(crate) fn member_settings(local_disk: bool) -> Settings {
     let mut settings = slatedb_settings();
     if !local_disk {
