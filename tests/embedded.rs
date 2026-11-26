@@ -391,13 +391,17 @@ async fn cli_serves_no_fault_controls_without_the_flag() {
     );
     let http = reqwest::Client::new();
     let url = format!("http://{addr}");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while !matches!(http.get(format!("{url}/status")).send().await, Ok(r) if r.status().is_success())
-    {
-        assert!(member.0.try_wait().unwrap().is_none(), "member exited");
-        assert!(tokio::time::Instant::now() < deadline, "member not ready");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    // The deadline also covers a `/status` request that never gets an answer:
+    // the member binds its socket before it opens storage and serves HTTP.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !matches!(http.get(format!("{url}/status")).send().await, Ok(r) if r.status().is_success())
+        {
+            assert!(member.0.try_wait().unwrap().is_none(), "member exited");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("member not ready");
     let response = http
         .post(format!("{url}/debug/partition"))
         .json(&serde_json::json!({"blocked": []}))
