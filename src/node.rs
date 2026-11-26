@@ -30,6 +30,7 @@ mod forwarding;
 mod lease;
 mod log;
 mod maintenance;
+mod pause;
 mod proposal;
 pub use forwarding::ForwardView;
 pub(crate) use forwarding::LocalRead;
@@ -305,6 +306,8 @@ pub struct Node {
     held_puts: Option<quorum_put::HeldPuts>,
     /// The term of the entries in the last submitted PreparePuts job.
     prepare_term: u64,
+    /// True while the log above a held entry is past its alarm bound. See `pause`.
+    hold_alarm: bool,
     /// The last entry of a PreparePuts job that a storage error ended. No early reply runs
     /// until apply passes it, so the committed path applies those entries and retries.
     unprepared: u64,
@@ -747,6 +750,7 @@ impl Node {
             held_puts: None,
             prepare_term: 0,
             unprepared: 0,
+            hold_alarm: false,
             quorum_reply_index: 0,
             watch_waiters: Vec::new(),
             state: applied,
@@ -820,6 +824,7 @@ impl Node {
     fn tick(&mut self) -> Result<()> {
         self.tick_raft()?;
         self.retry_reads();
+        self.tick_apply_pause();
         self.expire_leases()?;
         self.publish_member()?;
         self.tick_shared()?;
@@ -1788,6 +1793,7 @@ impl Node {
             status["write_profile"] = crate::write_profile::snapshot();
         }
         status["quorum_reply_index"] = self.quorum_reply_index.into();
+        status["apply_paused"] = self.pause_status();
         status["quota"] = self.quota_status();
         status["members_row"] = self.members_status();
         if let (Some(writer), Some((base, applied, bytes))) = (&self.writer, self.state.view) {

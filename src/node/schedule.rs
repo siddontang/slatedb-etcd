@@ -151,17 +151,14 @@ impl Node {
     /// log cache moves its first index at staging, and Raft drops its unstable snapshot before
     /// the write ends, so each step needs its own index.
     pub(super) fn installing(&self) -> bool {
-        let store = self.raw.store();
-        let unstable = self.raw.raft.raft_log.unstable.snapshot.as_ref();
-        let accepted = unstable.map_or(0, |snapshot| snapshot.get_metadata().index);
-        let stored = store.staged_snapshot_index().max(store.snapshot_index());
         // Raft scans from its own applied index. `complete_apply` keeps that index at or above
         // `state.applied`, also for a waiting member that starts with Raft ahead. So Raft's
         // index is below a snapshot only when this one is, and the guard holds then.
-        accepted.max(stored) > self.state.applied
+        self.accepted_snapshot() > 0
     }
 
     pub(super) fn schedule_apply(&mut self) -> Result<()> {
+        self.preempt_paused_apply();
         if self.apply_busy {
             return self.pipeline_apply();
         }
@@ -245,8 +242,9 @@ impl Node {
             .apply_jobs
             .pop_front()
             .context("unexpected apply completion")?;
+        // A covering snapshot can end a job at its applied prefix. See `pause`.
         ensure!(
-            completed.applied == target,
+            completed.applied == target || completed.early && completed.applied < target,
             "apply completion has the wrong index"
         );
         ensure!(
@@ -327,8 +325,12 @@ impl Node {
             }
             Output::Unprepared(last) => self.unprepared = last,
             Output::Entries(replies) => {
+                // Raft takes the ConfState of a snapshot when it accepts it. A snapshot is above
+                // the commit index, so it covers each entry of these replies, and its ConfState
+                // holds or undoes each of their changes. Raft must not apply them again.
+                let superseded = self.installing();
                 for command in replies {
-                    if let Some(change) = &command.change {
+                    if let Some(change) = command.change.as_ref().filter(|_| !superseded) {
                         self.raw.apply_conf_change(change)?;
                         self.membership_checkpoint = self.state.applied;
                     }

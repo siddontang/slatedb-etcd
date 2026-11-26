@@ -4,6 +4,9 @@ use raft::eraftpb::Snapshot;
 
 #[path = "shared/apply_retry.rs"]
 mod retry;
+pub(super) use retry::Control;
+#[cfg(test)]
+pub(super) use retry::Paused;
 
 pub(super) const BATCH_ENTRIES: u64 = 32;
 /// Committed-entry jobs that may wait in the apply queue behind the running job.
@@ -284,6 +287,9 @@ pub(super) struct Completion {
     pub applied: u64,
     pub state: Option<AppliedState>,
     pub output: Output,
+    /// A covering snapshot ended the job before its last entry. `applied` is the end of the
+    /// applied prefix.
+    pub early: bool,
 }
 
 struct Executor {
@@ -293,8 +299,8 @@ struct Executor {
     inline_checkpoints: bool,
     /// Shared mode: the durable log that a rebase replays.
     log: Option<crate::storage::LogReader>,
-    /// True once the worker stops. A job that retries a failed read then ends.
-    stop: tokio::sync::watch::Receiver<bool>,
+    /// The stop and preemption of a job that waits on a storage error, and its pause report.
+    signals: retry::Signals,
 }
 
 impl Drop for Executor {
@@ -347,6 +353,7 @@ impl Executor {
         );
         let copy_state = changes_state || matches!(work.job, Job::Query(Query::Maintenance(..)));
         let previous_revision = self.state.revision;
+        let mut early = false;
         // A checkpoint that opened in the background becomes the base of the next view.
         if changes_state {
             self.state.switch_base();
@@ -357,8 +364,20 @@ impl Executor {
         let output = match work.job {
             #[cfg(test)]
             Job::Panic => panic!("injected apply worker panic"),
+            Job::Entries(entries)
+                if entries.first().is_some_and(|first| {
+                    self.signals.superseded(first.index, self.state.applied)
+                }) =>
+            {
+                // A job before this one ended early. The snapshot replaces these entries.
+                early = true;
+                Output::Entries(Vec::new())
+            }
             Job::Entries(entries) => {
-                Output::Entries(Box::pin(self.apply_retrying(entries, work.header)).await?)
+                let (replies, covered) =
+                    Box::pin(self.apply_retrying(entries, work.header)).await?;
+                early = covered;
+                Output::Entries(replies)
             }
             Job::PreparePuts { commands, term } => {
                 match self.prepare_or_skip(&commands, term, work.header).await? {
@@ -515,14 +534,15 @@ impl Executor {
             applied: self.state.applied,
             state,
             output,
+            early,
         })
     }
 }
 
 pub(super) struct Worker {
     database: Option<std::sync::Arc<slatedb::Db>>,
-    /// Tells a job that retries a failed read to end. See `Worker::shutdown`.
-    stop: tokio::sync::watch::Sender<bool>,
+    /// Ends or preempts a job that waits on a storage error, and reads its pause report.
+    pub control: Control,
     work: mpsc::Sender<Work>,
     completed: mpsc::Receiver<Result<Completion>>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
@@ -549,20 +569,20 @@ impl Worker {
         let (work, mut jobs) = mpsc::channel::<Work>(PIPELINE_DEPTH);
         let (done, completed) = mpsc::channel(PIPELINE_DEPTH);
         let database = state.database();
-        let (stop, stopping) = tokio::sync::watch::channel(false);
+        let (control, signals) = retry::signals();
         let mut executor = Executor {
             state,
             events,
             snapshot_task: None,
             inline_checkpoints: manual,
             log,
-            stop: stopping,
+            signals,
         };
         #[cfg(test)]
         if manual {
             return Self {
                 database,
-                stop,
+                control,
                 work,
                 completed,
                 task: None,
@@ -593,7 +613,7 @@ impl Worker {
         let task = tokio::spawn(worker);
         Self {
             database,
-            stop,
+            control,
             work,
             completed,
             task: Some(task),
@@ -603,7 +623,7 @@ impl Worker {
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
-        self.stop.send_replace(true);
+        self.control.stop();
         self.completed.close();
         self.work = mpsc::channel(1).0;
         if let Some(task) = self.task.take() {

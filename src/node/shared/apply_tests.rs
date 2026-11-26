@@ -260,7 +260,7 @@ async fn lose_a_checkpoint_object(lose: Lose) {
         snapshot_task: None,
         inline_checkpoints: true,
         log: Some(storage.reader()),
-        stop: tokio::sync::watch::channel(false).1,
+        signals: super::retry::signals().1,
     };
     if lose == Lose::Deleted {
         executor.state.admin.delete_checkpoint(id).await.unwrap();

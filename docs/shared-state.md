@@ -667,6 +667,11 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
 | Writes fail for a long time | Proposals fail at the soft limit. Apply pauses at the hard limit |
 | The writer finds data that it cannot use | The writer halts, and leadership moves once |
 | A client read meets a storage error | Only that request fails. See [Read faults](#read-faults) |
+| A client read meets a transient error | The request fails with `Unavailable` |
+| A client read meets corrupt data | The request fails with `DataLoss`. The counter goes up |
+| An apply read meets a transient error | Apply pauses and runs the entry again |
+| An apply read meets corrupt data | Apply holds on the entry. Earlier state stays readable |
+| All members hold on one corrupt shared row | Restore an earlier backup. Old state stays readable |
 | An invariant of the member fails | The member stops |
 | A member stops reporting its base | Its base can be deleted. It rebases on a missing SST |
 | A checkpoint open fails | The member keeps its base and tries the next checkpoint |
@@ -696,7 +701,25 @@ applied before the error, with their replies, membership changes, and lease comm
 the rest again after 100 ms, and the wait doubles up to 5 s. A missing object rebases the state
 at the applied index first. A shutdown ends the retry at once. A membership change takes effect
 only after its batch is stored. Base readers stop after the retries of the member database, so
-a read fails instead of waiting forever. Corrupt data and invariant errors still stop apply.
+a read fails instead of waiting forever. Only invariant errors stop the member.
+
+Corrupt stored data holds apply on its entry. The member logs an error, sets
+`slatedb_etcd_apply_held`, and reports the entry and the reason in `apply_paused` of `/status`.
+It checks the entry again every 30 s. It stays up and serves reads of its earlier state:
+
+- A linearizable read whose read index is above the applied index fails at once with
+  `Unavailable` and the reason of the hold.
+- A serializable read with no fence serves the last applied view. The local fast path stays
+  closed while an acknowledged early Put is ahead of apply, and a forwarded write still waits
+  for its revision on this member.
+
+A held follower asks its leader for a snapshot. The leader serves it with a base above the held
+entry, as for any snapshot request. When Raft accepts a snapshot that covers a waiting entry, the
+waiting job ends with the entries that it applied. Their replies go out once, and queued jobs
+below the snapshot are dropped. Raft already took the ConfState of the snapshot, so the
+membership changes of those entries do not reach Raft again. The install then skips the held
+entry. `slatedb_etcd_apply_held_entries` counts the log entries above the held entry. Above
+100,000 the member logs an alarm, because the log cannot shrink.
 
 A rebase, the adoption of an opened base, and a snapshot install load the new base and check
 it first: the Auth store, the leases, the counters, and the members row. Only then does the

@@ -160,8 +160,8 @@ async fn a_shutdown_ends_a_retrying_apply_at_once() {
     faults.set(0);
 }
 
-/// An error of the member's own invariants still stops apply. A storage error of a read and a
-/// missing object are the only errors that apply runs again.
+/// An error of the member's own invariants still stops apply. Only a storage error of a read
+/// and a missing object retry, and only corrupt stored data holds.
 #[tokio::test]
 async fn an_invariant_error_still_stops_apply() {
     let dir = tempfile::tempdir().unwrap();
@@ -185,7 +185,9 @@ async fn an_invariant_error_still_stops_apply() {
         fault: crate::mvcc::storage_fault::StorageFault::Corrupt,
         message: "short history key".into(),
     });
-    assert_eq!(retryable(&corrupt), None);
+    assert_eq!(retryable(&corrupt), Some(StorageFault::Corrupt));
+    let invariant = anyhow::anyhow!("the base checkpoint has no applied term");
+    assert_eq!(retryable(&invariant), None);
     worker.state_mut().close().await.unwrap();
 }
 
@@ -419,5 +421,105 @@ async fn a_failed_diagnostic_or_compaction_read_retries() {
     let step = RaftCommand::CompactStep { id: "10".into() };
     let completion = retried(&mut worker, &faults, vec![entry(10, step)]).await;
     assert_eq!(completion.applied, 10);
+    worker.state_mut().close().await.unwrap();
+}
+
+/// A Put entry with the reply ID `index`.
+fn put_entry(index: u64, key: &str) -> Entry {
+    let etcd = RaftCommand::Etcd {
+        id: index.to_string(),
+        origin: 1,
+        etcd: put(key),
+    };
+    entry(index, etcd)
+}
+
+/// A diagnostic Get of `key`.
+fn get_entry(index: u64, key: &str) -> Entry {
+    let get = RaftCommand::Diagnostic(crate::Command {
+        id: index.to_string(),
+        request: crate::Request {
+            operations: vec![crate::Operation::Get { key: key.into() }],
+        },
+    });
+    entry(index, get)
+}
+
+/// Wait until apply holds on `index`, and then preempt it with a snapshot through `covers`.
+fn preempt_when_held(worker: &Worker, index: u64, covers: u64) -> tokio::task::JoinHandle<()> {
+    let (preempt, mut paused) = worker.control.handles();
+    tokio::spawn(async move {
+        let held = paused.wait_for(|paused| {
+            paused
+                .as_ref()
+                .is_some_and(|paused| paused.held && paused.index == index)
+        });
+        tokio::time::timeout(Duration::from_secs(5), held)
+            .await
+            .expect("apply did not hold")
+            .unwrap();
+        // The hold checks the entry again and stays.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        preempt.send_replace(covers);
+    })
+}
+
+/// Corrupt stored data holds apply on its entry instead of stopping it. The hold reports the
+/// entry, and it checks the entry again. A snapshot that covers the entry ends the job with
+/// its applied prefix, whose reply goes out once. The queued job behind it is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrupt_data_holds_apply_until_a_snapshot_covers_it() {
+    let mut state = cold(Arc::new(InMemory::new())).await;
+    // The direct write takes one sequence number. A view pins the state at the applied index.
+    state.db().put(b"data/bad", b"\xff\xfe").await.unwrap();
+    state.applied += 1;
+    let (events, _) = mpsc::channel(8);
+    let mut worker = Worker::start(state, events, true, None);
+    worker
+        .submit(entries(vec![put_entry(6, "k9"), get_entry(7, "bad")]))
+        .unwrap();
+    worker.submit(entries(vec![put_entry(8, "k8")])).unwrap();
+    let preempt = preempt_when_held(&worker, 7, 9);
+    let held = worker.step().await.unwrap().unwrap();
+    preempt.await.unwrap();
+    assert!(held.early);
+    assert_eq!(held.applied, 6);
+    let Output::Entries(replies) = held.output else {
+        panic!("expected entries");
+    };
+    let ids: Vec<_> = replies.iter().map(|reply| reply.id.as_str()).collect();
+    assert_eq!(ids, ["6"]);
+    let dropped = worker.step().await.unwrap().unwrap();
+    assert!(dropped.early);
+    assert_eq!(dropped.applied, 6);
+    assert!(matches!(dropped.output, Output::Entries(replies) if replies.is_empty()));
+    assert_eq!(worker.control.paused(), None);
+    worker.state_mut().close().await.unwrap();
+}
+
+/// A stored members row that does not decode is corrupt data. A membership change holds on
+/// it instead of stopping apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_corrupt_members_row_holds_apply() {
+    let mut state = cold(Arc::new(InMemory::new())).await;
+    state
+        .db()
+        .put(crate::cluster::KEY, b"{not a members row")
+        .await
+        .unwrap();
+    state.applied += 1;
+    let (events, _) = mpsc::channel(8);
+    let mut worker = Worker::start(state, events, true, None);
+    let change = RaftCommand::Cluster {
+        id: "6".into(),
+        request: crate::cluster::Command::Remove(9),
+        credentials: Default::default(),
+    };
+    worker.submit(entries(vec![entry(6, change)])).unwrap();
+    let preempt = preempt_when_held(&worker, 6, 6);
+    let held = worker.step().await.unwrap().unwrap();
+    preempt.await.unwrap();
+    assert!(held.early);
+    assert_eq!(held.applied, 5);
     worker.state_mut().close().await.unwrap();
 }
