@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import rustfs_fixture
+
 spec = importlib.util.spec_from_file_location("benchmark", Path(__file__).with_name("benchmark-etcd.py"))
 benchmark = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(benchmark)
@@ -125,7 +127,8 @@ class BenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "report.json"
             output.write_text('{"passed": true, "complete": true}')
-            with patch("sys.argv", ["benchmark", "--output", str(output)]), \
+            # One member keeps local state, so the build is the first step that fails.
+            with patch("sys.argv", ["benchmark", "--members", "1", "--output", str(output)]), \
                  patch.object(benchmark.subprocess, "run",
                               side_effect=subprocess.CalledProcessError(1, "go")), \
                  patch.object(benchmark.subprocess, "check_output", return_value="test cpu"):
@@ -135,6 +138,30 @@ class BenchmarkTests(unittest.TestCase):
             self.assertFalse(report["passed"])
             self.assertFalse(report["complete"])
             self.assertEqual(report["samples"], [])
+
+    def run_failed_start(self, argv):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report.json"
+            output.write_text('{"passed": true, "complete": true}')
+            environment = {k: v for k, v in benchmark.os.environ.items()
+                           if k not in rustfs_fixture.STORE_ENV}
+            failure = RuntimeError("RustFS exited with status 1 before bucket creation")
+            with patch.dict(benchmark.os.environ, environment, clear=True), \
+                 patch("sys.argv", ["benchmark", *argv, "--output", str(output)]), \
+                 patch.object(rustfs_fixture, "local_rustfs", side_effect=failure) as start, \
+                 patch.object(benchmark.subprocess, "run",
+                              side_effect=subprocess.CalledProcessError(1, "go")), \
+                 patch.object(benchmark.subprocess, "check_output", return_value="test cpu"):
+                with self.assertRaises((RuntimeError, subprocess.CalledProcessError)):
+                    benchmark.main()
+            return json.loads(output.read_text()), start
+
+    def test_failed_rustfs_start_replaces_old_passed_report(self):
+        report, start = self.run_failed_start([])
+        start.assert_called_once()
+        self.assertFalse(report["passed"])
+        self.assertTrue(report["pending"])
 
 
 

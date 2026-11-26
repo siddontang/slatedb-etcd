@@ -1,12 +1,31 @@
 #!/usr/bin/env python3
-"""Check the RustFS fixture and its store settings."""
+"""Check the RustFS fixture, its store settings, and the reports of the launchers that use it."""
 
+import importlib.util
 from io import BytesIO
+import json
+import os
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError, URLError
 
 import rustfs_fixture as s3
+
+SCRIPTS = Path(__file__).resolve().parent
+
+
+def load(name):
+    spec = importlib.util.spec_from_file_location(name.replace("-", "_"), SCRIPTS / (name + ".py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def without_store():
+    """Return the environment without the settings of a reusable server."""
+    return {k: v for k, v in os.environ.items() if k not in s3.STORE_ENV}
 
 
 class BucketReadiness(unittest.TestCase):
@@ -88,6 +107,39 @@ class SharedStore(unittest.TestCase):
         self.assertIn("Content-MD5", calls[1][3])
         self.assertEqual(len(calls), 3)
 
+
+class StaleReports(unittest.TestCase):
+    """A failed RustFS start must replace an earlier passed report."""
+
+    def run_launcher(self, name, argv, module=None):
+        module = module or load(name)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report.json"
+            binary = Path(directory) / "slatedb-etcd"
+            binary.write_bytes(b"binary")
+            output.write_text('{"passed": true, "complete": true}')
+            argv = [name, *[str(arg).format(output=output, binary=binary) for arg in argv]]
+            failure = RuntimeError("RustFS exited with status 1 before bucket creation")
+            with patch.dict(os.environ, without_store(), clear=True), patch("sys.argv", argv), \
+                    patch.object(s3, "local_rustfs", side_effect=failure), \
+                    patch.object(tempfile, "mkdtemp", return_value=directory):
+                with self.assertRaises(RuntimeError):
+                    module.main()
+            report = json.loads(output.read_text())
+            self.assertFalse(report["passed"], name)
+            self.assertTrue(report["pending"], name)
+
+    def test_launchers_write_a_failed_report_before_rustfs_starts(self):
+        compat = load("check-compat")
+        compat.subprocess = Mock(check_output=Mock(return_value="go version test"))
+        self.run_launcher("check-compat", ["--binary", "{binary}", "--output", "{output}"],
+                          module=compat)
+        self.run_launcher("check-robustness", ["--binary", "{binary}", "--output", "{output}"])
+        self.run_launcher("harness", ["bench", "--binary", "{binary}", "--output", "{output}"])
+        check = load("check-s3")
+        check.local_rustfs = Mock(side_effect=RuntimeError("RustFS exited"))
+        self.run_launcher("check-s3", ["--binary", "{binary}", "--output", "{output}"],
+                          module=check)
 
 
 if __name__ == "__main__":

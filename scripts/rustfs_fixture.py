@@ -32,6 +32,8 @@ from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 import zipfile
 
+from reporting import write_pending
+
 ROOT = Path(__file__).resolve().parents[1]
 # The server environment that `shared_store` exports, and that nested runners reuse.
 STORE_ENV = ("SLATEDB_S3_TEST_ENDPOINT", "SLATEDB_S3_TEST_BUCKET", "AWS_ACCESS_KEY_ID",
@@ -179,13 +181,18 @@ def local_rustfs():
 
 
 @contextmanager
-def shared_store():
+def shared_store(report=None, value=None):
     """Supply one RustFS server to the clusters of several members in this process and its children.
 
     If the environment already names a server, for example from an outer runner, use that server.
     Otherwise start one and export its settings to `os.environ` until the context ends. Yield the
     store description for reports.
+
+    With a `report` path, first replace that report with the failed `value`, so a failed start
+    leaves no earlier passed report.
     """
+    if report is not None:
+        write_pending(report, value or {})
     if all(os.environ.get(name) for name in STORE_ENV):
         yield {"name": "RustFS", "version": VERSION, "reused": True}
         return

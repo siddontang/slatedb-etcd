@@ -47,8 +47,9 @@ def main():
         "log": str(log),
         "tests": [],
     }
-    # Clusters of several members run in shared state mode on one RustFS server.
-    with shared_store() as store:
+    # Clusters of several members run in shared state mode on one RustFS server. A failed start
+    # must not leave an earlier passed report.
+    with shared_store(args.output, report) as store:
         report["object_store"] = store
         process = subprocess.Popen(
             command, cwd=root / "tests" / args.suite,

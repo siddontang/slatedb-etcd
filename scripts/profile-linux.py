@@ -117,7 +117,7 @@ def main():
     args.s3_bucket, args.s3_endpoint, args.s3_allow_http = None, None, False
     args.members, args.rustfs = 3, False
     # Three service members run in shared state mode on RustFS.
-    with benchmark.object_store(args, [args.backend]) as store:
+    with benchmark.object_store(args, [args.backend], report_path, report) as store:
         report["object_store"] = store
         sample = benchmark.run_sample(
             args, tools, binary, args.backend, args.concurrency, args.read_percent, 0,

@@ -173,6 +173,8 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     revision = json.loads(INVENTORY.read_text())["revision"]
     results = []
+    # Replace an earlier summary before RustFS starts, because the start can fail.
+    (args.output / "summary.json").write_text("[]\n")
     # Several service members run in shared state mode. All cases use one RustFS server.
     with shared_store() if args.members > 1 else nullcontext():
         for case in selected:

@@ -17,7 +17,7 @@ import threading
 import time
 import urllib.request
 
-from reporting import write_report
+from reporting import write_pending, write_report
 from rustfs_fixture import delete_prefix, shared_args, shared_store, unique_prefix
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -320,22 +320,26 @@ def main():
         parser.error("--rustfs supplies its own bucket, endpoint, and HTTP settings")
     if args.rustfs and kinds == ["etcd"]:
         parser.error("--rustfs requires a service or baseline backend")
-    with object_store(args, kinds) as store:
-        benchmark(args, kinds, store)
+    report = new_report(args, kinds)
+    # Replace an earlier report before RustFS starts or a build runs. Either can fail.
+    with object_store(args, kinds, args.output, report) as store:
+        benchmark(args, kinds, store, report)
 
 
 @contextmanager
-def object_store(args, kinds):
+def object_store(args, kinds, path, report):
     """Start RustFS for `--rustfs`, and for service clusters of several members without a bucket.
 
-    Several service members run in shared state mode, as production runs on S3. Yield the store
-    description, or None for local state.
+    Several service members run in shared state mode, as production runs on S3. First replace the
+    report at `path` with the failed `report`. Yield the store description, or None for
+    local state.
     """
     several = args.members > 1 and any(kind != "etcd" for kind in kinds)
     if not args.rustfs and (args.s3_bucket or not several):
+        write_pending(path, report)
         yield None
         return
-    with shared_store() as store:
+    with shared_store(path, report) as store:
         args.s3_bucket = os.environ["SLATEDB_S3_TEST_BUCKET"]
         args.s3_endpoint = os.environ["SLATEDB_S3_TEST_ENDPOINT"]
         args.s3_allow_http = True
@@ -344,10 +348,10 @@ def object_store(args, kinds):
         yield store
 
 
-def benchmark(args, kinds, store):
+def new_report(args, kinds):
     cases = workload_cases(kinds, args.concurrency, args.read_percent, args.baseline_concurrency)
     expected = len(cases)*args.repeat
-    report = {"schema_version": 2, "passed": False, "complete": False, "samples": [],
+    return {"schema_version": 2, "passed": False, "complete": False, "samples": [],
               "created_at": datetime.now(timezone.utc).isoformat(), "expected_samples": expected,
               "platform": platform.system(), "architecture": platform.machine(), "logical_cpus": os.cpu_count(),
               "members": args.members, "target_ops_per_second": args.rate,
@@ -363,6 +367,12 @@ def benchmark(args, kinds, store):
               "resource_phases": "CPU deltas and peak RSS cover only the measured phase; retained preload memory remains",
               "limits": "bounded concurrency; warm keys; host page cache is not cleared; RSS is not unique physical memory; "
                         "ps CPU precision and controller barriers affect short samples; no capacity or cross-AZ claim"}
+
+
+def benchmark(args, kinds, store, report):
+    cases = workload_cases(kinds, args.concurrency, args.read_percent, args.baseline_concurrency)
+    expected = report["expected_samples"]
+    report["state_backend"] = "s3" if args.s3_bucket else "local"
     if store:
         report["object_store"] = store
     report["host_memory_bytes"] = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")

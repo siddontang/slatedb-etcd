@@ -232,6 +232,9 @@ def main():
         if not cases:
             parser.error("No Go benchmark package matched " + args.package)
     args.output.mkdir(parents=True, exist_ok=True)
+    # Replace an earlier summary before RustFS starts, because the start can fail.
+    label = "examples" if args.suite == "examples" else f"{args.suite}-{args.shard_index}"
+    (args.output / f"{args.target}-{label}-summary.jsonl").write_text("")
     # Service clusters of several members run in shared state mode on one RustFS server.
     with shared_store() if args.target == "service" else nullcontext():
         run_suite(source, cases, args, process_suite, required)

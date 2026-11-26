@@ -31,8 +31,9 @@ def main():
     report = {"created_at": datetime.now(timezone.utc).isoformat(), "passed": True,
               "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
               "jepsen_requested": args.jepsen, "runs": []}
-    # All seeds run their clusters of three members on one RustFS server.
-    with shared_store():
+    # All seeds run their clusters of three members on one RustFS server. A failed start must
+    # not leave an earlier passed report.
+    with shared_store(args.output, report):
         check_seeds(args, seeds, binary, directory, report)
     print("Report:", args.output)
     raise SystemExit(0 if report["passed"] else 1)

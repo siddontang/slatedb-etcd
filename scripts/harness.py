@@ -370,9 +370,10 @@ def main():
         # The removal of replicated mode must replace these checks.
         run_cluster(args, root, extra, None)
         return
-    # The three benchmark members run in shared state mode on one RustFS server.
+    # The three benchmark members run in shared state mode on one RustFS server. A failed start
+    # must not leave an earlier passed report.
     prefix = unique_prefix("harness")
-    with shared_store() as store:
+    with shared_store(args.output or root / "report.json", {"mode": args.mode}) as store:
         run_cluster(args, root, extra + shared_args(prefix), store)
         # The run directory stays for the logs. A failed run raises above and keeps its objects.
         if os.environ.get("SLATEDB_KEEP_DATA") != "1":
