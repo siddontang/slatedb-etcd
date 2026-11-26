@@ -19,7 +19,6 @@ mod range;
 #[cfg(test)]
 pub(crate) use put::DIRECT_TXNS;
 pub(crate) use put::{batchable_txn, prepare_put, prepare_txn_puts, CurrentView};
-pub(crate) use range::{Budget, TOO_LARGE};
 
 pub(crate) const CURRENT: &[u8] = b"etcd/current/";
 pub(crate) const HISTORY: &[u8] = b"etcd/history/";
@@ -355,8 +354,8 @@ struct View<'a, R> {
     leases: &'a BTreeMap<i64, crate::lease::LeaseRecord>,
     /// Metadata of the live applied rows. Pinned read views have no index.
     index: Option<&'a crate::state::key_index::KeyIndex>,
-    /// Byte budgets of a client read. Apply-side views are unbounded.
-    budget: range::Budget,
+    /// Bytes of rows a streaming Range may materialize. `None` means unbounded.
+    row_budget: Option<usize>,
     /// Current keys at the pinned snapshot. Live views count rows by scanning.
     keys: Option<&'a crate::state::key_index::KeyPin>,
 }
@@ -928,7 +927,32 @@ pub async fn read(
         request,
         leases,
         None,
-        Budget::default(),
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn read_snapshot(
+    db: &impl StateRead,
+    rows: &crate::state::rows::RowCache,
+    revision: i64,
+    compact_revision: i64,
+    request: &RequestOp,
+    leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
+    keys: &crate::state::key_index::KeyPin,
+) -> KvResult<ResponseOp> {
+    read_from(
+        ReadDb::Pinned {
+            db,
+            rows,
+            seq: keys.seq(),
+        },
+        revision,
+        compact_revision,
+        request,
+        leases,
+        Some(keys),
+        None,
     )
     .await
 }
@@ -961,10 +985,9 @@ pub(super) fn row_bytes(kv: &KeyValue) -> usize {
     std::mem::size_of::<KeyValue>() + kv.key.len() + kv.value.len()
 }
 
-/// Read from a pinned snapshot within `budget`.
-/// `None` means the rows exceed `budget.rows`. The caller can repeat the read on the same
-/// snapshot without a row budget and get the same result. A response over `budget.response`
-/// fails with `TOO_LARGE`.
+/// Read a streaming Range from a pinned snapshot within `budget` bytes of rows.
+/// `None` means the rows exceed the budget. The caller can repeat the read on the same snapshot
+/// without a budget and get the same result.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_snapshot_within(
     db: &impl StateRead,
@@ -974,7 +997,7 @@ pub(crate) async fn read_snapshot_within(
     request: &RequestOp,
     leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
     keys: &crate::state::key_index::KeyPin,
-    budget: Budget,
+    budget: usize,
 ) -> Option<KvResult<ResponseOp>> {
     let result = read_from(
         ReadDb::Pinned {
@@ -987,7 +1010,7 @@ pub(crate) async fn read_snapshot_within(
         request,
         leases,
         Some(keys),
-        budget,
+        Some(budget),
     )
     .await;
     match result {
@@ -1008,7 +1031,7 @@ async fn read_from<'a, R: StateRead>(
     request: &RequestOp,
     leases: &'a BTreeMap<i64, crate::lease::LeaseRecord>,
     keys: Option<&'a crate::state::key_index::KeyPin>,
-    budget: Budget,
+    row_budget: Option<usize>,
 ) -> KvResult<ResponseOp> {
     validate(request)?;
     if !read_only(request, false) {
@@ -1024,7 +1047,7 @@ async fn read_from<'a, R: StateRead>(
         prev_revisions: vec![],
         leases,
         index: None,
-        budget,
+        row_budget,
         keys,
     };
     if let Some(Op::RequestRange(range)) = &request.request {
@@ -1113,7 +1136,7 @@ async fn prepare_view(
         prev_revisions: vec![],
         leases,
         index,
-        budget: Budget::default(),
+        row_budget: None,
         keys: None,
     };
     let plan = view.plan(request, false).await?;
@@ -1252,7 +1275,7 @@ pub(crate) async fn revoke_keys(
         prev_revisions: vec![],
         leases,
         index: None,
-        budget: Budget::default(),
+        row_budget: None,
         keys: None,
     };
     for key in lease_keys(db, index, id).await? {

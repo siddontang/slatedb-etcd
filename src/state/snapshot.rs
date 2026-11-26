@@ -234,7 +234,6 @@ impl StateMachine {
         next.metrics = self.metrics.clone();
         // The copied state supplies the cluster quota, if any.
         next.set_quota_flag(self.quota_flag());
-        next.max_response_bytes = self.max_response_bytes;
         next.write_batches = self.write_batches;
         next.row_marker = self.row_marker.take();
         next.watch_capture = self.watch_capture.take();

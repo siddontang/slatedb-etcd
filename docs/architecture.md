@@ -226,7 +226,6 @@ Later apply and snapshot installation cannot change the selected view.
 Four read jobs can run, with at most 16 point reads per job.
 Up to three current key-ordered Range scans can run together with a 4 MiB row budget each.
 A scan over budget, historical reads, sorted or filtered Ranges, and transactions run alone.
-`--max-response-bytes` optionally caps the encoded rows of a read. See [internals](internals.md).
 Wide reads start in queue order. Current point reads can pass queued wide reads.
 The queue holds at most 64 requests. Each running job has a five-second deadline.
 Shutdown stops these jobs before closing the state database.

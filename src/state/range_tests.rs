@@ -1,5 +1,5 @@
 //! Range assembly against a model of every version, across sort orders, limits, filters,
-//! revisions, and the response byte cap.
+//! and revisions.
 
 use super::*;
 use crate::proto::etcdserverpb::request_op::Request as Op;
@@ -212,92 +212,4 @@ async fn ranges_match_the_collected_model() {
         drop(view);
         state.close().await.unwrap();
     }
-}
-
-#[tokio::test]
-async fn response_cap_bounds_kept_rows() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
-    // Ten rows of about 1 KiB; the cap holds about three of them.
-    for index in 1..=10u64 {
-        let put = RequestOp {
-            request: Some(Op::RequestPut(PutRequest {
-                key: format!("k{index:02}").into_bytes(),
-                value: vec![b'v'; 1000],
-                ..Default::default()
-            })),
-        };
-        state.apply_etcd(index, &put).await.unwrap().result.unwrap();
-    }
-    state.max_response_bytes = Some(3500);
-    let view = state.read_view().unwrap();
-    let all = |revision, sort_order, sort_target, limit| RangeRequest {
-        key: b"k".to_vec(),
-        range_end: b"l".to_vec(),
-        revision,
-        sort_order,
-        sort_target,
-        limit,
-        ..Default::default()
-    };
-    for revision in [0, 11] {
-        for (sort_order, sort_target) in [(0, 0), (2, 0), (1, 3), (2, 4)] {
-            // The whole interval exceeds the cap.
-            let error = read_range(&view, &all(revision, sort_order, sort_target, 0))
-                .await
-                .unwrap_err();
-            assert_eq!(error.code, tonic::Code::ResourceExhausted as i32);
-            assert_eq!(error.message, crate::mvcc::TOO_LARGE);
-            // A limit keeps only its rows, so the read fits.
-            let reply = read_range(&view, &all(revision, sort_order, sort_target, 3))
-                .await
-                .unwrap();
-            assert_eq!((reply.kvs.len(), reply.more, reply.count), (3, true, 10));
-            // Counts and keys read no values, so they fit.
-            let mut count = all(revision, sort_order, sort_target, 0);
-            count.count_only = true;
-            assert_eq!(read_range(&view, &count).await.unwrap().count, 10);
-            if sort_target != 4 {
-                let mut keys = all(revision, sort_order, sort_target, 0);
-                keys.keys_only = true;
-                assert_eq!(read_range(&view, &keys).await.unwrap().kvs.len(), 10);
-            }
-        }
-    }
-    assert_eq!(state.metrics.too_large_reads.get(), 8);
-    // A transaction counts the rows of all its Ranges together.
-    let two = RequestOp {
-        request: Some(Op::RequestTxn(TxnRequest {
-            success: vec![range_op(all(0, 0, 0, 2)), range_op(all(0, 0, 0, 2))],
-            ..Default::default()
-        })),
-    };
-    let error = view.read(&two, None).await.unwrap().result.unwrap_err();
-    assert_eq!(error.message, crate::mvcc::TOO_LARGE);
-    assert_eq!(state.metrics.too_large_reads.get(), 9);
-    // Apply-side reads never use the member-local cap: a write transaction returns every row.
-    let write = RequestOp {
-        request: Some(Op::RequestTxn(TxnRequest {
-            success: vec![
-                range_op(all(0, 0, 0, 0)),
-                RequestOp {
-                    request: Some(Op::RequestPut(PutRequest {
-                        key: b"z".to_vec(),
-                        ..Default::default()
-                    })),
-                },
-            ],
-            ..Default::default()
-        })),
-    };
-    let response = state.apply_etcd(11, &write).await.unwrap().result.unwrap();
-    let Some(Resp::ResponseTxn(txn)) = response.response else {
-        panic!("expected txn");
-    };
-    let Some(Resp::ResponseRange(range)) = &txn.responses[0].response else {
-        panic!("expected range");
-    };
-    assert_eq!(range.kvs.len(), 10);
-    drop(view);
-    state.close().await.unwrap();
 }

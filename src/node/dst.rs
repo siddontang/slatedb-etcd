@@ -333,7 +333,6 @@ impl Simulation {
                 quota_bytes: flag,
                 quota_reassert: false,
                 quota_warning_fraction: 0.0,
-                max_response_bytes: None,
                 auto_compaction: None,
                 id,
                 cluster_id: "dst".into(),

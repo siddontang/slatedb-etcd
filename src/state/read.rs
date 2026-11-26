@@ -16,8 +16,6 @@ pub(crate) struct ReadView {
     /// Shared mode: the longest time that one read may pin the base. Each read starts its own
     /// deadline, so an old view stays usable for new reads.
     pin_max: Option<std::time::Duration>,
-    /// Encoded bytes of rows one read response may keep. `None` means unbounded.
-    max_response_bytes: Option<usize>,
 }
 
 impl StateMachine {
@@ -33,7 +31,6 @@ impl StateMachine {
             leases: self.leases.clone(),
             keys: self.key_index.pin(self.applied),
             pin_max: self.shared.as_ref().map(|shared| shared.pin_max),
-            max_response_bytes: self.max_response_bytes,
         }))
     }
 }
@@ -63,8 +60,6 @@ impl ReadView {
 
     /// Read with an optional budget for materialized Range rows.
     /// `Ok(None)` means the rows exceed `budget`; the same read without a budget returns the result.
-    /// With `--max-response-bytes`, a read keeps at most that many encoded rows or fails with
-    /// `TOO_LARGE`.
     pub async fn read_within(
         &self,
         request: &RequestOp,
@@ -82,27 +77,35 @@ impl ReadView {
             Some(crate::proto::etcdserverpb::request_op::Request::RequestRange(_))
         )
         .then(std::time::Instant::now);
-        let budget = mvcc::Budget {
-            rows: budget,
-            response: self.max_response_bytes,
+        let result = match budget {
+            Some(budget) => match mvcc::read_snapshot_within(
+                &state,
+                &self.rows,
+                self.revision,
+                self.compact_revision,
+                request,
+                &self.leases,
+                &self.keys,
+                budget,
+            )
+            .await
+            {
+                Some(result) => result,
+                None => return Ok(None),
+            },
+            None => {
+                mvcc::read_snapshot(
+                    &state,
+                    &self.rows,
+                    self.revision,
+                    self.compact_revision,
+                    request,
+                    &self.leases,
+                    &self.keys,
+                )
+                .await
+            }
         };
-        let Some(result) = mvcc::read_snapshot_within(
-            &state,
-            &self.rows,
-            self.revision,
-            self.compact_revision,
-            request,
-            &self.leases,
-            &self.keys,
-            budget,
-        )
-        .await
-        else {
-            return Ok(None);
-        };
-        if matches!(&result, Err(error) if error.message == mvcc::TOO_LARGE) {
-            self.metrics.too_large_reads.inc();
-        }
         if let Some(start) = start {
             let histogram = if result.is_ok() {
                 &self.metrics.range_ok

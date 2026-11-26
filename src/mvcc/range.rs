@@ -1,4 +1,4 @@
-//! Assemble Range responses from key-ordered row sources under the read budgets.
+//! Assemble Range responses from key-ordered row sources.
 //!
 //! Every source yields candidate rows in key order: one point row, the overlay rows of a
 //! write transaction, a current-row scan, or a history scan that keeps the newest version of
@@ -10,55 +10,6 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use super::*;
-
-/// The error of a read whose kept rows exceed `--max-response-bytes`.
-pub(crate) const TOO_LARGE: &str = "etcdserver: range response is too large";
-
-/// Byte budgets of one read. `None` means unbounded. Apply-side views have no budget, so
-/// write results never depend on member-local configuration.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Budget {
-    /// Bytes of rows a shared streaming scan may materialize before it runs again alone.
-    pub rows: Option<usize>,
-    /// Encoded bytes of kept rows across the whole response, including transaction children.
-    pub response: Option<usize>,
-}
-
-impl Budget {
-    fn take(&mut self, kv: &KeyValue) -> KvResult<()> {
-        if let Some(rows) = &mut self.rows {
-            *rows = rows.checked_sub(row_bytes(kv)).ok_or_else(over_budget)?;
-        }
-        if let Some(response) = &mut self.response {
-            *response = response
-                .checked_sub(response_bytes(kv))
-                .ok_or_else(too_large)?;
-        }
-        Ok(())
-    }
-
-    fn give_back(&mut self, kv: &KeyValue) {
-        if let Some(rows) = &mut self.rows {
-            *rows += row_bytes(kv);
-        }
-        if let Some(response) = &mut self.response {
-            *response += response_bytes(kv);
-        }
-    }
-}
-
-pub(crate) fn too_large() -> KvError {
-    KvError {
-        code: Code::ResourceExhausted as i32,
-        message: TOO_LARGE.into(),
-    }
-}
-
-/// Encoded bytes of one `kvs` entry of a RangeResponse: tag, length, and message.
-fn response_bytes(kv: &KeyValue) -> usize {
-    let len = kv.encoded_len();
-    1 + prost::length_delimiter_len(len) + len
-}
 
 /// The fields of `mvccpb.KeyValue` without its value bytes.
 #[derive(Clone, PartialEq, Message)]
@@ -135,7 +86,7 @@ impl Candidate {
         match (self, value) {
             (Self::Decoded(kv), true) => Ok(kv),
             (Self::Decoded(mut kv), false) => {
-                kv.value.clear();
+                kv.value = vec![];
                 Ok(kv)
             }
             (Self::Current(_, Some(meta)), false) | (Self::History(_, meta), false) => Ok(meta),
@@ -201,7 +152,9 @@ impl Eq for Ranked {}
 /// Collect the response rows of one Range from candidates in key order.
 pub(super) struct Assembly<'r> {
     r: &'r RangeRequest,
-    budget: Budget,
+    /// Bytes of key-ordered rows a shared streaming scan may keep. Only streaming Ranges run
+    /// in the shared slots, so other sort orders never carry a budget.
+    budget: Option<usize>,
     /// Candidates before filters, as etcd counts them.
     count: i64,
     /// Candidates that pass the revision filters.
@@ -213,7 +166,7 @@ pub(super) struct Assembly<'r> {
 }
 
 impl<'r> Assembly<'r> {
-    fn new(r: &'r RangeRequest, budget: Budget) -> Self {
+    fn new(r: &'r RangeRequest, budget: Option<usize>) -> Self {
         Self {
             r,
             budget,
@@ -228,6 +181,11 @@ impl<'r> Assembly<'r> {
     /// A limit of `k` keeps `k` rows. Zero keeps every row.
     fn keep(&self) -> Option<usize> {
         (self.r.limit > 0).then(|| usize::try_from(self.r.limit).unwrap_or(usize::MAX))
+    }
+
+    /// The rows can be complete before the last candidate: the source needs a separate count.
+    fn can_stop(&self) -> bool {
+        self.r.count_only || (self.key_order && self.keep().is_some())
     }
 
     /// Later candidates can change only the count.
@@ -261,7 +219,9 @@ impl<'r> Assembly<'r> {
                 return Ok(());
             }
             let kv = candidate.into_kv(!self.r.keys_only)?;
-            self.budget.take(&kv)?;
+            if let Some(budget) = &mut self.budget {
+                *budget = budget.checked_sub(row_bytes(&kv)).ok_or_else(over_budget)?;
+            }
             self.kvs.push(kv);
             return Ok(());
         }
@@ -281,10 +241,8 @@ impl<'r> Assembly<'r> {
             if order(&kv, worst, target, descending).is_ge() {
                 return Ok(());
             }
-            let worst = self.heap.pop().unwrap();
-            self.budget.give_back(&worst.kv);
+            self.heap.pop();
         }
-        self.budget.take(&kv)?;
         self.heap.push(Ranked {
             kv,
             target,
@@ -298,7 +256,7 @@ impl<'r> Assembly<'r> {
         !self.r.count_only && self.keep().is_some_and(|k| self.matched > k as i64)
     }
 
-    fn finish(self, revision: i64) -> (RangeResponse, Budget) {
+    fn finish(self, revision: i64) -> RangeResponse {
         let more = self.more();
         let mut kvs = if self.key_order {
             self.kvs
@@ -310,29 +268,28 @@ impl<'r> Assembly<'r> {
                 .collect()
         };
         if self.r.keys_only {
+            // Release the sort values instead of keeping their capacity.
             for kv in &mut kvs {
-                kv.value.clear();
+                kv.value = vec![];
             }
         }
-        let response = RangeResponse {
+        RangeResponse {
             header: header(revision),
             kvs,
             more,
             count: self.count,
-        };
-        (response, self.budget)
+        }
     }
 }
 
 impl<R: StateRead> View<'_, R> {
-    pub(super) async fn range(&mut self, r: &RangeRequest) -> KvResult<RangeResponse> {
-        let mut out = Assembly::new(r, self.budget);
+    pub(super) async fn range(&self, r: &RangeRequest) -> KvResult<RangeResponse> {
+        let mut out = Assembly::new(r, self.row_budget);
         let total = self.offer_rows(r, &mut out).await?;
-        let (mut response, budget) = out.finish(self.current_revision());
+        let mut response = out.finish(self.current_revision());
         if let Some(total) = total {
             response.count = total;
         }
-        self.budget = budget;
         Ok(response)
     }
 
@@ -369,7 +326,7 @@ impl<R: StateRead> View<'_, R> {
                     }
                     // Debug builds also read the history rows and check the result against them.
                     if cfg!(debug_assertions) {
-                        let mut history = Assembly::new(r, Budget::default());
+                        let mut history = Assembly::new(r, None);
                         self.history_range(&r.key, &r.range_end, r.revision, &mut history)
                             .await?;
                         let journal = (&out.kvs, count, out.more());
@@ -399,9 +356,14 @@ impl<R: StateRead> View<'_, R> {
         if bounds.is_empty() {
             return Ok(None);
         }
-        // The key order of a pinned view holds the count, so the scan stops once the rows are
-        // complete. Debug builds scan the whole interval and check the count against the rows.
-        let total = self.keys.map(|keys| keys.count(&r.key, &r.range_end));
+        // The key order of a pinned view holds the count, so a read that can stop early stops
+        // once the rows are complete. Other reads scan the interval anyway and count it there,
+        // without holding the key order lock. Debug builds scan the whole interval and check the
+        // count against the rows.
+        let total = self
+            .keys
+            .filter(|_| out.can_stop())
+            .map(|keys| keys.count(&r.key, &r.range_end));
         let full_scan = total.is_none() || cfg!(debug_assertions);
         if total.is_some() && r.count_only && !full_scan {
             return Ok(total);

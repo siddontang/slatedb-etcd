@@ -454,7 +454,7 @@ async fn compares(
         prev_revisions: vec![],
         leases,
         index: Some(current.index),
-        budget: super::Budget::default(),
+        row_budget: None,
         // Compares read single keys from the live overlay, never a pinned key order.
         keys: None,
     };

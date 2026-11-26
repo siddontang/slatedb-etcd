@@ -190,12 +190,6 @@ struct Args {
     /// Quota usage fraction that sets the early-warning gauge and log. Zero disables it.
     #[arg(long, default_value_t = slatedb_etcd::server::DEFAULT_QUOTA_WARNING_FRACTION)]
     quota_warning_fraction: f64,
-    /// Encoded row bytes that one Range or read-only Txn response may return. Larger reads fail
-    /// with ResourceExhausted before the member holds the whole result. Zero, the default, sets
-    /// no limit, as in etcd.
-    #[arg(long, default_value_t = 0,
-          value_parser = clap::value_parser!(u64).range(0..=i32::MAX as u64))]
-    max_response_bytes: u64,
     /// Automatic compaction mode: periodic keeps a duration, revision keeps a revision count.
     #[arg(long, value_enum, default_value = "periodic")]
     auto_compaction_mode: slatedb_etcd::compactor::Mode,
@@ -362,8 +356,6 @@ async fn run(args: Args) -> Result<()> {
         quota_bytes: args.quota_backend_bytes,
         quota_reassert: args.quota_reassert,
         quota_warning_fraction: args.quota_warning_fraction,
-        max_response_bytes: (args.max_response_bytes > 0)
-            .then_some(args.max_response_bytes as usize),
         auto_compaction: slatedb_etcd::compactor::Retention::parse(
             args.auto_compaction_mode,
             &args.auto_compaction_retention,

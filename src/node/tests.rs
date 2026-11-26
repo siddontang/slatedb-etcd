@@ -19,7 +19,6 @@ pub(super) fn options(dir: &std::path::Path) -> NodeOptions {
         quota_bytes: 0,
         quota_reassert: false,
         quota_warning_fraction: 0.0,
-        max_response_bytes: None,
         auto_compaction: None,
         id: 1,
         cluster_id: "worker-test".into(),
