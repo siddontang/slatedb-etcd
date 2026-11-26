@@ -118,7 +118,8 @@ subcompactions, because each one buffers SST data until the disk takes it.
 On Linux, SST writes of replicated state on local storage start disk writeback one SST block at
 a time, so Raft log syncs wait behind only a few blocks. Shared state mode and S3 do not pace SST
 writes. While SlateDB's latest write-side sample of unflushed memtable bytes is at least 85 % of
-its `max_unflushed_bytes`, writeback of that member starts 1 MiB at a time, so flushes and
+its `max_unflushed_bytes`, writeback of that member starts 1 MiB at a time while the memtables
+grow by at least 16 MiB/s, as in a bulk load, and 256 KiB at a time otherwise, so flushes and
 compaction catch up. A background flush alone does not update the sample.
 On Linux, jemalloc background threads return freed pages to the OS after 200 ms.
 `_RJEM_MALLOC_CONF` overrides that default.

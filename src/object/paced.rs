@@ -11,8 +11,11 @@
 //! Block-sized windows cost one disk round trip per block. After a bulk load, flushes and
 //! compaction then fell behind: unflushed memtables reached `max_unflushed_bytes`, and SlateDB
 //! held the apply pipeline for seconds. So while SlateDB reports unflushed memtable bytes of at
-//! least [`BACKLOG_PERCENT`] of that limit, each window fills `PACE_BYTES`. Raft log syncs then
-//! wait longer, but writers no longer wait for seconds of backpressure.
+//! least [`BACKLOG_PERCENT`] of that limit, windows grow. Raft log syncs then wait longer, but
+//! writers no longer wait for seconds of backpressure. While the memtables grow by at least
+//! [`LOAD_BYTES_PER_SEC`], as in a bulk load, a window fills `PACE_BYTES`. Otherwise, as in
+//! the minutes of drain after a load, it fills `BACKLOG_BYTES`: a Raft log sync then waits
+//! behind a quarter of the bytes.
 //!
 //! SlateDB uploads a large SST as 10 MiB multipart parts, up to 8 at a time, and flushes and
 //! compactions run concurrently. Pacing each writer alone still left dozens of windows in
@@ -32,7 +35,7 @@ use std::io::ErrorKind;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use async_trait::async_trait;
@@ -43,8 +46,22 @@ use slatedb::object_store::*;
 
 use super::sst_reads::{self, SstReads};
 
-/// The largest window. Windows are this large only during a write backlog.
+/// The largest window. Windows are this large only during a write backlog under a fast load.
 const PACE_BYTES: u64 = 1024 * 1024;
+/// The window during a write backlog while writes are slow.
+///
+/// After a bulk load, the memtables stayed above [`BACKLOG_PERCENT`] for seconds to minutes
+/// while compaction drained L0. With `PACE_BYTES` windows, 3-4 MiB were then in writeback ahead
+/// of each Raft log sync, and on a SATA SSD those syncs took 60-110 ms at 550 writes/s.
+const BACKLOG_BYTES: u64 = 256 * 1024;
+/// Memtable growth per second that keeps `PACE_BYTES` windows during a backlog.
+///
+/// A bulk load of 4-100 KiB values grew the memtables by about 65 MB/s. Kubernetes-like steady
+/// writes after it grew them by 2-3 MB/s. `BACKLOG_BYTES` windows alone let the load reach
+/// `max_unflushed_bytes` and stall apply for 2.5-3 s.
+pub(crate) const LOAD_BYTES_PER_SEC: i64 = 16 << 20;
+/// How long one growth sample lasts.
+const LOAD_SAMPLE_MS: u64 = 1000;
 /// Unflushed memtable bytes, in percent of `max_unflushed_bytes`, that start backlog windows.
 ///
 /// A bulk load reached the limit within 5 s and then stalled apply for seconds. Short write
@@ -76,9 +93,9 @@ pub(crate) struct PacedStore {
     inner: Arc<LocalFileSystem>,
     reads: Arc<SstReads>,
     lane: &'static Lane,
-    /// SlateDB of this store has a write backlog, so its windows fill `PACE_BYTES`. Each store
-    /// has its own flag: embedded members share the lane but not their memtables.
-    backlog: Arc<AtomicBool>,
+    /// The window size of this store during a write backlog, or 0 for one window per chunk.
+    /// Each store has its own size: embedded members share the lane but not their memtables.
+    backlog: Arc<AtomicU64>,
 }
 
 impl PacedStore {
@@ -388,8 +405,9 @@ impl<'a> Pacer<'a> {
 
 /// Write `data` at `offset`, one window in writeback at a time.
 ///
-/// A window ends with each chunk of `data`, or at `PACE_BYTES` during a write backlog. The next
-/// window is copied into the page cache while the previous one is on the device.
+/// A window ends with each chunk of `data`, or at the store's backlog window size during a write
+/// backlog. The next window is copied into the page cache while the previous one is on the
+/// device.
 fn write_paced(
     file: &File,
     mut offset: u64,
@@ -397,7 +415,7 @@ fn write_paced(
     path: &FsPath,
     lane: &Lane,
     writer: Writer,
-    backlog: &AtomicBool,
+    backlog: &AtomicU64,
 ) -> Result<()> {
     let mut pacer = Pacer {
         file,
@@ -410,12 +428,19 @@ fn write_paced(
     for chunk in data.iter() {
         let mut chunk = chunk.as_ref();
         while !chunk.is_empty() {
-            let len = chunk.len().min((PACE_BYTES - (offset - start)) as usize);
+            let window = backlog.load(Ordering::Relaxed);
+            let size = if window == 0 { PACE_BYTES } else { window };
+            // The size can shrink between chunks.
+            if offset - start >= size {
+                pacer.submit(start, offset - start)?;
+                start = offset;
+            }
+            let len = chunk.len().min((size - (offset - start)) as usize);
             file.write_all_at(&chunk[..len], offset)
                 .map_err(|e| io_error(e, path))?;
             offset += len as u64;
             chunk = &chunk[len..];
-            if offset - start == PACE_BYTES || !backlog.load(Ordering::Relaxed) {
+            if offset - start == size || window == 0 {
                 pacer.submit(start, offset - start)?;
                 start = offset;
             }
@@ -572,7 +597,7 @@ struct PacedUpload {
     /// write exits. A cancelled part's write keeps running after its task is gone.
     active: Option<Arc<Active<'static>>>,
     lane: &'static Lane,
-    backlog: Arc<AtomicBool>,
+    backlog: Arc<AtomicU64>,
     store: Arc<LocalFileSystem>,
     reads: Arc<SstReads>,
     location: Path,
@@ -658,19 +683,20 @@ impl MultipartUpload for PacedUpload {
 }
 
 impl PacedStore {
-    /// A SlateDB metrics recorder that turns backlog windows of this store on and off.
+    /// A SlateDB metrics recorder that sets the backlog window size of this store.
     ///
     /// SlateDB sets its unflushed memtable gauge before each write. The recorder compares it
-    /// with [`BACKLOG_PERCENT`] of `max_unflushed_bytes`. It drops every other metric.
+    /// with [`BACKLOG_PERCENT`] of `max_unflushed_bytes`, and measures how fast it grows. It
+    /// drops every other metric.
     pub(crate) fn backlog_recorder(
         &self,
         max_unflushed_bytes: usize,
     ) -> Arc<dyn slatedb_common::metrics::MetricsRecorder> {
         Arc::new(BacklogRecorder {
-            gauge: Arc::new(UnflushedGauge {
-                backlog: self.backlog.clone(),
-                threshold: (max_unflushed_bytes / 100 * BACKLOG_PERCENT) as i64,
-            }),
+            gauge: Arc::new(UnflushedGauge::new(
+                self.backlog.clone(),
+                (max_unflushed_bytes / 100 * BACKLOG_PERCENT) as i64,
+            )),
             noop: slatedb_common::metrics::NoopMetricsRecorder::new(),
         })
     }
@@ -682,14 +708,62 @@ struct BacklogRecorder {
 }
 
 struct UnflushedGauge {
-    backlog: Arc<AtomicBool>,
+    backlog: Arc<AtomicU64>,
     threshold: i64,
+    origin: std::time::Instant,
+    /// The last value, and the growth since the sample started at `sampled` ms after `origin`.
+    last: AtomicI64,
+    grown: AtomicI64,
+    sampled: AtomicU64,
+    /// The previous sample grew by at least [`LOAD_BYTES_PER_SEC`].
+    load: AtomicBool,
+}
+
+impl UnflushedGauge {
+    fn new(backlog: Arc<AtomicU64>, threshold: i64) -> Self {
+        Self {
+            backlog,
+            threshold,
+            origin: std::time::Instant::now(),
+            last: AtomicI64::new(0),
+            grown: AtomicI64::new(0),
+            sampled: AtomicU64::new(0),
+            load: AtomicBool::new(false),
+        }
+    }
+
+    /// Record `value` at `now` ms after `origin`. Concurrent calls can lose a little growth from
+    /// a sample; that only moves the load decision by one sample.
+    fn update(&self, value: i64, now: u64) {
+        // A finished flush lowers the value. Only writes grow it.
+        let grown = (value - self.last.swap(value, Ordering::Relaxed)).max(0);
+        let grown = self.grown.fetch_add(grown, Ordering::Relaxed) + grown;
+        let sampled = self.sampled.load(Ordering::Relaxed);
+        let elapsed = now.saturating_sub(sampled);
+        if elapsed >= LOAD_SAMPLE_MS
+            && self
+                .sampled
+                .compare_exchange(sampled, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.grown.fetch_sub(grown, Ordering::Relaxed);
+            let load = grown.saturating_mul(1000) >= LOAD_BYTES_PER_SEC * elapsed as i64;
+            self.load.store(load, Ordering::Relaxed);
+        }
+        let window = if value < self.threshold {
+            0
+        } else if self.load.load(Ordering::Relaxed) {
+            PACE_BYTES
+        } else {
+            BACKLOG_BYTES
+        };
+        self.backlog.store(window, Ordering::Relaxed);
+    }
 }
 
 impl slatedb_common::metrics::GaugeFn for UnflushedGauge {
     fn set(&self, value: i64) {
-        self.backlog
-            .store(value >= self.threshold, Ordering::Relaxed);
+        self.update(value, self.origin.elapsed().as_millis() as u64);
     }
 }
 
@@ -1143,7 +1217,8 @@ mod tests {
     }
 
     /// Windows end with each chunk, so a Raft log sync waits behind a few SST blocks. During a
-    /// write backlog they fill `PACE_BYTES`, across chunk and part boundaries.
+    /// write backlog they fill `PACE_BYTES` under a fast load and `BACKLOG_BYTES` otherwise,
+    /// across chunk and part boundaries.
     #[tokio::test]
     async fn backlog_windows_fill_pace_bytes() {
         use slatedb_common::metrics::MetricsRecorder;
@@ -1168,18 +1243,28 @@ mod tests {
         assert_eq!(windows(lane), data.len().div_ceil(block));
 
         // SlateDB reports its unflushed bytes through the recorder.
+        let unflushed = Arc::new(UnflushedGauge::new(store.backlog.clone(), 100));
         let recorder = BacklogRecorder {
-            gauge: Arc::new(UnflushedGauge {
-                backlog: store.backlog.clone(),
-                threshold: 100,
-            }),
+            gauge: unflushed.clone(),
             noop: slatedb_common::metrics::NoopMetricsRecorder::new(),
         };
         let gauge = recorder.register_gauge(slatedb::db_stats::TOTAL_MEM_SIZE_BYTES, "", &[]);
-        gauge.set(99);
-        assert!(!store.backlog.load(Ordering::Relaxed));
-        gauge.set(100);
-        assert!(store.backlog.load(Ordering::Relaxed));
+        let window = || store.backlog.load(Ordering::Relaxed);
+        unflushed.update(99, 0);
+        assert_eq!(window(), 0);
+        // A backlog with no measured load gets the small window.
+        unflushed.update(100, 10);
+        assert_eq!(window(), BACKLOG_BYTES);
+        // A sample of at least LOAD_BYTES_PER_SEC selects the large window from its end on.
+        let loaded = 100 + LOAD_BYTES_PER_SEC;
+        unflushed.update(loaded - 1, LOAD_SAMPLE_MS - 1);
+        assert_eq!(window(), BACKLOG_BYTES);
+        unflushed.update(loaded, LOAD_SAMPLE_MS);
+        assert_eq!(window(), PACE_BYTES);
+        // A finished flush lowers the value. That is not growth, and the load holds until the
+        // next sample ends.
+        unflushed.update(200, LOAD_SAMPLE_MS + 10);
+        assert_eq!(window(), PACE_BYTES);
 
         store.put(&path, payload()).await.unwrap();
         assert_eq!(windows(lane), 3);
@@ -1202,6 +1287,19 @@ mod tests {
         };
         multipart().await;
         assert_eq!(windows(lane), 2 + 2);
+
+        // Growth below the rate in the next sample ends the load: windows fill BACKLOG_BYTES.
+        unflushed.update(200 + LOAD_BYTES_PER_SEC / 2, 2 * LOAD_SAMPLE_MS);
+        assert_eq!(window(), BACKLOG_BYTES);
+        store.put(&path, payload()).await.unwrap();
+        assert_eq!(windows(lane), data.len().div_ceil(BACKLOG_BYTES as usize));
+        assert_eq!(store.get(&path).await.unwrap().bytes().await.unwrap(), data);
+        multipart().await;
+        assert_eq!(
+            windows(lane),
+            first.len().div_ceil(BACKLOG_BYTES as usize)
+                + second.len().div_ceil(BACKLOG_BYTES as usize)
+        );
 
         gauge.set(0);
         store.put(&path, payload()).await.unwrap();
@@ -1242,7 +1340,11 @@ mod tests {
         a.put(&Path::from("state/compacted/a.sst"), payload())
             .await
             .unwrap();
-        assert_eq!(std::mem::take(&mut lane.state.lock().unwrap().windows), 1);
+        // No load was measured, so A's windows fill BACKLOG_BYTES.
+        assert_eq!(
+            std::mem::take(&mut lane.state.lock().unwrap().windows),
+            (PACE_BYTES / BACKLOG_BYTES) as usize
+        );
         // B still writes one block per window.
         b.put(&Path::from("state/compacted/b.sst"), payload())
             .await
