@@ -1072,11 +1072,14 @@ fn slatedb_settings_bound_compaction_buffers() {
     assert_eq!(settings.l0_sst_size_bytes, defaults.l0_sst_size_bytes);
     let compactor = settings.compactor_options.as_ref().unwrap();
     let sources = |key: &str| compactor.scheduler_options.get(key).map(String::as_str);
-    assert_eq!(sources("min_compaction_sources"), Some("8"));
+    assert_eq!(
+        sources("min_compaction_sources"),
+        Some(MIN_COMPACTION_SOURCES.to_string().as_str())
+    );
     // SlateDB's default of 8 sources per job bounds the read-ahead buffers of one job.
     assert_eq!(sources("max_compaction_sources"), None);
-    assert_eq!(settings.l0_max_ssts, 16);
-    assert_eq!(settings.l0_max_ssts_per_key, 16);
+    assert_eq!(settings.l0_max_ssts, 2 * MIN_COMPACTION_SOURCES);
+    assert_eq!(settings.l0_max_ssts_per_key, 2 * MIN_COMPACTION_SOURCES);
     let worker = settings
         .compactor_options
         .as_ref()
@@ -1182,8 +1185,8 @@ async fn cold_scan_survives_compaction_and_gc_on_local_disk() {
     assert_eq!(first.key.as_ref(), key(0, 0).as_slice());
     // GC keeps the newest L0 SST that a compaction replaced, so later L0 SSTs must be newer.
     tokio::time::sleep(Duration::from_millis(10)).await;
-    // Four L0 SSTs make the size-tiered scheduler compact them.
-    for batch in 1..4 {
+    // `MIN_COMPACTION_SOURCES` L0 SSTs make the size-tiered scheduler compact them.
+    for batch in 1..MIN_COMPACTION_SOURCES {
         write(batch).await;
     }
 
