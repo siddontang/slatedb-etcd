@@ -180,7 +180,8 @@ file in one pass. The image has no size limit. Each row has the 64 MiB limit of 
 6. A member without the restore flag, also a joining member, waits while the lease changes. It
    fails after 60 s without a change. If the restore already created its checkpoint, the member
    writes the marker and opens on that checkpoint. Otherwise an ordinary start claims an empty
-   bootstrap. A joining member never claims it.
+   bootstrap. A joining member never claims it. Before any claim exists, it waits up to 60 s for
+   the initial members to decide, and then fails. Start it again later.
 7. Once the marker exists, a start reads only the marker. It does not read the restore objects
    or open the first checkpoint again.
 8. A restore into a cluster that an ordinary start or another snapshot created fails. A file
@@ -197,9 +198,11 @@ stopped attempt to go stale.
 To abandon a partial restore, make these checks first:
 
 1. Every member process of the cluster is stopped.
-2. `shared/bootstrap-op.json` has `"kind":"restore"` and the SHA-256 of your snapshot file. An
-   ordinary bootstrap also has no marker before its first checkpoint. Only this check tells the
-   two apart.
+2. `shared/bootstrap-op.json` has `"kind":"restore"`, and its `snapshot` field names your file.
+   The field is the 32-byte digest at the end of the file in hexadecimal: the SHA-256 of the
+   bytes before it. `sha256sum` of the whole file gives another value. Read the digest with
+   `tail -c 32 <file> | xxd -p -c 32`. An ordinary bootstrap also has no marker before its first
+   checkpoint. Only this check tells the two apart.
 3. `shared/bootstrap.json` is missing.
 
 Then delete `shared/` under the cluster prefix and start the restore again. Never delete

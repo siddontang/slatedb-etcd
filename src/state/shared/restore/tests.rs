@@ -986,7 +986,7 @@ async fn a_restore_into_an_ordinary_state_fails() {
 #[derive(Debug)]
 struct FailingReads {
     inner: Arc<dyn ObjectStore>,
-    failing: Vec<String>,
+    failing: std::sync::Mutex<Vec<String>>,
 }
 
 impl std::fmt::Display for FailingReads {
@@ -1019,7 +1019,8 @@ impl ObjectStore for FailingReads {
         path: &Path,
         options: slatedb::object_store::GetOptions,
     ) -> slatedb::object_store::Result<slatedb::object_store::GetResult> {
-        if self.failing.iter().any(|part| path.as_ref().contains(part)) {
+        let failing = self.failing.lock().unwrap().clone();
+        if failing.iter().any(|part| path.as_ref().contains(part)) {
             return Err(slatedb::object_store::Error::Generic {
                 store: "failing",
                 source: std::io::Error::other("an injected read failure").into(),
@@ -1094,7 +1095,7 @@ async fn a_bootstrapped_cluster_needs_no_restore_object() {
     for failing in [LEASE.to_owned(), manifest] {
         let faulty: Arc<dyn ObjectStore> = Arc::new(FailingReads {
             inner: store.clone(),
-            failing: vec![failing.clone()],
+            failing: std::sync::Mutex::new(vec![failing.clone()]),
         });
         // The injected failure reaches the restore objects. An open of the restore checkpoint
         // retries the failed read and does not return.
@@ -1327,4 +1328,105 @@ async fn a_slow_large_row_keeps_the_lease() {
     waiting.await.unwrap().unwrap();
     assert!(competing.hooks.started_after.lock().unwrap().is_none());
     assert!(started.elapsed() > STALE);
+}
+
+/// A member pauses before its writer opens, and another member takes over and publishes the
+/// restore. The paused open then fails, and the obsolete lease cannot be read. The marker
+/// decides first, so the member starts from the published restore.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_open_after_the_publication_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snapshot");
+    fixture(&path, 10).await;
+    let store = store();
+    let faulty = Arc::new(FailingReads {
+        inner: store.clone(),
+        failing: Default::default(),
+    });
+    let (reached, resume) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let paused = checked(
+        &path,
+        URL,
+        Hooks {
+            before_open: Some((reached.clone(), resume.clone())),
+            ..Default::default()
+        },
+    );
+    let starter = member(faulty.clone());
+    let starting = starter.spawn(&paused);
+    reached.notified().await;
+    let publisher = member(store.clone());
+    publisher
+        .restore(&checked(&path, URL, Hooks::default()))
+        .await
+        .unwrap();
+    *starter.source.fail_writer.lock().unwrap() = Some(anyhow::anyhow!("an injected open error"));
+    faulty.failing.lock().unwrap().push(LEASE.to_owned());
+    resume.notify_one();
+    starting.await.unwrap().unwrap();
+    assert!(paused.hooks.started_after.lock().unwrap().is_none());
+    assert_eq!(
+        publisher.marker().await,
+        Some(Some(paused.input.digest.clone()))
+    );
+}
+
+/// A member joins after the cluster claim and before any bootstrap decision. It claims nothing
+/// and waits. Without a decision it fails after `STALE`. When an ordinary voter bootstraps the
+/// cluster, it opens. When a voter claims a restore and writes rows, it opens only after the
+/// marker exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_waits_for_the_bootstrap_decision() {
+    let claimed = || async {
+        let store = store();
+        shared::claim(store.as_ref(), "cluster", "test", 0, &[1])
+            .await
+            .unwrap();
+        store
+    };
+    let store = claimed().await;
+    let started = Instant::now();
+    let error = open_join(store.clone()).await.err().unwrap();
+    assert!(started.elapsed() >= STALE);
+    assert!(
+        format!("{error:#}").contains("no bootstrap yet"),
+        "{error:#}"
+    );
+    let source = member(store).source;
+    assert_eq!(bootstrap_op(&source).await.unwrap(), None);
+
+    let store = claimed().await;
+    let joining = tokio::spawn(open_join(store.clone()));
+    tokio::time::sleep(STALE / 3).await;
+    assert!(!joining.is_finished());
+    let ordinary = open_shared(store.clone()).await;
+    joining.await.unwrap().unwrap().close().await.unwrap();
+    ordinary.close().await.unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snapshot");
+    fixture(&path, 20).await;
+    let store = claimed().await;
+    let started = Instant::now();
+    let joining = tokio::spawn(open_join(store.clone()));
+    tokio::time::sleep(STALE / 3).await;
+    assert!(!joining.is_finished());
+    let slow = checked(
+        &path,
+        URL,
+        Hooks {
+            batch_delay: Duration::from_millis(100),
+            ..Default::default()
+        },
+    );
+    let restoring = member(store.clone()).spawn(&slow);
+    let joined = joining.await.unwrap().unwrap();
+    let marker = member(store).marker().await;
+    assert_eq!(marker, Some(Some(slow.input.digest.clone())));
+    assert!(started.elapsed() > STALE * 2);
+    restoring.await.unwrap().unwrap();
+    joined.close().await.unwrap();
 }

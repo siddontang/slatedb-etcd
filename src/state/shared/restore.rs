@@ -664,6 +664,12 @@ impl Advance {
     }
 }
 
+/// Read the bootstrap marker alone: `None` without a marker, else the digest that it records.
+async fn marker(source: &Source) -> Result<Option<Option<String>>> {
+    let marker = get_json::<serde_json::Value>(source, BOOTSTRAP).await?;
+    Ok(marker.map(|(marker, _)| marker["restore"].as_str().map(str::to_owned)))
+}
+
 /// Read the facts. `writer` is the open writer of the lease owner.
 ///
 /// The bootstrap marker decides the outcome alone. With a marker, the function reads nothing
@@ -674,9 +680,8 @@ async fn observe(
     watch: &mut Watch,
     writer: Option<&Db>,
 ) -> Result<Facts> {
-    let marker = get_json::<serde_json::Value>(source, BOOTSTRAP).await?;
-    if let Some((marker, _)) = marker {
-        return Ok(Facts::marked(marker["restore"].as_str().map(str::to_owned)));
+    if let Some(digest) = marker(source).await? {
+        return Ok(Facts::marked(digest));
     }
     let claim = bootstrap_op(source).await?;
     let stored = admin.read_manifest(None).await?.is_some();
@@ -781,20 +786,25 @@ pub(crate) async fn seed(
                 let Err(error) = own(source, admin, restore, &mut watch).await else {
                     continue;
                 };
-                // The writer of a member that took the lease fences this one. A member that
-                // lost the lease while its open was in flight can also fence the owner. The
-                // owner then opens again and continues after the durable rows.
-                match watch.observe(source).await? {
-                    Lease::Ours if fenced(&error) => {
+                // Decide on the facts first. Another member can publish the restore meanwhile:
+                // the marker then decides, also when the obsolete lease cannot be read.
+                let facts = observe(source, admin, &mut watch, None).await?;
+                match next(&facts, Some(&restore.input)) {
+                    Step::Done => return Ok(()),
+                    Step::FreshPrefix => bail!(FRESH_PREFIX),
+                    // A member that lost the lease while its open was in flight can fence the
+                    // owner. The owner then opens again and continues after the durable rows.
+                    _ if facts.lease == Lease::Ours && fenced(&error) => {
                         tracing::warn!(%error, "a stale restore writer fenced this one; open again")
                     }
-                    Lease::Ours => {
+                    _ if facts.lease == Lease::Ours => {
                         return Err(error.context(
                             "the restore of this snapshot did not complete; start it again, or \
                              stop every member and delete shared/ under the cluster prefix (see \
                              docs/shared-state-guide.md)",
                         ))
                     }
+                    // The writer of a member that took the lease fences this one.
                     _ => tracing::warn!(%error, "another member took over the snapshot restore"),
                 }
             }
@@ -1049,8 +1059,9 @@ async fn complete(db: &Db, input: &Input, mut usage: crate::batch::Usage) -> Res
 /// clients.
 ///
 /// A bootstrapped cluster needs nothing. Otherwise an ordinary start claims an empty bootstrap. A
-/// `join` start never claims it: its Raft log decides its base. A pending restore claim holds
-/// either start while the restore makes progress. Once the restore created its checkpoint, the
+/// `join` start never claims it. It waits up to `STALE` for the initial voters to claim it, and
+/// then fails with a retryable error. A pending restore claim holds either start while the
+/// restore makes progress. Once the restore created its checkpoint, the
 /// start can complete the marker. A restore without progress for `STALE` fails the start, so it
 /// never serves an empty base while a restore claim exists.
 pub(super) async fn resolve_bootstrap(
@@ -1060,6 +1071,7 @@ pub(super) async fn resolve_bootstrap(
 ) -> Result<()> {
     let mut watch = Watch::new(0);
     let mut log = Every(None);
+    let started = Instant::now();
     loop {
         let facts = observe(source, admin, &mut watch, None).await?;
         let snapshot = match &facts.claim {
@@ -1068,7 +1080,17 @@ pub(super) async fn resolve_bootstrap(
         };
         match next(&facts, None) {
             Step::Done => return Ok(()),
-            Step::Claim if join => return Ok(()),
+            // An empty view before the decision could become a restore, so the join waits.
+            Step::Claim if join => {
+                ensure!(
+                    started.elapsed() < STALE,
+                    "the cluster has no bootstrap yet; start its initial members, then join again"
+                );
+                if log.due() {
+                    tracing::info!("wait for the initial members to bootstrap the cluster");
+                }
+                tokio::time::sleep(POLL).await;
+            }
             Step::Claim => {
                 claim_bootstrap(source, &BootstrapOp::Empty).await?;
             }
