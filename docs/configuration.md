@@ -212,9 +212,11 @@ Rules and limits:
   ahead refuses each batch and sets `clock_alarm` to `ahead`. After three refusals the leader
   hands over the lead. No client request fails, because the overlay keeps the batches.
 - A writer without fresh clock samples of a voter majority waits. `/status` shows
-  `clock.waiting`, and `slatedb_etcd_shared_writer_clock_waiting` is 1. One voter has no clock
-  probe. An earlier binary has no `/raft/clock` route and gives no sample. See
-  [Clocks](shared-state.md#clocks).
+  `clock.waiting`, and `slatedb_etcd_shared_writer_clock_waiting` is 1. A wait that holds a
+  batch for 30 s is a `stalled` fault. A skew that missing voters could still support is
+  uncertain: the ticks stay at the bound, and `clock.uncertain` shows it without an alarm.
+- One voter has no clock probe. An earlier binary has no `/raft/clock` route and gives no
+  sample, so upgrade all members first. See [Clocks](shared-state.md#clocks).
 - A storage error of the writer keeps the member up. The writer opens again with a backoff, and
   a member whose path fails hands over the lead. See
   [writer faults](shared-state.md#writer-faults).

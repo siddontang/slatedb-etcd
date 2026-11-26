@@ -117,7 +117,7 @@ A member in shared state mode also exports these gauges. Replicated members omit
 | `slatedb_etcd_shared_apply_paused` | 1 while apply waits above twice `--overlay-max-bytes` |
 | `slatedb_etcd_shared_writer_running` | 1 while the writer database of this member is open |
 | `slatedb_etcd_shared_writer_clock_alarm` | 1 while the clock is too far behind or ahead |
-| `slatedb_etcd_shared_writer_clock_waiting` | 1 while the writer waits for its clock bound |
+| `slatedb_etcd_shared_writer_clock_waiting` | 1 while the clock bound holds or is uncertain |
 | `slatedb_etcd_shared_writer_reopens` | Writer opens after a fence or a lost manifest race |
 | `slatedb_etcd_shared_writer_consecutive_failures` | Writer faults in a row, other than fences |
 | `slatedb_etcd_shared_writer_faults_total` | Counter of writer faults, clock refusals, and stalls |

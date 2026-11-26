@@ -624,8 +624,13 @@ reads the writer clock in these places:
   (`db.rs:150-153`). Each batch gets the next tick (`batch_write.rs:204`). If the new leader's
   clock is behind, each write sleeps up to 10 s and then fails with `InvalidClockTick`
   (`clock.rs:53-83`).
-- **SST IDs:** SST IDs are ULIDs with a time from the clock. A new L0 SST whose ID time is below
-  the newest L0 SST ID fails the manifest update (`manifest/invariants.rs:51-83`).
+- **SST IDs:** SST IDs are ULIDs with a time from the clock: L0 SSTs at a flush
+  (`memtable_flusher/tracker.rs:425-437`) and compaction outputs
+  (`compactor_executor.rs:797,856`). A new L0 SST whose ID time is below the newest L0 SST ID
+  fails the manifest update (`manifest/invariants.rs:51-83`).
+- **Compaction jobs:** a job ID is a ULID too. SlateDB refuses a new job below the newest job
+  ID, and an output SST below its job ID (`compactions_store/invariants.rs:12-50`). So a
+  Defragment submits its job with the clock of the writer.
 - **Background work:** checkpoint times (`manifest/store.rs:160-175`), GC
   (`garbage_collector.rs:418-450`), and the compactor read the time. GC compares SST ID times
   with its own clock. Its guards are the newest L0 and the compaction low watermark
@@ -653,30 +658,44 @@ peer traffic. The voter returns its process and its wall clock.
 - A reply gives no sample when its probe is of an earlier term or another set of voters, when it
   comes from another process than the voter's current one, or when a newer probe already gave
   one. A delayed reply thus never replaces a newer sample.
-- With `m` a voter majority, the bound is the `(m - 1)`-th largest projected peer clock plus
-  `--max-clock-skew`. The leader reads its own clock at each check, and it is the last member of
-  the majority. With three voters the bound follows the larger of the two peer clocks. With one
-  peer missing it follows the other peer.
-- The cap of a tick is the bound at the low edges. A leader clock above the bound also at the
-  high edges is measured skew: `clock_alarm` is `ahead`. A slow reply alone never refuses.
+- With `m` a voter majority, the bound is the `m`-th largest clock of all voters plus
+  `--max-clock-skew`. The leader reads its own clock at each check, with equal edges. For three
+  voters with clocks 40, 100, and 40 and a 5 ms limit, the bound is 45. With 110, 100, and 40 it
+  is 105.
+- The cap of a tick is the bound at the low edges of the peer windows. A leader clock above the
+  bound also at the high edges is measured skew: `clock_alarm` is `ahead`. A slow reply alone
+  never refuses.
+- A missing voter counts as one that agrees with the leader. So the skew is measured only when
+  no majority can support the leader clock. Otherwise it is uncertain: ticks stay at the cap,
+  `/status` shows `clock.uncertain`, and no alarm rises.
 - Too few fresh samples mean waiting, not refusal. A new leader waits for samples before its
-  open, and the materializer waits while samples are missing. `/status` shows `clock.waiting`,
-  and `slatedb_etcd_shared_writer_clock_waiting` is 1.
-- One voter has no probe and no ahead check. Its writer keeps the SlateDB default clock.
+  open, and the materializer waits while samples are missing or the last tick is above the cap.
+  `/status` shows `clock.waiting`, and `slatedb_etcd_shared_writer_clock_waiting` is 1.
+- A wait counts toward the 30 s stall limit only while a batch waits, as other due work does.
+  It then makes a `stalled` fault, not a clock fault. An idle writer waits with no fault.
+- One voter has no probe and no ahead check. Its writer keeps the SlateDB default clock. When a
+  voter joins in the same term, the writer takes the check before its next batch, and it keeps
+  the check until the next open. The node gives the clock the new voters when Raft applies the
+  change, and when a voter process changes.
 
 The writer `Db` uses `clock::Gate` as its SlateDB clock. Before the materializer submits a batch,
 the gate fixes its tick as `max(last, min(now, cap))`. `last` starts at the floor. The gate
 returns exactly that tick until SlateDB wrote the batch, so a later clock jump or sample cannot
-change it. When the floor is above the cap, the batch waits. Background work reads
-`max(last, min(now, cap))`, which never steps back, and `last` while samples are missing.
-Sleeps and tickers keep SlateDB's default clock, which follows the monotonic clock.
+change it. When `last` is above the cap, the batch waits: after an open above the cap, or after
+a backward step of a voter majority. Background work reads `max(last, min(now, cap))`, which
+never steps back, and `last` while samples are missing. Sleeps and tickers keep SlateDB's
+default clock, which follows the monotonic clock.
+
+Each gate belongs to the term of its open. When the member stands down or a new term starts, the
+gate stays at `last`, and no batch gets a tick again. So a flush or a compaction that a stopped
+writer still runs takes no time above the last bound.
 
 A measured skew refuses the batch. The materializer fails with a clock fault, and the batch
 stays in the overlay for the next writer. No client request fails, and no proposal waits for the
-check. Three faults hand over the lead. The handoff prefers a voter whose clock is not above the
-`m`-th largest voter clock. The leader's own clock, read now, counts in that order. Raft
-election eligibility does not change. No override exists for
-a tick in the future: the recovery is to wait until real time passes it.
+check. Three faults hand over the lead. The handoff places last a voter that the check would
+refuse as leader: its clock is above the `m`-th largest voter clock plus `--max-clock-skew`. The
+leader's own clock, read now, counts in that order. Raft election eligibility does not change.
+No override exists for a tick in the future: the recovery is to wait until real time passes it.
 
 **Bootstrap boundary.** A snapshot restore writes its rows before Raft runs
 (`state/shared/restore.rs`, `own`). That writer uses SlateDB's default clock. Its monotonic
@@ -687,7 +706,8 @@ tick. A restore host clock more than `--max-clock-skew` ahead thus makes each le
 start until real time passes the tick. Check the clock of the restore host before a restore.
 
 An earlier binary has no `/raft/clock` route and gives no sample. A leader whose current peers
-of a majority run an earlier binary waits.
+of a majority run an earlier binary waits. Mixed binary versions are outside the current
+contract, so upgrade all members before the writer of a new leader must start.
 
 ## Restart
 
@@ -889,8 +909,8 @@ it.
 
 The leader hands its lead to another voter after three faults in a row, after one data fault,
 or after 30 s without durable progress. The target is the voter with the longest matched log
-and no writer fault mark. A voter whose clock is above the `m`-th largest voter clock comes after
-the others. Its report must come from its current process, arrive after the start of the
+and no writer fault mark. A voter that the clock check would refuse as leader comes after the
+others. Its report must come from its current process, arrive after the start of the
 incident, and carry the leader's current Raft term. So a voter that stopped, or that led
 and failed in a term between, is not a target.
 
