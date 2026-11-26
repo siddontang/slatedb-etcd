@@ -80,23 +80,109 @@ struct Voters {
     /// The voters, each with the process of its last transport frame. Empty while this member
     /// does not lead.
     voters: BTreeMap<u64, Option<u64>>,
+    /// The node configured this clock at least once. A clock that no node drives, as in a test
+    /// of the writer alone, has no checks.
+    managed: bool,
     nonce: u64,
     samples: HashMap<u64, Sample>,
+}
+
+/// The bound of a tick at one time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Bound {
+    /// The `m`-th largest voter clock plus the skew limit. A tick at or below it is at most the
+    /// skew limit above a majority of the voters.
+    pub cap: i64,
+    /// The leader clock now.
+    pub real: i64,
 }
 
 /// The decision of the ahead check at one time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Verdict {
-    /// One voter, or this member does not lead. No check applies.
+    /// This member does not lead. No tick is authorized.
     Off,
-    /// Fewer than `m - 1` voters have a fresh sample.
+    /// This member is the only voter. Its own clock is the majority.
+    Single(Bound),
+    /// Too few voters have a fresh sample to name the `m`-th largest clock.
     Waiting,
-    /// The leader clock `real` is above the bound also at the favourable edge of each window,
-    /// by `by` milliseconds. `cap` is the bound at the unfavourable edge.
-    Ahead { by: i64, cap: i64, real: i64 },
-    /// A tick at or below `cap` is at most the skew limit above a majority of the voters. The
-    /// leader clock reads `real`.
-    Admit { cap: i64, real: i64 },
+    /// The leader clock is above the bound, but missing voters could still form a majority
+    /// that supports it. This is no measured skew: ticks stay at the cap, and no alarm rises.
+    Uncertain(Bound),
+    /// The leader clock is above the bound also at the high edge of each window, and also when
+    /// each missing voter agrees with the leader. It is `by` milliseconds ahead.
+    Ahead { by: i64, bound: Bound },
+    /// The leader clock is within the bound.
+    Admit(Bound),
+}
+
+/// One voter in the order of the clocks: its offset to the leader's monotonic clock at the low
+/// and the high edge of its window. The leader's own entry has equal edges.
+#[derive(Clone, Copy, Debug)]
+struct Entry {
+    id: u64,
+    low: i64,
+    high: i64,
+}
+
+/// The clocks of the voters at one monotonic time `now`: the leader read now, and each peer
+/// with a fresh sample.
+struct Order {
+    me: u64,
+    majority: usize,
+    entries: Vec<Entry>,
+    /// Voters other than the leader without a fresh sample.
+    missing: usize,
+    now: i64,
+}
+
+impl Order {
+    fn new(held: &Voters, now: i64, real: i64) -> Self {
+        let mut entries = vec![];
+        if held.voters.contains_key(&held.me) {
+            let own = real.saturating_sub(now);
+            entries.push(Entry {
+                id: held.me,
+                low: own,
+                high: own,
+            });
+        }
+        let mut missing = 0;
+        for &id in held.voters.keys().filter(|id| **id != held.me) {
+            let fresh = held
+                .samples
+                .get(&id)
+                .filter(|sample| now - sample.at < FRESH_MS);
+            match fresh {
+                Some(sample) => entries.push(Entry {
+                    id,
+                    low: sample.low,
+                    high: sample.high,
+                }),
+                None => missing += 1,
+            }
+        }
+        Self {
+            me: held.me,
+            majority: held.voters.len() / 2 + 1,
+            entries,
+            missing,
+            now,
+        }
+    }
+
+    /// The `m`-th largest projected clock at `edge`, with `top` more voters above all others.
+    /// `None` when the order has fewer than `m` voters.
+    fn mth(&self, edge: fn(&Entry) -> i64, top: usize) -> Option<i64> {
+        let Some(rank) = self.majority.checked_sub(top + 1) else {
+            return Some(i64::MAX);
+        };
+        let mut edges: Vec<i64> = self.entries.iter().map(edge).collect();
+        edges.sort_unstable_by(|a, b| b.cmp(a));
+        edges
+            .get(rank)
+            .map(|offset| offset.saturating_add(self.now))
+    }
 }
 
 /// The clock checks of this member's writer.
@@ -118,6 +204,8 @@ pub(in crate::node) struct Clock {
     ahead: Arc<AtomicI64>,
     /// Set while the writer waits for samples or for its bound to pass the last tick.
     waiting: Arc<AtomicBool>,
+    /// Set while the leader clock is above the bound, but missing voters could support it.
+    uncertain: Arc<AtomicBool>,
     /// A new sample wakes a writer that waits.
     sampled: Arc<tokio::sync::Notify>,
 }
@@ -139,6 +227,7 @@ impl Clock {
             voters: Arc::default(),
             ahead: Arc::default(),
             waiting: Arc::default(),
+            uncertain: Arc::default(),
             sampled: Arc::default(),
         }
     }
@@ -194,6 +283,7 @@ impl Clock {
         held.term = term;
         held.me = me;
         held.voters = voters;
+        held.managed = true;
     }
 
     /// Start a probe of `peer`.
@@ -247,48 +337,54 @@ impl Clock {
 
     /// Decide whether the leader can write a tick now.
     ///
-    /// The bound is the `(m - 1)`-th largest projected peer clock plus the skew limit. `cap`
-    /// uses the low edge of each window, so a tick at or below it is never too far ahead of a
-    /// majority. The refusal uses the high edge, so a slow reply alone never refuses. The
-    /// leader's own clock is read now, and it counts once as the last member of the majority.
+    /// The bound is the `m`-th largest clock of all voters plus the skew limit, where `m` is a
+    /// majority. The leader reads its own clock now. `cap` uses the low edge of each peer
+    /// window, so a tick at or below it is never too far ahead of a majority. A measured skew
+    /// uses the high edges and counts each missing voter as one that agrees with the leader, so
+    /// neither a slow reply nor a missing one alone refuses.
     pub(super) fn verdict(&self) -> Verdict {
+        self.decide().2
+    }
+
+    /// The verdict, whether a node manages this clock, and the term that this member leads.
+    /// One lock covers the term and the verdict.
+    fn decide(&self) -> (bool, Option<u64>, Verdict) {
         let held = self.voters.lock().unwrap();
-        let mine = usize::from(held.voters.contains_key(&held.me));
-        let need = (held.voters.len() / 2 + 1).saturating_sub(mine);
-        if held.voters.is_empty() || need == 0 {
-            return Verdict::Off;
+        if held.voters.is_empty() {
+            return (held.managed, None, Verdict::Off);
         }
-        let now = (self.mono_ms)();
-        let fresh: Vec<Sample> = held
-            .samples
-            .iter()
-            .filter(|(id, sample)| {
-                **id != held.me && held.voters.contains_key(id) && now - sample.at < FRESH_MS
-            })
-            .map(|(_, sample)| *sample)
-            .collect();
+        let (now, real) = ((self.mono_ms)(), (self.now_ms)());
+        let order = Order::new(&held, now, real);
+        let (managed, term) = (held.managed, Some(held.term));
+        let single = held.voters.len() == 1 && held.voters.contains_key(&held.me);
         drop(held);
-        if fresh.len() < need {
-            return Verdict::Waiting;
-        }
         let skew = self.max_skew.as_millis() as i64;
-        let bound = |edge: fn(&Sample) -> i64| {
-            let mut edges: Vec<i64> = fresh.iter().map(edge).collect();
-            edges.sort_unstable_by(|a, b| b.cmp(a));
-            edges[need - 1].saturating_add(now).saturating_add(skew)
+        let Some(low) = order.mth(|entry| entry.low, 0) else {
+            return (managed, term, Verdict::Waiting);
         };
-        let cap = bound(|sample| sample.low);
-        let limit = bound(|sample| sample.high);
-        let real = (self.now_ms)();
-        if real > limit {
-            Verdict::Ahead {
-                by: real - limit,
-                cap,
-                real,
-            }
-        } else {
-            Verdict::Admit { cap, real }
+        let bound = Bound {
+            cap: low.saturating_add(skew),
+            real,
+        };
+        if single {
+            return (managed, term, Verdict::Single(bound));
         }
+        let measured = order.mth(|entry| entry.high, 0).unwrap_or(i64::MAX);
+        if real <= measured.saturating_add(skew) {
+            return (managed, term, Verdict::Admit(bound));
+        }
+        let limit = order
+            .mth(|entry| entry.high, order.missing)
+            .unwrap_or(i64::MAX)
+            .saturating_add(skew);
+        let verdict = match real > limit {
+            true => Verdict::Ahead {
+                by: real - limit,
+                bound,
+            },
+            false => Verdict::Uncertain(bound),
+        };
+        (managed, term, verdict)
     }
 
     /// Record a measured skew ahead of a voter majority, or its end. Log the start of one.
@@ -302,52 +398,50 @@ impl Clock {
         }
     }
 
-    /// Check the leader clock against the samples, for `/status` and the alarm gauge.
-    pub(in crate::node) fn observe(&self) {
-        match self.verdict() {
-            Verdict::Ahead { by, .. } => self.note_ahead(Some(by)),
-            Verdict::Off | Verdict::Admit { .. } => self.note_ahead(None),
+    /// Record the decision of a check for `/status`: a measured skew, an uncertain one, or
+    /// neither.
+    fn note(&self, verdict: &Verdict) {
+        let (ahead, uncertain) = match verdict {
+            Verdict::Ahead { by, .. } => (Some(*by), false),
+            Verdict::Uncertain(_) => (None, true),
+            Verdict::Off | Verdict::Single(_) | Verdict::Admit(_) => (None, false),
             // Missing samples keep the last decision.
-            Verdict::Waiting => {}
-        }
+            Verdict::Waiting => return,
+        };
+        self.note_ahead(ahead);
+        self.uncertain.store(uncertain, Ordering::Relaxed);
     }
 
-    /// This member stopped leading. Its samples and its ahead alarm end.
+    /// Check the leader clock against the samples, for `/status` and the alarm gauge.
+    pub(in crate::node) fn observe(&self) {
+        self.note(&self.verdict());
+    }
+
+    /// This member stopped leading. Its samples and its alarms of the ahead check end. A writer
+    /// `Db` of the ended term keeps its last tick. See `Gate`.
     pub(in crate::node) fn stand_down(&self) {
         self.configure(0, 0, BTreeMap::new());
         self.note_ahead(None);
+        self.uncertain.store(false, Ordering::Relaxed);
         self.waiting.store(false, Ordering::Relaxed);
     }
 
-    /// The voters whose clock is above the `m`-th largest clock of the voters. The leader's own
-    /// clock is read now. A voter without a fresh sample is not in the set.
+    /// The voters that the ahead check would refuse as leader: their clock is above the `m`-th
+    /// largest voter clock plus the skew limit. The order is the one of `verdict`, with the
+    /// leader's own clock read now. A voter without a fresh sample is not in the set.
     pub(in crate::node) fn above(&self) -> HashSet<u64> {
         let held = self.voters.lock().unwrap();
-        let majority = held.voters.len() / 2 + 1;
-        let now = (self.mono_ms)();
-        let mut offsets: Vec<(u64, i64)> = held
-            .samples
-            .iter()
-            .filter(|(id, sample)| {
-                **id != held.me && held.voters.contains_key(id) && now - sample.at < FRESH_MS
-            })
-            .map(|(id, sample)| (*id, sample.low))
-            .collect();
-        if held.voters.contains_key(&held.me) {
-            offsets.push((held.me, (self.now_ms)() - now));
-        }
-        let me = held.me;
+        let order = Order::new(&held, (self.mono_ms)(), (self.now_ms)());
         drop(held);
-        if offsets.len() < majority {
+        let Some(mth) = order.mth(|entry| entry.low, 0) else {
             return HashSet::new();
-        }
-        let mut sorted: Vec<i64> = offsets.iter().map(|(_, offset)| *offset).collect();
-        sorted.sort_unstable_by(|a, b| b.cmp(a));
-        let mth = sorted[majority - 1];
-        offsets
-            .into_iter()
-            .filter(|(id, offset)| *id != me && *offset > mth)
-            .map(|(id, _)| id)
+        };
+        let limit = mth.saturating_add(self.max_skew.as_millis() as i64);
+        order
+            .entries
+            .iter()
+            .filter(|entry| entry.id != order.me && entry.low.saturating_add(order.now) > limit)
+            .map(|entry| entry.id)
             .collect()
     }
 
@@ -366,6 +460,10 @@ impl Clock {
         self.waiting.load(Ordering::Relaxed)
     }
 
+    pub(in crate::node) fn uncertain(&self) -> bool {
+        self.uncertain.load(Ordering::Relaxed)
+    }
+
     /// Set or clear the wait of the writer. Log the start of a wait.
     fn set_waiting(&self, reason: Option<&str>) {
         let was = self.waiting.swap(reason.is_some(), Ordering::Relaxed);
@@ -382,24 +480,43 @@ impl Clock {
         let _ = tokio::time::timeout(most, sampled).await;
     }
 
-    /// Wait until the ahead check can decide, and return the SlateDB clock of a new writer. A
-    /// leader of several voters thus waits for the samples of a majority before its open, and
-    /// its `Db` never reads a time without a bound. Missing samples are no measured skew, so
-    /// the wait is no writer fault.
+    /// Wait until the ahead check can decide, and return the SlateDB clock of a new writer.
+    ///
+    /// The gate belongs to the term that this member leads now. A leader of several voters
+    /// waits for the samples of a majority before its open, and its `Db` never reads a time
+    /// without a bound. A lone voter gets a gate without a check. Only a clock that no node
+    /// manages, in a test, gets a gate with no owner.
     pub(super) async fn gate(&self) -> Arc<Gate> {
         loop {
-            let start = match self.verdict() {
-                Verdict::Off => None,
+            let (managed, term, verdict) = self.decide();
+            if !managed {
+                return Arc::new(Gate::new(Some(self.clone()), Mode::Test, None));
+            }
+            // A member that stopped leading waits until the node stops its writer task.
+            let Some(term) = term else {
+                tokio::time::sleep(RECHECK).await;
+                continue;
+            };
+            let (guarded, start) = match verdict {
+                Verdict::Off => {
+                    tokio::time::sleep(RECHECK).await;
+                    continue;
+                }
+                Verdict::Single(_) => (false, None),
                 Verdict::Waiting => {
                     self.wait(NO_SAMPLES, RECHECK).await;
                     continue;
                 }
-                Verdict::Ahead { cap, real, .. } | Verdict::Admit { cap, real } => {
-                    Some(real.min(cap))
-                }
+                Verdict::Ahead { bound, .. }
+                | Verdict::Uncertain(bound)
+                | Verdict::Admit(bound) => (true, Some(bound.real.min(bound.cap))),
             };
             self.set_waiting(None);
-            return Arc::new(Gate::new(Some(self.clone()), start));
+            let mode = Mode::Owned {
+                term,
+                guarded: AtomicBool::new(guarded),
+            };
+            return Arc::new(Gate::new(Some(self.clone()), mode, start));
         }
     }
 
@@ -409,7 +526,8 @@ impl Clock {
             "alarm": self.alarm_name(),
             "behind_ms": self.skew.load(Ordering::Relaxed),
             "ahead_ms": self.ahead.load(Ordering::Relaxed),
-            "waiting": self.waiting(),
+            "waiting": self.waiting() || self.uncertain(),
+            "uncertain": self.uncertain(),
             "samples": samples,
         })
     }
@@ -430,6 +548,8 @@ pub(super) fn floor(manifest: &slatedb::VersionedManifest) -> i64 {
 
 /// The wait reason of a writer without the samples of a voter majority.
 const NO_SAMPLES: &str = "too few voters have a fresh clock sample";
+/// The wait reason of a writer whose last tick is above the bound.
+const ABOVE_CAP: &str = "the last tick is above the clock bound of a voter majority";
 
 /// A batch refusal: the leader clock is ahead of a voter majority over the skew limit. The
 /// writer reports it as a `Fault::Clock`.
@@ -453,22 +573,48 @@ impl std::error::Error for ClockAhead {}
 /// The SlateDB clock of one writer `Db`.
 ///
 /// `admit` fixes the tick of each batch before the materializer submits it:
-/// `max(last, min(now, cap))`. Until the batch completes, `now` returns exactly that tick, so
-/// the batch writer of SlateDB stamps the batch with it. A later step of the wall clock or a
-/// change of the samples cannot change it.
+/// `max(last, min(now, cap))`. The tick must be at or below the cap, so a retained `last` that
+/// a backward step left above the bound waits. Until the batch completes, `now` returns exactly
+/// that tick, so the batch writer of SlateDB stamps the batch with it. A later step of the wall
+/// clock or a change of the samples cannot change it.
 ///
-/// Flushes, checkpoints, the compactor, and GC read `now` too. Between batches it returns
+/// Flushes, checkpoints, the compactor, and GC read `now` too. They take the SST IDs, the
+/// checkpoint times, and the sequence times from it. Between batches it returns
 /// `max(last, min(now, cap))`, and without fresh samples it stays at `last`. So it never steps
 /// back. Sleeps and tickers use SlateDB's default clock, which follows the monotonic clock. A
-/// step of the wall clock thus does not move them. With one voter, `now` is the default clock.
+/// step of the wall clock thus does not move them.
+///
+/// A gate belongs to the term of its open. When that term ends, `now` stays at `last` and no
+/// batch gets a tick again. A lone voter's gate reads SlateDB's default clock. It takes the
+/// check when a voter joins in the term, and it never drops the check again.
 pub(in crate::node) struct Gate {
     clock: Option<Clock>,
+    mode: Mode,
     default: DefaultSystemClock,
     ticks: Mutex<Ticks>,
     /// Tests: each admitted batch notifies the first and waits for the second before SlateDB
     /// gets it.
     #[cfg(test)]
     pub(super) hold: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+}
+
+/// The owner and the check of a gate. The open of the writer decides it.
+#[derive(Debug)]
+enum Mode {
+    /// No node manages the clock, as in a test of the writer alone. No check applies.
+    Test,
+    /// The writer of leader term `term`. Without `guarded`, the open saw one voter.
+    Owned { term: u64, guarded: AtomicBool },
+}
+
+/// What `now` returns between batches.
+enum Reading {
+    /// SlateDB's default clock.
+    Default,
+    /// The last time: the term ended, or the samples are missing.
+    Frozen,
+    /// A time at or below the bound.
+    Capped(i64),
 }
 
 #[derive(Debug)]
@@ -482,17 +628,19 @@ struct Ticks {
 impl std::fmt::Debug for Gate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Gate")
+            .field("mode", &self.mode)
             .field("ticks", &*self.ticks.lock().unwrap())
             .finish_non_exhaustive()
     }
 }
 
 impl Gate {
-    fn new(clock: Option<Clock>, start: Option<i64>) -> Self {
+    fn new(clock: Option<Clock>, mode: Mode, start: Option<i64>) -> Self {
         let default = DefaultSystemClock::new();
         let last = start.unwrap_or_else(|| default.now().timestamp_millis());
         Self {
             clock,
+            mode,
             default,
             ticks: Mutex::new(Ticks {
                 last,
@@ -506,7 +654,7 @@ impl Gate {
     /// A clock with no ahead check, for tests that drive the materializer alone.
     #[cfg(test)]
     pub(in crate::node) fn unchecked() -> Arc<Self> {
-        Arc::new(Self::new(None, None))
+        Arc::new(Self::new(None, Mode::Test, None))
     }
 
     /// The writer opened at the manifest tick `tick`. Each later tick is at or above it.
@@ -515,63 +663,97 @@ impl Gate {
         ticks.last = ticks.last.max(tick);
     }
 
+    /// The verdict for this gate's term, or `None` when the term ended. A verdict with more
+    /// than one voter turns on the check of a lone voter's gate for good.
+    fn owned(&self) -> Option<(Verdict, bool)> {
+        let (Some(clock), Mode::Owned { term, guarded }) = (&self.clock, &self.mode) else {
+            return Some((Verdict::Off, false));
+        };
+        let (_, lead, verdict) = clock.decide();
+        if lead != Some(*term) || verdict == Verdict::Off {
+            return None;
+        }
+        if !matches!(verdict, Verdict::Single(_)) {
+            guarded.store(true, Ordering::Relaxed);
+        }
+        Some((verdict, guarded.load(Ordering::Relaxed)))
+    }
+
     /// The time that SlateDB reads now, in milliseconds.
     fn read(&self) -> i64 {
         let mut ticks = self.ticks.lock().unwrap();
         if let Some(tick) = ticks.admitted {
             return tick;
         }
-        let verdict = self.clock.as_ref().map_or(Verdict::Off, Clock::verdict);
-        let next = match verdict {
-            Verdict::Off => self.default.now().timestamp_millis(),
-            Verdict::Waiting => ticks.last,
-            Verdict::Ahead { cap, real, .. } | Verdict::Admit { cap, real } => real.min(cap),
+        let reading = match self.owned() {
+            None => Reading::Frozen,
+            Some((Verdict::Off, _)) => Reading::Default,
+            Some((Verdict::Single(_), false)) => Reading::Default,
+            Some((Verdict::Waiting, _)) => Reading::Frozen,
+            Some((Verdict::Single(bound), true))
+            | Some((Verdict::Uncertain(bound), _))
+            | Some((Verdict::Ahead { bound, .. }, _))
+            | Some((Verdict::Admit(bound), _)) => Reading::Capped(bound.real.min(bound.cap)),
+        };
+        let next = match reading {
+            Reading::Default => self.default.now().timestamp_millis(),
+            Reading::Frozen => ticks.last,
+            Reading::Capped(time) => time,
         };
         ticks.last = ticks.last.max(next);
         ticks.last
     }
 
     /// Fix the tick of the next batch. Wait while too few voters have a fresh sample, or while
-    /// the cap is below the last tick, as after an open above the cap. Refuse the batch with a
-    /// `ClockAhead` error when the leader clock is ahead of a voter majority. The batch then
-    /// stays in the overlay, and the next writer writes it again.
+    /// the cap is below the last tick, as after an open above the cap or a backward step.
+    /// Refuse the batch with a `ClockAhead` error when the leader clock is ahead of a voter
+    /// majority. The batch then stays in the overlay, and the next writer writes it again.
+    /// After the term of the gate ends, no batch gets a tick: the call waits until the node
+    /// stops the writer task.
     pub(super) async fn admit(&self) -> Result<Admitted<'_>> {
+        let unpinned = Admitted { gate: self };
         let Some(clock) = &self.clock else {
-            return Ok(Admitted { gate: self });
+            return Ok(unpinned);
         };
         loop {
-            let (cap, real) = match clock.verdict() {
-                Verdict::Off => {
+            let Some((verdict, guarded)) = self.owned() else {
+                clock.set_waiting(None);
+                return std::future::pending().await;
+            };
+            let bound = match verdict {
+                // A test gate, or a lone voter's gate that never saw a second voter.
+                Verdict::Off | Verdict::Single(_) if !guarded => {
                     clock.set_waiting(None);
-                    return Ok(Admitted { gate: self });
+                    return Ok(unpinned);
                 }
+                Verdict::Off => return std::future::pending().await,
                 Verdict::Waiting => {
                     clock.wait(NO_SAMPLES, RECHECK).await;
                     continue;
                 }
                 Verdict::Ahead { by, .. } => {
                     clock.set_waiting(None);
-                    clock.note_ahead(Some(by));
+                    clock.note(&verdict);
                     return Err(ClockAhead { by_ms: by }.into());
                 }
-                Verdict::Admit { cap, real } => (cap, real),
+                Verdict::Single(bound) | Verdict::Uncertain(bound) | Verdict::Admit(bound) => {
+                    clock.note(&verdict);
+                    bound
+                }
             };
-            clock.note_ahead(None);
             // The lock guard must not live across an await.
             let above = {
                 let mut ticks = self.ticks.lock().unwrap();
-                let tick = ticks.last.max(real.min(cap));
-                if tick <= cap {
+                let tick = ticks.last.max(bound.real.min(bound.cap));
+                if tick <= bound.cap {
                     ticks.last = tick;
                     ticks.admitted = Some(tick);
                 }
-                tick.saturating_sub(cap)
+                tick.saturating_sub(bound.cap)
             };
             if above > 0 {
                 let wait = Duration::from_millis(above as u64).min(RECHECK);
-                clock
-                    .wait("the last tick is above the clock bound", wait)
-                    .await;
+                clock.wait(ABOVE_CAP, wait).await;
                 continue;
             }
             clock.set_waiting(None);
@@ -643,7 +825,9 @@ impl Node {
 
     /// Give the clock check the term and the voters of this leader. With `probe`, send a clock
     /// probe to each other voter. A manual transport has no peer routes, so the check is off.
-    pub(super) fn tick_clock(&mut self, probe: bool) {
+    /// The node also calls it at once when Raft applies a configuration change or a voter
+    /// process changes, so the next batch admission sees the new voters.
+    pub(in crate::node) fn tick_clock(&mut self, probe: bool) {
         let Some(writer) = &self.writer else {
             return;
         };

@@ -125,26 +125,108 @@ fn a_delayed_older_reply_never_replaces_a_newer_one() {
     let fast = time.wall() + 10_000;
     time.advance(5);
     assert!(reply(&clock, &time, 2, 0, 5));
+    assert!(reply(&clock, &time, 3, 0, 0));
     assert!(!late(&clock, 2, early, fast, (sent, time.mono())));
-    // The leader is 10 s ahead of member 2, and member 3 gave no sample.
+    // The leader is 10 s ahead of both peers.
     time.step(10_000);
     assert!(ahead(clock.verdict()).is_some_and(|by| by > 4_000));
 }
 
-/// Three voters with one missing: the fast leader and its correct peer are the majority.
+/// Three voters with one missing: the missing voter could agree with the fast leader, so the
+/// skew is uncertain, not measured. The tick stays at the cap of the correct peer, and no alarm
+/// rises. The reply of the third voter then proves the skew.
 #[test]
-fn a_fast_leader_with_one_correct_peer_and_one_missing_is_ahead() {
+fn a_missing_voter_makes_a_fast_leader_uncertain() {
     let (clock, time) = leader(&[1, 2, 3]);
     assert_eq!(clock.verdict(), Verdict::Waiting);
-    assert!(reply(&clock, &time, 2, -10_000, 2));
+    assert!(reply(&clock, &time, 2, -10_000, 0));
+    let Verdict::Uncertain(bound) = clock.verdict() else {
+        panic!("a missing voter did not make the skew uncertain");
+    };
+    assert_eq!(bound.cap, time.wall() - 5_000);
+    clock.observe();
+    assert_eq!(clock.alarm_name(), None);
+    assert_eq!(clock.status()["uncertain"], true);
+    assert_eq!(clock.status()["waiting"], true);
+    assert!(reply(&clock, &time, 3, -10_000, 0));
     assert_eq!(ahead(clock.verdict()), Some(5_000));
     clock.observe();
     assert_eq!(clock.alarm_name(), Some("ahead"));
-    assert_eq!(clock.status()["ahead_ms"], 5_000);
+    assert_eq!(clock.status()["uncertain"], false);
     // The skew ends with a correct leader clock.
     time.step(-10_000);
     clock.observe();
     assert_eq!(clock.alarm_name(), None);
+}
+
+/// A correct leader, a peer whose reply is 10 s behind, and a missing correct peer. The
+/// missing peer and the leader can form a majority, so the leader is uncertain and admits at
+/// the cap. With five voters and one missing, three peers 10 s behind prove the skew.
+#[tokio::test]
+async fn partial_replies_prove_a_skew_only_when_no_majority_can_support_it() {
+    let (clock, time) = leader(&[1, 2, 3]);
+    assert!(reply(&clock, &time, 2, -10_000, 0));
+    assert!(matches!(clock.verdict(), Verdict::Uncertain(_)));
+    let gate = clock.gate().await;
+    gate.admit()
+        .await
+        .expect("an uncertain skew refused a batch")
+        .done();
+    assert!(read(&gate) <= time.wall() - 5_000);
+    assert_eq!(clock.alarm_name(), None);
+    assert!(clock.uncertain());
+
+    let (clock, time) = leader(&[1, 2, 3, 4, 5]);
+    for peer in 2..=4 {
+        assert!(reply(&clock, &time, peer, -10_000, 0));
+    }
+    assert_eq!(ahead(clock.verdict()), Some(5_000));
+}
+
+/// The bound is the `m`-th largest clock of all voters, with the leader's own clock read now.
+/// Clocks with a 5 ms limit: the leader at 40 and peers at 100 and 40 give the bound 45, so
+/// a retained tick of 100 waits. Peers at 100 and 100 give 105, and the tick of 100 is
+/// admitted. A fast leader at 110 with peers at 100 and 40 has the bound 105 and is ahead.
+#[tokio::test]
+async fn the_bound_is_the_majority_clock_of_all_voters() {
+    let case = |leader_ms: i64, peers: [i64; 2]| {
+        let (clock, time) = skewed(&[1, 2, 3], Duration::from_millis(5));
+        time.wall.store(START + leader_ms, Ordering::SeqCst);
+        for (peer, peer_ms) in [2, 3].into_iter().zip(peers) {
+            assert!(late(&clock, peer, clock.probe(), START + peer_ms, (0, 0)));
+        }
+        clock
+    };
+    let clock = case(40, [100, 40]);
+    assert_eq!(
+        clock.verdict(),
+        Verdict::Admit(Bound {
+            cap: START + 45,
+            real: START + 40
+        })
+    );
+    let gate = clock.gate().await;
+    gate.floor(START + 100);
+    let waited = tokio::time::timeout(Duration::from_millis(300), gate.admit()).await;
+    assert!(
+        waited.is_err(),
+        "a retained tick above the bound was admitted"
+    );
+    assert!(clock.waiting());
+    assert_eq!(clock.alarm_name(), None);
+
+    let clock = case(40, [100, 100]);
+    let gate = clock.gate().await;
+    gate.floor(START + 100);
+    let admitted = gate.admit().await.unwrap();
+    assert_eq!(read(&gate), START + 100);
+    admitted.done();
+
+    let clock = case(110, [100, 40]);
+    let Verdict::Ahead { by, bound } = clock.verdict() else {
+        panic!("a fast leader was not ahead");
+    };
+    assert_eq!((by, bound.cap), (5, START + 105));
 }
 
 /// Two fast voters of three are a majority. Neither is refused.
@@ -154,7 +236,7 @@ fn two_fast_voters_of_three_are_a_majority() {
     time.step(10_000);
     assert!(reply(&clock, &time, 2, 0, 2));
     assert!(reply(&clock, &time, 3, -10_000, 2));
-    let Verdict::Admit { cap, real } = clock.verdict() else {
+    let Verdict::Admit(Bound { cap, real }) = clock.verdict() else {
         panic!("a fast majority was refused");
     };
     assert!(real <= cap);
@@ -172,7 +254,7 @@ fn slow_replies_never_refuse_a_correct_leader() {
     for (peer, probe) in probes {
         assert!(late(&clock, peer, probe, clock_ms, (sent, time.mono())));
     }
-    let Verdict::Admit { cap, real } = clock.verdict() else {
+    let Verdict::Admit(Bound { cap, real }) = clock.verdict() else {
         panic!("slow replies refused a correct leader");
     };
     assert!(cap < real, "the low edge must cap the tick: {cap} {real}");
@@ -186,7 +268,7 @@ fn slow_replies_never_refuse_a_correct_leader() {
 fn one_voter_has_no_ahead_check() {
     let (clock, time) = leader(&[1]);
     time.step(3_600_000);
-    assert_eq!(clock.verdict(), Verdict::Off);
+    assert!(matches!(clock.verdict(), Verdict::Single(_)));
     let (clock, _) = leader(&[1, 2, 3]);
     clock.stand_down();
     assert_eq!(clock.verdict(), Verdict::Off);
@@ -304,7 +386,9 @@ async fn an_admitted_tick_holds_until_slatedb_writes_the_batch() {
     let (clock, time) = skewed(&[1, 2, 3], Duration::from_millis(5));
     let at = |ms: i64| time.wall.store(START + ms, Ordering::SeqCst);
     at(90);
-    assert!(late(&clock, 2, clock.probe(), START + 100, (0, 0)));
+    for peer in [2, 3] {
+        assert!(late(&clock, peer, clock.probe(), START + 100, (0, 0)));
+    }
     let gate = clock.gate().await;
     let db = open(&store, &gate).await;
     gate.floor(floor(&db.manifest()));
@@ -312,7 +396,9 @@ async fn an_admitted_tick_holds_until_slatedb_writes_the_batch() {
     db.flush().await.unwrap();
     assert_eq!(db.manifest().last_l0_clock_tick(), START + 90);
 
-    assert!(late(&clock, 2, clock.probe(), START + 90, (0, 0)));
+    for peer in [2, 3] {
+        assert!(late(&clock, peer, clock.probe(), START + 90, (0, 0)));
+    }
     at(94);
     let reached = Arc::new(tokio::sync::Notify::new());
     let resume = Arc::new(tokio::sync::Notify::new());
@@ -464,8 +550,9 @@ async fn an_idle_leader_clock_advances_and_never_steps_back() {
     db.close().await.unwrap();
 }
 
-/// The handoff set holds a voter whose clock is above the `m`-th largest clock. The leader reads
-/// its own clock now, so a fast leader never makes a correct voter suspect.
+/// The handoff set holds a voter whose clock is above the `m`-th largest clock plus the skew
+/// limit. The leader reads its own clock now, so a fast leader never makes a correct voter
+/// suspect.
 #[test]
 fn only_a_voter_above_the_majority_clock_is_suspect() {
     let (clock, time) = leader(&[1, 2, 3]);
@@ -476,9 +563,167 @@ fn only_a_voter_above_the_majority_clock_is_suspect() {
     // above them, and the fast leader does not make member 2 suspect.
     time.step(30_000);
     assert!(clock.above().is_empty());
+    // A peer 1 ms above the majority clock would not be refused as leader, so it is no suspect.
+    let (clock, time) = leader(&[1, 2, 3]);
+    assert!(reply(&clock, &time, 2, 1, 0));
+    assert!(reply(&clock, &time, 3, 0, 0));
+    assert!(clock.above().is_empty());
+    assert!(reply(&clock, &time, 2, 6_000, 0));
+    assert_eq!(clock.above(), HashSet::from([2]));
     // With one sample of three voters, the leader and that peer are the majority.
     let (clock, time) = leader(&[1, 2, 3]);
     time.step(10_000);
     assert!(reply(&clock, &time, 2, -10_000, 1));
     assert!(clock.above().is_empty());
+}
+
+/// A leader clock one hour behind the machine clock, so SlateDB's default clock is far ahead
+/// of each voter.
+fn behind_machine(voters: &[u64]) -> (Clock, Time) {
+    let (clock, time) = leader(voters);
+    let machine = DefaultSystemClock::new().now().timestamp_millis();
+    time.wall.store(machine - 3_600_000, Ordering::SeqCst);
+    (clock, time)
+}
+
+/// The newest L0 SST ID time of `manifest`.
+fn newest_sst(manifest: &slatedb::VersionedManifest) -> i64 {
+    let newest = manifest.l0().iter().map(|view| view.sst.id.value()).max();
+    newest.map_or(i64::MIN, |id| id.timestamp_ms() as i64)
+}
+
+/// Item 1 of review round 1: the leader writes a batch and stands down, and a flush runs after
+/// that. The voter clocks are one hour behind the machine clock. The ended term freezes the
+/// SlateDB clock, so the reopened manifest holds no tick and no L0 SST ID time above the last
+/// authorized time. No batch gets a tick after the term ended. A compaction while the term lasts
+/// takes output SST IDs at or below the cap. After the term, the frozen clock holds them too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ended_term_freezes_the_slatedb_clock() {
+    for new_term in [false, true] {
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let (clock, time) = behind_machine(&[1, 2, 3]);
+        assert!(reply(&clock, &time, 2, 0, 0));
+        assert!(reply(&clock, &time, 3, 0, 0));
+        let gate = clock.gate().await;
+        let db = open(&store, &gate).await;
+        // The admin takes the ID of a submitted compaction from the same clock.
+        let admin = slatedb::admin::Admin::builder("state", store.clone())
+            .with_system_clock(gate.clone())
+            .build();
+        write(&db, &gate, 1).await;
+        db.flush().await.unwrap();
+        // The compactor needs its clock to move: all clocks run 10x fast, with fresh samples.
+        let running = tokio::spawn({
+            let (clock, time) = (clock.clone(), time.clone());
+            async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    time.advance(100);
+                    reply(&clock, &time, 2, 0, 0);
+                    reply(&clock, &time, 3, 0, 0);
+                }
+            }
+        });
+        dst_compact(&admin, 1).await.unwrap();
+        running.abort();
+        let _ = running.await;
+        let compacted = admin.read_manifest(None).await.unwrap().unwrap();
+        assert!(!compacted.compacted().is_empty());
+        for view in compacted.compacted().iter().flat_map(|run| run.sst_views()) {
+            assert!(view.sst.id.value().timestamp_ms() as i64 <= read(&gate));
+        }
+        write(&db, &gate, 2).await;
+        let authorized = read(&gate);
+        assert!(authorized <= time.wall());
+        match new_term {
+            false => clock.stand_down(),
+            true => configure(&clock, 3, &[1, 2, 3], PROCESS),
+        }
+        assert_eq!(read(&gate), authorized);
+        // A flush is queued at the step-down, and its caller drops it. The work still runs.
+        drop(tokio::spawn({
+            let db = db.clone();
+            async move { db.flush().await }
+        }));
+        let admitted = tokio::time::timeout(Duration::from_millis(200), gate.admit()).await;
+        assert!(admitted.is_err(), "a batch got a tick after its term ended");
+        db.flush().await.unwrap();
+        // The frozen clock holds the time of the compactor too, so the compaction need not
+        // end. Any output takes its SST ID from the frozen clock.
+        let _ = dst_compact(&admin, 1).await;
+        db.close_with_options(slatedb::config::CloseOptions { flush_type: None })
+            .await
+            .unwrap();
+        let manifest = admin.read_manifest(None).await.unwrap().unwrap();
+        assert!(manifest.last_l0_clock_tick() <= authorized);
+        assert!(newest_sst(&manifest) <= authorized);
+        assert!(
+            floor(&manifest) <= authorized,
+            "{}",
+            floor(&manifest) - authorized
+        );
+        for run in manifest.compacted() {
+            for view in run.sst_views() {
+                assert!(view.sst.id.value().timestamp_ms() as i64 <= authorized);
+            }
+        }
+    }
+}
+
+/// Sig-Codex, round 1: after a backward step of the leader and one peer, the other peer keeps
+/// the old time. The next batch waits: only one of three voters supports the retained tick.
+/// The manifest keeps the tick of the first batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_backward_step_of_a_majority_holds_the_next_batch() {
+    let store: Arc<dyn slatedb::object_store::ObjectStore> =
+        Arc::new(slatedb::object_store::memory::InMemory::new());
+    let (clock, time) = leader(&[1, 2, 3]);
+    time.step(60_000);
+    assert!(reply(&clock, &time, 2, 0, 0));
+    assert!(reply(&clock, &time, 3, 0, 0));
+    let gate = clock.gate().await;
+    let db = open(&store, &gate).await;
+    write(&db, &gate, 1).await;
+    let first = read(&gate);
+    // The leader and member 3 step back 60 s. Member 2 keeps its clock.
+    time.step(-60_000);
+    assert!(reply(&clock, &time, 2, 60_000, 0));
+    assert!(reply(&clock, &time, 3, 0, 0));
+    let held = tokio::time::timeout(Duration::from_millis(300), write(&db, &gate, 2)).await;
+    assert!(
+        held.is_err(),
+        "a batch was admitted above two of three voters"
+    );
+    assert_eq!(clock.alarm_name(), None);
+    db.flush().await.unwrap();
+    assert_eq!(db.manifest().last_l0_clock_tick(), first);
+    db.close().await.unwrap();
+}
+
+/// A lone voter's writer has no check. A promoted learner joins the voters in the same term.
+/// The next batch waits for the sample of the new voter, and then gets a bounded tick.
+#[tokio::test]
+async fn a_promoted_voter_turns_on_the_check_before_the_next_batch() {
+    let (clock, time) = leader(&[1]);
+    let gate = clock.gate().await;
+    gate.admit().await.unwrap().done();
+    configure(&clock, 2, &[1, 2], PROCESS);
+    let waited = tokio::time::timeout(Duration::from_millis(300), gate.admit()).await;
+    assert!(
+        waited.is_err(),
+        "a batch was admitted without the new voter's sample"
+    );
+    assert!(clock.waiting());
+    // The check holds also while the samples are missing: the clock does not move.
+    let frozen = read(&gate);
+    time.advance(1_000);
+    assert_eq!(read(&gate), frozen);
+    assert!(reply(&clock, &time, 2, 0, 0));
+    let admitted = tokio::time::timeout(Duration::from_secs(1), gate.admit())
+        .await
+        .expect("the sample did not end the wait")
+        .unwrap();
+    assert!(read(&gate) <= time.wall().max(frozen));
+    admitted.done();
 }

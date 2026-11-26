@@ -1343,7 +1343,12 @@ impl Node {
                 writer,
             } => self.view_ack(member, checkpoints, publish, coverage, writer),
             Event::PeerProcess { member, process } => {
+                let changed = self.raw.store().process(member) != process;
                 self.raw.store().note_process(member, process);
+                // A new voter process drops its clock sample before the next batch admission.
+                if changed {
+                    self.tick_clock(false);
+                }
             }
             Event::SnapshotRefused { member, target } => {
                 self.raw.store().note_refused(member, target);

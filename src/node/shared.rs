@@ -1547,7 +1547,8 @@ impl Node {
             gauges
                 .clock_alarm
                 .set(writer.clock.alarm_name().is_some().into());
-            gauges.clock_waiting.set(writer.clock.waiting().into());
+            let waiting = writer.clock.waiting() || writer.clock.uncertain();
+            gauges.clock_waiting.set(waiting.into());
             gauges
                 .reopens
                 .set(writer.reopens.load(std::sync::atomic::Ordering::Relaxed) as i64);
