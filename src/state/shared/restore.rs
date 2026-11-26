@@ -919,6 +919,7 @@ async fn write(
         }
         if unflushed >= FLUSH_BYTES || flushed.elapsed() >= FLUSH_INTERVAL {
             db.flush().await?;
+            crate::failpoint::hit("shared-restore-after-flush");
             advance.flushes.fetch_add(1, Ordering::Relaxed);
             unflushed = 0;
             flushed = Instant::now();

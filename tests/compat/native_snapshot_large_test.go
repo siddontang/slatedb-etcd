@@ -58,23 +58,22 @@ func putRetrying(ctx context.Context, api *clientv3.Client, key, value string) (
 }
 
 // TestNativeSnapshotStreamsLargeState saves more than the former 64 MiB limit through the
-// etcdctl save path while writes continue, then restores it. SLATEDB_SNAPSHOT_TEST_MIB sets the
-// state size. Both state modes stream the backup. A restore into shared mode accepts at most
-// 64 MiB, so each image restores into a replicated cluster.
+// etcdctl save path while writes continue, then restores it into the same state mode and writes.
+// SLATEDB_SNAPSHOT_TEST_MIB sets the state size. TestFailpointSharedRestore stops such a restore.
 func TestNativeSnapshotStreamsLargeState(t *testing.T) {
 	for _, mode := range []string{"replicated", "shared"} {
-		t.Run(mode, func(t *testing.T) { streamLargeState(t, "--state-mode", mode) })
+		t.Run(mode, func(t *testing.T) { streamLargeState(t, mode) })
 	}
 }
 
-func streamLargeState(t *testing.T, args ...string) {
+func streamLargeState(t *testing.T, mode string) {
 	mib := 80
 	if value := os.Getenv("SLATEDB_SNAPSHOT_TEST_MIB"); value != "" {
 		var err error
 		mib, err = strconv.Atoi(value)
 		require.NoError(t, err)
 	}
-	source := newClusterSize(t, 1, args...)
+	source := newClusterSize(t, 1, "--state-mode", mode)
 	api := client(t, source.addresses)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
@@ -147,7 +146,7 @@ func streamLargeState(t *testing.T, args ...string) {
 
 	started := time.Now()
 	restored := newClusterConfigured(t, 1, func(c *cluster) { c.readyTimeout = 10 * time.Minute },
-		"--restore-snapshot", file)
+		"--state-mode", mode, "--restore-snapshot", file)
 	t.Logf("restored %d MiB and elected a leader in %s", info.Size()>>20, time.Since(started))
 	if linux {
 		_, restorePeak := processMemory(t, restored.processes[1].Process.Pid)
@@ -165,4 +164,7 @@ func streamLargeState(t *testing.T, args ...string) {
 	result, err = check.Get(ctx, "concurrent/during")
 	require.NoError(t, err)
 	require.Empty(t, result.Kvs)
+	after, err := putRetrying(ctx, check, "after/restore", "value")
+	require.NoError(t, err)
+	require.Equal(t, boundary+1, after.Header.Revision)
 }
