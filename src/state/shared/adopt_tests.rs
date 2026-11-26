@@ -1,4 +1,5 @@
-//! A failed load of a new base leaves the current state and the snapshot receipt for a retry.
+//! A failed load of a new base leaves the current state, and an install keeps its base for a
+//! retry.
 
 use super::*;
 use crate::object::faults::{FaultStore, FAIL_SST_GET};
@@ -96,11 +97,11 @@ async fn a_failed_base_load_keeps_the_state() {
     writer.close().await.unwrap();
 }
 
-/// The install of a received snapshot fails on a read of its base. The receipt stays and pins
-/// the checkpoint, so retention cannot delete it before the retry. The retry installs the
-/// snapshot, and then the receipt goes.
+/// The install of a received snapshot fails on a read of its base. The install keeps the base,
+/// which pins the checkpoint, so retention cannot delete it before the retry. The retry installs
+/// the snapshot, and then the install holds no base.
 #[tokio::test]
-async fn a_failed_install_keeps_the_receipt() {
+async fn a_failed_install_keeps_its_base() {
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     let options = options();
     let open = |cache| {
@@ -140,16 +141,23 @@ async fn a_failed_install_keeps_the_receipt() {
     snapshot.mut_metadata().index = 4;
     snapshot.mut_metadata().term = 4;
     snapshot.data = transfer::ViewDescriptor::new(id).encode().unwrap();
+    let mut reader = None;
     faults.set(FAIL_SST_GET);
-    behind.install_snapshot(&snapshot).await.unwrap_err();
+    let failed = behind.install_snapshot_with(&snapshot, &mut reader).await;
     faults.set(0);
+    failed.unwrap_err();
     assert!(faults.entered.available_permits() > 0, "no read failed");
     assert_eq!(behind.applied, 1);
+    assert!(reader.is_some(), "the failed install dropped its base");
     assert!(
         source.pinned().contains(&id),
         "the failed install lost the pin"
     );
-    behind.install_snapshot(&snapshot).await.unwrap();
+    behind
+        .install_snapshot_with(&snapshot, &mut reader)
+        .await
+        .unwrap();
+    assert!(reader.is_none(), "the install kept its base");
     assert_eq!(behind.applied, 4);
     assert_eq!(behind.base_checkpoint(), Some(id));
     assert!(source.take_received(id).is_none(), "the receipt stayed");

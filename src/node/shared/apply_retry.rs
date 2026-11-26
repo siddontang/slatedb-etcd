@@ -38,7 +38,7 @@ pub(in crate::node) struct Paused {
 
 /// The node side of the signals of an apply job that waits on a storage error.
 pub(in crate::node) struct Control {
-    stop: watch::Sender<bool>,
+    stop: Arc<watch::Sender<bool>>,
     preempt: Arc<watch::Sender<u64>>,
     paused: watch::Receiver<Option<Paused>>,
     /// The sender of the pause report, so a node test can set it without a job.
@@ -60,6 +60,12 @@ impl Control {
             *covered = (*covered).max(index);
             raise
         });
+    }
+
+    /// A handle that stops the worker from another task, for tests.
+    #[cfg(test)]
+    pub(in crate::node) fn stopper(&self) -> Arc<watch::Sender<bool>> {
+        self.stop.clone()
     }
 
     /// A handle that preempts from another task, and the pause reports, for tests.
@@ -103,7 +109,7 @@ pub(super) fn signals() -> (Control, Signals) {
     let (paused, pauses) = watch::channel(None);
     let paused = Arc::new(paused);
     let control = Control {
-        stop,
+        stop: Arc::new(stop),
         preempt: Arc::new(preempt),
         paused: pauses,
         #[cfg(test)]
@@ -381,12 +387,16 @@ impl Executor {
     /// shared mode a storage error of the base load leaves the state as it was. A transient
     /// error runs the install again. A missing object or corrupt data holds it, as for an
     /// adoption. A newer snapshot ends the wait with `Waited::Covered`. A replicated install is
-    /// not staged, so its errors stop apply.
+    /// not staged, so its errors stop apply. The job keeps the base of the checkpoint across its
+    /// tries, and it drops the base when it ends.
     pub(super) async fn install_retrying(&mut self, snapshot: &Snapshot) -> Result<Waited> {
         let mut retry = Retry::default();
         let index = snapshot.get_metadata().index + 1;
+        // The base of the snapshot stays with the job until it ends, also when a stale receipt
+        // replaces the receipt slot meanwhile.
+        let mut reader = None;
         loop {
-            let installed = Box::pin(self.state.install_snapshot(snapshot)).await;
+            let installed = Box::pin(self.state.install_snapshot_with(snapshot, &mut reader)).await;
             let staged = self.state.is_shared();
             let (fault, error) = match installed.map_err(|error| (retryable(&error), error)) {
                 Err((Some(fault), error)) if staged => (fault, error),

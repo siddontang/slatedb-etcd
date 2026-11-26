@@ -443,8 +443,10 @@ checkpoint is gone, it takes a checkpoint in the same range as a restart does.
   checkpoint at once. It builds no image.
 - **Receive:** the HTTP handler opens `reader(C)` before it steps `MsgSnapshot` into Raft, as
   today's handler copies objects first (`api.rs:103-117`). A failed open fails the request, and
-  Raft retries. The member keeps the reader until the install succeeds or a newer snapshot
-  replaces it, also while the install retries. The member reports `C` in `ViewAck`.
+  Raft retries. The install takes the reader and keeps it across its tries. It drops the reader
+  when it succeeds, when Raft accepts a newer snapshot, or at a stop. A later receipt does not
+  replace it, also one of a stale snapshot that Raft then rejects. The member reports `C` in
+  `ViewAck`.
 - The record index can be above `F(C)`. The record keeps the two apart: the checkpoint gives `F`
   and its term, and the record metadata gives the index and the term there. Install loads the
   state at `F`, so the counter and term rows match. It then raises the applied index, the

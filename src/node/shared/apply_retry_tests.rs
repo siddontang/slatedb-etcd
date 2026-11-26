@@ -652,3 +652,147 @@ async fn a_missing_object_holds_an_adoption() {
 async fn corrupt_data_holds_an_adoption() {
     base_hold(BaseFault::Corrupt, false).await;
 }
+
+/// How `install_keeps_its_base` ends the install job.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InstallEnd {
+    /// A stale receipt replaces the receipt slot, and the manifests stop decoding. The retry
+    /// still installs from the base that the job keeps.
+    Installs,
+    /// A newer snapshot that Raft accepted ends the job.
+    Preempted,
+    /// The worker stops.
+    Stopped,
+}
+
+/// An install at 4 takes the base of its receipt, and its first load fails. The job keeps that
+/// base across its tries, and it drops it when the job ends.
+async fn install_keeps_its_base(end: InstallEnd) {
+    use crate::object::faults::{CORRUPT_MANIFEST, LOSE_SST_TWICE};
+    use crate::state::shared::tests::{checkpoint, options, put, writer};
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let open = |cache| {
+        let store: Arc<dyn ObjectStore> = faults.clone();
+        async move {
+            StateMachine::open_shared(
+                store,
+                "cluster",
+                "test",
+                cache,
+                &options(),
+                crate::state::transfer::Backend::Local,
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let large = |key: &str| put(key, &"v".repeat(8 << 10));
+    let mut ahead = open(Default::default()).await;
+    let mut behind = open(COLD).await;
+    for state in [&mut ahead, &mut behind] {
+        state.entry_term = 4;
+    }
+    let writer = writer(&ahead).await;
+    let mut written = 0;
+    for n in 1..=2 {
+        ahead.apply_etcd(n, &large(&format!("k{n}"))).await.unwrap();
+    }
+    let stale = checkpoint(&ahead, &writer, &mut written)
+        .await
+        .checkpoint
+        .unwrap();
+    for n in 3..=4 {
+        ahead.apply_etcd(n, &large(&format!("k{n}"))).await.unwrap();
+    }
+    let id = checkpoint(&ahead, &writer, &mut written)
+        .await
+        .checkpoint
+        .unwrap();
+    behind.apply_etcd(1, &large("k1")).await.unwrap();
+    let source = behind.shared.as_ref().unwrap().source.clone();
+    source.receive(id).await.unwrap();
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = 4;
+    snapshot.mut_metadata().term = 4;
+    snapshot.data = crate::state::transfer::ViewDescriptor::new(id)
+        .encode()
+        .unwrap();
+    // The first load loses an SST, and the install holds. Later reads find it again.
+    faults.set(LOSE_SST_TWICE);
+    let (events, _) = mpsc::channel(8);
+    let mut worker = Worker::start(behind, events, true, None);
+    worker
+        .submit(Work {
+            job: Job::Snapshot(snapshot),
+            header: HEADER,
+            delay: Duration::ZERO,
+        })
+        .unwrap();
+    let (preempt, mut paused) = worker.control.handles();
+    let stopper = worker.control.stopper();
+    let during = {
+        let source = source.clone();
+        let faults = faults.clone();
+        tokio::spawn(async move {
+            let held = paused.wait_for(|paused| {
+                paused
+                    .as_ref()
+                    .is_some_and(|paused| paused.held && paused.index == 5)
+            });
+            tokio::time::timeout(Duration::from_secs(5), held)
+                .await
+                .expect("the install did not hold")
+                .unwrap();
+            match end {
+                InstallEnd::Installs => {
+                    // Raft rejects the stale snapshot later. Its receipt replaces the slot.
+                    source.receive(stale).await.unwrap();
+                    faults.set(CORRUPT_MANIFEST);
+                }
+                InstallEnd::Preempted => drop(preempt.send_replace(10)),
+                InstallEnd::Stopped => drop(stopper.send_replace(true)),
+            }
+        })
+    };
+    let result = tokio::time::timeout(Duration::from_secs(10), worker.step())
+        .await
+        .expect("the install did not end");
+    during.await.unwrap();
+    faults.set(0);
+    match end {
+        InstallEnd::Installs => {
+            let installed = result.unwrap().unwrap();
+            assert!(!installed.early);
+            assert_eq!(installed.applied, 4);
+            assert_eq!(worker.state().base_checkpoint(), Some(id));
+        }
+        InstallEnd::Preempted => {
+            let ended = result.unwrap().unwrap();
+            assert!(ended.early);
+            assert_eq!(ended.applied, 1);
+            assert!(!source.pinned().contains(&id), "the job kept its base");
+        }
+        InstallEnd::Stopped => {
+            assert!(result.is_err(), "the stopped install did not fail");
+            assert!(!source.pinned().contains(&id), "the job kept its base");
+        }
+    }
+    worker.state_mut().close().await.unwrap();
+    ahead.close().await.unwrap();
+    writer.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_install_keeps_its_base_when_a_stale_receipt_comes() {
+    install_keeps_its_base(InstallEnd::Installs).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_newer_snapshot_releases_the_base_of_an_install() {
+    install_keeps_its_base(InstallEnd::Preempted).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_releases_the_base_of_an_install() {
+    install_keeps_its_base(InstallEnd::Stopped).await;
+}

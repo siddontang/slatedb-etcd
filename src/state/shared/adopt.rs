@@ -125,11 +125,17 @@ impl StateMachine {
     }
 
     /// Install a format 6 snapshot: the checkpoint that Raft sent. The receive handler opened it.
+    ///
+    /// `reader` is the base of the install job. The first try takes it from the receipt, or it
+    /// opens the checkpoint. A failed try leaves it there, so the next try needs no new open. A
+    /// later receipt of another snapshot cannot replace it then. The caller drops it when the
+    /// job ends: after the install, a newer accepted snapshot, or a stop.
     pub(crate) async fn install_view(
         &mut self,
         descriptor: transfer::ViewDescriptor,
         index: u64,
         term: u64,
+        reader: &mut Option<Arc<Base>>,
     ) -> Result<()> {
         let shared = self
             .shared
@@ -155,18 +161,21 @@ impl StateMachine {
             }
             return Ok(());
         }
-        // The receipt pins the checkpoint until the install succeeds, so a retry that follows
-        // a failed load still finds it. See "Receive" in `docs/shared-state.md`.
-        let base = match shared.source.received(id) {
-            Some(base) => base,
-            // A storage error of the open keeps its class, so apply can retry.
+        // The job keeps the base across its tries, so a retry after a failed load still has
+        // it. See "Receive" in `docs/shared-state.md`.
+        let base = match reader.as_ref().filter(|base| base.checkpoint == Some(id)) {
+            Some(base) => base.clone(),
             None => {
-                let base = shared
-                    .source
-                    .open_base(id)
-                    .await
-                    .map_err(crate::mvcc::storage_fault::read_cause)?;
-                shared.source.keep_received(id, &base);
+                let base = match shared.source.take_received(id) {
+                    Some(base) => base,
+                    // A storage error of the open keeps its class, so apply can retry.
+                    None => shared
+                        .source
+                        .open_base(id)
+                        .await
+                        .map_err(crate::mvcc::storage_fault::read_cause)?,
+                };
+                *reader = Some(base.clone());
                 base
             }
         };
@@ -180,9 +189,7 @@ impl StateMachine {
         let row_term = if base.applied == index { term } else { 0 };
         self.adopt_base(base, row_term).await?;
         // The state holds the base now, and the base pins its checkpoint.
-        if let Some(shared) = &self.shared {
-            shared.source.take_received(id);
-        }
+        reader.take();
         self.extend_base(index, term)
     }
 }

@@ -338,9 +338,9 @@ pub(crate) struct Source {
     pub cache: Arc<dyn slatedb::db_cache::DbCache>,
     /// Opens and deletions of checkpoints. One lock orders them. See `Pins`.
     pins: Mutex<Pins>,
-    /// Bases of received snapshots, with their last use. A receipt pins its checkpoint until
-    /// the install succeeds or a newer receipt replaces it, also while the install retries. Raft
-    /// can also drop a snapshot, so a receipt expires `RECEIPT_LIFETIME` after its last use.
+    /// Bases of received snapshots that no install took yet, with their receive time. An
+    /// install takes the base and keeps it while it retries. Raft can also drop a snapshot, so a
+    /// receipt expires after `RECEIPT_LIFETIME`.
     received: Mutex<std::collections::HashMap<uuid::Uuid, (std::time::Instant, Arc<Base>)>>,
     /// DST: every open fails, as for a checkpoint that cannot open.
     #[cfg(test)]
@@ -566,25 +566,6 @@ impl Source {
         *self.received.lock().unwrap() =
             std::collections::HashMap::from([(id, (std::time::Instant::now(), base))]);
         Ok(())
-    }
-
-    /// The base of the receipt of `id`, if any. The receipt stays, and its lifetime starts
-    /// again, so an install that fails keeps the pin for its next try.
-    fn received(&self, id: uuid::Uuid) -> Option<Arc<Base>> {
-        let mut received = self.received.lock().unwrap();
-        let (at, base) = received.get_mut(&id)?;
-        *at = std::time::Instant::now();
-        Some(base.clone())
-    }
-
-    /// Keep `base` as the receipt of `id` until the install succeeds. An install opens the
-    /// checkpoint itself after a restart or after the receipt expired. A newer receipt stays.
-    fn keep_received(&self, id: uuid::Uuid, base: &Arc<Base>) {
-        self.received
-            .lock()
-            .unwrap()
-            .entry(id)
-            .or_insert_with(|| (std::time::Instant::now(), base.clone()));
     }
 
     fn take_received(&self, id: uuid::Uuid) -> Option<Arc<Base>> {
