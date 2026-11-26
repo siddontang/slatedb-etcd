@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check S3 startup retries before the recovery tests."""
+"""Check the RustFS fixture and its store settings."""
 
 from io import BytesIO
 import unittest
@@ -56,6 +56,11 @@ class SharedStore(unittest.TestCase):
         flags = s3.shared_args(first, self.SERVER)
         self.assertEqual(flags[:2], ["--state-mode", "shared"])
         self.assertEqual(flags[flags.index("--s3-prefix") + 1], first)
+        self.assertIn("--s3-allow-http", flags)
+        secure = s3.shared_args(first, dict(self.SERVER, SLATEDB_S3_TEST_ENDPOINT="https://s3"))
+        self.assertNotIn("--s3-allow-http", secure)
+        aws = s3.shared_args(first, {"SLATEDB_S3_TEST_BUCKET": "bucket"})
+        self.assertNotIn("--s3-endpoint", aws)
         with self.assertRaises(RuntimeError):
             s3.shared_args(first, {})
 

@@ -137,5 +137,6 @@ class BenchmarkTests(unittest.TestCase):
             self.assertEqual(report["samples"], [])
 
 
+
 if __name__ == "__main__":
     unittest.main()

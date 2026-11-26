@@ -10,6 +10,10 @@ import subprocess
 import sys
 from urllib.parse import urlsplit
 
+# The fixture runs as a symlink in the upstream bin directory. Load the RustFS helpers.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+from rustfs_fixture import shared_args  # noqa: E402
+
 
 def local_url(value):
     url = urlsplit(value)
@@ -28,16 +32,14 @@ def shared_store(store, cluster):
     """Return the flags and the environment of one member of a cluster of several members.
 
     The members run in shared state mode on RustFS. `cluster` is the first member's data directory.
-    It names one cluster and stays the same when the members restart.
+    It names one cluster and stays the same when the members restart. The prefix of the cluster is
+    below the prefix of the run, which check-upstream-go.py removes after each test.
     """
     if store is None:
         raise ValueError("A cluster of several members needs RustFS. Run check-upstream-go.py")
-    prefix = "upstream-e2e/" + hashlib.sha256(cluster.encode()).hexdigest()[:16]
-    flags = ["--state-mode", "shared", "--s3-bucket", store["bucket"], "--s3-endpoint",
-             store["endpoint"], "--s3-allow-http", "--s3-prefix", prefix]
-    env = {"AWS_ACCESS_KEY_ID": store["access_key"], "AWS_SECRET_ACCESS_KEY": store["secret_key"],
-           "AWS_EC2_METADATA_DISABLED": "true"}
-    return flags, env
+    prefix = store["prefix"] + "/" + hashlib.sha256(cluster.encode()).hexdigest()[:16]
+    env = {name: value for name, value in store.items() if name.startswith("AWS_")}
+    return shared_args(prefix, store), dict(env, AWS_EC2_METADATA_DISABLED="true")
 
 
 def service_args(argv=None, store=None):

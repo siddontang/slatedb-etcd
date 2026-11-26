@@ -63,8 +63,9 @@ class BenchResults(unittest.TestCase):
         self.assertEqual(len({c.name for c in cells}), 392)
 
     def test_fixture_puts_several_members_on_rustfs(self):
-        store = {"endpoint": "http://127.0.0.1:9", "bucket": "b", "access_key": "k",
-                 "secret_key": "s"}
+        store = {"prefix": "upstream-e2e/run", "SLATEDB_S3_TEST_ENDPOINT": "http://127.0.0.1:9",
+                 "SLATEDB_S3_TEST_BUCKET": "b", "AWS_ACCESS_KEY_ID": "k",
+                 "AWS_SECRET_ACCESS_KEY": "s"}
 
         def member(count, cluster="/tmp/cluster/0", settings=store):
             names = [f"m{i}" for i in range(count)]
@@ -88,6 +89,7 @@ class BenchResults(unittest.TestCase):
         # A restart keeps the prefix. Another cluster gets another prefix.
         self.assertEqual(prefix(command), prefix(member(3)[0]))
         self.assertNotEqual(prefix(command), prefix(member(3, "/tmp/other/0")[0]))
+        self.assertTrue(prefix(command).startswith("upstream-e2e/run/"))
         single, env = member(1)
         self.assertNotIn("--state-mode", single)
         self.assertEqual(env, {})

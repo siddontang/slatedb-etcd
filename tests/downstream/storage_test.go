@@ -78,14 +78,21 @@ func backend(t *testing.T, kind string) *clientv3.Client {
 			s3, bucket := os.Getenv("SLATEDB_S3_TEST_ENDPOINT"), os.Getenv("SLATEDB_S3_TEST_BUCKET")
 			require.True(t, s3 != "" && bucket != "", "run scripts/check-compat.py --suite downstream")
 			// A temporary directory name repeats across tests, so the prefix takes a random part.
-			prefix := make([]byte, 8)
-			_, err = rand.Read(prefix)
+			random := make([]byte, 8)
+			_, err = rand.Read(random)
 			require.NoError(t, err)
+			prefix := "downstream/" + hex.EncodeToString(random)
+			// This module cannot import the compat test package. Its flags copy `storeFlags` in
+			// tests/compat/compat_test.go and `shared_args` in scripts/rustfs_fixture.py.
+			flags := []string{"--state-mode", "shared", "--s3-bucket", bucket, "--s3-prefix", prefix,
+				"--s3-endpoint", s3}
+			if strings.HasPrefix(s3, "http://") {
+				flags = append(flags, "--s3-allow-http")
+			}
 			for i, endpoint := range endpoints {
 				args := []string{"--id", fmt.Sprint(i + 1), "--listen", endpoint,
-					"--cluster-id", filepath.Base(root), "--dir", filepath.Join(root, fmt.Sprint(i+1)),
-					"--state-mode", "shared", "--s3-bucket", bucket, "--s3-endpoint", s3,
-					"--s3-allow-http", "--s3-prefix", "downstream/" + hex.EncodeToString(prefix)}
+					"--cluster-id", filepath.Base(root), "--dir", filepath.Join(root, fmt.Sprint(i+1))}
+				args = append(args, flags...)
 				for j, peer := range endpoints {
 					args = append(args, "--peer", fmt.Sprintf("%d=%s", j+1, peer))
 				}

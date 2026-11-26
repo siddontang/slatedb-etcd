@@ -12,7 +12,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-from rustfs_fixture import shared_store
+from rustfs_fixture import STORE_ENV, shared_store, unique_prefix
 from upstream_source import ROOT, INVENTORY, build_tool, checked_source, start_cluster
 
 
@@ -256,13 +256,12 @@ def run_suite(source, cases, args, process_suite, required):
                 (binaries / "slatedb-etcd").symlink_to(args.binary.resolve(strict=True))
                 (binaries / "etcd").symlink_to(ROOT / "tests/upstream/service-process.py")
                 # The fixture runs clusters of several members in shared state mode on RustFS.
+                # Their prefixes are below one prefix of this run.
+                store_prefix = unique_prefix("upstream-e2e")
                 settings = binaries / "shared-store.json"
                 settings.touch(mode=0o600)
-                settings.write_text(json.dumps({
-                    "endpoint": os.environ["SLATEDB_S3_TEST_ENDPOINT"],
-                    "bucket": os.environ["SLATEDB_S3_TEST_BUCKET"],
-                    "access_key": os.environ["AWS_ACCESS_KEY_ID"],
-                    "secret_key": os.environ["AWS_SECRET_ACCESS_KEY"]}))
+                settings.write_text(json.dumps(
+                    {"prefix": store_prefix, **{name: os.environ[name] for name in STORE_ENV}}))
                 files = ["tests/framework/e2e/" + name for name in ("cluster.go", "etcd_process.go")]
                 overlay = fixture_overlay(source, directory, "process-fixture.patch", files)
                 go_flags.append("-overlay=" + str(overlay))

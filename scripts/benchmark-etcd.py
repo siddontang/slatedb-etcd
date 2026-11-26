@@ -18,7 +18,7 @@ import time
 import urllib.request
 
 from reporting import write_report
-from rustfs_fixture import shared_store, unique_prefix
+from rustfs_fixture import shared_args, shared_store, unique_prefix
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -145,14 +145,16 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
                     workers = getattr(args, "service_runtime_workers", None)
                     if kind == "service" and workers is not None:
                         command += ["--runtime-workers", str(workers)]
-                    if args.s3_bucket:
-                        command += ["--s3-bucket", args.s3_bucket]
-                    if args.s3_endpoint:
-                        command += ["--s3-endpoint", args.s3_endpoint]
-                    if args.s3_allow_http:
-                        command += ["--s3-allow-http"]
                     if members > 1:
-                        command += ["--state-mode", "shared", "--s3-prefix", prefix]
+                        command += shared_args(prefix, {"SLATEDB_S3_TEST_BUCKET": args.s3_bucket,
+                                                        "SLATEDB_S3_TEST_ENDPOINT": args.s3_endpoint})
+                    else:
+                        if args.s3_bucket:
+                            command += ["--s3-bucket", args.s3_bucket]
+                        if args.s3_endpoint:
+                            command += ["--s3-endpoint", args.s3_endpoint]
+                        if args.s3_allow_http:
+                            command += ["--s3-allow-http"]
                     for j in range(members):
                         command += ["--peer", f"{j+1}={peers[j]}", "--client-peer", f"{j+1}={clients[j]}"]
                 log = open(root / f"node{i+1}.log", "w")

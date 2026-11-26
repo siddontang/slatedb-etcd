@@ -136,10 +136,10 @@ func TestThreeVirtualMachines(t *testing.T) {
 			"--trusted-ca-file", directory + "/client-ca.pem", "--client-cert-auth",
 			"--peer-cert-file", directory + "/peer-cert.pem", "--peer-key-file", directory + "/peer-key.pem",
 			"--peer-trusted-ca-file", directory + "/peer-ca.pem",
-			"--s3-bucket", os.Getenv("SLATEDB_S3_TEST_BUCKET"), "--s3-allow-http",
-			"--s3-endpoint", "http://host.lima.internal:" + port,
-			// The three guests share one state on the host's RustFS server.
-			"--state-mode", "shared", "--s3-prefix", "multihost/" + filepath.Base(root)}
+		}
+		// The three guests share one state on the host's RustFS server.
+		args = append(args, storeFlags("http://host.lima.internal:"+port,
+			os.Getenv("SLATEDB_S3_TEST_BUCKET"), "multihost/"+filepath.Base(root))...)
 		for j, host := range hosts {
 			args = append(args, "--peer", fmt.Sprintf("%d=https://%s:2380", j+1, host),
 				"--client-peer", fmt.Sprintf("%d=https://%s:2379", j+1, host))

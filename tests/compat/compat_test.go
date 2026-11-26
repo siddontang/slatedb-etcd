@@ -166,8 +166,21 @@ func sharedStoreArgs(t *testing.T, root string, args []string) []string {
 		t.Fatal("A cluster of several members needs RustFS. Run scripts/check-compat.py, or " +
 			"run go test through scripts/rustfs_fixture.py")
 	}
-	return []string{"--state-mode", "shared", "--s3-bucket", bucket, "--s3-endpoint", endpoint,
-		"--s3-allow-http", "--s3-prefix", "compat/" + filepath.Base(root)}
+	return storeFlags(endpoint, bucket, "compat/"+filepath.Base(root))
+}
+
+// storeFlags returns the shared state flags of one member. The Python launchers build the same
+// flags with `shared_args` in scripts/rustfs_fixture.py. The downstream module, which cannot
+// import this test package, has a copy in tests/downstream/storage_test.go.
+func storeFlags(endpoint, bucket, prefix string) []string {
+	flags := []string{"--state-mode", "shared", "--s3-bucket", bucket, "--s3-prefix", prefix}
+	if endpoint != "" {
+		flags = append(flags, "--s3-endpoint", endpoint)
+		if strings.HasPrefix(endpoint, "http://") {
+			flags = append(flags, "--s3-allow-http")
+		}
+	}
+	return flags
 }
 
 func (c *cluster) start(id int) {
