@@ -208,7 +208,55 @@ fn report() {
             UNFLUSHED.load(Relaxed) >> 20,
             UNFLUSHED_MAX.swap(UNFLUSHED.load(Relaxed), Relaxed) >> 20,
         ));
+        line.push_str(&format!(
+            " l0={} sr={} run={} cmp_mb={} bp={} l0stall={}",
+            L0.load(Relaxed),
+            SR.load(Relaxed),
+            RUNNING.load(Relaxed),
+            COMPACTED.load(Relaxed) >> 20,
+            BACKPRESSURE.load(Relaxed),
+            L0_STALL.load(Relaxed),
+        ));
         backlog_samples = 0;
         eprintln!("{line}");
+    }
+}
+
+/// SlateDB metrics kept for the DIAG line: L0 SSTs, sorted runs, running compactions,
+/// bytes compacted, backpressure waits, L0 stalls.
+pub static L0: AtomicI64 = AtomicI64::new(0);
+pub static SR: AtomicI64 = AtomicI64::new(0);
+pub static RUNNING: AtomicI64 = AtomicI64::new(0);
+pub static COMPACTED: AtomicI64 = AtomicI64::new(0);
+pub static BACKPRESSURE: AtomicI64 = AtomicI64::new(0);
+pub static L0_STALL: AtomicI64 = AtomicI64::new(0);
+
+pub fn metric(name: &str) -> Option<&'static AtomicI64> {
+    Some(match name {
+        "slatedb.db.l0_sst_count" => &L0,
+        "slatedb.db.sorted_run_count" => &SR,
+        "slatedb.compactor.running_compactions" => &RUNNING,
+        "slatedb.compactor.bytes_compacted" => &COMPACTED,
+        "slatedb.db.backpressure_count" => &BACKPRESSURE,
+        "slatedb.db.l0_stall_count" => &L0_STALL,
+        _ => return None,
+    })
+}
+
+pub struct Metric(pub &'static AtomicI64);
+
+impl slatedb_common::metrics::GaugeFn for Metric {
+    fn set(&self, value: i64) {
+        self.0.store(value, Relaxed);
+    }
+}
+impl slatedb_common::metrics::CounterFn for Metric {
+    fn increment(&self, value: u64) {
+        self.0.fetch_add(value as i64, Relaxed);
+    }
+}
+impl slatedb_common::metrics::UpDownCounterFn for Metric {
+    fn increment(&self, value: i64) {
+        self.0.fetch_add(value, Relaxed);
     }
 }

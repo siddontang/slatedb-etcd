@@ -719,6 +719,9 @@ impl slatedb_common::metrics::MetricsRecorder for BacklogRecorder {
         description: &str,
         labels: &[(&str, &str)],
     ) -> Arc<dyn slatedb_common::metrics::CounterFn> {
+        if let Some(cell) = crate::diag::metric(name) {
+            return Arc::new(crate::diag::Metric(cell));
+        }
         self.noop.register_counter(name, description, labels)
     }
 
@@ -731,6 +734,9 @@ impl slatedb_common::metrics::MetricsRecorder for BacklogRecorder {
         if name == slatedb::db_stats::TOTAL_MEM_SIZE_BYTES {
             return self.gauge.clone();
         }
+        if let Some(cell) = crate::diag::metric(name) {
+            return Arc::new(crate::diag::Metric(cell));
+        }
         self.noop.register_gauge(name, description, labels)
     }
 
@@ -740,6 +746,9 @@ impl slatedb_common::metrics::MetricsRecorder for BacklogRecorder {
         description: &str,
         labels: &[(&str, &str)],
     ) -> Arc<dyn slatedb_common::metrics::UpDownCounterFn> {
+        if let Some(cell) = crate::diag::metric(name) {
+            return Arc::new(crate::diag::Metric(cell));
+        }
         self.noop
             .register_up_down_counter(name, description, labels)
     }

@@ -243,7 +243,58 @@ pub(crate) fn slatedb_settings() -> Settings {
             worker.bytes_to_fetch = COMPACTION_FETCH_BYTES;
         }
     }
+    diag_knobs(&mut settings);
     settings
+}
+
+/// TEMP diag: SlateDB knobs from the environment.
+fn diag_knobs(settings: &mut Settings) {
+    let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+    if let Some(v) = env("SE_L0_MAX_SSTS") {
+        settings.l0_max_ssts = v;
+        settings.l0_max_ssts_per_key = v;
+    }
+    if let Some(v) = env("SE_L0_SST_MB") {
+        settings.l0_sst_size_bytes = v << 20;
+    }
+    if let Some(v) = env("SE_UNFLUSHED_MB") {
+        settings.max_unflushed_bytes = v << 20;
+    }
+    if let Some(v) = env("SE_FLUSH_PAR") {
+        settings.l0_flush_parallelism = v;
+    }
+    if let Some(c) = settings.compactor_options.as_mut() {
+        if let Some(v) = env("SE_MAX_CONC") {
+            c.max_concurrent_compactions = v;
+        }
+        for (e, k) in [
+            ("SE_MIN_SRC", "min_compaction_sources"),
+            ("SE_MAX_SRC", "max_compaction_sources"),
+            ("SE_INCL", "include_size_threshold"),
+            ("SE_CONSOL", "sorted_run_consolidation_threshold"),
+        ] {
+            if let Ok(v) = std::env::var(e) {
+                c.scheduler_options.insert(k.to_string(), v);
+            }
+        }
+        if let Some(w) = c.worker.as_mut() {
+            if let Some(v) = env("SE_MAX_CONC") {
+                w.max_concurrent_compactions = v;
+            }
+            if let Some(v) = env("SE_SUBCOMP") {
+                w.max_subcompactions = v;
+            }
+            if let Some(v) = env("SE_MAX_SST_MB") {
+                w.max_sst_size = v << 20;
+            }
+            if let Some(v) = env("SE_FETCH_TASKS") {
+                w.max_fetch_tasks = v;
+            }
+            if let Some(v) = env("SE_FETCH_KB") {
+                w.bytes_to_fetch = v << 10;
+            }
+        }
+    }
 }
 
 /// SlateDB settings for the state machine of one member; `local_disk` when its store is a
