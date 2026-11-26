@@ -349,7 +349,7 @@ fn logical_size_row(applied: u64, size: crate::batch::Usage) -> Vec<u8> {
 }
 
 /// The first key after every `etcd/current/` key.
-const CURRENT_END: &[u8] = b"etcd/current0";
+pub(crate) const CURRENT_END: &[u8] = b"etcd/current0";
 
 impl StateMachine {
     pub async fn open(dir: &Path) -> Result<Self> {

@@ -21,7 +21,8 @@ use anyhow::{Context, Result};
 use prost::Message;
 
 use crate::mvcc::CURRENT;
-use crate::state::{StateRead, StateScan};
+use crate::state::view::StateView;
+use crate::state::{StateRead, StateScan, CURRENT_END};
 
 /// The revision metadata of one current key.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -72,6 +73,74 @@ impl KeyMeta {
     }
 }
 
+/// The most parallel scans that load the index: one per CPU of this process, at most 8.
+fn scan_parts() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get().min(8))
+}
+
+/// Split `etcd/current/` into at most `parts` ascending, disjoint ranges that cover it. The
+/// split keys come from `firsts`, the first keys of the compacted SSTs, so each part reads about
+/// whole SSTs. Any split keys give the same rows; the SSTs only balance the parts.
+fn scan_bounds<'a>(firsts: impl IntoIterator<Item = &'a [u8]>, parts: usize) -> Vec<Vec<u8>> {
+    let mut firsts: Vec<&[u8]> = firsts
+        .into_iter()
+        .filter(|key| *key > CURRENT && *key < CURRENT_END)
+        .collect();
+    firsts.sort_unstable();
+    firsts.dedup();
+    let mut bounds = vec![CURRENT.to_vec()];
+    // Pick `parts - 1` split keys spread over the candidates, each above the last one.
+    for part in 1..parts.max(1) {
+        if let Some(key) = firsts.get(part * firsts.len() / parts) {
+            if bounds.last().is_some_and(|last| last.as_slice() < *key) {
+                bounds.push(key.to_vec());
+            }
+        }
+    }
+    bounds.push(CURRENT_END.to_vec());
+    bounds
+}
+
+/// Scan the ranges between consecutive `bounds` of one snapshot in parallel tasks, and return
+/// the rows of each range in order.
+async fn scan_parts_of(
+    snapshot: Arc<slatedb::DbSnapshot>,
+    bounds: &[Vec<u8>],
+) -> Result<Vec<Vec<(Arc<[u8]>, KeyMeta)>>> {
+    let mut tasks = tokio::task::JoinSet::new();
+    for (part, range) in bounds.windows(2).enumerate() {
+        let (snapshot, range) = (snapshot.clone(), range[0].clone()..range[1].clone());
+        tasks.spawn(async move { (part, scan_meta(snapshot.as_ref(), range).await) });
+    }
+    let mut parts = vec![Vec::new(); bounds.len().saturating_sub(1)];
+    while let Some(done) = tasks.join_next().await {
+        let (part, rows) = done.context("key index scan task failed")?;
+        parts[part] = rows?;
+    }
+    Ok(parts)
+}
+
+/// Read the metadata of the current rows in `range`, in key order.
+async fn scan_meta(
+    db: &impl StateRead,
+    range: std::ops::Range<Vec<u8>>,
+) -> Result<Vec<(Arc<[u8]>, KeyMeta)>> {
+    let options = slatedb::config::ScanOptions {
+        read_ahead_bytes: 1024 * 1024,
+        max_fetch_tasks: 4,
+        ..Default::default()
+    };
+    let mut scan = db.scan_range(range, &options).await?;
+    let mut rows = Vec::new();
+    while let Some(row) = scan.next().await? {
+        let Some(key) = row.key.strip_prefix(CURRENT) else {
+            continue;
+        };
+        rows.push((key.into(), KeyMeta::decode(&row.value)?));
+    }
+    Ok(rows)
+}
+
 #[derive(Default)]
 pub(crate) struct KeyIndex {
     keys: HashMap<Arc<[u8]>, KeyMeta>,
@@ -87,29 +156,36 @@ pub(crate) struct KeyIndex {
 impl KeyIndex {
     /// Scan all current rows once.
     ///
-    /// Startup time grows with this scan. It reads several SST blocks per request, and it builds
-    /// the key order in bulk from the sorted rows instead of one tree insertion per key.
-    pub(crate) async fn load(db: &impl StateRead) -> Result<Self> {
+    /// Startup time grows with this scan: it reads every current value to decode a few integer
+    /// fields. A live database splits the key range at SST boundaries and scans the parts of one
+    /// snapshot in parallel tasks. The index is then built from the parts in key order, and the
+    /// key order in bulk from the sorted rows instead of one tree insertion per key.
+    pub(crate) async fn load(reads: &StateView) -> Result<Self> {
         let started = std::time::Instant::now();
-        let mut index = Self::default();
-        let options = slatedb::config::ScanOptions {
-            read_ahead_bytes: 1024 * 1024,
-            max_fetch_tasks: 4,
-            ..Default::default()
+        let parts = match reads {
+            StateView::Live(db) => {
+                let manifest = db.manifest();
+                let firsts = manifest
+                    .compacted()
+                    .iter()
+                    .flat_map(|run| run.sst_views())
+                    .filter_map(|view| view.sst.info.first_entry.as_deref());
+                let bounds = scan_bounds(firsts, scan_parts());
+                // One snapshot gives every part the same sequence.
+                scan_parts_of(db.snapshot()?, &bounds).await?
+            }
+            _ => vec![scan_meta(reads, CURRENT.to_vec()..CURRENT_END.to_vec()).await?],
         };
-        let mut scan = db.scan_under(CURRENT, &options).await?;
-        let mut sorted = Vec::new();
-        while let Some(row) = scan.next().await? {
-            let Some(key) = row.key.strip_prefix(CURRENT) else {
-                continue;
-            };
-            let meta = KeyMeta::decode(&row.value)?;
-            let key: Arc<[u8]> = key.into();
+        let scans = parts.len();
+        let mut index = Self::default();
+        let mut sorted = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+        for (key, meta) in parts.into_iter().flatten() {
             index.link(meta.lease, key.clone());
             index.keys.insert(key.clone(), meta);
             sorted.push((key, Presence::Live));
         }
-        // The scan returns each key once in ascending order, so `collect` builds the tree in bulk.
+        // The parts are disjoint and ascending, and each returns its keys once in ascending
+        // order, so `collect` builds the tree in bulk.
         let keys = sorted.into_iter().collect();
         index.order = Arc::new(KeyOrder {
             keys: RwLock::new(Ordered {
@@ -120,6 +196,7 @@ impl KeyIndex {
         });
         tracing::info!(
             keys = index.keys.len(),
+            scans,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "loaded key index"
         );
@@ -228,8 +305,8 @@ impl KeyIndex {
 
     /// Compare the index with a full current-row scan.
     #[cfg(test)]
-    pub(crate) async fn matches(&self, db: &slatedb::Db) -> Result<bool> {
-        let fresh = Self::load(db).await?;
+    pub(crate) async fn matches(&self, db: &Arc<slatedb::Db>) -> Result<bool> {
+        let fresh = Self::load(&StateView::Live(db.clone())).await?;
         let latest = self.pin(u64::MAX);
         let ordered = self.order.keys.read().unwrap();
         let visible: Vec<&[u8]> = ordered
@@ -537,6 +614,7 @@ mod tests {
             .build()
             .await
             .unwrap();
+        let db = Arc::new(db);
         let mut expected = KeyIndex::default();
         // `step` makes an overwrite differ from the flushed row in its revisions and lease.
         let write = |batch: &mut slatedb::WriteBatch, index: &mut KeyIndex, i: u32, step: i64| {
@@ -582,7 +660,7 @@ mod tests {
         expected.commit(0);
 
         assert!(expected.matches(&db).await.unwrap());
-        let loaded = KeyIndex::load(&db).await.unwrap();
+        let loaded = KeyIndex::load(&StateView::Live(db.clone())).await.unwrap();
         assert_eq!(loaded.len(), expected.len());
         assert_eq!(loaded.pin(u64::MAX).count(b"", &[0]), loaded.len() as i64);
         // The ordered user keys, not only their number, match the visible keys.
@@ -597,6 +675,60 @@ mod tests {
         };
         assert_eq!(visible(&loaded), visible(&expected));
         assert_eq!(loaded.lease_keys(3), expected.lease_keys(3));
+
+        // Parallel parts return the rows of one full scan, with split keys on a row, between
+        // rows, on a deleted row, and past the last row.
+        let full = scan_meta(db.as_ref(), CURRENT.to_vec()..CURRENT_END.to_vec())
+            .await
+            .unwrap();
+        let splits: [&[u8]; 4] = [b"key/00001", b"key/01000x", b"key/02001", b"zzz"];
+        let row_keys: Vec<Vec<u8>> = splits.iter().map(|key| [CURRENT, key].concat()).collect();
+        let bounds = scan_bounds(row_keys.iter().map(Vec::as_slice), 8);
+        assert_eq!(bounds.len(), 6);
+        let parts = scan_parts_of(db.snapshot().unwrap(), &bounds)
+            .await
+            .unwrap();
+        assert!(parts[1..4].iter().all(|part| !part.is_empty()));
+        assert_eq!(parts.concat(), full);
         db.close().await.unwrap();
+    }
+
+    #[test]
+    fn scan_bounds_cover_the_current_prefix() {
+        let key = |name: &str| [CURRENT, name.as_bytes()].concat();
+        let whole = vec![CURRENT.to_vec(), CURRENT_END.to_vec()];
+        // No SSTs, or one part: a single scan.
+        assert_eq!(scan_bounds([], 4), whole);
+        assert_eq!(scan_bounds([key("b").as_slice()], 1), whole);
+        // Keys outside the prefix and the prefix itself are no split keys.
+        let outside = [
+            b"etcd/apply".as_slice(),
+            CURRENT,
+            CURRENT_END,
+            b"etcd/hash/1",
+        ];
+        assert_eq!(scan_bounds(outside, 4), whole);
+        // Duplicate and unsorted first keys give ascending, distinct bounds.
+        let (b, c, d) = (key("b"), key("c"), key("d"));
+        let firsts = [
+            d.as_slice(),
+            b.as_slice(),
+            c.as_slice(),
+            b.as_slice(),
+            d.as_slice(),
+        ];
+        let expected = vec![
+            CURRENT.to_vec(),
+            b.clone(),
+            c.clone(),
+            d.clone(),
+            CURRENT_END.to_vec(),
+        ];
+        assert_eq!(scan_bounds(firsts, 8), expected);
+        // Fewer parts than first keys spread the split keys.
+        assert_eq!(
+            scan_bounds(firsts, 2),
+            vec![CURRENT.to_vec(), c.clone(), CURRENT_END.to_vec()]
+        );
     }
 }
