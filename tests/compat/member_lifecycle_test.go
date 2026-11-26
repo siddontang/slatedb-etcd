@@ -20,7 +20,9 @@ func TestLearnerJoinPromoteRemoveAndRecover(t *testing.T) {
 }
 
 func testLearnerLifecycle(t *testing.T, size int, strict bool) {
-	c := newClusterSize(t, size, "--strict-reconfig-check", fmt.Sprint(strict))
+	// The learner makes a second member, so a single voter also starts on RustFS.
+	c := newClusterConfigured(t, size, func(c *cluster) { c.sharedStore = true },
+		"--strict-reconfig-check", fmt.Sprint(strict))
 	api := client(t, c.addresses)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -48,6 +50,7 @@ func testLearnerLifecycle(t *testing.T, size int, strict bool) {
 		args := []string{"--id", fmt.Sprint(id), "--listen", endpoint, "--join",
 			"--dir", filepath.Join(c.root, "learner"), "--cluster-id", filepath.Base(c.root),
 			"--strict-reconfig-check", fmt.Sprint(strict), "--snapshot-every", "0"}
+		args = append(args, c.storeArgs...)
 		for _, member := range added.Members {
 			args = append(args, "--peer", fmt.Sprintf("%d=%s", member.ID, member.PeerURLs[0]))
 		}

@@ -111,7 +111,11 @@ func TestS3Recovery(t *testing.T) {
 	proxy := &s3Proxy{target: target}
 	server := httptest.NewServer(proxy)
 	defer server.Close()
-	c := newCluster(t, "--s3-bucket", bucket, "--s3-endpoint", server.URL, "--s3-allow-http")
+	// These faults select the SST uploads and reads of one follower under its own member prefix.
+	// Shared state mode has no such prefix: only the leader writes SSTs. The removal of replicated
+	// mode must replace this test.
+	c := newCluster(t, "--state-mode", "replicated", "--s3-bucket", bucket, "--s3-endpoint",
+		server.URL, "--s3-allow-http")
 	leader := c.leader()
 	follower := leader%3 + 1
 	api := client(t, []string{c.addresses[leader-1]})

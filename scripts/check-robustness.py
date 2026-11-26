@@ -12,6 +12,7 @@ import sys
 import time
 
 from reporting import write_report
+from rustfs_fixture import shared_store
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -30,6 +31,14 @@ def main():
     report = {"created_at": datetime.now(timezone.utc).isoformat(), "passed": True,
               "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
               "jepsen_requested": args.jepsen, "runs": []}
+    # All seeds run their clusters of three members on one RustFS server.
+    with shared_store():
+        check_seeds(args, seeds, binary, directory, report)
+    print("Report:", args.output)
+    raise SystemExit(0 if report["passed"] else 1)
+
+
+def check_seeds(args, seeds, binary, directory, report):
     for seed in seeds:
         print(f"Checking process faults for seed {seed}", flush=True)
         started = time.time()
@@ -57,8 +66,6 @@ def main():
         report["passed"] &= run["passed"]
         args.output.parent.mkdir(parents=True, exist_ok=True)
         write_report(args.output, report)
-    print("Report:", args.output)
-    raise SystemExit(0 if report["passed"] else 1)
 
 
 if __name__ == "__main__":

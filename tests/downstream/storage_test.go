@@ -2,6 +2,8 @@ package downstream
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/url"
@@ -71,9 +73,19 @@ func backend(t *testing.T, kind string) *clientv3.Client {
 			for i := 0; i < 3; i++ {
 				endpoints = append(endpoints, address(t))
 			}
+			// Three members run in shared state mode on the RustFS server of
+			// scripts/check-compat.py, with a prefix for this cluster only.
+			s3, bucket := os.Getenv("SLATEDB_S3_TEST_ENDPOINT"), os.Getenv("SLATEDB_S3_TEST_BUCKET")
+			require.True(t, s3 != "" && bucket != "", "run scripts/check-compat.py --suite downstream")
+			// A temporary directory name repeats across tests, so the prefix takes a random part.
+			prefix := make([]byte, 8)
+			_, err = rand.Read(prefix)
+			require.NoError(t, err)
 			for i, endpoint := range endpoints {
 				args := []string{"--id", fmt.Sprint(i + 1), "--listen", endpoint,
-					"--cluster-id", filepath.Base(root), "--dir", filepath.Join(root, fmt.Sprint(i+1))}
+					"--cluster-id", filepath.Base(root), "--dir", filepath.Join(root, fmt.Sprint(i+1)),
+					"--state-mode", "shared", "--s3-bucket", bucket, "--s3-endpoint", s3,
+					"--s3-allow-http", "--s3-prefix", "downstream/" + hex.EncodeToString(prefix)}
 				for j, peer := range endpoints {
 					args = append(args, "--peer", fmt.Sprintf("%d=%s", j+1, peer))
 				}

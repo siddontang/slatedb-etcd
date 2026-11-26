@@ -128,7 +128,10 @@ func TestCommittedApplyBacklogSurvivesRestart(t *testing.T) {
 }
 
 func TestSnapshotApplyKeepsPeerReplicationLive(t *testing.T) {
-	c := newCluster(t)
+	// Replicated mode only. In shared state mode a restarted member adopts the newest shared
+	// checkpoint when it starts, so it installs no Raft snapshot. The removal of replicated mode
+	// must replace this test.
+	c := newCluster(t, "--state-mode", "replicated")
 	leader := c.leader()
 	lagging := leader%3 + 1
 	api := client(t, []string{c.addresses[leader-1]})
