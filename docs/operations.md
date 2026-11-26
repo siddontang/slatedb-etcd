@@ -72,9 +72,11 @@ Neither operation guarantees immediate disk shrinkage. Checkpoints can retain ol
 SlateDB's garbage collector removes objects after their retention rules permit it.
 With replicated state on local disk, garbage collection deletes an SST that a compaction
 replaced once no running read can use it: every read registers itself, and GC waits until the
-reads that started before the compaction have ended, however long they run. Replaced SSTs leave
-the disk 2-3 minutes after the compaction (a 2-minute compactor checkpoint and minimum age, and
-GC every minute). A long scan, such as the index rebuild at startup, delays GC until it ends.
+reads that started before the compaction have ended, however long they run. On an idle member, replaced
+SSTs usually leave the disk 2-3 minutes after the compaction (a 2-minute compactor checkpoint
+and minimum age, and GC every minute). Reads that are running when GC first finds an SST
+unused can delay its deletion to a later GC run. A long scan, such as the index rebuild at
+startup, delays it until the scan ends.
 S3 and shared state mode keep SlateDB's defaults: a compaction keeps the SSTs that it replaces
 for 15 minutes, and GC runs every 10 minutes, so they leave after 15-25 minutes.
 A Raft snapshot checkpoint for a lagging follower can keep them for up to an hour.

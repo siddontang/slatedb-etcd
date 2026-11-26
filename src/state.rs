@@ -257,9 +257,9 @@ pub(crate) fn slatedb_settings() -> Settings {
 ///
 /// On a member-local directory, `open_at` installs `read_guard::LiveSstFilter`: GC deletes a
 /// replaced SST only after every read that may use it has ended, however long it runs. The
-/// checkpoint lifetime and `min_age` drop to 2 minutes, GC runs every minute, and a replaced SST
-/// leaves 2-3 minutes after the compaction. The checkpoint stays as a second guard for a read
-/// that holds no `ReadGuard`.
+/// checkpoint lifetime and `min_age` drop to 2 minutes, and GC runs every minute. A replaced SST
+/// usually leaves 2-3 minutes after the compaction. Running reads can delay it to a later GC run.
+/// The checkpoint stays as a second guard for a read that holds no `ReadGuard`.
 ///
 /// Any other store, including one a caller passes to `open_store`, keeps the defaults: it has no
 /// filter, and each GC run lists the SSTs of the store.

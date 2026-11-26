@@ -350,6 +350,37 @@ mod tests {
         }
     }
 
+    /// An SST keeps its first ticket across GC runs. A read that starts after the first run does
+    /// not delay it, but it delays an SST that GC offers for the first time later.
+    #[tokio::test]
+    async fn the_filter_keeps_an_sst_ticket_across_runs() {
+        let readers = readers();
+        let store = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let db = Arc::new(Db::builder("db", store).build().await.unwrap());
+        let filter = LiveSstFilter::default();
+        filter.bind(&db);
+        let first = object("db/compacted/01KB0000000000000000000001.sst");
+        let second = object("db/compacted/01KB0000000000000000000002.sst");
+
+        let early = readers.enter();
+        let allowed = filter
+            .allowed_with(readers, HashSet::from([first.clone()]), Duration::ZERO)
+            .await;
+        assert!(allowed.is_empty(), "a read that started before is running");
+        let later = readers.enter();
+        drop(early);
+        let allowed = filter
+            .allowed_with(
+                readers,
+                HashSet::from([first.clone(), second]),
+                Duration::ZERO,
+            )
+            .await;
+        assert_eq!(allowed, HashSet::from([first]));
+        drop(later);
+        db.close().await.unwrap();
+    }
+
     fn object(location: &str) -> ObjectMetadata {
         ObjectMetadata {
             location: location.into(),
