@@ -378,7 +378,10 @@ impl Server {
         .await?;
         let diagnostics = router(ApiState {
             events: events.clone(),
-            cluster_id: config.cluster_id.clone(),
+            peer: node.identity(),
+            refusals: std::sync::Arc::new(crate::api::Refusals::new(
+                node.metrics.refused_peer_stores.clone(),
+            )),
             location: Some(node.location.clone()),
             shared: node.shared_source(),
             fault_controls: config.fault_controls,

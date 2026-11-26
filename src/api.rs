@@ -17,13 +17,68 @@ use crate::{ApiError, Request};
 #[derive(Clone)]
 pub struct ApiState {
     pub events: mpsc::Sender<Event>,
-    pub cluster_id: String,
+    /// The identity that this member sends. It admits peer traffic with the same identity.
+    pub(crate) peer: crate::peer::Identity,
+    pub(crate) refusals: std::sync::Arc<Refusals>,
     /// The object namespace that serves and receives snapshot objects.
     pub(crate) location: Option<std::sync::Arc<crate::state::transfer::Location>>,
     /// Shared mode: the objects that a received format 6 snapshot names.
     pub(crate) shared: Option<std::sync::Arc<crate::state::shared::Source>>,
     /// Serve the fault controls under `/debug`. Off unless a test cluster enables them.
     pub(crate) fault_controls: bool,
+}
+
+impl ApiState {
+    /// Admit peer traffic that names the identity of this member. See `Identity::admits`.
+    pub(crate) fn admit(
+        &self,
+        cluster: Option<&str>,
+        store: Option<&str>,
+    ) -> Result<(), &'static str> {
+        match self.peer.admits(cluster, store) {
+            Ok(()) => Ok(()),
+            Err(crate::peer::Mismatch::Cluster) => Err("peer cluster does not match"),
+            Err(crate::peer::Mismatch::Store) => {
+                self.refusals.record(&self.peer, store);
+                Err("peer shared store does not match")
+            }
+        }
+    }
+}
+
+/// The shortest time between two error logs of refused peer stores.
+const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Peer traffic that this member refused for its shared store.
+pub(crate) struct Refusals {
+    counter: prometheus::IntCounter,
+    /// The time of the last error log. A refused peer tries again on each Raft tick.
+    logged: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl Refusals {
+    pub(crate) fn new(counter: prometheus::IntCounter) -> Self {
+        Self {
+            counter,
+            logged: Default::default(),
+        }
+    }
+
+    /// Count a refusal of `peer` store, and log an error at most once per interval.
+    fn record(&self, local: &crate::peer::Identity, peer: Option<&str>) {
+        self.counter.inc();
+        let now = std::time::Instant::now();
+        let mut logged = self.logged.lock().unwrap();
+        if logged.is_none_or(|last| now.duration_since(last) >= REFUSAL_LOG_INTERVAL) {
+            *logged = Some(now);
+            tracing::error!(
+                local = ?local.store,
+                peer = ?peer,
+                "refused a peer on another shared store: all members must use the same bucket \
+                 and prefix"
+            );
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -98,13 +153,15 @@ async fn propose(State(state): State<ApiState>, Json(request): Json<Request>) ->
         .into_response()
 }
 
+/// Admit the peer request of `headers`. See `ApiState::admit`.
+fn admit(state: &ApiState, headers: &HeaderMap) -> Result<(), &'static str> {
+    let header = |name| headers.get(name).and_then(|value| value.to_str().ok());
+    state.admit(header(crate::peer::CLUSTER), header(crate::peer::STORE))
+}
+
 async fn raft_message(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Response {
-    if headers
-        .get("x-cluster-id")
-        .and_then(|value| value.to_str().ok())
-        != Some(&state.cluster_id)
-    {
-        return StatusCode::FORBIDDEN.into_response();
+    if let Err(refusal) = admit(&state, &headers) {
+        return (StatusCode::FORBIDDEN, refusal).into_response();
     }
     let size = body.len();
     let Ok(message) = crate::peer::decode_message(body) else {
@@ -121,12 +178,8 @@ async fn covered_snapshot(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if headers
-        .get("x-cluster-id")
-        .and_then(|value| value.to_str().ok())
-        != Some(&state.cluster_id)
-    {
-        return StatusCode::FORBIDDEN.into_response();
+    if let Err(refusal) = admit(&state, &headers) {
+        return (StatusCode::FORBIDDEN, refusal).into_response();
     }
     let target = crate::peer::process_of(
         headers
@@ -230,12 +283,8 @@ async fn view_ack(
     headers: HeaderMap,
     Json(report): Json<ViewAck>,
 ) -> Response {
-    if headers
-        .get("x-cluster-id")
-        .and_then(|value| value.to_str().ok())
-        != Some(&state.cluster_id)
-    {
-        return StatusCode::FORBIDDEN.into_response();
+    if let Err(refusal) = admit(&state, &headers) {
+        return (StatusCode::FORBIDDEN, refusal).into_response();
     }
     let event = Event::ViewAck {
         member: report.member,
@@ -262,10 +311,15 @@ async fn snapshot_file(
     headers: HeaderMap,
     Query(query): Query<FileQuery>,
 ) -> Response {
+    // A shared member sends format 6 snapshots, and no peer copies its objects. Its location
+    // serves the shared state, so the route must not serve it to any peer.
+    if state.peer.store.is_some() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     if headers
-        .get("x-cluster-id")
+        .get(crate::peer::CLUSTER)
         .and_then(|value| value.to_str().ok())
-        != Some(&state.cluster_id)
+        != Some(&state.peer.cluster)
     {
         return StatusCode::FORBIDDEN.into_response();
     }

@@ -25,6 +25,7 @@ async fn a_restart_opens_the_record_checkpoint_above_its_row() {
                 overlay_max_bytes: 1 << 30,
                 restore: None,
                 record,
+                store_id: None,
             };
             StateMachine::open_shared(
                 store,
@@ -201,6 +202,7 @@ async fn open_at(
         overlay_max_bytes: 1 << 30,
         restore: None,
         record,
+        store_id: None,
     };
     StateMachine::open_shared(
         store.clone(),

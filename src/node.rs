@@ -259,6 +259,8 @@ const MAX_UNCOMMITTED_BYTES: usize = 2 * log::MAX_BYTES;
 
 pub struct Node {
     pub(crate) metrics: std::sync::Arc<crate::metrics::Member>,
+    /// The cluster and the shared store that this member names on its peer traffic.
+    peer: crate::peer::Identity,
     /// The object namespace that serves snapshot objects to peers.
     pub(crate) location: std::sync::Arc<crate::state::transfer::Location>,
     last_observed_leader: u64,
@@ -440,6 +442,7 @@ impl Node {
             overlay_max_bytes: options.overlay_max_bytes,
             restore: options.restore.clone(),
             record: crate::state::shared::Record::of(storage.recovery_snapshot())?,
+            store_id: None,
         };
         let mut state = options
             .object_store
@@ -611,6 +614,10 @@ impl Node {
             }
         };
         let manual_apply = transport_override.is_some();
+        let identity = crate::peer::Identity {
+            cluster: options.cluster_id.clone(),
+            store: state.store_id().map(|id| id.to_string()),
+        };
         state.set_open_retries(!manual_apply);
         let mut traffic = BTreeMap::<u64, std::sync::Arc<crate::metrics::PeerTraffic>>::new();
         let mut transports = tokio::task::JoinSet::new();
@@ -630,7 +637,7 @@ impl Node {
                 transports.spawn(transport_to(
                     peer,
                     address_rx,
-                    options.cluster_id.clone(),
+                    identity.clone(),
                     rx,
                     events.clone(),
                     options.transport.clone(),
@@ -744,6 +751,7 @@ impl Node {
             prefer_query: false,
             apply_delay_ms: 0,
             options,
+            peer: identity,
             senders,
             peer_addresses,
             transports,
@@ -831,6 +839,11 @@ impl Node {
             self.raw.campaign()?;
         }
         self.propose_term_start()
+    }
+
+    /// The identity that this member sends with its peer traffic. Peers must name the same one.
+    pub(crate) fn identity(&self) -> crate::peer::Identity {
+        self.peer.clone()
     }
 
     /// The shared-mode objects that the snapshot receive path opens.
@@ -1780,6 +1793,7 @@ impl Node {
             .flatten()
             .and_then(|view| view.checkpoint().ok());
             status["shared_state"] = json!({
+                "store_id": self.peer.store,
                 "base_applied_index": base,
                 "base_checkpoint": self.state.base_checkpoint,
                 "record_index": self.raw.store().snapshot_index(),

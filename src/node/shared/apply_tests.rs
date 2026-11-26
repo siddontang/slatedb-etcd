@@ -154,6 +154,7 @@ async fn lose_a_checkpoint_object(lose: Lose) {
         overlay_max_bytes: 1 << 30,
         restore: None,
         record: None,
+        store_id: None,
     };
     let store: std::sync::Arc<dyn ObjectStore> = faults.clone();
     let mut state = StateMachine::open_shared(
@@ -309,6 +310,7 @@ async fn grouping_members() -> (StateMachine, StateMachine, Vec<Entry>) {
         overlay_max_bytes: 1 << 30,
         restore: None,
         record: None,
+        store_id: None,
     };
     let mut members = vec![];
     for _ in 0..2 {
