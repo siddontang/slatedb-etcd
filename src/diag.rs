@@ -87,6 +87,49 @@ pub static LANE_WAIT: Stat = Stat::new("lwait");
 pub static WINDOW: Stat = Stat::new("win");
 /// Final SST sync, rename, and directory sync.
 pub static PUBLISH: Stat = Stat::new("pub");
+/// Put group proposed to the log job that persisted its last entry being handled.
+pub static PERSIST: Stat = Stat::new("persist");
+/// Log job finished on the log thread to the node handling it.
+pub static LOGWAKE: Stat = Stat::new("logwake");
+/// Deferred write: deferral to proposal.
+pub static DEFER: Stat = Stat::new("defer");
+/// Tokio timer overshoot of a 5 ms sleep (runtime scheduling delay).
+pub static SCHED: Stat = Stat::new("sched");
+/// Node event queue length at each receive (max per second).
+pub static EVQ_MAX: AtomicU64 = AtomicU64::new(0);
+/// Proposals deferred because of a backlog.
+pub static DEFERRED: AtomicU64 = AtomicU64::new(0);
+
+static PROPOSED: std::sync::Mutex<std::collections::VecDeque<(u64, Instant)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+pub fn proposed(last: u64) {
+    PROPOSED.lock().unwrap().push_back((last, Instant::now()));
+}
+
+pub fn persisted(last: u64) {
+    let mut q = PROPOSED.lock().unwrap();
+    while q.front().is_some_and(|(i, _)| *i <= last) {
+        PERSIST.since(q.pop_front().unwrap().1);
+    }
+    if q.len() > 100_000 {
+        q.clear();
+    }
+}
+
+/// Start the runtime scheduling probe once, from a task on the server runtime.
+pub fn start_sched() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tokio::spawn(async {
+            loop {
+                let t = Instant::now();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                SCHED.observe(t.elapsed().saturating_sub(Duration::from_millis(5)));
+            }
+        });
+    });
+}
 
 pub static FLUSH_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static COMPACT_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -129,7 +172,7 @@ pub fn start() {
 fn report() {
     let stats = [
         &GRPC_PUT, &REPLY, &LOOP, &LOG_JOB, &WAL_FSYNC, &APPLY_JOB, &DB_WRITE, &LANE_WAIT,
-        &WINDOW, &PUBLISH,
+        &WINDOW, &PUBLISH, &PERSIST, &LOGWAKE, &DEFER, &SCHED,
     ];
     let mut backlog_samples = 0u32;
     let mut last = Instant::now();
@@ -154,7 +197,9 @@ fn report() {
         let cur = INFLIGHT_BYTES.load(Relaxed).max(0);
         let curw = INFLIGHT_WIN.load(Relaxed).max(0);
         line.push_str(&format!(
-            " fl_mb={:.1} co_mb={:.1} infl_kb_max={} infl_win_max={} backlog20={} unfl_mb={} unfl_mb_max={}",
+            " evq_max={} deferred={} fl_mb={:.1} co_mb={:.1} infl_kb_max={} infl_win_max={} backlog20={} unfl_mb={} unfl_mb_max={}",
+            EVQ_MAX.swap(0, Relaxed),
+            DEFERRED.swap(0, Relaxed),
             FLUSH_BYTES.swap(0, Relaxed) as f64 / 1e6,
             COMPACT_BYTES.swap(0, Relaxed) as f64 / 1e6,
             INFLIGHT_MAX.swap(cur, Relaxed) / 1024,

@@ -205,6 +205,8 @@ impl Node {
         ensure!(self.log_busy, "unexpected log completion");
         let mut task = self.log_queue.pop_front().context("missing log job")?;
         ensure!(task.id == completed.id, "log completion is out of order");
+        crate::diag::LOGWAKE.since(completed.diag_done);
+        crate::diag::persisted(completed.durable.last_index);
         self.log_bytes -= task.bytes;
         self.log_snapshot_bytes -= task.snapshot_bytes;
         self.log_busy = false;

@@ -318,6 +318,7 @@ impl Kv for Service {
 
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         crate::diag::start();
+        crate::diag::start_sched();
         let diag_start = std::time::Instant::now();
         let credentials = credentials(&request);
         let forwarded = is_forwarded(&request);

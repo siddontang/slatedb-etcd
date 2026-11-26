@@ -136,6 +136,7 @@ impl Node {
             return;
         }
         waiting.bytes += data.capacity();
+        crate::diag::DEFERRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         waiting.requests.push_back(WaitingProposal {
             id,
             data,
@@ -164,6 +165,9 @@ impl Node {
                 break;
             }
             let waiting = self.waiting_proposals.requests.pop_front().unwrap();
+            crate::diag::DEFER.observe(
+                (Instant::now() + self.request_timeout).saturating_duration_since(waiting.expires),
+            );
             self.waiting_proposals.bytes -= waiting.data.capacity();
             if waiting.response.is_closed() {
                 continue;
@@ -224,6 +228,9 @@ impl Node {
         };
         proposal.set_entries(group.entries);
         let result = self.raw.raft.step(proposal);
+        if result.is_ok() {
+            crate::diag::proposed(self.raw.raft.raft_log.last_index());
+        }
         let started = Instant::now();
         for (id, response) in group.clients {
             if let Err(ref error) = result {

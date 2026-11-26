@@ -130,6 +130,7 @@ pub(super) struct Work {
 }
 
 pub(super) struct Completion {
+    pub diag_done: std::time::Instant,
     pub id: u64,
     pub durable: Durable,
     pub fetched: Option<(super::cache::Fetch, raft::Result<Vec<Entry>>)>,
@@ -178,6 +179,7 @@ impl Executor {
             Job::Panic => panic!("injected log worker panic"),
         }
         Ok(Completion {
+            diag_done: std::time::Instant::now(),
             id: work.id,
             durable: Durable::read(&self.storage)?,
             fetched,

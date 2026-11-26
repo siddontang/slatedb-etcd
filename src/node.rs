@@ -907,6 +907,7 @@ impl Node {
                 }
                 event = events.recv() => {
                     diag_start = Some(Instant::now());
+                    crate::diag::EVQ_MAX.fetch_max(events.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     let Some(event) = event else { return Ok(()); };
                     let peer = matches!(
                         event,
