@@ -922,24 +922,11 @@ async fn read_index_wait_expires_but_a_running_read_finishes() {
 
 #[tokio::test]
 async fn an_expired_queued_read_does_not_start() {
-    use crate::proto::etcdserverpb::{request_op::Request as Op, RangeRequest};
     let dir = tempfile::tempdir().unwrap();
     let mut node = leader_node(dir.path()).await;
     // A sorted Range holds the exclusive slot.
     let (tx, _held) = oneshot::channel();
-    node.enqueue_query(Query::Read(
-        RequestOp {
-            request: Some(Op::RequestRange(RangeRequest {
-                key: b"a".to_vec(),
-                range_end: b"z".to_vec(),
-                sort_order: 2,
-                serializable: true,
-                ..Default::default()
-            })),
-        },
-        None,
-        ClientResponse::Kv(tx),
-    ));
+    node.enqueue_query(sorted_read(tx));
     node.drive_ready().await.unwrap();
     assert_eq!(node.read_executor.len(), 1);
 
@@ -968,6 +955,55 @@ async fn an_expired_queued_read_does_not_start() {
     node.complete_read(output).unwrap();
     assert!(live.await.unwrap().is_ok());
     assert!(node.reads.is_empty());
+}
+
+/// A sorted serializable Range of every key. It runs in the exclusive slot.
+fn sorted_read(tx: KvResponse) -> Query {
+    use crate::proto::etcdserverpb::{request_op::Request as Op, RangeRequest};
+    Query::Read(
+        RequestOp {
+            request: Some(Op::RequestRange(RangeRequest {
+                key: b"a".to_vec(),
+                range_end: b"z".to_vec(),
+                sort_order: 2,
+                serializable: true,
+                ..Default::default()
+            })),
+        },
+        None,
+        ClientResponse::Kv(tx),
+    )
+}
+
+#[tokio::test]
+async fn a_queued_read_whose_caller_left_does_not_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    let (tx, held) = oneshot::channel();
+    node.enqueue_query(sorted_read(tx));
+    node.drive_ready().await.unwrap();
+    assert_eq!(node.read_executor.len(), 1);
+
+    // A second sorted Range and a live Range wait. Then the caller of the sorted Range times out.
+    let (tx, gone) = oneshot::channel();
+    node.enqueue_query(sorted_read(tx));
+    let (tx, live) = oneshot::channel();
+    node.linear_read(wide_range(b"a", b"z"), tx);
+    let id = *node.reads.keys().next().unwrap();
+    node.drive_ready().await.unwrap();
+    confirm_read(&mut node, &id).await;
+    assert_eq!(node.read_queries.len(), 2);
+    drop(gone);
+
+    let output = node.read_executor.step().await.unwrap().unwrap();
+    node.complete_read(output).unwrap();
+    assert!(held.await.unwrap().is_ok());
+    node.schedule_reads();
+    assert_eq!(node.read_executor.len(), 1);
+    assert!(node.read_queries.is_empty());
+    let output = node.read_executor.step().await.unwrap().unwrap();
+    node.complete_read(output).unwrap();
+    assert!(live.await.unwrap().is_ok());
 }
 
 #[tokio::test]

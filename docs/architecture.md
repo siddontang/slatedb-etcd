@@ -232,8 +232,8 @@ A running wide-read job has a 60-second deadline, so a large LIST is not retried
 Shutdown stops these jobs before closing the state database.
 The owner checks the term, role, and leader identity again before returning the result.
 Leadership loss or client cancellation removes the pending request.
-A linearizable read that does not start in the read executor within five seconds also fails,
-and a queued read whose request failed does not start.
+A linearizable read fails if it does not start in the read executor within five seconds after
+the owner accepts it. A queued read whose request failed or whose caller left does not start.
 At most 64 ReadIndex requests can wait. These requests do not append log entries.
 Unconfirmed requests retry every two Raft ticks until confirmation, cancellation, or timeout.
 Retries cover lost messages and reads dropped before a new leader commits its first entry.

@@ -421,3 +421,54 @@ impl Kv for Service {
         Ok(Response::new(response))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A large LIST can run past the ten-second write wait. Its reply must still reach the caller.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_range_reply_reaches_the_caller() {
+        let (events, mut receiver) = mpsc::channel(4);
+        let service = Service::new(
+            1,
+            events,
+            &BTreeMap::new(),
+            crate::auth::TokenIssuer::parse("simple").unwrap(),
+            crate::tls::Transport::default(),
+            DEFAULT_WATCH_PROGRESS_INTERVAL,
+        )
+        .unwrap();
+        let range = Op::RequestRange(RangeRequest {
+            key: b"a".to_vec(),
+            range_end: b"z".to_vec(),
+            ..Default::default()
+        });
+        let call = tokio::spawn(async move {
+            service
+                .execute(range, false, crate::auth::Credentials::default())
+                .await
+        });
+        let Some(Event::Authenticated(_, event)) = receiver.recv().await else {
+            panic!("expected an authenticated event");
+        };
+        let Event::Kv(_, reply) = *event else {
+            panic!("expected a KV event");
+        };
+        tokio::time::advance(Duration::from_secs(12)).await;
+        tokio::task::yield_now().await;
+        assert!(!call.is_finished());
+        let response = ResponseOp {
+            response: Some(Resp::ResponseRange(RangeResponse {
+                count: 1,
+                ..Default::default()
+            })),
+        };
+        reply
+            .send(Ok(crate::node::KvReply::Owned(Outcome {
+                result: Ok(response.clone()),
+            })))
+            .unwrap();
+        assert_eq!(call.await.unwrap().unwrap(), response);
+    }
+}
