@@ -98,6 +98,7 @@ func testLearnerLifecycle(t *testing.T, size int, strict bool) {
 	// A new leader refuses a membership change until it applies the entries that it had when it
 	// took the lead, see #148. Shared state mode applies more slowly than replicated state mode.
 	// Wait until the leader applied all entries in its log.
+	var incomplete map[string]any
 	require.Eventually(t, func() bool {
 		response, err := http.Get("http://" + endpoint + "/status")
 		if err != nil {
@@ -108,11 +109,17 @@ func testLearnerLifecycle(t *testing.T, size int, strict bool) {
 		if json.NewDecoder(response.Body).Decode(&state) != nil || state["role"] != "Leader" {
 			return false
 		}
-		applied, _ := state["applied_index"].(float64)
-		committed, _ := state["commit_index"].(float64)
-		last, _ := state["last_log_index"].(float64)
+		applied, ok1 := state["applied_index"].(float64)
+		committed, ok2 := state["commit_index"].(float64)
+		last, ok3 := state["last_log_index"].(float64)
+		if !ok1 || !ok2 || !ok3 {
+			// A missing field must fail the test, not read as 0 and pass the wait.
+			incomplete = state
+			return true
+		}
 		return committed >= last && applied >= committed
 	}, 10*time.Second, 20*time.Millisecond, "the new leader did not apply its log")
+	require.Nil(t, incomplete, "status lacks an index field")
 	removed := uint64(1)
 	// A two-voter cluster needs both voters until removal commits.
 	if size > 1 {
