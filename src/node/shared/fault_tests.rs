@@ -695,9 +695,12 @@ async fn a_clock_refusal_does_not_wait_for_the_old_close() {
     first.put("tick").await;
     first.covered(2, Duration::from_secs(10)).await;
     let events = first.events.clone();
+    // The first writer closes completely, so the next writer is the only one that reads the
+    // manifest in the background.
     first.writer().sync(false, 2, &events);
-    // The clock check holds the next manifest read of the opened writer, then refuses. That
-    // read then holds the close of the refused writer.
+    first.writer().stop().await;
+    // The clock check holds the next manifest read of the opened writer, and refuses only once
+    // that read waits. The read then holds the close of the refused writer.
     let (lagging, armed) = (
         Arc::new(AtomicBool::new(true)),
         Arc::new(AtomicBool::new(true)),
@@ -710,9 +713,17 @@ async fn a_clock_refusal_does_not_wait_for_the_old_close() {
             return now();
         }
         if arm.swap(false, Ordering::SeqCst) {
-            // The opened writer polls its manifest each 100 ms. Its next poll is the held read.
+            // The opened writer polls its manifest in the background. Wait until that poll
+            // holds the read. The limit only guards against a hang.
             store.set(PAUSE_MANIFEST_READ);
-            std::thread::sleep(Duration::from_millis(500));
+            let limit = Instant::now() + Duration::from_secs(30);
+            while store.entered.available_permits() == 0 {
+                assert!(
+                    Instant::now() < limit,
+                    "the writer did not poll its manifest"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
         now() - 60_000
     });
