@@ -40,6 +40,8 @@ type cluster struct {
 	args          []string
 	// readyTimeout replaces the 20 s startup wait, for example for a large restore.
 	readyTimeout time.Duration
+	// deferStart leaves the members stopped. The test starts them and waits for readiness.
+	deferStart bool
 }
 
 func listenLocal(t *testing.T) net.Listener {
@@ -131,6 +133,9 @@ func newClusterConfigured(t *testing.T, size int, configure func(*cluster), extr
 			os.RemoveAll(root)
 		}
 	})
+	if c.deferStart {
+		return c
+	}
 	for i := 1; i <= size; i++ {
 		c.start(i)
 	}

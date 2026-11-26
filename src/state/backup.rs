@@ -31,17 +31,15 @@ const CHECKPOINT_NAME: &str = "native-backup";
 /// `etcdctl snapshot save` accepts a file of a multiple of this size plus the digest.
 const ALIGN: u64 = 512;
 const DIGEST: u64 = 32;
-/// The largest image that a shared-mode restore reads into memory.
-const MAX_SHARED_RESTORE_BYTES: usize = 64 * 1024 * 1024;
 /// The largest encoded row of an image. A restore decodes rows up to this size, and a backup
 /// rejects a larger row before it publishes the image. A Raft entry holds at most 8 MiB, but
 /// the auth row holds every user and role and can grow beyond that.
 pub(super) const MAX_ROW_BYTES: usize = 64 * 1024 * 1024;
 /// The row bytes of one restore write batch.
-const RESTORE_BATCH_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const RESTORE_BATCH_BYTES: usize = 4 * 1024 * 1024;
 /// The row bytes a restore writes between flushes. Without a flush, SlateDB keeps up to
 /// `max_unflushed_bytes` in memtables. This matches the L0 SST size.
-const RESTORE_FLUSH_BYTES: usize = 64 * 1024 * 1024;
+pub(super) const RESTORE_FLUSH_BYTES: usize = 64 * 1024 * 1024;
 /// A data directory with this file holds an interrupted restore. Startup rejects it.
 pub(crate) const RESTORE_MARKER: &str = "restore-incomplete";
 
@@ -444,31 +442,53 @@ impl Image<'_> {
 }
 
 /// Read a native image file row by row, and check its digest at the end.
-struct ImageFile {
+pub(super) struct ImageFile {
     payload: Hashing<std::io::Take<BufReader<std::fs::File>>>,
     version: u32,
     rows: u64,
     read: u64,
+    /// Return true for a row that the restore does not copy. `next` skips it.
+    skip: fn(&[u8]) -> bool,
+    /// The digest state after the last copied row.
+    copied: Sha256,
 }
 
 impl ImageFile {
-    fn open(path: &Path) -> Result<Self> {
+    pub(super) fn open(path: &Path, skip: fn(&[u8]) -> bool) -> Result<Self> {
         let file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
         ensure!(len > DIGEST, "snapshot is missing its checksum");
         let payload = Hashing {
             inner: BufReader::with_capacity(1024 * 1024, file).take(len - DIGEST),
             hash: Sha256::new(),
+            bytes: 0,
+            progress: None,
+            #[cfg(test)]
+            throttle: None,
         };
         Ok(Self {
             payload,
             version: 0,
             rows: 0,
             read: 0,
+            skip,
+            copied: Sha256::new(),
         })
     }
 
-    fn header(&mut self) -> Result<()> {
+    /// Store the number of file bytes read in `progress` after each read. A slow read of a large
+    /// row then still shows progress, and a read that hangs shows none.
+    pub(super) fn count_in(&mut self, progress: Arc<std::sync::atomic::AtomicU64>) {
+        self.payload.progress = Some(progress);
+    }
+
+    /// Return at most `bytes` from each read, and wait `delay` before it, as a slow disk does.
+    #[cfg(test)]
+    pub(super) fn throttle(&mut self, bytes: usize, delay: Duration) {
+        self.payload.throttle = Some((bytes, delay));
+    }
+
+    pub(super) fn header(&mut self) -> Result<()> {
         let (version, _applied, rows): (u32, u64, u64) =
             crate::codec::read::<_, MAX_ROW_BYTES>(&mut self.payload)
                 .context("invalid native snapshot")?;
@@ -481,20 +501,30 @@ impl ImageFile {
         Ok(())
     }
 
-    /// Decode a row. `Bytes` reads each field at once, where `Vec<u8>` reads it bytewise.
-    fn next(&mut self) -> Result<Option<(Bytes, Bytes)>> {
-        if self.read == self.rows {
-            return Ok(None);
+    /// Decode the next copied row. `Bytes` reads each field at once, where `Vec<u8>` reads it
+    /// bytewise.
+    pub(super) fn next(&mut self) -> Result<Option<(Bytes, Bytes)>> {
+        while self.read < self.rows {
+            self.read += 1;
+            let (key, value): (Bytes, Bytes) =
+                crate::codec::read::<_, MAX_ROW_BYTES>(&mut self.payload)
+                    .context("invalid native snapshot")?;
+            if !(self.skip)(&key) {
+                self.copied = self.payload.hash.clone();
+                return Ok(Some((key, value)));
+            }
         }
-        self.read += 1;
-        let row = crate::codec::read::<_, MAX_ROW_BYTES>(&mut self.payload)
-            .context("invalid native snapshot")?;
-        Ok(Some(row))
+        Ok(None)
+    }
+
+    /// The SHA-256 of the file bytes through the last copied row.
+    pub(super) fn prefix(&self) -> [u8; DIGEST as usize] {
+        self.copied.clone().finalize().into()
     }
 
     /// Read the rest of the file. Check its digest, then that the rows filled the payload.
     /// Return the digest.
-    fn finish(mut self, rows: Result<()>) -> Result<[u8; DIGEST as usize]> {
+    pub(super) fn finish(mut self, rows: Result<()>) -> Result<[u8; DIGEST as usize]> {
         let trailing = std::io::copy(&mut self.payload, &mut std::io::sink())?;
         let mut checksum = [0; DIGEST as usize];
         self.payload.inner.into_inner().read_exact(&mut checksum)?;
@@ -511,47 +541,63 @@ impl ImageFile {
 struct Hashing<R> {
     inner: R,
     hash: Sha256,
+    bytes: u64,
+    /// Gets `bytes` after each read, if set.
+    progress: Option<Arc<std::sync::atomic::AtomicU64>>,
+    #[cfg(test)]
+    throttle: Option<(usize, Duration)>,
 }
 
 impl<R: Read> Read for Hashing<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(test)]
+        let buf = match self.throttle {
+            Some((bytes, delay)) => {
+                std::thread::sleep(delay);
+                let len = buf.len().min(bytes);
+                &mut buf[..len]
+            }
+            None => buf,
+        };
         let n = self.inner.read(buf)?;
         self.hash.update(&buf[..n]);
+        self.bytes += n as u64;
+        if let Some(progress) = &self.progress {
+            progress.store(self.bytes, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(n)
     }
 }
 
 /// Return true for the rows that a restore replaces instead of copying.
-fn replaced(key: &[u8]) -> bool {
+pub(super) fn replaced(key: &[u8]) -> bool {
     key == APPLIED || derived_key(key) || key == crate::cluster::KEY
 }
 
 /// A native image file that passed `check`.
 pub(super) struct Checked {
-    path: PathBuf,
+    pub(super) path: PathBuf,
     /// The number of rows that a restore copies.
-    copied: u64,
-    digest: [u8; DIGEST as usize],
+    pub(super) copied: u64,
+    pub(super) digest: [u8; DIGEST as usize],
 }
 
-/// Check every row in one pass.
-pub(super) fn check(path: &Path) -> Result<Checked> {
-    let mut image = ImageFile::open(path)?;
+/// Check every row in one pass. `skip` returns true for the rows that the restore does not copy.
+pub(super) fn check(path: &Path, skip: fn(&[u8]) -> bool) -> Result<Checked> {
+    let mut image = ImageFile::open(path, skip)?;
     let mut copied = 0;
     let rows = (|| {
         image.header()?;
         let mut last: Option<Bytes> = None;
         while let Some((key, value)) = image.next()? {
             ensure!(snapshot_key(&key), "invalid snapshot key");
-            if replaced(&key) {
-                continue;
-            }
             // Images hold rows in key order, so order also rules out duplicates.
             ensure!(
                 last.as_ref().is_none_or(|last| *last < key),
                 "duplicate or unordered snapshot key"
             );
-            restored(&key, value, 0)?;
+            // The restored value of the auth row or the alarm row can have another size.
+            row_size(&key, &restored(&key, value, 0)?)?;
             last = Some(key);
             copied += 1;
         }
@@ -565,16 +611,18 @@ pub(super) fn check(path: &Path) -> Result<Checked> {
     })
 }
 
-/// The rows of one restore batch, with the image to read on or, at its end, its digest.
-type Batch = (
-    Vec<(Bytes, Bytes)>,
-    std::result::Result<ImageFile, [u8; DIGEST as usize]>,
-);
+/// The copied rows of one restore batch, the SHA-256 of the file through its last row, and the
+/// image to read on or, at its end, its digest.
+pub(super) struct Batch {
+    pub(super) rows: Vec<(Bytes, Bytes)>,
+    pub(super) prefix: [u8; DIGEST as usize],
+    pub(super) rest: std::result::Result<ImageFile, [u8; DIGEST as usize]>,
+}
 
-/// Read the next copied rows of an image, about `RESTORE_BATCH_BYTES` of them. Each call
-/// holds a blocking thread only while it reads, never while the writer catches up: a SlateDB
-/// flush can need the same blocking pool, as the local object store does.
-fn read_batch(mut image: ImageFile) -> Result<Batch> {
+/// Read the next copied rows of an image, about `limit` bytes of them. Each call holds a
+/// blocking thread only while it reads, never while the writer catches up: a SlateDB flush can
+/// need the same blocking pool, as the local object store does.
+pub(super) fn read_batch(mut image: ImageFile, limit: usize) -> Result<Batch> {
     let mut rows = vec![];
     let mut bytes = 0;
     let end = (|| {
@@ -582,32 +630,42 @@ fn read_batch(mut image: ImageFile) -> Result<Batch> {
         if image.version == 0 {
             image.header()?;
         }
-        while bytes < RESTORE_BATCH_BYTES {
+        while bytes < limit {
             let Some((key, value)) = image.next()? else {
                 return Ok(true);
             };
-            if replaced(&key) {
-                continue;
-            }
             bytes += key.len() + value.len();
             rows.push((key, value));
         }
         Ok(false)
     })();
+    let prefix = image.prefix();
     // At a read error, `finish` prefers the checksum error, as `check` does.
     if let Ok(false) = end {
-        return Ok((rows, Ok(image)));
+        return Ok(Batch {
+            rows,
+            prefix,
+            rest: Ok(image),
+        });
     }
     let digest = image.finish(end.map(|_| ()))?;
-    Ok((rows, Err(digest)))
+    Ok(Batch {
+        rows,
+        prefix,
+        rest: Err(digest),
+    })
 }
 
-/// The value that a restored cluster stores for `key`.
-fn restored(key: &[u8], value: Bytes, member: u64) -> Result<Bytes> {
+/// The value that a restored cluster stores for `key`. A shared restore records this rule in
+/// its input with `shared::TRANSFORM`, so change that version with it.
+pub(super) fn restored(key: &[u8], value: Bytes, member: u64) -> Result<Bytes> {
     if key == crate::auth::KEY {
         let mut auth: crate::auth::Store = serde_json::from_slice(&value)?;
         auth.reset_tokens();
         return Ok(serde_json::to_vec(&auth)?.into());
+    }
+    if let Some(lease) = crate::lease::restored(key, &value) {
+        return Ok(lease?.into());
     }
     if key == crate::maintenance::ALARMS {
         let mut alarms: Vec<crate::proto::etcdserverpb::AlarmMember> =
@@ -643,7 +701,7 @@ impl StateMachine {
         let started = std::time::Instant::now();
         // A large image reads for long. Keep the reads off the runtime that serves other members.
         let path = backup.to_owned();
-        let checked = tokio::task::spawn_blocking(move || check(&path)).await??;
+        let checked = tokio::task::spawn_blocking(move || check(&path, replaced)).await??;
         tracing::info!(rows = checked.copied, elapsed = ?started.elapsed(), "checked the snapshot to restore");
         Self::restore_checked(&checked, dir, id, cluster_id, members, objects, cache).await
     }
@@ -724,15 +782,16 @@ impl StateMachine {
         let member = *members.members.keys().next().unwrap();
         // Read the image in the blocking pool, as `check` does, one batch ahead of the writes.
         // A failed write drops the read in flight, which stops the reader.
-        let image = ImageFile::open(&checked.path)?;
-        let mut next = Some(tokio::task::spawn_blocking(move || read_batch(image)));
+        let image = ImageFile::open(&checked.path, replaced)?;
+        let read = |image| move || read_batch(image, RESTORE_BATCH_BYTES);
+        let mut next = Some(tokio::task::spawn_blocking(read(image)));
         let mut digest = None;
         let mut written = 0;
         let mut unflushed = 0;
-        while let Some(read) = next.take() {
-            let (rows, rest) = read.await??;
+        while let Some(batch) = next.take() {
+            let Batch { rows, rest, .. } = batch.await??;
             match rest {
-                Ok(image) => next = Some(tokio::task::spawn_blocking(move || read_batch(image))),
+                Ok(image) => next = Some(tokio::task::spawn_blocking(read(image))),
                 Err(end) => digest = Some(end),
             }
             if rows.is_empty() {
@@ -787,22 +846,24 @@ impl StateMachine {
         Ok(())
     }
 
-    /// Check and read a native snapshot for a new shared cluster. The shared database gets its
-    /// rows at index 1. See `shared::Restore`.
-    pub fn restore_shared(
+    /// Check a native backup for a new shared cluster in one pass. The member writes its rows
+    /// into the shared database when it opens. See `shared::Restore`.
+    pub async fn restore_shared(
         backup: &Path,
-        dir: &Path,
         id: u64,
         members: &crate::cluster::Store,
     ) -> Result<shared::Restore> {
-        check_restore_target(dir, id, members)?;
-        let (mut data, checksum) = restored_data(backup, members)?;
-        // The cluster claim sets the quota of shared mode.
-        data.rows.retain(|(key, _)| key != quota::KEY);
-        // The first view checkpoint must hold the membership. See `restored_data`.
-        data.rows
-            .push((crate::cluster::KEY.to_vec(), serde_json::to_vec(members)?));
-        Ok(shared::Restore::new(data.rows, checksum))
+        ensure!(
+            members.members.contains_key(&id),
+            "restore member is missing"
+        );
+        let started = std::time::Instant::now();
+        // A large image reads for long. Keep the reads off the runtime.
+        let path = backup.to_owned();
+        let checked =
+            tokio::task::spawn_blocking(move || check(&path, shared::not_restored)).await??;
+        tracing::info!(rows = checked.copied, elapsed = ?started.elapsed(), "checked the snapshot to restore");
+        shared::Restore::new(checked, id, members)
     }
 }
 
@@ -819,68 +880,17 @@ fn check_restore_target(dir: &Path, id: u64, members: &crate::cluster::Store) ->
     Ok(())
 }
 
-/// Read and check a native snapshot, and rewrite it for a new cluster with `members`. The rows
-/// are at index 1, with new auth tokens and the alarms on a member of the new cluster.
-/// Also return the snapshot checksum in hexadecimal. It identifies the snapshot.
-///
-/// A replicated restore drops the membership row of the backup. Each member restores with its
-/// own flags, so the first leader of the new cluster seeds the row. A shared restore writes the
-/// rows once for all members, so it stores the membership of the restoring member.
-fn restored_data(backup: &Path, members: &crate::cluster::Store) -> Result<(SnapshotData, String)> {
-    let mut bytes = vec![];
-    std::fs::File::open(backup)?
-        .take(MAX_SHARED_RESTORE_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() <= MAX_SHARED_RESTORE_BYTES,
-        "snapshot exceeds 64 MiB"
-    );
-    ensure!(bytes.len() > 32, "snapshot is missing its checksum");
-    let (payload, checksum) = bytes.split_at(bytes.len() - 32);
-    ensure!(
-        Sha256::digest(payload).as_slice() == checksum,
-        "snapshot checksum mismatch"
-    );
-    let (mut data, consumed): (SnapshotData, _) = bincode::serde::decode_from_slice(
-        payload,
-        bincode::config::legacy().with_limit::<MAX_SHARED_RESTORE_BYTES>(),
-    )
-    .context("invalid native snapshot")?;
-    ensure!(consumed == payload.len(), "trailing native snapshot data");
-    ensure!(
-        crate::readable_snapshot(data.version),
-        "unsupported snapshot version"
-    );
-    let mut seen = std::collections::BTreeSet::new();
-    for (key, value) in &mut data.rows {
-        ensure!(snapshot_key(key), "invalid snapshot key");
-        ensure!(seen.insert(key.clone()), "duplicate snapshot key");
-        if key == crate::auth::KEY {
-            let mut auth: crate::auth::Store = serde_json::from_slice(value)?;
-            auth.reset_tokens();
-            *value = serde_json::to_vec(&auth)?;
-        }
-        if key == crate::maintenance::ALARMS {
-            let mut alarms: Vec<crate::proto::etcdserverpb::AlarmMember> =
-                serde_json::from_slice(value)?;
-            // Keep alarm types, but attach them to a member of the restored cluster.
-            for alarm in &mut alarms {
-                alarm.member_id = *members.members.keys().next().unwrap();
-            }
-            alarms.sort_by_key(|alarm| alarm.alarm);
-            alarms.dedup();
-            *value = serde_json::to_vec(&alarms)?;
-        }
-    }
-    // The restored log starts at (1, 1). Install stores that term from the snapshot.
-    data.rows
-        .retain(|(key, _)| key != APPLIED && !derived_key(key) && key != crate::cluster::KEY);
-    data.rows
-        .push((APPLIED.to_vec(), 1_u64.to_be_bytes().to_vec()));
-    data.applied = 1;
-    data.version = crate::SNAPSHOT_FORMAT;
-    let checksum = checksum.iter().map(|byte| format!("{byte:02x}")).collect();
-    Ok((data, checksum))
+/// Write a checksummed image of `rows` to `path`.
+#[cfg(test)]
+pub(crate) fn write_image(path: &Path, rows: Vec<(Vec<u8>, Vec<u8>)>) {
+    let mut bytes = crate::codec::encode(&SnapshotData {
+        version: crate::SNAPSHOT_FORMAT,
+        applied: rows.len() as u64,
+        rows,
+    })
+    .unwrap();
+    bytes.extend_from_slice(&Sha256::digest(&bytes));
+    std::fs::write(path, bytes).unwrap();
 }
 
 fn sync_dir(dir: &Path) -> Result<()> {

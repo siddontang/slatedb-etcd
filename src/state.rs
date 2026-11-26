@@ -53,8 +53,6 @@ mod lease_index_tests;
 pub(crate) mod maintenance;
 #[cfg(test)]
 mod quota_tests;
-#[cfg(test)]
-mod shared_tests;
 
 pub(crate) const APPLIED: &[u8] = b"meta/applied";
 /// The apply position with its Raft term: `(index, term)`, two big-endian `u64` values.
@@ -805,10 +803,14 @@ fn snapshot_key(key: &[u8]) -> bool {
     key.starts_with(DATA) || key.starts_with(b"etcd/") || key == APPLIED || derived_key(key)
 }
 
-/// Return true for a meta row that each state derives again: the applied term and the logical
-/// size counters. Format 4 images and backups omit these rows, so the previous reader accepts them.
+/// Return true for a meta row that each state derives again: the applied term, the logical
+/// size counters, and the progress of a shared restore. Format 4 images and backups omit these
+/// rows, so the previous reader accepts them.
 fn derived_key(key: &[u8]) -> bool {
-    key == APPLIED_TERM || key == shared::LOGICAL_BYTES || key == LOGICAL_SIZE
+    key == APPLIED_TERM
+        || key == shared::LOGICAL_BYTES
+        || key == LOGICAL_SIZE
+        || key == shared::PROGRESS
 }
 
 fn data_key(key: &str) -> Vec<u8> {

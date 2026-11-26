@@ -316,12 +316,10 @@ impl Server {
                 .await?;
             } else {
                 // A new shared cluster gets the rows in its shared database when it opens.
-                restore = Some(crate::state::StateMachine::restore_shared(
-                    &backup,
-                    &config.dir,
-                    config.id,
-                    &members,
-                )?);
+                restore = Some(
+                    crate::state::StateMachine::restore_shared(&backup, config.id, &members)
+                        .await?,
+                );
             }
         }
         // Snapshot restore must see the original data directory before AutoTLS creates fixtures.

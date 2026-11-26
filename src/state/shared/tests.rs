@@ -7,7 +7,7 @@ use slatedb::config::{CheckpointOptions, CheckpointScope, ScanOptions};
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
 
-pub(super) fn options() -> shared::Options {
+pub(in crate::state) fn options() -> shared::Options {
     shared::Options {
         quota: 0,
         voters: vec![1],
@@ -20,7 +20,7 @@ pub(super) fn options() -> shared::Options {
     }
 }
 
-pub(super) async fn open_shared(store: Arc<dyn ObjectStore>) -> StateMachine {
+pub(in crate::state) async fn open_shared(store: Arc<dyn ObjectStore>) -> StateMachine {
     StateMachine::open_shared(
         store,
         "cluster",
@@ -33,7 +33,7 @@ pub(super) async fn open_shared(store: Arc<dyn ObjectStore>) -> StateMachine {
     .unwrap()
 }
 
-pub(super) fn put(key: &str, value: &str) -> RequestOp {
+pub(in crate::state) fn put(key: &str, value: &str) -> RequestOp {
     RequestOp {
         request: Some(Op::RequestPut(PutRequest {
             key: key.as_bytes().to_vec(),
@@ -43,7 +43,7 @@ pub(super) fn put(key: &str, value: &str) -> RequestOp {
     }
 }
 
-pub(super) fn delete(key: &str, end: &str) -> RequestOp {
+pub(in crate::state) fn delete(key: &str, end: &str) -> RequestOp {
     RequestOp {
         request: Some(Op::RequestDeleteRange(DeleteRangeRequest {
             key: key.as_bytes().to_vec(),
@@ -261,7 +261,7 @@ async fn no_op_entries_write_no_batch_after_the_membership_seed() {
 }
 
 /// Open the shared writer, as the leader task does.
-pub(super) async fn writer(state: &StateMachine) -> slatedb::Db {
+pub(in crate::state) async fn writer(state: &StateMachine) -> slatedb::Db {
     let source = state.shared.as_ref().unwrap().source.clone();
     source.open_writer().await.unwrap()
 }
@@ -280,7 +280,7 @@ async fn flush(state: &StateMachine, writer: &slatedb::Db, written: &mut u64) {
 }
 
 /// Write the overlay batches into the shared database, flush, and open a checkpoint of it.
-pub(super) async fn checkpoint(
+pub(in crate::state) async fn checkpoint(
     state: &StateMachine,
     writer: &slatedb::Db,
     written: &mut u64,
@@ -591,18 +591,18 @@ async fn a_shared_backup_restores_into_a_replicated_cluster() {
     let shared_image = state.snapshot_data().await.unwrap();
     let data: SnapshotData = crate::codec::decode(&shared_image).unwrap();
     assert!(data.rows.iter().all(|(key, _)| !derived_key(key)));
-    super::tests::check_format_4(&data);
-    let shared_backup = super::tests::backup_bytes(shared_image);
-    super::tests::check_format_4_backup(&shared_backup);
+    crate::state::tests::check_format_4(&data);
+    let shared_backup = crate::state::tests::backup_bytes(shared_image);
+    crate::state::tests::check_format_4_backup(&shared_backup);
     // A Snapshot RPC in shared mode sends the same image of the pinned view. It pads the
     // membership JSON, so `etcdctl snapshot save` accepts the length: 512 * n + the digest.
-    let streamed = super::tests::streamed_backup(&state).await;
+    let streamed = crate::state::tests::streamed_backup(&state).await;
     assert_eq!(
         streamed.len() % 512,
         32,
         "etcdctl snapshot save checks this size"
     );
-    super::tests::check_format_4_backup(&streamed);
+    crate::state::tests::check_format_4_backup(&streamed);
     let mut padded: SnapshotData = crate::codec::decode(&streamed[..streamed.len() - 32]).unwrap();
     // The backup ends with the membership in memory. The Raft image sends only a stored row.
     let (key, members) = padded.rows.pop().unwrap();
@@ -614,17 +614,18 @@ async fn a_shared_backup_restores_into_a_replicated_cluster() {
     let mut stored = data.rows.clone();
     stored.retain(|(key, _)| key != crate::cluster::KEY);
     assert_eq!(padded.rows, stored);
-    let reference_backup = super::tests::backup_bytes(reference.snapshot_data().await.unwrap());
+    let reference_backup =
+        crate::state::tests::backup_bytes(reference.snapshot_data().await.unwrap());
 
     let restored = {
         let path = dir.path().join("from-shared");
         std::fs::create_dir(&path).unwrap();
-        super::tests::restore(&path, streamed).await
+        crate::state::tests::restore(&path, streamed).await
     };
     let expected = {
         let path = dir.path().join("from-replicated");
         std::fs::create_dir(&path).unwrap();
-        super::tests::restore(&path, reference_backup).await
+        crate::state::tests::restore(&path, reference_backup).await
     };
     assert_eq!(rows(&restored, b"").await, rows(&expected, b"").await);
     assert_eq!(restored.logical_size(), expected.logical_size());
@@ -669,7 +670,8 @@ async fn readers_drop_a_logical_size_row() {
     let image = crate::codec::encode(&data).unwrap();
     let path = dir.path().join("restore");
     std::fs::create_dir(&path).unwrap();
-    let restored = super::tests::restore(&path, super::tests::backup_bytes(image)).await;
+    let restored =
+        crate::state::tests::restore(&path, crate::state::tests::backup_bytes(image)).await;
     assert_eq!(
         restored
             .applied_state()
@@ -1416,98 +1418,6 @@ async fn a_fenced_writer_deletes_no_checkpoint() {
         .collect();
     assert_eq!(left, [views[0].1, views[3].1, views[4].1]);
     state.close().await.unwrap();
-}
-
-fn restore(id: &str) -> shared::Restore {
-    let members = crate::cluster::Store::initial(&[(1, "127.0.0.1:1".to_owned())].into());
-    shared::Restore::new(
-        vec![
-            (APPLIED.to_vec(), 1_u64.to_be_bytes().to_vec()),
-            (
-                crate::cluster::KEY.to_vec(),
-                serde_json::to_vec(&members).unwrap(),
-            ),
-            (b"etcd/restored".to_vec(), id.as_bytes().to_vec()),
-        ],
-        id.to_owned(),
-    )
-}
-
-fn restore_source(store: Arc<dyn ObjectStore>) -> (Arc<shared::Source>, slatedb::admin::Admin) {
-    let source = shared::offline_source(store.clone(), "cluster", StateCache::default()).unwrap();
-    let admin = slatedb::admin::Admin::builder(source.state().as_str(), store).build();
-    (source, admin)
-}
-
-/// The bootstrap claim names the snapshot. The same snapshot restores again with success. Another
-/// snapshot fails, and so does a shared state that an older ordinary start created.
-#[tokio::test]
-async fn a_restore_claim_names_its_snapshot() {
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let (source, admin) = restore_source(store.clone());
-    shared::seed(&source, &admin, &restore("a")).await.unwrap();
-    shared::seed(&source, &admin, &restore("a")).await.unwrap();
-    let error = shared::seed(&source, &admin, &restore("b"))
-        .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("new cluster prefix"),
-        "{error:#}"
-    );
-    let (id, _) = shared::view_checkpoints(&admin)
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    assert_eq!(id, 1);
-    // A normal first leader created this shared state. It has no restore claim.
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let (source, admin) = restore_source(store);
-    let db = source.open_writer().await.unwrap();
-    db.put(b"etcd/other", b"value").await.unwrap();
-    db.flush().await.unwrap();
-    db.close().await.unwrap();
-    let error = shared::seed(&source, &admin, &restore("a"))
-        .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("new cluster prefix"),
-        "{error:#}"
-    );
-}
-
-/// A restore stopped after its rows reached the shared database and before its checkpoint and
-/// marker. The next restore of the same snapshot completes the checkpoint and the marker.
-#[tokio::test]
-async fn a_restore_completes_after_a_failure_before_its_marker() {
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let (source, admin) = restore_source(store);
-    let partial = restore("a");
-    shared::seed_rows_for_test(&source, &partial).await.unwrap();
-    assert!(!source.bootstrapped().await.unwrap());
-    assert!(admin.read_manifest(None).await.unwrap().is_some());
-    shared::seed(&source, &admin, &partial).await.unwrap();
-    assert!(source.bootstrapped().await.unwrap());
-    let (seq, checkpoint) = shared::view_checkpoints(&admin)
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    assert_eq!(seq, 1);
-    let base = source.open_base(checkpoint.id).await.unwrap();
-    assert_eq!(base.applied, 1);
-    assert_eq!(
-        base.get(b"etcd/restored").await.unwrap().as_deref(),
-        Some(b"a".as_slice())
-    );
-    // Another snapshot cannot take over the state of this one.
-    let error = shared::seed(&source, &admin, &restore("b"))
-        .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("new cluster prefix"),
-        "{error:#}"
-    );
 }
 
 /// Defragment from sorted runs only. SlateDB can reuse the destination run ID, so the check

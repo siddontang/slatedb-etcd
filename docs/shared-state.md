@@ -817,8 +817,8 @@ its writer publishes. MoveLeader can still move the lead to it.
 - **View age:** compare 10 s and 30 s under light writes and bursts. Choose the release default
   from follower peak memory, retained log bytes, S3 requests, compaction bytes, and write p99.
 - **Recovery:** restore a cluster after loss of the shared prefix at the target data size. A
-  backup has no image size limit. A restore into shared mode accepts at most 64 MiB today, so
-  production use needs a larger restore path.
+  backup and a restore have no image size limit. Measure the restore time and the memory of the
+  restoring member.
 
 ## Decisions
 

@@ -923,53 +923,20 @@ async fn ordinary(store: Arc<dyn ObjectStore>) -> (StateMachine, Handles) {
     (state, handles)
 }
 
-fn snapshot(id: &str) -> crate::state::shared::Restore {
-    let members = crate::cluster::Store::initial(&[(1, "127.0.0.1:1".to_owned())].into());
-    crate::state::shared::Restore::new(
-        vec![
-            (crate::state::APPLIED.to_vec(), 1_u64.to_be_bytes().to_vec()),
-            (
-                crate::cluster::KEY.to_vec(),
-                serde_json::to_vec(&members).unwrap(),
-            ),
-            (b"etcd/restored".to_vec(), id.as_bytes().to_vec()),
-        ],
-        id.to_owned(),
-    )
+/// A checked image of one row with value `id`, for a restore by member 1.
+fn snapshot(dir: &std::path::Path, id: &str) -> crate::state::shared::Restore {
+    snapshot_with(dir, id, crate::state::shared::Hooks::default())
 }
 
-/// A restore claims the bootstrap and stops before its marker. An ordinary member then
-/// opens without the restore flag. It does not select an empty base: it waits. The restore
-/// completes, and the ordinary member opens on the restored checkpoint.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_ordinary_start_waits_for_a_pending_restore() {
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let source = crate::state::shared::offline_source(
-        store.clone(),
-        "root",
-        crate::state::StateCache::default(),
-    )
-    .unwrap();
-    let restore = snapshot("a");
-    crate::state::shared::seed_rows_for_test(&source, &restore)
-        .await
-        .unwrap();
-    let opening = tokio::spawn(ordinary(store.clone()));
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(!opening.is_finished());
-    let admin = slatedb::admin::Admin::builder(source.state().as_str(), store).build();
-    crate::state::shared::seed(&source, &admin, &restore)
-        .await
-        .unwrap();
-    let (state, _handles) = opening.await.unwrap();
-    let base = state.shared.as_ref().unwrap().base.clone();
-    assert_eq!(base.applied, 1);
-    assert_eq!(
-        base.get(b"etcd/restored").await.unwrap().as_deref(),
-        Some(b"a".as_slice())
-    );
-    drop(base);
-    state.close().await.unwrap();
+fn snapshot_with(
+    dir: &std::path::Path,
+    id: &str,
+    hooks: crate::state::shared::Hooks,
+) -> crate::state::shared::Restore {
+    let path = dir.join(id);
+    let rows = vec![(b"etcd/restored".to_vec(), id.as_bytes().to_vec())];
+    crate::state::backup::write_image(&path, rows);
+    crate::state::shared::Restore::for_test(&path, "127.0.0.1:1", hooks)
 }
 
 /// An ordinary leader bootstraps first. A later restore into that cluster fails, and tells
@@ -987,7 +954,8 @@ async fn a_restore_after_an_ordinary_bootstrap_fails() {
     assert!(handles.source.bootstrapped().await.unwrap());
     let admin =
         slatedb::admin::Admin::builder(handles.source.state().as_str(), store.clone()).build();
-    let error = crate::state::shared::seed(&handles.source, &admin, &snapshot("a"))
+    let dir = tempfile::tempdir().unwrap();
+    let error = crate::state::shared::seed(&handles.source, &admin, &snapshot(dir.path(), "a"))
         .await
         .unwrap_err();
     assert!(
@@ -999,13 +967,14 @@ async fn a_restore_after_an_ordinary_bootstrap_fails() {
     state.close().await.unwrap();
 }
 
-/// A restore stops after its rows, or after its checkpoint, before its marker. An ordinary
-/// server start never serves the empty base while the restore claim is pending. After the
-/// rows it fails after its wait. After the checkpoint it completes the marker with the
-/// snapshot checksum and starts. A retry of the same snapshot then succeeds, and an ordinary
-/// start follows the restore.
+/// A restore stops after its completion batch, or after its checkpoint, before its marker. An
+/// ordinary server start never serves the empty base while the restore claim is pending. After
+/// the completion batch it fails once the lease is stale. After the checkpoint it completes the
+/// marker with the snapshot digest and starts. A retry of the same snapshot then succeeds, and
+/// an ordinary start follows the restore.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_ordinary_start_resolves_a_stopped_restore() {
+    use crate::state::shared::{Hooks, Stop};
     for checkpointed in [false, true] {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let source = crate::state::shared::offline_source(
@@ -1015,16 +984,20 @@ async fn an_ordinary_start_resolves_a_stopped_restore() {
         )
         .unwrap();
         let admin = slatedb::admin::Admin::builder(source.state().as_str(), store.clone()).build();
-        let restore = snapshot("a");
-        if checkpointed {
-            crate::state::shared::seed_checkpoint_for_test(&source, &restore)
-                .await
-                .unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let stop = if checkpointed {
+            Stop::AfterCheckpoint
         } else {
-            crate::state::shared::seed_rows_for_test(&source, &restore)
-                .await
-                .unwrap();
-        }
+            Stop::AfterCompletion
+        };
+        let hooks = Hooks {
+            stop: std::sync::Mutex::new(Some(stop)),
+            ..Default::default()
+        };
+        let restore = snapshot_with(files.path(), "a", hooks);
+        crate::state::shared::seed(&source, &admin, &restore)
+            .await
+            .unwrap_err();
         let dir = tempfile::tempdir().unwrap();
         let mut config = crate::server::ServerConfig::single_node(dir.path());
         config.state_mode = crate::state::StateMode::Shared;
@@ -1035,13 +1008,14 @@ async fn an_ordinary_start_resolves_a_stopped_restore() {
         )
         .await
         .unwrap();
+        let digest = restore.digest().to_owned();
         if checkpointed {
             let server = started.unwrap();
             server.wait_ready(Duration::from_secs(15)).await.unwrap();
             server.shutdown().await.unwrap();
             assert_eq!(
-                source.restored_snapshot().await.unwrap().as_deref(),
-                Some("a")
+                source.restored_snapshot().await.unwrap(),
+                Some(digest.clone())
             );
         } else {
             let error = started.err().unwrap();
@@ -1049,13 +1023,10 @@ async fn an_ordinary_start_resolves_a_stopped_restore() {
             assert!(!source.bootstrapped().await.unwrap());
         }
         // The same snapshot restores with success at either boundary.
-        crate::state::shared::seed(&source, &admin, &restore)
+        crate::state::shared::seed(&source, &admin, &snapshot(files.path(), "a"))
             .await
             .unwrap();
-        assert_eq!(
-            source.restored_snapshot().await.unwrap().as_deref(),
-            Some("a")
-        );
+        assert_eq!(source.restored_snapshot().await.unwrap(), Some(digest));
         let dir = tempfile::tempdir().unwrap();
         let mut config = crate::server::ServerConfig::single_node(dir.path());
         config.state_mode = crate::state::StateMode::Shared;

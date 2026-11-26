@@ -1,4 +1,4 @@
-use super::{Stream, MAX_ROW_BYTES, RESTORE_MARKER};
+use super::{write_image, Stream, MAX_ROW_BYTES, RESTORE_MARKER};
 use crate::state::*;
 use crate::{Command, Operation};
 use sha2::{Digest, Sha256};
@@ -306,7 +306,7 @@ async fn a_restore_rejects_an_image_replaced_after_its_check() {
     };
     let path = dir.path().join("native.snapshot");
     std::fs::write(&path, image(b"checked")).unwrap();
-    let checked = super::check(&path).unwrap();
+    let checked = super::check(&path, super::replaced).unwrap();
     // Between the passes, a valid image with as many rows replaces the checked file.
     std::fs::write(&path, image(b"replaced")).unwrap();
     let target = dir.path().join("restored");
@@ -369,25 +369,13 @@ async fn a_paused_client_keeps_the_backup_checkpoint() {
     state.close().await.unwrap();
 }
 
-/// Write a checksummed image of `rows` to `path`.
-fn write_image(path: &std::path::Path, rows: Vec<(Vec<u8>, Vec<u8>)>) {
-    let mut bytes = crate::codec::encode(&SnapshotData {
-        version: crate::SNAPSHOT_FORMAT,
-        applied: rows.len() as u64,
-        rows,
-    })
-    .unwrap();
-    bytes.extend_from_slice(&Sha256::digest(&bytes));
-    std::fs::write(path, bytes).unwrap();
-}
-
 async fn restore_checked(
     path: &std::path::Path,
     dir: &std::path::Path,
     cluster: &str,
     objects: &crate::object::Config,
 ) -> Result<()> {
-    let checked = super::check(path)?;
+    let checked = super::check(path, super::replaced)?;
     StateMachine::restore_checked(
         &checked,
         dir,
@@ -524,7 +512,7 @@ async fn a_restore_does_not_index_the_copied_keys() {
     released(&source).await;
     let path = dir.path().join("native.snapshot");
     std::fs::write(&path, &data).unwrap();
-    let checked = super::check(&path).unwrap();
+    let checked = super::check(&path, super::replaced).unwrap();
     let mut state = StateMachine::open(&dir.path().join("restore"))
         .await
         .unwrap();
@@ -613,7 +601,7 @@ async fn a_restore_check_does_not_stall_a_single_worker_runtime() {
     *bytes.last_mut().unwrap() ^= 1;
     std::fs::write(&path, bytes).unwrap();
     let started = std::time::Instant::now();
-    assert!(super::check(&path).is_err());
+    assert!(super::check(&path, super::replaced).is_err());
     let pass = started.elapsed();
 
     let gap = Arc::new(AtomicU64::new(0));
@@ -669,7 +657,7 @@ async fn an_interrupted_s3_restore_retries_after_its_namespace_is_cleared() {
     let objects = crate::object::Config::TestS3(store.clone(), s3.clone());
     // The image changes during the restore, after the member claimed its namespace.
     write_image(&path, rows(b"checked"));
-    let checked = super::check(&path).unwrap();
+    let checked = super::check(&path, super::replaced).unwrap();
     write_image(&path, rows(b"replaced"));
     let target = dir.path().join("member");
     let error = StateMachine::restore_checked(
