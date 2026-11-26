@@ -2398,7 +2398,7 @@ dependencies = [
 [[package]]
 name = "raft-engine"
 version = "0.4.2"
-source = "git+https://github.com/siddontang/raft-engine?branch=codex%2Fcache-identity#c5a630efbcb314a8453e7d8d0269efecbf77d7a3"
+source = "git+https://github.com/tikv/raft-engine?rev=32b68d36ca#32b68d36cab7e4fab7746f44ee92d0fd70941358"
 dependencies = [
  "byteorder",
  "crc32fast",

@@ -13,6 +13,6 @@ Imported common tests retain notices from The etcd Authors under Apache License 
 Their adapted source and license appear under tests/compat/ and tests/upstream/.
 The SlateDB license text retains the upstream copyright notice for Chris Riccomini.
 
-Raft and Raft Engine come from Git forks of the TiKV repositories. See docs/dependencies.md.
+Raft comes from a Git fork and Raft Engine from upstream TiKV Git. See docs/dependencies.md.
 Raft Engine: Copyright 2017-present PingCAP, Inc. Licensed under Apache License 2.0.
 Raft: Copyright TiKV Project Authors. Licensed under Apache License 2.0.
