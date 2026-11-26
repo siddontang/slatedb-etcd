@@ -151,6 +151,7 @@ async fn lose_a_checkpoint_object(lose: Lose) {
         join: false,
         empty_log: false,
         pin_max: Duration::from_secs(300),
+        overlay_max_bytes: 1 << 30,
         restore: None,
         record: None,
     };
@@ -305,6 +306,7 @@ async fn grouping_members() -> (StateMachine, StateMachine, Vec<Entry>) {
         join: false,
         empty_log: false,
         pin_max: Duration::from_secs(300),
+        overlay_max_bytes: 1 << 30,
         restore: None,
         record: None,
     };

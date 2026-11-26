@@ -139,10 +139,11 @@ checkpoint. The stream reads the view twice, as above, so the image has no size 
 has the same 64 MiB limit.
 The backup view is exempt from `--view-pin-max`. The stream ends with Unavailable when the client
 takes no message for 60 s. The first pass does not count.
-A member streams at most 4 backups. Their pinned overlay segments count against
-`--overlay-max-bytes`. A backup above a limit returns ResourceExhausted; retry it later.
-When base switches leave the pinned segments above the limit, the oldest backup ends with
-Unavailable. See [backups](shared-state.md#backups).
+A member streams at most 4 backups. The overlay segments that they keep after a base switch
+count against `--overlay-max-bytes`. So a backup of a full overlay can start.
+A backup above a limit returns ResourceExhausted; retry it later. When base switches leave the
+kept segments above the limit, the oldest backup ends with Unavailable.
+See [backups](shared-state.md#backups).
 A restore into shared mode still reads the whole file in memory, so it accepts at most 64 MiB.
 That limit applies to every file it restores, including one saved from a replicated member.
 

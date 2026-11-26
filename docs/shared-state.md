@@ -340,12 +340,16 @@ not count as idle time.
 A slow backup keeps the segments that later base switches release. Each member bounds this:
 
 - At most 4 backups stream at one time.
-- The segments that the backups pin count against `--overlay-max-bytes`. A segment that several
-  backups pin counts once.
-- A new backup above either limit fails with ResourceExhausted. Retry it later.
-- When pinned segments grow above the limit, the oldest backup ends with Unavailable
-  (`backup too slow`). Its pin and its share of the budget end at once. The client reads the
-  error before the messages that it did not read.
+- A segment counts against `--overlay-max-bytes` only after the overlay released it, at a base
+  switch or a rebase. The overlay already counts the other segments. So a backup of a full
+  overlay, as when the writer is down, can start. A segment that several backups keep counts once.
+- A new backup fails with ResourceExhausted at 4 streams or while the count is above the limit.
+  Retry it later.
+- When released segments raise the count above the limit, the oldest backup ends with
+  Unavailable (`backup too slow`). It ends also when its client has unread messages, and the
+  client reads the error first. It keeps its place and its count until its task drops the view,
+  so later checks end no other backup for the same bytes.
+- The member keeps these limits across a base adoption, a rebase, and a snapshot install.
 - This budget does not change the write admission of the leader.
 
 ## Base switch

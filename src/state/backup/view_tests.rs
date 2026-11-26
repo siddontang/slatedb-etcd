@@ -1,10 +1,11 @@
 //! Shared-mode backups: the image of a pinned view, its pin, and the member budget.
 
-use super::view::{Backups, IDLE_MAX, MAX_STREAMS};
+use super::view::IDLE_MAX;
 use super::{backup_error, Stream, MAX_ROW_BYTES};
 use crate::proto::etcdserverpb::{response_op, RangeRequest, RequestOp, ResponseOp};
 use crate::proto::mvccpb::KeyValue;
-use crate::state::shared_tests::{checkpoint, delete, open_shared, put, writer};
+use crate::state::overlay::{Holders, MAX_HOLDERS};
+use crate::state::shared_tests::{checkpoint, delete, open_shared, options, put, writer};
 use crate::state::*;
 use futures::StreamExt;
 use slatedb::object_store::memory::InMemory;
@@ -27,8 +28,25 @@ struct Fixture {
 impl Fixture {
     /// A shared state whose base holds `rows` rows of `VALUE_BYTES`.
     async fn new(rows: usize) -> Self {
+        Self::with_budget(rows, u64::MAX).await
+    }
+
+    /// Like `new`, with a budget of `limit` bytes for the segments that backups keep.
+    async fn with_budget(rows: usize, limit: u64) -> Self {
         let store = Arc::new(InMemory::new());
-        let state = open_shared(store.clone()).await;
+        let state = StateMachine::open_shared(
+            store.clone(),
+            "cluster",
+            "test",
+            StateCache::default(),
+            &shared::Options {
+                overlay_max_bytes: limit,
+                ..options()
+            },
+            transfer::Backend::Local,
+        )
+        .await
+        .unwrap();
         let writer = writer(&state).await;
         let mut fixture = Self {
             state,
@@ -77,8 +95,23 @@ impl Fixture {
         id
     }
 
-    fn backups(&self) -> Arc<Backups> {
-        self.state.backups().unwrap()
+    fn holders(&self) -> Arc<Holders> {
+        self.state.shared.as_ref().unwrap().holders.clone()
+    }
+
+    /// Hold new backups before their first pass until the returned semaphore gets a permit.
+    fn hold(&self) -> Arc<tokio::sync::Semaphore> {
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.holders().hold.lock().unwrap() = Some(hold.clone());
+        hold
+    }
+
+    /// The text of the member's metrics.
+    fn metrics(&self) -> String {
+        let families = self.state.metrics.registry.gather();
+        prometheus::TextEncoder::new()
+            .encode_to_string(&families)
+            .unwrap()
     }
 
     fn pins(&self, id: uuid::Uuid) -> bool {
@@ -89,7 +122,7 @@ impl Fixture {
     /// Wait until `streams` backups stream and the member no longer pins checkpoint `id`.
     async fn released(&self, id: uuid::Uuid, streams: usize) {
         for _ in 0..500 {
-            if self.backups().status().0 == streams && !self.pins(id) {
+            if self.holders().status().0 == streams && !self.pins(id) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -198,7 +231,7 @@ async fn a_shared_backup_streams_the_view_image() {
     assert!(value("kept").is_some() && value("new").is_some());
     assert!(rows.iter().all(|(key, _)| key != quota::KEY));
     assert_eq!(rows.last().unwrap().0, crate::cluster::KEY);
-    assert_eq!(fixture.backups().status(), (0, 0));
+    assert_eq!(fixture.holders().status(), (0, 0));
     fixture.close().await;
 }
 
@@ -267,7 +300,7 @@ async fn a_shared_backup_rejects_a_large_row_before_its_first_chunk() {
         "{error:?}"
     );
     assert!(stream.recv().await.is_none());
-    assert_eq!(fixture.backups().status(), (0, 0));
+    assert_eq!(fixture.holders().status(), (0, 0));
     fixture.close().await;
 }
 
@@ -281,7 +314,7 @@ async fn a_shared_backup_releases_its_pin_when_the_client_goes_away() {
     stream.recv().await.unwrap().unwrap();
     fill().await;
     fixture.switch().await;
-    let (streams, bytes) = fixture.backups().status();
+    let (streams, bytes) = fixture.holders().status();
     assert!(streams == 1 && bytes > 0, "{streams} {bytes}");
     assert!(fixture.pins(first));
     drop(stream);
@@ -312,7 +345,7 @@ async fn a_shared_backup_fails_when_an_sst_goes_away() {
         .await
         .expect("the stream kept retrying");
     assert_eq!(error.code, tonic::Code::Unavailable as i32, "{error:?}");
-    assert_eq!(fixture.backups().status(), (0, 0));
+    assert_eq!(fixture.holders().status(), (0, 0));
     fixture.close().await;
 }
 
@@ -322,8 +355,7 @@ async fn a_shared_backup_fails_when_an_sst_goes_away() {
 async fn a_long_count_pass_does_not_hold_apply() {
     let mut fixture = Fixture::new(4).await;
     let first = fixture.state.base_checkpoint().unwrap();
-    let hold = Arc::new(tokio::sync::Semaphore::new(0));
-    *fixture.backups().hold.lock().unwrap() = Some(hold.clone());
+    let _hold = fixture.hold();
     let started = std::time::Instant::now();
     let mut stream = fixture.state.backup().await.unwrap();
     assert!(started.elapsed() < Duration::from_secs(1));
@@ -348,8 +380,7 @@ async fn a_long_count_pass_does_not_hold_apply() {
 async fn an_idle_client_ends_a_shared_backup() {
     let mut fixture = Fixture::new(200).await;
     let first = fixture.state.base_checkpoint().unwrap();
-    let hold = Arc::new(tokio::sync::Semaphore::new(0));
-    *fixture.backups().hold.lock().unwrap() = Some(hold.clone());
+    let hold = fixture.hold();
     let mut stream = fixture.state.backup().await.unwrap();
     fixture.switch().await;
     tokio::time::pause();
@@ -364,7 +395,7 @@ async fn an_idle_client_ends_a_shared_backup() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     tokio::time::advance(IDLE_MAX - Duration::from_secs(1)).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(fixture.backups().status().0, 1, "the stream ended early");
+    assert_eq!(fixture.holders().status().0, 1, "the stream ended early");
     tokio::time::advance(Duration::from_secs(2)).await;
     fixture.released(first, 0).await;
     // The error comes before the buffered chunks.
@@ -378,52 +409,61 @@ async fn an_idle_client_ends_a_shared_backup() {
     fixture.close().await;
 }
 
-/// Put rows of 10 KiB under `prefix` until the overlay holds `bytes`.
-async fn fill_overlay(fixture: &mut Fixture, prefix: &str, bytes: u64) {
+/// Put rows of 10 KiB under `prefix` until the overlay holds `bytes`. Return the row count.
+async fn fill_overlay(fixture: &mut Fixture, prefix: &str, bytes: u64) -> usize {
     let value = "w".repeat(10 * 1024);
     let mut n = 0;
     while fixture.state.view_status().unwrap().2 < bytes {
         fixture.put(&format!("{prefix}/{n:03}"), &value).await;
         n += 1;
     }
+    n
 }
 
 /// A slow backup keeps the segments that base switches release. While the leader keeps writing,
-/// the pinned segments pass the budget, and the oldest backup ends. It ends at once, though its
-/// client still has a full buffer to read, and the client then reads the error first. A new
-/// backup above the budget fails with ResourceExhausted, and it succeeds later.
+/// the released segments pass the budget, and the oldest backup ends. It ends though its client
+/// still has a full buffer to read, and the client then reads the error first. A new backup
+/// fails while the charge is above the budget, and it succeeds later.
 #[tokio::test]
 async fn the_budget_ends_the_oldest_backup_with_a_full_buffer() {
     const KIB: u64 = 1024;
-    let mut fixture = Fixture::new(200).await;
-    let first = fixture.state.base_checkpoint().unwrap();
     let limit = 1024 * KIB;
-    let registry = prometheus::Registry::new();
-    fixture.backups().configure(limit, &registry).unwrap();
+    let mut fixture = Fixture::with_budget(200, limit).await;
+    let first = fixture.state.base_checkpoint().unwrap();
 
     let mut oldest = fixture.state.backup().await.unwrap();
     oldest.recv().await.unwrap().unwrap();
     fill().await;
-    // The oldest backup pins the open segment, which takes these writes.
+    // The oldest backup pins the open segment, which takes these writes. The overlay holds it,
+    // so it costs nothing until the switch releases it.
     fill_overlay(&mut fixture, "first", 600 * KIB).await;
+    assert_eq!(fixture.holders().status(), (1, 0));
     fixture.switch().await;
     let newer = fixture.state.backup().await.unwrap();
-    let (streams, bytes) = fixture.backups().status();
+    let (streams, bytes) = fixture.holders().status();
     assert!(streams == 2 && bytes >= 600 * KIB && bytes <= limit);
-    // The newer backup pins the next segment. Together they pass the budget.
+    // The newer backup pins the next segment. Once released, both pass the budget.
     fill_overlay(&mut fixture, "second", 600 * KIB).await;
     fixture.switch().await;
+    // No check ran since the switch. A new backup fails while the charge is above the budget.
+    let error = backup_error(fixture.state.backup().await.err().unwrap());
+    assert_eq!(
+        error.code,
+        tonic::Code::ResourceExhausted as i32,
+        "{error:?}"
+    );
     for _ in 0..200 {
-        if fixture.backups().status().0 == 1 {
+        if fixture.holders().status().0 == 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let (streams, bytes) = fixture.backups().status();
-    assert!(streams == 1 && bytes <= limit, "{streams} {bytes}");
-    let text = prometheus::TextEncoder::new()
-        .encode_to_string(&registry.gather())
-        .unwrap();
+    let (streams, bytes) = fixture.holders().status();
+    assert!(
+        streams == 1 && bytes > 0 && bytes <= limit,
+        "{streams} {bytes}"
+    );
+    let text = fixture.metrics();
     assert!(
         text.contains("slatedb_etcd_shared_backup_streams 1\n"),
         "{text}"
@@ -440,14 +480,6 @@ async fn the_budget_ends_the_oldest_backup_with_a_full_buffer() {
     assert!(error.message.contains("backup too slow"), "{error:?}");
     assert!(oldest.recv().await.is_none());
 
-    // With the newer backup, a view with a large open segment passes the budget.
-    fill_overlay(&mut fixture, "third", 600 * KIB).await;
-    let error = backup_error(fixture.state.backup().await.err().unwrap());
-    assert_eq!(
-        error.code,
-        tonic::Code::ResourceExhausted as i32,
-        "{error:?}"
-    );
     // The newer backup completes at its boundary.
     let image = decode(&collect(newer).await);
     assert!(image
@@ -458,20 +490,202 @@ async fn the_budget_ends_the_oldest_backup_with_a_full_buffer() {
         .rows
         .iter()
         .any(|(key, _)| *key == current("second/000")));
-    // The rejected backup succeeds on a retry.
+    // The refused backup succeeds on a retry.
     collect(fixture.state.backup().await.unwrap()).await;
     fixture.close().await;
 }
 
-/// A member streams at most `MAX_STREAMS` backups. Another one fails with ResourceExhausted
+/// A backup of an overlay above the budget starts and completes. The overlay holds every pinned
+/// segment, as when the writer is down and no checkpoint releases them.
+#[tokio::test]
+async fn a_backup_of_a_full_overlay_starts() {
+    const KIB: u64 = 1024;
+    let mut fixture = Fixture::with_budget(1, 256 * KIB).await;
+    let rows = fill_overlay(&mut fixture, "pending", 600 * KIB).await;
+    assert!(fixture.state.view_status().unwrap().2 > 256 * KIB);
+    // Two backups start, and several budget checks run while they wait.
+    let hold = fixture.hold();
+    let streams = [
+        fixture.state.backup().await.unwrap(),
+        fixture.state.backup().await.unwrap(),
+    ];
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(fixture.holders().status(), (2, 0));
+    hold.add_permits(1);
+    for stream in streams {
+        let image = decode(&collect(stream).await);
+        for n in 0..rows {
+            let key = current(&format!("pending/{n:03}"));
+            assert!(
+                image.rows.iter().any(|(row, _)| *row == key),
+                "pending/{n:03}"
+            );
+        }
+    }
+    fixture.close().await;
+}
+
+/// A backup keeps its base checkpoint reported while it streams, also after a base switch.
+#[tokio::test]
+async fn a_backup_keeps_its_base_reported_until_it_ends() {
+    let mut fixture = Fixture::new(200).await;
+    let first = fixture.state.base_checkpoint().unwrap();
+    let hold = fixture.hold();
+    let mut stream = fixture.state.backup().await.unwrap();
+    fixture.put("key", "after").await;
+    fixture.switch().await;
+    // The count pass waits.
+    assert!(fixture.pins(first));
+    hold.add_permits(1);
+    stream.recv().await.unwrap().unwrap();
+    fill().await;
+    // The task waits for the client with the reader open.
+    assert_eq!(fixture.holders().status().0, 1);
+    assert!(fixture.pins(first));
+    while let Some(chunk) = stream.recv().await {
+        chunk.unwrap();
+        let streaming = fixture.holders().status().0 == 1;
+        assert!(!streaming || fixture.pins(first), "the stream lost its pin");
+    }
+    fixture.released(first, 0).await;
+    fixture.close().await;
+}
+
+/// An ending backup stays charged until its task drops the view. Until then a new backup fails,
+/// and further checks end no other backup for the same bytes.
+#[tokio::test]
+async fn an_ending_backup_keeps_its_charge_until_it_drops_its_view() {
+    const KIB: u64 = 1024;
+    let mut fixture = Fixture::new(1).await;
+    let holders = fixture.holders();
+    let hold = fixture.hold();
+    let oldest = fixture.state.backup().await.unwrap();
+    fill_overlay(&mut fixture, "first", 300 * KIB).await;
+    fixture.switch().await;
+    let mut streams = vec![];
+    for _ in 1..MAX_HOLDERS {
+        streams.push(fixture.state.backup().await.unwrap());
+    }
+    fill_overlay(&mut fixture, "second", 300 * KIB).await;
+    fixture.switch().await;
+    let (_, charged) = holders.status();
+    assert!(charged >= 600 * KIB, "{charged}");
+    // No task runs between these steps.
+    holders.set_limit(450 * KIB);
+    holders.enforce();
+    holders.enforce();
+    assert_eq!(holders.status(), (MAX_HOLDERS, charged));
+    let text = fixture.metrics();
+    let retained = format!("slatedb_etcd_shared_backup_retained_bytes {charged}\n");
+    assert!(text.contains(&retained), "{text}");
+    let error = backup_error(fixture.state.backup().await.err().unwrap());
+    assert_eq!(
+        error.code,
+        tonic::Code::ResourceExhausted as i32,
+        "{error:?}"
+    );
+    // The oldest task drops its view. The other ones fit the budget and keep streaming.
+    for _ in 0..200 {
+        if holders.status().0 < MAX_HOLDERS {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (count, bytes) = holders.status();
+    assert!(
+        count == MAX_HOLDERS - 1 && bytes < charged,
+        "{count} {bytes}"
+    );
+    streams.push(fixture.state.backup().await.unwrap());
+    hold.add_permits(1);
+    drop(oldest);
+    for stream in streams {
+        collect(stream).await;
+    }
+    fixture.close().await;
+}
+
+/// The backups of a member keep their limits when the member adopts a newer checkpoint. The
+/// adoption discards the overlay, and the backups that keep its segments are charged for them.
+#[tokio::test]
+async fn backups_keep_their_limits_across_an_adoption() {
+    const KIB: u64 = 1024;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut ahead = open_shared(store.clone()).await;
+    let mut behind = open_shared(store).await;
+    for state in [&mut ahead, &mut behind] {
+        state.entry_term = 4;
+    }
+    let writer = writer(&ahead).await;
+    let value = "v".repeat(10 * 1024);
+    for n in 1..=40 {
+        let request = put(&format!("k{n:02}"), &value);
+        ahead.apply_etcd(n, &request).await.unwrap();
+    }
+    let newer = checkpoint(&ahead, &writer, &mut 0).await;
+    for n in 1..=20 {
+        let request = put(&format!("k{n:02}"), &value);
+        behind.apply_etcd(n, &request).await.unwrap();
+    }
+    let holders = behind.shared.as_ref().unwrap().holders.clone();
+    let hold = Arc::new(tokio::sync::Semaphore::new(0));
+    *holders.hold.lock().unwrap() = Some(hold.clone());
+    let mut streams = vec![];
+    for _ in 0..MAX_HOLDERS {
+        streams.push(behind.backup().await.unwrap());
+    }
+    assert_eq!(holders.status(), (MAX_HOLDERS, 0));
+    behind.adopt_opened(newer, 4).await.unwrap();
+    assert_eq!(behind.applied, 40);
+    let after = &behind.shared.as_ref().unwrap().holders;
+    assert!(Arc::ptr_eq(after, &holders));
+    let (count, charged) = holders.status();
+    assert!(
+        count == MAX_HOLDERS && charged >= 200 * KIB,
+        "{count} {charged}"
+    );
+    let error = backup_error(behind.backup().await.err().unwrap());
+    assert_eq!(
+        error.code,
+        tonic::Code::ResourceExhausted as i32,
+        "{error:?}"
+    );
+    let families = behind.metrics.registry.gather();
+    let text = prometheus::TextEncoder::new()
+        .encode_to_string(&families)
+        .unwrap();
+    assert!(text.contains(&format!(
+        "slatedb_etcd_shared_backup_streams {MAX_HOLDERS}\n"
+    )));
+    // The budget still applies. The backups share the discarded segment, so all of them end.
+    holders.set_limit(100 * KIB);
+    for _ in 0..200 {
+        if holders.status().0 == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(holders.status(), (0, 0));
+    for mut stream in streams {
+        let error = failure(&mut stream).await;
+        assert!(error.message.contains("backup too slow"), "{error:?}");
+    }
+    hold.add_permits(1);
+    collect(behind.backup().await.unwrap()).await;
+    writer.close().await.unwrap();
+    ahead.close().await.unwrap();
+    behind.close().await.unwrap();
+}
+
+/// A member streams at most `MAX_HOLDERS` backups. Another one fails with ResourceExhausted
 /// until a stream ends.
 #[tokio::test]
 async fn a_member_streams_a_bounded_number_of_backups() {
     let fixture = Fixture::new(1).await;
-    let hold = Arc::new(tokio::sync::Semaphore::new(0));
-    *fixture.backups().hold.lock().unwrap() = Some(hold.clone());
+    let hold = fixture.hold();
     let mut streams = vec![];
-    for _ in 0..MAX_STREAMS {
+    for _ in 0..MAX_HOLDERS {
         streams.push(fixture.state.backup().await.unwrap());
     }
     let error = backup_error(fixture.state.backup().await.err().unwrap());
@@ -482,7 +696,7 @@ async fn a_member_streams_a_bounded_number_of_backups() {
     );
     drop(streams.pop());
     for _ in 0..200 {
-        if fixture.backups().status().0 < MAX_STREAMS {
+        if fixture.holders().status().0 < MAX_HOLDERS {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;

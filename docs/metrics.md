@@ -117,7 +117,7 @@ A member in shared state mode also exports these gauges. Replicated members omit
 | `slatedb_etcd_shared_view_checkpoints` | `view-` checkpoints after the last publication |
 | `slatedb_etcd_shared_clock_skew_milliseconds` | Local clock lag behind the writer clock |
 | `slatedb_etcd_shared_backup_streams` | Native backups that stream a pinned view |
-| `slatedb_etcd_shared_backup_retained_bytes` | Overlay bytes that the streaming backups pin |
+| `slatedb_etcd_shared_backup_retained_bytes` | Released overlay bytes that backups still keep |
 
 The member sets the first six gauges on each Raft tick. The leader sets the checkpoint count
 after each publication. The clock gauge changes at each writer open. The backup gauges change

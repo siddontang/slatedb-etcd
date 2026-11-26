@@ -135,8 +135,6 @@ pub struct StateMachine {
     reads: StateView,
     /// The overlay and base of shared state mode. `None` in replicated mode.
     pub(crate) shared: Option<shared::Shared>,
-    /// The shared-mode backups that stream views of this member. See `backup::view`.
-    backups: Arc<backup::Backups>,
 }
 
 /// Weight budgets of the state cache. Both are separate from Raft log memory.
@@ -542,7 +540,6 @@ impl StateMachine {
             members_checked: None,
             reads,
             shared,
-            backups: Arc::default(),
         })
     }
 

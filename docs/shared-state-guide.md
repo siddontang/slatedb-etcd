@@ -127,8 +127,8 @@ Keep host clocks synchronized with NTP.
   the leader.
 - A read view keeps its base for at most `--view-pin-max`. A longer read fails with a retryable
   error. A native backup is exempt. It ends when its client takes no message for 60 s.
-- Native backups keep the overlay segments of their views. These count against
-  `--overlay-max-bytes`, and at most 4 backups stream on a member.
+- Native backups keep the overlay segments of their views after a base switch. These count
+  against `--overlay-max-bytes`, and at most 4 backups stream on a member.
 
 ## Operations
 

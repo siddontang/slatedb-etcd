@@ -14,6 +14,7 @@ pub(super) fn options() -> shared::Options {
         join: false,
         empty_log: false,
         pin_max: Duration::from_secs(300),
+        overlay_max_bytes: 1 << 30,
         restore: None,
         record: None,
     }

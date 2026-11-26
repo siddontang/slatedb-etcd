@@ -466,6 +466,7 @@ mod tests {
             join: false,
             empty_log: true,
             pin_max: Duration::from_secs(300),
+            overlay_max_bytes: 1 << 30,
             restore: None,
             record: None,
         };

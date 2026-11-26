@@ -9,11 +9,12 @@
 //!
 //! Apply is the only writer. A `ViewCheckpoint` entry closes the open segment. A base switch
 //! releases the closed segments that the new base covers. Views keep `Arc` references, so a
-//! released segment stays in memory until the last view that uses it drops.
+//! released segment stays in memory until the last view that uses it drops. `Holders` bounds the
+//! released segments that long holders keep.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::Bound;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use bytes::Bytes;
@@ -31,6 +32,8 @@ pub(crate) struct Segment {
     last: AtomicU64,
     /// Key and value bytes of all versions.
     bytes: AtomicU64,
+    /// True after the overlay dropped the segment. Only views still hold it then.
+    released: AtomicBool,
 }
 
 /// The upper end of a scan.
@@ -67,6 +70,11 @@ impl Segment {
     /// Key and value bytes of all versions.
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Return true after the overlay dropped the segment.
+    pub(crate) fn released(&self) -> bool {
+        self.released.load(Ordering::Acquire)
     }
 
     /// The sequence of the newest batch, or zero for an empty segment.
@@ -287,7 +295,13 @@ impl Overlay {
     pub(crate) fn release(&mut self, through: u64) {
         let open = self.segments.pop().unwrap();
         let before = self.segments.len();
-        self.segments.retain(|segment| segment.last() > through);
+        self.segments.retain(|segment| {
+            let kept = segment.last() > through;
+            if !kept {
+                segment.released.store(true, Ordering::Release);
+            }
+            kept
+        });
         self.segments.push(open);
         if self.segments.len() != before + 1 {
             self.shared = self.segments.clone().into();
@@ -298,6 +312,9 @@ impl Overlay {
     /// Drop all segments and batches. The new base at `base` holds their state. The queue stays
     /// the same object, so the materializer keeps its handle.
     pub(crate) fn reset(&mut self, base: u64) {
+        for segment in &self.segments {
+            segment.released.store(true, Ordering::Release);
+        }
         self.segments = vec![Arc::new(Segment::default())];
         self.shared = self.segments.clone().into();
         self.queue.reset(base);
@@ -314,6 +331,215 @@ impl Overlay {
     /// Key and value bytes in the segments that the overlay still holds.
     pub(crate) fn bytes(&self) -> u64 {
         self.segments.iter().map(|segment| segment.bytes()).sum()
+    }
+}
+
+/// The most holders that keep overlay segments at one time on a member.
+pub(crate) const MAX_HOLDERS: usize = 4;
+/// The interval of the budget check while holders run.
+const CHECK_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The long holders of overlay segments on one member, oldest first, and their byte budget.
+///
+/// A view keeps its segments after the overlay releases them. A read holds a view for at most
+/// `--view-pin-max`. A longer holder, a native backup, registers here instead. The budget charges
+/// a segment only after the overlay released it, and once, also when several holders keep it.
+/// A new holder fails at `MAX_HOLDERS` or while the charge is above the budget. When base
+/// switches raise the charge above the budget, the oldest holder ends. An ending holder keeps its
+/// place and its charge until it drops its view.
+pub(crate) struct Holders {
+    active: Mutex<Active>,
+    /// The budget in key and value bytes: `--overlay-max-bytes`.
+    limit: AtomicU64,
+    gauges: std::sync::OnceLock<Gauges>,
+    /// Tests hold a backup here before its first pass, as for a long count of a large state.
+    #[cfg(test)]
+    pub(crate) hold: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+}
+
+#[derive(Default)]
+struct Active {
+    next: u64,
+    holds: VecDeque<Entry>,
+}
+
+struct Entry {
+    id: u64,
+    segments: Arc<[Arc<Segment>]>,
+    /// Ends the holder. `None` after the budget ended it.
+    end: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+struct Gauges {
+    holders: prometheus::IntGauge,
+    retained: prometheus::IntGauge,
+}
+
+/// A holder that `Holders::admit` refused. The text names the limit.
+#[derive(Debug)]
+pub(crate) struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The bytes of the distinct released segments in `views`. The overlay holds the other ones, so
+/// the holders keep no extra memory for them.
+fn retained<'a>(views: impl Iterator<Item = &'a Arc<[Arc<Segment>]>>) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    views
+        .flat_map(|segments| segments.iter())
+        .filter(|segment| segment.released() && seen.insert(Arc::as_ptr(segment)))
+        .map(|segment| segment.bytes())
+        .sum()
+}
+
+impl Holders {
+    pub(crate) fn new(limit: u64) -> Self {
+        Self {
+            active: Mutex::default(),
+            limit: AtomicU64::new(limit),
+            gauges: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            hold: Mutex::default(),
+        }
+    }
+
+    /// Register the gauges of the holders in `registry`.
+    pub(crate) fn register(&self, registry: &prometheus::Registry) -> anyhow::Result<()> {
+        let gauge = |name: &str, help: &str| -> anyhow::Result<prometheus::IntGauge> {
+            let gauge = prometheus::IntGauge::new(name, help)?;
+            registry.register(Box::new(gauge.clone()))?;
+            Ok(gauge)
+        };
+        let gauges = Gauges {
+            holders: gauge(
+                "slatedb_etcd_shared_backup_streams",
+                "Native backups that stream a pinned view of this member.",
+            )?,
+            retained: gauge(
+                "slatedb_etcd_shared_backup_retained_bytes",
+                "Bytes of released overlay segments that the streaming backups still pin.",
+            )?,
+        };
+        let _ = self.gauges.set(gauges);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_limit(&self, limit: u64) {
+        self.limit.store(limit, Ordering::Relaxed);
+    }
+
+    /// The holders and the bytes of the released segments that they keep.
+    #[cfg(test)]
+    pub(crate) fn status(&self) -> (usize, u64) {
+        let active = self.active.lock().unwrap();
+        let bytes = retained(active.holds.iter().map(|entry| &entry.segments));
+        (active.holds.len(), bytes)
+    }
+
+    /// Register a holder of `segments`. The overlay holds every segment of a new view, so the
+    /// view adds nothing to the charge until a base switch.
+    pub(crate) fn admit(self: &Arc<Self>, segments: &Arc<[Arc<Segment>]>) -> Result<Hold, Refused> {
+        let mut active = self.active.lock().unwrap();
+        if active.holds.len() >= MAX_HOLDERS {
+            return Err(Refused(format!(
+                "{MAX_HOLDERS} native snapshots stream on this member; retry later"
+            )));
+        }
+        let limit = self.limit.load(Ordering::Relaxed);
+        let bytes = retained(active.holds.iter().map(|entry| &entry.segments));
+        if bytes > limit {
+            return Err(Refused(format!(
+                "native snapshots keep {bytes} released overlay bytes, above the limit of \
+                 {limit}; retry later"
+            )));
+        }
+        let id = active.next;
+        active.next += 1;
+        let (end, ended) = tokio::sync::oneshot::channel();
+        active.holds.push_back(Entry {
+            id,
+            segments: segments.clone(),
+            end: Some(end),
+        });
+        self.publish(&active);
+        Ok(Hold {
+            holders: self.clone(),
+            id,
+            ended,
+        })
+    }
+
+    /// End the oldest holders until the ones that do not end fit the budget. An ending holder
+    /// stays charged until it drops its view, so a later check ends no other holder for it.
+    pub(crate) fn enforce(&self) {
+        let mut active = self.active.lock().unwrap();
+        let limit = self.limit.load(Ordering::Relaxed);
+        loop {
+            let staying = active.holds.iter().filter(|entry| entry.end.is_some());
+            if retained(staying.map(|entry| &entry.segments)) <= limit {
+                break;
+            }
+            let Some(oldest) = active.holds.iter_mut().find(|entry| entry.end.is_some()) else {
+                break;
+            };
+            tracing::warn!(limit, "end the oldest native snapshot above the budget");
+            let _ = oldest.end.take().unwrap().send(());
+        }
+        self.publish(&active);
+    }
+
+    /// Check the budget every `CHECK_EVERY`. Never return. Each holder runs this, so a base
+    /// switch that releases held segments ends the oldest holder soon after.
+    pub(crate) async fn watch(&self) -> std::convert::Infallible {
+        let mut ticks = tokio::time::interval(CHECK_EVERY);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            self.enforce();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn held(&self) {
+        let hold = self.hold.lock().unwrap().clone();
+        if let Some(hold) = hold {
+            let _ = hold.acquire().await;
+        }
+    }
+
+    fn publish(&self, active: &Active) {
+        if let Some(gauges) = self.gauges.get() {
+            let bytes = retained(active.holds.iter().map(|entry| &entry.segments));
+            gauges.holders.set(active.holds.len() as i64);
+            gauges.retained.set(bytes as i64);
+        }
+    }
+}
+
+/// One admitted holder. Dropping it frees its place and its share of the budget.
+pub(crate) struct Hold {
+    holders: Arc<Holders>,
+    id: u64,
+    ended: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl Hold {
+    /// Resolve when the budget ends the holder.
+    pub(crate) async fn ended(&mut self) {
+        let _ = (&mut self.ended).await;
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let mut active = self.holders.active.lock().unwrap();
+        active.holds.retain(|entry| entry.id != self.id);
+        self.holders.publish(&active);
     }
 }
 

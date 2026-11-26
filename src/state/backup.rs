@@ -21,8 +21,6 @@ mod view;
 #[cfg(test)]
 mod view_tests;
 
-pub(crate) use view::Backups;
-
 /// The bytes of one Snapshot response message.
 const CHUNK_BYTES: usize = 64 * 1024;
 /// The messages buffered ahead of a slow client.
@@ -53,7 +51,7 @@ pub struct Chunk {
     pub remaining: u64,
 }
 
-/// A backup above a limit: the row size, or the streams and memory of shared-mode backups. The
+/// A backup above a limit: the row size, or the holder limits of `overlay::Holders`. The
 /// Snapshot RPC returns ResourceExhausted for it.
 #[derive(Debug)]
 pub(crate) struct TooLarge(String);
@@ -685,6 +683,7 @@ impl StateMachine {
                     join: false,
                     empty_log: false,
                     pin_max: std::time::Duration::from_secs(300),
+                    overlay_max_bytes: u64::MAX,
                     restore: None,
                     record: None,
                 },
