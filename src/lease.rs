@@ -83,19 +83,6 @@ pub async fn load(db: &impl StateRead) -> anyhow::Result<BTreeMap<i64, LeaseReco
 pub type LeaseChange = Option<(i64, Option<LeaseRecord>)>;
 pub type PreparedLease = (LeaseReply, WriteBatch, i64, LeaseChange);
 
-pub async fn prepare(
-    db: &impl StateRead,
-    revision: i64,
-    compact_revision: i64,
-    index: u64,
-    leases: &BTreeMap<i64, LeaseRecord>,
-    command: &LeaseCommand,
-) -> Result<PreparedLease, KvError> {
-    let (prepared, _) =
-        evaluate(db, None, revision, compact_revision, index, leases, command).await?;
-    Ok(prepared)
-}
-
 /// Evaluate a lease command in apply. `index_keys` must describe the applied current rows of
 /// `db`.
 pub(crate) async fn prepare_with_counts(

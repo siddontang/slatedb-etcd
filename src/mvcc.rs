@@ -1302,26 +1302,6 @@ async fn read_from<'a, R: StateRead>(
     view.execute(plan, false).await
 }
 
-/// Build one atomic state batch. Semantic errors discard all changes.
-pub async fn prepare(
-    db: &impl StateRead,
-    revision: i64,
-    compact_revision: i64,
-    request: &RequestOp,
-    leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
-) -> KvResult<(ResponseOp, WriteBatch, i64)> {
-    let (response, batch, next, _) = prepare_view(
-        ReadDb::Live(db),
-        None,
-        revision,
-        compact_revision,
-        request,
-        leases,
-    )
-    .await?;
-    Ok((response, batch, next))
-}
-
 /// Evaluate a write on the live applied state. `index` must describe the same applied rows.
 pub(crate) async fn prepare_with_counts(
     db: &impl StateRead,

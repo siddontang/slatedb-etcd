@@ -108,15 +108,20 @@ async fn read_path_matches_transaction_evaluation_without_a_write_batch() {
                             })),
                         },
                     ] {
-                        let expected = mvcc::prepare(
+                        let expected = match mvcc::prepare_with_counts(
                             state.db().as_ref(),
+                            None,
                             state.revision,
                             state.compact_revision,
                             &request,
                             &state.leases,
                         )
                         .await
-                        .map(|(response, _, _)| response);
+                        {
+                            Ok((response, ..)) => Ok(response),
+                            Err(mvcc::ApplyError::Request(error)) => Err(error),
+                            Err(mvcc::ApplyError::Unapplied(error)) => panic!("{error:#}"),
+                        };
                         let actual = state.read_etcd(&request).await.unwrap().result;
                         assert_eq!(
                             serde_json::to_value(actual).unwrap(),
