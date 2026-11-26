@@ -737,7 +737,9 @@ and later retries in a row wait from 100 ms up to 5 s. A corrupt page ends the s
 `DataLoss`. The stream reads one catch-up page at a time between its other work. So a Cancel, a
 closed client, or a closed request stream still ends the work while the store fails. A progress
 request waits until its watchers have every event through its revision. Until its reply, the
-stream takes no feed batch, so no later event goes before it.
+stream takes no feed batch, so no later event goes before it. Later progress requests fold into
+one with the newest revision. A watcher created meanwhile starts after the published revision,
+and it does not hold back the earlier reply.
 
 ### Writer faults
 
