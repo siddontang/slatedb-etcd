@@ -1625,7 +1625,7 @@ impl Node {
         let health = self
             .writer
             .as_ref()
-            .map(|writer| writer.health.report(term));
+            .map(|writer| writer.health.report(term, self.apply_held_at));
         let body = json!({"member": self.options.id, "checkpoints": pinned, "publish": publish,
             "coverage": crate::peer::process_id(), "writer": health});
         let client = self.options.transport.http.clone();

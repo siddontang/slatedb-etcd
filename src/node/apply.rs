@@ -4,9 +4,7 @@ use raft::eraftpb::Snapshot;
 
 #[path = "shared/apply_retry.rs"]
 mod retry;
-pub(super) use retry::Control;
-#[cfg(test)]
-pub(super) use retry::Paused;
+pub(super) use retry::{Control, Paused};
 
 pub(super) const BATCH_ENTRIES: u64 = 32;
 /// Committed-entry jobs that may wait in the apply queue behind the running job.

@@ -68,6 +68,17 @@ impl Node {
     pub(super) fn tick_apply_pause(&mut self) {
         let paused = self.worker.control.paused();
         let held = paused.as_ref().filter(|paused| paused.held);
+        // The mark stays after a covering snapshot ends the job, until the install passes it.
+        match held {
+            Some(paused) => self.apply_held_at = Some(paused.index),
+            None if self
+                .apply_held_at
+                .is_some_and(|index| self.state.applied >= index) =>
+            {
+                self.apply_held_at = None;
+            }
+            None => {}
+        }
         let last = self.raw.raft.raft_log.last_index();
         let growth = held.map_or(0, |paused| last.saturating_sub(paused.index));
         self.metrics.apply_held.set(held.is_some().into());

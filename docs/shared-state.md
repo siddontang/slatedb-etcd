@@ -672,6 +672,7 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
 | An apply read meets a transient error | Apply pauses and runs the entry again |
 | An apply read meets corrupt data | Apply holds on the entry. Earlier state stays readable |
 | All members hold on one corrupt shared row | Restore an earlier backup. Old state stays readable |
+| A voter's apply holds | It is never a handoff target. A held leader hands over after 30 s |
 | An invariant of the member fails | The member stops |
 | A member stops reporting its base | Its base can be deleted. It rebases on a missing SST |
 | A checkpoint open fails | The member keeps its base and tries the next checkpoint |
@@ -812,6 +813,14 @@ stalled I/O never returns. Other faults retry with the backoff.
 So a fault on one member's path moves the lead once. A fault of the whole backend moves it at
 most once per member. A marked member stays out of automatic handoffs until it leads again and
 its writer publishes. MoveLeader can still move the lead to it.
+
+A member whose apply holds on corrupt data sends `apply_held_at` in its `ViewAck`: the held
+entry. This is not a writer mark. No publication clears it, also not one of the applied
+prefix, and it clears only when apply passes the entry. A held voter is never a target, also
+not as a last resort or in a handoff for another cause. A leader whose apply waits on one entry
+for more than 30 s hands its lead over, as after a stall. While it holds, its own publications
+do not end the incident, so it tries each voter once. As a follower it then asks for a
+snapshot above the held entry. See [Read faults](#read-faults).
 
 ## Costs and trade-offs
 

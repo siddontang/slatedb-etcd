@@ -308,6 +308,8 @@ pub struct Node {
     prepare_term: u64,
     /// True while the log above a held entry is past its alarm bound. See `pause`.
     hold_alarm: bool,
+    /// The entry that apply held on, until apply passes it. See `WriterReport::apply_held_at`.
+    apply_held_at: Option<u64>,
     /// The last entry of a PreparePuts job that a storage error ended. No early reply runs
     /// until apply passes it, so the committed path applies those entries and retries.
     unprepared: u64,
@@ -751,6 +753,7 @@ impl Node {
             prepare_term: 0,
             unprepared: 0,
             hold_alarm: false,
+            apply_held_at: None,
             quorum_reply_index: 0,
             watch_waiters: Vec::new(),
             state: applied,
@@ -1794,6 +1797,7 @@ impl Node {
         }
         status["quorum_reply_index"] = self.quorum_reply_index.into();
         status["apply_paused"] = self.pause_status();
+        status["apply_held_at"] = self.apply_held_at.into();
         status["quota"] = self.quota_status();
         status["members_row"] = self.members_status();
         if let (Some(writer), Some((base, applied, bytes))) = (&self.writer, self.state.view) {
