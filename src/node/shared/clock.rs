@@ -54,6 +54,12 @@ pub(in crate::node) struct Probe {
     nonce: u64,
 }
 
+/// Tests: the nonce of `probe`.
+#[cfg(test)]
+pub(super) fn probe_nonce(probe: &Probe) -> u64 {
+    probe.nonce
+}
+
 /// The clock of one voter, as one probe measured it. The voter read its clock at a time in the
 /// probe window from the send to the reply. Its offset to the leader's monotonic clock is thus
 /// between `low` and `high`. Each projection of the offset advances at the leader's monotonic

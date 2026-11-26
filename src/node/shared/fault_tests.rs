@@ -1031,6 +1031,50 @@ async fn a_clock_wait_stalls_only_with_a_due_batch() {
     leader.close().await;
 }
 
+/// The writer clock of three voters is one hour behind the machine clock. A Defragment
+/// compaction takes its job ID from the writer clock, so the compactor of the writer accepts the
+/// job and its outputs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_defragment_compaction_uses_the_writer_clock() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut clock = clock();
+    let machine = clock.now_ms.clone();
+    clock.now_ms = Arc::new(move || machine() - 3_600_000);
+    let voters = [1, 2, 3].map(|id| (id, Some(id))).into_iter().collect();
+    clock.configure(2, 1, voters);
+    // Both peers agree with the writer clock. Their samples stay fresh.
+    let sampling = tokio::spawn({
+        let clock = clock.clone();
+        async move {
+            loop {
+                for peer in [2, 3] {
+                    let probe = clock.probe();
+                    let now = (clock.mono_ms)();
+                    let reply = crate::node::ProbeReply {
+                        nonce: clock::probe_nonce(&probe),
+                        process: peer,
+                        clock_ms: (clock.now_ms)(),
+                    };
+                    clock.sample(peer, probe, reply, now, now);
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    });
+    let mut leader = Leader::open(store, Duration::from_millis(100), clock).await;
+    leader.lead(2);
+    leader.covered(1, Duration::from_secs(10)).await;
+    leader.put("before").await;
+    let db = leader.writer().open.lock().unwrap().clone().unwrap();
+    db.flush().await.unwrap();
+    let admin = leader.writer().compaction_admin();
+    crate::state::maintenance::compact_all(&admin)
+        .await
+        .unwrap();
+    sampling.abort();
+    leader.close().await;
+}
+
 /// An error of this member's own invariants still stops the member.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_invariant_error_stops_the_member() {

@@ -260,6 +260,8 @@ pub(super) struct Writer {
     pub(super) retained: Option<prometheus::IntGauge>,
     /// The writer `Db` while this member leads.
     open: OpenWriter,
+    /// The SlateDB clock of that `Db`. Defragment submits its compaction with it.
+    open_gate: OpenGate,
     pub(super) gauges: Option<Gauges>,
     /// The highest manual checkpoint index that requested a publication after apply.
     checkpoint_requested: u64,
@@ -381,6 +383,7 @@ impl Writer {
             retention: crate::state::ViewRetention::Off,
             retained: None,
             open: OpenWriter::default(),
+            open_gate: OpenGate::default(),
             gauges: None,
             checkpoint_requested: 0,
             remote_checkpoint: 0,
@@ -425,6 +428,21 @@ impl Writer {
 
     pub fn running(&self) -> bool {
         self.stop.is_some()
+    }
+
+    /// The admin that submits a Defragment compaction. SlateDB refuses a compaction job whose
+    /// ID time is below the newest job, and an output SST whose ID time is below its job. The
+    /// compactor of the writer takes both times from the writer clock, so the job takes its ID
+    /// from that clock too.
+    pub(super) fn compaction_admin(&self) -> Arc<slatedb::admin::Admin> {
+        match self.open_gate.lock().unwrap().clone() {
+            Some(gate) => Arc::new(
+                slatedb::admin::Admin::builder(self.source.state(), self.source.store.clone())
+                    .with_system_clock(gate)
+                    .build(),
+            ),
+            None => self.admin.clone(),
+        }
     }
 
     /// Open the writer on the leader of `term`. Close it on any other member.
@@ -477,6 +495,7 @@ impl Writer {
                 clock: self.clock.clone(),
                 reopens: self.reopens.clone(),
                 open: self.open.clone(),
+                open_gate: self.open_gate.clone(),
                 health,
             },
         );
@@ -633,11 +652,14 @@ struct Leading {
     clock: Clock,
     reopens: Arc<std::sync::atomic::AtomicU64>,
     open: OpenWriter,
+    open_gate: OpenGate,
     health: fault::TaskHealth,
 }
 
 /// The writer `Db` while the writer task runs. Defragment flushes and compacts it.
 type OpenWriter = Arc<Mutex<Option<Arc<slatedb::Db>>>>;
+/// The SlateDB clock of the open writer `Db`.
+type OpenGate = Arc<Mutex<Option<Arc<clock::Gate>>>>;
 
 /// Wait until the member asks the writer task to stop. The result holds no borrow, so the task
 /// stays `Send` across later waits.
@@ -696,6 +718,7 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         clock,
         reopens,
         open,
+        open_gate,
         mut health,
     } = leading;
     let current = || *leadership.borrow() == (true, term);
@@ -818,6 +841,7 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         publisher.progress.rearm();
         publisher.db = Some(db.clone());
         *open.lock().unwrap() = Some(db.clone());
+        *open_gate.lock().unwrap() = Some(gate.clone());
         let progress = publisher.progress.clone();
         let running = async {
             tokio::select! {
@@ -831,6 +855,7 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
             let mut slot = open.lock().unwrap();
             if slot.as_ref().is_some_and(|open| Arc::ptr_eq(open, &db)) {
                 *slot = None;
+                *open_gate.lock().unwrap() = None;
             }
         }
         match outcome {
@@ -1417,7 +1442,7 @@ impl Node {
         };
         let defragment = Defragment {
             db,
-            admin: writer.admin.clone(),
+            admin: writer.compaction_admin(),
             progress: writer.progress.clone(),
             announced: writer.applied.announced.clone(),
             leadership: writer.leadership.subscribe(),
