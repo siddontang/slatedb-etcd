@@ -138,6 +138,7 @@ class BenchmarkTests(unittest.TestCase):
             self.assertFalse(report["passed"])
             self.assertFalse(report["complete"])
             self.assertEqual(report["samples"], [])
+            self.assertEqual(report["state_modes"], {"service": "replicated", "etcd": "local"})
 
     def run_failed_start(self, argv):
         import json
@@ -162,7 +163,23 @@ class BenchmarkTests(unittest.TestCase):
         start.assert_called_once()
         self.assertFalse(report["passed"])
         self.assertTrue(report["pending"])
+        self.assertEqual(report["state_modes"], {"service": "shared", "etcd": "local"})
 
+    def test_etcd_alone_reports_local_state_and_starts_no_rustfs(self):
+        report, start = self.run_failed_start(["--backends", "etcd"])
+        start.assert_not_called()
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["state_modes"], {"etcd": "local"})
+
+    def test_s3_options_require_a_bucket(self):
+        for argv in (["--s3-endpoint", "http://127.0.0.1:9"], ["--s3-allow-http"]):
+            with patch("sys.argv", ["benchmark", *argv]), \
+                 patch.object(rustfs_fixture, "local_rustfs") as start, \
+                 patch("sys.stderr"):
+                with self.assertRaises(SystemExit) as end:
+                    benchmark.main()
+            self.assertEqual(end.exception.code, 2)
+            start.assert_not_called()
 
 
 if __name__ == "__main__":

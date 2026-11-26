@@ -125,7 +125,7 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
         memory, resource_errors = [], []
         initial = ",".join(f"node{i+1}=http://{peer}" for i, peer in enumerate(peers))
         sample = {"passed": False, "backend": kind, "members": members, "concurrency": concurrency,
-                  "read_percent": reads, "repeat": repeat}
+                  "read_percent": reads, "repeat": repeat, "state_mode": state_mode(kind, members)}
         try:
             for i in range(members):
                 data = root / f"node{i+1}"
@@ -320,10 +320,20 @@ def main():
         parser.error("--rustfs supplies its own bucket, endpoint, and HTTP settings")
     if args.rustfs and kinds == ["etcd"]:
         parser.error("--rustfs requires a service or baseline backend")
+    if (args.s3_endpoint or args.s3_allow_http) and not args.s3_bucket:
+        # The service CLI has the same rule and message.
+        parser.error("the following required arguments were not provided: --s3-bucket <S3_BUCKET>")
     report = new_report(args, kinds)
     # Replace an earlier report before RustFS starts or a build runs. Either can fail.
     with object_store(args, kinds, args.output, report) as store:
         benchmark(args, kinds, store, report)
+
+
+def state_mode(kind, members):
+    """Return the state layout that a backend runs with."""
+    if kind == "etcd":
+        return "local"
+    return "shared" if members > 1 else "replicated"
 
 
 @contextmanager
@@ -361,7 +371,7 @@ def new_report(args, kinds):
               "client_target": args.client_target,
               "deployment": f"{args.members} processes per backend; shared host and disk; loopback plaintext",
               "reference_etcd": "v3.6.5", "state_backend": "s3" if args.s3_bucket else "local",
-              "state_mode": "shared" if args.members > 1 else "replicated",
+              "state_modes": {kind: state_mode(kind, args.members) for kind in kinds},
               "raft_snapshot_entries": args.snapshot_entries, "quota_bytes": args.quota_bytes,
               "order_seed": args.seed, "binaries": {},
               "resource_phases": "CPU deltas and peak RSS cover only the measured phase; retained preload memory remains",
