@@ -428,6 +428,9 @@ impl Writer {
             }
             self.health.end();
             self.handoff.lead(false);
+            if !leader {
+                self.clock.stand_down();
+            }
             self.transfer = None;
             self.demand = 0;
             self.certified = None;
@@ -538,7 +541,8 @@ impl Writer {
             "paused": self.paused,
             "rejected_base": self.rejected.status(),
             "clock_skew_ms": self.clock.skew.load(std::sync::atomic::Ordering::Relaxed),
-            "clock_alarm": self.clock.alarm.load(std::sync::atomic::Ordering::Relaxed),
+            "clock_alarm": self.clock.alarm_name(),
+            "clock": self.clock.status(),
             "reopens": self.reopens.load(std::sync::atomic::Ordering::Relaxed),
             "reports": self.reports.lock().unwrap().len(),
             "health": self.health.status(),
@@ -1343,6 +1347,8 @@ impl Node {
     pub(super) fn sync_writer(&mut self) {
         let leader = self.raw.raft.state == StateRole::Leader;
         let term = self.raw.raft.term;
+        // A new leader probes the voters at once. Its first write waits for their samples.
+        self.tick_clock(true);
         if let Some(writer) = &mut self.writer {
             writer.sync(leader, term, &self.events);
         }
@@ -1487,6 +1493,11 @@ impl Node {
     /// leader's demand for a base.
     pub(super) fn tick_shared(&mut self) -> Result<()> {
         self.certify_base()?;
+        let probe = self
+            .writer
+            .as_ref()
+            .is_some_and(|writer| (writer.ticks + 1) % clock::PROBE_TICKS == 0);
+        self.tick_clock(probe);
         self.tick_writer_health();
         let Some(writer) = &mut self.writer else {
             return Ok(());
@@ -1500,13 +1511,9 @@ impl Node {
             gauges
                 .leading
                 .set(writer.open.lock().unwrap().is_some().into());
-            gauges.clock_alarm.set(
-                writer
-                    .clock
-                    .alarm
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .into(),
-            );
+            gauges
+                .clock_alarm
+                .set(writer.clock.alarm_name().is_some().into());
             gauges
                 .reopens
                 .set(writer.reopens.load(std::sync::atomic::Ordering::Relaxed) as i64);
@@ -1932,6 +1939,7 @@ mod demand;
 mod fault;
 mod rejected;
 pub(super) use clock::Clock;
+pub(crate) use clock::{Millis, ProbeReply, ProbeRequest, PROBE_ROUTE};
 use defragment::Defragment;
 #[cfg(test)]
 use defragment::DefragmentStep;

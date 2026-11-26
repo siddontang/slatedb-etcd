@@ -34,6 +34,7 @@ mod proposal;
 pub use forwarding::ForwardView;
 pub(crate) use forwarding::LocalRead;
 pub(crate) use shared::WriterReport;
+pub(crate) use shared::{Millis, ProbeReply, ProbeRequest, PROBE_ROUTE};
 mod quorum_put;
 mod quota;
 mod read;
@@ -861,6 +862,21 @@ impl Node {
     /// The shared-mode objects that the snapshot receive path opens.
     pub(crate) fn shared_source(&self) -> Option<std::sync::Arc<crate::state::shared::Source>> {
         self.writer.as_ref().map(|writer| writer.source.clone())
+    }
+
+    /// Shared mode: the wall clock that this member returns to a clock probe of the leader.
+    pub(crate) fn probe_clock(&self) -> Option<Millis> {
+        self.writer
+            .as_ref()
+            .map(|writer| writer.clock.now_ms.clone())
+    }
+
+    /// Tests: skew the wall clock of this member's writer and of its probe replies.
+    #[cfg(test)]
+    pub(crate) fn set_clock(&mut self, now_ms: Millis) {
+        if let Some(writer) = &mut self.writer {
+            writer.clock.now_ms = now_ms;
+        }
     }
 
     pub async fn run(self, events: mpsc::Receiver<Event>) -> Result<()> {
