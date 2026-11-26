@@ -198,11 +198,15 @@ impl Executor {
         self.over_budget.clear();
     }
 
-    /// True if every queued manual job still has time left to run.
+    /// The shortest time a queued manual job has left before its deadline.
     #[cfg(test)]
-    pub fn manual_jobs_have_time(&self) -> bool {
+    pub fn manual_time_left(&self) -> Option<Duration> {
         let now = tokio::time::Instant::now();
-        self.manual.iter().flatten().all(|work| work.deadline > now)
+        self.manual
+            .iter()
+            .flatten()
+            .map(|work| work.deadline.saturating_duration_since(now))
+            .min()
     }
 
     #[cfg(test)]

@@ -426,7 +426,8 @@ impl Kv for Service {
 mod tests {
     use super::*;
 
-    /// A large LIST can run past the ten-second write wait. Its reply must still reach the caller.
+    /// A large LIST can run past the ten-second write wait. Its reply must still reach the caller
+    /// after nearly five seconds of ReadIndex wait and nearly 60 seconds of execution.
     #[tokio::test(start_paused = true)]
     async fn a_slow_range_reply_reaches_the_caller() {
         let (events, mut receiver) = mpsc::channel(4);
@@ -455,7 +456,7 @@ mod tests {
         let Event::Kv(_, reply) = *event else {
             panic!("expected a KV event");
         };
-        tokio::time::advance(Duration::from_secs(12)).await;
+        tokio::time::advance(Duration::from_secs(64)).await;
         tokio::task::yield_now().await;
         assert!(!call.is_finished());
         let response = ResponseOp {

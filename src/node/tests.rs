@@ -900,7 +900,10 @@ async fn read_index_wait_expires_but_a_running_read_finishes() {
     node.reads.get_mut(&id).unwrap().started = Instant::now() - Duration::from_secs(12);
     node.expire_reads();
     assert!(running.try_recv().is_err());
-    assert!(node.read_executor.manual_jobs_have_time());
+    // The wide-read deadline is 60 s after submission: 54 s remain, less the few
+    // microseconds that passed before the clock paused.
+    let left = node.read_executor.manual_time_left().unwrap();
+    assert!(left > Duration::from_secs(53) && left <= Duration::from_secs(54));
     let output = node.read_executor.step().await.unwrap().unwrap();
     tokio::time::resume();
     node.complete_read(output).unwrap();

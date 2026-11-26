@@ -228,7 +228,9 @@ Up to three current key-ordered Range scans can run together with a 4 MiB row bu
 A scan over budget, historical reads, sorted or filtered Ranges, and transactions run alone.
 Wide reads start in queue order. Current point reads can pass queued wide reads.
 The queue holds at most 64 requests. A running point-read job has a five-second deadline.
-A running wide-read job has a 60-second deadline, so a large LIST is not retried from the start.
+A running wide-read job has a 60-second deadline. This avoids the retries from the start that
+the old five-second cutoff caused for a large LIST. A shared scan and its exclusive rerun use
+the same deadline, so a rerun that waits for the exclusive slot has less time left to execute.
 Shutdown stops these jobs before closing the state database.
 The owner checks the term, role, and leader identity again before returning the result.
 Leadership loss or client cancellation removes the pending request.
