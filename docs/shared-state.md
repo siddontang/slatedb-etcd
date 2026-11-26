@@ -690,6 +690,14 @@ serializable read, and the diagnostic reads use one rule, which the writer rule 
 - **Corrupt:** any other SlateDB kind, or a stored row that does not decode. The request fails
   with `DataLoss`. The member logs an error and counts it in `slatedb_etcd_read_corrupt_total`.
 
+Apply reads too. A read that fails is no result of an entry, because each member must reach the
+same result. A transient error leaves the entry unapplied. Apply keeps the entries that it
+applied before the error, with their replies, membership changes, and lease commands. It runs
+the rest again after 100 ms, and the wait doubles up to 5 s. A missing object rebases the state
+at the applied index first. A shutdown ends the retry at once. A membership change takes effect
+only after its batch is stored. Base readers stop after the retries of the member database, so
+a read fails instead of waiting forever. Corrupt data and invariant errors still stop apply.
+
 A Watch page that fails for a transient or missing object runs again on a new view. Each
 watcher resumes at its own next revision, so no revision is lost. The first retry runs at once,
 and later retries in a row wait from 100 ms up to 5 s. A corrupt page ends the stream with

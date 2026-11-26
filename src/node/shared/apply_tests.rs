@@ -29,9 +29,19 @@ async fn a_rebase_onto_an_older_base_below_the_log_fails_closed() {
     lose_a_checkpoint_object(Lose::Deleted).await;
 }
 
+/// A shared-mode apply read fails with a transient store error after a lease grant and a
+/// membership change applied in the same job. Apply keeps that prefix and its replies. After
+/// the store recovers, it applies the rest, and each entry completes exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_apply_read_keeps_the_applied_prefix() {
+    lose_a_checkpoint_object(Lose::Unavailable).await;
+}
+
 /// The base of `lose_a_checkpoint_object`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Lose {
+    /// The base has row 20, and its SST reads fail until the store recovers.
+    Unavailable,
     /// The base has row 20.
     AtRow,
     /// The base has row 19, and an announcement certified it through the empty entry 20.
@@ -41,8 +51,8 @@ enum Lose {
 }
 
 async fn lose_a_checkpoint_object(lose: Lose) {
-    let truncated = lose != Lose::AtRow;
-    use crate::object::faults::{FaultStore, LOSE_SST_TWICE};
+    let truncated = !matches!(lose, Lose::AtRow | Lose::Unavailable);
+    use crate::object::faults::{FaultStore, FAIL_SST_GET, LOSE_SST_TWICE};
     use slatedb::config::{CheckpointOptions, CheckpointScope, WriteOptions};
     use slatedb::object_store::ObjectStore;
     let faults = std::sync::Arc::new(FaultStore::new(std::sync::Arc::new(
@@ -125,6 +135,15 @@ async fn lose_a_checkpoint_object(lose: Lose) {
     .unwrap();
     entries[21].entry_type = EntryType::EntryConfChange as i32;
     entries[21].data = change.encode_to_vec();
+    if lose == Lose::Unavailable {
+        entries[20].data = RaftCommand::Lease {
+            id: "21".into(),
+            lease: LeaseCommand::Grant { id: 77, ttl: 60 },
+            origin: 1,
+        }
+        .encode()
+        .unwrap();
+    }
     // Entry 23 reads an old revision. Only the base holds that history row.
     entries[22].data = command(
         23,
@@ -241,12 +260,22 @@ async fn lose_a_checkpoint_object(lose: Lose) {
         snapshot_task: None,
         inline_checkpoints: true,
         log: Some(storage.reader()),
+        stop: tokio::sync::watch::channel(false).1,
     };
     if lose == Lose::Deleted {
         executor.state.admin.delete_checkpoint(id).await.unwrap();
     }
     // The block cache load and its direct read both lose the object, so the job fails.
-    faults.set(LOSE_SST_TWICE);
+    if lose == Lose::Unavailable {
+        faults.set(FAIL_SST_GET);
+        let faults = faults.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            faults.set(0);
+        });
+    } else {
+        faults.set(LOSE_SST_TWICE);
+    }
     let result = executor
         .execute(Work {
             job: Job::Entries(entries[20..].to_vec()),
@@ -268,6 +297,27 @@ async fn lose_a_checkpoint_object(lose: Lose) {
         return;
     }
     let completion = result.unwrap();
+    if lose == Lose::Unavailable {
+        // No rebase ran. The prefix kept its lease grant and its membership change.
+        assert!(faults.entered.available_permits() > 0, "no read failed");
+        assert_eq!(completion.applied, 24);
+        let Output::Entries(replies) = completion.output else {
+            panic!("expected entries");
+        };
+        let ids: Vec<_> = replies.iter().map(|reply| reply.id.as_str()).collect();
+        assert_eq!(ids, ["21", "22", "23", "24"]);
+        assert!(matches!(
+            replies[0].lease,
+            Some(LeaseCommand::Grant { id: 77, .. })
+        ));
+        assert_eq!(replies[1].change.as_ref().unwrap().node_id, 9);
+        assert!(replies[2..].iter().all(|reply| reply.change.is_none()));
+        assert!(executor.state.members.members.contains_key(&9));
+        assert_eq!(executor.state.base_checkpoint(), Some(id));
+        executor.state.close().await.unwrap();
+        writer.close().await.unwrap();
+        return;
+    }
     // The read lost its object. The rebase restarted the job, and every entry of the job
     // completes exactly once, with the Compact notice and the membership change.
     assert_eq!(faults.entered.available_permits(), 2);

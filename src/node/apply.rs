@@ -2,6 +2,9 @@ use super::*;
 use crate::mvcc::Outcome;
 use raft::eraftpb::Snapshot;
 
+#[path = "shared/apply_retry.rs"]
+mod retry;
+
 pub(super) const BATCH_ENTRIES: u64 = 32;
 /// Committed-entry jobs that may wait in the apply queue behind the running job.
 pub(super) const PIPELINE_DEPTH: usize = 4;
@@ -287,6 +290,8 @@ struct Executor {
     inline_checkpoints: bool,
     /// Shared mode: the durable log that a rebase replays.
     log: Option<crate::storage::LogReader>,
+    /// True once the worker stops. A job that retries a failed read then ends.
+    stop: tokio::sync::watch::Receiver<bool>,
 }
 
 impl Drop for Executor {
@@ -298,32 +303,10 @@ impl Drop for Executor {
 }
 
 impl Executor {
-    /// Run one job. In shared mode a missing checkpoint object rebases the state to the position
-    /// before the job, and the whole job runs again. Each entry then completes exactly once.
+    /// Run one job. See `apply_retrying` for a storage error of a read.
     async fn execute(&mut self, work: Work) -> Result<Completion> {
-        let start = self.state.applied;
-        let retry = match (&work.job, &self.log) {
-            (Job::Entries(entries), Some(_)) => Some((entries.clone(), work.header)),
-            _ => None,
-        };
         // Box the inner jobs. Their futures are large, and DST runs them on a test stack.
-        let result = Box::pin(self.execute_once(work)).await;
-        let Some((entries, header)) = retry else {
-            return result;
-        };
-        match result {
-            Err(error) if crate::state::shared::missing_object(&error) => {
-                tracing::warn!(%error, "an apply read lost its checkpoint object");
-                Box::pin(self.rebase(header, start)).await?;
-                Box::pin(self.execute_once(Work {
-                    job: Job::Entries(entries),
-                    header,
-                    delay: Duration::ZERO,
-                }))
-                .await
-            }
-            result => result,
-        }
+        Box::pin(self.execute_once(work)).await
     }
 
     /// Rebuild the state from the newest checkpoint at or below `applied`, and replay the local
@@ -372,11 +355,10 @@ impl Executor {
             #[cfg(test)]
             Job::Panic => panic!("injected apply worker panic"),
             Job::Entries(entries) => {
-                Output::Entries(apply_entries(&mut self.state, entries, work.header).await?)
+                Output::Entries(Box::pin(self.apply_retrying(entries, work.header)).await?)
             }
             Job::PreparePuts { commands, term } => {
-                let (batch, replies) =
-                    super::quorum_put::prepare(&self.state, &commands, term, work.header).await?;
+                let (batch, replies) = self.prepare_retrying(&commands, term, work.header).await?;
                 Output::PreparedPuts(batch, replies)
             }
             Job::PublishPuts(batch) => {
@@ -534,6 +516,8 @@ impl Executor {
 
 pub(super) struct Worker {
     database: Option<std::sync::Arc<slatedb::Db>>,
+    /// Tells a job that retries a failed read to end. See `Worker::shutdown`.
+    stop: tokio::sync::watch::Sender<bool>,
     work: mpsc::Sender<Work>,
     completed: mpsc::Receiver<Result<Completion>>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
@@ -560,17 +544,20 @@ impl Worker {
         let (work, mut jobs) = mpsc::channel::<Work>(PIPELINE_DEPTH);
         let (done, completed) = mpsc::channel(PIPELINE_DEPTH);
         let database = state.database();
+        let (stop, stopping) = tokio::sync::watch::channel(false);
         let mut executor = Executor {
             state,
             events,
             snapshot_task: None,
             inline_checkpoints: manual,
             log,
+            stop: stopping,
         };
         #[cfg(test)]
         if manual {
             return Self {
                 database,
+                stop,
                 work,
                 completed,
                 task: None,
@@ -601,6 +588,7 @@ impl Worker {
         let task = tokio::spawn(worker);
         Self {
             database,
+            stop,
             work,
             completed,
             task: Some(task),
@@ -610,6 +598,7 @@ impl Worker {
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
+        self.stop.send_replace(true);
         self.completed.close();
         self.work = mpsc::channel(1).0;
         if let Some(task) = self.task.take() {
@@ -691,6 +680,18 @@ pub(super) async fn apply_entries(
     header: Header,
 ) -> Result<Vec<AppliedCommand>> {
     let mut replies = vec![];
+    apply_into(state, entries, header, &mut replies).await?;
+    Ok(replies)
+}
+
+/// Apply `entries` in order and add a reply for each one. After an error, `replies` holds the
+/// replies of the entries that applied before it.
+async fn apply_into(
+    state: &mut StateMachine,
+    entries: Vec<Entry>,
+    header: Header,
+    replies: &mut Vec<AppliedCommand>,
+) -> Result<()> {
     let mut entries = entries.into_iter().peekable();
     while let Some(entry) = entries.next() {
         ensure!(
@@ -885,7 +886,7 @@ pub(super) async fn apply_entries(
             reply,
         });
     }
-    Ok(replies)
+    Ok(())
 }
 
 // Replay in bounded batches when recovery exceeds the pending-entry quota.

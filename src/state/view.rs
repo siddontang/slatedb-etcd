@@ -56,7 +56,8 @@ impl Base {
     }
 
     /// Open checkpoint `id` of the database at `root`. The reader writes nothing and does not
-    /// poll, and it shares the member's block cache.
+    /// poll, and it shares the member's block cache. A read ends after the retries of the
+    /// member's database, so apply and client reads see a storage error instead of a hang.
     pub(crate) async fn open(
         store: Arc<dyn slatedb::object_store::ObjectStore>,
         root: &str,
@@ -67,6 +68,7 @@ impl Base {
             .with_reader_mode(DbReaderMode::Checkpoint(id))
             .with_options(DbReaderOptions {
                 skip_wal_replay: true,
+                object_store_max_retries: super::slatedb_settings().object_store_max_retries,
                 ..Default::default()
             })
             .with_db_cache(cache, 0)

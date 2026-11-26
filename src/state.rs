@@ -635,7 +635,8 @@ impl StateMachine {
     async fn write_batch(&mut self, batch: WriteBatch, index: u64) -> Result<()> {
         let size = batch
             .logical_size(self.applied_state(), &self.key_index, self.logical_bytes)
-            .await?;
+            .await
+            .map_err(crate::mvcc::storage_fault::read_cause)?;
         let size = self.store_batch(batch, index, size).await?;
         self.logical_bytes = size;
         self.applied_term = self.entry_term;
