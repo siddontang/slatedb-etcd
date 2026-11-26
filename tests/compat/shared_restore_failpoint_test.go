@@ -3,6 +3,7 @@
 package compat
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math/rand"
@@ -17,9 +18,25 @@ import (
 	"go.uber.org/zap"
 )
 
+// checkLargeValues replays the seeded values of the large keys and reads one key at a time, so
+// memory stays bounded. Every key must hold its acknowledged value.
+func checkLargeValues(ctx context.Context, t *testing.T, api *clientv3.Client, mib int) {
+	t.Helper()
+	random := rand.New(rand.NewSource(1))
+	value := make([]byte, 1024*1024)
+	for i := 0; i < mib; i++ {
+		random.Read(value)
+		key := fmt.Sprintf("large/%06d", i)
+		result, err := api.Get(ctx, key)
+		require.NoError(t, err)
+		require.Len(t, result.Kvs, 1, key)
+		require.True(t, bytes.Equal(value, result.Kvs[0].Value), "%s has another value", key)
+	}
+}
+
 // Save a shared-mode backup above 64 MiB and restore it into a new shared cluster. The restore
 // crashes after its first durable rows. The same command waits for the stale lease, continues
-// after the stored rows, and the restored cluster accepts a write.
+// after the stored rows. Every key keeps its acknowledged value, and the cluster accepts a write.
 func TestFailpointSharedRestore(t *testing.T) {
 	const mib = 72
 	source := newClusterSize(t, 1, "--state-mode", "shared")
@@ -33,6 +50,7 @@ func TestFailpointSharedRestore(t *testing.T) {
 		_, err := putRetrying(ctx, api, fmt.Sprintf("large/%06d", i), string(value))
 		require.NoError(t, err)
 	}
+	checkLargeValues(ctx, t, api, mib)
 	file := filepath.Join(t.TempDir(), "shared.snapshot")
 	_, err := snapshot.SaveWithVersion(ctx, zap.NewNop(), clientv3.Config{Endpoints: source.addresses}, file)
 	require.NoError(t, err)
@@ -60,9 +78,9 @@ func TestFailpointSharedRestore(t *testing.T) {
 	require.Contains(t, string(log), "continue the partial snapshot restore")
 
 	check := client(t, restored.addresses)
+	checkLargeValues(ctx, t, check, mib)
 	result, err := check.Get(ctx, fmt.Sprintf("large/%06d", mib-1))
 	require.NoError(t, err)
-	require.Equal(t, value, result.Kvs[0].Value)
 	count, err := check.Get(ctx, "large/", clientv3.WithPrefix(), clientv3.WithCountOnly())
 	require.NoError(t, err)
 	require.Equal(t, int64(mib), count.Count)
