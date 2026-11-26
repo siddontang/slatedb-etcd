@@ -15,6 +15,7 @@ async fn server() -> (
         shared: None,
         events,
         cluster_id: "stream-test".into(),
+        fault_controls: false,
     });
     let task = tokio::spawn(crate::tls::serve(listener, router, None));
     (address, received, task)

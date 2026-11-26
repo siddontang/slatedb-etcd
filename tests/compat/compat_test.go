@@ -145,7 +145,7 @@ func newClusterConfigured(t *testing.T, size int, configure func(*cluster), extr
 
 func (c *cluster) start(id int) {
 	c.t.Helper()
-	args := []string{"--id", strconv.Itoa(id), "--listen", endpointHost(c.addresses[id-1]), "--dir", filepath.Join(c.root, fmt.Sprintf("node-%d", id)), "--cluster-id", filepath.Base(c.root), "--snapshot-every", fmt.Sprint(c.snapshotEvery)}
+	args := []string{"--id", strconv.Itoa(id), "--listen", endpointHost(c.addresses[id-1]), "--dir", filepath.Join(c.root, fmt.Sprintf("node-%d", id)), "--cluster-id", filepath.Base(c.root), "--snapshot-every", fmt.Sprint(c.snapshotEvery), "--enable-fault-controls"}
 	args = append(args, c.args...)
 	peers := c.addresses
 	if len(c.peerAddresses) != 0 {

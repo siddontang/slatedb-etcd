@@ -22,6 +22,8 @@ pub struct ApiState {
     pub(crate) location: Option<std::sync::Arc<crate::state::transfer::Location>>,
     /// Shared mode: the objects that a received format 6 snapshot names.
     pub(crate) shared: Option<std::sync::Arc<crate::state::shared::Source>>,
+    /// Serve the fault controls under `/debug`. Off unless a test cluster enables them.
+    pub(crate) fault_controls: bool,
 }
 
 impl IntoResponse for ApiError {
@@ -36,7 +38,7 @@ impl IntoResponse for ApiError {
 }
 
 pub fn router(state: ApiState) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route_service(
             "/slatedb.peer.Transport/Exchange",
             crate::peer::service(state.clone()),
@@ -49,12 +51,16 @@ pub fn router(state: ApiState) -> Router {
         .route("/status", get(status))
         .route("/debug/log-stats", get(log_stats))
         .route("/checkpoint", post(checkpoint))
-        .route("/debug/value", get(local_value))
-        .route("/debug/partition", post(partition))
-        .route("/debug/snapshot-delay", post(snapshot_delay))
-        .route("/debug/apply-delay", post(apply_delay))
-        .route("/debug/log-fault", post(log_fault))
-        .route("/debug/log-read-fault", post(log_read_fault))
+        .route("/debug/value", get(local_value));
+    if state.fault_controls {
+        router = router
+            .route("/debug/partition", post(partition))
+            .route("/debug/snapshot-delay", post(snapshot_delay))
+            .route("/debug/apply-delay", post(apply_delay))
+            .route("/debug/log-fault", post(log_fault))
+            .route("/debug/log-read-fault", post(log_read_fault));
+    }
+    router
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
 }

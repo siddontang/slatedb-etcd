@@ -3,6 +3,8 @@
 These interfaces are trusted test controls. They bypass etcd Auth.
 Keep them on loopback or behind mutual peer TLS. Restrict peer credentials to trusted operators.
 With separate listeners, only the peer listener exposes these routes.
+The partition, delay, and log fault routes exist only when the member starts with
+`--enable-fault-controls`. Without that flag they return 404.
 
 ## Routes
 

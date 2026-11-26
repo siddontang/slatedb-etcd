@@ -88,6 +88,8 @@ pub struct ServerConfig {
     pub max_clock_skew: Duration,
     /// Shared mode: whether the leader deletes old view checkpoints. Off by default.
     pub view_retention: crate::state::ViewRetention,
+    /// Serve the `/debug` fault controls (partition, delays, log faults). Off by default.
+    pub fault_controls: bool,
 }
 
 /// A free local port for a test member. A port 0 listener returns its port to the pool, and a
@@ -149,6 +151,7 @@ impl ServerConfig {
             overlay_max_bytes: DEFAULT_OVERLAY_MAX_BYTES,
             max_clock_skew: Duration::from_secs(5),
             view_retention: crate::state::ViewRetention::Off,
+            fault_controls: false,
         }
     }
 }
@@ -378,6 +381,7 @@ impl Server {
             cluster_id: config.cluster_id.clone(),
             location: Some(node.location.clone()),
             shared: node.shared_source(),
+            fault_controls: config.fault_controls,
         });
         // Peer gRPC has no RPC metrics; diagnostics paths never collide with gRPC services.
         let peer_app = App::new(

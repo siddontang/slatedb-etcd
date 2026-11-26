@@ -359,7 +359,9 @@ def main():
     root = Path(tempfile.mkdtemp(prefix="slatedb-raft-poc-"))
     print(f"Run directory: {root}", flush=True)
     # In tests, small log files let the log truncation check reclaim whole files.
-    extra = ["--log-file-bytes", str(256 * 1024)] if args.mode == "test" else []
+    # Only tests use the fault routes; bench mode must also run binaries that predate the flag.
+    extra = (["--log-file-bytes", str(256 * 1024), "--enable-fault-controls"]
+             if args.mode == "test" else [])
     cluster = Cluster(args.binary.resolve(), root, args.snapshot_every, extra)
     report = {"mode": args.mode, "host": platform.platform(), "machine": platform.machine(),
               "created_at": datetime.now(timezone.utc).isoformat(), "logical_cpus": os.cpu_count(),

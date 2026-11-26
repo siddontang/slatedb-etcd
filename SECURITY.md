@@ -18,7 +18,8 @@ channel.
 
 Listeners bind to loopback by default. Remote mode requires mutual TLS on separate client and peer
 ports. Local users and processes can still connect to loopback ports.
-The default shared plaintext listener exposes trusted diagnostic and fault controls.
+The default shared plaintext listener exposes trusted diagnostic controls.
+Fault controls are off unless `--enable-fault-controls` is set; use that flag only in test clusters.
 Those controls, including Raft transport, are outside etcd Auth enforcement.
 Enabling Auth alone does not make that shared listener safe for untrusted local users.
 
