@@ -118,8 +118,8 @@ pub(super) fn signals() -> (Control, Signals) {
 }
 
 /// How a wait after a storage error ended.
-#[derive(PartialEq, Eq)]
-pub(super) enum Waited {
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::node) enum Waited {
     /// Try again.
     Again,
     /// A snapshot covers the entry. The job ends with its applied prefix.
@@ -251,12 +251,13 @@ impl Executor {
     /// rebases the state at the applied index first. Corrupt data holds apply on its entry.
     /// Other errors stop apply.
     ///
-    /// The flag is true when a covering snapshot ended the job early, at its prefix boundary.
+    /// A covering snapshot can end the job early. It then returns the end of the applied
+    /// prefix, which the node already counts as applied.
     pub(super) async fn apply_retrying(
         &mut self,
         entries: Vec<Entry>,
         header: Header,
-    ) -> Result<(Vec<AppliedCommand>, bool)> {
+    ) -> Result<(Vec<AppliedCommand>, Option<u64>)> {
         let mut replies = vec![];
         let mut retry = Retry::default();
         // Each try starts at the first entry of the job that did not apply. Every applied entry
@@ -269,75 +270,90 @@ impl Executor {
             let tried = Box::pin(apply_into(&mut self.state, rest, header, &mut replies)).await;
             let Err(error) = tried else {
                 retry.done(&self.signals);
-                return Ok((replies, false));
+                return Ok((replies, None));
             };
             next += (self.state.applied - before) as usize;
+            // The prefix ends here. The wait below keeps this boundary, also while a rebase
+            // replays below it.
+            let prefix = self.state.applied;
             let fault = match retryable(&error) {
                 Some(StorageFault::Missing) if self.log.is_some() => {
                     tracing::warn!(%error, "an apply read lost its checkpoint object");
-                    self.rebase_retrying(header, self.state.applied).await?;
+                    if self.rebase_retrying(header, prefix).await? == Waited::Covered {
+                        return Ok((replies, Some(prefix)));
+                    }
                     StorageFault::Missing
                 }
                 Some(fault @ (StorageFault::Transient | StorageFault::Corrupt)) => fault,
                 _ => return Err(error),
             };
-            let index = self.state.applied + 1;
-            if retry.wait(&mut self.signals, index, fault, &error).await? == Waited::Covered {
+            if retry
+                .wait(&mut self.signals, prefix + 1, fault, &error)
+                .await?
+                == Waited::Covered
+            {
                 retry.done(&self.signals);
-                return Ok((replies, true));
+                return Ok((replies, Some(prefix)));
             }
         }
     }
 
     /// Rebase the state at `applied`. A failed load leaves the state as it was, and a failed
     /// replay leaves a state below `applied`. Both run the rebase again after a storage error
-    /// of a read. See `StateMachine::adopt_base`.
-    async fn rebase_retrying(&mut self, header: Header, applied: u64) -> Result<()> {
+    /// of a read. A snapshot that covers `applied + 1` ends the wait. See
+    /// `StateMachine::adopt_base`.
+    async fn rebase_retrying(&mut self, header: Header, applied: u64) -> Result<Waited> {
         let mut retry = Retry::default();
         loop {
             let Err(error) = Box::pin(self.rebase(header, applied)).await else {
                 retry.done(&self.signals);
-                return Ok(());
+                return Ok(Waited::Again);
             };
             let Some(fault) = retryable(&error) else {
                 return Err(error);
             };
-            // A rebase is no entry, so no snapshot preempts it.
-            retry
-                .wait(&mut self.signals, u64::MAX, fault, &error)
-                .await?;
+            let index = applied + 1;
+            if retry.wait(&mut self.signals, index, fault, &error).await? == Waited::Covered {
+                retry.done(&self.signals);
+                return Ok(Waited::Covered);
+            }
         }
     }
 
     /// Adopt an opened base. A transient storage error of the load leaves the state as it was,
-    /// so the adoption runs again.
+    /// so the adoption runs again. A snapshot above the base ends the wait with
+    /// `Waited::Covered`, and the state stays as it was.
     pub(super) async fn adopt_retrying(
         &mut self,
         base: std::sync::Arc<crate::state::view::Base>,
         term: u64,
-    ) -> Result<()> {
+    ) -> Result<Waited> {
         let mut retry = Retry::default();
+        let index = base.applied + 1;
         loop {
             match self.state.adopt_opened(base.clone(), term).await {
                 Err(error) if retryable(&error) == Some(StorageFault::Transient) => {
                     let fault = StorageFault::Transient;
-                    retry
-                        .wait(&mut self.signals, u64::MAX, fault, &error)
-                        .await?;
+                    if retry.wait(&mut self.signals, index, fault, &error).await? == Waited::Covered
+                    {
+                        retry.done(&self.signals);
+                        return Ok(Waited::Covered);
+                    }
                 }
                 adopted => {
                     retry.done(&self.signals);
-                    return adopted;
+                    return adopted.map(|()| Waited::Again);
                 }
             }
         }
     }
 
     /// Install a snapshot. In shared mode a transient storage error of the base load leaves the
-    /// state as it was, so the install runs again. A replicated install is not staged, so its
-    /// errors stop apply.
-    pub(super) async fn install_retrying(&mut self, snapshot: &Snapshot) -> Result<()> {
+    /// state as it was, so the install runs again. A newer snapshot ends the wait with
+    /// `Waited::Covered`. A replicated install is not staged, so its errors stop apply.
+    pub(super) async fn install_retrying(&mut self, snapshot: &Snapshot) -> Result<Waited> {
         let mut retry = Retry::default();
+        let index = snapshot.get_metadata().index + 1;
         loop {
             match Box::pin(self.state.install_snapshot(snapshot)).await {
                 Err(error)
@@ -345,13 +361,15 @@ impl Executor {
                         && retryable(&error) == Some(StorageFault::Transient) =>
                 {
                     let fault = StorageFault::Transient;
-                    retry
-                        .wait(&mut self.signals, u64::MAX, fault, &error)
-                        .await?;
+                    if retry.wait(&mut self.signals, index, fault, &error).await? == Waited::Covered
+                    {
+                        retry.done(&self.signals);
+                        return Ok(Waited::Covered);
+                    }
                 }
                 installed => {
                     retry.done(&self.signals);
-                    return installed;
+                    return installed.map(|()| Waited::Again);
                 }
             }
         }

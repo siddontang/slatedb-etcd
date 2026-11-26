@@ -82,11 +82,18 @@ impl StateMachine {
             shared.base.applied,
             shared.base_index,
         );
-        let newest = newest_base_through(&self.admin, &shared.source, limit).await?;
+        // The search reads manifests and opens a checkpoint. It changes nothing, so a storage
+        // error keeps its class, and apply can run the rebase again.
+        let mark = crate::mvcc::storage_fault::read_cause;
+        let newest = newest_base_through(&self.admin, &shared.source, limit)
+            .await
+            .map_err(mark)?;
         let base = match (newest, current) {
             (Some(base), _) if base.applied >= index => base,
             (_, Some(current)) if index > row => {
-                reopen_above_row(&self.admin, &shared.source, current, Some(row), index).await?
+                reopen_above_row(&self.admin, &shared.source, current, Some(row), index)
+                    .await
+                    .map_err(mark)?
             }
             (Some(base), _) => base,
             (None, _) => {
@@ -149,7 +156,13 @@ impl StateMachine {
         }
         let base = match received {
             Some(base) => base,
-            None => shared.source.open_base(id).await?,
+            // An install that runs again opens the checkpoint again. A storage error keeps its
+            // class, so apply can retry.
+            None => shared
+                .source
+                .open_base(id)
+                .await
+                .map_err(crate::mvcc::storage_fault::read_cause)?,
         };
         // The record index can be above the checkpoint row: the leader certified that no entry
         // in between changed state. The record gives the term at its own index only.

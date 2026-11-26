@@ -94,7 +94,8 @@ async fn covering_snapshot(source: &std::path::Path) -> Message {
 /// Apply holds on corrupt data in entry 8, after entry 5 added learner 4. Raft then accepts a
 /// snapshot without learner 4 and takes its ConfState. The snapshot ends the held job with
 /// its prefix, and the prefix must not add learner 4 to Raft again. After the install, Raft's
-/// ConfState is the one of the snapshot, and apply goes on above it.
+/// ConfState is the one of the snapshot, and apply goes on above it. A stale adoption that
+/// completes after the snapshot does not change it either.
 #[tokio::test]
 async fn a_covering_snapshot_ends_a_held_job_without_its_stale_conf_changes() {
     let dir = tempfile::tempdir().unwrap();
@@ -111,6 +112,11 @@ async fn a_covering_snapshot_ends_a_held_job_without_its_stale_conf_changes() {
     node.raw.step(snapshot).unwrap();
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
+    assert_eq!(node.raw.raft.prs().conf().to_conf_state(), conf);
+    // An adoption of an older base that completes now must not bring learner 4 back either.
+    let mut stale = conf.clone();
+    stale.learners = vec![4];
+    node.finish_output(Output::Adopted(stale)).unwrap();
     assert_eq!(node.raw.raft.prs().conf().to_conf_state(), conf);
     let held = tokio::time::timeout(Duration::from_secs(5), node.worker.step())
         .await

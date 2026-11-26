@@ -4,7 +4,7 @@ use raft::eraftpb::Snapshot;
 
 #[path = "shared/apply_retry.rs"]
 mod retry;
-pub(super) use retry::{Control, Paused};
+pub(super) use retry::{Control, Paused, Waited};
 
 pub(super) const BATCH_ENTRIES: u64 = 32;
 /// Committed-entry jobs that may wait in the apply queue behind the running job.
@@ -299,6 +299,10 @@ struct Executor {
     log: Option<crate::storage::LogReader>,
     /// The stop and preemption of a job that waits on a storage error, and its pause report.
     signals: retry::Signals,
+    /// Runs once after a rebase adopted its base and before it replays, for tests. Its error
+    /// fails the replay.
+    #[cfg(test)]
+    before_replay: Option<Box<dyn FnOnce() -> Result<()> + Send>>,
 }
 
 impl Drop for Executor {
@@ -319,10 +323,15 @@ impl Executor {
     /// Rebuild the state from the newest checkpoint at or below `applied`, and replay the local
     /// log to `applied`. No view is published until the replay ends, so reads see no older
     /// state. Earlier jobs already sent the replies of the replayed entries, and Raft already
-    /// applied their membership changes.
+    /// applied their membership changes. A replay that fails leaves the state below `applied`.
+    /// A job that a snapshot then ends sends no state. See `apply_retrying`.
     async fn rebase(&mut self, header: Header, applied: u64) -> Result<()> {
         let log = self.log.clone().context("rebase needs the log")?;
         self.state.rebase(applied, |index| log.term(index)).await?;
+        #[cfg(test)]
+        if let Some(hook) = self.before_replay.take() {
+            hook()?;
+        }
         while self.state.applied < applied {
             let low = self.state.applied + 1;
             let entries = log.entries(low, (low + BATCH_ENTRIES).min(applied + 1))?;
@@ -352,6 +361,7 @@ impl Executor {
         let copy_state = changes_state || matches!(work.job, Job::Query(Query::Maintenance(..)));
         let previous_revision = self.state.revision;
         let mut early = false;
+        let mut prefix = None;
         // A checkpoint that opened in the background becomes the base of the next view.
         if changes_state {
             self.state.switch_base();
@@ -372,9 +382,11 @@ impl Executor {
                 Output::Entries(Vec::new())
             }
             Job::Entries(entries) => {
-                let (replies, covered) =
-                    Box::pin(self.apply_retrying(entries, work.header)).await?;
-                early = covered;
+                let (replies, ended) = Box::pin(self.apply_retrying(entries, work.header)).await?;
+                early = ended.is_some();
+                // A rebase replay that failed left the state below the applied prefix. The
+                // snapshot replaces it, so the node gets only the prefix boundary.
+                prefix = ended.filter(|prefix| *prefix > self.state.applied);
                 Output::Entries(replies)
             }
             Job::PreparePuts { commands, term } => {
@@ -395,16 +407,29 @@ impl Executor {
                 self.state.mark_row()?;
                 Output::Entries(Vec::new())
             }
-            Job::AdoptBase { base, term } => {
-                self.adopt_retrying(base, term).await?;
-                Output::Adopted(self.state.members.conf())
-            }
+            Job::AdoptBase { base, term } => match self.adopt_retrying(base, term).await? {
+                Waited::Again => Output::Adopted(self.state.members.conf()),
+                // A newer snapshot replaces this adoption.
+                Waited::Covered => {
+                    early = true;
+                    Output::Entries(Vec::new())
+                }
+            },
             Job::RaiseBase(snapshot) => {
                 self.state.raise_to_record(&snapshot).await?;
                 Output::Entries(Vec::new())
             }
             Job::Snapshot(snapshot) => {
-                self.install_retrying(&snapshot).await?;
+                if self.install_retrying(&snapshot).await? == Waited::Covered {
+                    // A newer snapshot replaces this one. The state did not change.
+                    early = true;
+                    return Ok(Completion {
+                        applied: self.state.applied,
+                        state: Some(AppliedState::new(&self.state)?),
+                        output: Output::Entries(Vec::new()),
+                        early,
+                    });
+                }
                 // An object snapshot replaces the database. The node rebinds its handles.
                 Output::Snapshot(Rebound {
                     db: self.state.database(),
@@ -517,7 +542,7 @@ impl Executor {
                 }
             }
         };
-        let state = match copy_state {
+        let state = match copy_state && prefix.is_none() {
             true => {
                 let mut state = AppliedState::new(&self.state)?;
                 state.watch = self
@@ -529,7 +554,7 @@ impl Executor {
             false => None,
         };
         Ok(Completion {
-            applied: self.state.applied,
+            applied: prefix.unwrap_or(self.state.applied),
             state,
             output,
             early,
@@ -575,6 +600,8 @@ impl Worker {
             inline_checkpoints: manual,
             log,
             signals,
+            #[cfg(test)]
+            before_replay: None,
         };
         #[cfg(test)]
         if manual {

@@ -77,15 +77,12 @@ pub(crate) fn read(error: slatedb::Error) -> anyhow::Error {
     })
 }
 
-/// Mark `error` as an error of a storage read when a SlateDB error caused it. Other errors,
-/// such as a byte count that does not add up, keep their type.
+/// Mark `error` as an error of a storage read when a storage error caused it, with the class of
+/// `classify`. Other errors, such as a byte count that does not add up, keep their type.
 pub(crate) fn read_cause(error: anyhow::Error) -> anyhow::Error {
-    match error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<slatedb::Error>())
-    {
-        Some(cause) => anyhow::Error::new(Classified {
-            fault: of_slatedb(cause),
+    match classify(&error) {
+        Some(fault) => anyhow::Error::new(Classified {
+            fault,
             message: format!("{error:#}"),
         }),
         None => error,

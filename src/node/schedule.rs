@@ -257,9 +257,11 @@ impl Node {
         );
         self.apply_busy = !self.apply_jobs.is_empty();
         self.expire_reads();
+        // A job that a snapshot ended during a rebase replay sends only its prefix boundary. The
+        // snapshot replaces the state. See `apply_retrying`.
         let Some(state) = completed.state else {
             ensure!(
-                completed.applied == self.state.applied,
+                completed.applied == self.state.applied || completed.early,
                 "read changed the apply position"
             );
             return self.finish_output(completed.output);
@@ -410,6 +412,8 @@ impl Node {
             }
             Output::Read { response, outcome } => response.kv(outcome)?,
             Output::Linear { id, outcome } => self.finish_read(id, outcome)?,
+            // Raft took the ConfState of a snapshot that it accepted above the adopted base.
+            Output::Adopted(conf) if self.installing() => drop(conf),
             Output::Adopted(conf) => shared::reconcile_conf(&mut self.raw, &conf)?,
             Output::Checkpoint(built) => {
                 if let Some(built) = built {

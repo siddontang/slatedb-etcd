@@ -56,7 +56,12 @@ pub(crate) const DELAY_SHARED: u8 = 16;
 /// direct read, so only this mode fails a read that goes through the block cache.
 pub(crate) const LOSE_SST_TWICE: u8 = 10;
 /// Fail every SST read with a retryable error, like a local file with a persistent I/O error.
-pub(crate) const RETRYABLE_SST_GET: u8 = 11;
+pub(crate) const RETRYABLE_SST_GET: u8 = 17;
+/// Report the next two SST reads as missing, like `LOSE_SST_TWICE`. Then fail every read, like
+/// `FAIL_GET`.
+pub(crate) const LOSE_SST_TWICE_THEN_FAIL: u8 = 18;
+/// The second step of `LOSE_SST_TWICE_THEN_FAIL`.
+const LOSE_SST_ONCE_THEN_FAIL: u8 = 19;
 
 impl FaultStore {
     pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
@@ -201,11 +206,18 @@ impl ObjectStore for FaultStore {
             }
         }
         let mode = self.mode.load(Ordering::SeqCst);
-        if (mode == LOSE_SST_ONCE || mode == LOSE_SST_TWICE) && path.as_ref().ends_with(".sst") {
-            let next = if mode == LOSE_SST_TWICE {
-                LOSE_SST_ONCE
-            } else {
-                0
+        let losing = [
+            LOSE_SST_ONCE,
+            LOSE_SST_TWICE,
+            LOSE_SST_TWICE_THEN_FAIL,
+            LOSE_SST_ONCE_THEN_FAIL,
+        ];
+        if losing.contains(&mode) && path.as_ref().ends_with(".sst") {
+            let next = match mode {
+                LOSE_SST_TWICE => LOSE_SST_ONCE,
+                LOSE_SST_TWICE_THEN_FAIL => LOSE_SST_ONCE_THEN_FAIL,
+                LOSE_SST_ONCE_THEN_FAIL => FAIL_GET,
+                _ => 0,
             };
             self.mode.store(next, Ordering::SeqCst);
             self.entered.add_permits(1);
