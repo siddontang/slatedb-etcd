@@ -742,12 +742,17 @@ A Watch page that fails for a transient or missing object runs again on a new vi
 watcher resumes at its own next revision, so no revision is lost. The first retry runs at once,
 and later retries in a row wait from 100 ms up to 5 s. A corrupt page ends the stream with
 `DataLoss`. The stream reads one catch-up page at a time between its other work. So a Cancel, a
-closed client, or a closed request stream still ends the work while the store fails. A progress
-request waits until its watchers have every event through its revision. Until its reply, the
-stream takes no feed batch, so no later event goes before it. Later progress requests fold into
-one with the newest revision. A watcher created meanwhile starts after the published revision,
-and it does not hold back the earlier reply. A canceled watcher leaves the waiting requests, so
-their ID sets stay bounded, and a later watcher with its ID does not hold them back either.
+closed client, or a closed request stream still ends the work while the store fails.
+
+A progress request follows etcd in one case: a watcher of the stream with a start revision above
+the next revision drops it, with no reply. etcd also drops a request while a watcher catches up.
+This member instead keeps such a request when the events through its revision exist but a failing
+store delays them. The reply then follows those events, so a client need not ask again. Until the
+reply, the stream takes no feed batch, so no later event goes before it. Later progress requests
+fold into one with the newest revision. A create that comes meanwhile waits until the reply goes
+out, because a client applies the reply to each watch that it knows. Its reply then follows in
+request order. A Cancel still gets its reply, and it removes a waiting create. At most 64 creates
+wait. The stream then reads no further request until the progress reply goes out.
 
 ### Writer faults
 

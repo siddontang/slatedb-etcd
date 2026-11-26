@@ -486,3 +486,155 @@ async fn a_progress_reply_follows_the_events_of_a_failing_catch_up() {
     assert!(progress.header.unwrap().revision >= revisions[9]);
     server.shutdown().await.unwrap();
 }
+
+/// The create that `a_create_waits_for_an_earlier_progress_reply` sends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Late {
+    /// A watch from revision 50, above the current revision.
+    Future,
+    /// A watch from the current revision.
+    Now,
+    /// A watch that takes ID 5 of a watch that the stream canceled meanwhile.
+    Reused,
+}
+
+fn watch_request(
+    request: crate::proto::etcdserverpb::watch_request::RequestUnion,
+) -> crate::proto::etcdserverpb::WatchRequest {
+    crate::proto::etcdserverpb::WatchRequest {
+        request_union: Some(request),
+    }
+}
+
+fn late_create(id: i64, start: i64) -> crate::proto::etcdserverpb::WatchRequest {
+    use crate::proto::etcdserverpb::{watch_request::RequestUnion, WatchCreateRequest};
+    watch_request(RequestUnion::CreateRequest(WatchCreateRequest {
+        key: b"late".to_vec(),
+        watch_id: id,
+        start_revision: start,
+        ..Default::default()
+    }))
+}
+
+/// A progress request waits while a catch-up fails. A create that comes after it gets its
+/// reply only after the progress reply. A client applies a stream-wide progress reply to each
+/// watch that it knows, so an earlier reply must not reach a watch that starts after it.
+async fn a_create_waits_for_an_earlier_progress_reply(late: Late) {
+    use crate::proto::etcdserverpb::{
+        watch_request::RequestUnion, WatchCancelRequest, WatchProgressRequest,
+    };
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let dir = tempfile::tempdir().unwrap();
+    let (server, _) = flushed(dir.path(), &faults).await;
+    faults.set(FAIL_SST_GET);
+    let (requests, input) = tokio::sync::mpsc::channel(4);
+    let mut stream = watch_stream(&server, input).await;
+    requests.send(historical()).await.unwrap();
+    assert!(reply(&mut stream).await.created);
+    if late == Late::Reused {
+        requests.send(late_create(5, 0)).await.unwrap();
+        let created = reply(&mut stream).await;
+        assert!(created.created && created.watch_id == 5);
+    }
+    failed_read(&faults).await;
+    let progress = RequestUnion::ProgressRequest(WatchProgressRequest {});
+    requests.send(watch_request(progress)).await.unwrap();
+    let (id, start) = match late {
+        Late::Future => (0, 50),
+        Late::Now => (0, 0),
+        Late::Reused => {
+            let cancel = RequestUnion::CancelRequest(WatchCancelRequest { watch_id: 5 });
+            requests.send(watch_request(cancel)).await.unwrap();
+            let canceled = reply(&mut stream).await;
+            assert!(canceled.canceled && canceled.watch_id == 5);
+            (5, 0)
+        }
+    };
+    requests.send(late_create(id, start)).await.unwrap();
+    let early = tokio::time::timeout(Duration::from_millis(500), stream.message()).await;
+    assert!(
+        early.is_err(),
+        "a reply came while the store failed: {early:?}"
+    );
+    faults.set(0);
+    let mut revisions = vec![];
+    let progress = loop {
+        let reply = reply(&mut stream).await;
+        assert!(!reply.created, "the create went before the progress reply");
+        if reply.watch_id == -1 {
+            break reply;
+        }
+        revisions.extend(
+            reply
+                .events
+                .iter()
+                .map(|e| e.kv.as_ref().unwrap().mod_revision),
+        );
+    };
+    assert_eq!(revisions.len(), 10);
+    let created = reply(&mut stream).await;
+    assert!(created.created && !created.canceled, "{created:?}");
+    if late == Late::Reused {
+        assert_eq!(created.watch_id, 5);
+    }
+    let goal = progress.header.unwrap().revision;
+    assert!(created.header.unwrap().revision >= goal);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_future_create_waits_for_an_earlier_progress_reply() {
+    a_create_waits_for_an_earlier_progress_reply(Late::Future).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_current_create_waits_for_an_earlier_progress_reply() {
+    a_create_waits_for_an_earlier_progress_reply(Late::Now).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reused_id_waits_for_an_earlier_progress_reply() {
+    a_create_waits_for_an_earlier_progress_reply(Late::Reused).await;
+}
+
+/// A create waits behind a progress request while the store fails. Its Cancel still gets a
+/// reply at once, and the create never runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_of_a_waiting_create_replies_during_a_store_fault() {
+    use crate::proto::etcdserverpb::{
+        watch_request::RequestUnion, WatchCancelRequest, WatchProgressRequest,
+    };
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let dir = tempfile::tempdir().unwrap();
+    let (server, _) = flushed(dir.path(), &faults).await;
+    faults.set(FAIL_SST_GET);
+    let (requests, input) = tokio::sync::mpsc::channel(4);
+    let mut stream = watch_stream(&server, input).await;
+    requests.send(historical()).await.unwrap();
+    assert!(reply(&mut stream).await.created);
+    failed_read(&faults).await;
+    let progress = RequestUnion::ProgressRequest(WatchProgressRequest {});
+    requests.send(watch_request(progress)).await.unwrap();
+    requests.send(late_create(7, 0)).await.unwrap();
+    let cancel = RequestUnion::CancelRequest(WatchCancelRequest { watch_id: 7 });
+    requests.send(watch_request(cancel)).await.unwrap();
+    let canceled = reply(&mut stream).await;
+    assert!(
+        canceled.canceled && !canceled.created && canceled.watch_id == 7,
+        "{canceled:?}"
+    );
+    faults.set(0);
+    loop {
+        let reply = reply(&mut stream).await;
+        assert!(!reply.created, "the canceled create ran");
+        if reply.watch_id == -1 {
+            break;
+        }
+    }
+    let after = tokio::time::timeout(Duration::from_millis(300), stream.message()).await;
+    assert!(
+        after.is_err(),
+        "a reply came after the progress reply: {after:?}"
+    );
+    server.shutdown().await.unwrap();
+}
