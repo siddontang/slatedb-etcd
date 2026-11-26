@@ -457,6 +457,12 @@ func TestDifferentialKV(t *testing.T) {
 	check("overlapping_deletes", clientv3.OpTxn(nil, []clientv3.Op{clientv3.OpDelete("p/", clientv3.WithPrefix(), clientv3.WithPrevKV()), clientv3.OpDelete("p/a", clientv3.WithPrevKV())}, nil))
 	check("history_before_deletes", clientv3.OpGet("p/", clientv3.WithPrefix(), clientv3.WithRev(9), clientv3.WithSort(clientv3.SortByCreateRevision, clientv3.SortDescend)))
 	check("empty_key", clientv3.OpPut("", "bad"))
+	check("sort_page_a", clientv3.OpPut("s/a", "z"))
+	check("sort_page_b", clientv3.OpPut("s/b", "y"))
+	check("sort_page_c", clientv3.OpPut("s/c", "a"))
+	// Without a sort order, etcd sorts only the first limit + 1 keys.
+	check("sort_value_no_order_limit", clientv3.OpGet("s/", clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByValue, clientv3.SortNone), clientv3.WithLimit(1)))
+	check("sort_value_ascend_limit", clientv3.OpGet("s/", clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByValue, clientv3.SortAscend), clientv3.WithLimit(1)))
 	ops := make([]clientv3.Op, 129)
 	for i := range ops {
 		ops[i] = clientv3.OpGet("key")

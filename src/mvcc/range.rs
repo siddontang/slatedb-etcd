@@ -183,15 +183,22 @@ impl<'r> Assembly<'r> {
         (self.r.limit > 0).then(|| usize::try_from(self.r.limit).unwrap_or(usize::MAX))
     }
 
+    /// The limit of a Range whose rows come from its first `limit + 1` matching keys. These
+    /// are key order, and, as in etcd, a sort target without a sort order or filters: etcd
+    /// sorts only that page.
+    fn page(&self) -> Option<usize> {
+        let unordered = self.r.sort_order == 0 && !has_filters(self.r);
+        self.keep().filter(|_| self.key_order || unordered)
+    }
+
     /// The rows can be complete before the last candidate: the source needs a separate count.
     fn can_stop(&self) -> bool {
-        self.r.count_only || (self.key_order && self.keep().is_some())
+        self.r.count_only || self.page().is_some()
     }
 
     /// Later candidates can change only the count.
     fn rows_complete(&self) -> bool {
-        self.r.count_only
-            || (self.key_order && self.keep().is_some_and(|k| self.matched > k as i64))
+        self.r.count_only || self.page().is_some_and(|k| self.matched > k as i64)
     }
 
     fn filtered(&self, kv: &KeyValue) -> bool {
@@ -358,26 +365,49 @@ impl<R: StateRead> View<'_, R> {
         }
         // The key order of a pinned view holds the count, so a read that can stop early stops
         // once the rows are complete. Other reads scan the interval anyway and count it there,
-        // without holding the key order lock. Debug builds scan the whole interval and check the
-        // count against the rows.
+        // without holding the key order lock.
         let total = self
             .keys
             .filter(|_| out.can_stop())
             .map(|keys| keys.count(&r.key, &r.range_end));
-        let full_scan = total.is_none() || cfg!(debug_assertions);
-        if total.is_some() && r.count_only && !full_scan {
+        if total.is_some() && r.count_only && !cfg!(debug_assertions) {
             return Ok(total);
         }
-        let mut scan = self.db.scan(bounds).await.map_err(KvError::storage)?;
+        let mut scan = self
+            .db
+            .scan(bounds.clone())
+            .await
+            .map_err(KvError::storage)?;
+        let mut stopped = false;
         while let Some(row) = scan.next().await.map_err(KvError::storage)? {
-            if !full_scan && out.rows_complete() {
+            out.offer(Candidate::Current(row.value, None))?;
+            if total.is_some() && out.rows_complete() {
+                stopped = true;
                 break;
             }
-            out.offer(Candidate::Current(row.value, None))?;
         }
-        if let Some(total) = total.filter(|_| full_scan) {
-            debug_assert_eq!(total, out.count, "key order count differs from the rows");
+        // Debug builds count the whole interval and check the key order count. The response is
+        // already complete, so a failed recount only skips the check.
+        if let Some(total) = total.filter(|_| cfg!(debug_assertions)) {
+            let rows = if stopped {
+                self.count_rows(bounds).await
+            } else {
+                Ok(out.count)
+            };
+            if let Ok(rows) = rows {
+                debug_assert_eq!(total, rows, "key order count differs from the rows");
+            }
         }
         Ok(total)
+    }
+
+    /// Count the rows of a scan.
+    async fn count_rows(&self, bounds: std::ops::Range<Vec<u8>>) -> Result<i64, slatedb::Error> {
+        let mut scan = self.db.scan(bounds).await?;
+        let mut rows = 0;
+        while scan.next().await?.is_some() {
+            rows += 1;
+        }
+        Ok(rows)
     }
 }

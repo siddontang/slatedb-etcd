@@ -48,10 +48,22 @@ fn expected(model: &Model, r: &RangeRequest, current: i64) -> RangeResponse {
         })
         .collect();
     let count = rows.len() as i64;
+    let filters = r.min_mod_revision != 0
+        || r.max_mod_revision != 0
+        || r.min_create_revision != 0
+        || r.max_create_revision != 0;
+    // Like etcd, a sort target without a sort order and without filters sorts only the first
+    // `limit + 1` keys.
+    let page = r.sort_order == 0 && r.sort_target != 0 && !filters && r.limit > 0;
     let mut kvs: Vec<KeyValue> = if r.count_only {
         vec![]
     } else {
         rows.into_iter()
+            .take(if page {
+                r.limit as usize + 1
+            } else {
+                usize::MAX
+            })
             .filter(|kv| {
                 (r.min_mod_revision == 0 || kv.mod_revision >= r.min_mod_revision)
                     && (r.max_mod_revision == 0 || kv.mod_revision <= r.max_mod_revision)
@@ -212,4 +224,104 @@ async fn ranges_match_the_collected_model() {
         drop(view);
         state.close().await.unwrap();
     }
+}
+
+/// A pinned state whose scans fail after `rows` rows.
+struct FailAfter {
+    state: StateView,
+    rows: usize,
+}
+
+struct FailScan<'a> {
+    scan: <StateView as StateRead>::Scan<'a>,
+    left: usize,
+}
+
+impl StateScan for FailScan<'_> {
+    async fn next(&mut self) -> Result<Option<crate::state::Row>, slatedb::Error> {
+        if self.left == 0 {
+            return Err(slatedb::Error::unavailable("injected scan failure".into()));
+        }
+        self.left -= 1;
+        self.scan.next().await
+    }
+
+    async fn seek(&mut self, key: &[u8]) -> Result<(), slatedb::Error> {
+        self.scan.seek(key).await
+    }
+}
+
+impl StateRead for FailAfter {
+    type Scan<'a> = FailScan<'a>;
+
+    async fn get(&self, key: &[u8]) -> Result<Option<bytes::Bytes>, slatedb::Error> {
+        self.state.get(key).await
+    }
+
+    async fn scan_range(
+        &self,
+        range: std::ops::Range<Vec<u8>>,
+        options: &slatedb::config::ScanOptions,
+    ) -> Result<FailScan<'_>, slatedb::Error> {
+        Ok(FailScan {
+            scan: self.state.scan_range(range, options).await?,
+            left: self.rows,
+        })
+    }
+
+    async fn scan_under(
+        &self,
+        prefix: &[u8],
+        options: &slatedb::config::ScanOptions,
+    ) -> Result<FailScan<'_>, slatedb::Error> {
+        Ok(FailScan {
+            scan: self.state.scan_under(prefix, options).await?,
+            left: self.rows,
+        })
+    }
+}
+
+/// A page whose rows, count, and `more` are known does not read the next row of the interval.
+#[tokio::test]
+async fn complete_pages_stop_before_the_next_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    for index in 1..=3u64 {
+        let put = RequestOp {
+            request: Some(Op::RequestPut(PutRequest {
+                key: format!("k{index}").into_bytes(),
+                value: b"v".to_vec(),
+                ..Default::default()
+            })),
+        };
+        state.apply_etcd(index, &put).await.unwrap().result.unwrap();
+    }
+    let view = state.read_view().unwrap();
+    // A page of one row needs two rows: the second sets `more`. The third read fails.
+    let db = FailAfter {
+        state: view.read_state(),
+        rows: 2,
+    };
+    let page = |sort_target| {
+        range_op(RangeRequest {
+            key: b"k".to_vec(),
+            range_end: b"l".to_vec(),
+            limit: 1,
+            sort_target,
+            ..Default::default()
+        })
+    };
+    for sort_target in [0, 4] {
+        let response = view.read_from(&db, &page(sort_target)).await.unwrap();
+        let Some(Resp::ResponseRange(reply)) = response.response else {
+            panic!("expected range");
+        };
+        assert_eq!(
+            (reply.kvs[0].key.as_slice(), reply.more, reply.count),
+            (b"k1".as_slice(), true, 3),
+            "sort target {sort_target}"
+        );
+    }
+    drop(view);
+    state.close().await.unwrap();
 }

@@ -128,13 +128,18 @@ Current point reads can pass queued scans and keep at least one task.
 Each job has a five-second deadline.
 Shared scans hold at most 3 x (4 MiB + one row) of decoded rows. The exclusive read keeps the old
 single-read bound: its result size, up to the logical data size. The two cases never overlap.
-Every Range keeps at most `limit` rows: key order streams them, and other sort orders keep the
-best `limit` rows in a heap. A sorted Range without a limit keeps every row, as before.
+The response assembly keeps at most `limit` rows: key order streams them, and other sort orders
+keep the best `limit` rows in a heap. A sorted Range without a limit keeps every row, as before.
+As in etcd, a sort target without a sort order or revision filters sorts only the first
+`limit + 1` keys, and the scan stops there.
+Some sources hold more before the assembly: a journal page holds `limit + 1` rows, and a Range
+after a write in the same transaction loads the whole interval into the overlay merge.
 Current scans and history scans decode only the key and revision fields for counts, revision
-filters, and rows past the limit, and decode the value of a kept row alone. `count_only` and
-`keys_only` reads from these scans copy no values, except that `keys_only` keeps values for
-`SORT_VALUE` until the sort ends. Point reads, journal pages, the history fallback for keys with
-many versions, and the overlay of a write transaction still decode whole rows, as before.
+filters, and rows that the limit drops. A value sort decodes the value of each matching row to
+compare it, and keeps only the best `limit`. Other orders decode the value of a kept row alone.
+`count_only` and `keys_only` reads from these scans keep no values, except that `keys_only`
+keeps values for `SORT_VALUE` until the sort ends. Point reads, journal pages, the history
+fallback for keys with many versions, and the write-transaction overlay decode whole rows.
 These bounds limit tasks, retained views, and scan rows, not encoded response bytes, as in etcd.
 At 1,024 committed but unapplied entries, the owner stops admitting new Raft proposals.
 A leader can hold up to 256 client writes before proposal when apply or log I/O falls behind.
@@ -264,8 +269,9 @@ A key with more than 16 versions up to the revision reads its current row instea
 If that row is newer than the revision, one descending scan reads the version.
 The cost is about one row and one seek per key in the interval.
 The scan passes each live row to the same response assembly as current Ranges, so a historical
-Range also keeps at most `limit` rows. It decodes a value only for a kept row, except for a key
-read through its current row or the descending scan, which decodes the whole row.
+Range also keeps at most `limit` rows. It decodes a value only for a kept row or, in a value
+sort, to compare it. A key read through its current row or the descending scan decodes the
+whole row.
 Range scans set `cache_blocks`, so repeated scans read blocks from the state block cache.
 SlateDB scans otherwise bypass that cache and fetch every block from the object store.
 
