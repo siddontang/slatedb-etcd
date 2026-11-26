@@ -30,6 +30,8 @@ new clusters. A stopped replicated S3 cluster can be converted offline. See
     shared/owner.json          the cluster claim: mode, quota, and the initial voters
     shared/bootstrap.json      written once after the first checkpoint
     shared/bootstrap-op.json   the one bootstrap operation: empty, or a snapshot restore
+    shared/restore-input.json  the snapshot digest, row count, and membership of a restore
+    shared/restore-lease.json  the member that writes the rows of a restore
     shared/conversion.json     the plan of an offline conversion
     shared/state/              the one SlateDB: manifest/, compacted/, checkpoints
     member-<id>/binding.json   the member identity and mode. It holds no state.
@@ -141,7 +143,7 @@ host clocks synchronized with NTP.
 | Status `db_size` | Read from the shared manifest. All members report about the same value |
 | HashKV and Hash | Computed from the member's view, as in replicated mode |
 | Native backup | Streams the member's view. See [backups](shared-state.md#backups) |
-| `--restore-snapshot` | Seeds a new shared cluster at index 1 |
+| `--restore-snapshot` | Seeds a new shared cluster at the copied row count plus one |
 | MoveLeader | Requests a checkpoint first, then transfers the lead within 3 s |
 
 Defragment flushes the writer and compacts every SST into one sorted run. The leader then
@@ -158,26 +160,40 @@ repeats it while it waits. The request also survives a leader change before the 
 opens.
 
 To restore a native snapshot, use a new cluster prefix and empty member directories. Start each
-member with `--restore-snapshot <file>` and `--state-mode shared`.
+member with `--restore-snapshot <file>` and `--state-mode shared`. Each member first checks its
+file in one pass. The image has no size limit. Each row has the 64 MiB limit of a backup.
 
 1. Before any writer opens, a member claims the one bootstrap operation,
-   `shared/bootstrap-op.json`, as a restore with the snapshot checksum.
-2. It writes the rows into the shared database at index 1, publishes the first checkpoint, and
-   writes the bootstrap marker with the checksum.
-3. Another member with the same snapshot finds the claim and completes or skips the same steps.
-   This also completes a restore that failed between its first write and the marker.
-4. A member without the restore flag resolves the bootstrap before it selects its base and
-   admits clients. While a restore is pending it waits, up to 60 s, and then fails. If the
-   restore already created its checkpoint, the member completes the marker with the snapshot
-   checksum and opens on that checkpoint. Otherwise an ordinary start claims an empty bootstrap.
-5. A restore into a cluster that an ordinary start or another snapshot created fails. Use a new
-   cluster prefix.
+   `shared/bootstrap-op.json`, as a restore with the snapshot SHA-256 digest.
+2. It then creates `shared/restore-input.json`. The input records the digest, the row count, the
+   membership row, the alarm owner, and the transform rules. Every later attempt uses the input,
+   not its own flags.
+3. One member at a time holds `shared/restore-lease.json` and writes. It writes the rows in 4 MiB
+   batches and flushes every 64 MiB or 10 s. Each batch also stores its last row number and the
+   SHA-256 of the file through that row.
+4. A last batch stores the apply marker at N, the copied row count plus one, with the membership
+   and the logical size. The member then publishes the checkpoint at N and writes the bootstrap
+   marker with the digest.
+5. The owner renews the lease every 10 s, but only after it read file bytes or flushed rows.
+   Another member with the same file takes over a lease that stays unchanged for 60 s. It reads
+   the file through the last stored row, compares the digest, and continues after that row.
+6. A member without the restore flag waits while the lease changes, and fails after 60 s without
+   a change. If the restore already created its checkpoint, the member writes the marker and
+   opens on that checkpoint. Otherwise an ordinary start claims an empty bootstrap.
+7. A restore into a cluster that an ordinary start or another snapshot created fails. A file
+   that differs from the stored rows also fails. Use a new cluster prefix.
 
-A restore that keeps failing logs the error and names the snapshot. Only for that case: check
-that `shared/bootstrap-op.json` names your snapshot, that `shared/bootstrap.json` is missing,
-and that no member process runs. Then delete `shared/` under the cluster prefix and start the
-restore again. Never delete `shared/` of a cluster that has a bootstrap marker: it holds the
-state of all members. A restore into shared mode accepts a backup of at most 64 MiB.
+The restored Raft log starts at N. Endpoint status can show a higher applied index after the
+election. KV responses retain the snapshot's MVCC revision until the next modifying transaction.
+
+A member serves no request until the restore completes. A large file takes minutes to check and
+to write, so give startup probes and service start timeouts that time. A stopped member can start
+the same restore again while its Raft log is empty. It waits up to 60 s for the lease of its
+stopped attempt to go stale.
+
+To abandon a partial restore, stop every member and check that `shared/bootstrap.json` is
+missing. Then delete `shared/` under the cluster prefix and start the restore again. Never delete
+`shared/` of a cluster that has a bootstrap marker: it holds the state of all members.
 
 ## Convert a replicated cluster
 

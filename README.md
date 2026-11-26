@@ -48,8 +48,7 @@ See [etcd maintenance][etcd-maintenance] and [SlateDB etcd administration](docs/
 Both services use one Raft write leader and default to a 2 GiB backend quota.
 Use `--quota-backend-bytes` to change the quota. When sizing SlateDB etcd, allow memory for an index
 that grows with the live key count. Native backup and restore stream the image with bounded memory.
-The image has no size limit, but each row has a 64 MiB limit. In shared state mode, a restore
-accepts an image of at most 64 MiB.
+The image has no size limit, but each row has a 64 MiB limit.
 See [snapshot limits](docs/object-snapshots.md#limits).
 
 [etcd-maintenance]: https://etcd.io/docs/v3.6/op-guide/maintenance/

@@ -144,8 +144,13 @@ count against `--overlay-max-bytes`. So a backup of a full overlay can start.
 A backup above a limit returns ResourceExhausted; retry it later. When base switches leave the
 kept segments above the limit, the oldest backup ends with Unavailable.
 See [backups](shared-state.md#backups).
-A restore into shared mode still reads the whole file in memory, so it accepts at most 64 MiB.
-That limit applies to every file it restores, including one saved from a replicated member.
+A restore into shared mode also checks the file in one pass and writes 4 MiB batches. It writes
+the rows once into the shared database, so it has no `restore-incomplete` file. Another member
+with the same file continues a stopped restore. The restored Raft log starts at N, the copied row
+count plus one. Endpoint status can show a higher applied index after the election. KV responses
+retain the snapshot's MVCC revision until the next modifying transaction. A member serves no
+request until its restore completes, so give startup probes and service start timeouts that time.
+See [the shared restore](shared-state-guide.md#operations).
 
 Downgrade authenticates the administrator and returns Unimplemented.
 The SlateDB format cannot run an older etcd binary. No rolling binary downgrade is claimed.

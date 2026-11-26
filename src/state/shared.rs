@@ -20,6 +20,14 @@ use super::overlay::Overlay;
 use super::view::{Base, SharedView, StateView};
 use super::*;
 
+mod restore;
+#[cfg(test)]
+pub(super) mod tests;
+pub use restore::Restore;
+pub(crate) use restore::{claim_bootstrap, not_restored, BootstrapOp, PROGRESS};
+#[cfg(test)]
+pub(crate) use restore::{seed, Hooks, Stop};
+
 /// The state layout and replication mode of a cluster.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -521,10 +529,10 @@ impl Source {
     }
 
     /// Record that a checkpoint exists. A member never starts from an empty base after this.
-    /// Write the bootstrap marker. A pending restore claim gives its snapshot checksum to the
-    /// marker, so a repair after a stopped restore keeps the identity of that restore.
+    /// A restore claim gives its snapshot digest to the marker, so a publisher of a restored
+    /// cluster writes the marker that the restore wrote.
     pub async fn mark_bootstrapped(&self, checkpoint: uuid::Uuid) -> Result<()> {
-        let restore = match bootstrap_op(self).await? {
+        let restore = match restore::bootstrap_op(self).await? {
             Some(BootstrapOp::Restore { snapshot }) => Some(snapshot),
             _ => None,
         };
@@ -532,7 +540,7 @@ impl Source {
             .await
     }
 
-    /// The checksum of the snapshot that the bootstrap marker records, if a restore wrote it.
+    /// The digest of the snapshot that the bootstrap marker records, if a restore wrote it.
     pub(crate) async fn restored_snapshot(&self) -> Result<Option<String>> {
         let data = self
             .store
@@ -545,7 +553,7 @@ impl Source {
         Ok(marker["restore"].as_str().map(str::to_owned))
     }
 
-    /// Write the bootstrap marker. A restore records its snapshot checksum in it.
+    /// Write the bootstrap marker. A restore records its snapshot digest in it.
     pub(crate) async fn mark_bootstrapped_with(
         &self,
         checkpoint: uuid::Uuid,
@@ -984,7 +992,7 @@ pub(crate) struct Options {
     pub pin_max: Duration,
     /// The budget of released overlay segments that long holders keep. See `overlay::Holders`.
     pub overlay_max_bytes: u64,
-    /// Rows of a native snapshot that seed a new cluster.
+    /// A checked native snapshot that seeds a new cluster.
     pub restore: Option<Restore>,
     /// The checkpoint that the durable Raft snapshot record names, if any.
     pub record: Option<Record>,
@@ -1015,263 +1023,6 @@ impl Record {
             row: view.row,
         }))
     }
-}
-
-/// The rows of a native snapshot that seed a new shared cluster. The shared database gets them
-/// at index 1 and term 1, then the first view checkpoint and the bootstrap marker. Each member
-/// then adopts that checkpoint as its base, as at a restart.
-#[derive(Clone)]
-pub struct Restore {
-    rows: Arc<Vec<(Vec<u8>, Vec<u8>)>>,
-    /// The snapshot checksum. `shared/restore.json` records it before the first write.
-    id: String,
-}
-
-impl Restore {
-    pub(crate) fn new(rows: Vec<(Vec<u8>, Vec<u8>)>, id: String) -> Self {
-        Self {
-            rows: Arc::new(rows),
-            id,
-        }
-    }
-}
-
-impl std::fmt::Debug for Restore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Restore({} rows, {})", self.rows.len(), self.id)
-    }
-}
-
-/// The one bootstrap operation of a shared cluster. Ordinary startup and a snapshot restore
-/// claim it with a create-only put before any writer opens, so only one of them bootstraps.
-const BOOTSTRAP_OP: &str = "shared/bootstrap-op.json";
-
-/// The bootstrap operation of a shared cluster.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum BootstrapOp {
-    /// The first leader starts from an empty state.
-    Empty,
-    /// A member restores the snapshot with this checksum at index 1.
-    Restore { snapshot: String },
-}
-
-async fn bootstrap_op(source: &Source) -> Result<Option<BootstrapOp>> {
-    match source
-        .store
-        .get(&Path::from(join(&source.root, BOOTSTRAP_OP)))
-        .await
-    {
-        Ok(result) => Ok(Some(
-            serde_json::from_slice(&result.bytes().await?)
-                .map_err(|error| super::stored(format!("invalid bootstrap claim: {error}")))?,
-        )),
-        Err(slatedb::object_store::Error::NotFound { .. }) => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// Claim `op` as the bootstrap operation, or return the operation that another member claimed.
-pub(crate) async fn claim_bootstrap(source: &Source, op: &BootstrapOp) -> Result<BootstrapOp> {
-    let path = Path::from(join(&source.root, BOOTSTRAP_OP));
-    match source
-        .store
-        .put_opts(
-            &path,
-            serde_json::to_vec(op)?.into(),
-            PutMode::Create.into(),
-        )
-        .await
-    {
-        Ok(_) | Err(slatedb::object_store::Error::AlreadyExists { .. }) => {}
-        Err(error) => return Err(error.into()),
-    }
-    bootstrap_op(source)
-        .await?
-        .context("the bootstrap claim disappeared")
-}
-
-/// Resolve the bootstrap operation before an ordinary start selects its base and admits clients.
-///
-/// A bootstrapped cluster needs nothing. Otherwise the start claims an empty bootstrap. A pending
-/// restore claim holds the start: once the restore created its checkpoint, the start completes
-/// the marker with the snapshot checksum. Before that the start waits, and then fails, so it
-/// never serves an empty base while a restore claim exists.
-async fn resolve_bootstrap(source: &Source, admin: &slatedb::admin::Admin) -> Result<()> {
-    let deadline = std::time::Instant::now() + RESTORE_WAIT;
-    loop {
-        if source.bootstrapped().await? {
-            return Ok(());
-        }
-        let BootstrapOp::Restore { snapshot } =
-            claim_bootstrap(source, &BootstrapOp::Empty).await?
-        else {
-            return Ok(());
-        };
-        if let Some(base) = newest_base(admin, source).await? {
-            let checkpoint = base
-                .checkpoint
-                .context("the restored base has no checkpoint")?;
-            return source
-                .mark_bootstrapped_with(checkpoint, Some(&snapshot))
-                .await;
-        }
-        ensure!(
-            std::time::Instant::now() < deadline,
-            "the restore of snapshot {snapshot} into this cluster is pending; start a member \
-             with the same --restore-snapshot, or use a new cluster prefix"
-        );
-        tracing::info!(%snapshot, "wait for the pending snapshot restore");
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-}
-
-/// The longest time that an ordinary start waits for a pending restore.
-#[cfg(not(test))]
-const RESTORE_WAIT: Duration = Duration::from_secs(60);
-#[cfg(test)]
-const RESTORE_WAIT: Duration = Duration::from_secs(3);
-
-/// The message for a restore into a cluster that this snapshot did not create.
-const FRESH_PREFIX: &str = "a snapshot restore needs a new cluster prefix and empty member \
-    directories; this shared state is not a restore of this snapshot (see \
-    docs/shared-state-guide.md)";
-
-/// Write the restored rows into a new shared database at index 1, create the first view
-/// checkpoint, and write the bootstrap marker with the snapshot checksum.
-///
-/// The restore claims the bootstrap operation with the checksum before its first write. A later
-/// or concurrent restore of the same snapshot completes the same steps, also after a failure
-/// between the first write and the marker. A restore into a cluster that an ordinary start or
-/// another snapshot created fails. An ordinary start waits while a restore claim is pending.
-pub(crate) async fn seed(
-    source: &Source,
-    admin: &slatedb::admin::Admin,
-    restore: &Restore,
-) -> Result<()> {
-    let ours = BootstrapOp::Restore {
-        snapshot: restore.id.clone(),
-    };
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if source.bootstrapped().await? {
-            ensure!(
-                source.restored_snapshot().await?.as_deref() == Some(restore.id.as_str()),
-                FRESH_PREFIX
-            );
-            return Ok(());
-        }
-        match bootstrap_op(source).await? {
-            Some(op) => ensure!(op == ours, FRESH_PREFIX),
-            // A state without a claim came from an ordinary start of an older binary or an
-            // unknown write.
-            None if admin.read_manifest(None).await?.is_some() => bail!(FRESH_PREFIX),
-            None => ensure!(claim_bootstrap(source, &ours).await? == ours, FRESH_PREFIX),
-        }
-        match write_seed(source, admin, restore).await {
-            Ok(()) => return Ok(()),
-            // Another member can restore the same snapshot at once. Its writer fences this one.
-            Err(error) if std::time::Instant::now() < deadline => {
-                tracing::warn!(%error, "the shared restore failed; try again")
-            }
-            Err(error) => {
-                return Err(error.context(
-                    "the restore of this snapshot did not complete; if no member runs, delete \
-                     shared/ under the cluster prefix and restore again (see \
-                     docs/shared-state-guide.md)",
-                ))
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
-/// Claim the restore and write its rows, then stop before the checkpoint and the marker, as a
-/// failed restore does.
-#[cfg(test)]
-pub(crate) async fn seed_rows_for_test(source: &Source, restore: &Restore) -> Result<()> {
-    let op = BootstrapOp::Restore {
-        snapshot: restore.id.clone(),
-    };
-    ensure!(claim_bootstrap(source, &op).await? == op, FRESH_PREFIX);
-    let db = source.open_writer().await?;
-    let mut batch = slatedb::WriteBatch::new();
-    for (key, value) in restore.rows.iter() {
-        batch.put(key, value);
-    }
-    batch.put(APPLIED_TERM, applied_term_row(1, 1));
-    db.write_with_options(batch, &slatedb::config::WriteOptions { seqnum: 1 })
-        .await?;
-    db.flush().await?;
-    db.close().await?;
-    Ok(())
-}
-
-/// Claim the restore, write its rows, and create its checkpoint, then stop before the marker.
-#[cfg(test)]
-pub(crate) async fn seed_checkpoint_for_test(source: &Source, restore: &Restore) -> Result<()> {
-    seed_rows_for_test(source, restore).await?;
-    let db = source.open_writer().await?;
-    let options = slatedb::config::CheckpointOptions {
-        name: Some(view_name(1)),
-        ..Default::default()
-    };
-    db.create_checkpoint(slatedb::config::CheckpointScope::Durable, &options)
-        .await?;
-    db.close().await?;
-    Ok(())
-}
-
-async fn write_seed(
-    source: &Source,
-    admin: &slatedb::admin::Admin,
-    restore: &Restore,
-) -> Result<()> {
-    let db = source.open_writer().await?;
-    match db.manifest().last_l0_seq() {
-        0 => {
-            let mut batch = slatedb::WriteBatch::new();
-            for (key, value) in restore.rows.iter() {
-                batch.put(key, value);
-            }
-            batch.put(APPLIED_TERM, applied_term_row(1, 1));
-            db.write_with_options(batch, &slatedb::config::WriteOptions { seqnum: 1 })
-                .await?;
-            db.flush().await?;
-        }
-        // An earlier attempt of this restore wrote the rows. The claim names the snapshot.
-        1 => ensure!(
-            decode_applied(db.get(APPLIED).await?)? == 1,
-            "the partial restore is not at index 1"
-        ),
-        last => bail!("the shared state is at sequence {last}, not at a partial restore"),
-    }
-    let existing = view_checkpoints(admin)
-        .await?
-        .into_iter()
-        .find(|(seq, _)| *seq == 1)
-        .map(|(_, checkpoint)| checkpoint.id);
-    let checkpoint = match existing {
-        Some(id) => id,
-        None => {
-            let options = slatedb::config::CheckpointOptions {
-                name: Some(view_name(1)),
-                ..Default::default()
-            };
-            db.create_checkpoint(slatedb::config::CheckpointScope::Durable, &options)
-                .await?
-                .id
-        }
-    };
-    source
-        .mark_bootstrapped_with(checkpoint, Some(&restore.id))
-        .await?;
-    db.close().await?;
-    ensure!(
-        source.restored_snapshot().await?.as_deref() == Some(restore.id.as_str()),
-        FRESH_PREFIX
-    );
-    Ok(())
 }
 
 /// The apply side of shared mode on one member.
@@ -1623,9 +1374,9 @@ impl StateMachine {
         let rows = Arc::new(rows::RowCache::new(cache.row_bytes));
         let admin = Arc::new(slatedb::admin::Admin::builder(state_root.as_str(), store).build());
         match &options.restore {
-            Some(restore) => seed(&source, &admin, restore).await?,
+            Some(restore) => restore::seed(&source, &admin, restore).await?,
             // A joining member finds a bootstrapped cluster. Its Raft log decides its base.
-            None if !options.join => resolve_bootstrap(&source, &admin).await?,
+            None if !options.join => restore::resolve_bootstrap(&source, &admin).await?,
             None => {}
         }
         // A joining member with no log waits for Raft: entries from index 1 or a snapshot.
@@ -1634,7 +1385,7 @@ impl StateMachine {
             Some(base) => {
                 // A stop between the first checkpoint and its marker leaves no marker.
                 if !source.bootstrapped().await? {
-                    source.mark_bootstrapped(base.checkpoint.unwrap()).await?;
+                    restore::mark_base(&source, &base).await?;
                 }
                 base
             }

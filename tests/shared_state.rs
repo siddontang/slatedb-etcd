@@ -461,6 +461,7 @@ async fn local_hash(server: &Server, revision: i64) -> Option<u32> {
     let local = KvClient::new(channel.clone())
         .range(RangeRequest {
             serializable: true,
+            count_only: true,
             ..all()
         })
         .await
@@ -795,8 +796,16 @@ async fn quiet_cluster(dir: &std::path::Path) -> (Vec<ServerConfig>, Vec<Option<
 async fn converge(servers: &[Option<Server>]) {
     let live: Vec<_> = servers.iter().flatten().collect();
     let mut revision = 0;
+    // Count only: a large state does not fit in one response message.
+    let count = RangeRequest {
+        count_only: true,
+        ..all()
+    };
     for server in &live {
-        if let Ok(reply) = KvClient::new(channel(server).await).range(all()).await {
+        if let Ok(reply) = KvClient::new(channel(server).await)
+            .range(count.clone())
+            .await
+        {
             revision = reply.into_inner().header.unwrap().revision;
             break;
         }
@@ -1037,12 +1046,14 @@ async fn defragment_and_manual_checkpoints_in_shared_mode() {
     .await;
 }
 
-/// Every member of a new shared cluster starts with the same native snapshot. One member seeds
-/// the shared database at index 1, the others find its marker, and all serve the rows.
+/// Every member of a new shared cluster starts with the same native snapshot of several write
+/// batches. One member writes the rows into the shared database, and the others wait for its
+/// marker. Every member starts its Raft log at the same restored index and serves the rows at
+/// the snapshot revision. A put then succeeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_new_shared_cluster_restores_a_snapshot() {
     within(async {
-        use slatedb_etcd::proto::etcdserverpb::SnapshotRequest;
+        use slatedb_etcd::proto::etcdserverpb::{SnapshotRequest, StatusRequest};
         let dir = tempfile::tempdir().unwrap();
         let (source, channel_source) = start(config(
             &dir.path().join("source"),
@@ -1050,10 +1061,20 @@ async fn a_new_shared_cluster_restores_a_snapshot() {
             Duration::from_secs(1),
         ))
         .await;
-        KvClient::new(channel_source.clone())
+        let mut kv = KvClient::new(channel_source.clone());
+        // A restore batch holds 4 MiB of rows, so these values need several batches.
+        let large = "v".repeat(1 << 20);
+        for n in 0..10 {
+            kv.put(put(&format!("large/{n}"), &large)).await.unwrap();
+        }
+        let revision = kv
             .put(put("restored", "value"))
             .await
-            .unwrap();
+            .unwrap()
+            .into_inner()
+            .header
+            .unwrap()
+            .revision;
         let mut snapshot = MaintenanceClient::new(channel_source)
             .snapshot(SnapshotRequest {})
             .await
@@ -1086,17 +1107,32 @@ async fn a_new_shared_cluster_restores_a_snapshot() {
                 })
                 .await
                 .is_ok_and(|reply| {
-                    reply.into_inner().kvs.first().map(|kv| kv.value.clone())
-                        == Some(b"value".to_vec())
+                    let reply = reply.into_inner();
+                    reply.kvs.first().map(|kv| kv.value.clone()) == Some(b"value".to_vec())
+                        && reply.header.unwrap().revision == revision
                 })
             })
             .await;
         }
+        // The log starts at the restored index, the copied row count plus one. Eleven puts store
+        // more than 22 rows, so a log that starts at index 1 fails this.
+        let mut indexes = vec![];
+        for server in servers.iter().flatten() {
+            let status = MaintenanceClient::new(channel(server).await)
+                .status(StatusRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            indexes.push(status.raft_applied_index);
+        }
+        assert!(indexes.iter().all(|index| *index > 22), "{indexes:?}");
         let lead = leader(servers[0].as_ref().unwrap()).await;
-        KvClient::new(channel(servers[lead as usize - 1].as_ref().unwrap()).await)
+        let after = KvClient::new(channel(servers[lead as usize - 1].as_ref().unwrap()).await)
             .put(put("after", "restore"))
             .await
-            .unwrap();
+            .unwrap()
+            .into_inner();
+        assert_eq!(after.header.unwrap().revision, revision + 1);
         converge(&servers).await;
         assert!(checkpoints_in(&dir.path().join("shared-objects")).await >= 1);
         for server in servers.into_iter().flatten() {

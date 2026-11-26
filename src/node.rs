@@ -420,6 +420,12 @@ impl Node {
         ensure_no_restore_marker(&options.dir)?;
         let empty_log = storage.last_index()? == 0;
         let empty_raft = empty_log && storage.snapshot_index() == 0;
+        // A shared restore keeps its progress in the shared state. A member can start it again
+        // until its Raft log has an entry.
+        ensure!(
+            options.restore.is_none() || empty_raft,
+            "snapshot restore requires a new, empty data directory"
+        );
         let shared = crate::state::shared::Options {
             quota: options.effective_quota().max(0) as u64,
             voters: options.peers.keys().copied().collect(),

@@ -5,7 +5,7 @@ use super::{backup_error, Stream, MAX_ROW_BYTES};
 use crate::proto::etcdserverpb::{response_op, RangeRequest, RequestOp, ResponseOp};
 use crate::proto::mvccpb::KeyValue;
 use crate::state::overlay::{Holders, MAX_HOLDERS};
-use crate::state::shared_tests::{checkpoint, delete, open_shared, options, put, writer};
+use crate::state::shared::tests::{checkpoint, delete, open_shared, options, put, writer};
 use crate::state::*;
 use futures::StreamExt;
 use slatedb::object_store::memory::InMemory;

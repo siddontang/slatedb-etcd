@@ -93,8 +93,8 @@ advance `meta/applied` alone, so a different index or a missing row means an unk
 next state batch stores the term again. A copied checkpoint with a known term must match the
 Raft snapshot term. At startup, a durable Raft snapshot at the applied index fills an unknown
 term in memory and must match a known term. Logical images and native backups omit the row.
-Install takes the term from the Raft snapshot metadata. A replicated restore starts in term 1 at
-the copied row count plus one, and a shared restore at index 1 in term 1.
+Install takes the term from the Raft snapshot metadata. A restore starts in term 1 at the copied
+row count plus one, in both state modes.
 
 ## Durability and ordering contract
 
