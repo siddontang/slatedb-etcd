@@ -755,6 +755,10 @@ async fn send_prepared(
     Ok(())
 }
 
+/// Keys of the creates that the server read and that wait for the apply barrier.
+#[cfg(test)]
+static WAITING_CREATES: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+
 impl Service {
     /// Wait until this member applied every Put that it already answered. Its batches are
     /// then on the feed.
@@ -834,6 +838,8 @@ impl Service {
                     // Requests observe all batches that the node published before them.
                     match message.request_union {
                         Some(RequestUnion::CreateRequest(request)) => {
+                            #[cfg(test)]
+                            WAITING_CREATES.lock().unwrap().push(request.key.clone());
                             pending = Some((request, Box::pin(self.apply_barrier())));
                         }
                         Some(RequestUnion::CancelRequest(request)) => {
@@ -1619,10 +1625,26 @@ mod tests {
                 .await
                 .unwrap();
         }
-        requests.send(create(request(2, "k", 0))).await.unwrap();
+        requests
+            .send(create(request(2, "full-queue", 0)))
+            .await
+            .unwrap();
+        // The server reads create 2 before the batch, so it already waits for a queue slot.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !WAITING_CREATES
+                .lock()
+                .unwrap()
+                .contains(&b"full-queue".to_vec())
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the server reads create 2");
         member.batches.send(f.put("k", "1").await).unwrap();
         let event = next(&mut output).await;
         assert_eq!((event.watch_id, event.events.len()), (1, 1));
+        drop(held);
         f.close().await;
     }
 
