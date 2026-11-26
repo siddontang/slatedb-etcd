@@ -30,6 +30,7 @@ pub(crate) struct StateMeters {
     pub hash_rev: Histogram,
     pub range_ok: Histogram,
     pub range_error: Histogram,
+    pub too_large_reads: IntCounter,
 }
 
 impl StateMeters {
@@ -129,6 +130,13 @@ impl StateMeters {
             )?,
             range_ok: ranges.with_label_values(&["true"]),
             range_error: ranges.with_label_values(&["false"]),
+            too_large_reads: register(
+                &registry,
+                IntCounter::new(
+                    "etcd_debugging_mvcc_range_too_large_total",
+                    "Reads rejected because their rows exceed --max-response-bytes.",
+                )?,
+            )?,
             registry,
         })
     }

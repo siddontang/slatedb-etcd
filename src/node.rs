@@ -164,6 +164,8 @@ pub struct NodeOptions {
     pub quota_reassert: bool,
     /// Quota usage fraction that raises the early warning. Zero disables the warning.
     pub quota_warning_fraction: f64,
+    /// Encoded row bytes that one client read may return. `None` sets no limit.
+    pub max_response_bytes: Option<usize>,
     /// Automatic compaction retention. `None` disables automatic compaction.
     pub auto_compaction: Option<crate::compactor::Retention>,
     pub strict_reconfiguration: bool,
@@ -486,6 +488,7 @@ impl Node {
             // Replicated apply uses the flag only until a `SetQuota` entry applies. Shared mode
             // takes the quota from the cluster claim.
             state.set_quota_flag(options.effective_quota());
+            state.max_response_bytes = options.max_response_bytes;
             // A shared base can be ahead of the log, or on another term at its index.
             Self::align_log(&mut storage, &state)?;
             // Flushed state proves this prefix was committed, even if its commit marker was lost.

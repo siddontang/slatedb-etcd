@@ -53,6 +53,8 @@ mod lease_index_tests;
 pub(crate) mod maintenance;
 #[cfg(test)]
 mod quota_tests;
+#[cfg(test)]
+mod range_tests;
 
 pub(crate) const APPLIED: &[u8] = b"meta/applied";
 /// The apply position with its Raft term: `(index, term)`, two big-endian `u64` values.
@@ -80,6 +82,9 @@ pub struct StateMachine {
     pub(crate) admin: Arc<slatedb::admin::Admin>,
     /// The quota that apply uses. Zero disables it. See `quota`.
     pub quota: u64,
+    /// Encoded bytes of rows one client read may return. `None` means unbounded, as in etcd.
+    /// Apply never reads it.
+    pub max_response_bytes: Option<usize>,
     /// The effective flag value of this member. Replicated apply uses it without a cluster quota.
     quota_flag: i64,
     /// The quota of the last applied `SetQuota` entry. `None` in shared mode.
@@ -509,6 +514,7 @@ impl StateMachine {
             metrics: Arc::new(crate::metrics::StateMeters::new()?),
             quota: cluster_quota.map_or(0, |quota| quota.bytes.max(0) as u64),
             quota_flag: 0,
+            max_response_bytes: None,
             cluster_quota,
             quota_boundary,
             current: current::CurrentRows::default(),

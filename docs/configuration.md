@@ -90,6 +90,7 @@ For example, use `--watch-progress-notify-interval=200ms` for the upstream clien
 | `--quota-backend-bytes` | 0 | Seeds or changes the cluster quota. Zero selects 2 GiB. |
 | `--quota-reassert` | off | Requests the quota flag again as the newest change. Use it once. |
 | `--quota-warning-fraction` | 0.8 | Quota share that raises the early warning; zero disables it. |
+| `--max-response-bytes` | 0 | Row bytes of one Range or read-only Txn; zero sets no limit. |
 | `--auto-compaction-mode` | periodic | `periodic` keeps a duration; `revision` keeps a count. |
 | `--auto-compaction-retention` | 0 | History to keep. Zero disables automatic compaction. |
 | `--log-cache-bytes` | 8388608 | Cache budget for log entries. |
@@ -98,6 +99,12 @@ For example, use `--watch-progress-notify-interval=200ms` for the upstream clien
 | `--log-term-bytes` | 1048576 | Budget for compressed term metadata. |
 | `--state-block-cache-bytes` | 67108864 | Weight budget for cached SST data blocks. |
 | `--state-meta-cache-bytes` | 67108864 | Budget for cached SST indexes, filters, and stats. |
+
+By default a Range response has no size limit beyond the 2 GiB gRPC message, as in etcd.
+With `--max-response-bytes`, a read whose kept rows exceed the value fails with
+`ResourceExhausted` and `etcdserver: range response is too large` before the member holds the
+whole result. A limit, `count_only`, or `keys_only` shrinks the kept rows. Write transactions
+ignore the cap, so every member applies them the same way.
 
 The read budget must hold one maximum entry. An encoded entry cannot exceed 8 MiB.
 The two state cache budgets add up to 128 MiB by default. Each must be positive.

@@ -1556,6 +1556,7 @@ impl StateMachine {
         next.metrics = self.metrics.clone();
         next.quota = self.quota;
         next.quota_flag = self.quota_flag;
+        next.max_response_bytes = self.max_response_bytes;
         // A base before the seed has no row. The bootstrap membership then stays in memory.
         if next.members_row.is_none() {
             next.members = self.members.clone();

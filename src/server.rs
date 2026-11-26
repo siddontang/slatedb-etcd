@@ -66,6 +66,9 @@ pub struct ServerConfig {
     pub quota_reassert: bool,
     /// Quota usage fraction that raises the early warning. Zero disables the warning.
     pub quota_warning_fraction: f64,
+    /// Encoded row bytes that one Range or read-only Txn response may return. Larger reads fail
+    /// with `ResourceExhausted`. `None` sets no limit, as in etcd.
+    pub max_response_bytes: Option<usize>,
     /// Automatic compaction retention, as etcd's `--auto-compaction-*` flags select it.
     /// `None` disables automatic compaction.
     pub auto_compaction: Option<crate::compactor::Retention>,
@@ -140,6 +143,7 @@ impl ServerConfig {
             quota_bytes: 0,
             quota_reassert: false,
             quota_warning_fraction: DEFAULT_QUOTA_WARNING_FRACTION,
+            max_response_bytes: None,
             auto_compaction: None,
             auth_token: "simple".into(),
             strict_reconfiguration: true,
@@ -359,6 +363,7 @@ impl Server {
                 quota_bytes: config.quota_bytes,
                 quota_reassert: config.quota_reassert,
                 quota_warning_fraction: config.quota_warning_fraction,
+                max_response_bytes: config.max_response_bytes,
                 auto_compaction: config.auto_compaction,
                 strict_reconfiguration: config.strict_reconfiguration,
                 join: config.join,
