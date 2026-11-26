@@ -933,13 +933,11 @@ pub async fn read(
     .await
 }
 
-/// Return true when a Range streams rows in key order: a current interval or any historical
-/// read, with or without revision filters. Such a Range holds at most `limit` rows.
-/// Other sort orders keep the best `limit` rows, or every row without a limit.
+/// Return true when a current Range streams rows in key order from one scan, and so can run in
+/// a shared scan slot. Every Range keeps at most `limit` rows. Historical pages stay out of the
+/// shared slots: a Kubernetes page of large objects passes the row budget and would run twice.
 pub(crate) fn streams_range(r: &RangeRequest) -> bool {
-    (!r.range_end.is_empty() || r.revision > 0)
-        && r.sort_target == 0
-        && matches!(r.sort_order, 0 | 1)
+    !r.range_end.is_empty() && r.revision <= 0 && key_ordered(r)
 }
 
 /// Return true when a Range returns all rows of its interval in key order.

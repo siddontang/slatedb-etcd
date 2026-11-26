@@ -119,11 +119,10 @@ KV reads use separate bounded tasks. Diagnostic queries still receive service be
 
 The owner queues at most 64 state queries, 64 KV reads, and 64 checkpoint requests.
 At most four KV read jobs run. Each point-read job contains at most 16 requests.
-Up to three streaming scans run together. A streaming scan is a Range in key order, current or
-historical, with or without revision filters.
-It decodes at most `limit` rows and stops the scan at a 4 MiB row budget.
+Up to three streaming scans run together. A streaming scan is a current Range in key order
+without revision filters. It decodes at most `limit` rows and stops the scan at a 4 MiB row budget.
 A scan over budget runs again alone on the same pinned view and with the same deadline.
-Other sort orders and read-only transactions also run alone.
+Historical reads, sorted or filtered Ranges, and read-only transactions also run alone.
 While one of these reads runs or waits, no new scan starts. Wide reads start in queue order.
 Current point reads can pass queued scans and keep at least one task.
 Each job has a five-second deadline.

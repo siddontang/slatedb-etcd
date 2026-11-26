@@ -232,15 +232,13 @@ async fn waiting_scans_do_not_block_current_point_reads() {
         .await
         .unwrap();
     let mut replies = vec![];
-    // Two descending Ranges need the exclusive slot. The point read passes the second one.
-    for wide in [true, true, false] {
+    for revision in [1, 1, 0] {
         let (tx, rx) = oneshot::channel();
         node.enqueue_query(Query::Read(
             RequestOp {
                 request: Some(Op::RequestRange(RangeRequest {
                     key: b"key".to_vec(),
-                    range_end: if wide { b"kez".to_vec() } else { vec![] },
-                    sort_order: if wide { 2 } else { 0 },
+                    revision,
                     serializable: true,
                     ..Default::default()
                 })),
