@@ -714,6 +714,19 @@ impl Stream {
         true
     }
 
+    /// Remove the waiting create at `at`. Two progress requests that it kept apart fold into
+    /// one, as in `hold_progress`, so the queue keeps its bound.
+    fn unqueue(&mut self, at: usize) -> bool {
+        if self.waiting.remove(at).is_none() {
+            return false;
+        }
+        let progress = |waiting: Option<&Waiting>| matches!(waiting, Some(Waiting::Progress));
+        if at > 0 && progress(self.waiting.get(at - 1)) && progress(self.waiting.get(at)) {
+            self.waiting.remove(at);
+        }
+        true
+    }
+
     /// The next waiting request, once no progress reply waits.
     fn next_waiting(&mut self) -> Option<Waiting> {
         match self.progress {
@@ -832,7 +845,7 @@ impl Stream {
                     matches!(waiting, Waiting::Create(create)
                         if create.reason.is_empty() && create.request.watch_id == id)
                 });
-                queued.and_then(|at| self.waiting.remove(at)).is_some()
+                queued.is_some_and(|at| self.unqueue(at))
             }
         };
         if canceled {
@@ -2020,6 +2033,26 @@ mod tests {
         let responses = f.responses();
         assert!(responses.iter().all(|r| !r.created), "{responses:?}");
         assert!(!f.stream.watchers.contains_key(&7));
+        f.close().await;
+    }
+
+    /// A Cancel of a waiting create between two waiting progress requests folds them into one.
+    /// So the queue holds at most one progress request more than its creates.
+    #[tokio::test]
+    async fn a_cancel_between_two_waiting_progress_requests_folds_them() {
+        let mut f = Fixture::new().await;
+        f.watch(request(1, "k", 0)).await;
+        f.put("k", "2").await;
+        f.stream.request_progress().unwrap();
+        f.stream.request_progress().unwrap();
+        f.stream.request_create(request(7, "k", 0)).await.unwrap();
+        f.stream.request_progress().unwrap();
+        assert_eq!(f.stream.waiting.len(), 3);
+        f.stream.cancel(7).await.unwrap();
+        assert!(matches!(
+            f.stream.waiting.iter().collect::<Vec<_>>()[..],
+            [Waiting::Progress]
+        ));
         f.close().await;
     }
 

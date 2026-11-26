@@ -765,7 +765,10 @@ progress request thus takes its revision after each earlier create reply. A crea
 decision when it comes: an empty range, an ID that a live or waiting watch holds, or the watch
 limit fails it. That decision stays, also when a later Cancel ends the watch with its ID. A
 Cancel takes effect and gets its reply at once, and it can end a waiting create with its own ID.
-Progress requests next to each other in the queue fold into one. At most 64 creates wait. One
+That create then gets only the Canceled reply. etcd sends Created first, so a client that picks
+its own watch IDs must not wait for Created after it cancels a create. The Go client lets the
+server pick IDs. A Cancel that ends a waiting create also folds the progress requests on its two
+sides. Progress requests next to each other in the queue fold into one. At most 64 creates wait. One
 more ends the stream with `Unavailable`, and the client resumes its watches on a new stream.
 
 ### Writer faults

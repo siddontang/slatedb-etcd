@@ -113,6 +113,9 @@ backups. Restore such a backup with the newer binary. Older restores reject the 
 Use `--restore-snapshot` for native backups; `etcdutl` cannot restore them.
 Save a backup with `etcdctl snapshot save` or the
 [native export tool](docs/operations.md#backups-and-restoration).
+A Watch create that comes while a progress reply waits waits behind it. A Cancel of such a create
+returns only Canceled, where etcd returns Created and then Canceled. This matters only to
+clients that pick their own watch IDs. See [Shared state](docs/shared-state.md).
 Downgrade returns Unimplemented after administrator authorization.
 Automatic certificate generation and certificate reload remain unsupported.
 HashKV requires revision records from database creation; older databases return a format error.
