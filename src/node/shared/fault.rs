@@ -918,3 +918,7 @@ mod tests;
 #[cfg(test)]
 #[path = "hold_handoff_tests.rs"]
 mod hold_tests;
+
+#[cfg(test)]
+#[path = "clock_handoff_tests.rs"]
+mod clock_tests;

@@ -1038,7 +1038,7 @@ fn shared_config(dir: &std::path::Path, faults: &Arc<FaultStore>) -> ServerConfi
     config
 }
 
-async fn channel(server: &Server) -> tonic::transport::Channel {
+pub(super) async fn channel(server: &Server) -> tonic::transport::Channel {
     tonic::transport::Endpoint::from_shared(server.client_url())
         .unwrap()
         .connect()
@@ -1078,7 +1078,7 @@ async fn keys(server: &Server, serializable: bool) -> Vec<(String, String)> {
         .collect()
 }
 
-fn health(status: &Value) -> &Value {
+pub(super) fn health(status: &Value) -> &Value {
     &status["shared_state"]["writer"]["health"]
 }
 
@@ -1196,16 +1196,20 @@ async fn the_overlay_limits_hold_while_the_writer_fails() {
     server.shutdown().await.unwrap();
 }
 
-/// Three shared voters, each behind its own fault store over one object store.
-struct Cluster {
+/// Three shared voters, each behind its own fault store over one object store. Each member's
+/// wall clock is the real clock plus its offset in `clocks`.
+pub(super) struct Cluster {
     servers: Vec<Server>,
     faults: Vec<Arc<FaultStore>>,
+    pub(super) store: Arc<dyn ObjectStore>,
+    clocks: Arc<[std::sync::atomic::AtomicI64; 4]>,
     _dir: tempfile::TempDir,
 }
 
 impl Cluster {
-    async fn start(tweak: impl Fn(&mut ServerConfig)) -> Self {
+    pub(super) async fn start(tweak: impl Fn(&mut ServerConfig)) -> Self {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let clocks: Arc<[std::sync::atomic::AtomicI64; 4]> = Arc::default();
         let dir = tempfile::tempdir().unwrap();
         let peers: std::collections::BTreeMap<u64, String> =
             (1..=3).map(|id| (id, crate::server::test_port())).collect();
@@ -1220,6 +1224,10 @@ impl Cluster {
             config.client_peers = peers.clone();
             config.view_max_age = Duration::from_millis(200);
             config.strict_reconfiguration = false;
+            let (clocks, real) = (clocks.clone(), Clock::system(Duration::ZERO, None).now_ms);
+            config.now_ms = Some(Arc::new(move || {
+                real() + clocks[id as usize].load(std::sync::atomic::Ordering::SeqCst)
+            }));
             tweak(&mut config);
             servers.push(Server::start(config).await.unwrap());
             faults.push(store);
@@ -1230,6 +1238,8 @@ impl Cluster {
         let cluster = Self {
             servers,
             faults,
+            store,
+            clocks,
             _dir: dir,
         };
         let leader = cluster.leader().await;
@@ -1241,7 +1251,12 @@ impl Cluster {
         cluster
     }
 
-    fn member(&self, id: u64) -> &Server {
+    /// Set the wall clock of member `id` to the real clock plus `offset_ms`.
+    pub(super) fn skew(&self, id: u64, offset_ms: i64) {
+        self.clocks[id as usize].store(offset_ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(super) fn member(&self, id: u64) -> &Server {
         &self.servers[id as usize - 1]
     }
 
@@ -1250,7 +1265,7 @@ impl Cluster {
     }
 
     /// The member that leads, as it reports itself.
-    async fn leading(&self) -> Option<u64> {
+    pub(super) async fn leading(&self) -> Option<u64> {
         for (n, server) in self.servers.iter().enumerate() {
             if status(server).await["role"] == "Leader" {
                 return Some(n as u64 + 1);
@@ -1259,7 +1274,7 @@ impl Cluster {
         None
     }
 
-    async fn leader(&self) -> u64 {
+    pub(super) async fn leader(&self) -> u64 {
         let mut leader = None;
         eventually("a leader", async || {
             leader = self.leading().await;
@@ -1270,7 +1285,7 @@ impl Cluster {
     }
 
     /// Record the leaders for `time`, and return them in order without repeats in a row.
-    async fn leaders(&self, time: Duration) -> Vec<u64> {
+    pub(super) async fn leaders(&self, time: Duration) -> Vec<u64> {
         let mut leaders: Vec<u64> = vec![];
         let started = Instant::now();
         while started.elapsed() < time {
@@ -1285,19 +1300,19 @@ impl Cluster {
     }
 
     /// Every member answers `/status` and a serializable read.
-    async fn all_up(&self) {
+    pub(super) async fn all_up(&self) {
         for server in &self.servers {
             keys(server, true).await;
         }
     }
 
-    async fn put(&self, key: &str) -> Result<(), tonic::Status> {
+    pub(super) async fn put(&self, key: &str) -> Result<(), tonic::Status> {
         let leader = self.leader().await;
         let mut kv = KvClient::new(channel(self.member(leader)).await);
         kv.put(put(key, "v")).await.map(|_| ())
     }
 
-    async fn shutdown(self) {
+    pub(super) async fn shutdown(self) {
         for server in self.servers {
             server.shutdown().await.unwrap();
         }
@@ -1305,7 +1320,11 @@ impl Cluster {
 }
 
 /// Wait up to `time` for `check`. Writer backoffs can exceed the 30 s of `eventually`.
-async fn until(what: &str, time: Duration, mut check: impl std::ops::AsyncFnMut() -> bool) {
+pub(super) async fn until(
+    what: &str,
+    time: Duration,
+    mut check: impl std::ops::AsyncFnMut() -> bool,
+) {
     let started = Instant::now();
     while !check().await {
         assert!(started.elapsed() < time, "timed out waiting for {what}");
@@ -1314,7 +1333,7 @@ async fn until(what: &str, time: Duration, mut check: impl std::ops::AsyncFnMut(
 }
 
 /// Wait until member `id` publishes as the leader and its writer has no mark.
-async fn publishes(cluster: &Cluster, id: u64) {
+pub(super) async fn publishes(cluster: &Cluster, id: u64) {
     until("a publication", Duration::from_secs(60), async || {
         let status = status(cluster.member(id)).await;
         status["shared_state"]["writer"]["announced"].as_u64() > Some(0)
