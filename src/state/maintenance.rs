@@ -209,7 +209,8 @@ impl StateMachine {
             let mut scan = hash_rows(self.applied_state(), revision).await?;
             while let Some(row) = scan.next().await.map_err(KvError::storage)? {
                 let user_key = hash_record_key(&row.value).map_err(KvError::storage)?;
-                if pending && hash_main(&row.key)? <= compact {
+                let main = hash_main(&row.key)?;
+                if pending && main <= compact {
                     survivors.insert(user_key.clone(), row.key.clone());
                 }
                 if row.key.len() == HASH.len() + 18 {
@@ -246,8 +247,9 @@ impl StateMachine {
         let mut empty_hash = Some(hash).filter(|_| self.compact_revision >= 0);
         let mut rows = hash_rows(self.applied_state(), revision).await?;
         while let Some(row) = rows.next().await.map_err(KvError::storage)? {
+            // A short record key is corrupt data. It fails this request and keeps the member.
+            let main = hash_main(&row.key)?;
             let key = &row.key[HASH.len()..];
-            let main = i64::from_be_bytes(key[..8].try_into().map_err(KvError::storage)?);
             let tombstone = key.len() == 18;
             if !exists(&row.key, main) || (main == self.compact_revision && tombstone) {
                 continue;
@@ -402,10 +404,18 @@ pub(crate) fn hash_append(crc: u32, record: &[u8]) -> Result<(u32, u64)> {
 }
 
 fn hash_main(key: &[u8]) -> std::result::Result<i64, KvError> {
-    key.get(HASH.len()..HASH.len() + 8)
-        .and_then(|main| main.try_into().ok())
-        .map(i64::from_be_bytes)
-        .ok_or_else(|| KvError::storage("invalid hash key"))
+    // The whole key must have the form of `hash_key`: the main revision, `_`, the
+    // subrevision, and an optional tombstone mark.
+    let record = key.get(HASH.len()..).unwrap_or_default();
+    let valid = match record.len() {
+        17 => true,
+        18 => record[17] == b't',
+        _ => false,
+    } && record[8] == b'_';
+    match record.get(..8) {
+        Some(main) if valid => Ok(i64::from_be_bytes(main.try_into().expect("eight bytes"))),
+        _ => Err(KvError::corrupt("invalid hash key")),
+    }
 }
 
 /// Scan the hash records through `revision`.

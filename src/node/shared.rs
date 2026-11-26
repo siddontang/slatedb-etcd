@@ -242,6 +242,8 @@ pub(super) struct Writer {
     pub switch_due: bool,
     /// Apply waits while the overlay is over the hard limit.
     pub paused: bool,
+    /// The last opened base that an adoption dropped. See `rejected`.
+    rejected: rejected::Rejected,
     /// A paused member polls the checkpoint list. Only one poll runs at a time.
     polling: Arc<std::sync::atomic::AtomicBool>,
     ticks: u64,
@@ -405,6 +407,7 @@ impl Writer {
             opened_slot: handles.opened.clone(),
             switch_due: false,
             paused: false,
+            rejected: Default::default(),
             polling: Arc::default(),
             ticks: 0,
         }
@@ -533,6 +536,7 @@ impl Writer {
             "announced": self.announced,
             "running": self.running(),
             "paused": self.paused,
+            "rejected_base": self.rejected.status(),
             "clock_skew_ms": self.clock.skew.load(std::sync::atomic::Ordering::Relaxed),
             "clock_alarm": self.clock.alarm.load(std::sync::atomic::Ordering::Relaxed),
             "reopens": self.reopens.load(std::sync::atomic::Ordering::Relaxed),
@@ -1625,7 +1629,7 @@ impl Node {
         let health = self
             .writer
             .as_ref()
-            .map(|writer| writer.health.report(term));
+            .map(|writer| writer.health.report(term, self.apply_held_at));
         let body = json!({"member": self.options.id, "checkpoints": pinned, "publish": publish,
             "coverage": crate::peer::process_id(), "writer": health});
         let client = self.options.transport.http.clone();
@@ -1707,6 +1711,8 @@ impl Node {
             writer.paused = true;
         } else if bytes < limit {
             writer.paused = false;
+            // A dropped base explains a pause only. Any way out of the pause ends its report.
+            writer.rejected.clear();
         }
         writer.paused
     }
@@ -1982,6 +1988,7 @@ impl Node {
 mod defragment;
 mod demand;
 mod fault;
+mod rejected;
 use defragment::Defragment;
 #[cfg(test)]
 use defragment::DefragmentStep;

@@ -286,7 +286,9 @@ async fn indexed_transactions_match_storage_evaluation() {
                 let rows = |batch: WriteBatch| batch.into_rows().collect::<Vec<_>>();
                 assert_eq!(rows(expected.1), rows(actual.1), "{request:?}");
             }
-            (Err(expected), Err(actual)) => assert_eq!(expected.message, actual.message),
+            (Err(mvcc::ApplyError::Request(expected)), Err(mvcc::ApplyError::Request(actual))) => {
+                assert_eq!(expected.message, actual.message)
+            }
             (expected, actual) => panic!("{request:?}: {} != {}", expected.is_ok(), actual.is_ok()),
         }
     }

@@ -54,13 +54,14 @@ fn the_backoff_doubles_to_its_cap_and_a_publication_ends_the_mark() {
     task.opened();
     assert!(!health.handoff_due());
     assert_eq!(health.consecutive(), 7);
-    assert!(health.report(3).failed_secs.is_some());
+    assert!(health.report(3, None).failed_secs.is_some());
     task.published();
     assert_eq!(
-        health.report(3),
+        health.report(3, None),
         WriterReport {
             failed_secs: None,
-            term: 3
+            term: 3,
+            apply_held_at: None,
         }
     );
     assert_eq!(health.consecutive(), 0);
@@ -103,7 +104,7 @@ fn the_watchdog_counts_only_due_storage_work() {
     assert!(health.check(Some(overdue)));
     assert!(!health.check(Some(overdue)));
     assert!(health.handoff_due());
-    assert!(health.report(1).failed_secs.is_some());
+    assert!(health.report(1, None).failed_secs.is_some());
     assert_eq!(health.total(), 1);
     task.done();
     assert!(!health.handoff_due());
@@ -125,7 +126,7 @@ fn each_durable_step_restarts_the_watchdog() {
     let stepped = health.record().due.unwrap();
     health.record().due = Some(stepped - Duration::from_secs(11));
     assert!(!health.check(None));
-    assert!(health.report(1).failed_secs.is_none());
+    assert!(health.report(1, None).failed_secs.is_none());
     // The next step hangs past the limit.
     health.record().due = ago(31);
     assert!(health.check(None));
@@ -223,6 +224,7 @@ fn received(process: u64, at: Instant, failed_secs: Option<u64>) -> Received {
         report: WriterReport {
             failed_secs,
             term: 7,
+            apply_held_at: None,
         },
     }
 }
@@ -238,6 +240,7 @@ fn tick<'a>(candidates: &'a [Candidate], published: Option<Instant>) -> Tick<'a>
         incident: None,
         term: 7,
         moves: &[],
+        held: false,
     }
 }
 
@@ -854,7 +857,7 @@ async fn an_idle_writer_that_slatedb_closes_opens_again() {
     leader.covered(index, Duration::from_secs(20)).await;
     let open = leader.writer().open.lock().unwrap().clone().unwrap();
     assert!(!Arc::ptr_eq(&open, &failed));
-    assert!(health.report(2).failed_secs.is_none());
+    assert!(health.report(2, None).failed_secs.is_none());
     leader.close().await;
 }
 
@@ -891,7 +894,7 @@ async fn a_buffered_write_under_a_long_age_limit_is_not_due() {
     assert!(deadline > Instant::now() + STALL);
     assert!(!writer.health.check(Some(deadline)));
     assert!(!writer.health.handoff_due());
-    assert!(writer.health.report(2).failed_secs.is_none());
+    assert!(writer.health.report(2, None).failed_secs.is_none());
     leader.close().await;
 }
 

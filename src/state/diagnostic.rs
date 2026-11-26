@@ -24,14 +24,11 @@ impl StateMachine {
                         values.push(None);
                     }
                     Operation::Get { key } => {
-                        let value = if let Some(value) = overlay.get(key) {
-                            value.clone()
-                        } else {
-                            self.applied_state()
-                                .get(&data_key(key))
-                                .await?
-                                .map(|v| String::from_utf8(v.to_vec()))
-                                .transpose()?
+                        // The reads come before any state change, so a storage error of a
+                        // read leaves the entry unapplied.
+                        let value = match overlay.get(key) {
+                            Some(value) => value.clone(),
+                            None => self.read_value(key).await?,
                         };
                         values.push(value);
                     }
@@ -46,10 +43,25 @@ impl StateMachine {
     }
 
     pub async fn local_value(&self, key: &str) -> Result<Option<String>> {
-        self.applied_state()
+        self.read_value(key).await
+    }
+
+    /// Read the diagnostic value of `key`. A storage error keeps its class, and a value that
+    /// is not UTF-8 is corrupt stored data.
+    async fn read_value(&self, key: &str) -> Result<Option<String>> {
+        let value = self
+            .applied_state()
             .get(&data_key(key))
-            .await?
-            .map(|value| String::from_utf8(value.to_vec()).map_err(Into::into))
+            .await
+            .map_err(crate::mvcc::storage_fault::read)?;
+        value
+            .map(|value| {
+                String::from_utf8(value.to_vec()).map_err(|error| {
+                    crate::mvcc::storage_fault::stored(format!(
+                        "the diagnostic value of {key:?} is not UTF-8: {error}"
+                    ))
+                })
+            })
             .transpose()
     }
 }

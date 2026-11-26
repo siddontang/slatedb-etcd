@@ -119,11 +119,11 @@ type Journals = Vec<(i64, Journal)>;
 /// `row` is the history version of `kv.key` at `kv.mod_revision`. It must be a live version of the
 /// same key and revision.
 fn stored_value(kv: &KeyValue, row: Option<bytes::Bytes>) -> Result<KeyValue, KvError> {
-    let row = row.ok_or_else(|| KvError::storage("Watch value has no history version"))?;
+    let row = row.ok_or_else(|| KvError::corrupt("Watch value has no history version"))?;
     let version = crate::proto::state::Version::decode(row).map_err(KvError::storage)?;
     match version.value {
         Some(value) if value.key == kv.key && value.mod_revision == kv.mod_revision => Ok(value),
-        _ => Err(KvError::storage(
+        _ => Err(KvError::corrupt(
             "Watch value does not match its history version",
         )),
     }
@@ -142,7 +142,7 @@ fn is_put(event: &Event) -> bool {
 fn decode(value: bytes::Bytes) -> Result<Journal, KvError> {
     let journal = Journal::decode(value).map_err(KvError::storage)?;
     if !journal.prev_revisions.is_empty() && journal.prev_revisions.len() != journal.events.len() {
-        return Err(KvError::storage("invalid Watch journal"));
+        return Err(KvError::corrupt("invalid Watch journal"));
     }
     Ok(journal)
 }
@@ -356,9 +356,13 @@ pub(crate) async fn scan(
         let row = match scan.next().await {
             Ok(Some(row)) => row,
             Ok(None) => break,
-            // A page that held its view too long keeps the revisions that it read, so a retry
-            // on a new view makes progress.
-            Err(error) if !rows.is_empty() && crate::state::view::expired(&error.to_string()) => {
+            // A page that held its view too long, or that the store failed, keeps the revisions
+            // that it read. So a retry on a new view makes progress.
+            Err(error)
+                if !rows.is_empty()
+                    && crate::mvcc::storage_fault::of_slatedb(&error)
+                        != crate::mvcc::storage_fault::StorageFault::Corrupt =>
+            {
                 let covered = rows.last().map(|(revision, _)| *revision).unwrap();
                 return Ok((rows, covered));
             }

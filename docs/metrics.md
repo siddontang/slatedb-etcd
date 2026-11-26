@@ -152,6 +152,16 @@ process, so embedded members of one process share them.
 | `slatedb_etcd_row_read_duration_seconds` | Storage reads of rows that the row cache missed |
 | `slatedb_etcd_shared_point_reads_total` | Shared-mode point reads by `source`: `overlay`, `base` |
 | `slatedb_etcd_local_store_calls_in_flight` | Local object store calls that hold a call slot |
+| `slatedb_etcd_read_corrupt_total` | Reads that met stored data that does not decode |
+
+Each member also exports these apply gauges, in both state modes.
+
+| Gauge | Meaning |
+| --- | --- |
+| `slatedb_etcd_apply_held` | 1 while apply holds on an entry that met corrupt stored data |
+| `slatedb_etcd_apply_held_entries` | Log entries above the entry that apply holds on |
+
+The member sets them on each Raft tick. `/status` reports the held entry in `apply_paused`.
 
 The `kind` label is `data`, `index`, `filter`, or `stats`. Each data, index, or filter miss is
 one object store read. A low data hit ratio with a slow row read time means cold SST blocks.

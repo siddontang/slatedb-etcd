@@ -66,6 +66,10 @@ pub(crate) struct Member {
     pub failed_proposals: IntCounter,
     pub failed_read_indexes: IntCounter,
     pub refused_peer_stores: IntCounter,
+    /// 1 while apply holds on corrupt stored data.
+    pub apply_held: IntGauge,
+    /// Log entries above the entry that apply holds on.
+    pub apply_held_entries: IntGauge,
 }
 
 /// Raft and applied state from one turn of the member's event loop.
@@ -140,6 +144,20 @@ impl Member {
             refused_peer_stores: counter(
                 "slatedb_etcd_peer_store_refusals_total",
                 "Peer requests refused because they name another shared store or none.",
+            )?,
+            apply_held: state::register(
+                &registry,
+                IntGauge::new(
+                    "slatedb_etcd_apply_held",
+                    "1 while apply holds on an entry that met corrupt stored data.",
+                )?,
+            )?,
+            apply_held_entries: state::register(
+                &registry,
+                IntGauge::new(
+                    "slatedb_etcd_apply_held_entries",
+                    "Log entries above the entry that apply holds on.",
+                )?,
             )?,
             registry,
             admin: std::sync::RwLock::new(admin),

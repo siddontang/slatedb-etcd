@@ -145,6 +145,9 @@ Term runs support synchronous Raft term lookup without retaining every payload.
 The apply task shares the process runtime; this change does not isolate CPU or disk resources.
 
 Status reports `apply_lag`, `apply_busy`, `apply_target`, and `queued_state_reads`.
+`apply_paused` names the entry that apply waits on after a storage error, with `held`, `reason`,
+`paused_ms`, and `log_alarm`. It is `null` while apply runs. `apply_held_at` keeps the held entry
+until apply passes it, also after a snapshot ended the held job.
 `POST /debug/apply-delay` accepts `{"delay_ms":2500}` to delay entry apply and snapshot
 installation.
 This loopback test hook has a five-second limit. Set the delay to zero to restore normal operation.

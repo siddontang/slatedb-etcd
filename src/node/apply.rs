@@ -2,6 +2,10 @@ use super::*;
 use crate::mvcc::Outcome;
 use raft::eraftpb::Snapshot;
 
+#[path = "shared/apply_retry.rs"]
+mod retry;
+pub(super) use retry::{Adoption, Control, Paused, RejectedBase, Waited};
+
 pub(super) const BATCH_ENTRIES: u64 = 32;
 /// Committed-entry jobs that may wait in the apply queue behind the running job.
 pub(super) const PIPELINE_DEPTH: usize = 4;
@@ -239,6 +243,8 @@ pub(super) enum Output {
     /// Shared mode adopted a checkpoint in process. Raft takes its ConfState, because the
     /// skipped entries can hold membership changes.
     Adopted(raft::eraftpb::ConfState),
+    /// Shared mode dropped an opened base that does not load, and it kept its own base.
+    RejectedBase(RejectedBase),
     Reads(Vec<Output>),
     SharedLinear(Vec<u64>, std::sync::Arc<Outcome>),
     Linear {
@@ -251,10 +257,13 @@ pub(super) enum Output {
     },
     Entries(Vec<AppliedCommand>),
     PreparedPuts(crate::state::put_batch::PreparedPuts, Vec<AppliedCommand>),
+    /// A storage error ended a PreparePuts job through this index. Its entries apply on the
+    /// committed path.
+    Unprepared(u64),
     Snapshot(Rebound),
     Query {
         response: Response,
-        value: Value,
+        value: std::result::Result<Value, ApiError>,
         require_leader: bool,
     },
     /// A test worker returns its checkpoint result inline to keep schedules deterministic.
@@ -278,6 +287,9 @@ pub(super) struct Completion {
     pub applied: u64,
     pub state: Option<AppliedState>,
     pub output: Output,
+    /// The job ended below its target: a covering snapshot ended it before its last entry, or an
+    /// adoption dropped its base. `applied` is the end of the applied prefix.
+    pub early: bool,
 }
 
 struct Executor {
@@ -287,6 +299,16 @@ struct Executor {
     inline_checkpoints: bool,
     /// Shared mode: the durable log that a rebase replays.
     log: Option<crate::storage::LogReader>,
+    /// The stop and preemption of a job that waits on a storage error, and its pause report.
+    signals: retry::Signals,
+    /// The applied index that this worker last reported, while the state is below it: the end
+    /// of the prefix of a job whose rebase replay failed. Only the install of a covering
+    /// snapshot ends it. See `recovering_job`.
+    reported: Option<u64>,
+    /// Runs once after a rebase adopted its base and before it replays, for tests. Its error
+    /// fails the replay.
+    #[cfg(test)]
+    before_replay: Option<Box<dyn FnOnce() -> Result<()> + Send>>,
 }
 
 impl Drop for Executor {
@@ -298,41 +320,25 @@ impl Drop for Executor {
 }
 
 impl Executor {
-    /// Run one job. In shared mode a missing checkpoint object rebases the state to the position
-    /// before the job, and the whole job runs again. Each entry then completes exactly once.
+    /// Run one job. See `apply_retrying` for a storage error of a read.
     async fn execute(&mut self, work: Work) -> Result<Completion> {
-        let start = self.state.applied;
-        let retry = match (&work.job, &self.log) {
-            (Job::Entries(entries), Some(_)) => Some((entries.clone(), work.header)),
-            _ => None,
-        };
         // Box the inner jobs. Their futures are large, and DST runs them on a test stack.
-        let result = Box::pin(self.execute_once(work)).await;
-        let Some((entries, header)) = retry else {
-            return result;
-        };
-        match result {
-            Err(error) if crate::state::shared::missing_object(&error) => {
-                tracing::warn!(%error, "an apply read lost its checkpoint object");
-                Box::pin(self.rebase(header, start)).await?;
-                Box::pin(self.execute_once(Work {
-                    job: Job::Entries(entries),
-                    header,
-                    delay: Duration::ZERO,
-                }))
-                .await
-            }
-            result => result,
-        }
+        Box::pin(self.execute_once(work)).await
     }
 
     /// Rebuild the state from the newest checkpoint at or below `applied`, and replay the local
     /// log to `applied`. No view is published until the replay ends, so reads see no older
     /// state. Earlier jobs already sent the replies of the replayed entries, and Raft already
-    /// applied their membership changes.
+    /// applied their membership changes. A replay that fails leaves the state below `applied`.
+    /// If a snapshot then ends the job, the executor recovers until the snapshot installs. See
+    /// `recovering_job`.
     async fn rebase(&mut self, header: Header, applied: u64) -> Result<()> {
         let log = self.log.clone().context("rebase needs the log")?;
         self.state.rebase(applied, |index| log.term(index)).await?;
+        #[cfg(test)]
+        if let Some(hook) = self.before_replay.take() {
+            hook()?;
+        }
         while self.state.applied < applied {
             let low = self.state.applied + 1;
             let entries = log.entries(low, (low + BATCH_ENTRIES).min(applied + 1))?;
@@ -350,6 +356,9 @@ impl Executor {
             }
             _ => {}
         }
+        if self.reported.is_some() && !matches!(work.job, Job::Snapshot(_)) {
+            return self.recovering_job(work.job);
+        }
         let changes_state = matches!(
             work.job,
             Job::Entries(_)
@@ -361,6 +370,7 @@ impl Executor {
         );
         let copy_state = changes_state || matches!(work.job, Job::Query(Query::Maintenance(..)));
         let previous_revision = self.state.revision;
+        let mut early = false;
         // A checkpoint that opened in the background becomes the base of the next view.
         if changes_state {
             self.state.switch_base();
@@ -371,13 +381,28 @@ impl Executor {
         let output = match work.job {
             #[cfg(test)]
             Job::Panic => panic!("injected apply worker panic"),
+            Job::Entries(entries)
+                if entries.first().is_some_and(|first| {
+                    self.signals.superseded(first.index, self.state.applied)
+                }) =>
+            {
+                // A job before this one ended early. The snapshot replaces these entries.
+                early = true;
+                Output::Entries(Vec::new())
+            }
             Job::Entries(entries) => {
-                Output::Entries(apply_entries(&mut self.state, entries, work.header).await?)
+                let (replies, ended) = Box::pin(self.apply_retrying(entries, work.header)).await?;
+                early = ended.is_some();
+                // A rebase replay that failed left the state below the applied prefix, which the
+                // node publishes with this job. Only the snapshot can replace that state.
+                self.reported = ended.filter(|prefix| *prefix > self.state.applied);
+                Output::Entries(replies)
             }
             Job::PreparePuts { commands, term } => {
-                let (batch, replies) =
-                    super::quorum_put::prepare(&self.state, &commands, term, work.header).await?;
-                Output::PreparedPuts(batch, replies)
+                match self.prepare_or_skip(&commands, term, work.header).await? {
+                    Some((batch, replies)) => Output::PreparedPuts(batch, replies),
+                    None => Output::Unprepared(commands.last().map_or(0, |(index, _)| *index)),
+                }
             }
             Job::PublishPuts(batch) => {
                 // The clients already have their replies. Recovery must replay the same outcome.
@@ -391,22 +416,38 @@ impl Executor {
                 self.state.mark_row()?;
                 Output::Entries(Vec::new())
             }
-            Job::AdoptBase { base, term } => {
-                self.state.adopt_opened(base, term).await?;
-                Output::Adopted(self.state.members.conf())
-            }
+            Job::AdoptBase { base, term } => match self.adopt_retrying(base, term).await? {
+                Adoption::Adopted => Output::Adopted(self.state.members.conf()),
+                // A newer snapshot replaces this adoption.
+                Adoption::Covered => {
+                    early = true;
+                    Output::Entries(Vec::new())
+                }
+                // The member keeps its base. The job ends below the index of the dropped base.
+                Adoption::Dropped(rejected) => {
+                    early = true;
+                    Output::RejectedBase(rejected)
+                }
+            },
             Job::RaiseBase(snapshot) => {
                 self.state.raise_to_record(&snapshot).await?;
                 Output::Entries(Vec::new())
             }
-            Job::Snapshot(snapshot) => {
-                self.state.install_snapshot(&snapshot).await?;
+            Job::Snapshot(snapshot) => match self.install_retrying(&snapshot).await? {
+                // A newer snapshot replaces this one. The state did not change.
+                Waited::Covered => {
+                    early = true;
+                    Output::Entries(Vec::new())
+                }
                 // An object snapshot replaces the database. The node rebinds its handles.
-                Output::Snapshot(Rebound {
-                    db: self.state.database(),
-                    admin: self.state.admin.clone(),
-                })
-            }
+                Waited::Again => {
+                    self.reported = None;
+                    Output::Snapshot(Rebound {
+                        db: self.state.database(),
+                        admin: self.state.admin.clone(),
+                    })
+                }
+            },
             Job::Query(query) => match query {
                 Query::Maintenance(command, credentials, status, response) => {
                     let result = self
@@ -422,10 +463,7 @@ impl Executor {
                         {
                             tracing::warn!(%error, "a maintenance read failed");
                             crate::mvcc::Outcome {
-                                result: Err(crate::mvcc::KvError::new(
-                                    tonic::Code::Unavailable,
-                                    &format!("etcdserver: {error}"),
-                                )),
+                                result: Err(crate::mvcc::KvError::read_failure(error)),
                             }
                         }
                         Err(error) => return Err(error),
@@ -433,7 +471,7 @@ impl Executor {
                     fill_value_header(work.header, &mut outcome)?;
                     Output::Query {
                         response,
-                        value: serde_json::to_value(outcome)?,
+                        value: Ok(serde_json::to_value(outcome)?),
                         require_leader: false,
                     }
                 }
@@ -457,18 +495,28 @@ impl Executor {
                 }
                 Query::AuthLookup(name, response) => Output::Query {
                     response,
-                    value: serde_json::to_value(self.state.auth.users.get(&name))?,
+                    value: Ok(serde_json::to_value(self.state.auth.users.get(&name))?),
                     require_leader: false,
                 },
                 Query::Linear(..) | Query::Read(..) => {
                     anyhow::bail!("read reached the apply worker")
                 }
                 Query::Local(key, response) => {
-                    let value = self.state.local_value(&key).await?;
+                    // A storage error of this diagnostic read fails only its request.
+                    let value = match self.state.local_value(&key).await {
+                        Ok(value) => Ok(json!({"value": value,
+                            "applied_index": self.state.applied})),
+                        Err(error) => {
+                            tracing::warn!(%error, "a local value read failed");
+                            Err(ApiError {
+                                error: crate::mvcc::KvError::read_failure(error).message,
+                                leader_id: 0,
+                            })
+                        }
+                    };
                     Output::Query {
                         response,
-                        value: json!({"value": value,
-                        "applied_index": self.state.applied}),
+                        value,
                         require_leader: false,
                     }
                 }
@@ -506,8 +554,24 @@ impl Executor {
                 }
             }
         };
-        let state = match copy_state {
-            true => {
+        self.completion(output, early, copy_state.then_some(previous_revision))
+    }
+
+    /// Build the completion of each job. `copy` gives the revision before the job when the
+    /// node takes a copy of the state. While the executor recovers, the state is below the
+    /// index that this worker last reported. The completion then reports that index and no
+    /// state, so the node keeps its published view.
+    fn completion(&mut self, output: Output, early: bool, copy: Option<i64>) -> Result<Completion> {
+        if let Some(reported) = self.reported {
+            return Ok(Completion {
+                applied: reported,
+                state: None,
+                output,
+                early: true,
+            });
+        }
+        let state = match copy {
+            Some(previous_revision) => {
                 let mut state = AppliedState::new(&self.state)?;
                 state.watch = self
                     .state
@@ -515,18 +579,33 @@ impl Executor {
                     .map(std::sync::Arc::new);
                 Some(state)
             }
-            false => None,
+            None => None,
         };
         Ok(Completion {
             applied: self.state.applied,
             state,
             output,
+            early,
         })
+    }
+
+    /// Run a job while the state is below the index that this worker last reported. Only
+    /// committed entries that the node queued before Raft accepted the snapshot can come then,
+    /// besides the install. They end early, because the snapshot covers them. The node starts
+    /// other work only when no job runs and no snapshot waits, so any other job is an error of
+    /// the node. See `Node::schedule_apply`.
+    fn recovering_job(&mut self, job: Job) -> Result<Completion> {
+        match job {
+            Job::Entries(_) => self.completion(Output::Entries(Vec::new()), true, None),
+            _ => anyhow::bail!("only entries and a snapshot reach apply while it waits for one"),
+        }
     }
 }
 
 pub(super) struct Worker {
     database: Option<std::sync::Arc<slatedb::Db>>,
+    /// Ends or preempts a job that waits on a storage error, and reads its pause report.
+    pub control: Control,
     work: mpsc::Sender<Work>,
     completed: mpsc::Receiver<Result<Completion>>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
@@ -553,17 +632,23 @@ impl Worker {
         let (work, mut jobs) = mpsc::channel::<Work>(PIPELINE_DEPTH);
         let (done, completed) = mpsc::channel(PIPELINE_DEPTH);
         let database = state.database();
+        let (control, signals) = retry::signals();
         let mut executor = Executor {
             state,
             events,
             snapshot_task: None,
             inline_checkpoints: manual,
             log,
+            signals,
+            reported: None,
+            #[cfg(test)]
+            before_replay: None,
         };
         #[cfg(test)]
         if manual {
             return Self {
                 database,
+                control,
                 work,
                 completed,
                 task: None,
@@ -594,6 +679,7 @@ impl Worker {
         let task = tokio::spawn(worker);
         Self {
             database,
+            control,
             work,
             completed,
             task: Some(task),
@@ -603,6 +689,7 @@ impl Worker {
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
+        self.control.stop();
         self.completed.close();
         self.work = mpsc::channel(1).0;
         if let Some(task) = self.task.take() {
@@ -684,6 +771,18 @@ pub(super) async fn apply_entries(
     header: Header,
 ) -> Result<Vec<AppliedCommand>> {
     let mut replies = vec![];
+    apply_into(state, entries, header, &mut replies).await?;
+    Ok(replies)
+}
+
+/// Apply `entries` in order and add a reply for each one. After an error, `replies` holds the
+/// replies of the entries that applied before it.
+async fn apply_into(
+    state: &mut StateMachine,
+    entries: Vec<Entry>,
+    header: Header,
+    replies: &mut Vec<AppliedCommand>,
+) -> Result<()> {
     let mut entries = entries.into_iter().peekable();
     while let Some(entry) = entries.next() {
         ensure!(
@@ -878,7 +977,7 @@ pub(super) async fn apply_entries(
             reply,
         });
     }
-    Ok(replies)
+    Ok(())
 }
 
 // Replay in bounded batches when recovery exceeds the pending-entry quota.

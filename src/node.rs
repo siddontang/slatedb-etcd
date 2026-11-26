@@ -305,6 +305,13 @@ pub struct Node {
     held_puts: Option<quorum_put::HeldPuts>,
     /// The term of the entries in the last submitted PreparePuts job.
     prepare_term: u64,
+    /// True while the log above a held entry is past its alarm bound. See `tick_apply_pause`.
+    hold_alarm: bool,
+    /// The entry that apply held on, until apply passes it. See `WriterReport::apply_held_at`.
+    apply_held_at: Option<u64>,
+    /// The last entry of a PreparePuts job that a storage error ended. No early reply runs
+    /// until apply passes it, so the committed path applies those entries and retries.
+    unprepared: u64,
     quorum_reply_index: u64,
     /// Watch creations that wait while a Put reply runs ahead of the local apply.
     watch_waiters: Vec<oneshot::Sender<()>>,
@@ -654,6 +661,7 @@ impl Node {
         )?);
         crate::metrics::reads::READS.register(&state.metrics.registry)?;
         crate::object::bounded::LIMITER.register(&state.metrics.registry)?;
+        crate::mvcc::storage_fault::register(&state.metrics.registry)?;
         let handles = state.shared_handles();
         let writer = match &handles {
             Some(handles) => {
@@ -742,6 +750,9 @@ impl Node {
             prepared_puts: None,
             held_puts: None,
             prepare_term: 0,
+            unprepared: 0,
+            hold_alarm: false,
+            apply_held_at: None,
             quorum_reply_index: 0,
             watch_waiters: Vec::new(),
             state: applied,
@@ -815,6 +826,7 @@ impl Node {
     fn tick(&mut self) -> Result<()> {
         self.tick_raft()?;
         self.retry_reads();
+        self.tick_apply_pause();
         self.expire_leases()?;
         self.publish_member()?;
         self.tick_shared()?;
@@ -1783,6 +1795,8 @@ impl Node {
             status["write_profile"] = crate::write_profile::snapshot();
         }
         status["quorum_reply_index"] = self.quorum_reply_index.into();
+        status["apply_paused"] = self.pause_status();
+        status["apply_held_at"] = self.apply_held_at.into();
         status["quota"] = self.quota_status();
         status["members_row"] = self.members_status();
         if let (Some(writer), Some((base, applied, bytes))) = (&self.writer, self.state.view) {

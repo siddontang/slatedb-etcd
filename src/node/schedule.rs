@@ -125,7 +125,7 @@ impl Node {
                 || self.apply_paused()
                 || self.quota_guarded()
                 || self.raw.store().snapshot_pending()
-                || last < self.raw.store().snapshot_index()
+                || self.installing()
                 || self.prepared_puts.is_some()
                 || !self.queries.is_empty()
                 || (!self.checkpoint_running && self.checkpoint_due(last).is_some())
@@ -151,24 +151,24 @@ impl Node {
     /// log cache moves its first index at staging, and Raft drops its unstable snapshot before
     /// the write ends, so each step needs its own index.
     pub(super) fn installing(&self) -> bool {
-        let store = self.raw.store();
-        let unstable = self.raw.raft.raft_log.unstable.snapshot.as_ref();
-        let accepted = unstable.map_or(0, |snapshot| snapshot.get_metadata().index);
-        let stored = store.staged_snapshot_index().max(store.snapshot_index());
         // Raft scans from its own applied index. `complete_apply` keeps that index at or above
         // `state.applied`, also for a waiting member that starts with Raft ahead. So Raft's
         // index is below a snapshot only when this one is, and the guard holds then.
-        accepted.max(stored) > self.state.applied
+        self.accepted_snapshot() > 0
     }
 
     pub(super) fn schedule_apply(&mut self) -> Result<()> {
+        self.preempt_paused_apply();
         if self.apply_busy {
             return self.pipeline_apply();
         }
-        if self.raw.store().snapshot_pending() {
+        // Raft can hold an accepted snapshot as unstable while the log queue is full, and the log
+        // cache then stages it. Other apply work waits until the record is durable, so the
+        // install goes first.
+        let snapshot_index = self.raw.store().snapshot_index();
+        if self.raw.store().snapshot_pending() || self.accepted_snapshot() > snapshot_index {
             return Ok(());
         }
-        let snapshot_index = self.raw.store().snapshot_index();
         if self.state.applied < snapshot_index {
             // The incoming snapshot covers the prepared prefix or establishes a new base.
             // Apply any remaining suffix through the normal committed log path.
@@ -245,8 +245,9 @@ impl Node {
             .apply_jobs
             .pop_front()
             .context("unexpected apply completion")?;
+        // A covering snapshot can end a job at its applied prefix. See `preempt_paused_apply`.
         ensure!(
-            completed.applied == target,
+            completed.applied == target || completed.early && completed.applied < target,
             "apply completion has the wrong index"
         );
         ensure!(
@@ -259,9 +260,11 @@ impl Node {
         );
         self.apply_busy = !self.apply_jobs.is_empty();
         self.expire_reads();
+        // A job that a snapshot ended during a rebase replay sends only its prefix boundary. The
+        // snapshot replaces the state. See `apply_retrying`.
         let Some(state) = completed.state else {
             ensure!(
-                completed.applied == self.state.applied,
+                completed.applied == self.state.applied || completed.early,
                 "read changed the apply position"
             );
             return self.finish_output(completed.output);
@@ -325,9 +328,14 @@ impl Node {
                 self.expire_pending();
                 self.finish_output(Output::Entries(replies))?;
             }
+            Output::Unprepared(last) => self.unprepared = last,
             Output::Entries(replies) => {
+                // Raft takes the ConfState of a snapshot when it accepts it. A snapshot is above
+                // the commit index, so it covers each entry of these replies, and its ConfState
+                // holds or undoes each of their changes. Raft must not apply them again.
+                let superseded = self.installing();
                 for command in replies {
-                    if let Some(change) = &command.change {
+                    if let Some(change) = command.change.as_ref().filter(|_| !superseded) {
                         self.raw.apply_conf_change(change)?;
                         self.membership_checkpoint = self.state.applied;
                     }
@@ -401,13 +409,16 @@ impl Node {
                 let result = if require_leader && self.raw.raft.leader_id == 0 {
                     Err(self.error("no leader"))
                 } else {
-                    Ok(value)
+                    value
                 };
                 let _ = response.send(result);
             }
             Output::Read { response, outcome } => response.kv(outcome)?,
             Output::Linear { id, outcome } => self.finish_read(id, outcome)?,
+            // Raft took the ConfState of a snapshot that it accepted above the adopted base.
+            Output::Adopted(conf) if self.installing() => drop(conf),
             Output::Adopted(conf) => shared::reconcile_conf(&mut self.raw, &conf)?,
+            Output::RejectedBase(rejected) => self.reject_base(rejected),
             Output::Checkpoint(built) => {
                 if let Some(built) = built {
                     self.checkpoint_built(built)?;
@@ -454,3 +465,119 @@ impl Node {
         Ok(())
     }
 }
+
+// Serve a member whose apply waits on a storage error. See "Read faults" in
+// `docs/shared-state.md`.
+//
+// A transient error pauses apply, and the job retries. Corrupt stored data holds apply on its
+// entry. The member stays up and serves reads of its earlier state. A held follower asks its
+// leader for a snapshot above the held entry, and a snapshot that Raft accepts ends the
+// waiting job at its applied prefix. A linearizable read that needs a later entry fails at
+// once instead of waiting for the read timeout.
+
+/// Log entries above a held entry after which the member logs an alarm. A long hold keeps the
+/// log, so an operator must replace the member's state.
+const HOLD_LOG_ALARM: u64 = 100_000;
+
+impl Node {
+    /// The index of the snapshot that Raft accepted and apply did not install yet, or zero.
+    pub(super) fn accepted_snapshot(&self) -> u64 {
+        let store = self.raw.store();
+        let unstable = self.raw.raft.raft_log.unstable.snapshot.as_ref();
+        let accepted = unstable.map_or(0, |snapshot| snapshot.get_metadata().index);
+        let stored = store.staged_snapshot_index().max(store.snapshot_index());
+        let index = accepted.max(stored);
+        if index > self.state.applied {
+            index
+        } else {
+            0
+        }
+    }
+
+    /// End a waiting apply job when an accepted snapshot covers its entry. Raft already took the
+    /// ConfState of the snapshot, so the job's prefix delivers its replies but not its
+    /// membership changes. See `finish_output`.
+    pub(super) fn preempt_paused_apply(&mut self) {
+        let accepted = self.accepted_snapshot();
+        if accepted > 0 {
+            self.worker.control.preempt(accepted);
+        }
+    }
+
+    /// Fail each linearizable read whose read index is above the applied index while apply
+    /// holds. The read can serve nothing below its read index.
+    pub(super) fn fence_reads(&mut self) {
+        // A transient pause ends soon, so its reads wait as usual.
+        let Some(paused) = self.worker.control.paused().filter(|paused| paused.held) else {
+            return;
+        };
+        let applied = self.state.applied;
+        let fenced: Vec<_> = self
+            .reads
+            .iter()
+            .filter(|(_, read)| read.index().is_some_and(|index| index > applied))
+            .map(|(id, _)| *id)
+            .collect();
+        let message = format!(
+            "storage unavailable; apply holds at entry {}: {}",
+            paused.index, paused.reason
+        );
+        for id in fenced {
+            if let Some(read) = self.reads.remove(&id) {
+                read.into_response().error(self.error(&message));
+            }
+        }
+    }
+
+    /// Run the periodic work of a paused apply: the metrics, the alarm, and the snapshot request
+    /// of a held follower.
+    pub(super) fn tick_apply_pause(&mut self) {
+        let paused = self.worker.control.paused();
+        let held = paused.as_ref().filter(|paused| paused.held);
+        // The mark stays after a covering snapshot ends the job, until the install passes it.
+        match held {
+            Some(paused) => self.apply_held_at = Some(paused.index),
+            None if self
+                .apply_held_at
+                .is_some_and(|index| self.state.applied >= index) =>
+            {
+                self.apply_held_at = None;
+            }
+            None => {}
+        }
+        let last = self.raw.raft.raft_log.last_index();
+        let growth = held.map_or(0, |paused| last.saturating_sub(paused.index));
+        self.metrics.apply_held.set(held.is_some().into());
+        self.metrics.apply_held_entries.set(growth as i64);
+        if growth >= HOLD_LOG_ALARM && !self.hold_alarm {
+            tracing::error!(
+                growth,
+                "the log grows behind held apply; replace the state of this member"
+            );
+        }
+        self.hold_alarm = growth >= HOLD_LOG_ALARM;
+        // The leader serves the request with a base above the held entry. See `certify_base`.
+        if held.is_some() && self.raw.raft.state != StateRole::Leader {
+            let _ = self.raw.request_snapshot();
+        }
+        self.fence_reads();
+    }
+
+    /// The `/status` report of a paused apply.
+    pub(super) fn pause_status(&self) -> Value {
+        match self.worker.control.paused() {
+            Some(paused) => json!({
+                "index": paused.index,
+                "held": paused.held,
+                "reason": paused.reason,
+                "paused_ms": paused.since.elapsed().as_millis() as u64,
+                "log_alarm": self.hold_alarm,
+            }),
+            None => Value::Null,
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "shared/pause_tests.rs"]
+mod pause_tests;

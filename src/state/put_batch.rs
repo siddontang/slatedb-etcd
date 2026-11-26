@@ -81,7 +81,8 @@ impl StateMachine {
                             Some(&batch),
                             size,
                         )
-                        .await?;
+                        .await
+                        .map_err(crate::mvcc::storage_fault::read_cause)?;
                     batch.extend(alarm_write);
                     Err(if corrupt {
                         mvcc::KvError::new(tonic::Code::DataLoss, "corrupt cluster")
@@ -146,7 +147,8 @@ impl StateMachine {
                                             Some(&batch),
                                             size,
                                         )
-                                        .await?;
+                                        .await
+                                        .map_err(crate::mvcc::storage_fault::read_cause)?;
                                     counts.merge(count);
                                     batch.extend(writes);
                                     Ok((reply, next))
@@ -160,14 +162,8 @@ impl StateMachine {
                             revision = next;
                             Ok(reply)
                         }
-                        Err(error) => {
-                            ensure!(
-                                error.code != tonic::Code::Internal as i32,
-                                "{}",
-                                error.message
-                            );
-                            Err(error)
-                        }
+                        Err(mvcc::ApplyError::Request(error)) => Err(error),
+                        Err(mvcc::ApplyError::Unapplied(error)) => return Err(error),
                     }
                 }
             };

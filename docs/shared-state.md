@@ -443,8 +443,10 @@ checkpoint is gone, it takes a checkpoint in the same range as a restart does.
   checkpoint at once. It builds no image.
 - **Receive:** the HTTP handler opens `reader(C)` before it steps `MsgSnapshot` into Raft, as
   today's handler copies objects first (`api.rs:103-117`). A failed open fails the request, and
-  Raft retries. The handler keeps the reader until the install finishes, and the member reports
-  `C` in `ViewAck`.
+  Raft retries. The install takes the reader and keeps it across its tries. It drops the reader
+  when it succeeds, when Raft accepts a newer snapshot, or at a stop. A later receipt does not
+  replace it, also one of a stale snapshot that Raft then rejects. The member reports `C` in
+  `ViewAck`.
 - The record index can be above `F(C)`. The record keeps the two apart: the checkpoint gives `F`
   and its term, and the record metadata gives the index and the term there. Install loads the
   state at `F`, so the counter and term rows match. It then raises the applied index, the
@@ -666,6 +668,13 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
 | Writes fail for all members | The writer retries with a capped backoff. Reads continue |
 | Writes fail for a long time | Proposals fail at the soft limit. Apply pauses at the hard limit |
 | The writer finds data that it cannot use | The writer halts, and leadership moves once |
+| A client read meets a storage error | Only that request fails. See [Read faults](#read-faults) |
+| A client read meets a transient error | The request fails with `Unavailable` |
+| A client read meets corrupt data | The request fails with `DataLoss`. The counter goes up |
+| An apply read meets a transient error | Apply pauses and runs the entry again |
+| An apply read meets corrupt data | Apply holds on the entry. Earlier state stays readable |
+| All members hold on one corrupt shared row | Restore an earlier backup. Old state stays readable |
+| A voter's apply holds | It is never a handoff target. A held leader hands over after 30 s |
 | An invariant of the member fails | The member stops |
 | A member stops reporting its base | Its base can be deleted. It rebases on a missing SST |
 | A checkpoint open fails | The member keeps its base and tries the next checkpoint |
@@ -675,6 +684,92 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
 | Writer opens in reverse term order | The current leader is fenced, then it opens again |
 | New leader's clock is behind | The writer waits, or refuses and then hands over the lead |
 | The shared `Db` is lost or corrupted | All members lose state together. Restore from a backup |
+
+### Read faults
+
+A storage error of a client read never stops the member. Range, Watch, HashKV, the local
+serializable read, and the diagnostic reads use one rule, which the writer rule below extends.
+
+- **Transient:** SlateDB `Unavailable` or a closed database, an object store error from a call
+  outside SlateDB, or a store call past its deadline. The request fails with `Unavailable`, and
+  the client retries.
+- **Missing:** a `Data` error with a missing object below it, or a read that held its view past
+  `--view-pin-max`. The request fails with `Unavailable`. The retry reads a newer view.
+- **Corrupt:** any other SlateDB kind, or a stored row that does not decode. The request fails
+  with `DataLoss`. The member logs an error and counts it in `slatedb_etcd_read_corrupt_total`.
+
+Apply reads too. A read that fails is no result of an entry, because each member must reach the
+same result. A transient error leaves the entry unapplied. Apply keeps the entries that it
+applied before the error, with their replies, membership changes, and lease commands. It runs
+the rest again after 100 ms, and the wait doubles up to 5 s. A missing object rebases the state
+at the applied index first. A shutdown ends the retry at once. A membership change takes effect
+only after its batch is stored. Base readers stop after the retries of the member database, so
+a read fails instead of waiting forever. Only invariant errors stop the member.
+
+Corrupt stored data holds apply on its entry. The member logs an error, sets
+`slatedb_etcd_apply_held`, and reports the entry and the reason in `apply_paused` of `/status`.
+It checks the entry again every 30 s. It stays up and serves reads of its earlier state:
+
+- A linearizable read whose read index is above the applied index fails at once with
+  `Unavailable` and the reason of the hold.
+- A serializable read with no fence serves the last applied view. The local fast path stays
+  closed while an acknowledged early Put is ahead of apply, and a forwarded write still waits
+  for its revision on this member.
+
+A held follower asks its leader for a snapshot. The leader serves it with a base above the held
+entry, as for any snapshot request. When Raft accepts a snapshot that covers a waiting entry, the
+waiting job ends with the entries that it applied. Their replies go out once, and queued jobs
+below the snapshot are dropped. Raft already took the ConfState of the snapshot, so the
+membership changes of those entries do not reach Raft again. The install then skips the held
+entry. `slatedb_etcd_apply_held_entries` counts the log entries above the held entry. Above
+100,000 the member logs an alarm, because the log cannot shrink. After Raft accepts a snapshot,
+apply starts no other job until the snapshot record is stored and the install runs.
+
+A rebase, the adoption of an opened base, and a snapshot install load the new base and check
+it first: the Auth store, the leases, the counters, and the members row. Only then does the
+member drop its overlay and its materializer queue. A failed read leaves the state as it was,
+and apply runs the step again after the same backoff. A row of the new base that does not
+decode or contradicts another row is corrupt data. A missing object or corrupt data in the base
+of an install holds apply, as corrupt data in an entry does, and a newer snapshot ends the hold.
+An adoption instead drops such a base and keeps its current base and overlay. The member logs
+the first failure of each checkpoint, counts corrupt data in `slatedb_etcd_read_corrupt_total`,
+and reports the checkpoint in `shared_state.writer.rejected_base` of `/status`. The next poll
+tries the newest checkpoint again. The report ends with the pause, after an adoption or an
+install.
+
+A rebase replay that fails leaves the state below the end of the applied prefix of its job. If a
+snapshot then ends the job, the job reports that end and no state. The entries that the node
+queued behind it end early and report the same index. The node starts no other job until the
+install, so a state read such as Status, HashKV, or a backup waits in its queue until then.
+
+An early Put reply evaluates its entries before the state write, and they can be uncommitted. A
+storage error there does not retry, because a new leader can replace the entries. Early replies
+stop until apply passes those entries, and the entries apply on the committed path above.
+
+A Watch page that fails for a transient or missing object runs again on a new view. Each
+watcher resumes at its own next revision, so no revision is lost. The first retry runs at once,
+and later retries in a row wait from 100 ms up to 5 s. A corrupt page ends the stream with
+`DataLoss`. The stream reads one catch-up page at a time between its other work. So a Cancel, a
+closed client, or a closed request stream still ends the work while the store fails.
+
+A progress request follows etcd in one case: a watcher of the stream that asked for a start
+revision above the current revision drops it, with no reply. A watcher with no start revision
+does not. etcd also drops a request while a watcher catches up. This member instead keeps such
+a request when the events through its revision exist but a failing store delays them. The reply
+then follows those events, so a client need not ask again. Until the reply, the stream takes no
+feed batch, so no later event goes before it.
+
+A client applies the reply to each watch that it knows. So the creates and progress requests that
+come while a reply waits wait in one queue, and they run in request order after it. A later
+progress request thus takes its revision after each earlier create reply. A create gets its
+decision when it comes: an empty range, an ID that a live or waiting watch holds, or the watch
+limit fails it. That decision stays, also when a later Cancel ends the watch with its ID. A
+Cancel takes effect and gets its reply at once, and it can end a waiting create with its own ID.
+That create then gets only the Canceled reply. etcd sends Created first, so a client that picks
+its own watch IDs must not wait for Created after it cancels a create. The Go client lets the
+server pick IDs. A Cancel that ends a waiting create also folds the progress requests on its two
+sides. Progress requests next to each other in the queue fold into one. At most 64 creates wait. One
+more ends the stream with `Unavailable`, and the client resumes its watches on a new stream.
 
 ### Writer faults
 
@@ -750,6 +845,14 @@ stalled I/O never returns. Other faults retry with the backoff.
 So a fault on one member's path moves the lead once. A fault of the whole backend moves it at
 most once per member. A marked member stays out of automatic handoffs until it leads again and
 its writer publishes. MoveLeader can still move the lead to it.
+
+A member whose apply holds on corrupt data sends `apply_held_at` in its `ViewAck`: the held
+entry. This is not a writer mark. No publication clears it, also not one of the applied
+prefix, and it clears only when apply passes the entry. A held voter is never a target, also
+not as a last resort or in a handoff for another cause. A leader whose apply waits on one entry
+for more than 30 s hands its lead over, as after a stall. While it holds, its own publications
+do not end the incident, so it tries each voter once. As a follower it then asks for a
+snapshot above the held entry. See [Read faults](#read-faults).
 
 ## Costs and trade-offs
 

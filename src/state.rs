@@ -476,6 +476,22 @@ impl StateMachine {
         reads: StateView,
         shared: Option<shared::Shared>,
     ) -> Result<Self> {
+        let shared_mode = shared.is_some();
+        let mut state = Self::load_rows(db, admin, location, rows, reads, shared_mode).await?;
+        state.shared = shared;
+        Ok(state)
+    }
+
+    /// Build the derived state from `reads` without the shared-mode overlay. The caller adds
+    /// it. `shared_mode` skips the cluster quota, which only replicated mode stores.
+    async fn load_rows(
+        db: Option<Arc<Db>>,
+        admin: Arc<slatedb::admin::Admin>,
+        location: Arc<transfer::Location>,
+        rows: Arc<rows::RowCache>,
+        reads: StateView,
+        shared_mode: bool,
+    ) -> Result<Self> {
         let applied = decode_applied(reads.get(APPLIED).await?)?;
         let applied_term = read_applied_term(&reads, applied).await?;
         let revision = read_revision(&reads).await?;
@@ -499,9 +515,9 @@ impl StateMachine {
         // A shared base from an older binary has only the total in `shared::LOGICAL_BYTES`, and
         // its apply marker is past any counter row, so the open counts the split again.
         let logical_bytes = load_logical_size(&reads, applied).await?;
-        let (cluster_quota, quota_boundary) = match &shared {
-            Some(_) => (None, 0),
-            None => quota::load(&reads).await?,
+        let (cluster_quota, quota_boundary) = match shared_mode {
+            true => (None, 0),
+            false => quota::load(&reads).await?,
         };
         Ok(Self {
             members: Arc::new(members),
@@ -537,7 +553,7 @@ impl StateMachine {
             members_mismatch: None,
             members_checked: None,
             reads,
-            shared,
+            shared: None,
         })
     }
 
@@ -635,7 +651,8 @@ impl StateMachine {
     async fn write_batch(&mut self, batch: WriteBatch, index: u64) -> Result<()> {
         let size = batch
             .logical_size(self.applied_state(), &self.key_index, self.logical_bytes)
-            .await?;
+            .await
+            .map_err(crate::mvcc::storage_fault::read_cause)?;
         let size = self.store_batch(batch, index, size).await?;
         self.logical_bytes = size;
         self.applied_term = self.entry_term;
@@ -771,24 +788,7 @@ pub(crate) fn applied_term_row(index: u64, term: u64) -> [u8; 16] {
     row
 }
 
-/// A stored object of the shared state that does not decode, or that contradicts another one.
-/// Each writer reads the same objects, so the error describes the shared store, not the applied
-/// state of one member. A writer task halts on it instead of stopping the member.
-#[derive(Debug)]
-pub(crate) struct StoredData(String);
-
-impl std::fmt::Display for StoredData {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for StoredData {}
-
-/// A `StoredData` error with `message`.
-pub(crate) fn stored(message: impl std::fmt::Display) -> anyhow::Error {
-    anyhow::Error::new(StoredData(message.to_string()))
-}
+pub(crate) use crate::mvcc::storage_fault::stored;
 
 /// Decode the `meta/applied` row. A state without the row has applied nothing.
 fn decode_applied(row: Option<bytes::Bytes>) -> Result<u64> {

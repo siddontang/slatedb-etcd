@@ -58,7 +58,7 @@ impl Simulation {
         let health = node
             .writer
             .as_ref()
-            .map(|writer| writer.health.report(term));
+            .map(|writer| writer.health.report(term, None));
         let health = coverage.and(health);
         self.nodes
             .get_mut(&leader)
