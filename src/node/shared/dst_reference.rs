@@ -23,7 +23,8 @@ pub(super) struct Reference {
     replicated: StateMachine,
     /// The indexes at which the in-memory state and the replicated state were equal.
     pub(super) compared: u64,
-    /// The compared entries of each kind. See `entry_kind`.
+    /// The compared entries of each kind. See `entry_kind`. A kind ends in ` (rejected)` when
+    /// the in-memory state applied the entry with an error reply.
     kinds: BTreeMap<String, u64>,
     /// Shared mode: the loaded fields of the in-memory state after each index.
     loaded: BTreeMap<u64, String>,
@@ -75,10 +76,13 @@ impl Reference {
         let Some(memory) = &mut self.memory else {
             return expected;
         };
-        let kind = entry_kind(&entry);
-        apply::apply_entries(memory, vec![entry], header)
+        let mut kind = entry_kind(&entry);
+        let replies = apply::apply_entries(memory, vec![entry], header)
             .await
             .unwrap();
+        if replies.iter().any(|applied| rejected(&applied.reply)) {
+            kind.push_str(" (rejected)");
+        }
         let digest = rows_digest(memory.applied_state()).await.unwrap();
         let index = memory.applied;
         assert_eq!(digest, expected, "the reference rows differ at {index}");
@@ -101,6 +105,20 @@ impl Reference {
             .iter()
             .map(|(kind, count)| format!("{kind}={count}"));
         kinds.collect::<Vec<_>>().join(", ")
+    }
+}
+
+/// Return true for an error reply. Apply stores the state of a rejected entry too, such as the
+/// apply marker, so the comparison still covers it.
+fn rejected(reply: &apply::Reply) -> bool {
+    let encoded = |value: &Value| value.get("result").is_some_and(|r| r.get("Err").is_some());
+    match reply {
+        apply::Reply::Encoded(value) | apply::Reply::PhysicalCompact { value, .. } => {
+            encoded(value)
+        }
+        apply::Reply::CompactFlush { .. } => false,
+        apply::Reply::Kv(outcome) => outcome.result.is_err(),
+        apply::Reply::Lease(outcome) => outcome.result.is_err(),
     }
 }
 
@@ -420,6 +438,12 @@ async fn the_row_digest_frames_each_key_and_value() {
 }
 
 impl Simulation {
+    /// Return true when the applied state of member `id` has a row at `key`.
+    async fn has_row(&self, id: u64, key: &[u8]) -> bool {
+        let state = self.nodes[&id].worker.state();
+        state.applied_state().get(key).await.unwrap().is_some()
+    }
+
     /// Propose `command` on the leader and deliver messages until it replies. The reply can be an
     /// error, but the entry must commit.
     async fn commit(&mut self, command: RaftCommand) {
@@ -445,8 +469,10 @@ impl Simulation {
 
 /// A shared cluster commits each entry kind that shared mode applies. The random shared schedules
 /// write only puts, lease grants, and view checkpoints. Here the view check and the comparison of
-/// the two references also cover transactions, deletes, the lease rules, compaction, maintenance,
-/// membership changes, auth, and diagnostic writes.
+/// the two references also cover transactions, deletes, the lease rules, compaction, alarms,
+/// membership changes, auth, and diagnostic writes. Each of these must apply without an error,
+/// and the test checks its effect. The maintenance commands that run only on a local member are
+/// committed too: apply rejects them, but still stores the apply marker.
 #[tokio::test]
 async fn every_entry_kind_matches_in_a_shared_cluster() {
     use crate::auth::{Command as A, Credentials};
@@ -479,11 +505,18 @@ async fn every_entry_kind_matches_in_a_shared_cluster() {
     sim.lease(LeaseCommand::KeepAlive { id: 77 }).await;
     sim.lease(LeaseCommand::Grant { id: 78, ttl: 3600 }).await;
     sim.commit(etcd("put-78", put("lease/78", 78))).await;
+    assert!(sim.has_row(leader, b"etcd/current/lease/78").await);
     sim.lease(LeaseCommand::Revoke { id: 78 }).await;
+    assert!(!sim.has_row(leader, b"etcd/current/lease/78").await);
     sim.lease(LeaseCommand::Grant { id: 79, ttl: 3600 }).await;
     sim.commit(etcd("put-79", put("lease/79", 79))).await;
     let generation = sim.nodes[&leader].state.leases[&79].generation;
     sim.lease(LeaseCommand::Expire { id: 79, generation }).await;
+    assert!(!sim.has_row(leader, b"etcd/current/lease/79").await);
+    assert_eq!(
+        sim.nodes[&leader].state.leases.keys().collect::<Vec<_>>(),
+        [&77]
+    );
     // Puts, a transaction, and a delete range.
     for key in ["a/1", "a/2", "a/3", "b/1"] {
         sim.commit(etcd(key, put(key, 0))).await;
@@ -504,6 +537,8 @@ async fn every_entry_kind_matches_in_a_shared_cluster() {
         ..Default::default()
     };
     sim.commit(etcd("txn", Op::RequestTxn(txn))).await;
+    assert!(sim.has_row(leader, b"etcd/current/a/4").await);
+    assert!(!sim.has_row(leader, b"etcd/current/a/1").await);
     let delete = DeleteRangeRequest {
         key: b"a/".to_vec(),
         range_end: b"a0".to_vec(),
@@ -511,31 +546,31 @@ async fn every_entry_kind_matches_in_a_shared_cluster() {
     };
     sim.commit(etcd("delete", Op::RequestDeleteRange(delete)))
         .await;
+    for key in ["a/2", "a/3", "a/4"] {
+        let key = format!("etcd/current/{key}");
+        assert!(!sim.has_row(leader, key.as_bytes()).await);
+    }
     sim.publish_view(&mut writers).await;
     sim.settle(4).await;
     // Diagnostic writes.
-    for (id, operation) in [
-        (
-            "diagnostic-put",
-            crate::Operation::Put {
-                key: "k".into(),
-                value: "v".into(),
-            },
-        ),
-        (
-            "diagnostic-delete",
-            crate::Operation::Delete { key: "k".into() },
-        ),
-    ] {
-        let request = crate::Request {
-            operations: vec![operation],
-        };
-        let command = crate::Command {
+    let diagnostic = |id: &str, operation| {
+        RaftCommand::Diagnostic(crate::Command {
             id: id.into(),
-            request,
-        };
-        sim.commit(RaftCommand::Diagnostic(command)).await;
-    }
+            request: crate::Request {
+                operations: vec![operation],
+            },
+        })
+    };
+    let value = "v".to_owned();
+    let write = crate::Operation::Put {
+        key: "k".into(),
+        value,
+    };
+    sim.commit(diagnostic("diagnostic-put", write)).await;
+    assert!(sim.has_row(leader, b"data/k").await);
+    let delete = crate::Operation::Delete { key: "k".into() };
+    sim.commit(diagnostic("diagnostic-delete", delete)).await;
+    assert!(!sim.has_row(leader, b"data/k").await);
     // A logical compaction, then a physical one with its steps.
     for _ in 0..4 {
         sim.commit(etcd("b/1", put("b/1", 0))).await;
@@ -546,6 +581,7 @@ async fn every_entry_kind_matches_in_a_shared_cluster() {
         compact: CompactionRequest { revision, physical },
     };
     sim.commit(compact("logical", revision - 2, false)).await;
+    assert_eq!(sim.nodes[&leader].state.compact_revision, revision - 2);
     let (tx, _reply) = oneshot::channel();
     let node = sim.nodes.get_mut(&leader).unwrap();
     node.propose(compact("physical", revision, true), tx)
@@ -554,25 +590,37 @@ async fn every_entry_kind_matches_in_a_shared_cluster() {
         sim.settle(2).await;
         sim.publish_view(&mut writers).await;
     }
-    // Maintenance.
+    let state = &sim.nodes[&leader].state;
+    assert_eq!(
+        (state.compact_revision, state.physical_revision),
+        (revision, revision)
+    );
+    // An alarm that turns on and off.
     let maintenance = |id: &str, request| RaftCommand::Maintenance {
         id: id.into(),
         request,
         credentials: Default::default(),
     };
-    let alarm = |action| AlarmRequest {
-        action,
-        member_id: leader,
-        alarm: 1,
-    };
     use crate::maintenance::Command as M;
+    let alarm = |action| {
+        M::Alarm(AlarmRequest {
+            action,
+            member_id: leader,
+            alarm: 1,
+        })
+    };
+    sim.commit(maintenance("alarm-on", alarm(1))).await;
+    assert_eq!(sim.nodes[&leader].worker.state().alarms.len(), 1);
+    sim.commit(maintenance("alarm-off", alarm(2))).await;
+    assert!(sim.nodes[&leader].worker.state().alarms.is_empty());
+    // Commands that run only on a local member. Apply rejects them.
+    let downgrade = DowngradeRequest::default();
     for (id, request) in [
         ("status", M::Status),
         ("hash", M::Hash(0)),
         ("hash-all", M::HashAll),
-        ("alarm-on", M::Alarm(alarm(1))),
-        ("alarm-off", M::Alarm(alarm(2))),
         ("defragment", M::Defragment),
+        ("downgrade", M::Downgrade(downgrade)),
     ] {
         sim.commit(maintenance(id, request)).await;
     }
@@ -583,32 +631,35 @@ async fn every_entry_kind_matches_in_a_shared_cluster() {
         credentials: Default::default(),
     };
     use crate::cluster::Command as C;
-    let url = format!("http://127.0.0.1:{}", 2379 + follower);
+    let url = format!("http://127.0.0.1:{}", 2479 + follower);
     let update = MemberUpdateRequest {
         id: follower,
         peer_ur_ls: vec![url.clone()],
     };
+    sim.commit(cluster("update", C::Update(update))).await;
+    let publish = C::Publish {
+        id: follower,
+        client_urls: vec![url.clone()],
+    };
+    sim.commit(cluster("publish", publish)).await;
+    let member = &sim.nodes[&leader].state.members.members[&follower];
+    assert_eq!(
+        (&member.peer_ur_ls, &member.client_ur_ls),
+        (&vec![url.clone()], &vec![url])
+    );
     let learner = Member {
         id: 4,
         peer_ur_ls: vec!["http://127.0.0.1:2383".into()],
         is_learner: true,
         ..Default::default()
     };
-    for (id, request) in [
-        ("update", C::Update(update)),
-        (
-            "publish",
-            C::Publish {
-                id: follower,
-                client_urls: vec![url],
-            },
-        ),
-        ("add", C::Add(learner)),
-        ("remove", C::Remove(4)),
-    ] {
-        sim.commit(cluster(id, request)).await;
-        sim.settle(2).await;
-    }
+    sim.commit(cluster("add", C::Add(learner))).await;
+    sim.settle(2).await;
+    let members = &sim.nodes[&leader].state.members.members;
+    assert!(members.get(&4).is_some_and(|member| member.is_learner));
+    sim.commit(cluster("remove", C::Remove(4))).await;
+    sim.settle(2).await;
+    assert!(!sim.nodes[&leader].state.members.members.contains_key(&4));
     // Auth: enable it, write with credentials, and disable it.
     let root = Credentials {
         user: Some("root".into()),
@@ -639,20 +690,17 @@ async fn every_entry_kind_matches_in_a_shared_cluster() {
     ] {
         sim.commit(auth(id, command)).await;
     }
+    assert!(sim.nodes[&leader].state.auth.enabled);
     let secured = etcd("secured", put("b/2", 0)).secure(Some(root.clone()));
     sim.commit(secured).await;
+    assert!(sim.has_row(leader, b"etcd/current/b/2").await);
     sim.commit(auth("disable", A::Disable(AuthDisableRequest {})))
         .await;
+    assert!(!sim.nodes[&leader].state.auth.enabled);
     sim.publish_view(&mut writers).await;
     sim.settle(10).await;
-    // The commands changed state, so their kinds cover more than error replies.
-    for node in sim.nodes.values() {
-        let state = &node.state;
-        assert_eq!(state.compact_revision, revision);
-        assert_eq!(state.leases.keys().collect::<Vec<_>>(), [&77]);
-        assert!(!state.members.members.contains_key(&4));
-    }
-    let kinds = sim.reference.as_ref().unwrap().kinds();
+    let kinds = &sim.reference.as_ref().unwrap().kinds;
+    let rejected = |kind: &str| format!("{kind} (rejected)");
     for kind in [
         "put",
         "txn",
@@ -665,11 +713,7 @@ async fn every_entry_kind_matches_in_a_shared_cluster() {
         "physical compact",
         "compact step",
         "diagnostic",
-        "maintenance Status",
-        "maintenance Hash",
-        "maintenance HashAll",
         "maintenance Alarm",
-        "maintenance Defragment",
         "member Update",
         "member Publish",
         "conf change AddLearnerNode member Add",
@@ -682,9 +726,23 @@ async fn every_entry_kind_matches_in_a_shared_cluster() {
         "view checkpoint",
         "seed members",
     ] {
+        assert!(kinds.contains_key(kind), "no {kind} entry in {kinds:?}");
         assert!(
-            kinds.contains(&format!("{kind}=")),
-            "no {kind} entry in {kinds}"
+            !kinds.contains_key(&rejected(kind)),
+            "a {kind} entry failed"
         );
+    }
+    for kind in [
+        "maintenance Status",
+        "maintenance Hash",
+        "maintenance HashAll",
+        "maintenance Defragment",
+        "maintenance Downgrade",
+    ] {
+        assert!(
+            kinds.contains_key(&rejected(kind)),
+            "no rejected {kind} entry in {kinds:?}"
+        );
+        assert!(!kinds.contains_key(kind), "a {kind} entry applied");
     }
 }
