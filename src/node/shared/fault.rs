@@ -279,9 +279,15 @@ impl Health {
     }
 
     /// Ask the writer task to drop its stalled attempt and open the writer again. The request
-    /// holds until the stall ends, so a task between two steps sees it at its next step.
+    /// holds until the stall ends, so a task between two steps sees it at its next step. A
+    /// request after the stall ended does nothing: the writer made progress since the tick.
     pub(super) fn restart(&self) {
-        self.record().restart = true;
+        let mut record = self.record();
+        if record.stalled.is_none() {
+            return;
+        }
+        record.restart = true;
+        drop(record);
         self.0.restart.send_modify(|restarts| *restarts += 1);
     }
 

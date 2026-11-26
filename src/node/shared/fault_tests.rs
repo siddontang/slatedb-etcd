@@ -167,6 +167,28 @@ fn a_retry_wait_is_no_stall() {
     assert!(health.record().due.is_none() && !health.stalled());
 }
 
+/// A restart request that comes after the stall ended does nothing. The writer made progress,
+/// so its next step runs.
+#[tokio::test]
+async fn a_restart_after_the_stall_ended_does_nothing() {
+    let health = Health::default();
+    let mut task = health.begin();
+    task.due();
+    health.record().due = Some(Instant::now() - STALL - Duration::from_secs(1));
+    assert!(health.check(None));
+    task.progressed();
+    health.restart();
+    assert!(!health.record().restart);
+    let waited = tokio::time::timeout(Duration::from_millis(200), task.restart_requested());
+    assert!(waited.await.is_err(), "a late restart request holds");
+    // A request during a stall holds.
+    health.record().due = Some(Instant::now() - STALL - Duration::from_secs(1));
+    assert!(health.check(None));
+    health.restart();
+    let waited = tokio::time::timeout(Duration::from_millis(200), task.restart_requested());
+    assert!(waited.await.is_ok());
+}
+
 /// A task of an earlier term changes nothing, also with a late error.
 #[test]
 fn a_late_result_of_an_earlier_term_changes_nothing() {
@@ -1644,12 +1666,13 @@ async fn a_replacement_writer_gets_a_fresh_interval_for_a_request() {
     writer.progress.inner.lock().unwrap().requested =
         Some(Instant::now() - STALL - Duration::from_secs(1));
     let old = writer.open.lock().unwrap().clone().unwrap();
-    // The node asks for the restart on each tick, as for a stall with no target, until the
-    // task drops its step.
+    // The overdue request is a stall. Each tick of the node checks the stall and asks for the
+    // restart, as for a stall with no target, until the task drops its step.
     let before = writer.health.consecutive();
     eventually("the restart", async || {
         let restarted = writer.health.consecutive() > before;
         if !restarted {
+            writer.health.check(writer.waiting());
             writer.health.restart();
         }
         restarted
@@ -1736,4 +1759,91 @@ async fn a_hung_stranded_check_trips_the_request_timer() {
     writer.sync(false, 3, &events);
     writer.stop().await;
     state.close().await.unwrap();
+}
+
+/// One pass serves both a checkpoint request and a Defragment republish. After it, neither the
+/// demand nor its wait comes back.
+#[test]
+fn a_pass_that_serves_a_request_and_a_republish_keeps_neither() {
+    let progress = Progress::new(5);
+    progress.request(3);
+    progress.republish();
+    let (flush, through) = progress.take_flush(Duration::from_secs(60));
+    assert!(flush);
+    let republish = progress.take_republish();
+    assert!(republish);
+    let demand = Demand {
+        progress: &progress,
+        through,
+        republish,
+    };
+    demand.served();
+    let inner = progress.inner.lock().unwrap();
+    assert!(inner.publish_through.is_none() && !inner.republish);
+    assert!(inner.requested.is_none() && inner.republished.is_none());
+}
+
+/// The check for a stranded checkpoint fails again and again while a request waits. The
+/// publisher retries it at the backoff, not in a tight loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failing_stranded_check_retries_at_the_backoff() {
+    use super::super::tests::{adopt_announced, stranded_checkpoint_on, STRANDED_AGE};
+    use std::sync::atomic::Ordering;
+    let (mut state, handles, events, mut announcements, lost) =
+        stranded_checkpoint_on(Arc::new(InMemory::new())).await;
+    let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+    writer.sync(true, 3, &events);
+    assert_eq!(
+        announcements.next(Duration::from_secs(10), true).await,
+        lost
+    );
+    adopt_announced(&mut state, lost).await;
+    tokio::time::sleep(RETRY_MAX + Duration::from_millis(500)).await;
+    let failures = writer.applied.failures.clone();
+    failures.store(10_000, Ordering::Relaxed);
+    writer.request_publication(1);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    // The backoff from 100 ms doubles to 2 s, so about five checks fit in 3 s.
+    let checks = 10_000 - failures.load(Ordering::Relaxed);
+    assert!((1..=8).contains(&checks), "{checks} checks in 3 s");
+    failures.store(0, Ordering::Relaxed);
+    writer.sync(false, 3, &events);
+    writer.stop().await;
+    state.close().await.unwrap();
+}
+
+/// A checkpoint request waits above the written batch while Defragment republishes publish
+/// again and again. A republish serves only itself, so the request keeps its wait and the
+/// watchdog fires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn republishes_do_not_hide_a_waiting_request() {
+    let store = Arc::new(InMemory::new());
+    let mut leader = Leader::open(store, Duration::from_millis(100), clock()).await;
+    leader.lead(2);
+    leader.covered(1, Duration::from_secs(10)).await;
+    let (_, idle) = mpsc::channel(1);
+    let mut announced = std::mem::replace(&mut leader.announced, idle);
+    let publications = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let answered = publications.clone();
+    tokio::spawn(async move {
+        while let Some(event) = announced.recv().await {
+            if let Event::ViewCheckpoint(_, _, Some(reply)) = event {
+                answered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let _ = reply.send(true);
+            }
+        }
+    });
+    let requested = Instant::now();
+    let through = leader.state.applied + 1;
+    let writer = leader.writer.as_ref().unwrap();
+    writer.progress.request(through);
+    until("the stall", STALL + Duration::from_secs(5), async || {
+        writer.progress.republish();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        writer.health.check(writer.waiting())
+    })
+    .await;
+    assert!(requested.elapsed() >= STALL);
+    assert!(publications.load(std::sync::atomic::Ordering::Relaxed) > 20);
+    leader.close().await;
 }

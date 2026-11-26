@@ -37,8 +37,10 @@ struct Inner {
     publish_through: Option<u64>,
     /// Publish a new checkpoint even at an unchanged sequence. Defragment sets this.
     republish: bool,
-    /// The time of the oldest request or republish that no publication served yet.
+    /// The time of the oldest request that no publication covered yet.
     requested: Option<Instant>,
+    /// The time of the oldest republish that no publication served yet.
+    republished: Option<Instant>,
 }
 
 impl Progress {
@@ -77,10 +79,7 @@ impl Progress {
 
     /// Publish a new checkpoint at the current sequence, for a changed layout.
     fn republish(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.republish = true;
-        inner.requested.get_or_insert_with(Instant::now);
-        drop(inner);
+        self.give_back(None, true);
         self.wake.notify_one();
     }
 
@@ -89,40 +88,57 @@ impl Progress {
     }
 
     fn request(&self, through: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        let through = inner
-            .publish_through
-            .map_or(through, |old| old.max(through));
-        inner.publish_through = Some(through);
-        inner.requested.get_or_insert_with(Instant::now);
-        drop(inner);
+        self.give_back(Some(through), false);
         self.wake.notify_one();
     }
 
-    /// The time of the oldest request that no publication served yet.
-    fn requested(&self) -> Option<Instant> {
-        self.inner.lock().unwrap().requested
+    /// Add a request and a republish without a wake. Each keeps the wait of an earlier one.
+    fn give_back(&self, through: Option<u64>, republish: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(through) = through {
+            let through = inner
+                .publish_through
+                .map_or(through, |old| old.max(through));
+            inner.publish_through = Some(through);
+            inner.requested.get_or_insert_with(Instant::now);
+        }
+        if republish {
+            inner.republish = true;
+            inner.republished.get_or_insert_with(Instant::now);
+        }
     }
 
-    /// A pass ended. When it `covered` the requests that it took, a request that came later
-    /// waits from now. A pass that covered no request, for example one below the written batch,
-    /// keeps the wait of the pending request.
-    fn served(&self, covered: bool) {
+    /// The time of the oldest request or republish that no publication served yet.
+    fn requested(&self) -> Option<Instant> {
+        let inner = self.inner.lock().unwrap();
+        inner.requested.into_iter().chain(inner.republished).min()
+    }
+
+    /// A pass ended. A request and a republish keep separate waits. A wait starts again only
+    /// when the pass covered that kind of demand and a newer one waits. A pass that covered no
+    /// request, for example one above the written batch, keeps the wait of the request.
+    fn served(&self, covered: bool, republished: bool) {
+        let now = Instant::now();
         let mut inner = self.inner.lock().unwrap();
-        let pending = inner.publish_through.is_some() || inner.republish;
-        if !pending {
+        if inner.publish_through.is_none() {
             inner.requested = None;
         } else if covered {
-            inner.requested = Some(Instant::now());
+            inner.requested = Some(now);
+        }
+        if !inner.republish {
+            inner.republished = None;
+        } else if republished {
+            inner.republished = Some(now);
         }
     }
 
     /// A new writer starts the wait of the pending requests, so it has a whole interval to
     /// reach them.
     fn rearm(&self) {
+        let now = Instant::now();
         let mut inner = self.inner.lock().unwrap();
-        let pending = inner.publish_through.is_some() || inner.republish;
-        inner.requested = pending.then(Instant::now);
+        inner.requested = inner.publish_through.map(|_| now);
+        inner.republished = inner.republish.then_some(now);
     }
 
     /// Wait until the shared `Db` holds every batch through `seq`.
@@ -168,8 +184,16 @@ struct Demand<'a> {
 impl Demand<'_> {
     /// The pass published, or found nothing to publish.
     fn served(mut self) {
-        let covered = self.through.take().is_some() || std::mem::take(&mut self.republish);
-        self.progress.served(covered);
+        let covered = self.through.take().is_some();
+        let republished = std::mem::take(&mut self.republish);
+        self.progress.served(covered, republished);
+    }
+
+    /// Give the demand back without a wake, for a later pass at the retry deadline.
+    fn requeue(mut self) {
+        let through = self.through.take();
+        let republish = std::mem::take(&mut self.republish);
+        self.progress.give_back(through, republish);
     }
 }
 
@@ -1081,6 +1105,8 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
     // A writer that stopped before its announcement committed can leave a stranded
     // checkpoint. A new writer announces it, so the members do not wait for more writes.
     let mut retry = Retry::new();
+    // A stranded check failed. The requests that wait for it retry at the backoff.
+    let mut rechecking = false;
     // The `Db` can close before the subscription, so each pass reads the current status.
     let mut status = db.subscribe();
     loop {
@@ -1119,9 +1145,14 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
             health.done();
             // A request with no new checkpoint can wait for a stranded one. The request and
             // its timer stay until the check finds the checkpoint or rules it out, so a hung or
-            // failing read of the check counts against the request.
-            if requested.is_some() {
+            // failing read of the check counts against the request. After a failed check, the
+            // retry keeps its backoff.
+            if requested.is_some() && !rechecking {
                 retry.now();
+            }
+            if !retry.due() && rechecking {
+                demand.requeue();
+                continue;
             }
             if retry.due() {
                 let checked = reannounce(
@@ -1133,9 +1164,12 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
                     &events,
                 );
                 match checked.await? {
-                    Recheck::Done => {}
-                    // The dropped demand gives the request back with its wait.
-                    Recheck::Failed => continue,
+                    Recheck::Done => rechecking = false,
+                    Recheck::Failed => {
+                        rechecking = true;
+                        demand.requeue();
+                        continue;
+                    }
                     Recheck::Closed => return Ok(()),
                 }
             }
