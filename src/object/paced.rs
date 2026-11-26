@@ -25,6 +25,10 @@
 //! `MAX_IDLE_COMPACTION_WINDOWS`. Windows already held are not taken back when a flush starts;
 //! each is released after one `PACE_BYTES` window of writeback. SlateDB stops L0 flushes when
 //! L0 is full, and only compaction frees L0 then.
+//!
+//! A Raft log `fdatasync` waits for the SST windows in writeback ahead of it. While one runs, the
+//! lane grants no new window ([`raft_sync`]), so a sync does not also wait for windows granted
+//! during it. A writer yields to at most one sync, so back-to-back syncs cannot starve flushes.
 
 use std::fmt;
 use std::fs::File;
@@ -190,6 +194,10 @@ struct LaneState {
     flush_waiting: usize,
     /// Memtable flush SSTs that are being written.
     flushes: usize,
+    /// Raft log syncs that are running.
+    syncs: usize,
+    /// Raft log syncs that have finished.
+    synced: u64,
     #[cfg(test)]
     max_used: usize,
     #[cfg(test)]
@@ -208,6 +216,8 @@ impl Lane {
                 compaction: 0,
                 flush_waiting: 0,
                 flushes: 0,
+                syncs: 0,
+                synced: 0,
                 #[cfg(test)]
                 max_used: 0,
                 #[cfg(test)]
@@ -224,7 +234,8 @@ impl Lane {
         if writer == Writer::Flush {
             st.flush_waiting += 1;
         }
-        while !st.admits(writer) {
+        let mut yielded = None;
+        while !st.admits(writer) || st.yields_to_sync(&mut yielded) {
             st = self.freed.wait(st).unwrap_or_else(|e| e.into_inner());
         }
         self.grant(st, writer)
@@ -238,7 +249,8 @@ impl Lane {
         if writer == Writer::Flush {
             st.flush_waiting += 1;
         }
-        while !st.admits(writer) {
+        let mut yielded = None;
+        while !st.admits(writer) || st.yields_to_sync(&mut yielded) {
             let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
                 if writer == Writer::Flush {
                     st.flush_waiting -= 1;
@@ -270,6 +282,12 @@ impl Lane {
         Window { lane: self, writer }
     }
 
+    /// Hold new windows back until the guard drops. See [`raft_sync`].
+    fn sync(&self) -> RaftSync<'_> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).syncs += 1;
+        RaftSync { lane: self }
+    }
+
     /// Mark one SST of `writer` as being written until the guard drops.
     fn start(&self, writer: Writer) -> Active<'_> {
         if writer == Writer::Flush {
@@ -292,12 +310,51 @@ impl LaneState {
             }
     }
 
+    /// Whether a writer that [`LaneState::admits`] must still wait for a running Raft log sync.
+    /// `yielded` holds the `synced` count when this writer first waited for a sync. Once any
+    /// sync has finished since then, it waits for no further sync.
+    fn yields_to_sync(&self, yielded: &mut Option<u64>) -> bool {
+        if self.syncs == 0 {
+            return false;
+        }
+        match *yielded {
+            Some(synced) if synced != self.synced => false,
+            Some(_) => true,
+            None => {
+                *yielded = Some(self.synced);
+                true
+            }
+        }
+    }
+
     fn compaction_windows(&self) -> usize {
         if self.flushes > 0 {
             MAX_COMPACTION_WINDOWS
         } else {
             MAX_IDLE_COMPACTION_WINDOWS
         }
+    }
+}
+
+/// Mark a Raft log sync as running until the guard drops. While it runs, the SST lane grants
+/// no new window; windows already in writeback finish. The sync itself is not delayed or
+/// skipped, so durability does not change.
+pub(crate) fn raft_sync() -> RaftSync<'static> {
+    LANE.sync()
+}
+
+/// A running Raft log sync.
+pub(crate) struct RaftSync<'a> {
+    lane: &'a Lane,
+}
+
+impl Drop for RaftSync<'_> {
+    fn drop(&mut self) {
+        let mut st = self.lane.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.syncs -= 1;
+        st.synced += 1;
+        drop(st);
+        self.lane.freed.notify_all();
     }
 }
 
@@ -1248,6 +1305,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(lane.state.lock().unwrap().windows, data.len() / 4096);
+    }
+
+    /// A running Raft log sync holds back new windows. A writer waits for at most one sync, so
+    /// back-to-back syncs cannot starve it.
+    #[test]
+    fn new_windows_wait_for_one_raft_sync() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        let lane = Lane::new();
+        let held = lane.acquire(Writer::Compaction);
+        let sync = lane.sync();
+        // A window already in writeback is untouched; a new one waits for the sync.
+        assert!(lane
+            .try_acquire(Writer::Flush, Duration::from_millis(50))
+            .is_none());
+        assert_eq!(lane.state.lock().unwrap().flush_waiting, 0);
+        drop(held);
+        let granted = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _w = lane.acquire(Writer::Flush);
+                granted.store(1, Ordering::SeqCst);
+            });
+            let started = Instant::now();
+            while lane.state.lock().unwrap().flush_waiting == 0 {
+                assert!(started.elapsed().as_secs() < 30, "the flush never waited");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            assert_eq!(
+                granted.load(Ordering::SeqCst),
+                0,
+                "window granted during a sync"
+            );
+            // The next sync starts before the waiter runs. It still gets its window.
+            let next = lane.sync();
+            drop(sync);
+            while granted.load(Ordering::SeqCst) == 0 {
+                assert!(started.elapsed().as_secs() < 30, "the writer starved");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(next);
+        });
+        // With no sync running, windows come at once.
+        drop(
+            lane.try_acquire(Writer::Flush, Duration::from_millis(50))
+                .expect("window"),
+        );
+        let st = lane.state.lock().unwrap();
+        assert_eq!(
+            (st.used, st.flush_waiting, st.syncs, st.synced),
+            (0, 0, 0, 2)
+        );
     }
 
     #[test]

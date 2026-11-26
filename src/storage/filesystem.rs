@@ -28,6 +28,9 @@ impl Handle for LogHandle {
     }
 
     fn sync(&self) -> io::Result<()> {
+        // SST writers start no new writeback while this sync waits for the disk.
+        #[cfg(target_os = "linux")]
+        let _sync = crate::object::paced::raft_sync();
         let start = Instant::now();
         let result = self.sync_file();
         self.metrics.fsync.observe(start.elapsed().as_secs_f64());
