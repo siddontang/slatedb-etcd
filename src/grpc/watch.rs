@@ -18,6 +18,8 @@ struct Watcher {
     _active: Option<crate::metrics::Active>,
     /// The create request. `Stream` keeps its start revision in `start`.
     request: WatchCreateRequest,
+    /// The start revision that the client asked for. Zero or less means the next revision.
+    requested: i64,
     /// The next revision that this watcher can receive.
     /// `None` means `position + 1` of the stream: the watcher follows the feed.
     start: Option<i64>,
@@ -717,6 +719,7 @@ impl Stream {
         if !reason.is_empty() {
             return Ok(());
         }
+        let requested = request.start_revision;
         if request.start_revision <= 0 {
             request.start_revision = created + 1;
         }
@@ -728,6 +731,7 @@ impl Stream {
                 .map(|m| crate::metrics::Active::new(&m.watchers)),
             start: None,
             request,
+            requested,
             progress: tokio::time::Instant::now(),
         };
         // A historical watcher is unsynced. The stream loop reads its pages one at a time.
@@ -767,8 +771,8 @@ impl Stream {
 
     /// Report progress after all events through the current applied revision.
     ///
-    /// etcd drops a progress request when a watcher of the stream starts after the current
-    /// revision, so this does too. A watcher whose events exist but whose catch-up waits on a
+    /// etcd drops a progress request when a watcher of the stream asked for a start after the
+    /// current revision, so this does too. A watcher whose events exist but whose catch-up waits on a
     /// failing store does not drop it. The reply then follows those events, unlike etcd, which
     /// drops such a request too.
     ///
@@ -780,7 +784,7 @@ impl Stream {
         let future = self
             .watchers
             .values()
-            .any(|watcher| watcher.request.start_revision > goal + 1);
+            .any(|watcher| watcher.requested > goal);
         if future {
             return Ok(());
         }
@@ -1932,9 +1936,9 @@ mod tests {
         f.close().await;
     }
 
-    /// As in etcd, a progress request is dropped while a watcher starts above the next
-    /// revision: it gets no reply and holds nothing. Once the store reaches the revision before
-    /// that start, a request gets its reply.
+    /// As in etcd, a progress request is dropped while a watcher asked for a start after the
+    /// current revision: it gets no reply and holds nothing. Once the store reaches that start,
+    /// a request gets its reply.
     #[tokio::test]
     async fn a_future_watch_drops_a_progress_request() {
         let mut f = Fixture::new().await;
@@ -1950,10 +1954,49 @@ mod tests {
         }
         f.stream.progress().unwrap();
         f.stream.settle().await.unwrap();
+        assert!(
+            f.responses().is_empty(),
+            "a reply at 49 before the start 50"
+        );
+        let batch = f.put("other", "50").await;
+        f.stream.batch(&batch).await.unwrap();
+        f.stream.progress().unwrap();
+        f.stream.settle().await.unwrap();
         let progress = f.responses();
         assert_eq!(progress.len(), 1, "{progress:?}");
         assert_eq!(progress[0].watch_id, -1);
-        assert_eq!(progress[0].header.unwrap().revision, 49);
+        assert_eq!(progress[0].header.unwrap().revision, 50);
+        f.close().await;
+    }
+
+    /// As in etcd 3.6.5: at revision 2, a watch from revision 3 drops a progress request. After
+    /// a Put at 3 it gets the event, and a new request gets its reply at 3. A watch from the
+    /// next revision with start 0 does not drop a request at 2.
+    #[tokio::test]
+    async fn an_explicit_start_after_the_revision_drops_a_progress_request() {
+        let mut f = Fixture::new().await;
+        let two = f.put("k", "2").await;
+        f.stream.batch(&two).await.unwrap();
+        f.watch(request(1, "k", 0)).await;
+        f.stream.progress().unwrap();
+        f.stream.settle().await.unwrap();
+        let progress = f.responses();
+        assert_eq!(progress.len(), 1, "{progress:?}");
+        assert_eq!(progress[0].header.unwrap().revision, 2);
+        f.stream.cancel(1).await.unwrap();
+        f.responses();
+        f.watch(request(2, "k", 3)).await;
+        f.stream.progress().unwrap();
+        f.stream.settle().await.unwrap();
+        assert!(f.responses().is_empty(), "a reply at 2 before the start 3");
+        let three = f.put("k", "3").await;
+        f.stream.batch(&three).await.unwrap();
+        assert_eq!(f.events(), [(2, 3, 0)]);
+        f.stream.progress().unwrap();
+        f.stream.settle().await.unwrap();
+        let progress = f.responses();
+        assert_eq!(progress.len(), 1, "{progress:?}");
+        assert_eq!(progress[0].header.unwrap().revision, 3);
         f.close().await;
     }
 
