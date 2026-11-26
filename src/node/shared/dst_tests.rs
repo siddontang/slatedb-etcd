@@ -220,7 +220,7 @@ impl Simulation {
     }
 
     /// Open, materialize, checkpoint, and announce on the leader.
-    async fn publish_view(&mut self, writers: &mut BTreeMap<u64, shared::DstWriter>) {
+    pub(super) async fn publish_view(&mut self, writers: &mut BTreeMap<u64, shared::DstWriter>) {
         let leader = self.leader().unwrap();
         for step in [
             WriterStep::Open,
@@ -257,7 +257,7 @@ impl Simulation {
     }
 
     /// The base index, the checkpoint, and the overlay bytes of member `id`.
-    fn base(&self, id: u64) -> (u64, Option<uuid::Uuid>, u64) {
+    pub(super) fn base(&self, id: u64) -> (u64, Option<uuid::Uuid>, u64) {
         let state = self.nodes[&id].worker.state();
         let (index, _, bytes) = state.view_status().unwrap();
         (index, state.base_checkpoint(), bytes)

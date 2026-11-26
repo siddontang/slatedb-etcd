@@ -375,6 +375,9 @@ impl StateMachine {
         // The planner reads in the background while apply continues. Replicated mode reads the
         // live database, whose compacted history rows do not change. Shared mode pins a view.
         let state = match &self.shared {
+            // A clone of the in-memory state keeps its rows.
+            #[cfg(test)]
+            None if self.is_memory() => self.applied_state().clone(),
             None => StateView::Live(self.db().clone()),
             Some(shared) => shared.pinned(),
         };

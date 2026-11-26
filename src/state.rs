@@ -579,6 +579,31 @@ impl StateMachine {
         &self.reads
     }
 
+    /// Open an empty in-memory state for the reference of the deterministic simulation.
+    ///
+    /// Apply writes each batch into one sorted map at once. The state has no SlateDB database,
+    /// no overlay, no base, no materializer, and no checkpoint. Apply uses the rules of shared
+    /// state mode, because the members of a shared-mode simulation use them. The checkpoint
+    /// namespace is in an unused in-memory object store, and no apply path reads it.
+    #[cfg(test)]
+    pub(crate) async fn open_memory() -> Result<Self> {
+        let store = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let backend = transfer::Backend::Local;
+        let cache = StateCache::default();
+        let location =
+            transfer::Location::open(store.clone(), "state", backend, false, cache, None).await?;
+        let admin = Arc::new(slatedb::admin::Admin::builder(location.root(), store).build());
+        let rows = Arc::new(rows::RowCache::new(0));
+        let reads = StateView::Memory(view::MemoryView::default());
+        Self::load(None, admin, location, rows, reads, None).await
+    }
+
+    /// Return true for a state from `open_memory`.
+    #[cfg(test)]
+    pub(crate) fn is_memory(&self) -> bool {
+        matches!(self.reads, StateView::Memory(_))
+    }
+
     /// Pin the applied state for a read that runs outside apply.
     pub(crate) fn pinned_state(&self) -> Result<StateView> {
         if let Some(shared) = &self.shared {
@@ -655,14 +680,16 @@ impl StateMachine {
         }
         self.put_logical_size(&mut batch, index, size);
         let batch = Arc::new(batch);
-        match &mut self.shared {
-            None => {
+        match (&mut self.shared, &mut self.reads) {
+            #[cfg(test)]
+            (None, StateView::Memory(rows)) => rows.write(&batch),
+            (None, _) => {
                 self.db()
                     .write_with_options(batch.to_storage(), &WriteOptions { seqnum: index })
                     .await?;
             }
             // Apply reads the overlay at once. The leader materializer writes the `Db` later.
-            Some(shared) => shared.overlay.push(index, batch.clone()),
+            (Some(shared), _) => shared.overlay.push(index, batch.clone()),
         }
         self.write_batches += 1;
         if members_saved {
