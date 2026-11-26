@@ -150,27 +150,6 @@ impl Simulation {
         }
     }
 
-    /// Shared mode: compare the loaded fields of each member with the in-memory reference at
-    /// its index. A member that opens or installs a base above its row must also equal it.
-    pub(super) fn check_loaded(&self) -> Result<(), String> {
-        let Some(reference) = self.reference.as_ref().filter(|_| self.shared.is_some()) else {
-            return Ok(());
-        };
-        for (&id, node) in &self.nodes {
-            let state = node.worker.state();
-            let Some(expected) = reference.loaded(state.applied) else {
-                continue;
-            };
-            if state.loaded_fields() != *expected {
-                return Err(format!(
-                    "member {id} loaded other fields at {}",
-                    state.applied
-                ));
-            }
-        }
-        Ok(())
-    }
-
     /// Propose a Put on the leader that no client waits for. With `ignore_value` on a missing
     /// key it fails, so it changes no state and stores no batch.
     pub(super) async fn propose_put(&mut self, put: PutRequest) {
@@ -225,25 +204,6 @@ impl Simulation {
             .collect()
     }
 
-    /// Open, materialize, checkpoint, and announce on the leader.
-    pub(super) async fn publish_view(&mut self, writers: &mut BTreeMap<u64, shared::DstWriter>) {
-        let leader = self.leader().unwrap();
-        for step in [
-            WriterStep::Open,
-            WriterStep::Materialize,
-            WriterStep::Checkpoint,
-            WriterStep::Announce,
-        ] {
-            let open = writers
-                .get(&leader)
-                .is_some_and(|writer| writer.db.is_some());
-            if matches!(step, WriterStep::Open) && open {
-                continue;
-            }
-            self.writer_step(writers, leader, step).await;
-        }
-    }
-
     /// Complete the manual checkpoints of member `id` that its base allows, as the run loop
     /// does after each event.
     fn finish_checkpoints(&mut self, id: u64) {
@@ -260,13 +220,6 @@ impl Simulation {
             .unwrap()
             .queue
             .pushed()
-    }
-
-    /// The base index, the checkpoint, and the overlay bytes of member `id`.
-    pub(super) fn base(&self, id: u64) -> (u64, Option<uuid::Uuid>, u64) {
-        let state = self.nodes[&id].worker.state();
-        let (index, _, bytes) = state.view_status().unwrap();
-        (index, state.base_checkpoint(), bytes)
     }
 }
 

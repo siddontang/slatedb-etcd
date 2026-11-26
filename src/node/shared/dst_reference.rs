@@ -176,6 +176,53 @@ impl ViewPoint {
 }
 
 impl Simulation {
+    /// Shared mode: compare the loaded fields of each member with the in-memory reference at
+    /// its index. A member that opens or installs a base above its row must also equal it.
+    fn check_loaded(&self) -> Result<(), String> {
+        let Some(reference) = self.reference.as_ref().filter(|_| self.shared.is_some()) else {
+            return Ok(());
+        };
+        for (&id, node) in &self.nodes {
+            let state = node.worker.state();
+            let Some(expected) = reference.loaded(state.applied) else {
+                continue;
+            };
+            if state.loaded_fields() != *expected {
+                return Err(format!(
+                    "member {id} loaded other fields at {}",
+                    state.applied
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Open, materialize, checkpoint, and announce on the leader.
+    pub(super) async fn publish_view(&mut self, writers: &mut BTreeMap<u64, shared::DstWriter>) {
+        let leader = self.leader().unwrap();
+        for step in [
+            WriterStep::Open,
+            WriterStep::Materialize,
+            WriterStep::Checkpoint,
+            WriterStep::Announce,
+        ] {
+            let open = writers
+                .get(&leader)
+                .is_some_and(|writer| writer.db.is_some());
+            if matches!(step, WriterStep::Open) && open {
+                continue;
+            }
+            self.writer_step(writers, leader, step).await;
+        }
+    }
+
+    /// The base index, the checkpoint, and the overlay bytes of member `id`.
+    pub(super) fn base(&self, id: u64) -> (u64, Option<uuid::Uuid>, u64) {
+        let state = self.nodes[&id].worker.state();
+        let (index, _, bytes) = state.view_status().unwrap();
+        (index, state.base_checkpoint(), bytes)
+    }
+
     /// Run `check_views`, and fail the simulation on a difference.
     pub(super) async fn check_reference(&mut self) {
         if let Err(error) = self.check_views().await {
