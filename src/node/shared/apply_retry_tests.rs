@@ -533,10 +533,10 @@ enum BaseFault {
     Corrupt,
 }
 
-/// A shared member at index 1 gets a checkpoint of index 4 that does not load, through an
-/// install or an adoption. Apply holds instead of stopping, and it reports the hold. A newer
-/// snapshot ends the job, and the state stays as it was.
-async fn base_hold(fault: BaseFault, install: bool) {
+/// A shared member at index 1 gets a snapshot of index 4 whose checkpoint does not load. Apply
+/// holds instead of stopping, and it reports the hold. A newer snapshot ends the job, and the
+/// state stays as it was.
+async fn base_hold(fault: BaseFault) {
     use crate::state::shared::tests::{checkpoint, options, put, writer};
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     let open = |cache| {
@@ -577,20 +577,16 @@ async fn base_hold(fault: BaseFault, install: bool) {
     }
     behind.apply_etcd(1, &large("k1")).await.unwrap();
     let id = base.checkpoint.unwrap();
-    let job = if install {
-        drop(base);
-        let source = behind.shared.as_ref().unwrap().source.clone();
-        source.receive(id).await.unwrap();
-        let mut snapshot = Snapshot::default();
-        snapshot.mut_metadata().index = 4;
-        snapshot.mut_metadata().term = 4;
-        snapshot.data = crate::state::transfer::ViewDescriptor::new(id)
-            .encode()
-            .unwrap();
-        Job::Snapshot(snapshot)
-    } else {
-        Job::AdoptBase { base, term: 4 }
-    };
+    drop(base);
+    let source = behind.shared.as_ref().unwrap().source.clone();
+    source.receive(id).await.unwrap();
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = 4;
+    snapshot.mut_metadata().term = 4;
+    snapshot.data = crate::state::transfer::ViewDescriptor::new(id)
+        .encode()
+        .unwrap();
+    let job = Job::Snapshot(snapshot);
     if fault == BaseFault::Missing {
         faults.set(crate::object::faults::LOSE_SST_TWICE);
     }
@@ -635,22 +631,113 @@ async fn base_hold(fault: BaseFault, install: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_missing_object_holds_an_install() {
-    base_hold(BaseFault::Missing, true).await;
+    base_hold(BaseFault::Missing).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn corrupt_data_holds_an_install() {
-    base_hold(BaseFault::Corrupt, true).await;
+    base_hold(BaseFault::Corrupt).await;
+}
+
+/// A shared member at index 1 opens a base of index 4 that does not load. The adoption drops
+/// the base instead of holding: the member keeps its base and overlay, and it applies the next
+/// entry. A later base that loads is adopted.
+async fn base_drop(fault: BaseFault) {
+    use crate::state::shared::tests::{checkpoint, options, put, writer};
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let open = |cache| {
+        let store: Arc<dyn ObjectStore> = faults.clone();
+        async move {
+            StateMachine::open_shared(
+                store,
+                "cluster",
+                "test",
+                cache,
+                &options(),
+                crate::state::transfer::Backend::Local,
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let large = |key: &str| put(key, &"v".repeat(8 << 10));
+    let mut ahead = open(Default::default()).await;
+    let mut behind = open(COLD).await;
+    for state in [&mut ahead, &mut behind] {
+        state.entry_term = 4;
+    }
+    let writer = writer(&ahead).await;
+    let mut written = 0;
+    for n in 1..=4 {
+        ahead.apply_etcd(n, &large(&format!("k{n}"))).await.unwrap();
+    }
+    let mut base = checkpoint(&ahead, &writer, &mut written).await;
+    if fault == BaseFault::Corrupt {
+        // The checkpoint keeps index 4, with a members row that does not decode.
+        writer
+            .put(crate::cluster::KEY, b"{not a members row")
+            .await
+            .unwrap();
+        base = checkpoint(&ahead, &writer, &mut written).await;
+    }
+    behind.apply_etcd(1, &large("k1")).await.unwrap();
+    let (events, _) = mpsc::channel(8);
+    let mut worker = Worker::start(behind, events, true, None);
+    let adopt = |base| Work {
+        job: Job::AdoptBase { base, term: 4 },
+        header: HEADER,
+        delay: Duration::ZERO,
+    };
+    if fault == BaseFault::Missing {
+        faults.set(crate::object::faults::LOSE_SST_TWICE);
+    }
+    worker.submit(adopt(base.clone())).unwrap();
+    let dropped = tokio::time::timeout(Duration::from_secs(5), worker.step())
+        .await
+        .expect("the adoption waited")
+        .unwrap()
+        .unwrap();
+    faults.set(0);
+    assert!(dropped.early);
+    assert_eq!(dropped.applied, 1);
+    let Output::RejectedBase(rejected) = dropped.output else {
+        panic!("the adoption did not drop its base");
+    };
+    assert_eq!(rejected.checkpoint, base.checkpoint);
+    assert_eq!(rejected.index, 4);
+    let class = match fault {
+        BaseFault::Missing => crate::mvcc::storage_fault::StorageFault::Missing,
+        BaseFault::Corrupt => crate::mvcc::storage_fault::StorageFault::Corrupt,
+    };
+    assert_eq!(rejected.fault, class);
+    assert_eq!(worker.control.paused(), None);
+    // The member keeps applying on its own base.
+    worker.submit(entries(vec![put_entry(2, "k2")])).unwrap();
+    assert_eq!(worker.step().await.unwrap().unwrap().applied, 2);
+    if fault == BaseFault::Corrupt {
+        // A newer checkpoint at the same index has no members row, so it loads.
+        writer.delete(crate::cluster::KEY).await.unwrap();
+        base = checkpoint(&ahead, &writer, &mut written).await;
+    }
+    worker.submit(adopt(base.clone())).unwrap();
+    let adopted = worker.step().await.unwrap().unwrap();
+    assert!(matches!(adopted.output, Output::Adopted(_)));
+    assert_eq!(adopted.applied, 4);
+    assert_eq!(worker.state().base_checkpoint(), base.checkpoint);
+    drop(base);
+    worker.state_mut().close().await.unwrap();
+    ahead.close().await.unwrap();
+    writer.close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_missing_object_holds_an_adoption() {
-    base_hold(BaseFault::Missing, false).await;
+async fn an_adoption_drops_a_base_with_a_missing_object() {
+    base_drop(BaseFault::Missing).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn corrupt_data_holds_an_adoption() {
-    base_hold(BaseFault::Corrupt, false).await;
+async fn an_adoption_drops_a_base_with_corrupt_data() {
+    base_drop(BaseFault::Corrupt).await;
 }
 
 /// How `install_keeps_its_base` ends the install job.

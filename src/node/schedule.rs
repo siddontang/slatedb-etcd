@@ -416,8 +416,15 @@ impl Node {
             Output::Read { response, outcome } => response.kv(outcome)?,
             Output::Linear { id, outcome } => self.finish_read(id, outcome)?,
             // Raft took the ConfState of a snapshot that it accepted above the adopted base.
-            Output::Adopted(conf) if self.installing() => drop(conf),
-            Output::Adopted(conf) => shared::reconcile_conf(&mut self.raw, &conf)?,
+            Output::Adopted(conf) if self.installing() => {
+                self.base_adopted();
+                drop(conf)
+            }
+            Output::Adopted(conf) => {
+                self.base_adopted();
+                shared::reconcile_conf(&mut self.raw, &conf)?
+            }
+            Output::RejectedBase(rejected) => self.reject_base(rejected),
             Output::Checkpoint(built) => {
                 if let Some(built) = built {
                     self.checkpoint_built(built)?;

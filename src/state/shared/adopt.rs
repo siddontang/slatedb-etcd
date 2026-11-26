@@ -195,7 +195,8 @@ impl StateMachine {
 }
 
 /// Mark an error of the load of a new base. A storage error keeps its class. Any other error is
-/// a row of the base that does not decode or contradicts another row.
+/// a row of the base that does not decode or contradicts another row. The load also builds the
+/// state meters, which fail only on invalid static options, so no member-local error comes here.
 fn candidate_fault(error: anyhow::Error) -> anyhow::Error {
     match crate::mvcc::storage_fault::classify(&error) {
         Some(_) => crate::mvcc::storage_fault::read_cause(error),

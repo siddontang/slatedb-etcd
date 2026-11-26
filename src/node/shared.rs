@@ -242,6 +242,9 @@ pub(super) struct Writer {
     pub switch_due: bool,
     /// Apply waits while the overlay is over the hard limit.
     pub paused: bool,
+    /// The last opened base that an adoption dropped, with its failure count. A later poll
+    /// tries the newest checkpoint again. An adopted base ends the report.
+    rejected_base: Option<(apply::RejectedBase, u64)>,
     /// A paused member polls the checkpoint list. Only one poll runs at a time.
     polling: Arc<std::sync::atomic::AtomicBool>,
     ticks: u64,
@@ -405,6 +408,7 @@ impl Writer {
             opened_slot: handles.opened.clone(),
             switch_due: false,
             paused: false,
+            rejected_base: None,
             polling: Arc::default(),
             ticks: 0,
         }
@@ -533,6 +537,13 @@ impl Writer {
             "announced": self.announced,
             "running": self.running(),
             "paused": self.paused,
+            "rejected_base": self.rejected_base.as_ref().map(|(rejected, failures)| json!({
+                "checkpoint": rejected.checkpoint.map(|id| id.to_string()),
+                "index": rejected.index,
+                "class": format!("{:?}", rejected.fault).to_lowercase(),
+                "reason": rejected.reason,
+                "failures": failures,
+            })),
             "clock_skew_ms": self.clock.skew.load(std::sync::atomic::Ordering::Relaxed),
             "clock_alarm": self.clock.alarm.load(std::sync::atomic::Ordering::Relaxed),
             "reopens": self.reopens.load(std::sync::atomic::Ordering::Relaxed),
@@ -1709,6 +1720,39 @@ impl Node {
             writer.paused = false;
         }
         writer.paused
+    }
+
+    /// Report a base that an adoption dropped. A paused member opens the newest checkpoint at
+    /// each poll, so the same base can fail again. Only its first failure logs. Each failure of
+    /// corrupt data counts as a corrupt read.
+    pub(super) fn reject_base(&mut self, rejected: apply::RejectedBase) {
+        if rejected.fault == crate::mvcc::storage_fault::StorageFault::Corrupt {
+            crate::mvcc::storage_fault::CORRUPT_READS.inc();
+        }
+        let Some(writer) = &mut self.writer else {
+            return;
+        };
+        let failures = match &writer.rejected_base {
+            Some((last, failures)) if last.checkpoint == rejected.checkpoint => failures + 1,
+            _ => {
+                tracing::error!(
+                    checkpoint = ?rejected.checkpoint,
+                    index = rejected.index,
+                    fault = ?rejected.fault,
+                    reason = rejected.reason,
+                    "drop a base that does not load; keep the current base"
+                );
+                1
+            }
+        };
+        writer.rejected_base = Some((rejected, failures));
+    }
+
+    /// An adoption succeeded, so no dropped base waits.
+    pub(super) fn base_adopted(&mut self) {
+        if let Some(writer) = &mut self.writer {
+            writer.rejected_base = None;
+        }
     }
 
     /// Return the index and log term of an opened base that a paused member can adopt: the

@@ -4,7 +4,7 @@ use raft::eraftpb::Snapshot;
 
 #[path = "shared/apply_retry.rs"]
 mod retry;
-pub(super) use retry::{Control, Paused, Waited};
+pub(super) use retry::{Adoption, Control, Paused, RejectedBase, Waited};
 
 pub(super) const BATCH_ENTRIES: u64 = 32;
 /// Committed-entry jobs that may wait in the apply queue behind the running job.
@@ -243,6 +243,8 @@ pub(super) enum Output {
     /// Shared mode adopted a checkpoint in process. Raft takes its ConfState, because the
     /// skipped entries can hold membership changes.
     Adopted(raft::eraftpb::ConfState),
+    /// Shared mode dropped an opened base that does not load, and it kept its own base.
+    RejectedBase(RejectedBase),
     Reads(Vec<Output>),
     SharedLinear(Vec<u64>, std::sync::Arc<Outcome>),
     Linear {
@@ -285,13 +287,10 @@ pub(super) struct Completion {
     pub applied: u64,
     pub state: Option<AppliedState>,
     pub output: Output,
-    /// A covering snapshot ended the job before its last entry. `applied` is the end of the
-    /// applied prefix.
+    /// The job ended below its target: a covering snapshot ended it before its last entry, or an
+    /// adoption dropped its base. `applied` is the end of the applied prefix.
     pub early: bool,
 }
-
-/// The message of a state read that waits for a snapshot after a failed rebase replay.
-const RECOVERING: &str = "storage unavailable; apply waits for a snapshot; retry";
 
 struct Executor {
     state: StateMachine,
@@ -302,10 +301,10 @@ struct Executor {
     log: Option<crate::storage::LogReader>,
     /// The stop and preemption of a job that waits on a storage error, and its pause report.
     signals: retry::Signals,
-    /// The applied index that the node already published, while the state is below it. A
-    /// rebase replay that failed sets it, and only the install of a covering snapshot ends it.
-    /// See `recovering_job`.
-    recovering: Option<u64>,
+    /// The applied index that this worker last reported, while the state is below it: the end
+    /// of the prefix of a job whose rebase replay failed. Only the install of a covering
+    /// snapshot ends it. See `recovering_job`.
+    reported: Option<u64>,
     /// Runs once after a rebase adopted its base and before it replays, for tests. Its error
     /// fails the replay.
     #[cfg(test)]
@@ -357,7 +356,7 @@ impl Executor {
             }
             _ => {}
         }
-        if self.recovering.is_some() && !matches!(work.job, Job::Snapshot(_)) {
+        if self.reported.is_some() && !matches!(work.job, Job::Snapshot(_)) {
             return self.recovering_job(work.job);
         }
         let changes_state = matches!(
@@ -396,7 +395,7 @@ impl Executor {
                 early = ended.is_some();
                 // A rebase replay that failed left the state below the applied prefix, which the
                 // node publishes with this job. Only the snapshot can replace that state.
-                self.recovering = ended.filter(|prefix| *prefix > self.state.applied);
+                self.reported = ended.filter(|prefix| *prefix > self.state.applied);
                 Output::Entries(replies)
             }
             Job::PreparePuts { commands, term } => {
@@ -418,11 +417,16 @@ impl Executor {
                 Output::Entries(Vec::new())
             }
             Job::AdoptBase { base, term } => match self.adopt_retrying(base, term).await? {
-                Waited::Again => Output::Adopted(self.state.members.conf()),
+                Adoption::Adopted => Output::Adopted(self.state.members.conf()),
                 // A newer snapshot replaces this adoption.
-                Waited::Covered => {
+                Adoption::Covered => {
                     early = true;
                     Output::Entries(Vec::new())
+                }
+                // The member keeps its base. The job ends below the index of the dropped base.
+                Adoption::Dropped(rejected) => {
+                    early = true;
+                    Output::RejectedBase(rejected)
                 }
             },
             Job::RaiseBase(snapshot) => {
@@ -437,7 +441,7 @@ impl Executor {
                 }
                 // An object snapshot replaces the database. The node rebinds its handles.
                 Waited::Again => {
-                    self.recovering = None;
+                    self.reported = None;
                     Output::Snapshot(Rebound {
                         db: self.state.database(),
                         admin: self.state.admin.clone(),
@@ -555,12 +559,12 @@ impl Executor {
 
     /// Build the completion of each job. `copy` gives the revision before the job when the
     /// node takes a copy of the state. While the executor recovers, the state is below the
-    /// published index. The completion then reports that index and no state, so the node keeps
-    /// its published view.
+    /// index that this worker last reported. The completion then reports that index and no
+    /// state, so the node keeps its published view.
     fn completion(&mut self, output: Output, early: bool, copy: Option<i64>) -> Result<Completion> {
-        if let Some(published) = self.recovering {
+        if let Some(reported) = self.reported {
             return Ok(Completion {
-                applied: published,
+                applied: reported,
                 state: None,
                 output,
                 early: true,
@@ -585,32 +589,16 @@ impl Executor {
         })
     }
 
-    /// Run a job while the state is below the published index. Only the install of a snapshot
-    /// changes the state then, and no job reads it. Committed entries end early, because the
-    /// snapshot covers them. A state read fails with a retryable error. Other jobs do nothing.
+    /// Run a job while the state is below the index that this worker last reported. Only
+    /// committed entries that the node queued before Raft accepted the snapshot can come then,
+    /// besides the install. They end early, because the snapshot covers them. The node starts
+    /// other work only when no job runs and no snapshot waits, so any other job is an error of
+    /// the node. See `Node::schedule_apply`.
     fn recovering_job(&mut self, job: Job) -> Result<Completion> {
-        let output = match job {
-            Job::Query(Query::Linear(..) | Query::Read(..)) => {
-                anyhow::bail!("read reached the apply worker")
-            }
-            Job::Query(query) => {
-                query.reject(ApiError {
-                    error: RECOVERING.to_owned(),
-                    leader_id: 0,
-                });
-                Output::Reads(Vec::new())
-            }
-            Job::PreparePuts { commands, .. } => {
-                Output::Unprepared(commands.last().map_or(0, |(index, _)| *index))
-            }
-            // A checkpoint result would set the record. The node starts none while Raft holds a
-            // snapshot that apply did not install.
-            Job::Checkpoint { .. } => {
-                anyhow::bail!("a checkpoint reached apply while it waits for a snapshot")
-            }
-            _ => Output::Entries(Vec::new()),
-        };
-        self.completion(output, true, None)
+        match job {
+            Job::Entries(_) => self.completion(Output::Entries(Vec::new()), true, None),
+            _ => anyhow::bail!("only entries and a snapshot reach apply while it waits for one"),
+        }
     }
 }
 
@@ -652,7 +640,7 @@ impl Worker {
             inline_checkpoints: manual,
             log,
             signals,
-            recovering: None,
+            reported: None,
             #[cfg(test)]
             before_replay: None,
         };

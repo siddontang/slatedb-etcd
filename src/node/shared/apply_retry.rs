@@ -132,6 +132,27 @@ pub(in crate::node) enum Waited {
     Covered,
 }
 
+/// How the adoption of an opened base ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::node) enum Adoption {
+    Adopted,
+    /// A snapshot covers the base. The state did not change.
+    Covered,
+    /// The base does not load. The state did not change.
+    Dropped(RejectedBase),
+}
+
+/// An opened base that an adoption dropped, because an object is missing or its data is
+/// corrupt. The node reports it in `/status`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::node) struct RejectedBase {
+    pub checkpoint: Option<uuid::Uuid>,
+    /// The index of the base.
+    pub index: u64,
+    pub fault: StorageFault,
+    pub reason: String,
+}
+
 /// The tries of one job after storage errors.
 #[derive(Default)]
 pub(super) struct Retry {
@@ -353,32 +374,40 @@ impl Executor {
     }
 
     /// Adopt an opened base. A storage error of the load leaves the state as it was. A
-    /// transient error runs the adoption again. A missing object or corrupt data holds it, and
-    /// apply checks it again every `HOLD_RECHECK`. A snapshot above the base ends the wait with
-    /// `Waited::Covered`, and the state stays as it was.
+    /// transient error runs the adoption again, and a snapshot above the base ends that wait. A
+    /// missing object or corrupt data drops the base: the member keeps its current base and
+    /// overlay, and the node tries the next base that it opens.
     pub(super) async fn adopt_retrying(
         &mut self,
         base: std::sync::Arc<crate::state::view::Base>,
         term: u64,
-    ) -> Result<Waited> {
+    ) -> Result<Adoption> {
         let mut retry = Retry::default();
         let index = base.applied + 1;
         loop {
             let adopted = self.state.adopt_opened(base.clone(), term).await;
-            let (fault, error) = match adopted.map_err(|error| (retryable(&error), error)) {
-                Err((Some(fault), error)) => (fault, error),
+            let error = match adopted.map_err(|error| (retryable(&error), error)) {
+                Err((Some(StorageFault::Transient), error)) => error,
+                Err((Some(fault), error)) => {
+                    retry.done(&self.signals);
+                    return Ok(Adoption::Dropped(RejectedBase {
+                        checkpoint: base.checkpoint,
+                        index: base.applied,
+                        fault,
+                        reason: format!("{error:#}"),
+                    }));
+                }
                 adopted => {
                     retry.done(&self.signals);
-                    return adopted.map(|()| Waited::Again).map_err(|(_, error)| error);
+                    return adopted
+                        .map(|()| Adoption::Adopted)
+                        .map_err(|(_, error)| error);
                 }
             };
-            if retry
-                .wait_base(&mut self.signals, index, fault, &error)
-                .await?
-                == Waited::Covered
-            {
+            let fault = StorageFault::Transient;
+            if retry.wait(&mut self.signals, index, fault, &error).await? == Waited::Covered {
                 retry.done(&self.signals);
-                return Ok(Waited::Covered);
+                return Ok(Adoption::Covered);
             }
         }
     }

@@ -730,11 +730,16 @@ it first: the Auth store, the leases, the counters, and the members row. Only th
 member drop its overlay and its materializer queue. A failed read leaves the state as it was,
 and apply runs the step again after the same backoff. A row of the new base that does not
 decode or contradicts another row is corrupt data. A missing object or corrupt data in the base
-of an install or an adoption holds apply, as corrupt data in an entry does, and a newer snapshot
-ends the hold. A rebase replay that fails leaves the state
-below the index that the member published. If a snapshot then ends the job, each later job
-reports that index and no state. Queued entries end early, and a state read such as Status,
-HashKV, or a backup fails with `Unavailable`. The install of the snapshot ends this.
+of an install holds apply, as corrupt data in an entry does, and a newer snapshot ends the hold.
+An adoption instead drops such a base and keeps its current base and overlay. The member logs
+the first failure of each checkpoint, counts corrupt data in `slatedb_etcd_read_corrupt_total`,
+and reports the checkpoint in `shared_state.writer.rejected_base` of `/status`. The next poll
+tries the newest checkpoint again, and a good one ends the report.
+
+A rebase replay that fails leaves the state below the end of the applied prefix of its job. If a
+snapshot then ends the job, the job reports that end and no state. The entries that the node
+queued behind it end early and report the same index. The node starts no other job until the
+install, so a state read such as Status, HashKV, or a backup waits in its queue until then.
 
 An early Put reply evaluates its entries before the state write, and they can be uncommitted. A
 storage error there does not retry, because a new leader can replace the entries. Early replies
