@@ -286,9 +286,9 @@ async fn readiness_works_with_auth_and_drop_requests_shutdown() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_failure_reaches_host_and_releases_storage() {
     let dir = tempfile::tempdir().unwrap();
-    let mut server = Server::start(ServerConfig::single_node(dir.path()))
-        .await
-        .unwrap();
+    let mut config = ServerConfig::single_node(dir.path());
+    config.fault_controls = true;
+    let mut server = Server::start(config).await.unwrap();
     ready(&server).await;
     put(&server, b"anchor", b"durable").await;
     let config = server.config().clone();
@@ -321,6 +321,39 @@ async fn worker_failure_reaches_host_and_releases_storage() {
     let server = Server::start(config).await.unwrap();
     ready(&server).await;
     assert_eq!(get(&server, b"anchor").await, b"durable");
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fault_controls_are_off_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(ServerConfig::single_node(dir.path()))
+        .await
+        .unwrap();
+    ready(&server).await;
+    let http = reqwest::Client::new();
+    for path in [
+        "/debug/partition",
+        "/debug/snapshot-delay",
+        "/debug/apply-delay",
+        "/debug/log-fault",
+        "/debug/log-read-fault",
+    ] {
+        let response = http
+            .post(format!("{}{path}", server.client_url()))
+            .json(&serde_json::json!({"fail": true, "delay_ms": 1, "blocked": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+    }
+    let status = http
+        .get(format!("{}/status", server.client_url()))
+        .send()
+        .await
+        .unwrap();
+    assert!(status.status().is_success());
+    put(&server, b"after", b"faults").await;
     server.shutdown().await.unwrap();
 }
 

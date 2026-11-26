@@ -19,6 +19,7 @@ by default. `--allow-remote` permits remote IPs and DNS names with separate mutu
 | `--join` | Join an existing cluster after MemberAdd. Start with a new directory. |
 | `--restore-snapshot` | Restore a native backup into a new directory; conflicts with `--join`. |
 | `--strict-reconfig-check` | `true` by default. Requires an explicit `true` or `false` value. |
+| `--enable-fault-controls` | Serve the `/debug` fault controls. Off by default; tests only. |
 
 Without a separate peer listener, the plaintext port also serves trusted diagnostic controls.
 With separate listeners, the client port exposes gRPC and the peer port carries internal traffic.

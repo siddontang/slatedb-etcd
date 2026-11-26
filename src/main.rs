@@ -162,6 +162,9 @@ struct Args {
     /// a known race against a new leader.
     #[arg(long, value_enum, default_value = "off")]
     view_retention: slatedb_etcd::state::ViewRetention,
+    /// Serve the trusted /debug fault controls. Test clusters only; off by default.
+    #[arg(long)]
+    enable_fault_controls: bool,
     /// Size of one Raft log file. Truncation frees disk space one whole file at a time.
     #[arg(long, default_value_t = slatedb_etcd::storage::DEFAULT_LOG_FILE_BYTES)]
     log_file_bytes: u64,
@@ -367,6 +370,7 @@ async fn run(args: Args) -> Result<()> {
         overlay_max_bytes: args.overlay_max_bytes,
         max_clock_skew: args.max_clock_skew,
         view_retention: args.view_retention,
+        fault_controls: args.enable_fault_controls,
     };
     let mut server = Server::start(config).await?;
     tracing::info!(node = args.id, listen = %server.client_addr(), "Node started");

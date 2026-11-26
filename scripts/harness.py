@@ -82,7 +82,8 @@ class Cluster:
         log = (self.root / f"node-{node}.log").open("ab")
         command = [str(self.binary), "--id", str(node), "--listen",
                    f"127.0.0.1:{self.ports[node]}", "--dir", str(self.root / f"node-{node}"),
-                   "--cluster-id", self.cluster_id, "--snapshot-every", str(self.snapshot_every)]
+                   "--cluster-id", self.cluster_id, "--snapshot-every", str(self.snapshot_every),
+                   "--enable-fault-controls"]
         command.extend(self.extra)
         for peer, port in self.ports.items():
             command.extend(["--peer", f"{peer}=127.0.0.1:{port}"])
