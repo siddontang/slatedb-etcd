@@ -640,13 +640,12 @@ impl Stream {
         };
         // Check the range before the create takes a member slot. A denied create whose
         // acknowledgment waits for a slow client must not hold one.
-        let denied = match reason {
-            "" => permit(&state.view.auth, &self.credentials(), &request).err(),
-            _ => None,
-        };
-        let slot = match (reason, &denied) {
-            ("", None) => self.limits.admit(),
-            _ => Ok(None),
+        let slot = if reason.is_empty()
+            && permit(&state.view.auth, &self.credentials(), &request).is_ok()
+        {
+            self.limits.admit()
+        } else {
+            Ok(None)
         };
         let reason = if slot.is_err() {
             "watch limit exceeded"
@@ -661,7 +660,8 @@ impl Stream {
             self.next_id += 1;
         }
         let header = state.header(self.position);
-        // Release the state before the send.
+        let auth = state.view.auth.clone();
+        // Release the state before the send. The Auth store does not pin the view.
         drop(state);
         send(
             &self.tx,
@@ -679,15 +679,14 @@ impl Stream {
             },
         )
         .await?;
-        if let Some(error) = denied {
-            return Err(error);
-        }
         if !reason.is_empty() {
             return Ok(());
         }
         if request.start_revision <= 0 {
             request.start_revision = self.position + 1;
         }
+        // A token can expire while the acknowledgment waits for the client.
+        permit(&auth, &self.credentials(), &request)?;
         let watcher = Watcher {
             _active: self
                 .meters
@@ -1540,6 +1539,69 @@ mod tests {
         f.close().await;
     }
 
+    /// A token that expires while the create acknowledgment waits for a slow client ends the
+    /// stream after the acknowledgment. The create installs no watcher and returns its slot.
+    #[tokio::test]
+    async fn a_token_that_expires_during_the_acknowledgment_ends_the_stream() {
+        let mut f = Fixture::new().await;
+        let mut auth = crate::auth::Store::default();
+        auth.enabled = true;
+        let user = crate::auth::User {
+            password: "p".into(),
+            roles: ["root".to_string()].into(),
+            ..Default::default()
+        };
+        auth.users.insert("root".into(), user);
+        // The token is valid for at least one more second.
+        let expires = now() + 2;
+        let issue = crate::auth::Command::IssueToken {
+            name: "root".into(),
+            password: "p".into(),
+            token: "t".into(),
+            expires,
+        };
+        auth.execute(&Default::default(), &issue, 0).unwrap();
+        f.state.auth = Arc::new(auth);
+        f.feed.send_replace(feed_state(&f.state));
+        let shared = limits(WatchOptions {
+            max_watchers: 1,
+            ..Default::default()
+        });
+        let credentials = crate::auth::Credentials {
+            token: "t".into(),
+            ..Default::default()
+        };
+        // The slow stream's output already holds a response it has not read.
+        let (tx, mut slow_output) = mpsc::channel(1);
+        tx.try_send(Ok(WatchResponse::default())).unwrap();
+        let mut slow = Stream::new(
+            tx,
+            false,
+            credentials,
+            None,
+            f.feed.subscribe(),
+            shared.clone(),
+        );
+        let create = tokio::spawn(async move {
+            let result = slow.create(request(1, "k", 0)).await;
+            (result, slow)
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!create.is_finished());
+        while now() < expires {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        slow_output.recv().await.unwrap().unwrap();
+        assert!(slow_output.recv().await.unwrap().unwrap().created);
+        let (result, slow) = create.await.unwrap();
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Unauthenticated);
+        assert!(slow.watchers.is_empty());
+        assert_eq!(shared.watchers.load(Ordering::Relaxed), 0);
+        f.close().await;
+    }
+
     /// Zero limits mean no limit, so one stream holds more than the default stream limit.
     #[tokio::test]
     async fn zero_limits_admit_watchers_past_the_default() {
@@ -1778,8 +1840,8 @@ mod tests {
             .unwrap()
     }
 
-    /// A client that leaves while its create scans history returns the member slot at once,
-    /// before the scan ends.
+    /// Streams share the member limit. A client that leaves while its create scans history
+    /// returns the member slot at once, before the scan ends.
     #[tokio::test]
     async fn a_closed_stream_releases_its_slot_during_a_history_scan() {
         let mut f = Fixture::new().await;
@@ -1799,14 +1861,20 @@ mod tests {
         requests.send(create(old)).await.unwrap();
         member.barrier().await.send(()).unwrap();
         assert!(!next(&mut output).await.canceled);
-        // The create now waits in its history scan. The client leaves.
+        // The create now waits in its history scan and holds the only slot.
+        let (others, mut other) = member.open().await;
+        others.send(create(request(1, "k", 0))).await.unwrap();
+        member.barrier().await.send(()).unwrap();
+        let refused = next(&mut other).await;
+        assert!(refused.canceled);
+        assert_eq!(refused.cancel_reason, "watch limit exceeded");
+        // The first client leaves. The second stream gets the slot while the scan is held.
         drop((requests, output));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let (requests, mut output) = member.open().await;
-            requests.send(create(request(1, "k", 0))).await.unwrap();
+            others.send(create(request(1, "k", 0))).await.unwrap();
             member.barrier().await.send(()).unwrap();
-            let created = next(&mut output).await;
+            let created = next(&mut other).await;
             if !created.canceled {
                 break;
             }
