@@ -1,0 +1,36 @@
+name: Start RustFS
+description: >-
+  Start one pinned RustFS server for the job. Clusters of several members run in shared state
+  mode on it. Later steps reuse it through the exported settings.
+runs:
+  using: composite
+  steps:
+    - name: Restore the RustFS release archive
+      uses: actions/cache@v4
+      with:
+        path: tmp/s3-tools
+        key: rustfs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/rustfs_fixture.py') }}
+    - name: Start the RustFS server
+      shell: bash
+      run: |
+        # The fixture checks the pinned archive checksum. It deletes the objects when the job ends.
+        settings="$RUNNER_TEMP/rustfs.env"
+        nohup python3 scripts/rustfs_fixture.py --env-file "$settings" \
+          > "$RUNNER_TEMP/rustfs.log" 2>&1 &
+        server=$!
+        for _ in $(seq 1 1200); do
+          if [ -s "$settings" ] || ! kill -0 "$server" 2>/dev/null; then break; fi
+          sleep 0.1
+        done
+        if [ ! -s "$settings" ]; then
+          cat "$RUNNER_TEMP/rustfs.log"
+          echo "RustFS did not start" >&2
+          exit 1
+        fi
+        . "$settings"
+        echo "::add-mask::$AWS_SECRET_ACCESS_KEY"
+        for name in SLATEDB_S3_TEST_ENDPOINT SLATEDB_S3_TEST_BUCKET AWS_ACCESS_KEY_ID \
+            AWS_SECRET_ACCESS_KEY AWS_EC2_METADATA_DISABLED; do
+          echo "$name=${!name}" >> "$GITHUB_ENV"
+        done
+        echo "RustFS serves at $SLATEDB_S3_TEST_ENDPOINT"
