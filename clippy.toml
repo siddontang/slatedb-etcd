@@ -1,0 +1,23 @@
+# Reads of a member's SlateDB database must hold a `ReadGuard`, or GC may delete an SST
+# that they still use. `StateRead` takes one for each read.
+disallowed-methods = [
+  { path = "slatedb::Db::get", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::Db::get_with_options", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::Db::get_key_value", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::Db::get_key_value_with_options", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::Db::scan", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::Db::scan_with_options", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::Db::scan_prefix", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::Db::scan_prefix_with_options", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::Db::scan_prefix_by_recency", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::Db::scan_prefix_by_recency_with_options", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::Db::begin", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::DbSnapshot::get", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::DbSnapshot::get_with_options", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::DbSnapshot::get_key_value", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::DbSnapshot::get_key_value_with_options", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::DbSnapshot::scan", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::DbSnapshot::scan_with_options", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::DbSnapshot::scan_prefix", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+  { path = "slatedb::DbSnapshot::scan_prefix_with_options", reason = "read through StateRead so the read holds a ReadGuard (src/state/read_guard.rs)" },
+]

@@ -716,8 +716,8 @@ async fn observe(
 }
 
 async fn stored_rows(db: &Db) -> Result<Rows> {
-    let progress = db.get(PROGRESS).await?;
-    let applied = decode_applied(db.get(APPLIED).await?)?;
+    let progress = StateRead::get(db, PROGRESS).await?;
+    let applied = decode_applied(StateRead::get(db, APPLIED).await?)?;
     Ok(match (progress, applied) {
         (Some(row), 0) => {
             Rows::Partial(serde_json::from_slice(&row).context("invalid restore progress")?)

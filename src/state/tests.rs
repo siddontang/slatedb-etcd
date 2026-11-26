@@ -1082,9 +1082,8 @@ fn slatedb_settings_bound_compaction_buffers() {
     );
 }
 
-/// Only a member-local directory runs compacted-SST GC every minute. Every store keeps SlateDB's
-/// compactor checkpoint lifetime: a cold scan can run for minutes, and GC would delete an SST
-/// that the scan still needs.
+/// Only a member-local directory shortens GC retention. It is safe there because `open_at`
+/// installs `read_guard::LiveSstFilter`, which waits for running reads.
 #[test]
 fn member_settings_shorten_gc_only_on_local_disk() {
     let defaults = Settings::default();
@@ -1096,50 +1095,68 @@ fn member_settings_shorten_gc_only_on_local_disk() {
     local.validate().unwrap();
     assert_eq!(
         gc_retention(&local),
-        (gc_retention(&defaults).0, Some(COMPACTED_GC_INTERVAL))
+        (
+            REPLACED_SST_DELAY,
+            REPLACED_SST_DELAY,
+            Some(COMPACTED_GC_INTERVAL)
+        )
     );
-    assert!(Some(COMPACTED_GC_INTERVAL) < gc_retention(&defaults).1);
+    let (lifetime, min_age, interval) = gc_retention(&defaults);
+    assert!(REPLACED_SST_DELAY < lifetime && REPLACED_SST_DELAY < min_age);
+    assert!(Some(COMPACTED_GC_INTERVAL) < interval);
 }
 
-/// The compactor checkpoint lifetime and the compacted-SST GC interval of `settings`.
-fn gc_retention(settings: &Settings) -> (Duration, Option<Duration>) {
+/// The compactor checkpoint lifetime, and the compacted-SST `min_age` and GC interval.
+fn gc_retention(settings: &Settings) -> (Duration, Duration, Option<Duration>) {
     let lifetime = settings
         .compactor_options
         .as_ref()
         .unwrap()
         .checkpoint_lifetime;
     let gc = settings.garbage_collector_options.as_ref().unwrap();
-    (lifetime, gc.compacted_options.as_ref().unwrap().interval)
+    let compacted = gc.compacted_options.as_ref().unwrap();
+    (lifetime, compacted.min_age, compacted.interval)
+}
+
+/// The default clock plus an offset that a test moves forward.
+#[derive(Debug, Default)]
+struct Ahead {
+    clock: slatedb_common::clock::DefaultSystemClock,
+    offset: std::sync::Mutex<Duration>,
+}
+
+impl slatedb_common::clock::SystemClock for Ahead {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        self.clock.now() + *self.offset.lock().unwrap()
+    }
+    fn sleep<'a>(
+        &'a self,
+        duration: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        self.clock.sleep(duration)
+    }
+    fn ticker<'a>(&'a self, duration: Duration) -> slatedb_common::clock::SystemClockTicker<'a> {
+        slatedb_common::clock::SystemClockTicker::new(self, duration)
+    }
+}
+
+/// The SST files of a database at `dir`.
+fn sst_files(dir: &std::path::Path) -> std::collections::BTreeSet<std::ffi::OsString> {
+    std::fs::read_dir(dir.join("compacted"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect()
 }
 
 /// A cold scan of a member-local directory reads every row although a compaction replaces its
-/// SST and GC runs 7 minutes later, as when the index rebuild at open or a DeleteRange reads a
-/// large data set from a busy disk. A 5-minute checkpoint lifetime lost the SST: `NotFound`.
-#[tokio::test]
-async fn cold_scan_survives_compaction_and_gc_on_local_disk() {
-    use slatedb_common::clock::{DefaultSystemClock, SystemClock, SystemClockTicker};
-
-    /// The default clock plus an offset that the test moves forward.
-    #[derive(Debug, Default)]
-    struct Ahead {
-        clock: DefaultSystemClock,
-        offset: std::sync::Mutex<Duration>,
-    }
-    impl SystemClock for Ahead {
-        fn now(&self) -> chrono::DateTime<chrono::Utc> {
-            self.clock.now() + *self.offset.lock().unwrap()
-        }
-        fn sleep<'a>(
-            &'a self,
-            duration: Duration,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-            self.clock.sleep(duration)
-        }
-        fn ticker<'a>(&'a self, duration: Duration) -> SystemClockTicker<'a> {
-            SystemClockTicker::new(self, duration)
-        }
-    }
-
+/// SST and GC runs 7 minutes later, far past the checkpoint lifetime and `min_age`. This is the
+/// index rebuild at open or a DeleteRange reading a large data set from a busy disk. Without the
+/// read guard, GC deletes the SST and the scan fails with `NotFound` (seen with a 5-minute
+/// lifetime in #123). After the scan ends, the next GC run deletes the replaced SST.
+///
+/// `pinned` scans a `DbSnapshot` (read views, HashKV, export); otherwise the scan reads the live
+/// database (apply, the index rebuild).
+async fn cold_scan_survives_compaction_and_gc(pinned: bool) {
     let dir = tempfile::tempdir().unwrap();
     let store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(
         slatedb::object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap(),
@@ -1156,6 +1173,16 @@ async fn cold_scan_survives_compaction_and_gc_on_local_disk() {
         .build()
         .await
         .unwrap();
+    let db = Arc::new(db);
+    let filter = Arc::new(read_guard::LiveSstFilter::default());
+    filter.bind(&db);
+    let clock = Arc::new(Ahead::default());
+    let collector = slatedb::GarbageCollectorBuilder::new("db", store.clone())
+        .with_system_clock(clock.clone())
+        .with_options(gc)
+        .with_gc_filter(filter)
+        .build();
+
     let rows = 4096;
     let value = vec![7u8; 1024];
     let key = |i: usize, batch: usize| format!("k{batch}-{i:05}").into_bytes();
@@ -1170,7 +1197,20 @@ async fn cold_scan_survives_compaction_and_gc_on_local_disk() {
     };
     // The scan starts on the first L0 SST and reads only its first block.
     write(0).await;
-    let mut scan = db.scan(key(0, 0)..key(0, 1)).await.unwrap();
+    let first_sst = sst_files(&dir.path().join("db"));
+    assert_eq!(first_sst.len(), 1);
+    let view = if pinned {
+        StateView::Snapshot(db.snapshot().unwrap())
+    } else {
+        StateView::Live(db.clone())
+    };
+    let mut scan = view
+        .scan_range(
+            key(0, 0)..key(0, 1),
+            &slatedb::config::ScanOptions::default(),
+        )
+        .await
+        .unwrap();
     let first = scan.next().await.unwrap().unwrap();
     assert_eq!(first.key.as_ref(), key(0, 0).as_slice());
     // GC keeps the newest L0 SST that a compaction replaced, so later L0 SSTs must be newer.
@@ -1180,10 +1220,7 @@ async fn cold_scan_survives_compaction_and_gc_on_local_disk() {
         write(batch).await;
     }
 
-    let clock = Arc::new(Ahead::default());
-    let admin = slatedb::admin::Admin::builder("db", store.clone())
-        .with_system_clock(clock.clone())
-        .build();
+    let admin = slatedb::admin::Admin::builder("db", store.clone()).build();
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let manifest = admin.read_manifest(None).await.unwrap().unwrap();
@@ -1193,8 +1230,22 @@ async fn cold_scan_survives_compaction_and_gc_on_local_disk() {
         assert!(std::time::Instant::now() < deadline, "no compaction");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // Wait until the database's in-memory manifest drops the replaced SST, so that only the
+    // running scan keeps it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !db.manifest().l0().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "manifest not refreshed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     *clock.offset.lock().unwrap() = Duration::from_secs(7 * 60);
-    admin.run_gc_once(gc).await.unwrap();
+    collector.run_gc_once().await;
+    assert!(
+        sst_files(&dir.path().join("db")).is_superset(&first_sst),
+        "GC deleted the SST of a running scan"
+    );
 
     let mut read = 1;
     while let Some(row) = scan.next().await.unwrap() {
@@ -1203,7 +1254,30 @@ async fn cold_scan_survives_compaction_and_gc_on_local_disk() {
         read += 1;
     }
     assert_eq!(read, rows);
+
+    // Once the scan ends, GC deletes the replaced SST. Reads of other tests in this process can
+    // delay a GC run, so try a few times.
+    drop(scan);
+    drop(view);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while sst_files(&dir.path().join("db")).is_superset(&first_sst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "GC kept the replaced SST"
+        );
+        collector.run_gc_once().await;
+    }
     db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cold_scan_survives_compaction_and_gc_on_local_disk() {
+    cold_scan_survives_compaction_and_gc(false).await;
+}
+
+#[tokio::test]
+async fn cold_snapshot_scan_survives_compaction_and_gc_on_local_disk() {
+    cold_scan_survives_compaction_and_gc(true).await;
 }
 
 /// The directory constructor marks its store as local disk. A store that a caller passes to

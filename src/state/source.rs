@@ -14,6 +14,8 @@ use bytes::Bytes;
 use slatedb::config::ScanOptions;
 use slatedb::{Db, DbIterator, DbReader, DbSnapshot};
 
+use super::read_guard::{self, ReadGuard};
+
 /// One stored row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
@@ -71,53 +73,68 @@ impl StateScan for DbIterator {
     }
 }
 
-impl StateRead for Db {
-    type Scan<'a> = DbIterator;
+/// An iterator of the member's database with the guard of its read. See `read_guard`.
+pub struct GuardedScan {
+    iter: DbIterator,
+    _guard: ReadGuard,
+}
 
-    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, slatedb::Error> {
-        Db::get(self, key).await
+impl StateScan for GuardedScan {
+    async fn next(&mut self) -> Result<Option<Row>, slatedb::Error> {
+        StateScan::next(&mut self.iter).await
     }
 
-    async fn scan_range(
-        &self,
-        range: Range<Vec<u8>>,
-        options: &ScanOptions,
-    ) -> Result<DbIterator, slatedb::Error> {
-        Db::scan_with_options(self, range, options).await
-    }
-
-    async fn scan_under(
-        &self,
-        prefix: &[u8],
-        options: &ScanOptions,
-    ) -> Result<DbIterator, slatedb::Error> {
-        Db::scan_prefix_with_options(self, prefix, .., options).await
+    async fn seek(&mut self, key: &[u8]) -> Result<(), slatedb::Error> {
+        StateScan::seek(&mut self.iter, key).await
     }
 }
 
-impl StateRead for DbSnapshot {
-    type Scan<'a> = DbIterator;
+/// Reads of the database and its snapshots hold a `ReadGuard`, so that GC keeps the SSTs they
+/// use. See `read_guard`.
+macro_rules! guarded_state_read {
+    ($ty:ty) => {
+        impl StateRead for $ty {
+            type Scan<'a> = GuardedScan;
 
-    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, slatedb::Error> {
-        DbSnapshot::get(self, key).await
-    }
+            #[allow(clippy::disallowed_methods)]
+            async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, slatedb::Error> {
+                let _guard = read_guard::enter();
+                <$ty>::get(self, key).await
+            }
 
-    async fn scan_range(
-        &self,
-        range: Range<Vec<u8>>,
-        options: &ScanOptions,
-    ) -> Result<DbIterator, slatedb::Error> {
-        DbSnapshot::scan_with_options(self, range, options).await
-    }
+            #[allow(clippy::disallowed_methods)]
+            async fn scan_range(
+                &self,
+                range: Range<Vec<u8>>,
+                options: &ScanOptions,
+            ) -> Result<GuardedScan, slatedb::Error> {
+                let guard = read_guard::enter();
+                let iter = <$ty>::scan_with_options(self, range, options).await?;
+                Ok(GuardedScan {
+                    iter,
+                    _guard: guard,
+                })
+            }
 
-    async fn scan_under(
-        &self,
-        prefix: &[u8],
-        options: &ScanOptions,
-    ) -> Result<DbIterator, slatedb::Error> {
-        DbSnapshot::scan_prefix_with_options(self, prefix, .., options).await
-    }
+            #[allow(clippy::disallowed_methods)]
+            async fn scan_under(
+                &self,
+                prefix: &[u8],
+                options: &ScanOptions,
+            ) -> Result<GuardedScan, slatedb::Error> {
+                let guard = read_guard::enter();
+                let iter = <$ty>::scan_prefix_with_options(self, prefix, .., options).await?;
+                Ok(GuardedScan {
+                    iter,
+                    _guard: guard,
+                })
+            }
+        }
+    };
 }
+
+guarded_state_read!(Db);
+guarded_state_read!(DbSnapshot);
 
 /// A checkpoint reader. A replicated backup scans its checkpoint through this.
 impl StateRead for DbReader {

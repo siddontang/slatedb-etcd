@@ -32,6 +32,7 @@ pub(crate) mod overlay;
 pub(crate) mod put_batch;
 pub(crate) mod quota;
 mod read;
+pub(crate) mod read_guard;
 pub(crate) mod rows;
 #[cfg(test)]
 mod rows_tests;
@@ -250,16 +251,18 @@ pub(crate) fn slatedb_settings() -> Settings {
 /// member-local directory.
 ///
 /// Compaction rewrites the sorted runs several times while a large data set loads. Each replaced
-/// SST stays until its compactor checkpoint expires and the next GC run. With SlateDB's defaults
-/// (a 15-minute checkpoint and GC every 10 minutes) that took 15 to 25 minutes. On a local
-/// directory GC runs every minute, so a replaced SST leaves 15-16 minutes after the compaction.
-/// Any other store, including one a caller passes to `open_store`, keeps the defaults, because
-/// each GC run lists the SSTs of the store.
+/// SST stays until its compactor checkpoint expires, it is `min_age` old, and the next GC run.
+/// With SlateDB's defaults (a 15-minute checkpoint and GC every 10 minutes) that took 15 to 25
+/// minutes, and a 1 GiB load left 6 GiB of replaced SSTs on disk.
 ///
-/// The checkpoint lifetime stays at SlateDB's default on every store. A read fails if it still
-/// iterates an input SST after the checkpoint expires and GC deletes it. Several reads scan once
-/// with one iterator: the index rebuild at open, a committed DeleteRange, HashKV, export and the
-/// usage count of an older directory. On a cold, busy volume such a scan can run for minutes.
+/// On a member-local directory, `open_at` installs `read_guard::LiveSstFilter`: GC deletes a
+/// replaced SST only after every read that may use it has ended, however long it runs. The
+/// checkpoint lifetime and `min_age` drop to 2 minutes, GC runs every minute, and a replaced SST
+/// leaves 2-3 minutes after the compaction. The checkpoint stays as a second guard for a read
+/// that holds no `ReadGuard`.
+///
+/// Any other store, including one a caller passes to `open_store`, keeps the defaults: it has no
+/// filter, and each GC run lists the SSTs of the store.
 pub(crate) fn member_settings(local_disk: bool) -> Settings {
     let mut settings = slatedb_settings();
     if !local_disk {
@@ -268,13 +271,20 @@ pub(crate) fn member_settings(local_disk: bool) -> Settings {
     if let Some(gc) = settings.garbage_collector_options.as_mut() {
         if let Some(compacted) = gc.compacted_options.as_mut() {
             compacted.interval = Some(COMPACTED_GC_INTERVAL);
+            compacted.min_age = REPLACED_SST_DELAY;
         }
+    }
+    if let Some(compactor) = settings.compactor_options.as_mut() {
+        compactor.checkpoint_lifetime = REPLACED_SST_DELAY;
     }
     settings
 }
 
 /// How often SlateDB deletes compacted SSTs that no manifest or checkpoint references.
 const COMPACTED_GC_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The compactor checkpoint lifetime and compacted-SST `min_age` of a member-local directory.
+const REPLACED_SST_DELAY: Duration = Duration::from_secs(120);
 
 /// Read the stored logical size, or count it when the counter does not match the apply marker.
 ///
@@ -426,11 +436,24 @@ impl StateMachine {
         let object_store = location.store();
         let rows = Arc::new(rows::RowCache::new(cache.row_bytes));
         let cache = cache.build();
-        let settings = member_settings(location.local_disk);
+        let mut settings = member_settings(location.local_disk);
         let admin = slatedb::admin::Admin::builder(root, object_store.clone()).build();
-        let mut builder = Db::builder(root, object_store);
+        let mut builder = Db::builder(root, object_store.clone());
         if let Some(metrics) = &location.metrics {
             builder = builder.with_metrics_recorder(metrics.clone());
+        }
+        // Member-local GC waits for running reads. `member_settings` relies on it.
+        let filter = location
+            .local_disk
+            .then(Arc::<read_guard::LiveSstFilter>::default);
+        let gc = filter
+            .as_ref()
+            .and_then(|filter| Some((filter, settings.garbage_collector_options.take()?)));
+        if let Some((filter, gc)) = gc {
+            let gc = slatedb::GarbageCollectorBuilder::new(root, object_store)
+                .with_options(gc)
+                .with_gc_filter(filter.clone());
+            builder = builder.with_gc_builder(gc);
         }
         let db = builder
             .with_db_cache(cache, 0)
@@ -439,8 +462,11 @@ impl StateMachine {
             .build()
             .await?;
         let db = Arc::new(db);
+        if let Some(filter) = &filter {
+            filter.bind(&db);
+        }
         let result = async {
-            let applied = decode_applied(db.get(APPLIED).await?)?;
+            let applied = decode_applied(StateRead::get(db.as_ref(), APPLIED).await?)?;
             ensure!(
                 db.snapshot()?.seq() == applied,
                 "SlateDB sequence and apply marker differ"

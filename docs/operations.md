@@ -70,10 +70,13 @@ Physical Compact also waits for the deletion batch to flush.
 Defragment rewrites active SSTs and waits for manifest publication.
 Neither operation guarantees immediate disk shrinkage. Checkpoints can retain old objects.
 SlateDB's garbage collector removes objects after their retention rules permit it.
-A SlateDB compaction keeps the SSTs that it replaces for 15 minutes, for reads that started
-before it. With replicated state on local disk, garbage collection runs every minute, so these
-SSTs leave the disk 15-16 minutes after the compaction when nothing else references them.
-S3 and shared state mode keep SlateDB's default of GC every 10 minutes: 15-25 minutes.
+With replicated state on local disk, garbage collection deletes an SST that a compaction
+replaced once no running read can use it: every read registers itself, and GC waits until the
+reads that started before the compaction have ended, however long they run. Replaced SSTs leave
+the disk 2-3 minutes after the compaction (a 2-minute compactor checkpoint and minimum age, and
+GC every minute). A long scan, such as the index rebuild at startup, delays GC until it ends.
+S3 and shared state mode keep SlateDB's defaults: a compaction keeps the SSTs that it replaces
+for 15 minutes, and GC runs every 10 minutes, so they leave after 15-25 minutes.
 A Raft snapshot checkpoint for a lagging follower can keep them for up to an hour.
 GC also keeps SSTs newer than the newest L0 SST. On an idle member after a bulk load, some
 replaced SSTs can stay until a later flush. A bulk load can hold 2-3 times the live data on

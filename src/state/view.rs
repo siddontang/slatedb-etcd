@@ -481,7 +481,7 @@ pub(crate) fn expired(message: &str) -> bool {
 /// box would cost an allocation for each scan.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum ViewScan<'a> {
-    Db(DbIterator),
+    Db(super::source::GuardedScan),
     Shared(SharedScan<'a>),
 }
 

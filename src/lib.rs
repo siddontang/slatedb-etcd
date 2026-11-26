@@ -1,3 +1,6 @@
+// Tests read SlateDB directly; `clippy.toml` restricts only the server code.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 mod batch;
 mod codec;
 mod command;
