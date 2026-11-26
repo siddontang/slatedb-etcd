@@ -354,6 +354,7 @@ impl Node {
                         Reply::Encoded(_) | Reply::Kv(_) | Reply::Lease(_) => {}
                     }
                     if let Some(pending) = self.pending.remove(&command.id) {
+                        crate::diag::REPLY.since(pending.started);
                         let reply = match command.reply {
                             Reply::Kv(outcome) => {
                                 pending.response.kv(outcome)?;

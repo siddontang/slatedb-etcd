@@ -317,11 +317,15 @@ impl Kv for Service {
     }
 
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
+        crate::diag::start();
+        let diag_start = std::time::Instant::now();
         let credentials = credentials(&request);
         let forwarded = is_forwarded(&request);
-        match self
+        let diag_result = self
             .execute(Op::RequestPut(request.into_inner()), forwarded, credentials)
-            .await?
+            .await;
+        crate::diag::GRPC_PUT.since(diag_start);
+        match diag_result?
             .response
         {
             Some(Resp::ResponsePut(r)) => Ok(Response::new(r)),

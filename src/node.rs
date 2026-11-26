@@ -885,6 +885,7 @@ impl Node {
         self.campaign_alone()?;
         loop {
             let mut step_responses = vec![];
+            let mut diag_start = None;
             tokio::select! {
                 _ = tokio::time::sleep_until(
                     self.compact_ready_at.unwrap_or_else(Instant::now).into()
@@ -905,6 +906,7 @@ impl Node {
                     self.complete_read(read?)?;
                 }
                 event = events.recv() => {
+                    diag_start = Some(Instant::now());
                     let Some(event) = event else { return Ok(()); };
                     let peer = matches!(
                         event,
@@ -926,6 +928,7 @@ impl Node {
                     }
                 }
             }
+            let diag_start = diag_start.unwrap_or_else(Instant::now);
             self.peer_waiters.extend(step_responses);
             self.drive_ready().await?;
             self.sync_lease_deadlines();
@@ -946,6 +949,7 @@ impl Node {
                 old_role = role;
             }
             self.finish_checkpoint_waiters()?;
+            crate::diag::LOOP.since(diag_start);
         }
     }
 

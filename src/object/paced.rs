@@ -355,32 +355,46 @@ struct Pacer<'a> {
     path: &'a FsPath,
     lane: &'a Lane,
     writer: Writer,
-    previous: Option<(u64, u64, Window<'a>)>,
+    previous: Option<(u64, u64, Window<'a>, std::time::Instant)>,
 }
 
 impl<'a> Pacer<'a> {
     /// Wait for the previous window, then start writeback of `len` bytes at `start`.
     fn submit(&mut self, start: u64, len: u64) -> Result<()> {
         self.wait()?;
+        let diag_start = std::time::Instant::now();
         let window = self.lane.acquire(self.writer);
-        sync_range(self.file, start, len, libc::SYNC_FILE_RANGE_WRITE)
-            .map_err(|e| io_error(e, self.path))?;
-        self.previous = Some((start, len, window));
+        crate::diag::LANE_WAIT.since(diag_start);
+        match self.writer {
+            Writer::Flush => &crate::diag::FLUSH_BYTES,
+            Writer::Compaction => &crate::diag::COMPACT_BYTES,
+        }
+        .fetch_add(len, Ordering::Relaxed);
+        crate::diag::window_start(len);
+        let diag_start = std::time::Instant::now();
+        let r = sync_range(self.file, start, len, libc::SYNC_FILE_RANGE_WRITE);
+        if r.is_err() {
+            crate::diag::window_end(len);
+        }
+        r.map_err(|e| io_error(e, self.path))?;
+        self.previous = Some((start, len, window, diag_start));
         Ok(())
     }
 
     /// Wait until the previous window is on the device, then release it.
     fn wait(&mut self) -> Result<()> {
-        if let Some((start, size, _window)) = self.previous.take() {
-            sync_range(
+        if let Some((start, size, _window, diag_start)) = self.previous.take() {
+            let r = sync_range(
                 self.file,
                 start,
                 size,
                 libc::SYNC_FILE_RANGE_WAIT_BEFORE
                     | libc::SYNC_FILE_RANGE_WRITE
                     | libc::SYNC_FILE_RANGE_WAIT_AFTER,
-            )
-            .map_err(|e| io_error(e, self.path))?;
+            );
+            crate::diag::window_end(size);
+            crate::diag::WINDOW.since(diag_start);
+            r.map_err(|e| io_error(e, self.path))?;
         }
         Ok(())
     }
@@ -429,7 +443,10 @@ fn write_paced(
 
 /// Sync the staged file, then atomically publish it and sync its directory.
 fn publish(file: File, staged: &FsPath, dest: &FsPath) -> Result<()> {
-    super::local::publish(file, staged, dest).map_err(|e| io_error(e, dest))
+    let diag_start = std::time::Instant::now();
+    let r = super::local::publish(file, staged, dest).map_err(|e| io_error(e, dest));
+    crate::diag::PUBLISH.since(diag_start);
+    r
 }
 
 #[async_trait]
@@ -688,6 +705,8 @@ struct UnflushedGauge {
 
 impl slatedb_common::metrics::GaugeFn for UnflushedGauge {
     fn set(&self, value: i64) {
+        crate::diag::unflushed(value);
+        crate::diag::BACKLOG.store(value >= self.threshold, Ordering::Relaxed);
         self.backlog
             .store(value >= self.threshold, Ordering::Relaxed);
     }

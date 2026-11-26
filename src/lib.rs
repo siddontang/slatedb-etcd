@@ -3,6 +3,7 @@ mod codec;
 mod command;
 pub mod convert;
 mod crc;
+pub mod diag;
 pub use batch::WriteBatch;
 
 pub mod api;

@@ -657,9 +657,11 @@ impl StateMachine {
         let batch = Arc::new(batch);
         match &mut self.shared {
             None => {
+                let diag_start = std::time::Instant::now();
                 self.db()
                     .write_with_options(batch.to_storage(), &WriteOptions { seqnum: index })
                     .await?;
+                crate::diag::DB_WRITE.since(diag_start);
             }
             // Apply reads the overlay at once. The leader materializer writes the `Db` later.
             Some(shared) => shared.overlay.push(index, batch.clone()),

@@ -31,6 +31,7 @@ impl Handle for LogHandle {
         let start = Instant::now();
         let result = self.sync_file();
         self.metrics.fsync.observe(start.elapsed().as_secs_f64());
+        crate::diag::WAL_FSYNC.since(start);
         result
     }
 }

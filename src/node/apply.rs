@@ -573,7 +573,9 @@ impl Worker {
         assert!(!manual, "manual apply is only available in tests");
         let worker = async move {
             while let Some(work) = jobs.recv().await {
+                let diag_start = std::time::Instant::now();
                 let result = executor.execute(work).await;
+                crate::diag::APPLY_JOB.since(diag_start);
                 let failed = result.is_err();
                 if done.send(result).await.is_err() || failed {
                     break;

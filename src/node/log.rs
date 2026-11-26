@@ -256,7 +256,12 @@ impl Worker {
                         break;
                     }
                     drop(stopped);
+                    let diag_start = std::time::Instant::now();
+                    let diag_writes = work.job.writes();
                     let result = executor.execute(work);
+                    if diag_writes {
+                        crate::diag::LOG_JOB.since(diag_start);
+                    }
                     let failed = result.is_err();
                     if tx.blocking_send(result).is_err() || failed {
                         break;
