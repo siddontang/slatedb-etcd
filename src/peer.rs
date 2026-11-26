@@ -111,8 +111,15 @@ pub(crate) const STORE: &str = "x-store-id";
 #[derive(Clone, Debug)]
 pub(crate) struct Identity {
     pub cluster: String,
-    /// The ID in `shared/store-id.json`. A replicated member has no shared store.
+    /// The store ID of the cluster claim. A replicated member has no shared store.
     pub store: Option<String>,
+}
+
+/// The part of a peer identity that differs from the identity of this member.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Mismatch {
+    Cluster,
+    Store,
 }
 
 #[cfg(test)]
@@ -126,6 +133,26 @@ impl From<&str> for Identity {
 }
 
 impl Identity {
+    /// Check the cluster and the store that a peer names. A member admits exactly the identity
+    /// that it sends.
+    ///
+    /// A member on another bucket or prefix cannot open the checkpoints of this store. So its
+    /// traffic stops before Raft can count it in a quorum. A peer that names no store is also
+    /// refused.
+    pub(crate) fn admits(
+        &self,
+        cluster: Option<&str>,
+        store: Option<&str>,
+    ) -> Result<(), Mismatch> {
+        if cluster != Some(self.cluster.as_str()) {
+            return Err(Mismatch::Cluster);
+        }
+        if store != self.store.as_deref() {
+            return Err(Mismatch::Store);
+        }
+        Ok(())
+    }
+
     /// Add the identity headers to a peer HTTP request.
     pub(crate) fn headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         let request = request.header(CLUSTER, &self.cluster);
@@ -362,7 +389,7 @@ fn spawn_snapshot(
 
 /// The result of one snapshot request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Delivery {
+enum Delivery {
     Sent,
     Failed,
     /// The receiver has no route for a snapshot above its row, or it runs another process.
@@ -372,7 +399,7 @@ pub(crate) enum Delivery {
 /// Send one snapshot. The node names a receiver process in the context of a view snapshot above
 /// its checkpoint row, and zero when it knows none. Such a snapshot goes to `COVERED_ROUTE`. An
 /// earlier binary answers 404, and another process 409, before Raft sees the snapshot.
-pub(crate) async fn post_snapshot(
+async fn post_snapshot(
     client: &reqwest::Client,
     url: &str,
     identity: &Identity,

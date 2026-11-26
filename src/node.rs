@@ -615,7 +615,7 @@ impl Node {
         let manual_apply = transport_override.is_some();
         let identity = crate::peer::Identity {
             cluster: options.cluster_id.clone(),
-            store: state.store_id(),
+            store: state.store_id().map(|id| id.to_string()),
         };
         state.set_open_retries(!manual_apply);
         let mut traffic = BTreeMap::<u64, std::sync::Arc<crate::metrics::PeerTraffic>>::new();
@@ -840,9 +840,9 @@ impl Node {
         self.propose_term_start()
     }
 
-    /// The ID of the shared store, in shared mode. Peers must name the same ID.
-    pub(crate) fn store_id(&self) -> Option<String> {
-        self.peer.store.clone()
+    /// The identity that this member sends with its peer traffic. Peers must name the same one.
+    pub(crate) fn identity(&self) -> crate::peer::Identity {
+        self.peer.clone()
     }
 
     /// The shared-mode objects that the snapshot receive path opens.

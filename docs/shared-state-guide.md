@@ -27,8 +27,7 @@ new clusters. A stopped replicated S3 cluster can be converted offline. See
 ```text
 <prefix>/<sha256(cluster-id)>/
     mode.json                  the cluster mode, written before any state
-    shared/owner.json          the cluster claim: mode, quota, and the initial voters
-    shared/store-id.json       the random ID of this shared store
+    shared/owner.json          the cluster claim: mode, quota, initial voters, and store ID
     shared/bootstrap.json      written once after the first checkpoint
     shared/bootstrap-op.json   the one bootstrap operation: empty, or a snapshot restore
     shared/restore-input.json  the snapshot digest, row count, and membership of a restore
@@ -43,9 +42,10 @@ All members use the same bucket, endpoint, region, and prefix.
 
 ### Shared store ID
 
-The first voter creates `shared/store-id.json` with a random ID. The other members read it, and a
-`--join` member needs it. Each member sends the ID with its Raft traffic and view reports. A
-member refuses peer traffic with another ID, or with no ID, before Raft sees it.
+The first voter creates the cluster claim, `shared/owner.json`, with a random store ID. The other
+members read the ID from the claim. A member refuses a claim with no store ID or with an ID that
+is not a UUID. Each member sends the ID with its Raft traffic and view reports. A member refuses
+peer traffic with another ID, or with no ID, before Raft sees it.
 
 So a member with the correct cluster ID and voters, but another bucket or prefix, cannot join the
 quorum. It cannot open the checkpoints of the other store. Both sides increment
@@ -56,9 +56,28 @@ ERROR refused a peer on another shared store: all members must use the same buck
 local=Some("<this store ID>") peer=Some("<peer store ID>")
 ```
 
-`/status` shows the ID as `shared_state.store_id`. Compare it on all members. Start the wrong
-member with the correct bucket and prefix and an empty data directory. Its binding keeps the old
-location. Then delete the objects that it wrote under the wrong prefix.
+`/status` shows the ID as `shared_state.store_id`. Compare it on all members, and compare their
+bucket and prefix flags. Start a member with the wrong flags again with the correct bucket and
+prefix and an empty data directory, because its binding keeps the old location.
+
+A mismatch shows only that two members use different stores. It does not show which store is in
+use or who owns it. Do not delete objects under the other prefix before you verify its owner and
+that no member uses it.
+
+The ID is a property of the objects, not of the location:
+
+- A copy of the whole cluster namespace to another prefix copies the claim and its ID. Members
+  on the copy accept members on the original. Do not run both.
+- A native snapshot restore into a new prefix creates a new claim. That store is independent and
+  has a new ID.
+
+A member records the ID in its local `object-store.json` at its first open. At each later start,
+it refuses a store at the same location with another ID or with no claim, before it writes:
+
+```text
+the data directory belongs to shared store <recorded ID>, but the store at this location has
+store ID <new ID>: the store was replaced. Use the original store, or a new data directory
+```
 
 ## Credentials and access
 
@@ -225,8 +244,12 @@ To abandon a partial restore, make these checks first:
    checkpoint. Only this check tells the two apart.
 3. `shared/bootstrap.json` is missing.
 
-Then delete `shared/` under the cluster prefix and start the restore again. Never delete
-`shared/` of a cluster that has a bootstrap marker: it holds the state of all members.
+Then delete every object under `shared/` except `shared/owner.json`: the `shared/state/` database
+and its `shared/state.*` objects, `shared/bootstrap-op.json`, `shared/restore-input.json`, and
+`shared/restore-lease.json`. Keep `shared/owner.json`, because the member directories recorded
+its store ID. Then start the restore again with the same member directories. The restore can
+use another snapshot file. Never delete `shared/` objects of a cluster that has a bootstrap
+marker: they hold the state of all members.
 
 ## Convert a replicated cluster
 

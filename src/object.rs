@@ -184,7 +184,7 @@ impl S3 {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct Binding {
     version: u32,
     cluster: String,
@@ -194,6 +194,10 @@ struct Binding {
     /// Replicated bindings omit the field, so they keep their earlier encoding.
     #[serde(default, skip_serializing_if = "StateMode::is_replicated")]
     mode: StateMode,
+    /// Shared mode: the store ID of the cluster claim at the first open. Only the local binding
+    /// holds it. A member refuses a store with another ID, because that store was replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    store_id: Option<uuid::Uuid>,
 }
 
 impl Config {
@@ -228,10 +232,11 @@ impl Config {
             let binding = bind(dir, cluster, member, None, mode)?;
             let store: Arc<dyn ObjectStore> = Arc::new(local_store(objects)?);
             let prefix = format!("member-{member}");
-            let quota =
+            let claimed =
                 claim_shared(store.as_ref(), "", &prefix, cluster, &binding, shared).await?;
+            record_store(dir, binding, claimed.store_id)?;
             let shared = crate::state::shared::Options {
-                quota,
+                quota: claimed.quota,
                 ..shared.clone()
             };
             return StateMachine::open_shared(store, "", cluster, cache, &shared, local).await;
@@ -258,6 +263,16 @@ impl Config {
                         "several shared-mode members need a shared object store"
                     );
                     let store = Arc::new(local_store(&objects)?);
+                    expect_store(store.as_ref(), "", cluster, &binding).await?;
+                    let claimed = crate::state::shared::claim(
+                        store.as_ref(),
+                        "",
+                        cluster,
+                        shared.quota,
+                        &shared.voters,
+                    )
+                    .await?;
+                    record_store(dir, binding.clone(), claimed.store_id)?;
                     StateMachine::open_shared(store, "", cluster, cache, shared, local).await
                 }
             };
@@ -277,10 +292,11 @@ impl Config {
                     .await
             }
             StateMode::Shared => {
-                let quota =
+                let claimed =
                     claim_shared(store.as_ref(), &root, &prefix, cluster, &binding, shared).await?;
+                record_store(dir, binding, claimed.store_id)?;
                 let shared = crate::state::shared::Options {
-                    quota,
+                    quota: claimed.quota,
                     ..shared.clone()
                 };
                 StateMachine::open_shared(store, &root, cluster, cache, &shared, backend).await
@@ -391,7 +407,8 @@ async fn claim_shared(
     cluster: &str,
     binding: &Binding,
     shared: &crate::state::shared::Options,
-) -> Result<u64> {
+) -> Result<crate::state::shared::Claimed> {
+    expect_store(store, root, cluster, binding).await?;
     ensure!(
         !crate::state::shared::has_replicated_member(store, root).await?,
         "the cluster uses Replicated state mode"
@@ -399,17 +416,56 @@ async fn claim_shared(
     // A joining member is not an initial voter. It checks the existing cluster before it writes
     // anything, so a failed join leaves an empty namespace empty.
     let joined = if shared.join {
-        Some(crate::state::shared::claimed_quota(store, root, cluster).await?)
+        Some(crate::state::shared::joined(store, root, cluster).await?)
     } else {
         None
     };
     crate::state::shared::claim_mode(store, root, cluster, StateMode::Shared).await?;
     // A shared-mode member keeps no state of its own. Its binding records the mode.
     claim(store, prefix, BINDING, binding).await?;
-    if let Some(quota) = joined {
-        return Ok(quota);
+    if let Some(claimed) = joined {
+        return Ok(claimed);
     }
     crate::state::shared::claim(store, root, cluster, shared.quota, &shared.voters).await
+}
+
+/// Refuse a store whose claim does not have the store ID that the data directory recorded. The
+/// check runs before any write, so a replaced store stays unchanged.
+async fn expect_store(
+    store: &dyn ObjectStore,
+    root: &str,
+    cluster: &str,
+    binding: &Binding,
+) -> Result<()> {
+    let Some(expected) = binding.store_id else {
+        return Ok(());
+    };
+    let found = crate::state::shared::claimed(store, root, cluster).await?;
+    let found = found.map(|claimed| claimed.store_id);
+    ensure!(
+        found == Some(expected),
+        "the data directory belongs to shared store {expected}, but the store at this location \
+         has {}: the store was replaced. Use the original store, or a new data directory",
+        found.map_or("no cluster claim".to_owned(), |id| format!("store ID {id}"))
+    );
+    Ok(())
+}
+
+/// Record the store ID of the cluster claim in the local binding at the first open.
+fn record_store(dir: &Path, mut binding: Binding, store_id: uuid::Uuid) -> Result<()> {
+    match binding.store_id {
+        Some(recorded) => {
+            ensure!(
+                recorded == store_id,
+                "the data directory belongs to shared store {recorded}, not {store_id}"
+            );
+            Ok(())
+        }
+        None => {
+            binding.store_id = Some(store_id);
+            write_binding(dir, &binding)
+        }
+    }
 }
 
 /// The claim of a replicated member namespace.
@@ -453,6 +509,7 @@ fn bind(
         owner: uuid::Uuid::new_v4().to_string(),
         s3,
         mode,
+        store_id: None,
     };
     std::fs::create_dir_all(dir)?;
     let temporary = dir.join("object-store.json.pending");
@@ -469,6 +526,11 @@ fn bind(
 }
 
 async fn claim(store: &dyn ObjectStore, prefix: &str, name: &str, binding: &Binding) -> Result<()> {
+    // The remote claim comes before the cluster claim, so it never holds the store ID.
+    let binding = &Binding {
+        store_id: None,
+        ..binding.clone()
+    };
     let path = format!("{prefix}/{name}").into();
     let data = serde_json::to_vec(binding)?;
     match store
@@ -806,5 +868,67 @@ mod tests {
                 "member {member} read {read:?}"
             );
         }
+    }
+
+    /// A member records the store ID of the cluster claim in its local binding. The remote
+    /// binding does not hold it, so an unchanged restart opens. A store at the same location with
+    /// another claim, or with no claim, was replaced. The member refuses it before any write.
+    #[tokio::test]
+    async fn a_restart_refuses_a_replaced_shared_store() {
+        use futures::StreamExt;
+        let dirs = tempfile::tempdir().unwrap();
+        let dir = dirs.path().join("1");
+        let open = |store: Arc<dyn ObjectStore>| {
+            let dir = dir.clone();
+            async move {
+                let options = crate::state::shared::Options {
+                    quota: 0,
+                    voters: vec![1],
+                    join: false,
+                    empty_log: true,
+                    pin_max: Duration::from_secs(300),
+                    overlay_max_bytes: 1 << 30,
+                    restore: None,
+                    record: None,
+                };
+                let state = Config::TestS3(store, s3())
+                    .open(
+                        &dir,
+                        "cluster",
+                        1,
+                        crate::state::StateCache::default(),
+                        StateMode::Shared,
+                        &options,
+                    )
+                    .await?;
+                state.close().await
+            }
+        };
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        open(store.clone()).await.unwrap();
+        let id = read_binding(&dir).unwrap().store_id.unwrap();
+        open(store.clone()).await.unwrap();
+        assert_eq!(read_binding(&dir).unwrap().store_id, Some(id));
+
+        let root = s3().cluster_prefix("cluster");
+        store
+            .delete(&format!("{root}/shared/owner.json").into())
+            .await
+            .unwrap();
+        let claimed = crate::state::shared::claim(store.as_ref(), &root, "cluster", 0, &[1])
+            .await
+            .unwrap();
+        assert_ne!(claimed.store_id, id);
+        let error = open(store).await.unwrap_err();
+        assert!(format!("{error:#}").contains("replaced"), "{error:#}");
+
+        let empty: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let error = open(empty.clone()).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no cluster claim"),
+            "{error:#}"
+        );
+        assert!(empty.list(None).next().await.is_none());
+        assert_eq!(read_binding(&dir).unwrap().store_id, Some(id));
     }
 }

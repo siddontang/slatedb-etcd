@@ -161,6 +161,7 @@ Use native backups and a new cluster if storage must move.
 | Address already in use | Stop the process that owns the port or choose a new cluster port set. |
 | No leader or request timeout | Check quorum, peer URLs, TLS trust, and logs. |
 | Error `refused a peer on another shared store` | Give all members one bucket and prefix. |
+| Error `the store was replaced` | Use the original shared store, or a new data directory. |
 | Peer TLS handshake failure | Check SANs, validity, roots, and client authentication. |
 | Permission denied | Check role grants, key ranges, and attached lease keys. |
 | Auth token is stale | Authenticate again after user, role, password, or permission changes. |

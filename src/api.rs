@@ -17,70 +17,67 @@ use crate::{ApiError, Request};
 #[derive(Clone)]
 pub struct ApiState {
     pub events: mpsc::Sender<Event>,
-    pub cluster_id: String,
+    /// The identity that this member sends. It admits peer traffic with the same identity.
+    pub(crate) peer: crate::peer::Identity,
+    pub(crate) refusals: std::sync::Arc<Refusals>,
     /// The object namespace that serves and receives snapshot objects.
     pub(crate) location: Option<std::sync::Arc<crate::state::transfer::Location>>,
     /// Shared mode: the objects that a received format 6 snapshot names.
     pub(crate) shared: Option<std::sync::Arc<crate::state::shared::Source>>,
     /// Serve the fault controls under `/debug`. Off unless a test cluster enables them.
     pub(crate) fault_controls: bool,
-    pub(crate) store: std::sync::Arc<StoreCheck>,
-}
-
-/// The shared store check of peer traffic.
-pub(crate) struct StoreCheck {
-    /// The ID in `shared/store-id.json`. A replicated member has none.
-    id: Option<String>,
-    /// Peer requests that named another store, or no store.
-    refused: prometheus::IntCounter,
-    /// The time of the last error log. A refused peer tries again on each Raft tick.
-    logged: std::sync::Mutex<Option<std::time::Instant>>,
-}
-
-/// The shortest time between two error logs of refused peer stores.
-const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
-
-impl StoreCheck {
-    pub(crate) fn new(id: Option<String>, refused: prometheus::IntCounter) -> Self {
-        Self {
-            id,
-            refused,
-            logged: Default::default(),
-        }
-    }
 }
 
 impl ApiState {
-    /// Admit peer traffic that names this cluster and this shared store.
-    ///
-    /// A member on another bucket or prefix cannot open the checkpoints of this store. So its
-    /// traffic stops here, before Raft can count it in a quorum. A peer that names no store is
-    /// also refused.
+    /// Admit peer traffic that names the identity of this member. See `Identity::admits`.
     pub(crate) fn admit(
         &self,
         cluster: Option<&str>,
         store: Option<&str>,
     ) -> Result<(), &'static str> {
-        if cluster != Some(self.cluster_id.as_str()) {
-            return Err("peer cluster does not match");
+        match self.peer.admits(cluster, store) {
+            Ok(()) => Ok(()),
+            Err(crate::peer::Mismatch::Cluster) => Err("peer cluster does not match"),
+            Err(crate::peer::Mismatch::Store) => {
+                self.refusals.record(&self.peer, store);
+                Err("peer shared store does not match")
+            }
         }
-        let check = &self.store;
-        if store == check.id.as_deref() {
-            return Ok(());
+    }
+}
+
+/// The shortest time between two error logs of refused peer stores.
+const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Peer traffic that this member refused for its shared store.
+pub(crate) struct Refusals {
+    counter: prometheus::IntCounter,
+    /// The time of the last error log. A refused peer tries again on each Raft tick.
+    logged: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl Refusals {
+    pub(crate) fn new(counter: prometheus::IntCounter) -> Self {
+        Self {
+            counter,
+            logged: Default::default(),
         }
-        check.refused.inc();
+    }
+
+    /// Count a refusal of `peer` store, and log an error at most once per interval.
+    fn record(&self, local: &crate::peer::Identity, peer: Option<&str>) {
+        self.counter.inc();
         let now = std::time::Instant::now();
-        let mut logged = check.logged.lock().unwrap();
+        let mut logged = self.logged.lock().unwrap();
         if logged.is_none_or(|last| now.duration_since(last) >= REFUSAL_LOG_INTERVAL) {
             *logged = Some(now);
             tracing::error!(
-                local = ?check.id,
-                peer = ?store,
+                local = ?local.store,
+                peer = ?peer,
                 "refused a peer on another shared store: all members must use the same bucket \
                  and prefix"
             );
         }
-        Err("peer shared store does not match")
     }
 }
 
@@ -314,10 +311,15 @@ async fn snapshot_file(
     headers: HeaderMap,
     Query(query): Query<FileQuery>,
 ) -> Response {
+    // A shared member sends format 6 snapshots, and no peer copies its objects. Its location
+    // serves the shared state, so the route must not serve it to any peer.
+    if state.peer.store.is_some() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     if headers
         .get(crate::peer::CLUSTER)
         .and_then(|value| value.to_str().ok())
-        != Some(&state.cluster_id)
+        != Some(&state.peer.cluster)
     {
         return StatusCode::FORBIDDEN.into_response();
     }

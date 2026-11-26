@@ -21,20 +21,32 @@ async fn server_on(
     tokio::task::JoinHandle<Result<()>>,
     prometheus::IntCounter,
 ) {
+    server_with(store, None).await
+}
+
+async fn server_with(
+    store: Option<&str>,
+    location: Option<std::sync::Arc<crate::state::transfer::Location>>,
+) -> (
+    String,
+    mpsc::Receiver<Event>,
+    tokio::task::JoinHandle<Result<()>>,
+    prometheus::IntCounter,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let (events, received) = mpsc::channel(256);
     let refused = prometheus::IntCounter::new("refused", "Refused peer stores.").unwrap();
     let router = crate::api::router(ApiState {
-        location: None,
+        location,
         shared: None,
         events,
-        cluster_id: "stream-test".into(),
+        peer: Identity {
+            cluster: "stream-test".into(),
+            store: store.map(str::to_owned),
+        },
+        refusals: std::sync::Arc::new(crate::api::Refusals::new(refused.clone())),
         fault_controls: false,
-        store: std::sync::Arc::new(crate::api::StoreCheck::new(
-            store.map(str::to_owned),
-            refused.clone(),
-        )),
     });
     let task = tokio::spawn(crate::tls::serve(listener, router, None));
     (address, received, task, refused)
@@ -760,4 +772,52 @@ async fn peers_of_another_store_or_no_store_are_refused_before_raft() {
     assert_eq!(refused.get(), 2 + routes);
     drop(messages);
     sender.await.unwrap();
+}
+
+/// The snapshot file route serves the objects of a replicated member. A shared member serves
+/// none, with or without the store ID, because its location holds the shared state.
+#[tokio::test]
+async fn a_shared_member_serves_no_snapshot_file() {
+    use slatedb::object_store::{memory::InMemory, ObjectStoreExt};
+    let objects: std::sync::Arc<dyn slatedb::object_store::ObjectStore> =
+        std::sync::Arc::new(InMemory::new());
+    let location = crate::state::transfer::Location::open(
+        objects.clone(),
+        "state",
+        crate::state::transfer::Backend::Local,
+        false,
+        crate::state::StateCache::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    let root = location.root();
+    let manifest = format!("manifest/{:020}.manifest", 1);
+    objects
+        .put(
+            &format!("{root}/{manifest}").into(),
+            b"manifest".to_vec().into(),
+        )
+        .await
+        .unwrap();
+    let http = reqwest::Client::new();
+    for (store, sent, status) in [
+        (None, None, reqwest::StatusCode::OK),
+        (Some("store-a"), None, reqwest::StatusCode::NOT_FOUND),
+        (
+            Some("store-a"),
+            Some("store-a"),
+            reqwest::StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let (address, _received, _task, _) = server_with(store, Some(location.clone())).await;
+        let identity = Identity {
+            cluster: "stream-test".into(),
+            store: sent.map(str::to_owned),
+        };
+        let route = crate::state::transfer::FILE_ROUTE;
+        let url = format!("http://{address}{route}?root={root}&path={manifest}");
+        let response = identity.headers(http.get(url)).send().await.unwrap();
+        assert_eq!(response.status(), status, "{store:?} {sent:?}");
+    }
 }
