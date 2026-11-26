@@ -756,6 +756,17 @@ async fn send_prepared(
 }
 
 impl Service {
+    /// Ask the node to answer once this member applied every Put that it already answered.
+    /// Its batches are then on the feed.
+    async fn apply_barrier(&self) -> Result<oneshot::Receiver<()>, Status> {
+        let (response, applied) = oneshot::channel();
+        self.events
+            .send(Event::WatchBarrier(response))
+            .await
+            .map_err(|_| unavailable())?;
+        Ok(applied)
+    }
+
     async fn watch_stream(
         &self,
         mut input: tonic::Streaming<WatchRequest>,
@@ -787,8 +798,12 @@ impl Service {
         // Automatic progress uses the configured interval. Token expiry needs at least 1 s.
         let mut checks = tokio::time::interval(self.watch_progress_interval.min(CHECK_INTERVAL));
         checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // A create waits here for the apply barrier. The stream keeps serving its watchers,
+        // leader loss and checks, and reads the next request only after the create.
+        let mut pending: Option<(WatchCreateRequest, oneshot::Receiver<()>)> = None;
         loop {
             let unsynced = stream.unsynced();
+            let waiting = pending.is_some();
             tokio::select! {
                 _ = tx.closed() => return Ok(()),
                 received = events.recv() => stream.receive(received).await?,
@@ -800,16 +815,28 @@ impl Service {
                 _ = std::future::ready(()), if unsynced => {
                     stream.catch_up(None).await?;
                 }
-                message = input.message() => {
+                applied = async { (&mut pending.as_mut().expect("waiting").1).await }, if waiting => {
+                    applied.map_err(|_| unavailable())?;
+                    let (request, _) = pending.take().expect("waiting");
+                    // The create observes every batch through the replied Puts.
+                    stream.drain(&mut events).await?;
+                    stream.create(request).await?;
+                }
+                message = input.message(), if !waiting => {
                     let Some(message) = message? else { return Ok(()); };
                     // Requests observe all batches that the node published before them.
-                    stream.drain(&mut events).await?;
                     match message.request_union {
-                        Some(RequestUnion::CreateRequest(request)) => stream.create(request).await?,
+                        Some(RequestUnion::CreateRequest(request)) => {
+                            pending = Some((request, self.apply_barrier().await?));
+                        }
                         Some(RequestUnion::CancelRequest(request)) => {
+                            stream.drain(&mut events).await?;
                             stream.cancel(request.watch_id).await?
                         }
-                        Some(RequestUnion::ProgressRequest(_)) => stream.progress().await?,
+                        Some(RequestUnion::ProgressRequest(_)) => {
+                            stream.drain(&mut events).await?;
+                            stream.progress().await?
+                        }
                         None => continue,
                     }
                 }
@@ -1384,6 +1411,213 @@ mod tests {
         f.stream.state_changed().unwrap();
         let error = f.stream.create(request(1, "k", 0)).await.unwrap_err();
         assert!(error.message().contains("no leader"));
+        f.close().await;
+    }
+
+    /// A member whose node answers Watch subscriptions from the fixture feed and hands each apply
+    /// barrier to the test, which releases it once the replied Put is applied.
+    struct EarlyReply {
+        batches: broadcast::Sender<Arc<Batch>>,
+        barriers: mpsc::Receiver<oneshot::Sender<()>>,
+        client: crate::proto::etcdserverpb::watch_client::WatchClient<tonic::transport::Channel>,
+    }
+
+    impl EarlyReply {
+        async fn start(f: &Fixture) -> Self {
+            let (events, mut node) = mpsc::channel(16);
+            let (batches, _) = broadcast::channel(16);
+            let (barrier, barriers) = mpsc::channel(16);
+            let (feed, published) = (f.feed.clone(), batches.clone());
+            tokio::spawn(async move {
+                while let Some(event) = node.recv().await {
+                    match event {
+                        Event::SubscribeWatch(response) => {
+                            let _ = response.send(crate::watch::Subscription {
+                                events: published.subscribe(),
+                                state: feed.subscribe(),
+                            });
+                        }
+                        Event::WatchBarrier(response) => barrier.send(response).await.unwrap(),
+                        _ => panic!("unexpected event"),
+                    }
+                }
+            });
+            let router = crate::grpc::Servers::new(
+                1,
+                events,
+                &Default::default(),
+                crate::auth::TokenIssuer::parse("simple").unwrap(),
+                Default::default(),
+                DEFAULT_WATCH_PROGRESS_INTERVAL,
+            )
+            .unwrap()
+            .router();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(crate::tls::serve(listener, router, None));
+            let client = crate::proto::etcdserverpb::watch_client::WatchClient::connect(url)
+                .await
+                .unwrap();
+            Self {
+                batches,
+                barriers,
+                client,
+            }
+        }
+
+        async fn open(&mut self) -> (mpsc::Sender<WatchRequest>, tonic::Streaming<WatchResponse>) {
+            self.open_with(false).await
+        }
+
+        async fn open_with(
+            &mut self,
+            require_leader: bool,
+        ) -> (mpsc::Sender<WatchRequest>, tonic::Streaming<WatchResponse>) {
+            let (requests, input) = mpsc::channel(16);
+            let mut request = Request::new(ReceiverStream::new(input));
+            if require_leader {
+                request
+                    .metadata_mut()
+                    .insert("hasleader", "true".parse().unwrap());
+            }
+            let output = self.client.watch(request).await.unwrap().into_inner();
+            (requests, output)
+        }
+
+        async fn barrier(&mut self) -> oneshot::Sender<()> {
+            tokio::time::timeout(std::time::Duration::from_secs(5), self.barriers.recv())
+                .await
+                .expect("a create waits for the apply barrier")
+                .unwrap()
+        }
+    }
+
+    fn create(request: WatchCreateRequest) -> WatchRequest {
+        WatchRequest {
+            request_union: Some(RequestUnion::CreateRequest(request)),
+        }
+    }
+
+    async fn next(output: &mut tonic::Streaming<WatchResponse>) -> WatchResponse {
+        tokio::time::timeout(std::time::Duration::from_secs(5), output.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    }
+
+    /// The member answered a Put at R before it applied R. A watcher created then on an open
+    /// stream starts after R, and the stream's earlier watcher still receives R.
+    #[tokio::test]
+    async fn a_create_on_an_open_stream_starts_after_an_early_put_reply() {
+        let mut f = Fixture::new().await;
+        let mut member = EarlyReply::start(&f).await;
+        let (requests, mut output) = member.open().await;
+        requests.send(create(request(1, "k", 0))).await.unwrap();
+        member.barrier().await.send(()).unwrap();
+        let created = next(&mut output).await;
+        assert!(created.created);
+        let before = created.header.unwrap().revision;
+        // The reply for R is out. The second create waits until R is applied.
+        requests.send(create(request(2, "k", 0))).await.unwrap();
+        let barrier = member.barrier().await;
+        let applied = f.put("k", "1").await;
+        assert_eq!(applied.revision, before + 1);
+        member.batches.send(applied).unwrap();
+        barrier.send(()).unwrap();
+        let first = next(&mut output).await;
+        assert_eq!((first.watch_id, first.events.len()), (1, 1));
+        assert_eq!(first.header.unwrap().revision, before + 1);
+        let created = next(&mut output).await;
+        assert!(created.created);
+        assert_eq!(created.watch_id, 2);
+        assert_eq!(created.header.unwrap().revision, before + 1);
+        member.batches.send(f.put("k", "2").await).unwrap();
+        let mut watchers = vec![];
+        for _ in 0..2 {
+            let response = next(&mut output).await;
+            assert_eq!(response.header.unwrap().revision, before + 2);
+            assert_eq!(response.events.len(), 1);
+            watchers.push(response.watch_id);
+        }
+        watchers.sort();
+        assert_eq!(watchers, [1, 2]);
+        f.close().await;
+    }
+
+    /// A create that waits for the apply barrier does not hide leader loss from the stream.
+    #[tokio::test]
+    async fn leader_loss_ends_a_stream_while_a_create_waits_for_the_apply_barrier() {
+        let f = Fixture::new().await;
+        let mut member = EarlyReply::start(&f).await;
+        let (requests, mut output) = member.open_with(true).await;
+        requests.send(create(request(1, "k", 0))).await.unwrap();
+        member.barrier().await.send(()).unwrap();
+        assert!(next(&mut output).await.created);
+        requests.send(create(request(2, "k", 0))).await.unwrap();
+        let _held = member.barrier().await;
+        let mut state = feed_state(&f.state);
+        state.leader = 0;
+        f.feed.send_replace(state);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), output.message())
+            .await
+            .expect("leader loss ends the stream while the barrier is held")
+            .unwrap_err();
+        assert!(error.message().contains("no leader"));
+        f.close().await;
+    }
+
+    /// A create with an explicit start also waits for an early Put reply: its header covers
+    /// the replied Put, and it still receives events from the requested revision.
+    #[tokio::test]
+    async fn an_explicit_start_create_waits_for_an_early_put_reply() {
+        let mut f = Fixture::new().await;
+        let mut member = EarlyReply::start(&f).await;
+        let (requests, mut output) = member.open().await;
+        requests.send(create(request(1, "k", 0))).await.unwrap();
+        member.barrier().await.send(()).unwrap();
+        let before = next(&mut output).await.header.unwrap().revision;
+        requests
+            .send(create(request(2, "k", before + 1)))
+            .await
+            .unwrap();
+        let barrier = member.barrier().await;
+        let applied = f.put("k", "1").await;
+        assert_eq!(applied.revision, before + 1);
+        member.batches.send(applied).unwrap();
+        barrier.send(()).unwrap();
+        let first = next(&mut output).await;
+        assert_eq!((first.watch_id, first.events.len()), (1, 1));
+        let created = next(&mut output).await;
+        assert!(created.created);
+        assert_eq!(created.watch_id, 2);
+        assert_eq!(created.header.unwrap().revision, before + 1);
+        let event = next(&mut output).await;
+        assert_eq!((event.watch_id, event.events.len()), (2, 1));
+        assert_eq!(
+            event.events[0].kv.as_ref().unwrap().mod_revision,
+            before + 1
+        );
+        f.close().await;
+    }
+
+    /// A client that leaves while its create waits for the apply barrier ends its stream task.
+    #[tokio::test]
+    async fn a_closed_stream_stops_waiting_for_the_apply_barrier() {
+        let f = Fixture::new().await;
+        let mut member = EarlyReply::start(&f).await;
+        let (requests, output) = member.open().await;
+        requests.send(create(request(1, "k", 0))).await.unwrap();
+        let barrier = member.barrier().await;
+        assert_eq!(member.batches.receiver_count(), 1);
+        drop((requests, output));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while member.batches.receiver_count() > 0 || !barrier.is_closed() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the stream task ends while the apply barrier waits");
         f.close().await;
     }
 }

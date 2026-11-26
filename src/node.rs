@@ -72,6 +72,9 @@ pub type LeaseResponse = oneshot::Sender<Result<crate::mvcc::Outcome<LeaseReply>
 
 pub enum Event {
     SubscribeWatch(oneshot::Sender<crate::watch::Subscription>),
+    /// Answer once this member applied every Put it already answered. A Watch create waits for
+    /// it, then drains the feed, so that its header and start cover such a Put.
+    WatchBarrier(oneshot::Sender<()>),
     WaitRevision(i64, Response),
     Authenticated(crate::auth::Credentials, Box<Event>),
     Auth(crate::auth::Command, Response),
@@ -301,6 +304,8 @@ pub struct Node {
     /// The term of the entries in the last submitted PreparePuts job.
     prepare_term: u64,
     quorum_reply_index: u64,
+    /// Watch creations that wait while a Put reply runs ahead of the local apply.
+    watch_waiters: Vec<oneshot::Sender<()>>,
     queries: VecDeque<Query>,
     prefer_query: bool,
     apply_delay_ms: u64,
@@ -731,6 +736,7 @@ impl Node {
             held_puts: None,
             prepare_term: 0,
             quorum_reply_index: 0,
+            watch_waiters: Vec::new(),
             state: applied,
             worker,
             apply_busy: false,
@@ -1209,6 +1215,17 @@ impl Node {
             Event::SubscribeWatch(response) => {
                 let _ = response.send(self.watch_feed.subscribe());
             }
+            Event::WatchBarrier(response) => {
+                // etcd creates a Watch at the local revision. Wait like a read so that the
+                // create covers a Put this member already answered.
+                if self.reply_ahead() {
+                    // A stream that closed while it waited drops its receiver.
+                    self.watch_waiters.retain(|waiter| !waiter.is_closed());
+                    self.watch_waiters.push(response);
+                } else {
+                    let _ = response.send(());
+                }
+            }
             Event::Metrics(response) => {
                 let id = self.options.id;
                 let _ = response.send(crate::metrics::Sample {
@@ -1508,13 +1525,19 @@ impl Node {
         );
     }
 
+    /// A prepared Put reply runs ahead of the local apply. Reads and Watch creation wait until
+    /// the replied entries are applied here.
+    fn reply_ahead(&self) -> bool {
+        self.state.applied < self.quorum_reply_index
+    }
+
     /// Publish the applied view for serializable point reads outside the owner.
     ///
     /// While a prepared Put reply runs ahead of the local apply (`quorum_reply_index`), reads
     /// wait in the owner so that a client that saw the reply also reads its effect here.
     fn publish_local_reads(&self) {
-        let local = (self.state.applied >= self.quorum_reply_index)
-            .then(|| LocalRead::new(self.state.read.clone(), self.header()));
+        let local =
+            (!self.reply_ahead()).then(|| LocalRead::new(self.state.read.clone(), self.header()));
         self.forwarding.publish_local(local);
     }
 

@@ -92,7 +92,7 @@ impl Node {
             || self.quota_guarded()
             || self.pending.is_empty()
             || high <= low
-            || self.state.applied < self.quorum_reply_index
+            || self.reply_ahead()
             || raft.pending_conf_index > self.state.applied
             || self.raw.store().durable.hard_state.term != raft.term
         {
@@ -475,6 +475,57 @@ mod tests {
         node.drain_apply().await.unwrap();
         assert_eq!(node.state.applied, index);
         assert!(node.prepared_puts.is_none());
+    }
+
+    /// A Watch with no start revision on the replying member starts after the replied Put.
+    #[tokio::test]
+    async fn a_watch_created_after_an_early_put_reply_starts_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = super::super::tests::leader_node(dir.path()).await;
+        let mut reply = put("watched", &mut node);
+        node.drive_ready().await.unwrap();
+        let index = node.raw.store().last_index().unwrap();
+        node.drain_apply().await.unwrap();
+        node.drain_log().await.unwrap();
+        node.drain_apply().await.unwrap();
+        ack(&mut node, index);
+        node.drive_ready().await.unwrap();
+        let outcome = reply.try_recv().unwrap().unwrap().into_outcome();
+        let Some(crate::proto::etcdserverpb::response_op::Response::ResponsePut(put)) =
+            outcome.result.unwrap().response
+        else {
+            panic!("expected a Put reply");
+        };
+        let revision = put.header.unwrap().revision;
+        assert!(node.state.applied < index);
+        let (subscribe, subscription) = oneshot::channel();
+        node.handle(
+            crate::node::Event::SubscribeWatch(subscribe),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        let mut subscription = subscription.await.unwrap();
+        assert_eq!(subscription.state.borrow().view.revision, revision - 1);
+        // A stream that closed while it waited frees its place.
+        let (gone, closed) = oneshot::channel();
+        node.handle(crate::node::Event::WatchBarrier(gone), &mut Vec::new())
+            .await
+            .unwrap();
+        drop(closed);
+        let (tx, mut barrier) = oneshot::channel();
+        node.handle(crate::node::Event::WatchBarrier(tx), &mut Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(node.watch_waiters.len(), 1);
+        node.drive_ready().await.unwrap();
+        assert!(barrier.try_recv().is_err());
+        node.drain_log().await.unwrap();
+        node.drain_apply().await.unwrap();
+        barrier.try_recv().unwrap();
+        // The replied Put is on the feed before the barrier clears.
+        assert_eq!(subscription.events.try_recv().unwrap().revision, revision);
+        assert_eq!(subscription.state.borrow().view.revision, revision);
     }
 
     #[tokio::test]
