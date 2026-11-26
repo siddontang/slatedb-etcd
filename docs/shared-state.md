@@ -352,6 +352,10 @@ A slow backup keeps the segments that later base switches release. Each member b
 - The member keeps these limits across a base adoption, a rebase, and a snapshot install.
 - This budget does not change the write admission of the leader.
 
+The merge of a view searches the segments from the oldest to the newest. A newer segment
+replaces an equal key. So a scan skips each key of the open segment above its sequence once.
+Scans and backups yield to the runtime every few hundred steps, also in a long run of deletes.
+
 ## Base switch
 
 1. Apply `ViewCheckpoint(C)`. Close the segment. Start `DbReader::open(Checkpoint(C))` in the

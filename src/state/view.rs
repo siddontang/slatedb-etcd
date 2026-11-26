@@ -195,10 +195,14 @@ impl SharedView {
     }
 
     /// Return the first overlay key after `lower` with its newest version at `seq`.
-    /// The newest segment wins for equal keys.
+    ///
+    /// The search goes from the oldest segment to the newest, and a newer segment replaces an
+    /// equal key. Each segment then searches only up to the best key so far. Only the open
+    /// segment holds versions above `seq`, and it comes last. So it skips only the hidden keys
+    /// below the next row, and a scan visits each hidden key once.
     fn next_overlay(&self, lower: Bound<&[u8]>, end: &End<'_>) -> Option<(Bytes, Option<Bytes>)> {
         let mut best: Option<(Bytes, Option<Bytes>)> = None;
-        for segment in self.segments.iter().rev() {
+        for segment in self.segments.iter() {
             let limit = best.as_ref().map(|(key, _)| key.as_ref());
             if let Some(found) = segment.first_after(lower, end, self.seq, limit) {
                 best = Some(found);
@@ -207,8 +211,8 @@ impl SharedView {
         best
     }
 
-    /// Return the last overlay key in `[start, upper)` with its newest version at `seq`.
-    /// The newest segment wins for equal keys.
+    /// Return the last overlay key in `[start, upper)` with its newest version at `seq`. Like
+    /// `next_overlay`, the search goes from the oldest segment to the newest.
     fn prev_overlay(
         &self,
         start: &[u8],
@@ -216,7 +220,7 @@ impl SharedView {
         end: &End<'_>,
     ) -> Option<(Bytes, Option<Bytes>)> {
         let mut best: Option<(Bytes, Option<Bytes>)> = None;
-        for segment in self.segments.iter().rev() {
+        for segment in self.segments.iter() {
             let limit = best.as_ref().map(|(key, _)| key.as_ref());
             if let Some(found) = segment.last_before(start, upper, end, self.seq, limit) {
                 best = Some(found);
@@ -263,11 +267,21 @@ pub(crate) struct SharedScan<'a> {
     after: Option<Bytes>,
     overlay_row: Option<(Bytes, Option<Bytes>)>,
     overlay_done: bool,
+    /// Merge steps, for `YIELD_EVERY`.
+    steps: u32,
 }
+
+/// A scan yields to the runtime after this many merge steps. A long run of overlay deletes, or
+/// rows that come from memory, then cannot hold the thread, and a cancelled scan ends soon.
+const YIELD_EVERY: u32 = 256;
 
 impl StateScan for SharedScan<'_> {
     async fn next(&mut self) -> Result<Option<Row>, slatedb::Error> {
         loop {
+            self.steps = self.steps.wrapping_add(1);
+            if self.steps.is_multiple_of(YIELD_EVERY) {
+                tokio::task::yield_now().await;
+            }
             self.view.check()?;
             if self.base_row.is_none() {
                 if let Some(base) = &mut self.base {
@@ -407,6 +421,7 @@ impl StateRead for SharedView {
             after: None,
             overlay_row: None,
             overlay_done: false,
+            steps: 0,
         })
     }
 
@@ -436,6 +451,7 @@ impl StateRead for SharedView {
             after: None,
             overlay_row: None,
             overlay_done: false,
+            steps: 0,
         })
     }
 }
@@ -761,6 +777,96 @@ mod tests {
         assert_eq!(view.get(b"k/1").await.unwrap(), Some("v".into()));
         assert_eq!(view.get(b"k/2").await.unwrap(), None);
         assert_eq!(rows(&view, b"k/").await, vec![row("k/1", "v")]);
+    }
+
+    /// Collect a scan of `view` in `order`.
+    async fn scan_all(view: &SharedView, order: slatedb::IterationOrder) -> Vec<Row> {
+        let options = ScanOptions {
+            order,
+            ..ScanOptions::default()
+        };
+        let mut scan = view.scan_under(b"k/", &options).await.unwrap();
+        let mut found = vec![];
+        while let Some(row) = scan.next().await.unwrap() {
+            found.push(row);
+        }
+        found
+    }
+
+    /// The newer segment wins for an equal key, and its delete hides the older value. Rows that
+    /// the open segment gets after the view's sequence stay hidden, in both scan orders.
+    #[tokio::test]
+    async fn a_newer_segment_wins_for_an_equal_key() {
+        let mut overlay = Overlay::new(0);
+        overlay.push(
+            1,
+            batch(&[
+                ("k/a", Some("old")),
+                ("k/b", Some("old")),
+                ("k/c", Some("old")),
+            ]),
+        );
+        overlay.close_segment();
+        overlay.push(2, batch(&[("k/a", Some("new")), ("k/b", None)]));
+        overlay.push(
+            3,
+            batch(&[("k/a", Some("late")), ("k/c", None), ("k/d", Some("late"))]),
+        );
+        let view = SharedView::new(Arc::new(Base::empty()), overlay.segments(), 2);
+        let expected = vec![row("k/a", "new"), row("k/c", "old")];
+        let ascending = scan_all(&view, slatedb::IterationOrder::Ascending).await;
+        assert_eq!(ascending, expected);
+        let mut descending = scan_all(&view, slatedb::IterationOrder::Descending).await;
+        descending.reverse();
+        assert_eq!(descending, expected);
+    }
+
+    /// A scan visits each key of each segment about once, also when the open segment holds many
+    /// keys above the view's sequence. A search from the newest segment visited the hidden keys
+    /// again for each visible key of an older segment.
+    #[tokio::test]
+    async fn a_scan_visits_hidden_keys_once() {
+        const VISIBLE: usize = 2_000;
+        const HIDDEN: usize = 4_000;
+        let mut overlay = Overlay::new(0);
+        let visible: Vec<_> = (0..VISIBLE).map(|n| format!("k/{:06}", n * 2)).collect();
+        let rows: Vec<_> = visible
+            .iter()
+            .map(|key| (key.as_str(), Some("v")))
+            .collect();
+        overlay.push(1, batch(&rows));
+        overlay.close_segment();
+        // The open segment has a visible tombstone and many later keys.
+        overlay.push(2, batch(&[("k/000000", None)]));
+        let hidden: Vec<_> = (0..HIDDEN).map(|n| format!("k/{:06}", n * 2 + 1)).collect();
+        let rows: Vec<_> = hidden
+            .iter()
+            .map(|key| (key.as_str(), Some("late")))
+            .collect();
+        overlay.push(3, batch(&rows));
+        let segments = overlay.segments();
+        let view = SharedView::new(Arc::new(Base::empty()), segments.clone(), 2);
+        let visits = || {
+            segments
+                .iter()
+                .map(|segment| segment.visits.load(std::sync::atomic::Ordering::Relaxed))
+                .sum::<u64>()
+        };
+        for order in [
+            slatedb::IterationOrder::Ascending,
+            slatedb::IterationOrder::Descending,
+        ] {
+            let before = visits();
+            let found = scan_all(&view, order).await;
+            assert_eq!(found.len(), VISIBLE - 1);
+            assert!(found.iter().all(|row| row.value == "v"));
+            let visited = visits() - before;
+            let bound = 3 * (VISIBLE + HIDDEN) as u64;
+            assert!(
+                visited <= bound,
+                "{visited} visits for {VISIBLE} + {HIDDEN} keys"
+            );
+        }
     }
 
     /// A warm base serves current rows of its L0 SSTs from the cache. Other rows still need GETs.

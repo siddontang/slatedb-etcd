@@ -34,6 +34,9 @@ pub(crate) struct Segment {
     bytes: AtomicU64,
     /// True after the overlay dropped the segment. Only views still hold it then.
     released: AtomicBool,
+    /// Keys that the scan searches visited.
+    #[cfg(test)]
+    pub(crate) visits: AtomicU64,
 }
 
 /// The upper end of a scan.
@@ -89,7 +92,7 @@ impl Segment {
     }
 
     /// Return the first key after `lower` that has a version at or below `seq`, with that
-    /// version. Keys at or after `limit` are not useful to the caller.
+    /// version. Keys after `limit` are not useful to the caller.
     pub(crate) fn first_after(
         &self,
         lower: Bound<&[u8]>,
@@ -99,7 +102,9 @@ impl Segment {
     ) -> Option<(Bytes, Option<Bytes>)> {
         let rows = self.rows.read().unwrap();
         for (key, versions) in rows.range::<[u8], _>((lower, Bound::Unbounded)) {
-            if !end.contains(key) || limit.is_some_and(|limit| key.as_ref() >= limit) {
+            #[cfg(test)]
+            self.visits.fetch_add(1, Ordering::Relaxed);
+            if !end.contains(key) || limit.is_some_and(|limit| key.as_ref() > limit) {
                 return None;
             }
             if let Some(value) = newest(versions, seq) {
@@ -110,7 +115,7 @@ impl Segment {
     }
 
     /// Return the last key in `[start, upper)` within `end` that has a version at or below
-    /// `seq`, with that version. Keys at or before `limit` are not useful to the caller.
+    /// `seq`, with that version. Keys before `limit` are not useful to the caller.
     pub(crate) fn last_before(
         &self,
         start: &[u8],
@@ -121,7 +126,9 @@ impl Segment {
     ) -> Option<(Bytes, Option<Bytes>)> {
         let rows = self.rows.read().unwrap();
         for (key, versions) in rows.range::<[u8], _>((Bound::Included(start), upper)).rev() {
-            if limit.is_some_and(|limit| key.as_ref() <= limit) {
+            #[cfg(test)]
+            self.visits.fetch_add(1, Ordering::Relaxed);
+            if limit.is_some_and(|limit| key.as_ref() < limit) {
                 return None;
             }
             if !end.contains(key) {

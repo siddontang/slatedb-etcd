@@ -678,6 +678,42 @@ async fn backups_keep_their_limits_across_an_adoption() {
     behind.close().await.unwrap();
 }
 
+/// A scan yields in a long run of overlay deletes, so a client that leaves during the count
+/// ends the stream before the scan reaches the end of the run.
+#[tokio::test]
+async fn a_backup_ends_during_a_long_run_of_deletes() {
+    let mut fixture = Fixture::new(0).await;
+    let mut batch = WriteBatch::new();
+    for n in 0..100_000 {
+        batch.delete(format!("etcd/gone/{n:06}").as_bytes());
+    }
+    let index = fixture.state.applied + 1;
+    fixture.state.mark_applied(&mut batch, index);
+    fixture.state.write_batch(batch, index).await.unwrap();
+    fixture.state.applied = index;
+    fixture.put("zz", "after the deletes").await;
+    let segment = fixture.state.shared.as_ref().unwrap().overlay.segments()[0].clone();
+    let before = segment.visits.load(std::sync::atomic::Ordering::Relaxed);
+    let hold = fixture.hold();
+    let stream = fixture.state.backup().await.unwrap();
+    hold.add_permits(1);
+    tokio::task::yield_now().await;
+    drop(stream);
+    for _ in 0..200 {
+        if fixture.holders().status().0 == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(fixture.holders().status().0, 0);
+    let visits = segment.visits.load(std::sync::atomic::Ordering::Relaxed) - before;
+    assert!(
+        visits < 50_000,
+        "the scan ran {visits} steps after the client left"
+    );
+    fixture.close().await;
+}
+
 /// A member streams at most `MAX_HOLDERS` backups. Another one fails with ResourceExhausted
 /// until a stream ends.
 #[tokio::test]

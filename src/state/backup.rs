@@ -293,7 +293,10 @@ impl Rows {
         let mut rows = 0_u64;
         let mut size = encoded_size(&header)? + encoded_size(&0_u64)?;
         let mut scan = rows_of(state).await?;
+        let mut read = 0_u64;
         while let Some(row) = scan.next().await? {
+            read += 1;
+            cooperate(read).await;
             if !(self.omit)(&row.key) {
                 rows += 1;
                 size += row_size(&row.key, &row.value)?;
@@ -313,7 +316,10 @@ impl Rows {
         image.write(&(rows + 1)).await?;
         let mut scan = rows_of(state).await?;
         let mut written = 0_u64;
+        let mut read = 0_u64;
         while let Some(row) = scan.next().await? {
+            read += 1;
+            cooperate(read).await;
             if !(self.omit)(&row.key) {
                 written += 1;
                 image.write(&(row.key, row.value)).await?;
@@ -322,6 +328,14 @@ impl Rows {
         ensure!(written == rows, "backup state changed during the stream");
         image.write(&(crate::cluster::KEY, members)).await?;
         image.finish().await
+    }
+}
+
+/// Yield to the runtime every 1024 rows. Rows that come from memory or cached blocks never wait,
+/// so without this a pass would hold the thread, and a cancelled stream would run on.
+async fn cooperate(rows: u64) {
+    if rows.is_multiple_of(1024) {
+        tokio::task::yield_now().await;
     }
 }
 
