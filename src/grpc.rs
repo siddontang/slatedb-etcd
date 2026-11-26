@@ -199,10 +199,17 @@ impl Service {
                     .await;
             }
         }
-        let read_permit = if mvcc::read_only(&request, false) && !mvcc::read_only(&request, true) {
+        let read_only = mvcc::read_only(&request, false);
+        let read_permit = if read_only && !mvcc::read_only(&request, true) {
             Some(self.read_admission.acquire().await?)
         } else {
             None
+        };
+        // A read can wait for its ReadIndex and then run in the read executor up to its limit.
+        let wait = if read_only {
+            crate::node::WIDE_READ_LIMIT + Duration::from_secs(10)
+        } else {
+            Duration::from_secs(10)
         };
         let redirect = if forwarded {
             None
@@ -214,7 +221,7 @@ impl Service {
         self.events
             .try_send(Event::Authenticated(credentials, Box::new(event)))
             .map_err(|_| Status::unavailable("etcdserver: too many requests"))?;
-        let reply = tokio::time::timeout(Duration::from_secs(10), rx)
+        let reply = tokio::time::timeout(wait, rx)
             .await
             .map_err(|_| {
                 Status::deadline_exceeded("etcdserver: request timed out; outcome unknown")

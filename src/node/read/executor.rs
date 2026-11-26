@@ -7,6 +7,8 @@ pub(in crate::node) const MAX_SCANS: usize = MAX_TASKS - 1;
 /// Bytes of rows that one shared scan can materialize.
 /// A larger result runs again in the exclusive slot on the same pinned view.
 pub(in crate::node) const SCAN_ROW_BUDGET: usize = 4 << 20;
+/// Execution time of a point read.
+const POINT_READ_LIMIT: Duration = Duration::from_secs(5);
 
 /// The executor capacity class of a read job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,7 +120,11 @@ impl Executor {
             queries,
             header,
             slot,
-            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            deadline: tokio::time::Instant::now()
+                + match slot {
+                    Slot::Point => POINT_READ_LIMIT,
+                    Slot::Scan | Slot::Exclusive => crate::node::WIDE_READ_LIMIT,
+                },
             row_budget: self.scan_row_budget,
         };
         self.start(work);

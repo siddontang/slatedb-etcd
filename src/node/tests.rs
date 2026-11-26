@@ -822,6 +822,36 @@ async fn read_index_requires_quorum_and_does_not_write_the_log() {
 }
 
 #[tokio::test]
+async fn read_index_wait_expires_but_a_running_read_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    let (tx, waiting) = oneshot::channel();
+    node.linear_read(range_request(), tx);
+    node.drive_ready().await.unwrap();
+    for read in node.reads.values_mut() {
+        read.started = Instant::now() - Duration::from_secs(6);
+    }
+    node.expire_reads();
+    assert!(node.reads.is_empty());
+    assert!(waiting.await.unwrap().is_err());
+
+    // A large LIST can run longer than the ReadIndex wait. The read executor limits it.
+    let (tx, mut running) = oneshot::channel();
+    node.linear_read(range_request(), tx);
+    let id = *node.reads.keys().next().unwrap();
+    node.drive_ready().await.unwrap();
+    confirm_read(&mut node, &id).await;
+    assert_eq!(node.read_executor.len(), 1);
+    node.reads.get_mut(&id).unwrap().started = Instant::now() - Duration::from_secs(6);
+    node.expire_reads();
+    assert!(running.try_recv().is_err());
+    let output = node.read_executor.step().await.unwrap().unwrap();
+    node.complete_read(output).unwrap();
+    assert!(running.await.unwrap().is_ok());
+    assert!(node.reads.is_empty());
+}
+
+#[tokio::test]
 async fn scans_run_together_and_rerun_alone_over_their_row_budget() {
     use crate::proto::etcdserverpb::{
         request_op::Request as Op, response_op::Response as Resp, PutRequest, RangeRequest,

@@ -8,10 +8,12 @@ pub(super) struct PendingRead {
     term: u64,
     leader: u64,
     role: StateRole,
-    started: Instant,
+    pub(super) started: Instant,
     index: Option<u64>,
     context: Option<u64>,
     retry_ticks: u8,
+    /// The read executor runs the read. Its deadline then limits the read.
+    executing: bool,
 }
 
 impl Node {
@@ -85,6 +87,7 @@ impl Node {
                     index: None,
                     context: None,
                     retry_ticks: 2,
+                    executing: false,
                 },
             );
         }
@@ -204,6 +207,13 @@ impl Node {
             {
                 queries.push(self.read_queries.remove(position).unwrap());
             }
+            for query in &queries {
+                if let Query::Linear(_, _, id) = query {
+                    if let Some(read) = self.reads.get_mut(id) {
+                        read.executing = true;
+                    }
+                }
+            }
             self.read_executor
                 .submit(self.state.read.clone(), queries, self.header());
         }
@@ -248,7 +258,8 @@ impl Node {
                     || read.role != role
                     || read.term != term
                     || read.response.is_closed()
-                    || now.duration_since(read.started) > Duration::from_secs(5)
+                    || (!read.executing
+                        && now.duration_since(read.started) > Duration::from_secs(5))
             })
             .map(|(id, _)| *id)
             .collect();
