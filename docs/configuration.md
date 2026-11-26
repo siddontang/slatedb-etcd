@@ -113,7 +113,10 @@ thresholds: by default 10,000 entries or 64 MiB of log, plus the entries applied
 Membership changes and peer snapshot requests do not wait for the byte threshold.
 These flags do not bound process RSS, SlateDB, state scans, or snapshot buffers.
 A memtable flush caches the SST index, filters, and current-row blocks; reads cache the rest.
-Compaction reads ahead 2 x 512 KiB per input SST. Each compaction job runs at most two
+A compaction job merges at least 8 L0 tables or 8 sorted runs of a similar size (SlateDB's
+default is 4), and memtable flushes stop at 16 L0 tables (default 8). After a bulk load this
+rewrites about 40 % of the bytes that the defaults rewrite. A read may consult a few more sorted
+runs. Compaction reads ahead 2 x 512 KiB per input SST. Each compaction job runs at most two
 subcompactions, because each one buffers SST data until the disk takes it.
 On Linux, SST writes of replicated state on local storage start disk writeback one SST block at
 a time, so Raft log syncs wait behind only a few blocks. Shared state mode and S3 do not pace SST

@@ -1070,6 +1070,13 @@ fn slatedb_settings_bound_compaction_buffers() {
     assert_eq!(settings.flush_interval, None);
     assert_eq!(settings.max_unflushed_bytes, defaults.max_unflushed_bytes);
     assert_eq!(settings.l0_sst_size_bytes, defaults.l0_sst_size_bytes);
+    let compactor = settings.compactor_options.as_ref().unwrap();
+    let sources = |key: &str| compactor.scheduler_options.get(key).map(String::as_str);
+    assert_eq!(sources("min_compaction_sources"), Some("8"));
+    // SlateDB's default of 8 sources per job bounds the read-ahead buffers of one job.
+    assert_eq!(sources("max_compaction_sources"), None);
+    assert_eq!(settings.l0_max_ssts, 16);
+    assert_eq!(settings.l0_max_ssts_per_key, 16);
     let worker = settings
         .compactor_options
         .as_ref()

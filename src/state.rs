@@ -200,6 +200,18 @@ const COMPACTION_FETCH_BYTES: usize = 512 * 1024;
 /// subcompactions this held about 185 MiB in put-v4096 on a server with 4 CPU threads.
 const SUBCOMPACTIONS: usize = 2;
 
+/// L0 SSTs, and sorted runs of a similar size, that one compaction job merges at least.
+///
+/// SlateDB's size-tiered scheduler uses the same minimum for both, by default 4. After a
+/// 150,000-pod load (2.9 GB flushed), the default compacted 7.3 GB: L0 jobs made 256 MiB sorted
+/// runs, and the runs were merged again and again. 8 compacted 2.9 GB, so the backlog after a
+/// load is a third as long. A job still merges at most SlateDB's default of 8 sources, which
+/// bounds its read-ahead buffers. A read may consult a few more sorted runs.
+const MIN_COMPACTION_SOURCES: usize = 8;
+/// L0 SSTs at which SlateDB stops memtable flushes. Twice [`MIN_COMPACTION_SOURCES`], as
+/// SlateDB's defaults are (8 and 4), so flushes go on while an L0 job runs.
+const L0_MAX_SSTS: usize = 2 * MIN_COMPACTION_SOURCES;
+
 /// The SST entries that a memtable flush caches: indexes, filters, and current-row data blocks.
 ///
 /// SlateDB inserts every data block of a flushed L0 SST by default. Each flush then filled the
@@ -227,12 +239,18 @@ pub(crate) fn slatedb_settings() -> Settings {
         flush_interval: None,
         object_store_max_retries: Some(3),
         manifest_poll_interval: Duration::from_millis(100),
+        l0_max_ssts: L0_MAX_SSTS,
+        l0_max_ssts_per_key: L0_MAX_SSTS,
         ..Settings::default()
     };
     // Frequent checkpoints need prompt L0 compaction and manifest refreshes.
     if let Some(compactor) = settings.compactor_options.as_mut() {
         compactor.poll_interval = Duration::from_millis(100);
         compactor.commit_compacted_interval = Duration::from_millis(100);
+        compactor.scheduler_options.insert(
+            "min_compaction_sources".into(),
+            MIN_COMPACTION_SOURCES.to_string(),
+        );
         if let Some(worker) = compactor.worker.as_mut() {
             worker.compactions_poll_interval = Duration::from_millis(100);
             worker.max_subcompactions = SUBCOMPACTIONS;
