@@ -129,11 +129,14 @@ A member in shared state mode also exports these gauges. Replicated members omit
 | `slatedb_etcd_shared_backup_retained_bytes` | Released overlay bytes that backups still keep |
 
 The member sets the first eleven rows on each Raft tick. The leader sets the checkpoint count
-after each publication. The clock skew gauge changes at each writer open. The backup gauges change when a
-backup starts or ends, and every 100 ms while one streams.
+after each publication. The clock skew gauge changes at each writer open. The backup gauges
+change when a backup starts or ends, and every 100 ms while one streams.
 
 - A base index that stops while the applied index grows means that no checkpoint reaches the
   member. Check S3 access and the leader's writer.
+- A clock alarm or a clock wait that lasts means that the leader clock disagrees with the voter
+  clocks, or that too few voters answer `/raft/clock`. `/status` shows `clock_alarm` and
+  `clock`. See [Clocks](shared-state.md#clocks).
 - Overlay bytes near `--overlay-max-bytes` mean that checkpoints are slow. The leader then
   rejects proposals.
 - Backup bytes near `--overlay-max-bytes` mean that a backup client reads slowly. New backups then

@@ -182,7 +182,7 @@ checkpoint of it, its base, under an in-memory overlay of the newer applied batc
 | `--view-max-age` | `10s` | Age of the oldest unflushed write that starts a flush and checkpoint. |
 | `--view-pin-max` | `5m` | Age after which a read view fails with a retryable error. |
 | `--overlay-max-bytes` | 1073741824 | Leader admission limit of the overlay. Apply waits at 2x. |
-| `--max-clock-skew` | `5s` | A new writer does not start with its clock this far behind. |
+| `--max-clock-skew` | `5s` | Writer clock limit: behind the manifest, or ahead of voters. |
 | `--view-retention` | `off` | `off` keeps all view checkpoints. `fenced` deletes unpinned ones. |
 
 Rules and limits:
@@ -200,11 +200,21 @@ Rules and limits:
   also refuses a prefix that holds a replicated member namespace.
 - A directory keeps its mode. A member refuses to start in a different mode.
 - The leader opens the writer when it takes the lead. The open fences the old writer. The leader
-  then checks that it still leads the same term, and waits until its clock passes the manifest
-  clock. A fence while it still leads opens the writer again.
-- Over `--max-clock-skew`, the writer does not start. The member logs an error, sets
-  `clock_alarm` in `/status`, exports `slatedb_etcd_shared_clock_skew_milliseconds`, and tries
-  again with a backoff. After three refusals the leader hands over the lead.
+  then checks that it still leads the same term. It waits until its clock passes the manifest
+  clock and the time of the newest L0 SST ID. A fence while it still leads opens the writer
+  again.
+- With its clock over `--max-clock-skew` behind, the writer does not start. The member logs an
+  error, sets `clock_alarm` to `behind` in `/status`, exports
+  `slatedb_etcd_shared_clock_skew_milliseconds`, and tries again with a backoff. After three
+  refusals the leader hands over the lead.
+- A leader of several voters probes the clock of each voter every 500 ms. It writes no tick more
+  than `--max-clock-skew` above the clocks of a voter majority. A leader clock that is further
+  ahead refuses each batch and sets `clock_alarm` to `ahead`. After three refusals the leader
+  hands over the lead. No client request fails, because the overlay keeps the batches.
+- A writer without fresh clock samples of a voter majority waits. `/status` shows
+  `clock.waiting`, and `slatedb_etcd_shared_writer_clock_waiting` is 1. One voter has no clock
+  probe. An earlier binary has no `/raft/clock` route and gives no sample. See
+  [Clocks](shared-state.md#clocks).
 - A storage error of the writer keeps the member up. The writer opens again with a backoff, and
   a member whose path fails hands over the lead. See
   [writer faults](shared-state.md#writer-faults).

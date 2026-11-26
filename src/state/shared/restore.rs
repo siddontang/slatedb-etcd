@@ -868,6 +868,16 @@ async fn write_steps(
                 };
                 db.create_checkpoint(slatedb::config::CheckpointScope::Durable, &options)
                     .await?;
+                // The restore runs before Raft, so no voter clock check applies. Each leader
+                // waits until its clock passes this tick. See "Clocks" in the design.
+                let local_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_millis() as i64);
+                tracing::info!(
+                    clock_tick = db.manifest().last_l0_clock_tick(),
+                    local_ms,
+                    "the restore checkpoint holds the writer clock of this host"
+                );
                 #[cfg(test)]
                 restore.hooks.stop_at(Stop::AfterCheckpoint)?;
             }

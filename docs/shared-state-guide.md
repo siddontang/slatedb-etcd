@@ -16,7 +16,7 @@ Use shared mode when S3 storage and S3 writes cost more than the extra risk belo
 | Raft snapshot for a new member | Copy of the SSTs | A checkpoint name, no data copy |
 | Fault domain | Each member has its own copy | A lost object affects all members |
 | Write access | Each member writes its own prefix | Every voter can write the shared prefix |
-| Leader change | No clock dependency | The new writer waits for the manifest clock |
+| Leader change | No clock dependency | The writer clock must stay near the voter clocks |
 
 Keep replicated mode, the default, when members must not share a fault domain. Shared mode is for
 new clusters. A stopped replicated S3 cluster can be converted offline. See
@@ -152,11 +152,20 @@ Manual cleanup with `off`:
 ## Clocks
 
 SlateDB starts a writer's clock at the `last_l0_clock_tick` of the manifest. A new leader waits
-until its local clock passes that tick. If the local clock is behind by more than
-`--max-clock-skew`, 5 s by default, the writer does not start. The member logs an error, sets
-`clock_alarm` in `/status`, sets `slatedb_etcd_shared_clock_skew_milliseconds`, and tries again
-with a backoff. After three refusals it hands the lead to a voter without a writer fault. Keep
-host clocks synchronized with NTP.
+until its local clock passes that tick and the time of the newest L0 SST ID. If the local clock
+is behind by more than `--max-clock-skew`, 5 s by default, the writer does not start. The member
+logs an error, sets `clock_alarm` to `behind` in `/status`, sets
+`slatedb_etcd_shared_clock_skew_milliseconds`, and tries again with a backoff.
+
+The leader also probes the clock of each voter every 500 ms. It writes no tick more than
+`--max-clock-skew` above the clocks of a voter majority. A leader clock that is further ahead
+refuses each batch and sets `clock_alarm` to `ahead`. Client writes still succeed into the
+overlay. While too few voters answer the probe, the writer waits and `/status` shows
+`clock.waiting`.
+
+After three clock refusals the leader hands the lead to a voter without a writer fault, and
+prefers a voter whose clock a majority supports. Keep host clocks synchronized with NTP, also on
+the host of a snapshot restore. See [Clocks](shared-state.md#clocks).
 
 ## Memory
 
@@ -306,6 +315,7 @@ place. Delete them after you check the converted cluster.
 | An announcement is lost | The writer announces the checkpoint again with the same backoff |
 | A member reads a deleted SST | The read fails and can retry. Apply rebuilds from a newer base |
 | The new leader's clock is behind | The writer waits, or refuses above `--max-clock-skew` |
+| The leader's clock is ahead of the voters | The writer refuses each batch. The lead moves |
 | All members restart | Each member opens the newest checkpoint and replays its log |
 | A member uses another bucket or prefix | Peers refuse its traffic. It cannot join the quorum |
 | The shared database is lost | All members lose state together. Restore from a backup |
