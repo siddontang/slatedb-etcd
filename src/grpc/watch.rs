@@ -468,6 +468,13 @@ impl Stream {
         for (id, _) in &pending {
             permit(&view.auth, &credentials, &self.watchers[id].request)?;
         }
+        #[cfg(test)]
+        if pending
+            .iter()
+            .any(|(id, _)| self.watchers[id].request.key == HELD_SCAN_KEY)
+        {
+            drop(HELD_SCAN.lock().await);
+        }
         // Each page is one read with its own pin deadline. An expired page resumes on a new
         // view after the last revision that each watcher received.
         let reads = view.read_state();
@@ -753,6 +760,12 @@ pub(crate) const PREPARED_BYTES: usize = 256 << 10;
 pub(crate) static LARGEST_BATCH: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// History scans for this key wait while a test holds `HELD_SCAN`.
+#[cfg(test)]
+const HELD_SCAN_KEY: &[u8] = b"held-scan";
+#[cfg(test)]
+static HELD_SCAN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn record_batch(_bytes: usize, _responses: usize) {
     #[cfg(test)]
     if _responses > 1 {
@@ -863,7 +876,6 @@ impl Service {
             let unsynced = stream.unsynced();
             let waiting = pending.is_some();
             tokio::select! {
-                _ = tx.closed() => return Ok(()),
                 received = events.recv() => stream.receive(received).await?,
                 changed = changes.changed() => {
                     changed.map_err(|_| unavailable())?;
@@ -950,16 +962,19 @@ impl Watch for Service {
         let service = self.clone();
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
-            if let Err(error) = service
-                .watch_stream(
+            // A client that leaves ends the stream at once, even while a create scans history
+            // or waits on the node. Its watchers then release their slots.
+            let result = tokio::select! {
+                _ = tx.closed() => Ok(()),
+                result = service.watch_stream(
                     request.into_inner(),
                     &tx,
                     require_leader,
                     credentials,
                     meters,
-                )
-                .await
-            {
+                ) => result,
+            };
+            if let Err(error) = result {
                 let _ = tx.send(Err(error)).await;
             }
         });
@@ -1433,19 +1448,49 @@ mod tests {
             ..Default::default()
         });
         let _live = shared.admit().unwrap();
+        let start = Arc::new(std::sync::Barrier::new(2));
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let refuser = std::thread::spawn({
-            let (shared, done) = (shared.clone(), done.clone());
+            let (shared, start, done) = (shared.clone(), start.clone(), done.clone());
             move || {
-                while !done.load(Ordering::Relaxed) {
+                start.wait();
+                for _ in 0..100_000 {
                     assert!(shared.admit().is_err());
                 }
+                done.store(true, Ordering::Release);
             }
         });
-        let over = (0..1_000_000).any(|_| shared.watchers.load(Ordering::Relaxed) > 1);
-        done.store(true, Ordering::Relaxed);
+        // Sample the count during every refused create.
+        start.wait();
+        let mut over = false;
+        while !done.load(Ordering::Acquire) {
+            over |= shared.watchers.load(Ordering::Relaxed) > 1;
+        }
         refuser.join().unwrap();
         assert!(!over);
+    }
+
+    /// Zero limits mean no limit, so one stream holds more than the default stream limit.
+    #[tokio::test]
+    async fn zero_limits_admit_watchers_past_the_default() {
+        let mut f = Fixture::new().await;
+        f.stream = Stream::new(
+            f.stream.tx.clone(),
+            false,
+            Default::default(),
+            None,
+            f.feed.subscribe(),
+            limits(WatchOptions {
+                max_watchers: 0,
+                max_watchers_per_stream: 0,
+                ..Default::default()
+            }),
+        );
+        for id in 1..=DEFAULT_MAX_WATCHERS_PER_STREAM as i64 + 1 {
+            f.watch(request(id, "k", 0)).await;
+        }
+        assert_eq!(f.stream.watchers.len(), DEFAULT_MAX_WATCHERS_PER_STREAM + 1);
+        f.close().await;
     }
 
     #[tokio::test]
@@ -1577,6 +1622,10 @@ mod tests {
 
     impl EarlyReply {
         async fn start(f: &Fixture) -> Self {
+            Self::start_with(f, WatchOptions::default()).await
+        }
+
+        async fn start_with(f: &Fixture, options: WatchOptions) -> Self {
             let (events, mut node) = mpsc::channel(16);
             let (batches, _) = broadcast::channel(16);
             let (barrier, barriers) = mpsc::channel(16);
@@ -1601,7 +1650,7 @@ mod tests {
                 &Default::default(),
                 crate::auth::TokenIssuer::parse("simple").unwrap(),
                 Default::default(),
-                WatchOptions::default(),
+                options,
             )
             .unwrap()
             .router();
@@ -1657,6 +1706,49 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap()
+    }
+
+    /// A client that leaves while its create scans history returns the member slot at once,
+    /// before the scan ends.
+    #[tokio::test]
+    async fn a_closed_stream_releases_its_slot_during_a_history_scan() {
+        let mut f = Fixture::new().await;
+        let mut member = EarlyReply::start_with(
+            &f,
+            WatchOptions {
+                max_watchers: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        f.put("other", "1").await;
+        let held = HELD_SCAN.lock().await;
+        let (requests, mut output) = member.open().await;
+        let mut old = request(1, "", 1);
+        old.key = HELD_SCAN_KEY.to_vec();
+        requests.send(create(old)).await.unwrap();
+        member.barrier().await.send(()).unwrap();
+        assert!(!next(&mut output).await.canceled);
+        // The create now waits in its history scan. The client leaves.
+        drop((requests, output));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let (requests, mut output) = member.open().await;
+            requests.send(create(request(1, "k", 0))).await.unwrap();
+            member.barrier().await.send(()).unwrap();
+            let created = next(&mut output).await;
+            if !created.canceled {
+                break;
+            }
+            assert_eq!(created.cancel_reason, "watch limit exceeded");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the closed stream keeps its slot"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        drop(held);
+        f.close().await;
     }
 
     /// The member answered a Put at R before it applied R. A watcher created then on an open
