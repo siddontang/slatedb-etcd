@@ -198,6 +198,13 @@ impl Executor {
         self.over_budget.clear();
     }
 
+    /// True if every queued manual job still has time left to run.
+    #[cfg(test)]
+    pub fn manual_jobs_have_time(&self) -> bool {
+        let now = tokio::time::Instant::now();
+        self.manual.iter().flatten().all(|work| work.deadline > now)
+    }
+
     #[cfg(test)]
     pub async fn step(&mut self) -> Result<Option<Output>> {
         loop {

@@ -620,6 +620,56 @@ pub(super) fn range_request() -> RequestOp {
     }
 }
 
+/// Commit and apply keys `a` to `h`, each with a 100-byte value.
+async fn put_letters(node: &mut Node) {
+    use crate::proto::etcdserverpb::{request_op::Request as Op, PutRequest};
+    for key in 0..8u8 {
+        let (tx, _) = oneshot::channel();
+        node.propose(
+            RaftCommand::Etcd {
+                id: format!("put-{key}"),
+                origin: 1,
+                etcd: RequestOp {
+                    request: Some(Op::RequestPut(PutRequest {
+                        key: vec![b'a' + key],
+                        value: vec![key; 100],
+                        ..Default::default()
+                    })),
+                },
+            },
+            tx,
+        )
+        .unwrap();
+    }
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    let mut ack = Message::default();
+    ack.set_msg_type(MessageType::MsgAppendResponse);
+    ack.from = 2;
+    ack.to = 1;
+    ack.term = node.raw.raft.term;
+    ack.index = node.raw.store().last_index().unwrap();
+    node.raw.step(ack).unwrap();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    node.drain_apply().await.unwrap();
+}
+
+/// A linearizable Range of the keys from `start` up to `end`.
+fn wide_range(start: &[u8], end: &[u8]) -> RequestOp {
+    RequestOp {
+        request: Some(
+            crate::proto::etcdserverpb::request_op::Request::RequestRange(
+                crate::proto::etcdserverpb::RangeRequest {
+                    key: start.to_vec(),
+                    range_end: end.to_vec(),
+                    ..Default::default()
+                },
+            ),
+        ),
+    }
+}
+
 async fn confirm_read(node: &mut Node, id: &u64) {
     let mut message = Message::default();
     message.set_msg_type(MessageType::MsgHeartbeatResponse);
@@ -823,6 +873,7 @@ async fn read_index_requires_quorum_and_does_not_write_the_log() {
 
 #[tokio::test]
 async fn read_index_wait_expires_but_a_running_read_finishes() {
+    use crate::proto::etcdserverpb::response_op::Response as Resp;
     let dir = tempfile::tempdir().unwrap();
     let mut node = leader_node(dir.path()).await;
     let (tx, waiting) = oneshot::channel();
@@ -836,58 +887,97 @@ async fn read_index_wait_expires_but_a_running_read_finishes() {
     assert!(waiting.await.unwrap().is_err());
 
     // A large LIST can run longer than the ReadIndex wait. The read executor limits it.
+    put_letters(&mut node).await;
     let (tx, mut running) = oneshot::channel();
-    node.linear_read(range_request(), tx);
+    node.linear_read_auth(wide_range(b"a", b"z"), None, ClientResponse::Kv(tx));
     let id = *node.reads.keys().next().unwrap();
     node.drive_ready().await.unwrap();
     confirm_read(&mut node, &id).await;
     assert_eq!(node.read_executor.len(), 1);
-    node.reads.get_mut(&id).unwrap().started = Instant::now() - Duration::from_secs(6);
+    // The scan runs 6 s after it started and 12 s after the request arrived.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    node.reads.get_mut(&id).unwrap().started = Instant::now() - Duration::from_secs(12);
     node.expire_reads();
     assert!(running.try_recv().is_err());
+    assert!(node.read_executor.manual_jobs_have_time());
+    let output = node.read_executor.step().await.unwrap().unwrap();
+    tokio::time::resume();
+    node.complete_read(output).unwrap();
+    let Some(Resp::ResponseRange(range)) = running
+        .await
+        .unwrap()
+        .unwrap()
+        .into_outcome()
+        .result
+        .unwrap()
+        .response
+    else {
+        panic!("expected a range response");
+    };
+    let keys: Vec<_> = range.kvs.iter().map(|kv| kv.key[0]).collect();
+    assert_eq!(keys, (b'a'..b'i').collect::<Vec<_>>());
+    assert!(node.reads.is_empty());
+}
+
+#[tokio::test]
+async fn an_expired_queued_read_does_not_start() {
+    use crate::proto::etcdserverpb::{request_op::Request as Op, RangeRequest};
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    // A sorted Range holds the exclusive slot.
+    let (tx, _held) = oneshot::channel();
+    node.enqueue_query(Query::Read(
+        RequestOp {
+            request: Some(Op::RequestRange(RangeRequest {
+                key: b"a".to_vec(),
+                range_end: b"z".to_vec(),
+                sort_order: 2,
+                serializable: true,
+                ..Default::default()
+            })),
+        },
+        None,
+        ClientResponse::Kv(tx),
+    ));
+    node.drive_ready().await.unwrap();
+    assert_eq!(node.read_executor.len(), 1);
+
+    let (tx, expired) = oneshot::channel();
+    node.linear_read(wide_range(b"a", b"m"), tx);
+    let stale = *node.reads.keys().next().unwrap();
+    let (tx, live) = oneshot::channel();
+    node.linear_read(wide_range(b"m", b"z"), tx);
+    let fresh = *node.reads.keys().find(|id| **id != stale).unwrap();
+    node.drive_ready().await.unwrap();
+    confirm_read(&mut node, &stale).await;
+    confirm_read(&mut node, &fresh).await;
+    assert_eq!(node.read_queries.len(), 2);
+
+    node.reads.get_mut(&stale).unwrap().started = Instant::now() - Duration::from_secs(6);
+    node.expire_reads();
+    assert!(expired.await.unwrap().is_err());
+
+    // Both scans could share the wide slots. Only the live one starts.
     let output = node.read_executor.step().await.unwrap().unwrap();
     node.complete_read(output).unwrap();
-    assert!(running.await.unwrap().is_ok());
+    node.schedule_reads();
+    assert_eq!(node.read_executor.len(), 1);
+    assert!(node.read_queries.is_empty());
+    let output = node.read_executor.step().await.unwrap().unwrap();
+    node.complete_read(output).unwrap();
+    assert!(live.await.unwrap().is_ok());
     assert!(node.reads.is_empty());
 }
 
 #[tokio::test]
 async fn scans_run_together_and_rerun_alone_over_their_row_budget() {
     use crate::proto::etcdserverpb::{
-        request_op::Request as Op, response_op::Response as Resp, PutRequest, RangeRequest,
+        request_op::Request as Op, response_op::Response as Resp, RangeRequest,
     };
     let dir = tempfile::tempdir().unwrap();
     let mut node = leader_node(dir.path()).await;
-    for key in 0..8u8 {
-        let (tx, _) = oneshot::channel();
-        node.propose(
-            RaftCommand::Etcd {
-                id: format!("put-{key}"),
-                origin: 1,
-                etcd: RequestOp {
-                    request: Some(Op::RequestPut(PutRequest {
-                        key: vec![b'a' + key],
-                        value: vec![key; 100],
-                        ..Default::default()
-                    })),
-                },
-            },
-            tx,
-        )
-        .unwrap();
-    }
-    node.drive_ready().await.unwrap();
-    node.drain_log().await.unwrap();
-    let mut ack = Message::default();
-    ack.set_msg_type(MessageType::MsgAppendResponse);
-    ack.from = 2;
-    ack.to = 1;
-    ack.term = node.raw.raft.term;
-    ack.index = node.raw.store().last_index().unwrap();
-    node.raw.step(ack).unwrap();
-    node.drive_ready().await.unwrap();
-    node.drain_log().await.unwrap();
-    node.drain_apply().await.unwrap();
+    put_letters(&mut node).await;
     let revision = node.state.revision;
     assert_eq!(revision, 9);
     // Each row counts more than 200 bytes. Two rows fit the shared budget; eight rows do not.

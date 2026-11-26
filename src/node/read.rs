@@ -263,6 +263,9 @@ impl Node {
             })
             .map(|(id, _)| *id)
             .collect();
+        if expired.is_empty() {
+            return;
+        }
         let mut failed = BTreeSet::new();
         for id in expired {
             if let Some(read) = self.reads.remove(&id) {
@@ -273,6 +276,11 @@ impl Node {
                     .error(self.error("read cancelled: leadership changed or request timed out"));
             }
         }
+        // A queued read whose caller already got an error must not take an executor slot.
+        self.read_queries.retain(|query| match query {
+            Query::Linear(_, _, id) => self.reads.contains_key(id),
+            _ => true,
+        });
         if !failed.is_empty() {
             self.metrics.failed_read_indexes.inc_by(failed.len() as u64);
         }

@@ -227,10 +227,13 @@ Four read jobs can run, with at most 16 point reads per job.
 Up to three current key-ordered Range scans can run together with a 4 MiB row budget each.
 A scan over budget, historical reads, sorted or filtered Ranges, and transactions run alone.
 Wide reads start in queue order. Current point reads can pass queued wide reads.
-The queue holds at most 64 requests. Each running job has a five-second deadline.
+The queue holds at most 64 requests. A running point-read job has a five-second deadline.
+A running wide-read job has a 60-second deadline, so a large LIST is not retried from the start.
 Shutdown stops these jobs before closing the state database.
 The owner checks the term, role, and leader identity again before returning the result.
-Leadership loss, a five-second timeout, or client cancellation removes the pending request.
+Leadership loss or client cancellation removes the pending request.
+A linearizable read that does not start in the read executor within five seconds also fails,
+and a queued read whose request failed does not start.
 At most 64 ReadIndex requests can wait. These requests do not append log entries.
 Unconfirmed requests retry every two Raft ticks until confirmation, cancellation, or timeout.
 Retries cover lost messages and reads dropped before a new leader commits its first entry.
