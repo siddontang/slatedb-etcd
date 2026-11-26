@@ -72,6 +72,42 @@ A removed member ID cannot rejoin. Do not reuse its old data directory for a new
 Strict reconfiguration checks protect quorum by default. Disabling them can make a cluster
 unavailable.
 
+## Write capacity and sharding
+
+All writes go through one Raft leader and one log. More members add read capacity and fault
+tolerance, not write capacity. The leader's CPU and its log sync rate set the write ceiling.
+See [scale measurements](benchmarks.md#measure-scale-against-etcd) for one host.
+
+The service cannot split one keyspace over several Raft groups. To spread writes now, run more
+than one cluster and give each cluster a part of the keyspace. For kube-apiserver, use
+`--etcd-servers-overrides`. It sends the listed resources to their own cluster:
+
+```sh
+kube-apiserver \
+  --etcd-servers=https://main-1:2379,https://main-2:2379,https://main-3:2379 \
+  --etcd-servers-overrides='/events#https://ev-1:2379;https://ev-2:2379;https://ev-3:2379'
+```
+
+Each override has the form `group/resource#server;server`. Separate overrides with commas.
+The core group is empty, so `/events` selects core Events. Events are a common first choice.
+They have a high write rate and a short TTL (1 hour by default). No controller needs them for
+correctness.
+Other resources with many writes, such as `coordination.k8s.io/leases`, can move the same way.
+
+Each cluster is independent. Make sure that your design accepts these limits:
+
+- Each cluster has its own revision. Resource versions from two clusters cannot be compared.
+  The apiserver compares them only inside one resource, so it works with this split.
+- No transaction spans two clusters. The apiserver does not need one between resources.
+- Each cluster needs its own quota, compaction, monitoring, and backups. The apiserver compacts
+  each cluster on `--etcd-compaction-interval`.
+- A restore of two clusters does not give one consistent point in time across them.
+- One resource cannot span two clusters. A single resource with too many writes still meets the
+  ceiling of one cluster.
+
+The split does not change the support status above. The service is still not a supported
+Kubernetes backend. The clusters can be etcd, this service, or a mix.
+
 ## Maintenance and storage
 
 Status returns local identity, Raft progress, size estimates, quota, and alarms.

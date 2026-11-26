@@ -159,6 +159,127 @@ Further benchmarks must add larger state, warm and cold reads, Watch fan-out, le
 compaction, snapshot catch-up, S3 request costs, and independent-host network latency.
 Record recovery latency and correctness alongside throughput during each fault campaign.
 
+## Measure scale against etcd
+
+These runs compare the service with etcd v3.6.5 at about 1 GiB of state. They measure load rate,
+restart time, memory, LIST cost, Watch delivery, and data directory size.
+The scale driver and its case files are not in this repository yet.
+
+### Method
+
+The driver is a Go program on the official clientv3 client. It sends the same phases to both
+backends. Each backend and repeat starts a fresh cluster with a 16 GiB quota. `scale-1g` and
+`scale-k8s` ran twice per backend, and `scale-1g-settle` ran once.
+
+- `scale-1g`: load 1,000,000 keys of 1 KiB in 1,000 prefixes with 256 writers. Then 60 s of
+  overwrites at 2,000/s, and the same with two paginated LIST loops (limit 500).
+  Then one paginated LIST at a revision 1,000 behind the head, capped at 300 s.
+- `scale-k8s`: load 150,000 pod objects, 90% of 4-8 KiB and 10% of 8-100 KiB (about 1.2 GiB).
+  Then 60 s of 500 Events/s (1 KiB, 1-hour leases) and 50 pod updates/s, with 100 watchers on
+  the pod prefix over 10 streams. Then the same with four paginated LIST loops. The first page
+  reads the head revision and later pages read that revision, as the apiserver does.
+  Then one unpaginated LIST of all pods.
+- Both cases then restart the member with SIGTERM and time the first accepted write.
+  Then they add a learner, wait until it reaches the leader revision, and promote it.
+- `scale-1g-settle`: the `scale-1g` load and write burst, then 420 s of 20 writes/s.
+  It measures the data directory after a longer period of light writes.
+
+The main phases use one member. The learner phase adds a second member on the same host.
+The driver measures Watch delivery from a timestamp in each value.
+A 0.2 s sampler records peak RSS and CPU of the server processes for each phase.
+Restart time is the time until the first write succeeds, with 0.5 s resolution.
+
+The host has an Intel Xeon E3-1241 v3 (4 cores, 8 threads), 32 GiB of memory, one SATA SSD
+(Samsung 860), and Ubuntu 24.04 with Linux 6.8. The server uses 4 logical CPUs (2 cores). The
+driver uses the other 4. No other benchmark runs on the host. An idle test service also runs.
+Both backends keep their default sync settings. No unsafe or no-sync option is set.
+The service runs commit 7f0e74b as a release build with SlateDB on the local disk.
+
+### Results
+
+Each cell shows the lowest and highest value of the repeats. Times are p99 unless named.
+RSS is the peak of the phase. A "page" is one LIST request of 500 keys.
+
+`scale-1g` (1,000,000 keys of 1 KiB):
+
+| Metric | etcd | This service |
+|---|---:|---:|
+| Load rate, keys/s | 9,690-10,420 | 13,601-13,824 |
+| Load peak RSS, MiB | 542-555 | 2,161-2,192 |
+| Data directory after load, MiB | 1,804-1,865 | 3,791-3,876 |
+| Writes at 2,000/s, write p99, ms | 45-118 | 110 |
+| Writes with two LIST loops, achieved writes/s | 261-265 | 1,980-1,995 |
+| Writes with two LIST loops, write p99, ms | 502-518 | 94-99 |
+| Writes with two LIST loops, LIST page p99, ms | 513-521 | 783-842 |
+| Writes with two LIST loops, RSS, MiB | 913-925 | 1,976-2,043 |
+| LIST of all keys at an older revision, s | 243-244 | 75-81 |
+| LIST at an older revision, page p99 ms / RSS MiB | 239-240 / 1,950-1,965 | 138-141 / 1,731-1,825 |
+| Restart until the first write, s (±0.5) | 5.0 | 3.5 |
+| RSS 5 s after restart, MiB | 1,955-1,973 | 278-318 |
+| Learner catch-up, s / learner RSS, MiB | 20 / 2,019-2,029 | 30-33 / 291-343 |
+| Peak RSS of the case, MiB | 1,950-1,965 | 2,161-2,192 |
+| Data directory at the end, MiB | 1,860 | 9,317-9,412 |
+
+`scale-k8s` (150,000 pod objects, about 1.2 GiB):
+
+| Metric | etcd | This service |
+|---|---:|---:|
+| Load rate, objects/s | 2,948-3,046 | 2,551-2,655 |
+| Load peak RSS, MiB | 249-267 | 1,614-1,680 |
+| Data directory after load, MiB | 2,375-2,439 | 4,264-4,267 |
+| Steady, write p99, ms | 94-98 | 139-210 |
+| Steady, Watch delivery p99, ms | 94-99 | 139-242 |
+| Steady, RSS, MiB | 245-251 | 1,485-1,495 |
+| Steady with four LIST loops, write p99, ms | 170-195 | 119-147 |
+| Steady with four LIST loops, Watch delivery p99, ms | 168-329 | 174-214 |
+| Steady with four LIST loops, one full paginated LIST, s | 23 | 21-23 |
+| Steady with four LIST loops, LIST page p99, ms | 197-198 | 565-626 |
+| Steady with four LIST loops, RSS, MiB | 1,822-1,852 | 1,504-1,509 |
+| One unpaginated LIST of 1.3 GB, s | 4.2-4.3 | 9.8-45.6 |
+| One unpaginated LIST, RSS, MiB | 4,436-4,444 | 3,764-4,756 |
+| Restart until the first write, s (±0.5) | 1.7-2.5 | 1.1-3.0 |
+| RSS 5 s after restart, MiB | 1,787-1,802 | 95-376 |
+| Learner catch-up, s / learner RSS, MiB | 15-16 / 1,854-1,882 | 30-69 / 334-562 |
+| Peak RSS of the case, MiB | 4,436-4,444 | 3,764-4,756 |
+| Data directory at the end, MiB | 1,967-1,968 | 9,042-9,664 |
+
+`scale-1g-settle` (one repeat; 60 s of writes at 2,000/s, then 420 s at 20/s):
+
+| Metric | etcd | This service |
+|---|---:|---:|
+| Load rate, keys/s | 9,669 | 11,721 |
+| Data directory after load, MiB | 1,865 | 3,690 |
+| Light writes, write p99, ms | 15 | 43 |
+| Light writes, server CPU, s | 11.5 | 91.5 |
+| Data directory at the end, MiB | 1,847 | 8,636 |
+
+The main points:
+
+- Writes under LIST load: in `scale-1g`, etcd writes fall to about 260/s with two LIST loops.
+  The service keeps 2,000 writes/s. Its LIST pages are slower.
+- LIST at an older revision is 3 times faster on the service. An unpaginated LIST of all pods
+  is 2-11 times slower.
+- Steady Watch delivery p99 is higher on the service: 139-242 ms against 94-99 ms.
+- etcd maps its whole bbolt file, so its RSS after a restart is near the data size. The service
+  keeps 1.5-2.2 GiB during heavy writes, and about 0.1-0.4 GiB after a restart.
+- A learner catches up 1.5-4.5 times more slowly on the service. It uses less memory.
+- The service data directory at the end of a case is 4.6-5.1 times that of etcd. It is still
+  4.7 times after 420 s of light writes. These runs do not show the size after replaced SSTs
+  can leave the disk. See [disk use](operations.md#disk-use-and-quota).
+
+### Limits
+
+- One host, one disk, and one member for the main phases. These are not three-member, cross-host,
+  or S3 results. The learner shares the disk with the leader.
+- Two repeats per case, or one. Some p99 values change by 2 times between repeats. Use the
+  ranges, not single values, and repeat a run before you rely on a small difference.
+- RSS is resident memory of all server processes, not unique physical memory.
+- Each case ends less than 15 minutes after its load starts. SlateDB keeps replaced SSTs for
+  15-16 minutes, so the data directory sizes include them. This is also true for
+  `scale-1g-settle`, which ends about 9.5 minutes after its load starts.
+- etcd's data directory includes free bbolt pages. Neither size is the logical data size.
+- A real apiserver keeps a watch cache and sends fewer LISTs to etcd than this driver does.
+
 ## Sample Linux CPU stacks
 
 Install a Linux `perf` binary and allow CPU sampling in an isolated test environment.
