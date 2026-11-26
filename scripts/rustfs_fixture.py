@@ -294,7 +294,9 @@ def serve(args):
         args.env_file.parent.mkdir(parents=True, exist_ok=True)
         args.env_file.touch(mode=0o600)
         args.env_file.chmod(0o600)
-        args.env_file.write_text("".join(f"export {name}={shlex.quote(os.environ[name])}\n"
+        # A reused server needs only the four STORE_ENV settings.
+        values = dict({"AWS_EC2_METADATA_DISABLED": "true"}, **os.environ)
+        args.env_file.write_text("".join(f"export {name}={shlex.quote(values[name])}\n"
                                          for name in names))
         print("Server settings:", args.env_file, flush=True)
     if args.command:

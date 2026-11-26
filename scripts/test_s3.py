@@ -6,6 +6,7 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -82,6 +83,24 @@ class SharedStore(unittest.TestCase):
         self.assertNotIn("--s3-endpoint", aws)
         with self.assertRaises(RuntimeError):
             s3.shared_args(first, {})
+
+    def test_env_file_of_a_reused_server_needs_only_the_four_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings, copy = Path(directory) / "rustfs.env", Path(directory) / "copy"
+            child = f"import shutil; shutil.copy({str(settings)!r}, {str(copy)!r})"
+            argv = ["rustfs_fixture.py", "--env-file", str(settings), "--", sys.executable, "-c",
+                    child]
+            server = dict(without_store(), **self.SERVER)
+            server.pop("AWS_EC2_METADATA_DISABLED", None)
+            with patch.dict(s3.os.environ, server, clear=True), patch("sys.argv", argv), \
+                    patch.object(s3, "local_rustfs") as start:
+                with self.assertRaises(SystemExit) as end:
+                    s3.main()
+            start.assert_not_called()
+            self.assertEqual(end.exception.code, 0)
+            self.assertIn("export AWS_EC2_METADATA_DISABLED=true\n", copy.read_text())
+            self.assertIn("export SLATEDB_S3_TEST_BUCKET=bucket\n", copy.read_text())
+            self.assertFalse(settings.exists())
 
     def test_prefix_deletion_lists_and_deletes_until_no_key_remains(self):
         listing = (b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
