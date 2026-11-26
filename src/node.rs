@@ -30,7 +30,6 @@ mod forwarding;
 mod lease;
 mod log;
 mod maintenance;
-mod pause;
 mod proposal;
 pub use forwarding::ForwardView;
 pub(crate) use forwarding::LocalRead;
@@ -306,7 +305,7 @@ pub struct Node {
     held_puts: Option<quorum_put::HeldPuts>,
     /// The term of the entries in the last submitted PreparePuts job.
     prepare_term: u64,
-    /// True while the log above a held entry is past its alarm bound. See `pause`.
+    /// True while the log above a held entry is past its alarm bound. See `tick_apply_pause`.
     hold_alarm: bool,
     /// The entry that apply held on, until apply passes it. See `WriterReport::apply_held_at`.
     apply_held_at: Option<u64>,
