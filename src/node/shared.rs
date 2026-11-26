@@ -286,6 +286,8 @@ pub(super) struct Writer {
     pub(super) skip_raise: bool,
     /// The health of this member's writer. See `fault`.
     pub(super) health: fault::Health,
+    /// A batch waits for the clock check since this time. See `Writer::note_clock_wait`.
+    pub(super) clock_due: Option<Instant>,
     /// The writer reports of the voters, and the handoff of a writer incident.
     pub(super) handoff: fault::Handoff,
 }
@@ -393,6 +395,7 @@ impl Writer {
             #[cfg(test)]
             skip_raise: false,
             health: fault::Health::default(),
+            clock_due: None,
             handoff: fault::Handoff::default(),
             progress: Arc::new(Progress::new(0)),
             admin: handles.admin.clone(),
@@ -435,6 +438,7 @@ impl Writer {
             }
             self.health.end();
             self.handoff.lead(false);
+            self.clock_due = None;
             if !leader {
                 self.clock.stand_down();
             }

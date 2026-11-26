@@ -804,13 +804,26 @@ fn handoff_due(health: &Health, paused: Option<&super::apply::Paused>) -> bool {
 impl Writer {
     /// The time since work that the publisher has not started became due: the oldest unflushed
     /// write at its age limit, or an explicit publication request. A writer that is not open
-    /// holds the progress of an earlier one, so only an open writer counts.
+    /// holds the progress of an earlier one, so only an open writer counts. A batch that waits
+    /// for clock samples or for its clock bound counts too, open writer or not. See
+    /// `note_clock_wait`.
     pub(super) fn waiting(&self) -> Option<Instant> {
         if self.open.lock().unwrap().is_none() {
-            return None;
+            return self.clock_due;
         }
         let aged = self.progress.deadline(self.max_age);
-        aged.into_iter().chain(self.progress.requested()).min()
+        aged.into_iter()
+            .chain(self.progress.requested())
+            .chain(self.clock_due)
+            .min()
+    }
+
+    /// Note on a leader tick whether the clock check holds due work: the writer waits for
+    /// samples or for its bound, and a batch waits for the writer. An idle writer that waits
+    /// is no due work, so its wait never becomes a stall.
+    pub(super) fn note_clock_wait(&mut self) {
+        let due = self.clock.waiting() && !self.queue.after(self.progress.written(), 1).is_empty();
+        self.clock_due = due.then(|| self.clock_due.unwrap_or_else(Instant::now));
     }
 }
 
@@ -869,6 +882,7 @@ impl Node {
         };
         moves.extend(writer.transfer.map(|(target, _)| target));
         if leader {
+            writer.note_clock_wait();
             writer.health.check(writer.waiting());
         }
         if let Some(gauges) = &writer.gauges {

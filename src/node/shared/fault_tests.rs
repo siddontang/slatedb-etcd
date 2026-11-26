@@ -991,6 +991,46 @@ async fn a_clock_over_the_skew_limit_makes_a_handoff_due() {
     first.close().await;
 }
 
+/// A leader of three voters gets no clock samples. While it is idle, the wait is no due work
+/// and never stalls. A batch that waits counts toward `STALL`: the fault is a stall, not a clock
+/// fault, so `clock_alarm` stays clear and the handoff is due.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clock_wait_stalls_only_with_a_due_batch() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let clock = clock();
+    let voters = [1, 2, 3].map(|id| (id, Some(id))).into_iter().collect();
+    clock.configure(2, 1, voters);
+    let mut leader = Leader::open(store, Duration::from_millis(100), clock.clone()).await;
+    leader.lead(2);
+    eventually("the wait for samples", async || clock.waiting()).await;
+    // An earlier term of this member wrote each batch, so no batch waits.
+    let applied = leader.state.applied;
+    let writer = leader.writer();
+    writer.progress.reset(applied);
+    writer.note_clock_wait();
+    assert_eq!(writer.waiting(), None);
+    assert!(!writer.health.check(writer.waiting()));
+    assert!(!writer.health.handoff_due());
+    // A batch now waits for the writer.
+    let index = leader.state.applied + 1;
+    let put = crate::proto::etcdserverpb::RequestOp {
+        request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
+            put("k-due", "v"),
+        )),
+    };
+    leader.state.apply_etcd(index, &put).await.unwrap();
+    let writer = leader.writer();
+    writer.note_clock_wait();
+    assert!(writer.clock_due.is_some());
+    writer.clock_due = Some(Instant::now() - STALL - Duration::from_secs(1));
+    writer.note_clock_wait();
+    assert!(writer.health.check(writer.waiting()));
+    assert!(writer.health.handoff_due());
+    assert_eq!(writer.health.status()["last_error_class"], "stalled");
+    assert_eq!(writer.clock.alarm_name(), None);
+    leader.close().await;
+}
+
 /// An error of this member's own invariants still stops the member.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_invariant_error_stops_the_member() {
