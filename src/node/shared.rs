@@ -1718,6 +1718,8 @@ impl Node {
             writer.paused = true;
         } else if bytes < limit {
             writer.paused = false;
+            // A dropped base explains a pause only. Any way out of the pause ends its report.
+            writer.rejected_base = None;
         }
         writer.paused
     }
@@ -1746,13 +1748,6 @@ impl Node {
             }
         };
         writer.rejected_base = Some((rejected, failures));
-    }
-
-    /// An adoption succeeded, so no dropped base waits.
-    pub(super) fn base_adopted(&mut self) {
-        if let Some(writer) = &mut self.writer {
-            writer.rejected_base = None;
-        }
     }
 
     /// Return the index and log term of an opened base that a paused member can adopt: the

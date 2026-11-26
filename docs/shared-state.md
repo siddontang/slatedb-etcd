@@ -734,7 +734,8 @@ of an install holds apply, as corrupt data in an entry does, and a newer snapsho
 An adoption instead drops such a base and keeps its current base and overlay. The member logs
 the first failure of each checkpoint, counts corrupt data in `slatedb_etcd_read_corrupt_total`,
 and reports the checkpoint in `shared_state.writer.rejected_base` of `/status`. The next poll
-tries the newest checkpoint again, and a good one ends the report.
+tries the newest checkpoint again. The report ends with the pause, after an adoption or an
+install.
 
 A rebase replay that fails leaves the state below the end of the applied prefix of its job. If a
 snapshot then ends the job, the job reports that end and no state. The entries that the node

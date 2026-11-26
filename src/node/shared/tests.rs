@@ -1478,9 +1478,9 @@ async fn voters_on_different_shared_stores_form_no_quorum() {
 
 /// A paused member opens the newest checkpoint at each poll, so an adoption can drop the same
 /// base again and again. `/status` reports the base with its failure count, and only the first
-/// failure logs. An adopted base ends the report.
+/// failure logs. The end of the pause ends the report, after an adoption or an install.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_dropped_base_is_reported_until_a_base_adopts() {
+async fn a_dropped_base_is_reported_until_the_pause_ends() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let dir = tempfile::tempdir().unwrap();
     let mut config = super::super::tests::options(dir.path());
@@ -1515,7 +1515,14 @@ async fn a_dropped_base_is_reported_until_a_base_adopts() {
     };
     node.finish_output(Output::RejectedBase(other)).unwrap();
     assert_eq!(report(&node)["failures"], 1);
-    let conf = node.raw.raft.prs().conf().to_conf_state();
-    node.finish_output(Output::Adopted(conf)).unwrap();
+    // The overlay stays above the soft limit: the member still waits, and the report stays.
+    let limit = node.options.overlay_max_bytes;
+    node.writer.as_mut().unwrap().paused = true;
+    node.state.view = Some((1, 1, limit + 1));
+    assert!(node.apply_paused());
+    assert_eq!(report(&node)["failures"], 1);
+    // An install or an adoption frees the overlay. The pause ends, and so does the report.
+    node.state.view = Some((1, 1, 0));
+    assert!(!node.apply_paused());
     assert_eq!(report(&node), Value::Null);
 }
