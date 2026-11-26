@@ -699,31 +699,27 @@ async fn a_clock_refusal_does_not_wait_for_the_old_close() {
     // manifest in the background.
     first.writer().sync(false, 2, &events);
     first.writer().stop().await;
-    // The clock check holds the next manifest read of the opened writer, and refuses only once
-    // that read waits. The read then holds the close of the refused writer.
-    let (lagging, armed) = (
-        Arc::new(AtomicBool::new(true)),
-        Arc::new(AtomicBool::new(true)),
-    );
+    // The first clock check holds the next manifest read of the opened writer, and refuses
+    // only once that read waits. The read then holds the close of the refused writer. Each
+    // later check reads the real clock, so the next writer opens.
+    let armed = Arc::new(AtomicBool::new(true));
     let mut skewed = clock();
     let now = clock().now_ms;
-    let (lag, arm, store) = (lagging.clone(), armed.clone(), faults.clone());
+    let (arm, store) = (armed.clone(), faults.clone());
     skewed.now_ms = Arc::new(move || {
-        if !lag.load(Ordering::SeqCst) {
+        if !arm.swap(false, Ordering::SeqCst) {
             return now();
         }
-        if arm.swap(false, Ordering::SeqCst) {
-            // The opened writer polls its manifest in the background. Wait until that poll
-            // holds the read. The limit only guards against a hang.
-            store.set(PAUSE_MANIFEST_READ);
-            let limit = Instant::now() + Duration::from_secs(30);
-            while store.entered.available_permits() == 0 {
-                assert!(
-                    Instant::now() < limit,
-                    "the writer did not poll its manifest"
-                );
-                std::thread::sleep(Duration::from_millis(5));
-            }
+        // The opened writer polls its manifest in the background. Wait until that poll holds
+        // the read. The limit only guards against a hang.
+        store.set(PAUSE_MANIFEST_READ);
+        let limit = Instant::now() + Duration::from_secs(30);
+        while store.entered.available_permits() == 0 {
+            assert!(
+                Instant::now() < limit,
+                "the writer did not poll its manifest"
+            );
+            std::thread::sleep(Duration::from_millis(5));
         }
         now() - 60_000
     });
@@ -736,7 +732,6 @@ async fn a_clock_refusal_does_not_wait_for_the_old_close() {
     .await;
     let held = tokio::time::timeout(Duration::from_secs(5), faults.entered.acquire());
     held.await.unwrap().unwrap().forget();
-    lagging.store(false, Ordering::SeqCst);
     let index = first.state.applied + 1;
     let put = crate::proto::etcdserverpb::RequestOp {
         request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
