@@ -75,16 +75,20 @@ Restrict that trust boundary to operators and member processes.
 The S3 suite starts RustFS 1.0.6 on loopback with a temporary bucket and credentials.
 It verifies the release archive checksum before extracting the server.
 The fixture supports Apple Silicon macOS and GNU/Linux on x86-64 and ARM64.
-Run the recovery suite with these commands.
+
+The S3 recovery check is deferred until
+[#149](https://github.com/slatedb/slatedb-etcd/issues/149). Its only test, `TestS3Recovery`, skips
+until it can inject a fault on the shared SSTs that one member reads. A run without a passed test
+fails, so CI does not run this check for now. These commands run it.
 
 ```sh
 scripts/cargo.sh build --locked --release
 python3 scripts/check-s3.py --output results/ci/s3.json
 ```
 
-It covers delayed uploads, lost successful PUT responses, failed reads, object outages,
-process crashes, and full cluster restart. It verifies acknowledged data and
-checks that pending object work cannot advance the Raft reclamation boundary.
+After #149, the check covers delayed uploads, lost successful PUT responses, failed reads, object
+outages, process crashes, and full cluster restart. It verifies acknowledged data and checks that
+pending object work cannot advance the Raft reclamation boundary.
 
 The DST suite injects delays and errors through the real ObjectStore interface.
 It checks recovery reads, terminal upload errors, and ambiguous successful PUT results.
