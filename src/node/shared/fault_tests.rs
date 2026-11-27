@@ -588,6 +588,7 @@ async fn a_defragment_survives_a_failed_publication() {
     let defragment = Defragment {
         db: writer.open.lock().unwrap().clone().unwrap().db,
         admin: leader.handles.admin.clone(),
+        owner: None,
         progress: writer.progress.clone(),
         announced: leader.handles.announced.clone(),
         leadership: writer.leadership.subscribe(),
@@ -1044,24 +1045,7 @@ async fn a_defragment_gets_the_open_writer_with_its_clock() {
     let voters = || [1, 2, 3].map(|id| (id, Some(id))).into_iter().collect();
     clock.configure(2, 1, voters());
     // Both peers agree with the writer clock. Their samples stay fresh.
-    let sampling = tokio::spawn({
-        let clock = clock.clone();
-        async move {
-            loop {
-                for peer in [2, 3] {
-                    let probe = clock.probe();
-                    let now = (clock.mono_ms)();
-                    let reply = crate::node::ProbeReply {
-                        nonce: clock::probe_nonce(&probe),
-                        process: peer,
-                        clock_ms: (clock.now_ms)(),
-                    };
-                    clock.sample(peer, probe, reply, now, now);
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-    });
+    let sampling = sample_peers(&clock);
     let mut leader = Leader::open(store, Duration::from_millis(100), clock.clone()).await;
     leader.lead(2);
     leader.covered(1, Duration::from_secs(10)).await;
@@ -1076,15 +1060,118 @@ async fn a_defragment_gets_the_open_writer_with_its_clock() {
     clock.configure(3, 1, voters());
     leader.writer().sync(true, 3, &events);
     reached.notified().await;
-    let Some(Open { db, admin }) = leader.writer().open.lock().unwrap().clone() else {
+    let Some(Open { db, admin, .. }) = leader.writer().open.lock().unwrap().clone() else {
         panic!("the published writer has no slot");
     };
     db.flush().await.unwrap();
-    crate::state::maintenance::compact_all(&admin)
+    crate::state::maintenance::compact_all(&admin, &|| Ok(()))
         .await
         .unwrap();
     *leader.writer().open_hold.lock().unwrap() = None;
     resume.notify_one();
+    sampling.abort();
+    leader.close().await;
+}
+
+/// The compaction jobs of the shared state.
+async fn jobs(leader: &Leader) -> usize {
+    let source = &leader.handles.source;
+    let admin = slatedb::admin::Admin::builder(source.state(), source.store.clone()).build();
+    let compactions = admin.read_compactions(None).await.unwrap();
+    compactions.map_or(0, |compactions| compactions.recent_compactions().count())
+}
+
+/// Keep the samples of peers 2 and 3 fresh, with clocks that agree with `clock`.
+fn sample_peers(clock: &Clock) -> tokio::task::JoinHandle<()> {
+    let clock = clock.clone();
+    tokio::spawn(async move {
+        loop {
+            for peer in [2, 3] {
+                let probe = clock.probe();
+                let now = (clock.mono_ms)();
+                let reply = crate::node::ProbeReply {
+                    nonce: clock::probe_nonce(&probe),
+                    process: peer,
+                    clock_ms: (clock.now_ms)(),
+                };
+                clock.sample(peer, probe, reply, now, now);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+}
+
+/// A leader of three voters whose samples stay fresh, after its first publication.
+async fn sampled_leader() -> (Leader, Clock, tokio::task::JoinHandle<()>) {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let clock = clock();
+    clock.configure(2, 1, three_voters());
+    let sampling = sample_peers(&clock);
+    let mut leader = Leader::open(store, Duration::from_millis(100), clock.clone()).await;
+    leader.lead(2);
+    leader.covered(1, Duration::from_secs(10)).await;
+    (leader, clock, sampling)
+}
+
+fn three_voters() -> BTreeMap<u64, Option<u64>> {
+    [1, 2, 3].map(|id| (id, Some(id))).into_iter().collect()
+}
+
+/// End the term of the writer, and open its successor of term 3.
+async fn hand_over(leader: &mut Leader, clock: &Clock) {
+    let old = leader.writer().open.lock().unwrap().clone().unwrap().db;
+    let events = leader.events.clone();
+    leader.writer().sync(false, 2, &events);
+    leader.writer().stop().await;
+    clock.configure(3, 1, three_voters());
+    leader.writer().sync(true, 3, &events);
+    let open = leader.writer().open.clone();
+    eventually("the successor", async || {
+        let slot = open.lock().unwrap().clone();
+        slot.is_some_and(|slot| !Arc::ptr_eq(&slot.db, &old))
+    })
+    .await;
+}
+
+/// Sig-Codex, round 3: a Defragment pauses after its flush, and its term ends. A successor opens.
+/// The old Defragment resumes. It submits no job, because its writer term ended, and the
+/// successor's `Db` stays open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_defragment_of_an_ended_term_submits_no_job() {
+    let (mut leader, clock, sampling) = sampled_leader().await;
+    leader.put("before").await;
+    leader.covered(2, Duration::from_secs(10)).await;
+    let writer = leader.writer();
+    let open = writer.open.lock().unwrap().clone().unwrap();
+    let (reached, resume) = (Arc::default(), Arc::default());
+    let defragment = Defragment {
+        db: open.db.clone(),
+        admin: open.admin.clone(),
+        owner: Some(open.gate.clone()),
+        progress: writer.progress.clone(),
+        announced: writer.applied.announced.clone(),
+        leadership: writer.leadership.subscribe(),
+        term: 2,
+        pause: Some((
+            DefragmentStep::Compact,
+            Arc::clone(&reached),
+            Arc::clone(&resume),
+        )),
+    };
+    let paused = tokio::spawn(defragment.run());
+    reached.notified().await;
+    hand_over(&mut leader, &clock).await;
+    let before = jobs(&leader).await;
+    resume.notify_one();
+    assert!(paused.await.unwrap().is_err());
+    assert_eq!(
+        jobs(&leader).await,
+        before,
+        "a Defragment of an ended term added a job"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let successor = leader.writer().open.lock().unwrap().clone().unwrap().db;
+    assert!(successor.status().close_reason.is_none());
     sampling.abort();
     leader.close().await;
 }

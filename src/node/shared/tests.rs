@@ -1109,6 +1109,7 @@ async fn a_defragment_that_loses_the_lead_returns_a_retryable_error() {
     let defragment = Defragment {
         db,
         admin: handles.admin.clone(),
+        owner: None,
         progress: writer.progress.clone(),
         announced: handles.announced.clone(),
         leadership: writer.leadership.subscribe(),
@@ -1134,6 +1135,7 @@ async fn a_defragment_that_loses_the_lead_returns_a_retryable_error() {
     let defragment = Defragment {
         db,
         admin: handles.admin.clone(),
+        owner: None,
         progress: writer.progress.clone(),
         announced: handles.announced.clone(),
         leadership: writer.leadership.subscribe(),
@@ -1208,6 +1210,7 @@ fn defragment(
     Defragment {
         db: writer.open.lock().unwrap().clone().unwrap().db,
         admin: handles.admin.clone(),
+        owner: None,
         progress: writer.progress.clone(),
         announced: handles.announced.clone(),
         leadership: writer.leadership.subscribe(),
@@ -1244,7 +1247,7 @@ async fn check_delayed_checkpoint(compact_before_defragment: bool) {
     if compact_before_defragment {
         // Rewrite the SSTs without advancing the applied announcement. The delayed
         // checkpoint now shares no input SSTs with the upcoming Defragment.
-        crate::state::maintenance::compact_all(&handles.admin)
+        crate::state::maintenance::compact_all(&handles.admin, &|| Ok(()))
             .await
             .unwrap();
     }

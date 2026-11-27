@@ -723,6 +723,14 @@ impl Gate {
         }
     }
 
+    /// Return true while the term of this gate lasts. A gate with no owner always lasts.
+    pub(super) fn current(&self) -> bool {
+        let Some(clock) = &self.clock else {
+            return true;
+        };
+        clock.with_verdict(|_, lead, verdict| self.owned(lead, verdict).is_some())
+    }
+
     /// A clock with no ahead check, for tests that drive the materializer alone.
     #[cfg(test)]
     pub(in crate::node) fn unchecked() -> Arc<Self> {

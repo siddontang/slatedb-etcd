@@ -657,6 +657,7 @@ struct Leading {
 pub(super) struct Open {
     pub(super) db: Arc<slatedb::Db>,
     pub(super) admin: Arc<slatedb::admin::Admin>,
+    pub(super) gate: Arc<clock::Gate>,
 }
 
 type OpenWriter = Arc<Mutex<Option<Open>>>;
@@ -858,6 +859,7 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         *open.lock().unwrap() = Some(Open {
             db: db.clone(),
             admin: Arc::new(admin),
+            gate: gate.clone(),
         });
         #[cfg(test)]
         {
@@ -1461,13 +1463,14 @@ impl Node {
         }
         let writer = self.writer.as_ref().context("shared mode has no writer")?;
         // The `Db` and the admin on its clock come as one pair, or the writer is not open.
-        let Some(Open { db, admin }) = writer.open.lock().unwrap().clone() else {
+        let Some(Open { db, admin, gate }) = writer.open.lock().unwrap().clone() else {
             let _ = response.send(Err(self.error("the shared writer is not open yet")));
             return Ok(());
         };
         let defragment = Defragment {
             db,
             admin,
+            owner: Some(gate),
             progress: writer.progress.clone(),
             announced: writer.applied.announced.clone(),
             leadership: writer.leadership.subscribe(),

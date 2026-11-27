@@ -1487,7 +1487,7 @@ async fn defragment_replaces_every_input_sorted_run() {
     assert_eq!(manifest.compacted().len(), 2);
     let input: std::collections::HashSet<_> =
         manifest.all_sst_views().map(|view| view.id).collect();
-    maintenance::compact_all(&admin).await.unwrap();
+    maintenance::compact_all(&admin, &|| Ok(())).await.unwrap();
     let checkpoint = db
         .create_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
         .await
@@ -1719,7 +1719,7 @@ async fn the_warm_set_stays_bounded_across_base_switches() {
             warmed.difference(&live).count()
         );
         seen.extend(current.iter().copied());
-        crate::state::maintenance::compact_all(&admin)
+        crate::state::maintenance::compact_all(&admin, &|| Ok(()))
             .await
             .unwrap();
     }
@@ -1771,7 +1771,7 @@ async fn timed_out_warms_keep_the_warm_set_bounded() {
         if cold > 0 && warmed.iter().any(|id| current.contains(id)) {
             partial += 1;
         }
-        crate::state::maintenance::compact_all(&admin)
+        crate::state::maintenance::compact_all(&admin, &|| Ok(()))
             .await
             .unwrap();
     }

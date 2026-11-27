@@ -6,6 +6,8 @@ use super::*;
 pub(in crate::node) struct Defragment {
     pub(super) db: Arc<slatedb::Db>,
     pub(super) admin: Arc<slatedb::admin::Admin>,
+    /// The SlateDB clock of `db`. No compaction job is submitted after its term ends.
+    pub(super) owner: Option<Arc<clock::Gate>>,
     pub(super) progress: Arc<Progress>,
     /// The newest applied announcement on this member.
     pub(super) announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
@@ -62,8 +64,15 @@ impl Defragment {
             return Err(failed(&self.leadership, error.into()));
         }
         self.pause_at(DefragmentStep::Compact).await;
-        let compacted_manifest_id = match crate::state::maintenance::compact_all(&self.admin).await
-        {
+        // SlateDB checks no writer epoch at a submission, so each one checks the term of the
+        // writer. A job of an ended term could stand above the floor of the next writer.
+        let owner = self.owner.clone();
+        let allowed = move || match owner.as_ref().is_none_or(|gate| gate.current()) {
+            true => Ok(()),
+            false => Err(anyhow::anyhow!("the writer term of this Defragment ended")),
+        };
+        let compacted = crate::state::maintenance::compact_all(&self.admin, &allowed);
+        let compacted_manifest_id = match compacted.await {
             Ok(id) => id,
             Err(error) => return Err(failed(&self.leadership, error)),
         };
