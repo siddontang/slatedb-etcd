@@ -7,7 +7,7 @@ mod retry;
 pub(super) use retry::{Adoption, Control, Paused, RejectedBase, Waited};
 
 pub(super) const BATCH_ENTRIES: u64 = 32;
-/// Committed-entry jobs that may wait in the apply queue behind the running job.
+/// Committed-entry jobs in the apply queue, the running job included.
 pub(super) const PIPELINE_DEPTH: usize = 4;
 /// Committed entries in one apply job. A larger job shares the fixed cost of a state write.
 pub(super) const APPLY_ENTRIES: u64 = 64;

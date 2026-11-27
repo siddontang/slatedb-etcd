@@ -1,6 +1,6 @@
 # Shared state: one writer and read-only followers
 
-**Status:** accepted design. Shared state is the only state mode. It changes parts of the
+**Status:** implemented. Shared state is the only state mode. It changes parts of the
 [architecture](architecture.md) contract. Source facts are from `b1fc78d` and SlateDB 0.18.1.
 
 ## Problem
@@ -73,10 +73,13 @@ The design depends on these rules. Later sections refer to them by number.
 1. **Prefix.** The shared `Db` holds the result of entries `1..=last_l0_seq` and nothing else.
    Apply writes one batch at the last index of each group (`put_batch.rs:170-171`). A batch holds
    final row values, so a batch that spans an index is still correct on top of a state below it.
-2. **One state writer.** Only the holder of the current writer epoch can commit L0 or compaction
-   changes. Checkpoint creation, refresh, and deletion and SlateDB GC also write the manifest
-   without an epoch check (`admin.rs:565-626`, `garbage_collector.rs:427-450`). Retention must
-   therefore stay safe when a deposed leader runs it.
+2. **One state writer.** Only the holder of the current writer epoch can commit L0 changes and
+   writer checkpoints. Compaction commits use the compactor epoch. The publisher calls
+   `Db::create_checkpoint`, which writes through the fenced manifest of the writer
+   (`memtable_flusher/manifest_writer.rs`). The admin checkpoint create, refresh,
+   and delete calls and SlateDB GC write the manifest without an epoch check (`admin.rs:538-626`,
+   `garbage_collector.rs:427-450`). Retention deletes through the admin, so it must stay safe
+   when a deposed leader runs it.
 3. **Equal views.** On every member, view `(C, S)` equals the state after entry `S`. Shared mode
    removes the two per-member inputs to apply (see [Determinism](#determinism)).
 4. **Overlay cover.** A member keeps every overlay batch above `F(C)` for each checkpoint `C`
@@ -92,6 +95,9 @@ The design depends on these rules. Later sections refer to them by number.
 <prefix>/<sha256(cluster-id)>/
     shared/owner.json          cluster claim, quota, voters, and store ID, PutMode::Create
     shared/bootstrap.json      written once after the first checkpoint, PutMode::Create
+    shared/bootstrap-op.json   the one bootstrap operation: empty, or a snapshot restore
+    shared/restore-input.json  the snapshot digest, row count, and membership of a restore
+    shared/restore-lease.json  the member that writes the rows of a restore
     shared/state/              the one SlateDB: manifest/, compacted/, wal/ fence files
     shared/state/.probe/       scratch objects of the write probe before a promotion
     member-<id>/binding.json   member identity, no state
@@ -236,10 +242,10 @@ does not poll (SlateDB `db_reader.rs:53-75`).
 - **Apply reads:** apply evaluates each entry against the view at `applied`. This covers point
   reads, lease revoke scans, Auth scans, and compaction step scans. The group overlay
   (`mvcc.rs:943-965`) stays on top for writes inside one group.
-- **Background planner:** the compaction planner reads the live `Db` today
-  (`state/compaction.rs:190-252`). It must read a view pinned when the plan starts.
+- **Background planner:** the compaction planner reads a view that `plan_compaction` pins
+  when the plan starts (`state/compaction.rs:379-383`). Apply continues meanwhile.
 - **Caches:** all readers of a member share one SlateDB `DbCache`, so a base switch keeps cached
-  blocks. An optional local disk cache can cut S3 reads further.
+  blocks. A member has no local disk cache.
 
 The key index, quota counter, lease table, Auth, alarms, members, and Watch capture keep their
 apply-time updates. They do not depend on SlateDB writes.
@@ -326,7 +332,7 @@ rate.
    also flushes on its own when a memtable reaches `l0_sst_size_bytes` (64 MiB). While a
    checkpoint is being published, later flushes join the next publication.
 2. When `last_l0_seq` advances, call `create_checkpoint(Durable)` with the name
-   `view-<checkpoint-id>`. `Durable` does not force another flush.
+   `view-<last_l0_seq>`, zero-padded to 20 digits. `Durable` does not force another flush.
 3. When the call returns, read `F` from the checkpoint's own `meta/applied`. Do not use the
    `last_l0_seq` read in step 2. A pending L0 commit can land first and raise the real `F`
    (`manifest_writer.rs:401-468`).
@@ -356,16 +362,27 @@ refuses to announce a checkpoint without `etcd/members`, and install rejects one
 Checkpoints have **no lifetime**. Only explicit deletion removes them. An idle cluster and a
 cluster with no leader therefore keep their checkpoints.
 
-- Each member reports every checkpoint that a live view still pins to the leader on the peer
-  stream (`ViewAck`). A long read or Watch scan on an old view therefore keeps its checkpoint.
+`--view-retention` selects the deletion. The default, `off`, deletes no checkpoint, so storage
+grows until a manual cleanup. `fenced` enables the rules below.
+
+- Every 50 ticks (5 s), each member reports the checkpoints that it pins: each checkpoint under
+  a live view, and the checkpoint of its Raft snapshot record. A follower sends the report,
+  `ViewAck`, as an HTTP POST to the peer route `/raft/view-ack`. It does not use the Raft stream.
+  The leader records its own report in memory. A long read or Watch scan on an old view
+  therefore keeps its checkpoint.
+- A new report of a member replaces its previous report. The leader keeps only the latest report
+  of each member. If a member reports X and then only Y, the next pass can delete X, also within
+  10 minutes of the report of X.
 - `--view-pin-max` (default 5 minutes) is a storage deadline of each read attempt, not a limit
   of the view. After it, the attempt fails with a retryable error, and a Watch stream resumes
   from its last delivered revision on a new view. A scan over its row budget keeps the same
   view, with its base and segments, while it waits to run again. The next attempt starts a new
   deadline. A native backup has no deadline. See [Backups](#backups).
-- The publisher keeps the two newest checkpoints and every checkpoint that a member reported in
-  the last 10 minutes. It deletes the rest.
-- A member that has not reported for 10 minutes loses this protection. It can then hit a missing
+- After each announcement, the publisher keeps the two newest checkpoints, each checkpoint at or
+  above the oldest one that a live view of the leader pins, and each checkpoint in the latest
+  report of a member when that report is less than 10 minutes old. It deletes the rest. A new
+  writer deletes nothing for 10 s after its open, so each member can report twice.
+- A member whose latest report is 10 minutes old loses this protection. It can then hit a missing
   SST and [rebase](#rebase).
 - Before each deletion, the publisher reads the manifest and checks that it still holds the
   writer epoch. A deposed leader can still race this check (invariant 2). Its worst result is a
@@ -781,22 +798,31 @@ All members must run the same binary version. Mixed binary versions are not supp
 
 ## Restart
 
-1. Read the base from the local Raft snapshot record. If that checkpoint was deleted, take the
-   newest `view-` checkpoint. If none exists and `bootstrap.json` exists, stop with an error.
-   A record above the newest checkpoint row names a checkpoint with certified coverage. The
-   member opens that checkpoint by its ID, because a Defragment can add a newer one at the same
-   row. It loads the state at `F` and starts at the record index with the record term. This
-   runs before the log check, because the log starts after the record index.
-   If retention deleted that checkpoint, the member takes the newest checkpoint whose own row,
-   read from the checkpoint, is between the record row and the record index. No entry in that
-   range changed state, so that checkpoint holds the same state. A record without a row, or no
-   such checkpoint, stops the start with an error that says how to recover. Each search skips
-   a checkpoint only when it is gone: deleted, its manifest or an SST missing, or deleted now
-   by retention. Any other error stops the start.
-2. [Install](#install) the base. If the local log ends below `F` or its term at `F` differs,
-   this is an adopt. Otherwise it is a local rebuild with nothing to replay yet.
-3. Replay committed log entries above `F` into the overlay. This is the current replay path with
-   the overlay as its target.
+Restart first selects a checkpoint and then recovers the index.
+
+1. **Newest checkpoint.** Open the newest `view-` checkpoint that holds `etcd/members`. Skip a
+   checkpoint that is gone. A joining member with an empty log does not use it. It starts from
+   an empty base and waits for Raft: entries from index 1 or a snapshot. Any other member stops
+   with an error when no checkpoint exists and `bootstrap.json` exists.
+2. **Record checkpoint.** The local Raft snapshot record counts only when its index is above the
+   row of that checkpoint. Such a record has certified coverage.
+   - If the record names the same checkpoint, the member keeps it.
+   - If the record names another checkpoint, the member opens the record checkpoint by its ID,
+     because a Defragment can add a newer one at the same row. If retention deleted it, the
+     member takes the newest checkpoint whose own row, read from the checkpoint, is between the
+     record row and the record index. No entry in that range changed state, so that checkpoint
+     holds the same state. A record without a row, or no such checkpoint, stops the start with
+     an error that says how to recover.
+
+   Each search skips a checkpoint only when it is gone: deleted, its manifest or an SST missing,
+   or deleted now by retention. Any other error stops the start.
+3. **Index.** Load the state at the checkpoint row `F`. With a record from step 2, raise the
+   base index, the applied index, and the term to the record index and term (`extend_base`).
+   This runs before the log check, because the log starts after the record index.
+4. [Install](#install) the base. If the local log ends below the base index or its term there
+   differs, this is an adopt. Otherwise it is a local rebuild with nothing to replay yet.
+5. Replay committed log entries above the base index into the overlay. This is the current
+   replay path with the overlay as its target.
 
 ## Operations
 
@@ -828,7 +854,7 @@ All members must run the same binary version. Mixed binary versions are not supp
 | All members hold on one corrupt shared row | Restore an earlier backup. Old state stays readable |
 | A voter's apply holds | It is never a handoff target. A held leader hands over after 30 s |
 | An invariant of the member fails | The member stops |
-| A member stops reporting its base | Its base can be deleted. It rebases on a missing SST |
+| A member stops reporting its base | `fenced` retention can delete its base. It rebases |
 | A checkpoint open fails | The member keeps its base and tries the next checkpoint |
 | No writes for a long time | Checkpoints have no lifetime, so all bases stay valid |
 | No leader for a long time | No process deletes anything |
@@ -1123,7 +1149,9 @@ Paths are under `slatedb-0.18.1/src`.
 - GC removes expired checkpoints: `garbage_collector.rs:427-450`.
 - Opening a writer increments the epoch with a manifest CAS. The old writer gets
   `Closed(Fenced)`: `manifest/store.rs:36-51`, `manifest_writer.rs:751-787`.
-- Checkpoint refresh and deletion write the manifest with no epoch check: `admin.rs:565-626`.
+- Admin checkpoint creation, refresh, and deletion write the manifest with no epoch check:
+  `admin.rs:538-626`. `Db::create_checkpoint` goes through the fenced manifest writer:
+  `checkpoint.rs:141-147`, `memtable_flusher/manifest_writer.rs:390-461`.
 - The L0 uploader has no epoch check, so a fenced writer can leave orphan SSTs:
   `memtable_flusher/uploader.rs:210-230`.
 - The compactor has its own epoch: `manifest/store.rs:53-67`.

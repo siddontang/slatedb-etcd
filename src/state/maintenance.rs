@@ -58,7 +58,7 @@ impl StateMachine {
             // The shared database belongs to the leader writer. The node runs Defragment there.
             Command::Defragment => Err(KvError::new(
                 Code::Unimplemented,
-                "shared state mode has no Defragment until phase 4",
+                "Defragment runs on the leader writer, not in apply",
             )),
             // gRPC Snapshot streams a backup through `Event::Snapshot`. This command keeps the
             // bounded in-memory image for Rust callers of the maintenance interface.

@@ -74,6 +74,7 @@ SlateDB uses these logical keys:
 | --- | --- |
 | `meta/applied` | Last applied Raft index |
 | `meta/applied-term` | `(index, term)` of the last applied entry, two big-endian `u64` values |
+| `meta/logical-size` | The quota counter at the index of its batch |
 | `data/` | Diagnostic JSON keyspace |
 | `etcd/current/` | Current values and key metadata |
 | `etcd/history/` | Historical versions and tombstones |
@@ -100,14 +101,17 @@ metadata. A restore starts in term 1 at the copied row count plus one.
 The service must preserve these rules across every implementation phase:
 
 1. Persist terms, votes, and entries before sending dependent vote or append acknowledgements.
-2. Persist the commit position before writing those entries to SlateDB.
+2. Apply only the committed entries that Raft delivered through Ready. Raft delivers them only
+   after the local log persists them. The commit marker can lag apply, because a commit-only
+   update has no sync. At startup, a base above the marker raises it.
 3. Apply a committed prefix in index order. Never apply an uncommitted entry.
 4. Store each state change and the covered final apply marker in one SlateDB batch.
 5. Require quorum commit and an exact state-machine result for every successful write reply.
 6. Advance RawNode's applied position only after the apply owner reports completion.
 7. Reclaim log entries only after a durable snapshot covers them.
-   Flushed SlateDB state with its apply marker is such a snapshot.
-8. Stop the node after a state storage failure. Do not continue from uncertain state.
+   The `view-` checkpoint of the member's base is such a snapshot.
+8. Never apply past a failed state read. Retry the entry or hold apply on it. Stop the node only
+   when an invariant of the member fails. See [read faults](shared-state.md#read-faults).
 
 The SlateDB sequence number equals the Raft apply index.
 The etcd MVCC revision is separate. A mutating transaction advances that revision once.
@@ -133,7 +137,7 @@ Each task can resume on another runtime worker after it yields.
 | Client and peer I/O | One Tokio task polls each connection and its HTTP/2 streams. |
 | Raft | One task owns RawNode. It orders events, advances consensus, and dispatches work. |
 | WAL | One dedicated `raft-log-io` OS thread per member writes, syncs, and reads the log. |
-| Apply | One Tokio task per member writes SlateDB and publishes revisions in log order. |
+| Apply | One Tokio task per member fills the overlay and publishes revisions in log order. |
 | KV reads | Up to four Tokio tasks read pinned views. Three budgeted scans may share them. |
 | Checkpoint | The leader publisher flushes state. Blocking workers sync snapshot records. |
 | Other work | Blocking workers handle password checks and metrics encoding. |
@@ -174,7 +178,7 @@ flowchart LR
     IO --> Log[Durable Raft log]
     IO -->|Durable completion| Raft
     Raft -->|Bounded work| Apply[One apply worker]
-    Apply --> DB[SlateDB]
+    Apply --> DB[Overlay over a base checkpoint]
     Apply -->|Completion and pinned read view| Raft
     Raft -->|Confirmed reads| Reads[Bounded read tasks]
     Reads -->|Pinned snapshot| DB
@@ -184,10 +188,11 @@ flowchart LR
 
 The Raft owner must not wait for a full apply queue.
 It keeps the remaining committed work in the durable log and submits bounded batches.
-The implementation allows one active apply job and four KV read jobs.
+The apply worker runs one job at a time. Up to four committed-entry jobs can be in flight: one
+runs and three wait in the worker queue. Four KV read jobs can run.
 It bounds queued reads and rejects excess requests with an explicit retryable error.
 It also rejects new proposals when the local apply backlog reaches its admission limit.
-Each entry batch contains at most 32 entries with a 512 KiB byte target.
+Each entry job contains at most 64 entries with a 512 KiB byte target.
 A single larger entry can exceed that byte target. Peer snapshots carry only a descriptor.
 At most 64 state queries, 64 KV reads, and 64 checkpoint requests can wait at the Raft owner.
 New proposals are rejected at 1,024 committed but unapplied entries.
@@ -231,7 +236,7 @@ The queue holds at most 64 requests. Each running job has a five-second deadline
 Shutdown stops these jobs before closing the state database.
 The owner checks the term, role, and leader identity again before returning the result.
 Leadership loss, a five-second timeout, or client cancellation removes the pending request.
-At most 64 ReadIndex requests can wait. These requests do not append log entries.
+At most 256 ReadIndex requests can wait. These requests do not append log entries.
 Unconfirmed requests retry every two Raft ticks until confirmation, cancellation, or timeout.
 Retries cover lost messages and reads dropped before a new leader commits its first entry.
 
@@ -390,7 +395,7 @@ The apply owner keeps an in-memory index of every current etcd key, like etcd's 
 Each entry holds the create revision, modification revision, version, lease, and row length.
 Startup builds it with one scan of `etcd/current/`. The scan reads several SST blocks per
 request, and the ordered key set is built in bulk from the sorted rows.
-Every state write updates it after SlateDB accepts the batch.
+Every state write updates it after the overlay accepts the batch.
 Snapshot installation, compaction, deletes, transactions, and lease revocation use this path.
 
 Put, transaction, and quota evaluation read metadata from the index.
@@ -409,7 +414,7 @@ On 64-bit hosts, each hash table slot uses 57 bytes. The table keeps 44 to 88 pe
 slots full. A key therefore costs 65 to 130 bytes plus its own heap allocation.
 One million 16-byte keys use about 150 MB. Table growth briefly holds the old and new slots.
 
-The apply worker groups consecutive etcd KV entries within its 32-entry, 512 KiB job target.
+The apply worker groups consecutive etcd KV entries within its 64-entry, 512 KiB job target.
 One large entry can exceed the byte target. The pending log limit still bounds that entry.
 Each request reads earlier writes from a temporary overlay and retains its own etcd revision.
 The overlay merges point reads and key index lookups only.
@@ -420,17 +425,19 @@ Quota accounting includes each successful request before it checks the next requ
 The storage write includes all mutations and the last covered apply marker at one SlateDB sequence.
 The owner publishes the read view after the storage write. Most replies also wait for that write.
 
-A leader can prepare ordinary Put results when Raft commits an entry above its local persisted
-index. Raft counts the leader only after its sync completes. In a three-voter cluster, both other
-voters must therefore persist the entry. A stream receipt, a learner, or a duplicate reply
-cannot supply a missing vote. Raft applies its current-term and membership rules.
+A leader can evaluate ordinary Puts before Raft commits them, while their log write runs. The
+reply waits until Raft commits the group in the same term, with the member still the leader.
+Raft counts the leader only after its sync completes. So in a three-voter cluster, a commit above
+the local persisted index needs both other voters to persist the entry. A stream receipt, a
+learner, or a duplicate reply cannot supply a missing vote. Raft applies its current-term and
+membership rules.
 
 The worker evaluates one contiguous group against the applied state and earlier puts in the group.
 The group must contain a pending client request. Each entry must belong to the current term.
 A pending configuration change blocks preparation. The group fits 32 entries and 512 KiB of log
 payload. Previous values and encoded mutations can use additional memory.
 The owner can return these results while it holds the prepared changes in memory.
-It waits for local log persistence and committed Ready delivery before writing them to SlateDB.
+It waits for local log persistence and committed Ready delivery before it stores them.
 While the prepared result is ahead of local state, new KV reads wait for local publication.
 A crash discards this temporary group. The durable quorum supplies the same entries on recovery.
 Early preparation accepts only ordinary puts. Transactions wait for the ordinary apply boundary.
@@ -482,7 +489,6 @@ MVCC compaction and Raft log reclamation are separate operations.
 Each mutation stores ordered Watch events in the same batch as its key changes and revision.
 Watch reads this journal after reconnect, restart, or snapshot installation.
 Progress must not pass undelivered events. Compacted history produces a cancellation.
-Old databases have no complete journal before their first write with Watch support.
 
 The leader proposes lease expiry. Followers never delete keys from local lease clocks.
 The leader proposes expiry only after the deadline passes. Later renewals in that term fail.
@@ -508,7 +514,7 @@ Membership changes use Raft configuration entries. Only one configuration change
 Apply validates the change again and produces either the new configuration or a no-op.
 The Raft owner applies that configuration before advancing its applied index.
 Each membership change triggers a checkpoint with the configuration at that snapshot's index.
-A new member receives an image that the leader builds on demand.
+A new member receives a snapshot record that names a `view-` checkpoint. It copies no data.
 A new learner starts with an empty configuration and installs a membership snapshot before replay.
 Durable membership takes precedence over startup transport addresses after recovery.
 Peer updates publish the member name and client URLs through the trusted Raft transport.
@@ -529,12 +535,15 @@ them.
 This quota is not a filesystem capacity limit.
 The apply worker keeps a derived count of keys and values under `etcd/`.
 Each batch keeps the final mutation per key and reads each old value once.
-The worker updates the counter only after SlateDB accepts the atomic batch.
+The worker updates the counter only after the overlay accepts the atomic batch.
 Quota reads cost O(1). The key index supplies old current-row lengths without a read.
 Other changed logical keys with unknown lengths cost one point read each.
-Startup performs one O(N) scan over N logical records.
+Each state batch stores the counter in `meta/logical-size`. Startup and install read it.
+They scan the N logical records once when the row is absent, when its index is not the apply
+marker, or when it has no count per row kind. A build with debug assertions also scans after a
+matching counter and compares the two. A release build uses a matching, complete counter.
 Snapshot replacement uses the same batch path.
-The counter adds no stored metadata. Snapshot import accepts only the current format, version 3.
+Snapshot import accepts only the current format, version 4.
 Each member caches immutable SST data in two weighted Moka caches. Each has 64 MiB by default.
 One holds data blocks. The other holds SST indexes, filters, and stats.
 Moka admits an entry only if it is more frequent than all entries it would evict together.
@@ -559,7 +568,7 @@ Each member owns a Prometheus registry. Scrapes take a short Raft sample and rea
 outside the Raft loop. File handles measure actual WAL I/O. The client listener counts gRPC
 messages and final statuses. See the [metrics contract](metrics.md).
 
-## Target storage and deployment architecture
+## Storage and deployment architecture
 
 The cluster keeps one SlateDB in S3. The leader writes it, and every replica reads checkpoints
 of it under an in-memory overlay. This stores one copy of each SST and repeats no object-store
@@ -586,7 +595,7 @@ The apply worker remains a Tokio task and shares CPU and disk resources with oth
 Large scans, native backups, and lease metadata copies still need bounded work and memory controls.
 Phase 4 now includes S3, remote mutual TLS, object faults, and three-guest recovery tests.
 Independent physical hosts, availability zones, and object cost measurements remain open.
-Object-reference snapshots remain future work.
+Raft snapshots now name a `view-` checkpoint, so an install copies no data.
 Phase 3 now includes local administrative and secure transport tests.
 Its remaining format and deployment limits appear in [administration](administration.md).
 
@@ -652,10 +661,8 @@ Apply reads the old current row only when the request asks for `prev_kv`.
 Append-only MVCC, Watch, and hash records skip quota lookups for keys absent before the batch.
 Other mutations still read prior values. Final mutations determine the byte counter.
 
-The snapshot builder captures membership with its pinned state view.
-It passes that membership with the result, so the owner does not decode the full snapshot.
-Snapshot serialization writes rows directly into its output and releases spare buffer capacity.
-It does not retain an intermediate collection of every row.
-It still scans and encodes the full retained state. Cost grows with uncompressed history.
+A Raft snapshot holds only a descriptor of the base checkpoint. The checkpoint job reads the
+membership of the base for its ConfState. It scans no rows.
+A native backup streams a pinned view. Its cost grows with the live rows and retained history.
 
 See the [benchmark guide](benchmarks.md) for Linux CPU sampling and comparison controls.
