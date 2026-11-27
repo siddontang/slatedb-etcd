@@ -753,6 +753,15 @@ impl Simulation {
         self.start(id).await;
     }
 
+    /// Run out the election timer of every member, as after a long time with no leader. The next
+    /// tick of a member starts an election, and no member refuses it for its leader lease.
+    fn expire_elections(&mut self) {
+        for node in self.nodes.values_mut() {
+            let raft = &mut node.raw.raft;
+            raft.election_elapsed = raft.election_elapsed.max(2 * raft.election_timeout());
+        }
+    }
+
     /// A follower, not `except`.
     fn follower(&self, except: u64) -> u64 {
         let leader = self.leader().unwrap();
@@ -991,6 +1000,10 @@ impl Simulation {
                 }
                 11..=12 => {
                     let id = sim.choose(3) as u64 + 1;
+                    // Ticks are rare here, so without this no member campaigns after a crash.
+                    if leader.is_none() {
+                        sim.expire_elections();
+                    }
                     sim.tick(id).await;
                     // A follower asks for a snapshot at its last index. Announcements and
                     // unmaterialized batches can follow the leader's base row.
