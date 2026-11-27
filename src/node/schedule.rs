@@ -54,40 +54,28 @@ impl Node {
         if self.base_below_record() {
             return None;
         }
-        // A failed checkpoint lets other apply jobs run before the next one.
-        if self
-            .checkpoint_retry_at
-            .is_some_and(|at| Instant::now() < at)
-        {
-            return None;
-        }
         // Shared mode records its base `F`. The log stays above the base, so the record needs
         // no flush, and any member can send it.
         let applied = self.checkpointable();
         let store = self.raw.store();
         let snapshot_index = store.snapshot_index();
-        // A peer snapshot or a manual checkpoint needs a complete image.
-        let image_can_advance =
-            applied > snapshot_index || (snapshot_index > 0 && !store.has_image());
-        let image_due = image_can_advance
-            && (store.image_wanted()
-                || self
-                    .checkpoint_waiters
-                    .iter()
-                    .any(|(index, _)| *index <= applied));
-        // Automatic checkpoints only truncate the local log. A membership change needs a
-        // checkpoint at its index.
-        // A membership checkpoint does not wait for a lagging follower: a new member needs it.
-        let forced = self.membership_checkpoint;
-        let truncate_due = ((forced > snapshot_index && applied >= forced)
-            || (self.next_checkpoint.is_some_and(|index| applied >= index)
-                && self.appended_bytes >= self.options.snapshot_min_bytes
-                && !self.follower_needs_log(applied, snapshot_index)))
-            && applied > snapshot_index
-            && !store.image_wanted()
-            && self.checkpoint_waiters.is_empty()
-            && !self.sending_snapshot();
-        (image_due || truncate_due).then_some(image_due)
+        let min_bytes = self.options.snapshot_min_bytes;
+        // Only the automatic checkpoint waits for a lagging follower.
+        let held = self.checkpoints.automatic_due(applied, min_bytes)
+            && self.follower_needs_log(applied, snapshot_index);
+        let due = self.checkpoints.due(
+            applied,
+            snapshot_index,
+            store.has_image(),
+            store.image_wanted(),
+            min_bytes,
+            held,
+        );
+        match due {
+            // Truncation would discard the image that a peer receives.
+            Some(false) if self.sending_snapshot() => None,
+            due => due,
+        }
     }
 
     /// Return true on the leader while a follower is behind `base` by at most `snapshot_every`
@@ -150,7 +138,7 @@ impl Node {
                 || self.installing()
                 || self.early_puts.active()
                 || !self.queries.is_empty()
-                || (!self.checkpoint_running && self.checkpoint_due().is_some())
+                || (!self.checkpoints.running() && self.checkpoint_due().is_some())
             {
                 return Ok(());
             }
@@ -228,7 +216,7 @@ impl Node {
             }
             return Ok(());
         }
-        if !self.checkpoint_running {
+        if !self.checkpoints.running() {
             if let Some(image) = self.checkpoint_due() {
                 return self.start_checkpoint(image);
             }
@@ -342,7 +330,7 @@ impl Node {
                 for command in replies {
                     if let Some(change) = command.change.as_ref().filter(|_| !superseded) {
                         self.raw.apply_conf_change(change)?;
-                        self.membership_checkpoint = self.state.applied;
+                        self.checkpoints.membership_changed(self.state.applied);
                         self.tick_clock(false);
                         self.prune_write_proofs();
                     }

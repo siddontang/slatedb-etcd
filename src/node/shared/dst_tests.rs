@@ -345,7 +345,7 @@ async fn a_follower_manual_checkpoint_completes_with_a_certified_base() {
     // No member truncates, so `grouped` gets the entries and no snapshot.
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
-        node.next_checkpoint = None;
+        node.checkpoints.set_next(None);
     }
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
@@ -387,12 +387,7 @@ async fn a_follower_manual_checkpoint_completes_with_a_certified_base() {
     node.handle(Event::Checkpoint(tx), &mut vec![])
         .await
         .unwrap();
-    let index = *node
-        .checkpoint_waiters
-        .iter()
-        .map(|(i, _)| i)
-        .max()
-        .unwrap();
+    let index = node.checkpoints.highest_waiter().unwrap();
     sim.settle(2).await;
     sim.finish_checkpoints(grouped);
     assert!(rx.try_recv().is_err());
@@ -923,7 +918,7 @@ async fn a_record_of_an_earlier_base_is_rebuilt_from_the_base() {
     let mut sim = Simulation::with_size(73, 5).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
-        node.next_checkpoint = None;
+        node.checkpoints.set_next(None);
     }
     sim.settle(5).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
@@ -967,7 +962,7 @@ async fn a_restart_above_its_record_does_not_send_a_deleted_checkpoint() {
     let mut sim = Simulation::with_size(79, 5).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
-        node.next_checkpoint = None;
+        node.checkpoints.set_next(None);
     }
     sim.settle(5).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
@@ -1045,7 +1040,7 @@ async fn a_record_at_the_applied_index_raises_the_base() {
     let mut sim = Simulation::new(83).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
-        node.next_checkpoint = None;
+        node.checkpoints.set_next(None);
     }
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
@@ -1057,7 +1052,7 @@ async fn a_record_at_the_applied_index_raises_the_base() {
     let member = sim.follower(0);
     sim.write(2).await;
     sim.settle(4).await;
-    let images = sim.nodes[&member].snapshot_images;
+    let images = sim.nodes[&member].checkpoints.images();
     let record = sim.record_at_applied(member).await;
     let admin = sim.nodes[&leader].writer.admin().clone();
     admin.delete_checkpoint(record.checkpoint).await.unwrap();
@@ -1069,7 +1064,7 @@ async fn a_record_at_the_applied_index_raises_the_base() {
         record.index
     );
     assert_eq!(base, Some(record.checkpoint));
-    assert_eq!(sim.nodes[&member].snapshot_images, images);
+    assert_eq!(sim.nodes[&member].checkpoints.images(), images);
 }
 
 /// Architecture: correctness does not depend on that raise. The raise fails, as when the
@@ -1082,7 +1077,7 @@ async fn a_failed_raise() {
     let mut sim = Simulation::new(83).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
-        node.next_checkpoint = None;
+        node.checkpoints.set_next(None);
     }
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
@@ -1106,12 +1101,15 @@ async fn a_failed_raise() {
     let node = sim.nodes.get_mut(&member).unwrap();
     assert!(!node.raw.store().has_image());
     // No checkpoint job starts below the record, and none resets the flush counter.
-    node.appended_bytes = 7;
-    let images = node.snapshot_images;
+    node.checkpoints.set_appended_bytes(7);
+    let images = node.checkpoints.images();
     assert_eq!(node.checkpoint_due(), None);
     node.start_checkpoint(true).unwrap();
-    assert!(!node.checkpoint_running);
-    assert_eq!((node.appended_bytes, node.snapshot_images), (7, images));
+    assert!(!node.checkpoints.running());
+    assert_eq!(
+        (node.checkpoints.appended_bytes(), node.checkpoints.images()),
+        (7, images)
+    );
     if let Some(mut writer) = writers.remove(&leader) {
         writer.close().await;
     }
@@ -1142,7 +1140,7 @@ async fn a_failed_raise() {
     assert!(index >= record.index);
     let kept = Record::of(sim.nodes[&member].raw.store().recovery_snapshot());
     assert_eq!(kept.unwrap().map(|record| record.checkpoint), base);
-    assert!(sim.nodes[&member].snapshot_images <= images + 2);
+    assert!(sim.nodes[&member].checkpoints.images() <= images + 2);
     assert_eq!(
         sim.nodes[&other].state.applied,
         sim.nodes[&member].state.applied
@@ -1244,7 +1242,7 @@ async fn an_empty_base_sends_a_record_only_after_its_first_base() {
     let mut sim = Simulation::new(89).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
-        node.next_checkpoint = None;
+        node.checkpoints.set_next(None);
     }
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
@@ -1733,7 +1731,7 @@ async fn a_failed_automatic_checkpoint_keeps_its_byte_trigger() {
     let mut sim = Simulation::new(83).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
-        node.next_checkpoint = None;
+        node.checkpoints.set_next(None);
     }
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
@@ -1748,14 +1746,14 @@ async fn a_failed_automatic_checkpoint_keeps_its_byte_trigger() {
     assert!(base > record, "base {base} record {record}");
     assert!(!node.apply_busy);
     // The bytes that the member appended are the automatic threshold.
-    let charged = node.appended_bytes;
+    let charged = node.checkpoints.appended_bytes();
     assert!(charged > 0);
     node.options.snapshot_min_bytes = charged;
-    node.next_checkpoint = Some(base);
-    node.membership_checkpoint = record;
+    node.checkpoints.set_next(Some(base));
+    node.checkpoints.membership_changed(record);
     assert_eq!(node.checkpoint_due(), Some(false));
     node.schedule_apply().unwrap();
-    assert!(node.checkpoint_running);
+    assert!(node.checkpoints.running());
     let mut completion = node.worker.step().await.unwrap().unwrap();
     let crate::node::apply::Output::Checkpoint(Some(built)) = &mut completion.output else {
         panic!("expected an inline checkpoint");
