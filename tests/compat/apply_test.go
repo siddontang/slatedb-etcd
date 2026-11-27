@@ -17,7 +17,10 @@ func applyDelay(t *testing.T, c *cluster, id int, milliseconds int) {
 }
 
 func TestSlowApplyKeepsRaftLive(t *testing.T) {
-	c := newCluster(t)
+	// Replicated mode only. The test expects the checkpoint to move `snapshot_index` past the
+	// delayed commit. In shared state mode, `snapshot_index` stays at 0 after the checkpoint
+	// reply. The removal of replicated mode must replace this test.
+	c := newCluster(t, "--state-mode", "replicated")
 	leader := c.leader()
 	api := client(t, []string{c.addresses[leader-1]})
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
