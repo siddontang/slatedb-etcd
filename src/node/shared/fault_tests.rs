@@ -857,7 +857,12 @@ async fn an_idle_writer_that_slatedb_closes_opens_again() {
     leader.covered(index, Duration::from_secs(20)).await;
     let open = leader.writer().open().unwrap().db;
     assert!(!Arc::ptr_eq(&open, &failed));
-    assert!(health.report(2, None).failed_secs.is_none());
+    // `covered` sends the announcement reply and returns at once. The publisher ends the mark
+    // when it processes that reply, so the test can read the health first.
+    eventually("the publication ends the mark", async || {
+        health.report(2, None).failed_secs.is_none()
+    })
+    .await;
     leader.close().await;
 }
 

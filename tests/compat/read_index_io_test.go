@@ -79,7 +79,7 @@ func TestReadIndexRejectsMinorityLeader(t *testing.T) {
 	c := newCluster(t)
 	leader := c.leader()
 	minority := client(t, []string{c.addresses[leader-1]})
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	_, err := minority.Put(ctx, "fenced-read", "before")
 	require.NoError(t, err)
@@ -97,6 +97,8 @@ func TestReadIndexRejectsMinorityLeader(t *testing.T) {
 	_, err = minority.Get(short, "fenced-read")
 	stop()
 	require.Error(t, err, "isolated leader returned a read without a quorum")
+	// The two followers tick in step, so they can split the vote. Each split costs one election
+	// timeout of 1 s to 2 s. The wait allows several splits.
 	var newLeader int
 	require.Eventually(t, func() bool {
 		for id := 1; id <= 3; id++ {
@@ -110,7 +112,7 @@ func TestReadIndexRejectsMinorityLeader(t *testing.T) {
 			}
 		}
 		return false
-	}, 5*time.Second, 20*time.Millisecond)
+	}, 12*time.Second, 20*time.Millisecond)
 	healthy := client(t, []string{c.addresses[newLeader-1]})
 	_, err = healthy.Put(ctx, "fenced-read", "after")
 	require.NoError(t, err)
