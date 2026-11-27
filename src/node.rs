@@ -246,6 +246,8 @@ struct LogTask {
 pub(crate) const TICK: Duration = Duration::from_millis(100);
 /// A client write fails if it waits longer than this before proposal, or after it.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// The wait after a failed checkpoint before the next one starts.
+const CHECKPOINT_RETRY: Duration = Duration::from_secs(1);
 /// Raft's uncommitted byte limit. Writers wait at half of it; see `Node::backlog`.
 const MAX_UNCOMMITTED_BYTES: usize = 2 * log::MAX_BYTES;
 
@@ -321,6 +323,8 @@ pub struct Node {
     recovered_from_index: u64,
     send_failures: Vec<(u64, bool)>,
     checkpoint_running: bool,
+    // The time before which no checkpoint starts after a failed one.
+    checkpoint_retry_at: Option<Instant>,
     // Full backlog checks by cause: apply lag, queued log jobs, queued log bytes,
     // uncommitted Raft bytes, unapplied log bytes.
     backlog_rejects: [u64; 5],
@@ -672,6 +676,7 @@ impl Node {
             recovered_from_index,
             send_failures: vec![],
             checkpoint_running: false,
+            checkpoint_retry_at: None,
             backlog_rejects: [0; 5],
             request_timeout: REQUEST_TIMEOUT,
             appended_bytes: 0,
@@ -1535,7 +1540,22 @@ impl Node {
             self.built_checkpoint.is_none(),
             "overlapping checkpoint results"
         );
-        self.built_checkpoint = Some((built.index, built.conf, built.result?));
+        let image = match built.result {
+            Ok(image) => image,
+            // A storage error fails only this checkpoint. The record stays, and the next
+            // checkpoint starts after `CHECKPOINT_RETRY`. Apply runs other jobs meanwhile.
+            Err(error) if crate::mvcc::storage_fault::classify(&error).is_some() => {
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    "a checkpoint failed; retry later"
+                );
+                self.checkpoint_running = false;
+                self.checkpoint_retry_at = Some(Instant::now() + CHECKPOINT_RETRY);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        self.built_checkpoint = Some((built.index, built.conf, image));
         Ok(())
     }
 

@@ -471,9 +471,8 @@ setup, one read pass then ran at about 9,500 ops/s in both modes.
 ## Rebase
 
 A member rebases when an apply read finds a missing SST. See [Read faults](#read-faults). A
-storage error in apply does not stop the node, with one exception: the read of the base
-membership for a Raft snapshot record. A paused member over the overlay limit adopts an opened
-base instead of a rebase. See step 4 of the memory limit in [Overlay](#overlay).
+storage error in apply does not stop the node. A paused member over the overlay limit adopts an
+opened base instead of a rebase. See step 4 of the memory limit in [Overlay](#overlay).
 
 1. Keep the entries that the job applied, with their replies. Publish no view until the rebase
    ends.
@@ -891,6 +890,10 @@ A rebase replay that fails leaves the state below the end of the applied prefix 
 snapshot then ends the job, the job reports that end and no state. The entries that the node
 queued behind it end early and report the same index. The node starts no other job until the
 install, so a state read such as Status, HashKV, or a backup waits in its queue until then.
+
+A Checkpoint job reads the base membership for the ConfState of its Raft snapshot record. A
+storage error there fails only that checkpoint. The member keeps its record, and the next
+checkpoint starts after 1 s. Apply runs other jobs meanwhile.
 
 An early Put reply evaluates its entries before the state write, and they can be uncommitted. A
 storage error there does not retry, because a new leader can replace the entries. Early replies

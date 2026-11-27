@@ -70,6 +70,14 @@ async fn a_covering_snapshot_preempts_a_failed_rebase_replay() {
     lose_a_checkpoint_object(Lose::Replay).await;
 }
 
+/// The base has row 19, and an announcement certified it through 20. The membership row is in
+/// an older SST, and its read for the Raft snapshot record fails on the store. The Checkpoint
+/// job fails, but the worker goes on, and the next Checkpoint job succeeds.
+#[tokio::test]
+async fn a_failed_checkpoint_read_keeps_the_worker() {
+    lose_a_checkpoint_object(Lose::Checkpoint).await;
+}
+
 /// The base of `lose_a_checkpoint_object`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Lose {
@@ -89,6 +97,9 @@ enum Lose {
     Stuck,
     /// The base has row 20. The first read of the rebase replay fails.
     Replay,
+    /// As `AboveRow`, with a flush at 10. The read of the membership for a Checkpoint job
+    /// fails on the store.
+    Checkpoint,
 }
 
 async fn lose_a_checkpoint_object(lose: Lose) {
@@ -152,7 +163,7 @@ async fn lose_a_checkpoint_object(lose: Lose) {
     .encode()
     .unwrap();
     // Entry 20 changes no state, so the base row is 19.
-    if lose == Lose::AboveRow {
+    if matches!(lose, Lose::AboveRow | Lose::Checkpoint) {
         entries[19].data.clear();
     }
     // Entry 21 is a physical Compact, and entry 22 adds a learner. Their completions come
@@ -263,7 +274,8 @@ async fn lose_a_checkpoint_object(lose: Lose) {
             .write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
             .await
             .unwrap();
-        if seq == 10 && matches!(lose, Lose::Deleted | Lose::DeletedInLog) {
+        let older_sst = matches!(lose, Lose::Deleted | Lose::DeletedInLog | Lose::Checkpoint);
+        if seq == 10 && older_sst {
             writer.flush().await.unwrap();
             let options = CheckpointOptions {
                 name: Some(crate::state::shared::view_name(seq)),
@@ -277,7 +289,11 @@ async fn lose_a_checkpoint_object(lose: Lose) {
         }
     }
     writer.flush().await.unwrap();
-    let row = if lose == Lose::AboveRow { 19 } else { 20 };
+    let row = if matches!(lose, Lose::AboveRow | Lose::Checkpoint) {
+        19
+    } else {
+        20
+    };
     let options = CheckpointOptions {
         name: Some(crate::state::shared::view_name(row)),
         ..Default::default()
@@ -345,6 +361,41 @@ async fn lose_a_checkpoint_object(lose: Lose) {
     };
     if deleted {
         executor.state.admin.delete_checkpoint(id).await.unwrap();
+    }
+    if lose == Lose::Checkpoint {
+        let images = tempfile::tempdir().unwrap();
+        let checkpoint = || Work {
+            job: Job::Checkpoint {
+                delay: Duration::ZERO,
+                dir: images.path().to_owned(),
+            },
+            header,
+            delay: Duration::ZERO,
+        };
+        // No read cached the SST of the flush at 10, so the membership read reaches the store.
+        faults.set(FAIL_SST_GET);
+        let failed = executor.execute(checkpoint()).await.unwrap();
+        let Output::Checkpoint(Some(built)) = failed.output else {
+            panic!("expected a checkpoint result");
+        };
+        let Err(error) = built.result else {
+            panic!("the checkpoint did not fail");
+        };
+        assert_eq!(
+            crate::mvcc::storage_fault::classify(&error),
+            Some(crate::mvcc::storage_fault::StorageFault::Transient)
+        );
+        // The store recovers. The next Checkpoint job records the base at 20.
+        faults.set(0);
+        let done = executor.execute(checkpoint()).await.unwrap();
+        let Output::Checkpoint(Some(built)) = done.output else {
+            panic!("expected a checkpoint result");
+        };
+        assert_eq!(built.index, 20);
+        assert!(matches!(built.result, Ok(Some(_))));
+        executor.state.close().await.unwrap();
+        writer.close().await.unwrap();
+        return;
     }
     // The block cache load and its direct read both lose the object, so the job fails.
     if lose == Lose::Unavailable {
