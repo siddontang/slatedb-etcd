@@ -83,7 +83,8 @@ scripts/cargo.sh build --locked --release
 python3 scripts/check-s3.py --output results/ci/s3.json
 ```
 
-The suite covers delayed uploads, lost successful PUT responses, failed reads, object outages,
+The suite runs replicated state mode, because its faults select the objects of one follower.
+It covers delayed uploads, lost successful PUT responses, failed reads, object outages,
 process crashes, snapshot transfer, and full cluster restart. It verifies acknowledged data and
 checks that pending object work cannot advance the Raft reclamation boundary.
 
@@ -93,7 +94,7 @@ A seed selects the member and checkpoint completion schedule. Each trace must re
 SlateDB background task order and the operating system remain outside the deterministic scheduler.
 
 The three-guest test uses independent Linux kernels, data disks, and network stacks.
-It uses mutual TLS, peer DNS names, and a shared temporary S3 service.
+It uses mutual TLS, peer DNS names, and a shared temporary S3 service in shared state mode.
 It stops a leader VM, drops peer packets with guest firewall rules, blocks S3 access, and restarts
 an offline follower through a Raft snapshot. Deployment files are synced before fault injection.
 The driver does not sync application data before a forced VM stop.

@@ -189,6 +189,8 @@ jobs:
         with:
           name: release-binaries
           path: target/release
+      # Clusters of several members run in shared state mode on this job's RustFS server.
+      - uses: ./.github/actions/rustfs
       - name: Run official-client KV and metrics tests
         run: |
           chmod +x target/release/slatedb-etcd
@@ -221,6 +223,8 @@ jobs:
           path: target/release
       - name: Restore binary permissions
         run: chmod +x target/release/slatedb-etcd target/release/slatedb-etcd-fault
+      # Clusters of several members run in shared state mode on this job's RustFS server.
+      - uses: ./.github/actions/rustfs
       - name: Check the imported upstream etcd suites
         run: |
           python3 scripts/check-compat.py --tags upstream --all-capabilities \
@@ -260,6 +264,8 @@ jobs:
           ref: a0614505aff9b8ff469e9c59c2d979a5936d13f4
           path: reference/etcd
           persist-credentials: false
+      # Clusters of several members run in shared state mode on this job's RustFS server.
+      - uses: ./.github/actions/rustfs
       - name: Run the official etcd benchmarks and process tests
         run: |
           # Build upstream tests with the Go release upstream pins. Its goroutine leak filter
@@ -321,6 +327,8 @@ jobs:
           path: target/release
       - name: Restore binary permissions
         run: chmod +x target/release/slatedb-etcd target/release/slatedb-etcd-fault
+      # Clusters of several members run in shared state mode on this job's RustFS server.
+      - uses: ./.github/actions/rustfs
       - name: Fetch Jepsen dependencies
         working-directory: tests/jepsen
         timeout-minutes: 6
@@ -498,6 +506,8 @@ jobs:
           path: tmp/performance
       - name: Restore binary permissions
         run: chmod +x tmp/performance/*
+      # Clusters of several members run in shared state mode on this job's RustFS server.
+      - uses: ./.github/actions/rustfs
       - name: Install Linux profiling tools
         if: matrix.group != 'throughput'
         run: |

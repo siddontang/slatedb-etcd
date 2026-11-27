@@ -1,5 +1,6 @@
 """Check resource parsing and failure handling in the benchmark controller."""
 
+from contextlib import contextmanager
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,6 +8,8 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
+
+import rustfs_fixture
 
 spec = importlib.util.spec_from_file_location("benchmark", Path(__file__).with_name("benchmark-etcd.py"))
 benchmark = importlib.util.module_from_spec(spec)
@@ -125,7 +128,8 @@ class BenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "report.json"
             output.write_text('{"passed": true, "complete": true}')
-            with patch("sys.argv", ["benchmark", "--output", str(output)]), \
+            # One member keeps local state, so the build is the first step that fails.
+            with patch("sys.argv", ["benchmark", "--members", "1", "--output", str(output)]), \
                  patch.object(benchmark.subprocess, "run",
                               side_effect=subprocess.CalledProcessError(1, "go")), \
                  patch.object(benchmark.subprocess, "check_output", return_value="test cpu"):
@@ -135,6 +139,94 @@ class BenchmarkTests(unittest.TestCase):
             self.assertFalse(report["passed"])
             self.assertFalse(report["complete"])
             self.assertEqual(report["samples"], [])
+            self.assertEqual(report["state_modes"], {"service": "replicated", "etcd": "local"})
+
+    def run_failed_start(self, argv):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report.json"
+            output.write_text('{"passed": true, "complete": true}')
+            environment = {k: v for k, v in benchmark.os.environ.items()
+                           if k not in rustfs_fixture.STORE_ENV}
+            failure = RuntimeError("RustFS exited with status 1 before bucket creation")
+            with patch.dict(benchmark.os.environ, environment, clear=True), \
+                 patch("sys.argv", ["benchmark", *argv, "--output", str(output)]), \
+                 patch.object(rustfs_fixture, "local_rustfs", side_effect=failure) as start, \
+                 patch.object(benchmark.subprocess, "run",
+                              side_effect=subprocess.CalledProcessError(1, "go")), \
+                 patch.object(benchmark.subprocess, "check_output", return_value="test cpu"):
+                with self.assertRaises((RuntimeError, subprocess.CalledProcessError)):
+                    benchmark.main()
+            return json.loads(output.read_text()), start
+
+    def test_failed_rustfs_start_replaces_old_passed_report(self):
+        report, start = self.run_failed_start([])
+        start.assert_called_once()
+        self.assertFalse(report["passed"])
+        self.assertTrue(report["pending"])
+        self.assertEqual(report["state_modes"], {"service": "shared", "etcd": "local"})
+
+    def test_etcd_alone_reports_local_state_and_starts_no_rustfs(self):
+        report, start = self.run_failed_start(["--backends", "etcd"])
+        start.assert_not_called()
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["state_modes"], {"etcd": "local"})
+
+    def test_s3_options_require_a_bucket(self):
+        for argv in (["--s3-endpoint", "http://127.0.0.1:9"], ["--s3-allow-http"]):
+            with patch("sys.argv", ["benchmark", *argv]), \
+                 patch.object(rustfs_fixture, "local_rustfs") as start, \
+                 patch("sys.stderr"):
+                with self.assertRaises(SystemExit) as end:
+                    benchmark.main()
+            self.assertEqual(end.exception.code, 2)
+            start.assert_not_called()
+
+    def service_args(self, args):
+        """Return the arguments of the first service member. Start no process."""
+        commands = []
+
+        def start(command, **_):
+            commands.append(command)
+            raise OSError("no process in this test")
+
+        defaults = dict(members=3, snapshot_entries=10, quota_bytes=1, read_requests=None,
+                        requests=1, keys=1, value_size=1, warmup=0, seed=0, timeout_seconds=1)
+        with patch.object(benchmark.subprocess, "Popen", side_effect=start):
+            sample = benchmark.run_sample(SimpleNamespace(**dict(defaults, **vars(args))),
+                                          Path("tools"), Path("slatedb-etcd"), "service", 1, 0, 0)
+        self.assertIn("no process", sample["error"])
+        return commands[0]
+
+    def test_http_opt_in_follows_the_caller_or_the_fixture(self):
+        caller = dict(s3_bucket="bucket", s3_endpoint="http://127.0.0.1:9")
+        command = self.service_args(SimpleNamespace(**caller, s3_allow_http=False))
+        self.assertIn("--s3-endpoint", command)
+        self.assertNotIn("--s3-allow-http", command)
+        command = self.service_args(SimpleNamespace(**caller, s3_allow_http=True))
+        self.assertIn("--s3-allow-http", command)
+        server = {"SLATEDB_S3_TEST_ENDPOINT": "http://127.0.0.1:9",
+                  "SLATEDB_S3_TEST_BUCKET": "bucket", "AWS_ACCESS_KEY_ID": "key",
+                  "AWS_SECRET_ACCESS_KEY": "secret", "AWS_EC2_METADATA_DISABLED": "true"}
+        @contextmanager
+        def own():
+            yield server, {"name": "RustFS"}
+
+        environment = {k: v for k, v in benchmark.os.environ.items()
+                       if k not in rustfs_fixture.STORE_ENV}
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            # The fixture starts its own server, or reuses the exported one of a CI step.
+            for exported in ({}, server):
+                args = SimpleNamespace(members=3, rustfs=False, s3_bucket=None, s3_endpoint=None,
+                                       s3_allow_http=False)
+                with patch.dict(benchmark.os.environ, dict(environment, **exported), clear=True), \
+                     patch.object(rustfs_fixture, "local_rustfs", side_effect=own) as start:
+                    with benchmark.object_store(args, ["service"], report, {}):
+                        command = self.service_args(args)
+                self.assertEqual(start.called, not exported)
+                self.assertIn("--s3-allow-http", command)
+                self.assertEqual(command[command.index("--state-mode") + 1], "shared")
 
 
 if __name__ == "__main__":

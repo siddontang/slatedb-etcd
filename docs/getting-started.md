@@ -82,15 +82,28 @@ A single node has no replica redundancy.
 
 ## Start three nodes
 
+Three nodes keep one shared state in an S3-compatible object store, as in production.
+Locally, use the pinned RustFS server of the test fixture. Start it in a separate terminal:
+
+```sh
+python3 scripts/rustfs_fixture.py --env-file tmp/rustfs.env
+```
+
+The script downloads and checks the RustFS release, then serves on loopback until Ctrl-C.
+It writes the endpoint, bucket, and temporary credentials to `tmp/rustfs.env`.
+
 Use a different directory and cluster ID from the single-node example.
 Open three terminals. Set `NODE_ID` to 1, 2, and 3 respectively, then run:
 
 ```sh
+. tmp/rustfs.env
 NODE_ID=1
 target/release/slatedb-etcd \
   --id "$NODE_ID" --listen "127.0.0.1:710$NODE_ID" \
   --peer 1=127.0.0.1:7101 --peer 2=127.0.0.1:7102 --peer 3=127.0.0.1:7103 \
-  --dir "tmp/cluster-demo/node-$NODE_ID" --cluster-id cluster-demo --snapshot-every 1000
+  --dir "tmp/cluster-demo/node-$NODE_ID" --cluster-id cluster-demo --snapshot-every 1000 \
+  --state-mode shared --s3-bucket "$SLATEDB_S3_TEST_BUCKET" \
+  --s3-endpoint "$SLATEDB_S3_TEST_ENDPOINT" --s3-allow-http
 ```
 
 Wait for election, then check every endpoint:
@@ -104,6 +117,8 @@ tmp/bin/etcdctl --endpoints=127.0.0.1:7102 get replicated
 A write needs a majority and leader apply. Linearizable reads also need quorum.
 All processes share one host and disk, so this example does not prove independent fault tolerance.
 Stop nodes with Ctrl-C. Restart each with its original arguments and directory.
+RustFS deletes its objects when it stops. After that, start the nodes with new directories.
+See [shared state mode](configuration.md#shared-state-mode).
 
 ## Next steps
 
