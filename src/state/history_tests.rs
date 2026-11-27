@@ -393,6 +393,41 @@ async fn historical_pages_skip_versions_after_the_revision() {
         .all(|kv| kv.value == b"old" && kv.mod_revision <= old));
 }
 
+/// Read `request` and return the reply with the read-ahead of each Range scan it made.
+async fn scan_read_ahead(
+    state: &StateMachine,
+    request: RangeRequest,
+) -> (RangeResponse, Vec<usize>) {
+    crate::mvcc::SCAN_READ_AHEAD.take();
+    let reply = read(state, request).await.unwrap();
+    (reply, crate::mvcc::SCAN_READ_AHEAD.take())
+}
+
+/// A history scan seeks past most versions of each key, so it does not read ahead. A scan of
+/// the current rows of an interval reads ahead.
+#[tokio::test]
+async fn history_scans_do_not_read_ahead() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
+    let mut old = 0;
+    for round in 0..3 {
+        for key in 0..4u8 {
+            put(&mut state, vec![b'k', key], vec![round; 8]).await;
+        }
+        if round == 0 {
+            old = state.revision;
+        }
+    }
+    let default = slatedb::config::ScanOptions::default().read_ahead_bytes;
+    let (reply, history) = scan_read_ahead(&state, range(b"k", b"l", old)).await;
+    assert_eq!(reply.kvs.len(), 4);
+    assert!(!history.is_empty());
+    assert!(history.iter().all(|&bytes| bytes == default), "{history:?}");
+    let (reply, current) = scan_read_ahead(&state, range(b"k", b"l", 0)).await;
+    assert_eq!(reply.kvs.len(), 4);
+    assert!(current.iter().all(|&bytes| bytes > default), "{current:?}");
+}
+
 /// Count the bytes that the test thread allocates while `PEAK_TRACKING` is set.
 struct PeakAlloc;
 
