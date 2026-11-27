@@ -48,6 +48,10 @@ impl Simulation {
         if leader == id || !self.nodes.contains_key(&id) {
             return;
         }
+        // A member sends no report when it has no address of the leader.
+        if self.nodes[&id].peer_address(leader).is_none() {
+            return;
+        }
         let pins = self.nodes[&id].dst_pins();
         let coverage = self.process(id);
         let node = &self.nodes[&id];
@@ -843,6 +847,34 @@ async fn a_restart_on_another_checkpoint_sends_that_checkpoint() {
         let record = Record::of(sim.nodes[&leader].raw.store().recovery_snapshot());
         assert_ne!(record.unwrap().unwrap().checkpoint, x);
     }
+}
+
+/// #171: a joining member has no members list until its first snapshot installs. The leader
+/// holds a record above its row, and sends it only to a process that reported the capability. The
+/// member reports to the configured address of the leader, and installs that record.
+#[tokio::test]
+async fn a_joining_member_installs_a_record_above_its_row() {
+    let mut sim = Simulation::new(67).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(10).await;
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(10).await;
+    let leader = sim.leader().unwrap();
+    let record = sim.certify_for(sim.follower(0)).await;
+    assert!(record.row.unwrap() < record.index);
+    let joining = sim.follower(0);
+    sim.joining = Some(joining);
+    sim.replace(joining, 0).await;
+    assert!(sim.nodes[&joining].state.members.members.is_empty());
+    let delivered = sim.delivered_views.len();
+    sim.settle(40).await;
+    assert_eq!(sim.leader(), Some(leader));
+    assert!(sim.delivered_views[delivered..].contains(&record.checkpoint));
+    let node = &sim.nodes[&joining];
+    assert_eq!(node.state.applied, sim.nodes[&leader].state.applied);
+    assert!(!node.state.members.members.is_empty());
 }
 
 /// Sig-Codex: a 409 for an earlier process of a member arrives after its new process reported
