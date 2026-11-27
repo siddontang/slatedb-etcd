@@ -5,9 +5,18 @@
 //!
 //! - **Behind:** a new writer waits until its clock passes the manifest tick. Over the skew
 //!   limit it does not start. See `Clock::pass`.
-//! - **Ahead:** the leader probes the clock of each voter. A majority of `m` voters holds the
-//!   leader and the `m - 1` peers with the largest clocks. The `(m - 1)`-th largest peer clock
-//!   plus the skew limit is the bound of a write. See `Clock::verdict`.
+//! - **Ahead:** the leader probes the clock of each voter. The bound of a tick is the `m`-th
+//!   largest clock of all voters plus the skew limit, where `m` is a majority. The leader reads
+//!   its own clock fresh at each check. A skew is measured only when no majority can support
+//!   the leader clock, also with each missing voter on the leader's side. Otherwise it is
+//!   uncertain, and ticks stay at the bound. See `Clock::verdict`.
+//!
+//! `Gate` is the SlateDB clock of one writer `Db`. It belongs to the term of its open, and it
+//! freezes when that term ends. See `Gate`.
+//!
+//! Lock order: `Clock::voters`, then `Gate::ticks`. `configure` and `sample` take only
+//! `voters`, so a refresh of the voters or samples runs wholly before or after each tick
+//! decision. See `Clock::with_verdict`.
 
 use super::*;
 use serde::{Deserialize, Serialize};
@@ -353,17 +362,28 @@ impl Clock {
     }
 
     /// The verdict, whether a node manages this clock, and the term that this member leads.
-    /// One lock covers the term and the verdict.
     fn decide(&self) -> (bool, Option<u64>, Verdict) {
+        self.with_verdict(|managed, term, verdict| (managed, term, verdict))
+    }
+
+    /// Run `then` with the verdict while the lock of the voters is still held. A tick decision
+    /// in `then` thus uses a proof that no refresh can change before the decision ends. `then`
+    /// may take `Gate::ticks`, but nothing else.
+    fn with_verdict<T>(&self, then: impl FnOnce(bool, Option<u64>, Verdict) -> T) -> T {
         let held = self.voters.lock().unwrap();
+        let (managed, term, verdict) = self.decide_held(&held);
+        then(managed, term, verdict)
+    }
+
+    /// The verdict from the voters `held`.
+    fn decide_held(&self, held: &Voters) -> (bool, Option<u64>, Verdict) {
         if held.voters.is_empty() {
             return (held.managed, None, Verdict::Off);
         }
         let (now, real) = ((self.mono_ms)(), (self.now_ms)());
-        let order = Order::new(&held, now, real);
+        let order = Order::new(held, now, real);
         let (managed, term) = (held.managed, Some(held.term));
         let single = held.voters.len() == 1 && held.voters.contains_key(&held.me);
-        drop(held);
         let skew = self.max_skew.as_millis() as i64;
         let Some(low) = order.mth(|entry| entry.low, 0) else {
             return (managed, term, Verdict::Waiting);
@@ -602,7 +622,17 @@ pub(in crate::node) struct Gate {
     /// gets it.
     #[cfg(test)]
     pub(super) hold: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    /// Tests: the next `read` takes the pair. It sends on the first and waits on the second
+    /// between its verdict and its advance of `last`.
+    #[cfg(test)]
+    pub(super) read_hold: Mutex<Option<ReadHold>>,
 }
+
+#[cfg(test)]
+pub(super) type ReadHold = (
+    std::sync::mpsc::SyncSender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
 
 /// The owner and the check of a gate. The open of the writer decides it.
 #[derive(Debug)]
@@ -611,6 +641,20 @@ enum Mode {
     Test,
     /// The writer of leader term `term`. Without `guarded`, the open saw one voter.
     Owned { term: u64, guarded: AtomicBool },
+}
+
+/// One decision of `Gate::admit`.
+enum Step {
+    /// The batch goes on without a pinned tick: a test gate or a lone voter's gate.
+    Unpinned,
+    /// The batch has its pinned tick.
+    Pinned(Verdict),
+    /// Wait for a sample, at most the time given, then decide again.
+    Wait(&'static str, Duration, Option<Verdict>),
+    /// The leader clock is ahead of a voter majority by the given milliseconds.
+    Refuse(Verdict, i64),
+    /// The term of the gate ended.
+    Ended,
 }
 
 /// What `now` returns between batches.
@@ -654,6 +698,8 @@ impl Gate {
             }),
             #[cfg(test)]
             hold: Mutex::default(),
+            #[cfg(test)]
+            read_hold: Mutex::default(),
         }
     }
 
@@ -669,13 +715,13 @@ impl Gate {
         ticks.last = ticks.last.max(tick);
     }
 
-    /// The verdict for this gate's term, or `None` when the term ended. A verdict with more
-    /// than one voter turns on the check of a lone voter's gate for good.
-    fn owned(&self) -> Option<(Verdict, bool)> {
-        let (Some(clock), Mode::Owned { term, guarded }) = (&self.clock, &self.mode) else {
+    /// The verdict for this gate's term from `lead` and `verdict`, or `None` when the term
+    /// ended. A verdict with more than one voter turns on the check of a lone voter's gate for
+    /// good.
+    fn owned(&self, lead: Option<u64>, verdict: Verdict) -> Option<(Verdict, bool)> {
+        let Mode::Owned { term, guarded } = &self.mode else {
             return Some((Verdict::Off, false));
         };
-        let (_, lead, verdict) = clock.decide();
         if lead != Some(*term) || verdict == Verdict::Off {
             return None;
         }
@@ -685,22 +731,45 @@ impl Gate {
         Some((verdict, guarded.load(Ordering::Relaxed)))
     }
 
-    /// The time that SlateDB reads now, in milliseconds.
+    /// The time that SlateDB reads now, in milliseconds. The pinned tick of a batch returns at
+    /// once. Otherwise the advance of `last` runs inside `Clock::with_verdict`.
     fn read(&self) -> i64 {
+        if let Some(tick) = self.ticks.lock().unwrap().admitted {
+            return tick;
+        }
+        let Some(clock) = &self.clock else {
+            return self.advance(Reading::Default);
+        };
+        clock.with_verdict(|_, lead, verdict| {
+            let reading = match self.owned(lead, verdict) {
+                None => Reading::Frozen,
+                Some((Verdict::Off, _)) => Reading::Default,
+                Some((Verdict::Single(_), false)) => Reading::Default,
+                Some((Verdict::Waiting, _)) => Reading::Frozen,
+                Some((Verdict::Single(bound), true))
+                | Some((Verdict::Uncertain(bound), _))
+                | Some((Verdict::Ahead { bound, .. }, _))
+                | Some((Verdict::Admit(bound), _)) => Reading::Capped(bound.real.min(bound.cap)),
+            };
+            #[cfg(test)]
+            {
+                let hold = self.read_hold.lock().unwrap().take();
+                if let Some((reached, resume)) = hold {
+                    let _ = reached.send(());
+                    let _ = resume.recv();
+                }
+            }
+            self.advance(reading)
+        })
+    }
+
+    /// Move `last` to `reading`, never back, and return it. A batch that SlateDB writes keeps
+    /// its pinned tick.
+    fn advance(&self, reading: Reading) -> i64 {
         let mut ticks = self.ticks.lock().unwrap();
         if let Some(tick) = ticks.admitted {
             return tick;
         }
-        let reading = match self.owned() {
-            None => Reading::Frozen,
-            Some((Verdict::Off, _)) => Reading::Default,
-            Some((Verdict::Single(_), false)) => Reading::Default,
-            Some((Verdict::Waiting, _)) => Reading::Frozen,
-            Some((Verdict::Single(bound), true))
-            | Some((Verdict::Uncertain(bound), _))
-            | Some((Verdict::Ahead { bound, .. }, _))
-            | Some((Verdict::Admit(bound), _)) => Reading::Capped(bound.real.min(bound.cap)),
-        };
         let next = match reading {
             Reading::Default => self.default.now().timestamp_millis(),
             Reading::Frozen => ticks.last,
@@ -715,56 +784,65 @@ impl Gate {
     /// Refuse the batch with a `ClockAhead` error when the leader clock is ahead of a voter
     /// majority. The batch then stays in the overlay, and the next writer writes it again.
     /// After the term of the gate ends, no batch gets a tick: the call waits until the node
-    /// stops the writer task.
+    /// stops the writer task. The verdict and the pin of the tick run in one
+    /// `Clock::with_verdict`.
     pub(super) async fn admit(&self) -> Result<Admitted<'_>> {
-        let unpinned = Admitted { gate: self };
         let Some(clock) = &self.clock else {
-            return Ok(unpinned);
+            return Ok(Admitted { gate: self });
         };
         loop {
-            let Some((verdict, guarded)) = self.owned() else {
-                clock.set_waiting(None);
-                return std::future::pending().await;
-            };
-            let bound = match verdict {
-                // A test gate, or a lone voter's gate that never saw a second voter.
-                Verdict::Off | Verdict::Single(_) if !guarded => {
+            let step = clock.with_verdict(|_, lead, verdict| self.step(lead, verdict));
+            match step {
+                Step::Unpinned => {
                     clock.set_waiting(None);
-                    return Ok(unpinned);
+                    return Ok(Admitted { gate: self });
                 }
-                Verdict::Off => return std::future::pending().await,
-                Verdict::Waiting => {
-                    clock.wait(NO_SAMPLES, RECHECK).await;
-                    continue;
+                Step::Pinned(verdict) => {
+                    clock.note(&verdict);
+                    clock.set_waiting(None);
+                    return Ok(Admitted { gate: self });
                 }
-                Verdict::Ahead { by, .. } => {
+                Step::Wait(reason, wait, verdict) => {
+                    if let Some(verdict) = verdict {
+                        clock.note(&verdict);
+                    }
+                    clock.wait(reason, wait).await;
+                }
+                Step::Refuse(verdict, by) => {
                     clock.set_waiting(None);
                     clock.note(&verdict);
                     return Err(ClockAhead { by_ms: by }.into());
                 }
-                Verdict::Single(bound) | Verdict::Uncertain(bound) | Verdict::Admit(bound) => {
-                    clock.note(&verdict);
-                    bound
+                Step::Ended => {
+                    clock.set_waiting(None);
+                    return std::future::pending().await;
                 }
-            };
-            // The lock guard must not live across an await.
-            let above = {
-                let mut ticks = self.ticks.lock().unwrap();
-                let tick = ticks.last.max(bound.real.min(bound.cap));
-                if tick <= bound.cap {
-                    ticks.last = tick;
-                    ticks.admitted = Some(tick);
-                }
-                tick.saturating_sub(bound.cap)
-            };
-            if above > 0 {
-                let wait = Duration::from_millis(above as u64).min(RECHECK);
-                clock.wait(ABOVE_CAP, wait).await;
-                continue;
             }
-            clock.set_waiting(None);
-            return Ok(Admitted { gate: self });
         }
+    }
+
+    /// One decision of `admit`, with the lock of the voters held. A pin happens here.
+    fn step(&self, lead: Option<u64>, verdict: Verdict) -> Step {
+        let Some((verdict, guarded)) = self.owned(lead, verdict) else {
+            return Step::Ended;
+        };
+        let bound = match verdict {
+            // A test gate, or a lone voter's gate that never saw a second voter.
+            Verdict::Off | Verdict::Single(_) if !guarded => return Step::Unpinned,
+            Verdict::Off => return Step::Ended,
+            Verdict::Waiting => return Step::Wait(NO_SAMPLES, RECHECK, None),
+            Verdict::Ahead { by, .. } => return Step::Refuse(verdict, by),
+            Verdict::Single(bound) | Verdict::Uncertain(bound) | Verdict::Admit(bound) => bound,
+        };
+        let mut ticks = self.ticks.lock().unwrap();
+        let tick = ticks.last.max(bound.real.min(bound.cap));
+        if tick > bound.cap {
+            let wait = Duration::from_millis(tick.saturating_sub(bound.cap) as u64).min(RECHECK);
+            return Step::Wait(ABOVE_CAP, wait, Some(verdict));
+        }
+        ticks.last = tick;
+        ticks.admitted = Some(tick);
+        Step::Pinned(verdict)
     }
 
     /// Tests: hold an admitted batch before SlateDB gets it.

@@ -727,3 +727,109 @@ async fn a_promoted_voter_turns_on_the_check_before_the_next_batch() {
     assert!(read(&gate) <= time.wall().max(frozen));
     admitted.done();
 }
+
+/// Clocks with a 5 ms limit: the leader at 40 and both peers at 100 allow a tick of 100. A
+/// restart of member 2 drops its sample, and the bound falls to 45.
+fn ordered() -> (Clock, Time) {
+    let (clock, time) = skewed(&[1, 2, 3], Duration::from_millis(5));
+    time.wall.store(START + 40, Ordering::SeqCst);
+    for peer in [2, 3] {
+        assert!(late(&clock, peer, clock.probe(), START + 100, (0, 0)));
+    }
+    (clock, time)
+}
+
+/// Restart member 2 in another thread. The receiver gets a message when the refresh ends.
+fn restart_peer(clock: &Clock) -> (std::sync::mpsc::Receiver<()>, std::thread::JoinHandle<()>) {
+    let (done, ended) = std::sync::mpsc::channel();
+    let clock = clock.clone();
+    let thread = std::thread::spawn(move || {
+        let voters = [1, 2, 3].map(|id| (id, Some(PROCESS + u64::from(id == 2))));
+        clock.configure(2, 1, voters.into_iter().collect());
+        let _ = done.send(());
+    });
+    (ended, thread)
+}
+
+/// Critic, round 2: a refresh of the voters runs wholly before or after a tick decision of
+/// `admit`. The test holds the tick lock while `admit` decides, and restarts a voter. The
+/// refresh waits for the pin, and the next batch follows the refreshed bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refresh_never_splits_the_admission_of_a_tick() {
+    let (clock, _time) = ordered();
+    let gate = clock.gate().await;
+    gate.floor(START + 100);
+    let (locked, release) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
+    let holder = std::thread::spawn({
+        let gate = gate.clone();
+        let (locked, release) = (locked.0, release.1);
+        move || {
+            let _ticks = gate.ticks.lock().unwrap();
+            locked.send(()).unwrap();
+            let _ = release.recv();
+        }
+    });
+    locked.1.recv().unwrap();
+    let admit = tokio::spawn({
+        let gate = gate.clone();
+        async move { gate.admit().await.map(|admitted| admitted.done()) }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (ended, refresh) = restart_peer(&clock);
+    let early = ended.recv_timeout(Duration::from_millis(200)).is_ok();
+    release.0.send(()).unwrap();
+    holder.join().unwrap();
+    refresh.join().unwrap();
+    admit.await.unwrap().unwrap();
+    assert!(
+        !early,
+        "a refresh ran between the verdict and the pin of a tick"
+    );
+    assert_eq!(read(&gate), START + 100);
+    let next = tokio::time::timeout(Duration::from_millis(300), gate.admit()).await;
+    assert!(
+        next.is_err(),
+        "the next batch used the bound from before the refresh"
+    );
+    assert!(!late(&clock, 2, clock.probe(), START + 100, (0, 0)) || clock.waiting());
+}
+
+/// Critic, round 2: the same for the advance of `last` between batches. A refresh waits until
+/// the advance ends. After the refresh the samples are too few, and `last` does not advance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refresh_never_splits_the_advance_of_the_clock() {
+    let (clock, time) = leader(&[1, 2, 3]);
+    assert!(reply(&clock, &time, 2, 0, 0));
+    assert!(reply(&clock, &time, 3, 0, 0));
+    let gate = clock.gate().await;
+    time.advance(50);
+    let (reached, paused) = std::sync::mpsc::sync_channel(1);
+    let (resume, resumed) = std::sync::mpsc::sync_channel(1);
+    *gate.read_hold.lock().unwrap() = Some((reached, resumed));
+    let reader = std::thread::spawn({
+        let gate = gate.clone();
+        move || read(&gate)
+    });
+    paused.recv().unwrap();
+    // Both peers restart, so the samples are too few after the refresh.
+    let (done, ended) = std::sync::mpsc::channel();
+    let refresh = std::thread::spawn({
+        let clock = clock.clone();
+        move || {
+            configure(&clock, 2, &[1, 2, 3], PROCESS + 1);
+            let _ = done.send(());
+        }
+    });
+    let early = ended.recv_timeout(Duration::from_millis(200)).is_ok();
+    resume.send(()).unwrap();
+    let advanced = reader.join().unwrap();
+    refresh.join().unwrap();
+    assert!(
+        !early,
+        "a refresh ran between the verdict and the advance of the clock"
+    );
+    assert_eq!(advanced, time.wall());
+    time.advance(1_000);
+    assert_eq!(clock.verdict(), Verdict::Waiting);
+    assert_eq!(read(&gate), advanced, "the clock advanced without samples");
+}
