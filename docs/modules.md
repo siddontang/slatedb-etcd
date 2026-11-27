@@ -18,9 +18,10 @@ The table gives the responsibility of each module. A module is not always the ow
   `state/read`, `state/shared`, `state/shared/adopt`, and `state/snapshot`.
 - Some modules own a type with private fields, and the other modules call its methods:
   `Writer` in `node/shared/writer`, `EarlyPuts` in `node/quorum_put`, `Checkpointer` in
-  `node/checkpoint`, `ReadIndexTable` in `node/read/table`, `Group` in `node/proposal`,
-  `Publisher` in `node/forwarding` and `node/watch`, the log `Worker` in `node/log`, `KeyIndex`
-  in `state/key_index`, `Overlay` in `state/overlay`, and `RowCache` in `state/rows`.
+  `node/checkpoint`, `ReadIndexTable` in `node/read/table`, `LeaseClock` in `node/lease/clock`,
+  `Group` in `node/proposal`, `Publisher` in `node/forwarding` and `node/watch`, the log `Worker`
+  in `node/log`, `KeyIndex` in `state/key_index`, `Overlay` in `state/overlay`, and `RowCache` in
+  `state/rows`.
 
 | Module | Responsibility |
 | --- | --- |
@@ -45,6 +46,7 @@ The table gives the responsibility of each module. A module is not always the ow
 | `node/read/table` | Keep the reads that wait for a ReadIndex proof, the executor, or a revision |
 | `node/read/executor` | Run bounded reads on immutable applied views |
 | `node/lease` | Schedule leader lease expiry from replicated generations |
+| `node/lease/clock` | Keep the leader's lease deadlines and its Expire proposals until they apply |
 | `state/quota` | Track the logical usage. KV, Put, and Lease apply compare it to the quota |
 | `node/cluster` | Propose the term-start entries, publish client URLs, and serve member requests |
 | `state/cluster` | Seed, change, and check the membership row |

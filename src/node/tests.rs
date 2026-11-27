@@ -1772,13 +1772,13 @@ async fn leader_renews_a_lease_without_a_log_append() {
     let mut node = leader_node(dir.path()).await;
     grant_lease(&mut node, 7, 60).await;
     let short = Instant::now() + Duration::from_secs(5);
-    node.lease_deadlines.get_mut(&7).unwrap().1 = short;
+    node.lease_clock.set_deadline(7, short);
     let last = node.raw.store().durable.last_index;
     let syncs = node.raw.store().durable.sync_writes;
     let generation = node.state.leases[&7].generation;
 
     assert_eq!(keep_alive(&mut node, 7).await.unwrap(), 60);
-    assert!(node.lease_deadlines[&7].1 > short + Duration::from_secs(50));
+    assert!(node.lease_clock.deadline(7) > short + Duration::from_secs(50));
     assert_eq!(keep_alive(&mut node, 99).await.unwrap(), 0, "unknown lease");
     assert_eq!(node.raw.store().durable.last_index, last);
     assert_eq!(node.raw.store().durable.sync_writes, syncs);
@@ -1801,7 +1801,8 @@ async fn an_expired_lease_is_not_renewed_before_its_expire_entry_applies() {
     let last = node.raw.raft.raft_log.last_index();
 
     // A renewal before the deadline moves it, so the owner proposes no expiry.
-    node.lease_deadlines.get_mut(&8).unwrap().1 = Instant::now() + Duration::from_millis(200);
+    node.lease_clock
+        .set_deadline(8, Instant::now() + Duration::from_millis(200));
     assert_eq!(keep_alive(&mut node, 8).await.unwrap(), 60);
     tokio::time::sleep(Duration::from_millis(250)).await;
     node.expire_leases().unwrap();
@@ -1809,15 +1810,15 @@ async fn an_expired_lease_is_not_renewed_before_its_expire_entry_applies() {
 
     // Past the deadline, a renewal fails and keeps the pending expiry valid.
     let past = Instant::now() - Duration::from_millis(1);
-    node.lease_deadlines.get_mut(&7).unwrap().1 = past;
+    node.lease_clock.set_deadline(7, past);
     node.expire_leases().unwrap();
     assert_eq!(node.raw.raft.raft_log.last_index(), last + 1);
     assert_eq!(keep_alive(&mut node, 7).await.unwrap(), 0);
-    assert_eq!(node.lease_deadlines[&7].1, past);
+    assert_eq!(node.lease_clock.deadline(7), past);
     commit_with_peer(&mut node).await;
     assert!(!node.state.leases.contains_key(&7));
     assert!(node.state.leases.contains_key(&8));
-    assert!(node.lease_expiring.is_empty());
+    assert_eq!(node.lease_clock.expiring(), 0);
     assert_eq!(keep_alive(&mut node, 7).await.unwrap(), 0);
 }
 
@@ -1826,7 +1827,8 @@ async fn leader_change_cancels_renewals_and_restores_the_full_ttl() {
     let dir = tempfile::tempdir().unwrap();
     let mut node = leader_node(dir.path()).await;
     grant_lease(&mut node, 7, 60).await;
-    node.lease_deadlines.get_mut(&7).unwrap().1 = Instant::now() + Duration::from_secs(1);
+    node.lease_clock
+        .set_deadline(7, Instant::now() + Duration::from_secs(1));
 
     // A proof from the old term cannot renew the lease.
     let (tx, mut reply) = oneshot::channel();
@@ -1847,8 +1849,9 @@ async fn leader_change_cancels_renewals_and_restores_the_full_ttl() {
     node.sync_lease_deadlines();
     let extend = node.promote_extend();
     assert_eq!(extend, Duration::from_secs(2));
-    let remaining = node.lease_deadlines[&7]
-        .1
+    let remaining = node
+        .lease_clock
+        .deadline(7)
         .saturating_duration_since(Instant::now());
     assert!(
         remaining > Duration::from_secs(60) + extend - Duration::from_secs(1),
@@ -1857,8 +1860,9 @@ async fn leader_change_cancels_renewals_and_restores_the_full_ttl() {
 
     // A lease granted later in the same term gets only its TTL.
     grant_lease(&mut node, 8, 60).await;
-    let remaining = node.lease_deadlines[&8]
-        .1
+    let remaining = node
+        .lease_clock
+        .deadline(8)
         .saturating_duration_since(Instant::now());
     assert!(remaining <= Duration::from_secs(60), "{remaining:?}");
 }
@@ -1869,7 +1873,7 @@ async fn a_renewal_with_a_stale_proof_is_cancelled() {
     let mut node = leader_node(dir.path()).await;
     grant_lease(&mut node, 7, 60).await;
     let deadline = Instant::now() + Duration::from_secs(5);
-    node.lease_deadlines.get_mut(&7).unwrap().1 = deadline;
+    node.lease_clock.set_deadline(7, deadline);
 
     let (tx, mut reply) = oneshot::channel();
     node.keep_alive(7, None, tx).unwrap();
@@ -1885,7 +1889,8 @@ async fn a_renewal_with_a_stale_proof_is_cancelled() {
     let error = reply.try_recv().unwrap().unwrap_err();
     assert!(error.error.contains("renewal cancelled"), "{}", error.error);
     assert_eq!(
-        node.lease_deadlines[&7].1, deadline,
+        node.lease_clock.deadline(7),
+        deadline,
         "a stale proof must not move the deadline"
     );
     assert!(node.renewals.is_empty());

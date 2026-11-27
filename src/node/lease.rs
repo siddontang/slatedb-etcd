@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::Arc;
+pub(super) mod clock;
 
 /// Bound the renewals that wait for one leadership proof.
 pub(super) const MAX_RENEWALS: usize = 4096;
@@ -45,45 +45,14 @@ impl Renewals {
 
 impl Node {
     pub(super) fn sync_lease_deadlines(&mut self) {
-        if self.raw.raft.state != StateRole::Leader || self.lease_term != self.raw.raft.term {
-            self.lease_deadlines.clear();
-            self.lease_expiring.clear();
-            self.lease_view = None;
-            self.lease_promoted = false;
-            self.lease_term = self.raw.raft.term;
-        }
-        if self.raw.raft.state != StateRole::Leader {
-            return;
-        }
-        // The node holds the previous map, so apply must copy it before a change.
-        // An equal pointer therefore proves that the lease set did not change.
+        let leader = self.raw.raft.state == StateRole::Leader;
         if self
-            .lease_view
-            .as_ref()
-            .is_some_and(|view| Arc::ptr_eq(view, &self.state.leases))
+            .lease_clock
+            .sync_term(self.raw.raft.term, leader, &self.state.leases)
         {
-            return;
+            let extend = self.promote_extend();
+            self.lease_clock.rebuild(&self.state.leases, extend);
         }
-        self.lease_deadlines
-            .retain(|id, _| self.state.leases.contains_key(id));
-        let now = Instant::now();
-        // Like etcd's Promote, a new leader extends inherited leases by an election timeout.
-        let extend = if self.lease_promoted {
-            Duration::ZERO
-        } else {
-            self.promote_extend()
-        };
-        self.lease_promoted = true;
-        for (&id, lease) in self.state.leases.iter() {
-            let entry = self.lease_deadlines.entry(id).or_insert((0, now));
-            if entry.0 != lease.generation {
-                *entry = (
-                    lease.generation,
-                    now + Duration::from_secs(lease.ttl as u64) + extend,
-                );
-            }
-        }
-        self.lease_view = Some(self.state.leases.clone());
     }
 
     /// The longest randomized election timeout.
@@ -101,11 +70,8 @@ impl Node {
         if self.backlogged() {
             return Ok(());
         }
-        let now = Instant::now();
-        for (&id, &(generation, deadline)) in &self.lease_deadlines {
-            if deadline > now || self.lease_expiring.contains(&(id, generation)) {
-                continue;
-            }
+        let mut due = self.lease_clock.due(Instant::now());
+        while let Some((id, generation)) = due.next() {
             let command = RaftCommand::Lease {
                 origin: self.options.id,
                 id: uuid::Uuid::new_v4().to_string(),
@@ -120,7 +86,7 @@ impl Node {
                 break;
             }
             if self.raw.propose(vec![], data).is_ok() {
-                self.lease_expiring.insert((id, generation));
+                due.proposed(id, generation);
             }
         }
         Ok(())
@@ -319,14 +285,9 @@ impl Node {
         let Some(lease) = self.state.leases.get(&id) else {
             return 0;
         };
-        let Some((_, deadline)) = self.lease_deadlines.get_mut(&id) else {
-            return 0;
-        };
-        let now = Instant::now();
-        if *deadline <= now {
+        if !self.lease_clock.renew(id, lease.ttl) {
             return 0;
         }
-        *deadline = now + Duration::from_secs(lease.ttl as u64);
         lease.ttl
     }
 }
