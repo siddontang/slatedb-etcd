@@ -62,14 +62,17 @@ fn txn_entry(index: u64) -> Entry {
     }
 }
 
-/// A state on `store` with `k0` to `k3` through index 4, with empty caches.
+/// A state on `store` with the membership at index 1, and `k0` to `k2` through index 4. See
+/// `reopen_cold`.
 async fn cold(store: Arc<dyn ObjectStore>) -> StateMachine {
     let mut state = open_cold(store).await;
-    for index in 1..=4 {
-        let key = format!("k{}", index - 1);
+    // A restart opens only a base that holds the membership.
+    state.seed_for_test(1).await.unwrap();
+    for index in 2..=4 {
+        let key = format!("k{}", index - 2);
         state.apply_etcd(index, &put(&key)).await.unwrap();
     }
-    state
+    reopen_cold(state).await
 }
 
 /// Open a state on `store` with empty caches.
@@ -78,6 +81,17 @@ async fn open_cold(store: Arc<dyn ObjectStore>) -> StateMachine {
     StateMachine::open_shared(store, "root", "test", COLD, &options)
         .await
         .unwrap()
+}
+
+/// Write the overlay of `state` into a shared checkpoint, and open the state again on it with
+/// empty caches. The rows are then in SSTs, so a read of them reads the store.
+async fn reopen_cold(state: StateMachine) -> StateMachine {
+    use crate::state::shared::tests::{checkpoint, writer};
+    let writer = writer(&state).await;
+    drop(checkpoint(&state, &writer, &mut 0).await);
+    writer.close().await.unwrap();
+    state.close().await.unwrap();
+    open_cold(state.shared.as_ref().unwrap().source.store.clone()).await
 }
 
 async fn hash(state: &mut StateMachine) -> Value {
@@ -92,7 +106,6 @@ async fn hash(state: &mut StateMachine) -> Value {
 /// A storage error of a Txn compare is no result of the entry: the entry stays unapplied until
 /// the read succeeds. Then it applies once, and the state matches a member with no fault.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "see #149"]
 async fn a_failed_read_leaves_the_entry_unapplied() {
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     let state = cold(faults.clone()).await;
@@ -142,7 +155,6 @@ async fn a_failed_read_leaves_the_entry_unapplied() {
 
 /// A shutdown ends an apply job that retries a failed read. It does not wait for the store.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "see #149"]
 async fn a_shutdown_ends_a_retrying_apply_at_once() {
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     let state = cold(faults.clone()).await;
@@ -227,7 +239,6 @@ fn entries(job: Vec<Entry>) -> Work {
 /// them. A read of it that keeps failing ends the job at once and frees the worker. The next
 /// entry of the new leader then applies while the store still fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "see #149"]
 async fn a_failed_early_put_evaluation_frees_the_worker() {
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     let state = cold(faults.clone()).await;
@@ -279,7 +290,6 @@ async fn a_failed_early_put_evaluation_frees_the_worker() {
 /// A job that overlaps the applied index still fails, at its start and in its middle. In the
 /// middle case a failed read retries the job first, so the retry must keep the index check.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "see #149"]
 async fn an_overlapping_job_still_fails() {
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     let state = cold(faults.clone()).await;
@@ -367,7 +377,6 @@ async fn retried(worker: &mut Worker, faults: &Arc<FaultStore>, job: Vec<Entry>)
 /// A committed diagnostic Get and a compaction step read before they change state. A storage
 /// error of the read leaves the entry unapplied, and apply runs it again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "see #149"]
 async fn a_failed_diagnostic_or_compaction_read_retries() {
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     let mut state = cold(faults.clone()).await;
@@ -404,6 +413,7 @@ async fn a_failed_diagnostic_or_compaction_read_retries() {
         .unwrap()
         .result
         .unwrap();
+    let state = reopen_cold(state).await;
     assert!(state.compaction_pending());
     let (events, _) = mpsc::channel(8);
     let mut worker = Worker::start(state, events, true, None);
