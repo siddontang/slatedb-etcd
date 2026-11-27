@@ -22,190 +22,6 @@ const KEEP_CHECKPOINTS: usize = 2;
 /// Batches that the materializer takes from the queue at once.
 const MATERIALIZE_BATCHES: usize = 64;
 
-/// Progress that the materializer, the publisher, and flush waiters share.
-pub(super) struct Progress {
-    inner: Mutex<Inner>,
-    /// The sequence of the newest batch in the shared `Db`.
-    written: tokio::sync::watch::Sender<u64>,
-    wake: tokio::sync::Notify,
-    /// Tests: the next `wrote` takes the pair. It sends on the first and waits on the second
-    /// before it changes the progress.
-    #[cfg(test)]
-    hold: Mutex<Option<clock::ReadHold>>,
-    /// Tests: the next writer task takes the pair before its reset. It notifies the first and
-    /// waits for the second.
-    #[cfg(test)]
-    reset_hold: Hold,
-}
-
-#[derive(Default)]
-struct Inner {
-    /// The time of the oldest write that no flush covers.
-    dirty_since: Option<Instant>,
-    /// Publish a checkpoint after the materializer writes this sequence.
-    publish_through: Option<u64>,
-    /// Publish a new checkpoint even at an unchanged sequence. Defragment sets this.
-    republish: bool,
-    /// The time of the oldest request that no publication covered yet.
-    requested: Option<Instant>,
-    /// The time of the oldest republish that no publication served yet.
-    republished: Option<Instant>,
-    /// The writer opens so far. Only the materializer of the newest open moves `written`. A
-    /// stopped materializer of an older open can end after the newer open.
-    owner: u64,
-}
-
-impl Progress {
-    pub(super) fn new(written: u64) -> Self {
-        Self {
-            inner: Mutex::default(),
-            written: tokio::sync::watch::channel(written).0,
-            wake: tokio::sync::Notify::new(),
-            #[cfg(test)]
-            hold: Mutex::default(),
-            #[cfg(test)]
-            reset_hold: Hold::default(),
-        }
-    }
-
-    pub fn written(&self) -> u64 {
-        *self.written.borrow()
-    }
-
-    /// The materializer of open `owner` wrote `seq`.
-    fn wrote(&self, owner: u64, seq: u64) {
-        #[cfg(test)]
-        {
-            let hold = self.hold.lock().unwrap().take();
-            if let Some((reached, resume)) = hold {
-                let _ = reached.send(());
-                let _ = resume.recv();
-            }
-        }
-        let mut inner = self.inner.lock().unwrap();
-        if inner.owner != owner {
-            return;
-        }
-        self.written.send_replace(seq);
-        let first = inner.dirty_since.is_none();
-        inner.dirty_since.get_or_insert_with(Instant::now);
-        let requested = inner.publish_through.is_some_and(|through| seq >= through);
-        drop(inner);
-        // The publisher sleeps until the oldest write reaches its age.
-        if first || requested {
-            self.wake.notify_one();
-        }
-    }
-
-    /// Start again after a writer open at `written`. The writes that the age limit tracked
-    /// were in the old writer. A publication request and a republish stay: a manual checkpoint
-    /// or a Defragment can ask before the new writer opens, or a failed pass gives them back.
-    /// Return the owner of the new open. The writer task calls this only while it still leads
-    /// its term. See `lead`.
-    fn reset(&self, written: u64) -> u64 {
-        let mut inner = self.inner.lock().unwrap();
-        inner.owner += 1;
-        inner.dirty_since = None;
-        self.written.send_replace(written);
-        inner.owner
-    }
-
-    /// Publish a new checkpoint at the current sequence, for a changed layout.
-    fn republish(&self) {
-        self.give_back(None, true);
-        self.wake.notify_one();
-    }
-
-    fn take_republish(&self) -> bool {
-        std::mem::take(&mut self.inner.lock().unwrap().republish)
-    }
-
-    fn request(&self, through: u64) {
-        self.give_back(Some(through), false);
-        self.wake.notify_one();
-    }
-
-    /// Add a request and a republish without a wake. Each keeps the wait of an earlier one.
-    fn give_back(&self, through: Option<u64>, republish: bool) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(through) = through {
-            let through = inner
-                .publish_through
-                .map_or(through, |old| old.max(through));
-            inner.publish_through = Some(through);
-            inner.requested.get_or_insert_with(Instant::now);
-        }
-        if republish {
-            inner.republish = true;
-            inner.republished.get_or_insert_with(Instant::now);
-        }
-    }
-
-    /// The time of the oldest request or republish that no publication served yet.
-    fn requested(&self) -> Option<Instant> {
-        let inner = self.inner.lock().unwrap();
-        inner.requested.into_iter().chain(inner.republished).min()
-    }
-
-    /// A pass ended. A request and a republish keep separate waits. A wait starts again only
-    /// when the pass covered that kind of demand and a newer one waits. A pass that covered no
-    /// request, for example one above the written batch, keeps the wait of the request.
-    fn served(&self, covered: bool, republished: bool) {
-        let now = Instant::now();
-        let mut inner = self.inner.lock().unwrap();
-        if inner.publish_through.is_none() {
-            inner.requested = None;
-        } else if covered {
-            inner.requested = Some(now);
-        }
-        if !inner.republish {
-            inner.republished = None;
-        } else if republished {
-            inner.republished = Some(now);
-        }
-    }
-
-    /// A new writer starts the wait of the pending requests, so it has a whole interval to
-    /// reach them.
-    fn rearm(&self) {
-        let now = Instant::now();
-        let mut inner = self.inner.lock().unwrap();
-        inner.requested = inner.publish_through.map(|_| now);
-        inner.republished = inner.republish.then_some(now);
-    }
-
-    /// Wait until the shared `Db` holds every batch through `seq`.
-    #[cfg(test)]
-    pub async fn wait_written(&self, seq: u64) -> Result<()> {
-        let mut written = self.written.subscribe();
-        written.wait_for(|written| *written >= seq).await?;
-        Ok(())
-    }
-
-    /// The time when the oldest unflushed write reaches `max_age`.
-    fn deadline(&self, max_age: Duration) -> Option<Instant> {
-        Some(self.inner.lock().unwrap().dirty_since? + max_age)
-    }
-
-    /// Return whether a flush is due, and the request that is one of its causes. Clear the
-    /// causes that it covers.
-    fn take_flush(&self, max_age: Duration) -> (bool, Option<u64>) {
-        let written = self.written();
-        let mut inner = self.inner.lock().unwrap();
-        let requested = inner.publish_through.filter(|through| written >= *through);
-        let aged = inner
-            .dirty_since
-            .is_some_and(|since| since.elapsed() >= max_age);
-        if requested.is_some() {
-            inner.publish_through = None;
-        }
-        if requested.is_some() || aged {
-            inner.dirty_since = None;
-        }
-        (requested.is_some() || aged, requested)
-    }
-}
-
 /// The publication demand that one publisher pass took: a request and a republish. A pass that
 /// fails or stops before its publication gives the demand back, so the next writer serves it.
 struct Demand<'a> {
@@ -413,18 +229,7 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
                 continue;
             }
         }
-        // The gate starts at the floor of the stored state, so the compactor and the flushes of
-        // the new `Db` take no ID time below it. See `clock::stored_floor`. The behind check of
-        // that floor comes first, so a floor far ahead never reaches the gate or SlateDB.
-        let opening = async {
-            let stored = clock::stored_floor(&publisher.admin).await?;
-            if !clock.pass(stored).await {
-                return Ok(None);
-            }
-            gate.floor(stored);
-            let db = publisher.source.open_writer_on(gate.clone()).await?;
-            anyhow::Ok(Some((db, stored)))
-        };
+        let opening = open_writer(&publisher, &clock, &gate);
         let opened = attempt(opening, &mut stopped, &mut health);
         let (db, stored) = match opened.await {
             Attempt::Done(Ok(None)) => {
@@ -494,12 +299,6 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         }
         gate.floor(tick);
         health.opened();
-        let admin = slatedb::admin::Admin::builder(
-            publisher.source.state(),
-            publisher.source.store.clone(),
-        )
-        .with_system_clock(gate.clone())
-        .build();
         #[cfg(test)]
         {
             let hold = publisher.progress.reset_hold.lock().unwrap().take();
@@ -508,28 +307,7 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
                 resume.notified().await;
             }
         }
-        // The open starts at `last_l0_seq`. Unflushed writes of an older writer are lost, and
-        // the overlay holds them.
-        //
-        // The task of a newer term can open while this task is here. `Writer::sync` changes
-        // the leadership before it starts that task. The read guard holds the leadership from
-        // the check through the reset and the slot, so a newer term comes before the check or
-        // after the slot. An older task then cannot move the progress back or replace the
-        // newer writer.
-        let owner = {
-            let leading = leadership.borrow();
-            (*leading == (true, term)).then(|| {
-                let owner = publisher.progress.reset(db.manifest().last_l0_seq());
-                publisher.progress.rearm();
-                *open.lock().unwrap() = Some(Open {
-                    db: db.clone(),
-                    admin: Arc::new(admin),
-                    gate: gate.clone(),
-                });
-                owner
-            })
-        };
-        let Some(owner) = owner else {
+        let Some(owner) = start(&publisher, &leadership, term, &open, &db, &gate) else {
             close(db).await;
             return Ok(());
         };
@@ -577,6 +355,59 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
     }
 }
 
+/// Open the writer `Db` on `gate`. Return the `Db` and the stored floor, or `None` when the
+/// local clock is behind that floor.
+async fn open_writer(
+    publisher: &Publisher,
+    clock: &Clock,
+    gate: &Arc<clock::Gate>,
+) -> Result<Option<(slatedb::Db, i64)>> {
+    // The gate starts at the floor of the stored state, so the compactor and the flushes of
+    // the new `Db` take no ID time below it. See `clock::stored_floor`. The behind check of
+    // that floor comes first, so a floor far ahead never reaches the gate or SlateDB.
+    let stored = clock::stored_floor(&publisher.admin).await?;
+    if !clock.pass(stored).await {
+        return Ok(None);
+    }
+    gate.floor(stored);
+    let db = publisher.source.open_writer_on(gate.clone()).await?;
+    Ok(Some((db, stored)))
+}
+
+/// Start the writer of `term` on `db`: reset the progress and fill the `Open` slot. Return the
+/// owner of the progress, or `None` when the task no longer leads.
+fn start(
+    publisher: &Publisher,
+    leadership: &tokio::sync::watch::Receiver<(bool, u64)>,
+    term: u64,
+    open: &OpenWriter,
+    db: &Arc<slatedb::Db>,
+    gate: &Arc<clock::Gate>,
+) -> Option<u64> {
+    let admin =
+        slatedb::admin::Admin::builder(publisher.source.state(), publisher.source.store.clone())
+            .with_system_clock(gate.clone())
+            .build();
+    // The open starts at `last_l0_seq`. Unflushed writes of an older writer are lost, and the
+    // overlay holds them.
+    //
+    // The task of a newer term can open while this task is here. `Writer::sync` changes the
+    // leadership before it starts that task. The read guard holds the leadership from the check
+    // through the reset and the slot, so a newer term comes before the check or after the slot.
+    // An older task then cannot move the progress back or replace the newer writer.
+    let leading = leadership.borrow();
+    (*leading == (true, term)).then(|| {
+        let owner = publisher.progress.reset(db.manifest().last_l0_seq());
+        publisher.progress.rearm();
+        *open.lock().unwrap() = Some(Open {
+            db: db.clone(),
+            admin: Arc::new(admin),
+            gate: gate.clone(),
+        });
+        owner
+    })
+}
+
 /// Return why the writer cannot open yet: a pending snapshot restore. An unreadable claim is an
 /// error.
 async fn bootstrap_wait(source: &Source) -> Result<Option<String>> {
@@ -618,23 +449,39 @@ pub(super) async fn materialize(
     loop {
         next = next.max(queue.released());
         pushed.wait_for(|position| position.pushed > next).await?;
-        let batches = queue.after(next, MATERIALIZE_BATCHES);
-        if batches.is_empty() {
-            // A release took the batches after the wait. The next pass reads its index.
-            continue;
-        }
-        for (seq, batch) in batches {
-            // The tick of the batch is fixed before SlateDB gets it. See `clock::Gate`.
-            let admitted = gate.admit().await;
-            #[cfg(test)]
-            gate.held().await;
-            db.write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
-                .await?;
-            admitted.done();
-            next = seq;
-            progress.wrote(owner, seq);
-        }
+        let limit = MATERIALIZE_BATCHES;
+        write_batches(&db, &queue, &gate, &progress, owner, &mut next, limit).await?;
     }
+}
+
+/// Write at most `limit` overlay batches after `next`, in order. Move `next` to each written
+/// batch.
+async fn write_batches(
+    db: &slatedb::Db,
+    queue: &Queue,
+    gate: &clock::Gate,
+    progress: &Progress,
+    owner: u64,
+    next: &mut u64,
+    limit: usize,
+) -> Result<()> {
+    let batches = queue.after(*next, limit);
+    if batches.is_empty() {
+        // A release took the batches after the wait. The next pass reads its index.
+        return Ok(());
+    }
+    for (seq, batch) in batches {
+        // The tick of the batch is fixed before SlateDB gets it. See `clock::Gate`.
+        let admitted = gate.admit().await;
+        #[cfg(test)]
+        gate.held().await;
+        db.write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
+            .await?;
+        admitted.done();
+        *next = seq;
+        progress.wrote(owner, seq);
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -777,6 +624,104 @@ async fn stranded(
     Ok(Some((checkpoint.id, base.applied)))
 }
 
+/// The publication state of one writer `Db`.
+struct Publication {
+    /// The start of the publisher. Retention waits `RETENTION_GRACE` after it.
+    led: Instant,
+    /// The writer epoch of the `Db`. Retention stops when a newer writer holds the manifest.
+    epoch: u64,
+    /// The `last_l0_seq` of the newest view checkpoint.
+    published: u64,
+    /// The bootstrap marker exists.
+    bootstrapped: bool,
+    /// A writer that stopped before its announcement committed can leave a stranded
+    /// checkpoint. A new writer announces it, so the members do not wait for more writes.
+    retry: Retry,
+    /// A stranded check failed. The requests that wait for it retry at the backoff.
+    rechecking: bool,
+}
+
+impl Publication {
+    /// Read the newest view checkpoint and the bootstrap marker of `db`.
+    async fn new(
+        admin: &slatedb::admin::Admin,
+        source: &Source,
+        progress: &Progress,
+        db: &slatedb::Db,
+    ) -> Result<Self> {
+        let led = Instant::now();
+        let epoch = db.manifest().writer_epoch();
+        let published = view_checkpoints(admin)
+            .await?
+            .last()
+            .map_or(0, |(seq, _)| *seq);
+        let bootstrapped = source.bootstrapped().await?;
+        if !bootstrapped {
+            // The first leader publishes the first checkpoint at once. It holds `etcd/members`.
+            progress.request(1);
+        }
+        Ok(Self {
+            led,
+            epoch,
+            published,
+            bootstrapped,
+            retry: Retry::new(),
+            rechecking: false,
+        })
+    }
+
+    /// Create the checkpoint of `last`, check its membership, and write the bootstrap marker.
+    /// Return the checkpoint with its row `F`, or `None` when it has no membership.
+    async fn checkpoint(
+        &mut self,
+        db: &slatedb::Db,
+        admin: &slatedb::admin::Admin,
+        source: &Source,
+        health: &fault::TaskHealth,
+        last: u64,
+    ) -> Result<Option<(uuid::Uuid, u64)>> {
+        let options = CheckpointOptions {
+            name: Some(view_name(last)),
+            ..Default::default()
+        };
+        let checkpoint = db
+            .create_checkpoint(CheckpointScope::Durable, &options)
+            .await?;
+        health.progressed();
+        self.published = last;
+        // A pending L0 commit can land first, so `F` comes from the checkpoint itself.
+        let base = source.open_base(checkpoint.id).await?;
+        health.progressed();
+        if base.get(crate::cluster::KEY).await?.is_none() {
+            tracing::error!(checkpoint = %checkpoint.id, "a view checkpoint has no membership");
+            admin.delete_checkpoint(checkpoint.id).await?;
+            return Ok(None);
+        }
+        tracing::debug!(checkpoint = %checkpoint.id, applied = base.applied, "publish view");
+        let row = base.applied;
+        drop(base);
+        // The marker comes before the first announcement. The checkpoint already exists, so a
+        // restart after the marker still finds a base.
+        if !self.bootstrapped {
+            source.mark_bootstrapped(checkpoint.id).await?;
+            health.progressed();
+            self.bootstrapped = true;
+        }
+        Ok(Some((checkpoint.id, row)))
+    }
+
+    /// Delete the old view checkpoints that no member reported in `reported`.
+    async fn retain(
+        &self,
+        admin: &slatedb::admin::Admin,
+        source: &Source,
+        reported: &HashSet<uuid::Uuid>,
+    ) -> Result<()> {
+        crate::state::shared::retain(admin, source, reported, KEEP_CHECKPOINTS, Some(self.epoch))
+            .await
+    }
+}
+
 /// Flush the shared `Db` when its oldest write reaches the age limit or on request. Create one
 /// checkpoint for each advance of `last_l0_seq`, and announce it through Raft.
 ///
@@ -800,29 +745,14 @@ async fn publish(
         applied,
         health,
     } = publisher;
-    let led = Instant::now();
-    let epoch = db.manifest().writer_epoch();
-    let mut published = view_checkpoints(&admin)
-        .await?
-        .last()
-        .map_or(0, |(seq, _)| *seq);
-    let mut bootstrapped = source.bootstrapped().await?;
-    if !bootstrapped {
-        // The first leader publishes the first checkpoint at once. It holds `etcd/members`.
-        progress.request(1);
-    }
+    let mut publication = Publication::new(&admin, &source, &progress, &db).await?;
     // The open and the reads above are done.
     health.done();
-    // A writer that stopped before its announcement committed can leave a stranded
-    // checkpoint. A new writer announces it, so the members do not wait for more writes.
-    let mut retry = Retry::new();
-    // A stranded check failed. The requests that wait for it retry at the backoff.
-    let mut rechecking = false;
     // The `Db` can close before the subscription, so each pass reads the current status.
     let mut status = db.subscribe();
     loop {
         fault::closed(&db, &status).await?;
-        let deadline = [progress.deadline(max_age), retry.at]
+        let deadline = [progress.deadline(max_age), publication.retry.at]
             .into_iter()
             .flatten()
             .min();
@@ -852,32 +782,32 @@ async fn publish(
         // SlateDB also flushes a full memtable by itself. Each advance gets one checkpoint.
         let last = db.manifest().last_l0_seq();
         demand.republish = progress.take_republish();
-        if last <= published && !demand.republish {
+        if last <= publication.published && !demand.republish {
             health.done();
             // A request with no new checkpoint can wait for a stranded one. The request and
             // its timer stay until the check finds the checkpoint or rules it out, so a hung or
             // failing read of the check counts against the request. After a failed check, the
             // retry keeps its backoff.
-            if requested.is_some() && !rechecking {
-                retry.now();
+            if requested.is_some() && !publication.rechecking {
+                publication.retry.now();
             }
-            if !retry.due() && rechecking {
+            if !publication.retry.due() && publication.rechecking {
                 demand.requeue();
                 continue;
             }
-            if retry.due() {
+            if publication.retry.due() {
                 let checked = reannounce(
                     &admin,
                     &source,
                     &applied,
-                    &mut retry,
-                    &mut bootstrapped,
+                    &mut publication.retry,
+                    &mut publication.bootstrapped,
                     &events,
                 );
                 match checked.await? {
-                    Recheck::Done => rechecking = false,
+                    Recheck::Done => publication.rechecking = false,
                     Recheck::Failed => {
-                        rechecking = true;
+                        publication.rechecking = true;
                         demand.requeue();
                         continue;
                     }
@@ -888,42 +818,19 @@ async fn publish(
             continue;
         }
         health.due();
-        let options = CheckpointOptions {
-            name: Some(view_name(last)),
-            ..Default::default()
-        };
-        let checkpoint = db
-            .create_checkpoint(CheckpointScope::Durable, &options)
-            .await?;
-        health.progressed();
-        published = last;
-        // A pending L0 commit can land first, so `F` comes from the checkpoint itself.
-        let base = source.open_base(checkpoint.id).await?;
-        health.progressed();
-        if base.get(crate::cluster::KEY).await?.is_none() {
-            tracing::error!(checkpoint = %checkpoint.id, "a view checkpoint has no membership");
-            admin.delete_checkpoint(checkpoint.id).await?;
+        let created = publication.checkpoint(&db, &admin, &source, &health, last);
+        let Some(id) = created.await? else {
             continue;
-        }
-        tracing::debug!(checkpoint = %checkpoint.id, applied = base.applied, "publish view");
-        let row = base.applied;
-        drop(base);
-        // The marker comes before the first announcement. The checkpoint already exists, so a
-        // restart after the marker still finds a base.
-        if !bootstrapped {
-            source.mark_bootstrapped(checkpoint.id).await?;
-            health.progressed();
-            bootstrapped = true;
-        }
-        let Some(accepted) = announce(&events, (checkpoint.id, row)).await else {
+        };
+        let Some(accepted) = announce(&events, id).await else {
             return Ok(());
         };
         demand.served();
         health.published();
-        retry.sent((checkpoint.id, row), accepted);
+        publication.retry.sent(id, accepted);
         // A new leader has no reports yet. It waits until each member has reported twice.
-        let retain =
-            retention == crate::state::ViewRetention::Fenced && led.elapsed() >= RETENTION_GRACE;
+        let retain = retention == crate::state::ViewRetention::Fenced
+            && publication.led.elapsed() >= RETENTION_GRACE;
         let kept = async {
             let views = view_checkpoints(&admin).await?.len();
             if let Some(gauge) = &retained {
@@ -931,14 +838,7 @@ async fn publish(
             }
             if retain {
                 let reported = reported(&reports);
-                crate::state::shared::retain(
-                    &admin,
-                    &source,
-                    &reported,
-                    KEEP_CHECKPOINTS,
-                    Some(epoch),
-                )
-                .await?;
+                publication.retain(&admin, &source, &reported).await?;
             }
             anyhow::Ok(())
         };
@@ -1919,6 +1819,7 @@ mod clock;
 mod defragment;
 mod demand;
 mod fault;
+mod progress;
 mod rejected;
 mod write_proof;
 mod writer;
@@ -1934,6 +1835,7 @@ use defragment::DefragmentStep;
 pub(super) use fault::fenced;
 pub(crate) use fault::WriterReport;
 use fault::{Candidate, HANDOFF_TIMEOUTS};
+pub(super) use progress::Progress;
 pub(crate) use write_proof::{Prober, WriteProbeReply, WriteProbeRequest, WRITE_PROBE_ROUTE};
 use write_proof::{Replied, REPLY_WAIT};
 pub(super) use writer::{next, Gauges, Writer};
