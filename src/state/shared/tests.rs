@@ -209,7 +209,7 @@ async fn no_op_entries_write_no_batch_after_the_membership_seed() {
         &[(1, "127.0.0.1:1".to_owned())].into(),
     ));
     state.apply(1, None).await.unwrap();
-    let queue = state.shared.as_ref().unwrap().overlay.queue();
+    let queue = state.shared.overlay.queue();
     assert_eq!((state.write_batches, queue.pushed()), (0, 0));
     let members = state.applied_state().get(crate::cluster::KEY).await;
     assert!(members.unwrap().is_none());
@@ -246,13 +246,13 @@ async fn no_op_entries_write_no_batch_after_the_membership_seed() {
 
 /// Open the shared writer, as the leader task does.
 pub(crate) async fn writer(state: &StateMachine) -> slatedb::Db {
-    let source = state.shared.as_ref().unwrap().source.clone();
+    let source = state.shared.source.clone();
     source.open_writer().await.unwrap()
 }
 
 /// Write the overlay batches into the shared database and flush it.
 async fn flush(state: &StateMachine, writer: &slatedb::Db, written: &mut u64) {
-    let queue = state.shared.as_ref().unwrap().overlay.queue();
+    let queue = state.shared.overlay.queue();
     for (seq, batch) in queue.after(*written, usize::MAX) {
         writer
             .write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
@@ -281,7 +281,7 @@ pub(crate) async fn checkpoint(
         .await
         .unwrap()
         .id;
-    let source = state.shared.as_ref().unwrap().source.clone();
+    let source = state.shared.source.clone();
     source.open_base(id).await.unwrap()
 }
 
@@ -326,20 +326,20 @@ async fn bases_switch_monotonically_and_release_covered_segments() {
         .unwrap();
     let before = state.read_view().unwrap();
     let expected = rows(&state, b"etcd/").await;
-    let bytes = state.shared.as_ref().unwrap().overlay.bytes();
+    let bytes = state.shared.overlay.bytes();
 
     // The newer open finishes first. The older one must not lower the base.
-    let shared = state.shared.as_ref().unwrap();
+    let shared = &state.shared;
     shared.offer(newer.clone());
     shared.offer(older.clone());
     state.switch_base();
-    assert_eq!(state.shared.as_ref().unwrap().base.applied, 21);
-    state.shared.as_ref().unwrap().offer(older);
+    assert_eq!(state.shared.base.applied, 21);
+    state.shared.offer(older);
     state.switch_base();
-    assert_eq!(state.shared.as_ref().unwrap().base.applied, 21);
+    assert_eq!(state.shared.base.applied, 21);
     // The two closed segments are covered. The switch also closed the segment with the delete,
     // which is above the base, and opened an empty one.
-    let overlay = &state.shared.as_ref().unwrap().overlay;
+    let overlay = &state.shared.overlay;
     let segments = overlay.segments();
     assert_eq!(segments.len(), 2);
     assert_eq!((segments[0].last(), segments[1].last()), (23, 0));
@@ -360,8 +360,6 @@ async fn bases_switch_monotonically_and_release_covered_segments() {
     // A reopen starts from the newest checkpoint and rebuilds the same derived state.
     state
         .shared
-        .as_ref()
-        .unwrap()
         .source
         .mark_bootstrapped(uuid::Uuid::nil())
         .await
@@ -371,7 +369,7 @@ async fn bases_switch_monotonically_and_release_covered_segments() {
     let reopened = open_shared(store.clone()).await;
     assert_eq!(reopened.applied, 21);
     assert_eq!(reopened.revision, revision - 1);
-    assert_eq!(reopened.shared.as_ref().unwrap().base.applied, 21);
+    assert_eq!(reopened.shared.base.applied, 21);
     let k0 = reopened.applied_state().get(b"etcd/current/k0").await;
     assert!(k0.unwrap().is_some());
     let admin = reopened.admin.clone();
@@ -423,20 +421,13 @@ async fn a_restart_writes_a_missing_bootstrap_marker() {
     let mut written = 0;
     let writer = writer(&state).await;
     checkpoint(&state, &writer, &mut written).await;
-    let source = state.shared.as_ref().unwrap().source.clone();
+    let source = state.shared.source.clone();
     assert!(!source.bootstrapped().await.unwrap());
     state.close().await.unwrap();
     // A restart with no client write finds the checkpoint and writes the marker.
     let state = open_shared(store).await;
-    assert!(state
-        .shared
-        .as_ref()
-        .unwrap()
-        .source
-        .bootstrapped()
-        .await
-        .unwrap());
-    assert_eq!(state.shared.as_ref().unwrap().base.applied, 1);
+    assert!(state.shared.source.bootstrapped().await.unwrap());
+    assert_eq!(state.shared.base.applied, 1);
     state.close().await.unwrap();
 }
 
@@ -476,7 +467,7 @@ async fn retention_keeps_the_checkpoint_of_a_live_base() {
             .unwrap();
         bases.push(checkpoint(&state, &writer, &mut written).await);
     }
-    let source = state.shared.as_ref().unwrap().source.clone();
+    let source = state.shared.source.clone();
     let count = || async { shared::view_checkpoints(&state.admin).await.unwrap().len() };
     // A slow open still uses the second checkpoint. Retention keeps it and all newer ones.
     let pinned = bases.remove(1);
@@ -589,7 +580,7 @@ async fn five_checkpoints(state: &mut StateMachine) -> Vec<(u64, uuid::Uuid)> {
 async fn an_open_after_the_retention_choice_fails() {
     let mut state = open_shared(Arc::new(InMemory::new())).await;
     let views = five_checkpoints(&mut state).await;
-    let source = state.shared.as_ref().unwrap().source.clone();
+    let source = state.shared.source.clone();
     let oldest = views[0].1;
     let retiring = source.begin_retire(&views, &Default::default(), 2);
     assert_eq!(retiring.ids, [views[0].1, views[1].1, views[2].1]);
@@ -616,7 +607,7 @@ async fn a_stopped_retention_releases_its_choice() {
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     let mut state = open_shared(faults.clone()).await;
     let views = five_checkpoints(&mut state).await;
-    let source = state.shared.as_ref().unwrap().source.clone();
+    let source = state.shared.source.clone();
     // The first deletion writes the manifest and waits there, after the choice.
     faults.set(STALL_STATE_PUT);
     let reported = std::collections::HashSet::new();
@@ -635,7 +626,7 @@ async fn a_stopped_retention_releases_its_choice() {
 async fn an_open_in_flight_keeps_its_checkpoint() {
     let mut state = open_shared(Arc::new(InMemory::new())).await;
     let views = five_checkpoints(&mut state).await;
-    let source = state.shared.as_ref().unwrap().source.clone();
+    let source = state.shared.source.clone();
     // The open reserved its checkpoint and waits for storage.
     let opening = source.reserve_open(views[0].1).unwrap();
     shared::retain(&state.admin, &source, &Default::default(), 2, None)
@@ -740,7 +731,7 @@ async fn a_skipped_snapshot_releases_its_receipt() {
         .unwrap()
         .id;
     state.apply_etcd(2, &put("b", "2")).await.unwrap();
-    let source = state.shared.as_ref().unwrap().source.clone();
+    let source = state.shared.source.clone();
     let install = |id: uuid::Uuid| {
         let mut snapshot = Snapshot::default();
         snapshot.mut_metadata().index = 1;
@@ -753,7 +744,7 @@ async fn a_skipped_snapshot_releases_its_receipt() {
     assert_eq!(state.applied, 2);
     state.switch_base();
     assert_eq!(state.base_checkpoint(), Some(x));
-    assert_eq!(state.view_status().unwrap().0, 1);
+    assert_eq!(state.view_status().0, 1);
     // At the base index: nothing changes, and the receipt goes.
     source.receive(second).await.unwrap();
     assert!(source.pinned().contains(&second));
@@ -797,9 +788,9 @@ async fn slow_base() -> (StateMachine, Arc<crate::object::faults::FaultStore>) {
     let writer = writer(&state).await;
     let mut written = 0;
     let base = checkpoint(&state, &writer, &mut written).await;
-    state.shared.as_ref().unwrap().offer(base);
+    state.shared.offer(base);
     state.switch_base();
-    assert_eq!(state.shared.as_ref().unwrap().base.applied, 64);
+    assert_eq!(state.shared.base.applied, 64);
     (state, faults)
 }
 
@@ -928,9 +919,9 @@ async fn historical_point_reads_return_the_version_at_the_revision() {
             .unwrap();
     }
     let base = checkpoint(&state, &writer, &mut written).await;
-    state.shared.as_ref().unwrap().offer(base);
+    state.shared.offer(base);
     state.switch_base();
-    assert_eq!(state.shared.as_ref().unwrap().base.applied, 5);
+    assert_eq!(state.shared.base.applied, 5);
     for value in ["b3", "b4"] {
         state
             .apply_etcd(state.applied + 1, &put("b", value))
@@ -971,16 +962,16 @@ async fn a_late_older_announcement_keeps_the_base() {
     let older = checkpoint(&state, &writer, &mut written).await;
     state.apply_etcd(2, &put("b", "2")).await.unwrap();
     let newer = checkpoint(&state, &writer, &mut written).await;
-    let opened = state.shared_handles().unwrap().opened;
+    let opened = state.shared_handles().opened;
     announce(&mut state, &newer).await;
     for _ in 0..100 {
         state.switch_base();
-        if state.shared.as_ref().unwrap().base.applied == 2 {
+        if state.shared.base.applied == 2 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(state.shared.as_ref().unwrap().base.applied, 2);
+    assert_eq!(state.shared.base.applied, 2);
     announce(&mut state, &older).await;
     for _ in 0..100 {
         if opened.newest() == Some(1) {
@@ -990,7 +981,7 @@ async fn a_late_older_announcement_keeps_the_base() {
     }
     assert_eq!(opened.newest(), Some(1));
     state.switch_base();
-    assert_eq!(state.shared.as_ref().unwrap().base.applied, 2);
+    assert_eq!(state.shared.base.applied, 2);
     state.close().await.unwrap();
 }
 
@@ -1026,7 +1017,7 @@ async fn a_member_behind_a_checkpoint_adopts_it() {
             .await
             .unwrap();
     }
-    let opened = behind.shared_handles().unwrap().opened;
+    let opened = behind.shared_handles().opened;
     opened.offer(at_six.clone(), 0);
     // A switch cannot use a base above the applied index.
     behind.switch_base();
@@ -1058,7 +1049,7 @@ async fn a_member_behind_a_checkpoint_adopts_it() {
 async fn a_fenced_writer_deletes_no_checkpoint() {
     let mut state = open_shared(Arc::new(InMemory::new())).await;
     let views = five_checkpoints(&mut state).await;
-    let source = state.shared.as_ref().unwrap().source.clone();
+    let source = state.shared.source.clone();
     let old = writer(&state).await;
     let old_epoch = old.manifest().writer_epoch();
     // A successor opens the writer. Its members pin the oldest checkpoint.
@@ -1173,7 +1164,7 @@ async fn defragment_replaces_every_input_sorted_run() {
 
 /// A writer that caches nothing at a flush, so the member cache holds no block of a new SST.
 async fn cold_writer(state: &StateMachine) -> slatedb::Db {
-    let source = state.shared.as_ref().unwrap().source.clone();
+    let source = state.shared.source.clone();
     slatedb::Db::builder(source.state(), source.store.clone())
         .with_db_cache(source.cache.clone(), 0)
         .with_settings(slatedb_settings())
@@ -1207,7 +1198,7 @@ async fn cold_checkpoint(
 /// Write the overlay into `writer` and flush it to a new L0 SST. A read of the apply marker
 /// caches what a base open reads, but no current-row block.
 async fn cold_flush(state: &StateMachine, writer: &slatedb::Db, written: &mut u64) {
-    let queue = state.shared.as_ref().unwrap().overlay.queue();
+    let queue = state.shared.overlay.queue();
     for (seq, batch) in queue.after(*written, usize::MAX) {
         writer
             .write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
@@ -1264,7 +1255,7 @@ async fn slow_sst_reads_do_not_delay_metadata_opens() {
     put_rows(&mut state, 0, 300).await;
     let writer = cold_writer(&state).await;
     let id = cold_checkpoint(&state, &writer, &mut 0).await;
-    let source = state.shared.as_ref().unwrap().source.clone();
+    let source = state.shared.source.clone();
     faults.set_delay(Duration::from_secs(3));
     faults.set(DELAY_SST_GET);
     let limit = Duration::from_secs(1);
@@ -1324,13 +1315,13 @@ async fn a_failed_warm_is_retried_on_a_later_base() {
     faults.set(FAIL_SST_GET);
     adopt(&mut state, first).await;
     faults.set(0);
-    let source = state.shared.as_ref().unwrap().source.clone();
+    let source = state.shared.source.clone();
     assert!(source.warmed().0.is_empty());
     put_rows(&mut state, 300, 10).await;
     let second = cold_checkpoint(&state, &writer, &mut written).await;
     adopt(&mut state, second).await;
     faults.set(FAIL_SST_GET);
-    let base = state.shared.as_ref().unwrap().base.clone();
+    let base = state.shared.base.clone();
     assert!(base.get(&current("k0001")).await.unwrap().is_some());
     faults.set(0);
     writer.close().await.unwrap();
@@ -1347,7 +1338,7 @@ async fn concurrent_warms_keep_both_results() {
     let first = cold_checkpoint(&state, &writer, &mut written).await;
     put_rows(&mut state, 50, 50).await;
     let second = cold_checkpoint(&state, &writer, &mut written).await;
-    let source = state.shared.as_ref().unwrap().source.clone();
+    let source = state.shared.source.clone();
     let (a, b) = (
         source.open_base(first).await.unwrap(),
         source.open_base(second).await.unwrap(),
@@ -1366,7 +1357,7 @@ async fn concurrent_warms_keep_both_results() {
 async fn the_warm_set_stays_bounded_across_base_switches() {
     let (_faults, mut state) = fault_state().await;
     let writer = cold_writer(&state).await;
-    let source = state.shared.as_ref().unwrap().source.clone();
+    let source = state.shared.source.clone();
     let admin = slatedb::admin::Admin::builder(source.state(), source.store.clone()).build();
     let mut written = 0;
     let mut seen = std::collections::HashSet::new();
@@ -1374,7 +1365,7 @@ async fn the_warm_set_stays_bounded_across_base_switches() {
         put_rows(&mut state, round * 20, 20).await;
         let id = cold_checkpoint(&state, &writer, &mut written).await;
         adopt(&mut state, id).await;
-        let base = state.shared.as_ref().unwrap().base.clone();
+        let base = state.shared.base.clone();
         let current: Vec<_> = base.ssts().iter().map(|(id, _)| *id).collect();
         // Only SSTs of live bases stay. Another task, such as a read, can still hold an older
         // base, so the bound is the set of live bases, not the last two.
@@ -1404,7 +1395,7 @@ async fn timed_out_warms_keep_the_warm_set_bounded() {
     use crate::object::faults::DELAY_SST_GET;
     let (faults, mut state) = fault_state().await;
     let writer = cold_writer(&state).await;
-    let source = state.shared.as_ref().unwrap().source.clone();
+    let source = state.shared.source.clone();
     let admin = slatedb::admin::Admin::builder(source.state(), source.store.clone()).build();
     faults.set_delay(Duration::from_millis(150));
     let mut written = 0;
@@ -1419,7 +1410,7 @@ async fn timed_out_warms_keep_the_warm_set_bounded() {
         faults.set(DELAY_SST_GET);
         adopt(&mut state, id).await;
         faults.set(0);
-        let base = state.shared.as_ref().unwrap().base.clone();
+        let base = state.shared.base.clone();
         let current: Vec<_> = base.ssts().iter().map(|(id, _)| *id).collect();
         // Only SSTs of live bases stay. Another task, such as a read, can still hold an older
         // base, so the bound is the set of live bases, not the last two.

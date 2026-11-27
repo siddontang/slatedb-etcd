@@ -428,7 +428,7 @@ mod tests {
 
     /// Open member 1 in `dir` with the S3 layout on `store`, close it, and return the store ID
     /// that it sends to its peers.
-    async fn open_member(store: Arc<dyn ObjectStore>, dir: &Path) -> Result<Option<uuid::Uuid>> {
+    async fn open_member(store: Arc<dyn ObjectStore>, dir: &Path) -> Result<uuid::Uuid> {
         let options = crate::state::shared::Options {
             quota: 0,
             voters: vec![1],
@@ -691,8 +691,8 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let sent = open(store.clone()).await.unwrap();
         let id = read_binding(&dir).unwrap().store_id.unwrap();
-        assert_eq!(sent, Some(id));
-        assert_eq!(open(store.clone()).await.unwrap(), Some(id));
+        assert_eq!(sent, id);
+        assert_eq!(open(store.clone()).await.unwrap(), id);
         assert_eq!(read_binding(&dir).unwrap().store_id, Some(id));
 
         let root = s3().cluster_prefix("cluster");
@@ -729,7 +729,7 @@ mod tests {
             let dirs = tempfile::tempdir().unwrap();
             let dir = dirs.path().join("1");
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            let id = open_member(store.clone(), &dir).await.unwrap().unwrap();
+            let id = open_member(store.clone(), &dir).await.unwrap();
             let reached = Arc::new(tokio::sync::Notify::new());
             let resume = Arc::new(tokio::sync::Notify::new());
             let hook = Some((reached.clone(), resume.clone()));

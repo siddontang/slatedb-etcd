@@ -373,9 +373,7 @@ impl Node {
         }
         let process = self.raw.store().process(member);
         let term = self.raw.raft.term;
-        let Some(writer) = &mut self.writer else {
-            return Ok(());
-        };
+        let writer = &mut self.writer;
         let refusal = match writer.proofs.check(Instant::now(), term, member, process) {
             Ok(()) => return Ok(()),
             Err(refusal) => refusal,
@@ -392,9 +390,7 @@ impl Node {
     /// Drop the write proofs of members that left the Raft configuration.
     pub(in crate::node) fn prune_write_proofs(&mut self) {
         let conf = self.raw.raft.prs().conf().to_conf_state();
-        let Some(writer) = &mut self.writer else {
-            return;
-        };
+        let writer = &mut self.writer;
         let members: std::collections::HashSet<u64> = [
             &conf.voters,
             &conf.learners,
@@ -473,9 +469,7 @@ impl Node {
         };
         let process = self.raw.store().process(member);
         let term = self.raw.raft.term;
-        let Some(writer) = &mut self.writer else {
-            return;
-        };
+        let writer = &mut self.writer;
         let failure = replied.outcome.clone().err();
         if !writer
             .proofs

@@ -50,9 +50,7 @@ impl Node {
         if rejected.fault == StorageFault::Corrupt {
             CORRUPT_READS.inc();
         }
-        let Some(writer) = &mut self.writer else {
-            return;
-        };
+        let writer = &mut self.writer;
         if writer.rejected.note(&rejected) {
             tracing::error!(
                 checkpoint = ?rejected.checkpoint,

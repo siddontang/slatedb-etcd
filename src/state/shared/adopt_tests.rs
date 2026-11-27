@@ -48,7 +48,7 @@ async fn a_failed_base_load_keeps_the_state() {
             .await
             .unwrap();
     }
-    let shared = behind.shared.as_ref().unwrap();
+    let shared = &behind.shared;
     let queue = shared.overlay.queue();
     let (pushed, batches, old_base) = (queue.pushed(), queue.len(), shared.base.checkpoint);
     assert!(batches > 0, "the member has no overlay batch");
@@ -68,10 +68,7 @@ async fn a_failed_base_load_keeps_the_state() {
         "{error:#}"
     );
     assert_eq!(behind.applied, 2);
-    let shared = behind
-        .shared
-        .as_ref()
-        .expect("the failed load dropped the state");
+    let shared = &behind.shared;
     assert_eq!(shared.base.checkpoint, old_base);
     assert_eq!((queue.pushed(), queue.len()), (pushed, batches));
     assert_eq!(rows(behind.applied_state(), b"etcd/").await, before);
@@ -118,7 +115,7 @@ async fn a_failed_install_keeps_its_base() {
         .checkpoint
         .unwrap();
     behind.apply_etcd(1, &large("k1")).await.unwrap();
-    let source = behind.shared.as_ref().unwrap().source.clone();
+    let source = behind.shared.source.clone();
     source.receive(id).await.unwrap();
     let mut snapshot = raft::eraftpb::Snapshot::default();
     snapshot.mut_metadata().index = 4;

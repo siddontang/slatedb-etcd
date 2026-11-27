@@ -88,14 +88,14 @@ impl Fixture {
     async fn switch(&mut self) -> uuid::Uuid {
         let base = checkpoint(&self.state, &self.writer, &mut self.written).await;
         let id = base.checkpoint.unwrap();
-        self.state.shared.as_ref().unwrap().offer(base);
+        self.state.shared.offer(base);
         self.state.switch_base();
         assert_eq!(self.state.base_checkpoint(), Some(id));
         id
     }
 
     fn holders(&self) -> Arc<Holders> {
-        self.state.shared.as_ref().unwrap().holders.clone()
+        self.state.shared.holders.clone()
     }
 
     /// Hold new backups before their first pass until the returned semaphore gets a permit.
@@ -114,7 +114,7 @@ impl Fixture {
     }
 
     fn pins(&self, id: uuid::Uuid) -> bool {
-        let source = &self.state.shared.as_ref().unwrap().source;
+        let source = &self.state.shared.source;
         source.pinned().contains(&id)
     }
 
@@ -408,7 +408,7 @@ async fn an_idle_client_ends_a_shared_backup() {
 async fn fill_overlay(fixture: &mut Fixture, prefix: &str, bytes: u64) -> usize {
     let value = "w".repeat(10 * 1024);
     let mut n = 0;
-    while fixture.state.view_status().unwrap().2 < bytes {
+    while fixture.state.view_status().2 < bytes {
         fixture.put(&format!("{prefix}/{n:03}"), &value).await;
         n += 1;
     }
@@ -497,7 +497,7 @@ async fn a_backup_of_a_full_overlay_starts() {
     const KIB: u64 = 1024;
     let mut fixture = Fixture::with_budget(1, 256 * KIB).await;
     let rows = fill_overlay(&mut fixture, "pending", 600 * KIB).await;
-    assert!(fixture.state.view_status().unwrap().2 > 256 * KIB);
+    assert!(fixture.state.view_status().2 > 256 * KIB);
     // Two backups start, and several budget checks run while they wait.
     let hold = fixture.hold();
     let streams = [
@@ -623,7 +623,7 @@ async fn backups_keep_their_limits_across_an_adoption() {
         let request = put(&format!("k{n:02}"), &value);
         behind.apply_etcd(n, &request).await.unwrap();
     }
-    let holders = behind.shared.as_ref().unwrap().holders.clone();
+    let holders = behind.shared.holders.clone();
     let hold = Arc::new(tokio::sync::Semaphore::new(0));
     *holders.hold.lock().unwrap() = Some(hold.clone());
     let mut streams = vec![];
@@ -633,7 +633,7 @@ async fn backups_keep_their_limits_across_an_adoption() {
     assert_eq!(holders.status(), (MAX_HOLDERS, 0));
     behind.adopt_opened(newer, 4).await.unwrap();
     assert_eq!(behind.applied, 40);
-    let after = &behind.shared.as_ref().unwrap().holders;
+    let after = &behind.shared.holders;
     assert!(Arc::ptr_eq(after, &holders));
     let (count, charged) = holders.status();
     assert!(
@@ -687,7 +687,7 @@ async fn a_backup_ends_during_a_long_run_of_deletes() {
     fixture.state.write_batch(batch, index).await.unwrap();
     fixture.state.applied = index;
     fixture.put("zz", "after the deletes").await;
-    let segment = fixture.state.shared.as_ref().unwrap().overlay.segments()[0].clone();
+    let segment = fixture.state.shared.overlay.segments()[0].clone();
     let before = segment.visits.load(std::sync::atomic::Ordering::Relaxed);
     let hold = fixture.hold();
     let stream = fixture.state.backup().await.unwrap();

@@ -36,15 +36,17 @@ async fn server_with(
     let address = listener.local_addr().unwrap().to_string();
     let (events, received) = mpsc::channel(256);
     let refused = prometheus::IntCounter::new("refused", "Refused peer stores.").unwrap();
+    let memory = std::sync::Arc::new(slatedb::object_store::memory::InMemory::new());
+    let cache = crate::state::StateCache::default();
     let router = crate::api::router(ApiState {
-        shared: None,
+        shared: crate::state::shared::offline_source(memory, "", cache).unwrap(),
         events,
         peer: Identity {
             cluster: "stream-test".into(),
             store: store.map(str::to_owned),
         },
         refusals: std::sync::Arc::new(crate::api::Refusals::new(refused.clone())),
-        clock: None,
+        clock: std::sync::Arc::new(|| 0),
         prober: None,
         fault_controls: false,
     });

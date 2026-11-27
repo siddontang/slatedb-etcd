@@ -347,7 +347,7 @@ fn proven_reply(node: &Node, nonce: u64, process: u64) -> Event {
 
 /// The nonce of the running probe of member 2.
 fn pending(node: &Node) -> u64 {
-    node.writer.as_ref().unwrap().proofs.pending(2).unwrap()
+    node.writer.proofs.pending(2).unwrap()
 }
 
 /// The transport frame of process `process` of member 2.
@@ -413,7 +413,7 @@ async fn a_new_learner_process_drops_its_proof_at_once() {
 
 /// The write proofs in the `/status` of `node`.
 fn shown(node: &Node) -> Value {
-    node.writer.as_ref().unwrap().status()["write_proofs"]["members"].clone()
+    node.writer.status()["write_proofs"]["members"].clone()
 }
 
 /// Record a proof of process 7 of member 2 on `node`. Return the nonce of its probe.

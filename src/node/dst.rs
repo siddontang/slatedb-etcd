@@ -78,7 +78,7 @@ struct Simulation {
     /// Every value that a client proposed. A read must not return another value.
     proposed: BTreeSet<(String, String)>,
     /// Shared mode: the one object store of all members.
-    shared: Option<std::sync::Arc<crate::object::faults::FaultStore>>,
+    shared: std::sync::Arc<crate::object::faults::FaultStore>,
     /// Shared mode and quota checks: the state that applies the committed entries in order.
     reference: Option<reference::Reference>,
     /// The reference digest of the `data/` and `etcd/` rows after each index.
@@ -189,9 +189,9 @@ impl Simulation {
             trace: vec![],
             installed_snapshots: 0,
             proposed: BTreeSet::new(),
-            shared: Some(std::sync::Arc::new(crate::object::faults::FaultStore::new(
+            shared: std::sync::Arc::new(crate::object::faults::FaultStore::new(
                 std::sync::Arc::new(slatedb::object_store::memory::InMemory::new()),
-            ))),
+            )),
             reference,
             digests: BTreeMap::new(),
             checked: BTreeMap::new(),
@@ -230,7 +230,7 @@ impl Simulation {
             senders.insert(peer, tx);
             self.links.insert((id, peer), rx);
         }
-        let store = self.shared.clone().expect("a shared store");
+        let store = self.shared.clone();
         let flag = self.quotas.get(&id).copied().unwrap_or(0);
         // Box the large open future, so the schedule future fits the test thread stack.
         let node = Box::pin(Node::open_with_transport(
@@ -873,9 +873,7 @@ impl Simulation {
         let Some(node) = self.nodes.values().next() else {
             return;
         };
-        let Some(writer) = &node.writer else {
-            return;
-        };
+        let writer = &node.writer;
         let directory = slatedb::config::GarbageCollectorDirectoryOptions {
             interval: None,
             min_age: std::time::Duration::from_millis(200),
@@ -1015,7 +1013,7 @@ impl Simulation {
                 }
                 27 => {
                     // The object store rejects SST writes for a while.
-                    let store = sim.shared.clone().unwrap();
+                    let store = sim.shared.clone();
                     store.set(crate::object::faults::FAIL_PUT);
                     for _ in 0..5 {
                         sim.deliver(true).await;

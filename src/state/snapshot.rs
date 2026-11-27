@@ -20,7 +20,7 @@ impl StateMachine {
         align: bool,
     ) -> Result<impl std::future::Future<Output = Result<Vec<u8>>> + Send + 'static> {
         // A view needs no flush. Its rows are in a checkpoint or in memory.
-        let snapshot = self.pinned_state()?;
+        let snapshot = self.pinned_state();
         let applied = self.applied;
         // A backup carries the membership in memory as its last row, padded for etcdctl. A
         // restore replaces it. A Raft image sends the stored row as it is. See `install_object`.

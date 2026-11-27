@@ -30,7 +30,7 @@ pub(super) struct AppliedState {
     pub compaction_plan: u64,
     pub physical_revision: i64,
     /// Shared mode: the base index, the applied `ViewCheckpoint` entries, and the overlay bytes.
-    pub view: Option<(u64, u64, u64)>,
+    pub view: (u64, u64, u64),
     /// Shared mode: the checkpoint of the base.
     pub base_checkpoint: Option<uuid::Uuid>,
     /// The quota that apply uses. A non-positive value means no limit.

@@ -870,9 +870,7 @@ impl Node {
         let held = self.apply_held_at.is_some() || paused.is_some();
         let (term, transferee) = (self.raw.raft.term, self.raw.raft.lead_transferee);
         let mut moves: Vec<u64> = self.transfers.iter().map(|(target, ..)| *target).collect();
-        let Some(writer) = &mut self.writer else {
-            return;
-        };
+        let writer = &mut self.writer;
         moves.extend(writer.transfer.map(|(target, _)| target));
         if leader {
             writer.note_clock_wait();
@@ -899,9 +897,7 @@ impl Node {
             true => self.handoff_candidates(),
             false => vec![],
         };
-        let Some(writer) = &mut self.writer else {
-            return;
-        };
+        let writer = &mut self.writer;
         let health = &writer.health;
         let decision = writer.handoff.step(&Tick {
             due,

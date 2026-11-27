@@ -231,7 +231,7 @@ async fn lose_a_checkpoint_object(lose: Lose) {
             .unwrap();
     }
     // The leader writer checkpoints entry 20 with its own cache. The member switches to it.
-    let handles = state.shared_handles().unwrap();
+    let handles = state.shared_handles();
     let writer = slatedb::Db::builder(handles.source.state(), store)
         .with_settings(crate::state::slatedb_settings())
         .build()
@@ -548,7 +548,7 @@ const HEADER: Header = Header {
 async fn publish_batches(
     state: &StateMachine,
 ) -> (slatedb::Db, std::sync::Arc<crate::state::view::Base>) {
-    let handles = state.shared_handles().unwrap();
+    let handles = state.shared_handles();
     let writer = handles.source.open_writer().await.unwrap();
     for (seq, batch) in handles.queue.after(0, usize::MAX) {
         writer
@@ -597,17 +597,17 @@ async fn a_member_that_applies_entries_apart_adopts_a_grouped_checkpoint() {
             .await
             .unwrap();
     }
-    let queue = |state: &StateMachine| state.shared_handles().unwrap().queue;
+    let queue = |state: &StateMachine| state.shared_handles().queue;
     assert_eq!((grouped.applied, queue(&grouped).pushed()), (2, 2));
     assert_eq!((apart.applied, queue(&apart).pushed()), (2, 1));
     let (writer, base) = publish_batches(&grouped).await;
     assert_eq!(base.applied, 2);
-    apart.shared.as_ref().unwrap().offer(base);
+    apart.shared.offer(base);
     apart.switch_base();
-    let handles = apart.shared_handles().unwrap();
+    let handles = apart.shared_handles();
     assert_eq!(*handles.based.borrow(), 2);
     assert_eq!(handles.queue.len(), 0);
-    assert_eq!(apart.view_status().unwrap().2, 0);
+    assert_eq!(apart.view_status().2, 0);
     let view = apart.read_view().unwrap();
     let value = view.state().get(b"etcd/current/k").await.unwrap();
     assert!(value.is_some());
@@ -630,7 +630,7 @@ async fn a_certified_checkpoint_covers_a_batch_of_another_grouping() {
     apply_entries(&mut grouped, entries, HEADER).await.unwrap();
     let (writer, base) = publish_batches(&apart).await;
     assert_eq!(base.applied, 1);
-    let handles = grouped.shared_handles().unwrap();
+    let handles = grouped.shared_handles();
     // The row alone covers only the batch at 1, which this member does not have.
     handles.opened.offer(base.clone(), 0);
     grouped.switch_base();
@@ -645,7 +645,7 @@ async fn a_certified_checkpoint_covers_a_batch_of_another_grouping() {
     grouped.switch_base();
     assert_eq!(*handles.based.borrow(), 2);
     assert_eq!(handles.queue.len(), 0);
-    assert_eq!(grouped.view_status().unwrap().2, 0);
+    assert_eq!(grouped.view_status().2, 0);
     let value = grouped.applied_state().get(b"etcd/current/k").await;
     assert!(value.unwrap().is_some());
     // A checkpoint at the same row with no certified coverage does not replace it.
@@ -656,6 +656,6 @@ async fn a_certified_checkpoint_covers_a_batch_of_another_grouping() {
     grouped.switch_base();
     assert_eq!(*handles.based.borrow(), 2);
     assert_eq!(grouped.base_checkpoint(), Some(id));
-    assert_eq!(grouped.view_status().unwrap().0, 2);
+    assert_eq!(grouped.view_status().0, 2);
     writer.close().await.unwrap();
 }

@@ -157,11 +157,7 @@ impl StateMachine {
     /// Call it between apply jobs. Only the pin runs here. Writes that apply later do not reach
     /// the view, so the image holds one applied state boundary.
     pub(crate) async fn backup(&self) -> Result<Stream> {
-        let shared = self
-            .shared
-            .as_ref()
-            .context("a backup needs a shared view")?;
-        self.shared_backup(shared)
+        self.shared_backup(&self.shared)
     }
 }
 

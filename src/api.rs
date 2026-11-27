@@ -21,9 +21,9 @@ pub struct ApiState {
     pub(crate) peer: crate::peer::Identity,
     pub(crate) refusals: std::sync::Arc<Refusals>,
     /// Shared mode: the objects that a received format 6 snapshot names.
-    pub(crate) shared: Option<std::sync::Arc<crate::state::shared::Source>>,
+    pub(crate) shared: std::sync::Arc<crate::state::shared::Source>,
     /// Shared mode: the wall clock that a clock probe of the leader reads.
-    pub(crate) clock: Option<crate::node::Millis>,
+    pub(crate) clock: crate::node::Millis,
     /// Shared mode: the write probes that the leader asks for before a promotion.
     pub(crate) prober: Option<std::sync::Arc<crate::node::Prober>>,
     /// Serve the fault controls under `/debug`. Off unless a test cluster enables them.
@@ -229,10 +229,10 @@ async fn step_message(
         let data = message.get_snapshot().get_data();
         match crate::state::transfer::ViewDescriptor::decode(data) {
             Ok(Some(view)) => {
-                let (Some(source), Ok(id)) = (&state.shared, view.checkpoint()) else {
+                let Ok(id) = view.checkpoint() else {
                     return StatusCode::BAD_REQUEST.into_response();
                 };
-                if let Err(error) = source.receive(id).await {
+                if let Err(error) = state.shared.receive(id).await {
                     tracing::warn!(%error, "cannot open the snapshot checkpoint");
                     return (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response();
                 }
@@ -257,8 +257,8 @@ struct ViewAck {
     publish: Option<u64>,
     /// The process of a member that installs a base above its checkpoint row.
     coverage: Option<u64>,
-    /// The health of the member's shared writer. A member without a writer sends none, and the
-    /// leader then does not hand it the writer after a writer fault.
+    /// The health of the member's shared writer. The leader hands the writer after a writer
+    /// fault only to a member that reports it.
     writer: Option<crate::node::WriterReport>,
 }
 
@@ -285,8 +285,7 @@ async fn view_ack(
 }
 
 /// Return the wall clock of this member to a clock probe of the shared leader. The leader
-/// times the probe, so the reply reads the clock as late as it can. A member without a clock
-/// answers 404.
+/// times the probe, so the reply reads the clock as late as it can.
 async fn clock_probe(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -295,13 +294,10 @@ async fn clock_probe(
     if let Err(refusal) = admit(&state, &headers) {
         return (StatusCode::FORBIDDEN, refusal).into_response();
     }
-    let Some(clock) = &state.clock else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
     Json(crate::node::ProbeReply {
         nonce: probe.nonce,
         process: crate::peer::process_id(),
-        clock_ms: clock(),
+        clock_ms: (state.clock)(),
     })
     .into_response()
 }

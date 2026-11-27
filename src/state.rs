@@ -113,8 +113,8 @@ pub struct StateMachine {
     pub(crate) members_checked: Option<(u64, u64)>,
     /// The state that apply reads: the overlay and base.
     reads: StateView,
-    /// The overlay and base. Only the in-memory state of a test has none.
-    pub(crate) shared: Option<shared::Shared>,
+    /// The overlay and base.
+    pub(crate) shared: shared::Shared,
 }
 
 /// Weight budgets of the state cache. Both are separate from Raft log memory.
@@ -310,19 +310,7 @@ impl StateMachine {
         location: Arc<transfer::Location>,
         rows: Arc<rows::RowCache>,
         reads: StateView,
-        shared: Option<shared::Shared>,
-    ) -> Result<Self> {
-        let mut state = Self::load_rows(admin, location, rows, reads).await?;
-        state.shared = shared;
-        Ok(state)
-    }
-
-    /// Build the derived state from `reads` without the overlay. The caller adds it.
-    async fn load_rows(
-        admin: Arc<slatedb::admin::Admin>,
-        location: Arc<transfer::Location>,
-        rows: Arc<rows::RowCache>,
-        reads: StateView,
+        shared: shared::Shared,
     ) -> Result<Self> {
         let applied = decode_applied(reads.get(APPLIED).await?)?;
         let applied_term = read_applied_term(&reads, applied).await?;
@@ -373,7 +361,7 @@ impl StateMachine {
             members_mismatch: None,
             members_checked: None,
             reads,
-            shared: None,
+            shared,
         })
     }
 
@@ -406,17 +394,29 @@ impl StateMachine {
     /// Open an empty in-memory state for the reference of the deterministic simulation.
     ///
     /// Apply writes each batch into one sorted map at once. The state has no SlateDB database,
-    /// no overlay, no base, no materializer, and no checkpoint. Apply uses the rules of shared
+    /// no materializer, and no checkpoint. Its shared state is empty, and apply does not use it.
+    /// Apply uses the rules of shared
     /// state mode, because the members of a shared-mode simulation use them. The checkpoint
     /// namespace is in an unused in-memory object store, and no apply path reads it.
     #[cfg(test)]
     pub(crate) async fn open_memory() -> Result<Self> {
         let store = Arc::new(slatedb::object_store::memory::InMemory::new());
         let location = transfer::Location::new("state", StateCache::default());
-        let admin = Arc::new(slatedb::admin::Admin::builder(location.root(), store).build());
+        let admin =
+            Arc::new(slatedb::admin::Admin::builder(location.root(), store.clone()).build());
         let rows = Arc::new(rows::RowCache::new(0));
         let reads = StateView::Memory(view::MemoryView::default());
-        Self::load(admin, location, rows, reads, None).await
+        // The overlay and base stay empty. Apply writes the rows into `reads`.
+        let source = shared::offline_source(store, "", StateCache::default())?;
+        let options = shared::tests::options();
+        let shared = shared::Shared::new(
+            Arc::new(view::Base::empty()),
+            source,
+            uuid::Uuid::nil(),
+            options.pin_max,
+            Arc::new(overlay::Holders::new(options.overlay_max_bytes)),
+        );
+        Self::load(admin, location, rows, reads, shared).await
     }
 
     /// Open a state for a test on the in-memory store of `dir`. A later open of the same `dir`
@@ -456,18 +456,18 @@ impl StateMachine {
             batch.put(key.as_ref(), value.as_ref());
         }
         mark_applied(&mut batch, index, self.entry_term);
-        let shared = self.shared.as_mut().expect("a shared state");
-        shared.overlay.push(index, Arc::new(batch));
+        self.shared.overlay.push(index, Arc::new(batch));
         self.applied = index;
     }
 
     /// Pin the applied state for a read that runs outside apply.
-    pub(crate) fn pinned_state(&self) -> Result<StateView> {
-        let shared = self
-            .shared
-            .as_ref()
-            .context("the state has no shared view")?;
-        Ok(shared.pinned())
+    pub(crate) fn pinned_state(&self) -> StateView {
+        // A clone of the in-memory state of a test keeps its rows.
+        #[cfg(test)]
+        if let StateView::Memory(_) = &self.reads {
+            return self.reads.clone();
+        }
+        self.shared.pinned()
     }
 
     /// Mark `index` applied in `batch`, with the term of its entry from `entry_term`.
@@ -500,9 +500,7 @@ impl StateMachine {
             // An entry that changes no state writes no batch. Otherwise each announcement would
             // dirty the memtable, and its flush would cause the next announcement. The overlay
             // still records that the state at `index` is the state after its newest batch.
-            if let Some(shared) = &mut self.shared {
-                shared.overlay.cover(index);
-            }
+            self.shared.overlay.cover(index);
             return Ok(size);
         }
         // Drop shared rows before SlateDB may expose the change. See `rows`.
@@ -513,12 +511,11 @@ impl StateMachine {
         }
         self.put_logical_size(&mut batch, index, size);
         let batch = Arc::new(batch);
-        match (&mut self.shared, &mut self.reads) {
+        match &mut self.reads {
             #[cfg(test)]
-            (None, StateView::Memory(rows)) => rows.write(&batch),
-            (None, _) => anyhow::bail!("the state has no overlay"),
+            StateView::Memory(rows) => rows.write(&batch),
             // Apply reads the overlay at once. The leader materializer writes the `Db` later.
-            (Some(shared), _) => shared.overlay.push(index, batch.clone()),
+            StateView::Shared(_) => self.shared.overlay.push(index, batch.clone()),
         }
         self.write_batches += 1;
         for (key, value) in batch.rows() {

@@ -34,13 +34,12 @@ impl Node {
         // A request of an earlier term can name a suffix that this leader replaced.
         let term = self.raw.raft.term;
         self.raw.store().lead_term(term);
-        if let Some(writer) = &mut self.writer {
-            if writer.demand_term != term {
-                writer.demand_term = term;
-                writer.demand = 0;
-                writer.certified = None;
-                writer.demand_publication = 0;
-            }
+        let writer = &mut self.writer;
+        if writer.demand_term != term {
+            writer.demand_term = term;
+            writer.demand = 0;
+            writer.certified = None;
+            writer.demand_publication = 0;
         }
         // A member does not lead before its install. See `tick_raft`. If it did, the install
         // would raise the base, and the state below the record could serve nothing.
@@ -54,9 +53,7 @@ impl Node {
             true => record,
             false => 0,
         };
-        let Some(writer) = &mut self.writer else {
-            return Ok(());
-        };
+        let writer = &mut self.writer;
         writer.certify_ticks += 1;
         let demand = writer.demand.max(wanted).max(record);
         let unmet = demand > *writer.applied.based.borrow();
@@ -94,23 +91,20 @@ impl Node {
         let checkpoint = base.checkpoint;
         tracing::info!(%checkpoint, row = base.row, covers, demand, "certify the base for a demand");
         if self.propose_view(checkpoint, covers)? {
-            if let Some(writer) = &mut self.writer {
-                writer.certified = Some((covers, ticks));
-            }
+            self.writer.certified = Some((covers, ticks));
         }
         Ok(())
     }
 
     /// Tell the log cache which checkpoint and index the base has. See `Cache::has_image`.
     pub(in crate::node) fn note_base(&self) {
-        if let Some(writer) = &self.writer {
-            let base = writer
-                .applied
-                .base_id
-                .borrow()
-                .map(|base| (base.checkpoint, base.index));
-            self.raw.store().note_base(base);
-        }
+        let base = self
+            .writer
+            .applied
+            .base_id
+            .borrow()
+            .map(|base| (base.checkpoint, base.index));
+        self.raw.store().note_base(base);
     }
 
     /// Return true while the base index of this shared member is below its Raft snapshot record.
@@ -118,11 +112,8 @@ impl Node {
     /// checkpoint at the base can replace the record then, so the checkpoint jobs wait, and
     /// `certify_base` raises the base through the record index.
     pub(in crate::node) fn base_below_record(&self) -> bool {
-        self.writer.is_some()
-            && self
-                .state
-                .view
-                .is_some_and(|(base, _, _)| base < self.raw.store().snapshot_index())
+        let (base, _, _) = self.state.view;
+        base < self.raw.store().snapshot_index()
     }
 
     /// Take a due job that offers the checkpoint of a record that apply passed as the base, once
@@ -133,9 +124,7 @@ impl Node {
         if !self.base_below_record() || record > self.state.applied {
             return false;
         }
-        let Some(writer) = &mut self.writer else {
-            return false;
-        };
+        let writer = &mut self.writer;
         if writer.raised_record >= record {
             return false;
         }

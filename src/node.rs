@@ -37,12 +37,12 @@ pub(crate) use shared::WriterReport;
 pub(crate) use shared::{Millis, ProbeReply, ProbeRequest, PROBE_ROUTE};
 pub(crate) use shared::{Prober, WriteProbeReply, WriteProbeRequest, WRITE_PROBE_ROUTE};
 mod quorum_put;
-mod quota;
 mod read;
 mod ready;
 mod response;
 mod schedule;
 mod shared;
+mod step;
 mod watch;
 use crate::peer::transport_to;
 use apply::{AppliedState, Completion, Header, Job, Output, Query, Reply, Work, Worker};
@@ -116,7 +116,7 @@ pub enum Event {
         publish: Option<u64>,
         /// The process of a member that installs a base above its checkpoint row.
         coverage: Option<u64>,
-        /// The health of the member's writer. A member without a writer sends none.
+        /// The health of the member's writer.
         writer: Option<shared::WriterReport>,
     },
     /// The first peer frame of a stream or request came from this process of `member`, if the
@@ -344,7 +344,7 @@ pub struct Node {
     lease_promoted: bool,
     renewals: lease::Renewals,
     /// The leader writer of the shared state.
-    writer: Option<shared::Writer>,
+    writer: shared::Writer,
     /// The leader's automatic Compact schedule. `None` when automatic compaction is off.
     auto_compaction: Option<auto_compaction::AutoCompaction>,
     /// Quota usage has reached the warning threshold and the warning is logged.
@@ -356,8 +356,6 @@ pub struct Node {
     /// still need the peer routes, so the test gives the samples itself.
     #[cfg(test)]
     clock_in_manual: bool,
-    /// The quota flag of this member.
-    quota: quota::Quota,
     /// The term and index of the first `SeedMembers` proposal of this member in its last term.
     members_proposed: Option<(u64, u64)>,
     /// The last term in which this member proposed its digest again. See `propose_members`.
@@ -444,7 +442,6 @@ impl Node {
                 &shared,
             )
             .await?;
-        let quota = quota::Quota::new(options.effective_quota());
         let recovered = async {
             // Apply takes the quota from the cluster claim. The flag only shows a difference.
             state.set_quota_flag(options.effective_quota());
@@ -527,7 +524,7 @@ impl Node {
         let manual_apply = transport_override.is_some();
         let identity = crate::peer::Identity {
             cluster: options.cluster_id.clone(),
-            store: state.store_id().map(|id| id.to_string()),
+            store: Some(state.store_id().to_string()),
         };
         state.set_open_retries(!manual_apply);
         let mut traffic = BTreeMap::<u64, std::sync::Arc<crate::metrics::PeerTraffic>>::new();
@@ -566,36 +563,27 @@ impl Node {
         crate::metrics::reads::READS.register(&state.metrics.registry)?;
         crate::mvcc::storage_fault::register(&state.metrics.registry)?;
         let handles = state.shared_handles();
-        let writer = match &handles {
-            Some(handles) => {
-                let gauge = prometheus::IntGauge::new(
-                    "slatedb_etcd_shared_clock_skew_milliseconds",
-                    "Milliseconds that the local clock is behind the shared writer clock.",
-                )?;
-                state.metrics.registry.register(Box::new(gauge.clone()))?;
-                let clock = shared::Clock::system(options.max_clock_skew, Some(gauge));
-                let retained = prometheus::IntGauge::new(
-                    "slatedb_etcd_shared_view_checkpoints",
-                    "View checkpoints of the shared state. Each one pins its SSTs.",
-                )?;
-                state
-                    .metrics
-                    .registry
-                    .register(Box::new(retained.clone()))?;
-                let mut writer = shared::Writer::new(handles, options.view_max_age, clock);
-                let prober = shared::Prober::new(options.id, handles.source.clone());
-                writer.prober = Some(std::sync::Arc::new(prober));
-                writer.retention = options.view_retention;
-                writer.retained = Some(retained);
-                writer.gauges = Some(shared::Gauges::register(&state.metrics.registry)?);
-                Some(writer)
-            }
-            None => None,
-        };
-        let mut compaction = compaction::Flush::new(&state);
-        if let Some(handles) = handles {
-            compaction.share(handles.based);
-        }
+        let gauge = prometheus::IntGauge::new(
+            "slatedb_etcd_shared_clock_skew_milliseconds",
+            "Milliseconds that the local clock is behind the shared writer clock.",
+        )?;
+        state.metrics.registry.register(Box::new(gauge.clone()))?;
+        let clock = shared::Clock::system(options.max_clock_skew, Some(gauge));
+        let retained = prometheus::IntGauge::new(
+            "slatedb_etcd_shared_view_checkpoints",
+            "View checkpoints of the shared state. Each one pins its SSTs.",
+        )?;
+        state
+            .metrics
+            .registry
+            .register(Box::new(retained.clone()))?;
+        let mut writer = shared::Writer::new(&handles, options.view_max_age, clock);
+        let prober = shared::Prober::new(options.id, handles.source.clone());
+        writer.prober = Some(std::sync::Arc::new(prober));
+        writer.retention = options.view_retention;
+        writer.retained = Some(retained);
+        writer.gauges = Some(shared::Gauges::register(&state.metrics.registry)?);
+        let compaction = compaction::Flush::new(&state, handles.based);
         let compact_plan = compaction::PlanReady::new(&state, manual_apply);
         let log_reader = Some(storage.reader());
         let worker = Worker::start(state, events.clone(), manual_apply, log_reader);
@@ -697,7 +685,6 @@ impl Node {
             lease_promoted: false,
             renewals: lease::Renewals::default(),
             writer,
-            quota,
             members_proposed: None,
             members_rechecked: 0,
             #[cfg(test)]
@@ -763,30 +750,24 @@ impl Node {
     }
 
     /// The shared-mode objects that the snapshot receive path opens.
-    pub(crate) fn shared_source(&self) -> Option<std::sync::Arc<crate::state::shared::Source>> {
-        self.writer.as_ref().map(|writer| writer.source.clone())
+    pub(crate) fn shared_source(&self) -> std::sync::Arc<crate::state::shared::Source> {
+        self.writer.source.clone()
     }
 
     /// Shared mode: the write probes that this member runs for the leader.
     pub(crate) fn write_prober(&self) -> Option<std::sync::Arc<Prober>> {
-        self.writer
-            .as_ref()
-            .and_then(|writer| writer.prober.clone())
+        self.writer.prober.clone()
     }
 
     /// Shared mode: the wall clock that this member returns to a clock probe of the leader.
-    pub(crate) fn probe_clock(&self) -> Option<Millis> {
-        self.writer
-            .as_ref()
-            .map(|writer| writer.clock.now_ms.clone())
+    pub(crate) fn probe_clock(&self) -> Millis {
+        self.writer.clock.now_ms.clone()
     }
 
     /// Tests: skew the wall clock of this member's writer and of its probe replies.
     #[cfg(test)]
     pub(crate) fn set_clock(&mut self, now_ms: Millis) {
-        if let Some(writer) = &mut self.writer {
-            writer.clock.now_ms = now_ms;
-        }
+        self.writer.clock.now_ms = now_ms;
     }
 
     pub async fn run(self, events: mpsc::Receiver<Event>) -> Result<()> {
@@ -812,9 +793,7 @@ impl Node {
         self.transports.shutdown().await;
         // Keep the Raft directory locked until the state worker has stopped.
         self.compaction.cancel();
-        if let Some(writer) = &mut self.writer {
-            writer.stop().await;
-        }
+        self.writer.stop().await;
         self.read_executor.shutdown().await;
         let apply = self.worker.shutdown().await;
         let log = self.log_worker.shutdown().await;
@@ -847,7 +826,7 @@ impl Node {
                     self.finish_compaction_flush(target?)?;
                 }
                 completed = self.worker.next() => { self.complete_apply(completed?)?; }
-                event = shared::next(&mut self.writer), if self.writer.is_some() => {
+                event = shared::next(&mut self.writer) => {
                     if let shared::WriterEvent::Failed(error) = event {
                         return Err(error);
                     }
@@ -969,7 +948,7 @@ impl Node {
                     M::MoveLeader(target) => {
                         self.move_leader(target, credentials.unwrap_or_default(), response)?
                     }
-                    M::Defragment if self.writer.is_some() => {
+                    M::Defragment => {
                         self.defragment_shared(credentials.unwrap_or_default(), response)?
                     }
                     M::Alarm(_) | M::Downgrade(_) => self.propose(
@@ -1205,12 +1184,10 @@ impl Node {
                     let committed = self.raw.raft.raft_log.committed;
                     // Shared mode: the leader publishes a checkpoint through the commit index. A
                     // follower asks the leader for that publication.
-                    if let Some(writer) = &self.writer {
-                        if self.raw.raft.state == StateRole::Leader {
-                            writer.request_publication(committed);
-                        } else {
-                            self.send_view_ack(Some(committed));
-                        }
+                    if self.raw.raft.state == StateRole::Leader {
+                        self.writer.request_publication(committed);
+                    } else {
+                        self.send_view_ack(Some(committed));
                     }
                     self.checkpoint_waiters.push((committed, response));
                     self.schedule_apply()?;
@@ -1238,9 +1215,7 @@ impl Node {
                 // frame of the earlier process then cannot bring that proof back.
                 if changed {
                     self.tick_clock(false);
-                    if let Some(writer) = &mut self.writer {
-                        writer.proofs.forget(member);
-                    }
+                    self.writer.proofs.forget(member);
                 }
             }
             Event::SnapshotRefused { member, target } => {
@@ -1530,7 +1505,7 @@ impl Node {
             return Ok(());
         }
         let store = self.raw.store();
-        let advances = self.checkpointable(self.state.applied) > store.snapshot_index();
+        let advances = self.checkpointable() > store.snapshot_index();
         // An image can replace a record without an image at the same index.
         let attaches = image && store.snapshot_index() > 0 && !store.has_image();
         if !advances && !attaches {
@@ -1579,28 +1554,13 @@ impl Node {
             }
             // Shared mode: the first request can arrive before apply reaches its commit index.
             // The covering publication is due once apply reaches it.
-            if let Some(writer) = &mut self.writer {
-                if leader {
-                    writer.request_checkpoint(index, applied);
-                }
+            if leader {
+                self.writer.request_checkpoint(index, applied);
             }
             // A manual checkpoint completes only with a complete image. In shared mode the
             // image is a view checkpoint, so the member's base must hold the state at `index`.
-            let store = self.raw.store();
-            let done = match &self.writer {
-                Some(writer) => {
-                    index <= self.state.applied
-                        && self
-                            .state
-                            .view
-                            .is_some_and(|(base, _, _)| base >= writer.covering(index))
-                }
-                None => {
-                    index <= store.snapshot_index()
-                        && index <= self.state.applied
-                        && (index == 0 || store.has_image())
-                }
-            };
+            let (base, _, _) = self.state.view;
+            let done = index <= self.state.applied && base >= self.writer.covering(index);
             if done {
                 let _ = response.send(Ok(self.status()?));
             } else {
@@ -1685,24 +1645,23 @@ impl Node {
         status["apply_held_at"] = self.apply_held_at.into();
         status["quota"] = self.quota_status();
         status["members_row"] = self.members_status();
-        if let (Some(writer), Some((base, applied, bytes))) = (&self.writer, self.state.view) {
-            let record = crate::state::transfer::ViewDescriptor::decode(
-                self.raw.store().recovery_snapshot().get_data(),
-            )
-            .ok()
-            .flatten()
-            .and_then(|view| view.checkpoint().ok());
-            status["shared_state"] = json!({
-                "store_id": self.peer.store,
-                "base_applied_index": base,
-                "base_checkpoint": self.state.base_checkpoint,
-                "record_index": self.raw.store().snapshot_index(),
-                "record_checkpoint": record,
-                "applied_view_checkpoints": applied,
-                "overlay_bytes": bytes,
-                "writer": writer.status(),
-            });
-        }
+        let (base, applied, bytes) = self.state.view;
+        let record = crate::state::transfer::ViewDescriptor::decode(
+            self.raw.store().recovery_snapshot().get_data(),
+        )
+        .ok()
+        .flatten()
+        .and_then(|view| view.checkpoint().ok());
+        status["shared_state"] = json!({
+            "store_id": self.peer.store,
+            "base_applied_index": base,
+            "base_checkpoint": self.state.base_checkpoint,
+            "record_index": self.raw.store().snapshot_index(),
+            "record_checkpoint": record,
+            "applied_view_checkpoints": applied,
+            "overlay_bytes": bytes,
+            "writer": self.writer.status(),
+        });
         status["snapshot_has_image"] = self.raw.store().has_image().into();
         status["snapshot_image_wanted"] = self.raw.store().image_wanted().into();
         status["snapshot_images_built"] = self.snapshot_images.into();

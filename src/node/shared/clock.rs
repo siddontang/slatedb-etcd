@@ -907,9 +907,7 @@ impl Node {
     /// The node also calls it at once when Raft applies a configuration change or a voter
     /// process changes, so the next batch admission sees the new voters.
     pub(in crate::node) fn tick_clock(&mut self, probe: bool) {
-        let Some(writer) = &self.writer else {
-            return;
-        };
+        let writer = &self.writer;
         #[cfg(test)]
         let manual = self.manual_transport && !self.clock_in_manual;
         #[cfg(not(test))]
