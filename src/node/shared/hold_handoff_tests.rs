@@ -75,7 +75,6 @@ fn a_publication_while_held_keeps_the_tried_voters() {
 #[test]
 fn a_held_voter_is_never_a_target() {
     let mut handoff = leading();
-    let candidates = [candidate(2, 20), candidate(3, 30)];
     // The writer mark of voter 3 is older than the publication below, so the mark is stale.
     handoff.reports.insert(3, report(3, Some(120), Some(9)));
     let published = Some(Instant::now() - Duration::from_secs(10));
@@ -84,8 +83,6 @@ fn a_held_voter_is_never_a_target() {
         handoff.step(&tick(&held_only, published, false)).transfer,
         None
     );
-    assert_eq!(rank(Some(&handoff), published, &candidates), Some(2));
-    assert_eq!(rank(Some(&handoff), published, &held_only), None);
     // The same voter without the hold is a stale but valid target.
     handoff.reports.insert(3, report(3, Some(120), None));
     handoff.exhausted = false;

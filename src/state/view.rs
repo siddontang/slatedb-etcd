@@ -1,6 +1,6 @@
 //! The state that apply, read views, Watch catch-up, and the compaction planner read.
 //!
-//! `StateView` is an enum over the two state modes, not a generic parameter or a trait object.
+//! `StateView` is an enum over the views, not a generic parameter or a trait object.
 //! A generic `StateMachine<S>` would spread a type parameter through the node, the apply worker,
 //! read views, and Watch. A trait object would box a future for each read. The enum costs one
 //! match for each call on the hot path.
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use slatedb::config::{DbReaderOptions, ScanOptions};
 use slatedb::manifest::SsTableId;
-use slatedb::{CacheTarget, Db, DbCacheManagerOps, DbIterator, DbReader, DbReaderMode, DbSnapshot};
+use slatedb::{CacheTarget, DbCacheManagerOps, DbIterator, DbReader, DbReaderMode};
 
 use super::overlay::{End, Segment};
 use super::{Row, StateRead, StateScan};
@@ -23,10 +23,6 @@ use super::{Row, StateRead, StateScan};
 /// A read-only state.
 #[derive(Clone)]
 pub(crate) enum StateView {
-    /// The live replicated database. Apply and the replicated compaction planner read it.
-    Live(Arc<Db>),
-    /// A pinned snapshot of the replicated database.
-    Snapshot(Arc<DbSnapshot>),
     /// A shared-mode view.
     Shared(SharedView),
     /// The in-memory state of a test. See `StateMachine::open_memory`.
@@ -129,9 +125,9 @@ impl Base {
 
     /// Load the cache entries of SST `id` that the member would cache if it wrote the SST.
     ///
-    /// A replicated member caches the entries of `flush_targets` when it flushes an L0 SST, and
-    /// SlateDB caches the index and filters of compaction output. A shared-mode member writes no
-    /// SST, so without this step each first read of a new block is an object store GET. On a
+    /// A writer caches the entries of `flush_targets` when it flushes an L0 SST, and SlateDB
+    /// caches the index and filters of compaction output. A member that does not write an SST
+    /// has no such entries, so without this step each first read of a new block is an object store GET. On a
     /// local MinIO, these cold reads cut point read throughput by more than half and raised the
     /// p99 latency ten times. See `Source::warm` and `docs/shared-state.md`.
     pub(crate) async fn warm_sst(&self, id: SsTableId, l0: bool) -> Result<(), slatedb::Error> {
@@ -575,7 +571,8 @@ impl StateView {
                 deadline,
                 ..view.clone()
             }),
-            other => other.clone(),
+            #[cfg(test)]
+            Self::Memory(_) => self.clone(),
         }
     }
 }
@@ -588,11 +585,10 @@ pub(crate) fn expired(message: &str) -> bool {
 
 /// The rows of a `StateView` scan.
 ///
-/// Both variants hold a SlateDB iterator inline. A scan lives on the stack of one request, and a
+/// A shared scan holds its SlateDB iterator inline. It lives on the stack of one request, and a
 /// box would cost an allocation for each scan.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum ViewScan<'a> {
-    Db(DbIterator),
     Shared(SharedScan<'a>),
     #[cfg(test)]
     Memory(MemoryScan),
@@ -601,7 +597,6 @@ pub(crate) enum ViewScan<'a> {
 impl StateScan for ViewScan<'_> {
     async fn next(&mut self) -> Result<Option<Row>, slatedb::Error> {
         match self {
-            Self::Db(scan) => StateScan::next(scan).await,
             Self::Shared(scan) => scan.next().await,
             #[cfg(test)]
             Self::Memory(scan) => scan.next().await,
@@ -610,7 +605,6 @@ impl StateScan for ViewScan<'_> {
 
     async fn seek(&mut self, key: &[u8]) -> Result<(), slatedb::Error> {
         match self {
-            Self::Db(scan) => StateScan::seek(scan, key).await,
             Self::Shared(scan) => scan.seek(key).await,
             #[cfg(test)]
             Self::Memory(scan) => scan.seek(key).await,
@@ -623,8 +617,6 @@ impl StateRead for StateView {
 
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, slatedb::Error> {
         match self {
-            Self::Live(db) => StateRead::get(db.as_ref(), key).await,
-            Self::Snapshot(snapshot) => StateRead::get(snapshot.as_ref(), key).await,
             Self::Shared(view) => view.get(key).await,
             #[cfg(test)]
             Self::Memory(view) => view.get(key).await,
@@ -637,8 +629,6 @@ impl StateRead for StateView {
         options: &ScanOptions,
     ) -> Result<ViewScan<'_>, slatedb::Error> {
         Ok(match self {
-            Self::Live(db) => ViewScan::Db(db.scan_range(range, options).await?),
-            Self::Snapshot(snapshot) => ViewScan::Db(snapshot.scan_range(range, options).await?),
             Self::Shared(view) => ViewScan::Shared(view.scan_range(range, options).await?),
             #[cfg(test)]
             Self::Memory(view) => ViewScan::Memory(view.scan_range(range, options).await?),
@@ -651,8 +641,6 @@ impl StateRead for StateView {
         options: &ScanOptions,
     ) -> Result<ViewScan<'_>, slatedb::Error> {
         Ok(match self {
-            Self::Live(db) => ViewScan::Db(db.scan_under(prefix, options).await?),
-            Self::Snapshot(snapshot) => ViewScan::Db(snapshot.scan_under(prefix, options).await?),
             Self::Shared(view) => ViewScan::Shared(view.scan_under(prefix, options).await?),
             #[cfg(test)]
             Self::Memory(view) => ViewScan::Memory(view.scan_under(prefix, options).await?),
@@ -666,6 +654,7 @@ mod tests {
     use super::super::source::rows;
     use super::*;
     use slatedb::config::{CheckpointOptions, CheckpointScope, WriteOptions};
+    use slatedb::Db;
 
     fn batch(rows: &[(&str, Option<&str>)]) -> Arc<crate::WriteBatch> {
         let mut batch = crate::WriteBatch::new();

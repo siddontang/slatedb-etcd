@@ -72,8 +72,13 @@ func TestAutoCompactionFlagsMatchEtcd(t *testing.T) {
 				"--listen-peer-urls", peer, "--initial-advertise-peer-urls", peer,
 				"--initial-cluster", "ref=" + peer, "--log-level", "error"}, flags...)...)
 			listen := address(t)
+			// The directory name selects the S3 prefix, so each case needs a unique name.
+			dir, err := os.MkdirTemp("", "slatedb-etcd-compat-")
+			require.NoError(t, err)
+			t.Cleanup(func() { os.RemoveAll(dir) })
+			flags = append(flags, sharedStoreArgs(t, dir, nil)...)
 			actual, ourOutput := startsWith(t, binary, append([]string{"--id", "1", "--listen", listen,
-				"--peer", "1=" + listen, "--dir", filepath.Join(t.TempDir(), "node")}, flags...)...)
+				"--peer", "1=" + listen, "--dir", filepath.Join(dir, "node")}, flags...)...)
 			require.Equal(t, expected, actual, "etcd: %s\nservice: %s", refOutput, ourOutput)
 		})
 	}

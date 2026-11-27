@@ -43,8 +43,7 @@ def stop(process):
             process.wait()
 
 
-def start_cluster(stack, directory, executable, target, members, ctl, snapshot, quota, extra=(),
-                  shared=True):
+def start_cluster(stack, directory, executable, target, members, ctl, snapshot, quota, extra=()):
     with ExitStack() as reservations:
         ports = []
         for _ in range(2 * members):
@@ -54,8 +53,8 @@ def start_cluster(stack, directory, executable, target, members, ctl, snapshot, 
     clients, peers = ports[:members], ports[members:]
     cluster = ",".join(f"m{i}=http://{addr}" for i, addr in enumerate(peers))
     store = []
-    if target != "etcd" and members > 1 and shared:
-        # Several members run in shared state mode on RustFS. An outer `shared_store` supplies one
+    if target != "etcd":
+        # Service members run in shared state mode on RustFS. An outer `shared_store` supplies one
         # server for all clusters of a run.
         stack.enter_context(shared_store())
         store = shared_args(unique_prefix("upstream"))

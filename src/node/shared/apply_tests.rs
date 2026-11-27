@@ -216,7 +216,6 @@ async fn lose_a_checkpoint_object(lose: Lose) {
             row_bytes: 0,
         },
         &options,
-        crate::state::transfer::Backend::Local,
     )
     .await
     .unwrap();
@@ -497,16 +496,10 @@ async fn grouping_members() -> (StateMachine, StateMachine, Vec<Entry>) {
     };
     let mut members = vec![];
     for _ in 0..2 {
-        let state = StateMachine::open_shared(
-            store.clone(),
-            "root",
-            "test",
-            Default::default(),
-            &options,
-            crate::state::transfer::Backend::Local,
-        )
-        .await
-        .unwrap();
+        let state =
+            StateMachine::open_shared(store.clone(), "root", "test", Default::default(), &options)
+                .await
+                .unwrap();
         members.push(state);
     }
     let entry = |index: u64, put: PutRequest| Entry {

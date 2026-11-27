@@ -87,11 +87,11 @@ class SharedStore(unittest.TestCase):
                 self.assertNotIn("AWS_SESSION_TOKEN", s3.os.environ)
             self.assertEqual(dict(s3.os.environ), {"AWS_SESSION_TOKEN": "old"})
 
-    def test_member_flags_select_shared_mode_and_the_prefix(self):
+    def test_member_flags_select_the_store_and_the_prefix(self):
         first, second = s3.unique_prefix("test"), s3.unique_prefix("test")
         self.assertNotEqual(first, second)
         flags = s3.shared_args(first, self.SERVER)
-        self.assertEqual(flags[:2], ["--state-mode", "shared"])
+        self.assertEqual(flags[:2], ["--s3-bucket", "bucket"])
         self.assertEqual(flags[flags.index("--s3-prefix") + 1], first)
         self.assertIn("--s3-allow-http", flags)
         secure = s3.shared_args(first, dict(self.SERVER, SLATEDB_S3_TEST_ENDPOINT="https://s3"))

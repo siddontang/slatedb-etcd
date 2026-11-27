@@ -19,6 +19,15 @@ impl Random {
 
 const KEYS: [&[u8]; 6] = [b"a", b"b", b"c", b"d", b"e", b"f"];
 
+/// Open a test state with the row cache budget of `cache`.
+async fn open(dir: &std::path::Path, cache: StateCache) -> StateMachine {
+    let store = crate::object::test_store(dir);
+    let options = shared::tests::options();
+    StateMachine::open_shared(store, "cluster", "test", cache, &options)
+        .await
+        .unwrap()
+}
+
 fn key(random: &mut Random) -> Vec<u8> {
     KEYS[random.next(KEYS.len() as u64) as usize].to_vec()
 }
@@ -176,19 +185,13 @@ async fn cached_reads_match_uncached_reads() {
             row_bytes: 64 * 1024,
             ..StateCache::default()
         };
-        let mut cached = StateMachine::open_with_cache(dirs[0].path(), small)
-            .await
-            .unwrap();
+        let mut cached = open(dirs[0].path(), small).await;
         let off = StateCache {
             row_bytes: 0,
             ..StateCache::default()
         };
-        let mut plain = StateMachine::open_with_cache(dirs[1].path(), off)
-            .await
-            .unwrap();
-        // A diverging member whose snapshots replace the other two.
-        let mut source = StateMachine::open(dirs[2].path()).await.unwrap();
-        let (mut cached_lease, mut plain_lease, mut source_lease) = (0, 0, 0);
+        let mut plain = open(dirs[1].path(), off).await;
+        let (mut cached_lease, mut plain_lease) = (0, 0);
         let mut views: Vec<(Arc<ReadView>, Arc<ReadView>)> = vec![];
         let mut random = Random(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
         for step in 0..300 {
@@ -196,18 +199,6 @@ async fn cached_reads_match_uncached_reads() {
             write(&mut cached, &mut Random(state_seed | 1), &mut cached_lease).await;
             write(&mut plain, &mut Random(state_seed | 1), &mut plain_lease).await;
             assert_eq!(cached.applied, plain.applied);
-            if step % 97 == 96 {
-                while source.applied <= cached.applied + 3 {
-                    write(&mut source, &mut random, &mut source_lease).await;
-                }
-                let mut snapshot = Snapshot::default();
-                snapshot.mut_metadata().index = source.applied;
-                snapshot.data = source.snapshot_job().unwrap().await.unwrap();
-                cached.install_snapshot(&snapshot).await.unwrap();
-                plain.install_snapshot(&snapshot).await.unwrap();
-                cached_lease = source_lease;
-                plain_lease = source_lease;
-            }
             views.push((cached.read_view().unwrap(), plain.read_view().unwrap()));
             if views.len() > 8 {
                 views.remove(random.next(views.len() as u64) as usize);
@@ -247,7 +238,7 @@ async fn cached_reads_match_uncached_reads() {
             .iter()
             .any(|key| cached.rows.get(key, applied, |_| ()).is_some()));
         drop(views);
-        for state in [cached, plain, source] {
+        for state in [cached, plain] {
             state.close().await.unwrap();
         }
     }

@@ -1,7 +1,6 @@
 mod batch;
 mod codec;
 mod command;
-pub mod convert;
 mod crc;
 pub use batch::WriteBatch;
 
@@ -21,6 +20,7 @@ mod peer;
 pub mod proto;
 pub mod server;
 pub mod state;
+pub mod status;
 pub mod storage;
 pub mod tls;
 pub mod watch;
@@ -36,14 +36,12 @@ pub(crate) const STORAGE_FORMAT: u32 = 3;
 
 /// The format of native snapshots and backups that this binary writes.
 ///
-/// Format 4 rows can hold hash digests and Watch journals without Put values. Binaries that read
-/// only format 3 reject format 4 and do not misread those rows.
+/// Format 4 rows can hold hash digests and Watch journals without Put values.
 pub(crate) const SNAPSHOT_FORMAT: u32 = 4;
 
 /// Return true when this binary can install snapshot rows of `version`.
-/// Format 3 rows hold full hash values and inline journal values, which this binary still reads.
 pub(crate) fn readable_snapshot(version: u32) -> bool {
-    version == STORAGE_FORMAT || version == SNAPSHOT_FORMAT
+    version == SNAPSHOT_FORMAT
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -109,13 +107,11 @@ pub enum RaftCommand {
     },
     Etcd {
         id: String,
-        #[serde(default)]
         origin: u64,
         etcd: proto::etcdserverpb::RequestOp,
     },
     Lease {
         id: String,
-        #[serde(default)]
         origin: u64,
         lease: lease::LeaseCommand,
     },
@@ -131,34 +127,15 @@ pub enum RaftCommand {
         id: String,
         checkpoint: String,
         /// The index through which the checkpoint holds the whole state: no entry after its row
-        /// changed state. An entry of an earlier binary has no value, and zero means the row.
-        #[serde(default)]
+        /// changed state. Zero means the row.
         covers: u64,
     },
-    /// A replicated-mode leader sets the logical quota of the cluster. A non-positive `bytes`
-    /// disables the check. A `seed` entry applies only when the state has no cluster quota.
-    /// Another entry applies only when its `(requested_at, member, bytes)` is newer than the
-    /// stored request. It changes no etcd state except the `etcd/quota` row. Shared mode ignores
-    /// it.
+    /// A leader proposes this entry at the start of each term. A state without the
+    /// `etcd/members` row stores `members`, so every member stores the same row. A state with
+    /// the row keeps it, and compares it with `digest`. See `state::cluster`.
     ///
     /// The enum is untagged, so this variant must precede `CompactStep`, which matches any `id`.
-    /// The JSON names the id `quota_id`. An older binary then fails to decode the entry and
-    /// stops, instead of applying it as a `CompactStep`.
-    SetQuota {
-        #[serde(rename = "quota_id")]
-        id: String,
-        bytes: i64,
-        seed: bool,
-        /// The wall clock of the operator request on `member`, in milliseconds. Zero for a seed.
-        requested_at: u64,
-        member: u64,
-    },
-    /// A leader proposes this entry at the start of each term, in both state modes. A state
-    /// without the `etcd/members` row stores `members`, so every member stores the same row. A
-    /// state with the row keeps it, and compares it with `digest`. See `state::cluster`.
-    ///
-    /// Like `SetQuota`, this variant precedes `CompactStep`, and the JSON names its id
-    /// `members_id`. An older binary then stops on the entry.
+    /// The JSON names its id `members_id`, so it does not decode as a `CompactStep`.
     SeedMembers(cluster::Seed),
     /// The leader proposes bounded physical compaction work after a Compact entry.
     CompactStep {
@@ -189,7 +166,6 @@ impl RaftCommand {
             | Self::Compact { id, .. }
             | Self::CompactStep { id }
             | Self::ViewCheckpoint { id, .. }
-            | Self::SetQuota { id, .. }
             | Self::Lease { id, .. } => id,
             Self::SeedMembers(seed) => &seed.id,
         }

@@ -279,10 +279,6 @@ pub(super) struct Writer {
     certify_ticks: u64,
     /// The leader term of the demand above. A new term drops the demand of the old one.
     demand_term: u64,
-    /// The applied index through which this leader asked for a checkpoint at its row.
-    exact_through: u64,
-    /// Apply stores the apply marker at the applied index, for a checkpoint at its row.
-    mark_row_due: bool,
     /// The highest record index whose checkpoint apply offered as the base. See `take_raise`.
     raised_record: u64,
     /// DST: skip that offer, as when the checkpoint cannot open.
@@ -399,8 +395,6 @@ impl Writer {
             demand_publication: 0,
             certify_ticks: 0,
             demand_term: 0,
-            exact_through: 0,
-            mark_row_due: false,
             raised_record: 0,
             #[cfg(test)]
             skip_raise: false,
@@ -1410,7 +1404,7 @@ impl Node {
     /// rebuild. Otherwise the member adopts the checkpoint as its snapshot record.
     pub(super) fn align_log(storage: &mut RaftStorage, state: &StateMachine) -> Result<()> {
         let index = state.applied;
-        if !state.is_shared() || index == 0 {
+        if index == 0 {
             return Ok(());
         }
         if index == storage.snapshot_index() {
@@ -1514,18 +1508,12 @@ impl Node {
 
     /// Propose a checkpoint with row `row` that the publisher created. Only the leader
     /// announces. Return true when Raft took the proposal.
-    ///
-    /// The coverage stays at the row unless every other member installs a base above its row.
     pub(super) fn announce_view(&mut self, checkpoint: uuid::Uuid, row: u64) -> Result<bool> {
-        let extend = self.extension_allowed();
         let Some(writer) = &self.writer else {
             return Ok(false);
         };
         let base = *writer.applied.base_id.borrow();
-        let covers = match extend {
-            true => demand::coverage(row, base, writer.queue.position()),
-            false => row,
-        };
+        let covers = demand::coverage(row, base, writer.queue.position());
         self.propose_view(checkpoint, covers)
     }
 

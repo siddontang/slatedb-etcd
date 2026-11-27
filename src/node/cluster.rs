@@ -14,10 +14,6 @@ impl Node {
     /// has not applied that entry yet, or has no row, proposes its digest once more after the
     /// first seed of its term applies. A new cluster pays one small entry for this.
     pub(super) fn propose_members(&mut self) -> Result<()> {
-        #[cfg(test)]
-        if self.hold_members {
-            return Ok(());
-        }
         let term = self.raw.raft.term;
         if self.raw.raft.state != StateRole::Leader || self.members_rechecked == term {
             return Ok(());
@@ -433,28 +429,6 @@ mod tests {
         )
     }
 
-    /// Two members that differ only in their client URL text apply one log alike, also when the
-    /// quota rejects some of its Puts. An earlier binary stored the flags of each member.
-    #[tokio::test]
-    async fn client_url_text_changes_no_replicated_apply_result() {
-        let entries = leader_log(3000, 40).await;
-        let mut results = vec![];
-        for (id, host) in [(2, "127.0.0.1".to_owned()), (3, long_host())] {
-            let dir = tempfile::tempdir().unwrap();
-            let node = replay(dir.path(), id, &entries, |config| {
-                config.client_peers = client_urls(&host);
-            })
-            .await;
-            results.push(applied(node.worker.state()).await);
-        }
-        assert_eq!(results[0], results[1]);
-        let (_, revision, _, alarms, row) = &results[0];
-        assert!(*revision > 1 && *revision < 41, "revision {revision}");
-        assert_eq!(*alarms, 1);
-        let row: crate::cluster::Store = serde_json::from_slice(row.as_ref().unwrap()).unwrap();
-        assert_eq!(row.members[&3].client_ur_ls, ["http://127.0.0.1:2382"]);
-    }
-
     /// Shared mode: two members on one store apply the same log alike. Only their bootstrap
     /// client URL text differs. Earlier, the first entry stored the flags of each member.
     #[tokio::test]
@@ -480,7 +454,6 @@ mod tests {
                 "test",
                 crate::state::StateCache::default(),
                 &shared,
-                crate::state::transfer::Backend::Local,
             )
             .await
             .unwrap();
@@ -524,8 +497,8 @@ mod tests {
                 )
             })
             .unwrap();
-        let reference = tempfile::tempdir().unwrap();
-        let reference = replay(reference.path(), 2, &entries, |_| {}).await;
+        let reference_dir = tempfile::tempdir().unwrap();
+        let reference = replay(reference_dir.path(), 2, &entries, |_| {}).await;
         let expected = applied(reference.worker.state()).await;
 
         let dir = tempfile::tempdir().unwrap();
@@ -553,7 +526,13 @@ mod tests {
         );
 
         let dir = tempfile::tempdir().unwrap();
-        let node = replay(dir.path(), 3, &entries, |config| config.join = true).await;
+        // A joining member needs the cluster claim on the store of the cluster.
+        let store = crate::object::test_store(reference_dir.path());
+        let node = replay(dir.path(), 3, &entries, |config| {
+            config.join = true;
+            config.object_store = crate::object::Config::Test(store, "root".into());
+        })
+        .await;
         assert_eq!(applied(node.worker.state()).await, expected);
     }
 
@@ -625,7 +604,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = options(dir.path());
         config.peers = BTreeMap::from([(1, "127.0.0.1:1".to_owned())]);
-        config.state_mode = crate::state::StateMode::Shared;
         let store = std::sync::Arc::new(slatedb::object_store::memory::InMemory::new());
         config.object_store = crate::object::Config::Test(store, "root".into());
         let (events, _) = mpsc::channel(256);
@@ -703,8 +681,8 @@ mod tests {
         );
     }
 
-    /// A leader proposes `SeedMembers`, then `SetQuota`, before the `Publish` of the tick that
-    /// elects it. A joining member without the row proposes no seed.
+    /// A leader proposes `SeedMembers` before the `Publish` of the tick that elects it. A joining
+    /// member without the row proposes no seed.
     #[tokio::test]
     async fn a_new_leader_seeds_the_members_before_other_entries() {
         let (mut node, commands) = lead_alone(|node| {
@@ -719,7 +697,6 @@ mod tests {
                 commands.as_slice(),
                 [
                     RaftCommand::SeedMembers(crate::cluster::Seed { digest: None, .. }),
-                    RaftCommand::SetQuota { .. },
                     RaftCommand::Cluster {
                         request: C::Publish { .. },
                         ..
@@ -730,99 +707,10 @@ mod tests {
         );
         // One seed in each term.
         node.propose_term_start().unwrap();
-        assert_eq!(node.raw.raft.raft_log.last_index(), 4);
+        assert_eq!(node.raw.raft.raft_log.last_index(), 3);
 
         let (_, commands) = lead_alone(|node| node.options.join = true).await;
-        assert!(
-            matches!(commands.as_slice(), [RaftCommand::SetQuota { .. }]),
-            "{commands:?}"
-        );
-    }
-
-    /// A log of an earlier binary has no seed. Its first other entry stores the bootstrap
-    /// membership, as that binary did with its first batch. A member that replays the log from
-    /// index 1 after an upgrade then matches a member that flushed a prefix under that binary.
-    #[tokio::test]
-    async fn a_log_of_an_earlier_binary_replays_as_that_binary_applied_it() {
-        let publish = RaftCommand::Cluster {
-            id: "publish-2".into(),
-            request: C::Publish {
-                id: 2,
-                client_urls: vec!["http://published:2381".into()],
-            },
-            credentials: Default::default(),
-        };
-        let commands: Vec<_> = std::iter::once(publish).chain((0..40).map(put)).collect();
-        let entries: Vec<_> = std::iter::once(Entry {
-            index: 1,
-            term: 1,
-            ..Default::default()
-        })
-        .chain((2..).zip(&commands).map(|(index, command)| Entry {
-            index,
-            term: 1,
-            data: command.encode().unwrap(),
-            ..Default::default()
-        }))
-        .collect();
-        let header = apply::Header {
-            cluster: 1,
-            member: 1,
-            term: 1,
-        };
-        let flags = || {
-            let mut members =
-                crate::cluster::Store::initial(&options(std::path::Path::new("")).peers);
-            for (id, url) in client_urls("127.0.0.1") {
-                members.members.get_mut(&id).unwrap().client_ur_ls = vec![url];
-            }
-            std::sync::Arc::new(members)
-        };
-        let dir = tempfile::tempdir().unwrap();
-        // The earlier binary stored the flags with entry 1, applied two more, and flushed.
-        let mut flushed = StateMachine::open(&dir.path().join("flushed"))
-            .await
-            .unwrap();
-        flushed.set_quota_flag(3000);
-        flushed.members = flags();
-        flushed.members_unsaved = true;
-        flushed.apply(1, None).await.unwrap();
-        apply::apply_entries(&mut flushed, entries[1..3].to_vec(), header)
-            .await
-            .unwrap();
-        flushed.db().flush().await.unwrap();
-        flushed.close().await.unwrap();
-        drop(flushed);
-        let mut flushed = StateMachine::open(&dir.path().join("flushed"))
-            .await
-            .unwrap();
-        flushed.set_quota_flag(3000);
-        apply::apply_entries(&mut flushed, entries[3..].to_vec(), header)
-            .await
-            .unwrap();
-        // This member flushed nothing. It replays the whole log.
-        let mut replayed = StateMachine::open(&dir.path().join("replayed"))
-            .await
-            .unwrap();
-        replayed.set_quota_flag(3000);
-        replayed.members = flags();
-        apply::apply_entries(&mut replayed, entries[..1].to_vec(), header)
-            .await
-            .unwrap();
-        assert!(replayed.members_row.is_none());
-        apply::apply_entries(&mut replayed, entries[1..].to_vec(), header)
-            .await
-            .unwrap();
-        let expected = applied(&flushed).await;
-        assert_eq!(applied(&replayed).await, expected);
-        let (_, revision, _, alarms, row) = expected;
-        assert!(revision > 1 && revision < 41, "revision {revision}");
-        assert_eq!(alarms, 1);
-        let row: crate::cluster::Store = serde_json::from_slice(&row.unwrap()).unwrap();
-        assert_eq!(row.members[&2].client_ur_ls, ["http://published:2381"]);
-        assert_eq!(row.members[&1].client_ur_ls, ["http://127.0.0.1:2380"]);
-        flushed.close().await.unwrap();
-        replayed.close().await.unwrap();
+        assert!(commands.is_empty(), "{commands:?}");
     }
 
     /// Shared mode: open a member of a new cluster, which starts from an empty base. Then give
@@ -836,7 +724,6 @@ mod tests {
         let store = std::sync::Arc::new(slatedb::object_store::memory::InMemory::new());
         let config = || {
             let mut config = options(dir);
-            config.state_mode = crate::state::StateMode::Shared;
             config.object_store = crate::object::Config::Test(store.clone(), "root".into());
             config.client_peers.insert(2, "local-only:8888".into());
             config.log_memory.pending_bytes = pending;
@@ -876,7 +763,6 @@ mod tests {
         let mut node = open_new_shared_member(dir, commands, pending)
             .await
             .unwrap();
-        assert!(node.quota.created_empty());
         for _ in 0..5 {
             node.drive_ready().await.unwrap();
             node.drain_log().await.unwrap();
@@ -885,64 +771,7 @@ mod tests {
         node
     }
 
-    /// Shared mode never starts a waiting member as a learner that skips its backlog. A base
-    /// adoption would make it a voter again while Raft counts the skipped entries as applied.
-    /// A backlog above the pending limit stops the start with an error instead.
-    #[tokio::test]
-    async fn a_waiting_shared_member_does_not_skip_its_backlog() {
-        let publish = RaftCommand::Cluster {
-            id: "legacy-publish".into(),
-            request: C::Publish {
-                id: 1,
-                client_urls: vec!["http://leader:2379".into()],
-            },
-            credentials: Default::default(),
-        };
-        let large = |n: usize| {
-            let mut command = put(n);
-            if let RaftCommand::Etcd { etcd, .. } = &mut command {
-                if let Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(put)) =
-                    &mut etcd.request
-                {
-                    put.value = vec![1; 1 << 20];
-                }
-            }
-            command
-        };
-        let commands: Vec<_> = std::iter::once(publish).chain((0..12).map(large)).collect();
-        let dir = tempfile::tempdir().unwrap();
-        let error = open_new_shared_member(dir.path(), &commands, 9 << 20)
-            .await
-            .err()
-            .unwrap();
-        assert!(
-            format!("{error:#}").contains("waiting shared member"),
-            "{error:#}"
-        );
-    }
-
-    /// Shared mode: a new member gets an earlier binary's `Publish` at index 2. It applies index
-    /// 1 and stops there, without storing its own membership. It then recovers by snapshot, also
-    /// in an idle cluster. See `a_guarded_shared_member_recovers_in_an_idle_cluster` in DST.
-    #[tokio::test]
-    async fn a_new_shared_member_stops_at_an_earlier_binary_publish() {
-        let publish = RaftCommand::Cluster {
-            id: "legacy-publish".into(),
-            request: C::Publish {
-                id: 1,
-                client_urls: vec!["http://leader:2379".into()],
-            },
-            credentials: Default::default(),
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let node = new_shared_member(dir.path(), &[publish]).await;
-        assert_eq!(node.state.applied, 1);
-        assert!(node.state.members_row.is_none());
-        assert_eq!(node.quota_status()["blocked_index"], 2);
-    }
-
-    /// Shared mode guards only the membership. A new member applies the seed and then a Put. The
-    /// cluster claim sets the quota, so no `SetQuota` entry is needed.
+    /// A new member applies the seed and then a Put. The cluster claim sets the quota.
     #[tokio::test]
     async fn a_new_shared_member_applies_a_put_after_the_seed() {
         let peers = options(std::path::Path::new("")).peers;
@@ -957,81 +786,5 @@ mod tests {
         let node = new_shared_member(dir.path(), &[seed, put(1)]).await;
         assert_eq!((node.state.applied, node.state.revision), (3, 2));
         assert!(node.state.members_row.is_some());
-        assert!(!node.quota_guarded());
-    }
-
-    /// An earlier binary counted its bootstrap row from its first batch. A member that replays
-    /// the log from empty counts the row before the first other entry checks the quota. That
-    /// entry can start an apply batch or fall inside one. Each member then makes the decisions
-    /// of a member that flushed the first entry, also at the quota boundary.
-    #[tokio::test]
-    async fn a_legacy_replay_counts_the_row_before_the_first_put() {
-        let members = std::sync::Arc::new(crate::cluster::Store::initial(
-            &options(std::path::Path::new("")).peers,
-        ));
-        // The row alone fills the quota. A member that counts it rejects the first Put.
-        let quota = (crate::cluster::KEY.len()
-            + serde_json::to_vec(members.as_ref()).unwrap().len()) as i64;
-        let entries: Vec<_> = (1..=5)
-            .map(|index| Entry {
-                index,
-                term: 1,
-                data: if index > 2 {
-                    put(index as usize).encode().unwrap()
-                } else {
-                    vec![]
-                },
-                ..Default::default()
-            })
-            .collect();
-        let header = apply::Header {
-            cluster: 1,
-            member: 1,
-            term: 1,
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let mut flushed = StateMachine::open(&dir.path().join("flushed"))
-            .await
-            .unwrap();
-        flushed.set_quota_flag(quota);
-        flushed.members = members.clone();
-        flushed.members_unsaved = true;
-        flushed.apply(1, None).await.unwrap();
-        flushed.db().flush().await.unwrap();
-        flushed.close().await.unwrap();
-        drop(flushed);
-        let mut flushed = StateMachine::open(&dir.path().join("flushed"))
-            .await
-            .unwrap();
-        flushed.set_quota_flag(quota);
-        apply::apply_entries(&mut flushed, entries[1..].to_vec(), header)
-            .await
-            .unwrap();
-        let expected = applied(&flushed).await;
-        assert_eq!((expected.1, expected.3), (1, 1));
-        flushed.close().await.unwrap();
-        // The first Put starts a batch, is inside one, or ends one.
-        for batches in [
-            vec![5],
-            vec![2, 3],
-            vec![1, 4],
-            vec![3, 2],
-            vec![1, 1, 1, 1, 1],
-        ] {
-            let path = dir.path().join(format!("replayed-{batches:?}"));
-            let mut replayed = StateMachine::open(&path).await.unwrap();
-            replayed.set_quota_flag(quota);
-            replayed.members = members.clone();
-            let mut rest = entries.as_slice();
-            for count in &batches {
-                let (batch, tail) = rest.split_at(*count);
-                apply::apply_entries(&mut replayed, batch.to_vec(), header)
-                    .await
-                    .unwrap();
-                rest = tail;
-            }
-            assert_eq!(applied(&replayed).await, expected, "batches {batches:?}");
-            replayed.close().await.unwrap();
-        }
     }
 }

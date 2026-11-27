@@ -237,7 +237,7 @@ async fn check(state: &StateMachine, model: &Model, random: &mut Random) {
 #[tokio::test]
 async fn historical_ranges_match_every_retained_revision() {
     let dir = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
     let mut random = Random(66);
     let mut model = Model::new();
     record(&state, &mut model).await;
@@ -343,22 +343,15 @@ async fn historical_ranges_match_every_retained_revision() {
     }
     super::compaction_tests::finish(&mut state).await;
     check(&state, &model, &mut random).await;
-    // A restart reads the same history.
     let (revision, compacted) = (state.revision, state.compact_revision);
     assert!(revision > 50 && compacted > 1, "{revision} {compacted}");
-    let state = super::tests::reopen(state, dir.path()).await;
-    assert_eq!(
-        (state.revision, state.compact_revision),
-        (revision, compacted)
-    );
-    check(&state, &model, &mut random).await;
 }
 
 /// A page at an old revision returns the old versions when many newer versions follow each key.
 #[tokio::test]
 async fn historical_pages_skip_versions_after_the_revision() {
     let dir = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
     for key in 0..50u8 {
         apply(
             &mut state,
@@ -483,7 +476,7 @@ async fn put(state: &mut StateMachine, key: Vec<u8>, value: Vec<u8>) {
 #[tokio::test]
 async fn journal_pages_hold_only_the_values_of_the_page() {
     let dir = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
     for key in 0..LARGE_KEYS {
         put(&mut state, vec![b'k', key], vec![key; LARGE]).await;
     }
@@ -518,7 +511,7 @@ async fn journal_pages_hold_only_the_values_of_the_page() {
 #[tokio::test]
 async fn journal_pages_skip_the_values_of_unrelated_deletes() {
     let dir = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
     put(&mut state, b"a".to_vec(), b"a".to_vec()).await;
     for key in 0..LARGE_KEYS {
         put(&mut state, vec![b'd', key], vec![key; LARGE]).await;
@@ -553,7 +546,7 @@ async fn counted_read(state: &StateMachine, request: RangeRequest) -> (RangeResp
 #[tokio::test]
 async fn historical_counts_follow_the_first_later_event() {
     let dir = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
     let mut model = Model::new();
     let put = |key: &[u8], value: &str| {
         Op::RequestPut(PutRequest {
@@ -625,7 +618,7 @@ async fn historical_counts_follow_the_first_later_event() {
 #[tokio::test]
 async fn sorted_pages_hold_only_the_kept_values() {
     let dir = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
     for key in 0..LARGE_KEYS {
         put(&mut state, vec![b'k', key], vec![key; LARGE]).await;
     }

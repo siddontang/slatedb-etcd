@@ -62,18 +62,36 @@ fn txn_entry(index: u64) -> Entry {
     }
 }
 
-/// A replicated state on `store` with `k0` to `k3` through index 4. The rows are in SSTs, and
-/// the state opens again with empty caches.
+/// A state on `store` with the membership at index 1, and `k0` to `k2` through index 4. See
+/// `reopen_cold`.
 async fn cold(store: Arc<dyn ObjectStore>) -> StateMachine {
-    let open = || StateMachine::open_store_with_cache(store.clone(), "root", COLD);
-    let mut state = open().await.unwrap();
-    for index in 1..=4 {
-        let key = format!("k{}", index - 1);
+    let mut state = open_cold(store).await;
+    // A restart opens only a base that holds the membership.
+    state.seed_for_test(1).await.unwrap();
+    for index in 2..=4 {
+        let key = format!("k{}", index - 2);
         state.apply_etcd(index, &put(&key)).await.unwrap();
     }
-    state.metrics.flush_db(state.db()).await.unwrap();
+    reopen_cold(state).await
+}
+
+/// Open a state on `store` with empty caches.
+async fn open_cold(store: Arc<dyn ObjectStore>) -> StateMachine {
+    let options = crate::state::shared::tests::options();
+    StateMachine::open_shared(store, "root", "test", COLD, &options)
+        .await
+        .unwrap()
+}
+
+/// Write the overlay of `state` into a shared checkpoint, and open the state again on it with
+/// empty caches. The rows are then in SSTs, so a read of them reads the store.
+async fn reopen_cold(state: StateMachine) -> StateMachine {
+    use crate::state::shared::tests::{checkpoint, writer};
+    let writer = writer(&state).await;
+    drop(checkpoint(&state, &writer, &mut 0).await);
+    writer.close().await.unwrap();
     state.close().await.unwrap();
-    open().await.unwrap()
+    open_cold(state.shared.as_ref().unwrap().source.store.clone()).await
 }
 
 async fn hash(state: &mut StateMachine) -> Value {
@@ -165,7 +183,7 @@ async fn a_shutdown_ends_a_retrying_apply_at_once() {
 #[tokio::test]
 async fn an_invariant_error_still_stops_apply() {
     let dir = tempfile::tempdir().unwrap();
-    let state = StateMachine::open(dir.path()).await.unwrap();
+    let state = StateMachine::open_test(dir.path()).await.unwrap();
     let (events, _) = mpsc::channel(8);
     let mut worker = Worker::start(state, events, true, None);
     worker
@@ -317,7 +335,7 @@ async fn a_membership_change_reads_its_row_once() {
     };
     let admin = crate::auth::Credentials::default();
     let dir = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
     state.apply_cluster(1, &voter(7), &admin).await.unwrap();
     let reads = || crate::batch::SIZE_READS.with(std::cell::Cell::get);
     let before = reads();
@@ -325,7 +343,7 @@ async fn a_membership_change_reads_its_row_once() {
     outcome.result.unwrap();
     assert_eq!(reads(), before, "the size count read the members row again");
     assert!(state.members.members.contains_key(&8));
-    let counted = crate::state::maintenance::count_logical_usage(state.db().as_ref())
+    let counted = crate::state::maintenance::count_logical_usage(state.applied_state())
         .await
         .unwrap();
     assert_eq!(state.logical_size(), counted.total());
@@ -395,14 +413,7 @@ async fn a_failed_diagnostic_or_compaction_read_retries() {
         .unwrap()
         .result
         .unwrap();
-    let memtable = slatedb::config::FlushOptions {
-        flush_type: slatedb::config::FlushType::MemTable,
-    };
-    state.db().flush_with_options(memtable).await.unwrap();
-    state.close().await.unwrap();
-    let state = StateMachine::open_store_with_cache(faults.clone(), "root", COLD)
-        .await
-        .unwrap();
+    let state = reopen_cold(state).await;
     assert!(state.compaction_pending());
     let (events, _) = mpsc::channel(8);
     let mut worker = Worker::start(state, events, true, None);
@@ -471,8 +482,7 @@ fn preempt_when_held(worker: &Worker, index: u64, covers: u64) -> tokio::task::J
 async fn corrupt_data_holds_apply_until_a_snapshot_covers_it() {
     let mut state = cold(Arc::new(InMemory::new())).await;
     // The direct write takes one sequence number. A view pins the state at the applied index.
-    state.db().put(b"data/bad", b"\xff\xfe").await.unwrap();
-    state.applied += 1;
+    state.write_raw(&[(b"data/bad", b"\xff\xfe")]);
     let (events, _) = mpsc::channel(8);
     let mut worker = Worker::start(state, events, true, None);
     worker
@@ -502,12 +512,7 @@ async fn corrupt_data_holds_apply_until_a_snapshot_covers_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_corrupt_members_row_holds_apply() {
     let mut state = cold(Arc::new(InMemory::new())).await;
-    state
-        .db()
-        .put(crate::cluster::KEY, b"{not a members row")
-        .await
-        .unwrap();
-    state.applied += 1;
+    state.write_raw(&[(crate::cluster::KEY, b"{not a members row")]);
     let (events, _) = mpsc::channel(8);
     let mut worker = Worker::start(state, events, true, None);
     let change = RaftCommand::Cluster {
@@ -542,16 +547,9 @@ async fn base_hold(fault: BaseFault) {
     let open = |cache| {
         let store: Arc<dyn ObjectStore> = faults.clone();
         async move {
-            StateMachine::open_shared(
-                store,
-                "cluster",
-                "test",
-                cache,
-                &options(),
-                crate::state::transfer::Backend::Local,
-            )
-            .await
-            .unwrap()
+            StateMachine::open_shared(store, "cluster", "test", cache, &options())
+                .await
+                .unwrap()
         }
     };
     let large = |key: &str| put(key, &"v".repeat(8 << 10));
@@ -648,16 +646,9 @@ async fn base_drop(fault: BaseFault) {
     let open = |cache| {
         let store: Arc<dyn ObjectStore> = faults.clone();
         async move {
-            StateMachine::open_shared(
-                store,
-                "cluster",
-                "test",
-                cache,
-                &options(),
-                crate::state::transfer::Backend::Local,
-            )
-            .await
-            .unwrap()
+            StateMachine::open_shared(store, "cluster", "test", cache, &options())
+                .await
+                .unwrap()
         }
     };
     let large = |key: &str| put(key, &"v".repeat(8 << 10));
@@ -761,16 +752,9 @@ async fn install_keeps_its_base(end: InstallEnd) {
     let open = |cache| {
         let store: Arc<dyn ObjectStore> = faults.clone();
         async move {
-            StateMachine::open_shared(
-                store,
-                "cluster",
-                "test",
-                cache,
-                &options(),
-                crate::state::transfer::Backend::Local,
-            )
-            .await
-            .unwrap()
+            StateMachine::open_shared(store, "cluster", "test", cache, &options())
+                .await
+                .unwrap()
         }
     };
     let large = |key: &str| put(key, &"v".repeat(8 << 10));

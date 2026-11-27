@@ -1217,7 +1217,7 @@ mod tests {
     impl Fixture {
         async fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
-            let mut state = StateMachine::open(dir.path()).await.unwrap();
+            let mut state = StateMachine::open_test(dir.path()).await.unwrap();
             state.watch_capture = Some(Default::default());
             let (feed, changes) = watch::channel(feed_state(&state));
             let feed = Arc::new(feed);

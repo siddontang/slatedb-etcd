@@ -123,7 +123,7 @@ async fn ranges_match_the_collected_model() {
             x % n
         };
         let dir = tempfile::tempdir().unwrap();
-        let mut state = StateMachine::open(dir.path()).await.unwrap();
+        let mut state = StateMachine::open_test(dir.path()).await.unwrap();
         let mut model = Model::new();
         for index in 1..=120u64 {
             let k = key(random(18));
@@ -285,7 +285,7 @@ impl StateRead for FailAfter {
 #[tokio::test]
 async fn complete_pages_stop_before_the_next_row() {
     let dir = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
     for index in 1..=3u64 {
         let put = RequestOp {
             request: Some(Op::RequestPut(PutRequest {
@@ -331,7 +331,7 @@ async fn complete_pages_stop_before_the_next_row() {
 #[tokio::test]
 async fn keys_only_scans_keep_the_lease() {
     let dir = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
     state
         .apply_lease(1, &crate::lease::LeaseCommand::Grant { id: 7, ttl: 30 })
         .await

@@ -15,9 +15,12 @@ async fn reference_compaction(state: &mut StateMachine, request: &CompactionRequ
         state.apply(index, None).await.unwrap();
         return false;
     }
-    let db = state.db().clone();
+    let db = state.applied_state().clone();
     let mut batch = WriteBatch::new();
-    let mut scan = db.scan_prefix(mvcc::HISTORY, ..).await.unwrap();
+    let mut scan = db
+        .scan_under(mvcc::HISTORY, &Default::default())
+        .await
+        .unwrap();
     let mut previous: Option<(Vec<u8>, bytes::Bytes, usize)> = None;
     while let Some(row) = scan.next().await.unwrap() {
         let len = row.value.len();
@@ -31,7 +34,7 @@ async fn reference_compaction(state: &mut StateMachine, request: &CompactionRequ
             previous = Some((version.key, row.key, len));
         }
     }
-    let mut scan = db.scan_prefix(HASH, ..).await.unwrap();
+    let mut scan = db.scan_under(HASH, &Default::default()).await.unwrap();
     let mut latest = std::collections::BTreeMap::new();
     while let Some(row) = scan.next().await.unwrap() {
         let main = i64::from_be_bytes(row.key[HASH.len()..HASH.len() + 8].try_into().unwrap());
@@ -47,10 +50,8 @@ async fn reference_compaction(state: &mut StateMachine, request: &CompactionRequ
             batch.delete_known(row.key, len);
         }
     }
-    let mut scan = db
-        .scan(crate::watch::EVENTS.to_vec()..crate::watch::key(request.revision))
-        .await
-        .unwrap();
+    let range = crate::watch::EVENTS.to_vec()..crate::watch::key(request.revision);
+    let mut scan = db.scan_range(range, &Default::default()).await.unwrap();
     while let Some(row) = scan.next().await.unwrap() {
         batch.delete_known(row.key, row.value.len());
     }
@@ -87,7 +88,11 @@ pub(super) async fn finish(state: &mut StateMachine) {
 }
 
 async fn rows(state: &StateMachine) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut scan = state.db().scan_prefix(b"etcd/", ..).await.unwrap();
+    let mut scan = state
+        .applied_state()
+        .scan_under(b"etcd/", &Default::default())
+        .await
+        .unwrap();
     let mut rows = vec![];
     while let Some(row) = scan.next().await.unwrap() {
         // Snapshots store the in-memory member list. This test covers MVCC rows.
@@ -99,7 +104,11 @@ async fn rows(state: &StateMachine) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 async fn count(state: &StateMachine, prefix: &[u8]) -> usize {
-    let mut scan = state.db().scan_prefix(prefix, ..).await.unwrap();
+    let mut scan = state
+        .applied_state()
+        .scan_under(prefix, &Default::default())
+        .await
+        .unwrap();
     let mut count = 0;
     while scan.next().await.unwrap().is_some() {
         count += 1;
@@ -207,10 +216,10 @@ fn hash_parts_combine_into_one_sequential_hash() {
 async fn stepped_compaction_matches_single_batch_compaction() {
     for seed in 0..4_u64 {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = StateMachine::open(&dir.path().join("stepped"))
+        let mut state = StateMachine::open_test(&dir.path().join("stepped"))
             .await
             .unwrap();
-        let mut reference = StateMachine::open(&dir.path().join("reference"))
+        let mut reference = StateMachine::open_test(&dir.path().join("reference"))
             .await
             .unwrap();
         let mut random = Random(seed);
@@ -265,7 +274,7 @@ async fn stepped_compaction_matches_single_batch_compaction() {
         assert_eq!(state.logical_bytes, reference.logical_bytes);
         assert_eq!(
             state.logical_bytes,
-            maintenance::count_logical_usage(state.db().as_ref())
+            maintenance::count_logical_usage(state.applied_state())
                 .await
                 .unwrap()
         );
@@ -277,7 +286,7 @@ async fn stepped_compaction_matches_single_batch_compaction() {
 #[tokio::test]
 async fn compact_applies_without_deleting_a_large_history() {
     let dir = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
     for n in 0..20_000 {
         let request = put(&format!("key-{}", n % 1000), &n.to_string());
         state
@@ -328,10 +337,15 @@ async fn compact_applies_without_deleting_a_large_history() {
     assert!(count(&state, mvcc::HISTORY).await < 1200);
     assert!(count(&state, HASH).await < 1200);
     assert!(count(&state, crate::watch::EVENTS).await <= 101);
-    assert!(state.db().get(compaction::PENDING).await.unwrap().is_none());
+    assert!(state
+        .applied_state()
+        .get(compaction::PENDING)
+        .await
+        .unwrap()
+        .is_none());
     assert_eq!(
         state.logical_bytes,
-        maintenance::count_logical_usage(state.db().as_ref())
+        maintenance::count_logical_usage(state.applied_state())
             .await
             .unwrap()
     );
@@ -342,7 +356,6 @@ async fn compact_applies_without_deleting_a_large_history() {
 enum Entry {
     Kv(RequestOp),
     Compact(i64),
-    Step,
 }
 
 async fn apply(state: &mut StateMachine, entry: &Entry) {
@@ -363,134 +376,16 @@ async fn apply(state: &mut StateMachine, entry: &Entry) {
                 .await
                 .unwrap();
         }
-        Entry::Step => {
-            state.apply_compaction_step(index).await.unwrap();
-        }
     }
-}
-
-#[tokio::test]
-async fn restart_resumes_compaction_from_the_durable_step() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("state");
-    let mut log = vec![];
-    for n in 0..3000 {
-        log.push(Entry::Kv(put(&format!("key-{}", n % 300), &n.to_string())));
-    }
-    log.push(Entry::Compact(2500));
-    log.extend(std::iter::repeat_n(Entry::Step, 3));
-    log.push(Entry::Kv(delete("key-1", "key-2")));
-    log.push(Entry::Compact(2800));
-    log.extend(std::iter::repeat_n(Entry::Step, 4));
-    let mut reference = StateMachine::open(&dir.path().join("reference"))
-        .await
-        .unwrap();
-    for entry in &log {
-        match entry {
-            Entry::Kv(request) => {
-                reference
-                    .apply_etcd(reference.applied + 1, request)
-                    .await
-                    .unwrap();
-            }
-            Entry::Compact(revision) => {
-                assert!(
-                    reference_compaction(
-                        &mut reference,
-                        &CompactionRequest {
-                            revision: *revision,
-                            physical: false,
-                        },
-                    )
-                    .await
-                );
-            }
-            Entry::Step => {}
-        }
-    }
-    let mut state = StateMachine::open(&path).await.unwrap();
-    for (position, entry) in log.iter().enumerate() {
-        apply(&mut state, entry).await;
-        if position == 3002 {
-            // Make a prefix that contains the first steps durable.
-            state.db().flush().await.unwrap();
-        }
-    }
-    assert!(state.compaction_pending());
-    // Unflushed steps are lost. Raft replays them from the log after a restart.
-    state.close().await.unwrap();
-    drop(state);
-    let mut state = StateMachine::open(&path).await.unwrap();
-    assert!(state.applied >= 3003);
-    assert!(state.compaction_pending());
-    for entry in &log[state.applied as usize..] {
-        apply(&mut state, entry).await;
-    }
-    finish(&mut state).await;
-    for revision in [0, 2799, 2800, 2900] {
-        assert_eq!(
-            serde_json::to_value(state.hash_kv(revision).await).unwrap(),
-            serde_json::to_value(reference.hash_kv(revision).await).unwrap()
-        );
-    }
-    assert_eq!(rows(&state).await, rows(&reference).await);
-    assert_eq!(state.logical_bytes, reference.logical_bytes);
-    // The node flushes outside ordered apply. After that flush, the finished pass survives.
-    state.db().flush().await.unwrap();
-    state.close().await.unwrap();
-    drop(state);
-    let state = StateMachine::open(&path).await.unwrap();
-    assert!(!state.compaction_pending());
-    assert_eq!(state.physical_revision(), 2800);
-    state.close().await.unwrap();
-    reference.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn snapshot_install_carries_a_pending_compaction() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut source = StateMachine::open(&dir.path().join("source"))
-        .await
-        .unwrap();
-    for n in 0..3000 {
-        source
-            .apply_etcd(source.applied + 1, &put(&format!("k{}", n % 50), "v"))
-            .await
-            .unwrap();
-    }
-    apply(&mut source, &Entry::Compact(2900)).await;
-    apply(&mut source, &Entry::Step).await;
-    assert!(source.compaction_pending());
-    let mut snapshot = Snapshot::default();
-    snapshot.mut_metadata().index = source.applied;
-    snapshot.set_data(source.snapshot_data().await.unwrap());
-    let mut target = StateMachine::open(&dir.path().join("target"))
-        .await
-        .unwrap();
-    target.install_snapshot(&snapshot).await.unwrap();
-    assert_eq!(target.compaction, source.compaction);
-    finish(&mut source).await;
-    finish(&mut target).await;
-    assert_eq!(rows(&source).await, rows(&target).await);
-    for state in [&source, &target] {
-        assert_eq!(
-            state.logical_bytes,
-            maintenance::count_logical_usage(state.db().as_ref())
-                .await
-                .unwrap()
-        );
-    }
-    source.close().await.unwrap();
-    target.close().await.unwrap();
 }
 
 #[tokio::test]
 async fn boundary_tombstones_select_the_retained_hash() {
     let dir = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(&dir.path().join("stepped"))
+    let mut state = StateMachine::open_test(&dir.path().join("stepped"))
         .await
         .unwrap();
-    let mut reference = StateMachine::open(&dir.path().join("reference"))
+    let mut reference = StateMachine::open_test(&dir.path().join("reference"))
         .await
         .unwrap();
     // Only tombstones remain at the second boundary. etcd then skips the older records.
@@ -520,7 +415,6 @@ async fn boundary_tombstones_select_the_retained_hash() {
                 };
                 assert!(reference_compaction(&mut reference, &request).await);
             }
-            Entry::Step => unreachable!(),
         }
     }
     assert_eq!(
@@ -545,7 +439,7 @@ async fn churn(state: &mut StateMachine, round: usize) {
 }
 
 async fn history(path: &std::path::Path) -> StateMachine {
-    let mut state = StateMachine::open(path).await.unwrap();
+    let mut state = StateMachine::open_test(path).await.unwrap();
     for n in 0..6000 {
         let request = put(&format!("key-{}", n % 300), &n.to_string());
         state.apply_etcd(state.applied + 1, &request).await.unwrap();
@@ -593,8 +487,16 @@ async fn planned_steps_match_inline_steps_under_concurrent_writes() {
         assert_eq!(a, b);
         assert_eq!(planned.compaction, inline.compaction, "step {round}");
         assert_eq!(
-            planned.db().get(compaction::PENDING).await.unwrap(),
-            inline.db().get(compaction::PENDING).await.unwrap()
+            planned
+                .applied_state()
+                .get(compaction::PENDING)
+                .await
+                .unwrap(),
+            inline
+                .applied_state()
+                .get(compaction::PENDING)
+                .await
+                .unwrap()
         );
         round += 1;
     }
@@ -668,72 +570,4 @@ async fn reads_at_and_below_the_boundary_during_a_pending_compaction() {
     assert!(round > 3, "{round}");
     assert_eq!(state.physical_revision(), boundary);
     state.close().await.unwrap();
-}
-
-/// A restart drops the planned read. Replay reads the lost steps again and reaches the same rows.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn restart_during_a_planned_step_replays_the_same_compaction() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("state");
-    let mut state = history(&path).await;
-    let mut reference = history(&dir.path().join("reference")).await;
-    let boundary = state.revision - 400;
-    let mut log = vec![Entry::Compact(boundary)];
-    for round in 0..12 {
-        for n in 0..40 {
-            log.push(Entry::Kv(put(
-                &format!("key-{}", (round * 37 + n) % 300),
-                &format!("new-{round}"),
-            )));
-        }
-        log.push(Entry::Step);
-    }
-    for entry in &log {
-        match entry {
-            Entry::Kv(request) => {
-                reference
-                    .apply_etcd(reference.applied + 1, request)
-                    .await
-                    .unwrap();
-            }
-            Entry::Compact(revision) => {
-                let request = CompactionRequest {
-                    revision: *revision,
-                    physical: false,
-                };
-                assert!(reference_compaction(&mut reference, &request).await);
-            }
-            Entry::Step => {}
-        }
-    }
-    let first = state.applied + 1;
-    for (position, entry) in log.iter().enumerate() {
-        apply(&mut state, entry).await;
-        if position == 41 * 3 {
-            // The first steps become durable. Later steps stay in the memtable.
-            state.db().flush().await.unwrap();
-        }
-    }
-    assert!(state.compaction_pending());
-    // A background read for the next step may still run when the process stops.
-    state.close().await.unwrap();
-    drop(state);
-    let mut state = StateMachine::open(&path).await.unwrap();
-    assert!(state.compaction_pending());
-    let durable = (state.applied + 1 - first) as usize;
-    assert!(durable > 41 * 3 && durable <= log.len(), "{durable}");
-    for entry in &log[durable..] {
-        apply(&mut state, entry).await;
-    }
-    finish(&mut state).await;
-    assert_eq!(rows(&state).await, rows(&reference).await);
-    assert_eq!(state.logical_bytes, reference.logical_bytes);
-    for revision in [boundary, boundary + 1, state.revision] {
-        assert_eq!(
-            serde_json::to_value(state.hash_kv(revision).await).unwrap(),
-            serde_json::to_value(reference.hash_kv(revision).await).unwrap()
-        );
-    }
-    state.close().await.unwrap();
-    reference.close().await.unwrap();
 }

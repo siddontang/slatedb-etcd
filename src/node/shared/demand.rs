@@ -23,10 +23,9 @@ impl Node {
     /// The base comes first, then one position read gives the last batch and the covered
     /// index. A switch between the reads makes the check stricter, not weaker. One announcement
     /// serves the demand at a time. A lost proposal is sent again after `CERTIFY_TICKS`. The
-    /// demand ends when the base index reaches it, so an idle cluster stops announcing.
-    ///
-    /// The leader certifies above a row only while every other member advertised that it
-    /// installs such a base. Otherwise it serves no demand, as an earlier binary does.
+    /// demand ends when the base index reaches it, so an idle cluster stops announcing. The log
+    /// cache sends a record above its row only to a peer whose current process advertised that
+    /// it installs such a base.
     pub(in crate::node) fn certify_base(&mut self) -> Result<()> {
         self.note_base();
         if self.raw.raft.state != StateRole::Leader {
@@ -41,7 +40,6 @@ impl Node {
                 writer.demand = 0;
                 writer.certified = None;
                 writer.demand_publication = 0;
-                writer.exact_through = 0;
             }
         }
         // A member does not lead before its install. See `tick_raft`. If it did, the install
@@ -50,7 +48,6 @@ impl Node {
             return Ok(());
         }
         let record = self.raw.store().snapshot_index();
-        let extend = self.extension_allowed();
         let wanted = self.raw.store().wanted_index();
         // A base below the record cannot replace the record, so the record index is a demand.
         let record = match self.base_below_record() {
@@ -63,12 +60,7 @@ impl Node {
         writer.certify_ticks += 1;
         let demand = writer.demand.max(wanted).max(record);
         let unmet = demand > *writer.applied.based.borrow();
-        // Without the capability on every member, a demand gets a checkpoint at its row.
-        self.serve_exact((!extend && unmet).then_some(demand));
-        let Some(writer) = &mut self.writer else {
-            return Ok(());
-        };
-        if !extend || !unmet {
+        if !unmet {
             writer.certified = None;
             return Ok(());
         }
@@ -107,59 +99,6 @@ impl Node {
             }
         }
         Ok(())
-    }
-
-    /// Return true when every other member of the configuration advertised, on its current
-    /// process, that it installs a base above the checkpoint row. A member that did not report
-    /// yet counts as an earlier binary.
-    pub(in crate::node) fn extension_allowed(&self) -> bool {
-        let store = self.raw.store();
-        let conf = self.raw.raft.prs().conf().to_conf_state();
-        conf.voters
-            .iter()
-            .chain(&conf.learners)
-            .filter(|&&id| id != self.options.id)
-            .all(|&id| store.coverage_capable(id))
-    }
-
-    /// An earlier binary installs a view snapshot only at its checkpoint row. The log cache does
-    /// not send it a record above the row, and asks here for a record at a row instead. `unmet`
-    /// asks too: the demand of a snapshot request or a follower's manual checkpoint while some
-    /// member lacks the capability, so no certification serves it.
-    ///
-    /// If the base is at its own row, above the record and at or above the demand, the next
-    /// record is at that row. Otherwise the leader publishes a checkpoint whose row is its applied
-    /// index. When no batch is at that index, apply first stores one that holds only the apply
-    /// marker, so the checkpoint row is there. That costs one flush and one checkpoint.
-    fn serve_exact(&mut self, unmet: Option<u64>) {
-        if unmet.is_none() && !self.raw.store().exact_wanted() {
-            return;
-        }
-        let wanted = unmet.unwrap_or(0).max(self.raw.store().wanted_index());
-        let record = self.raw.store().snapshot_index();
-        let applied = self.state.applied;
-        let Some(writer) = &mut self.writer else {
-            return;
-        };
-        let Some(base) = *writer.applied.base_id.borrow() else {
-            return;
-        };
-        if base.index == base.row && base.index > record && base.index >= wanted {
-            return;
-        }
-        if writer.exact_through >= applied {
-            return;
-        }
-        writer.exact_through = applied;
-        if writer.queue.pushed() < applied {
-            writer.mark_row_due = true;
-        }
-        writer.progress.request(applied);
-        tracing::info!(
-            applied,
-            record,
-            "publish a checkpoint at its row for an earlier binary"
-        );
     }
 
     /// Tell the log cache which checkpoint and index the base has. See `Cache::has_image`.
@@ -206,13 +145,6 @@ impl Node {
             return false;
         }
         true
-    }
-
-    /// Take a due job that stores the apply marker at the applied index.
-    pub(in crate::node) fn take_mark_row(&mut self) -> bool {
-        self.writer
-            .as_mut()
-            .is_some_and(|writer| std::mem::take(&mut writer.mark_row_due))
     }
 }
 

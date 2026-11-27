@@ -228,7 +228,7 @@ impl KeyIndex {
 
     /// Compare the index with a full current-row scan.
     #[cfg(test)]
-    pub(crate) async fn matches(&self, db: &slatedb::Db) -> Result<bool> {
+    pub(crate) async fn matches(&self, db: &impl StateRead) -> Result<bool> {
         let fresh = Self::load(db).await?;
         let latest = self.pin(u64::MAX);
         let ordered = self.order.keys.read().unwrap();

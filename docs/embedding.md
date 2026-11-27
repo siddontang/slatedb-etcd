@@ -22,7 +22,15 @@ use slatedb_etcd::server::{Server, ServerConfig};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let server = Server::start(ServerConfig::single_node("data/member-1")).await?;
+    let s3 = slatedb_etcd::object::S3 {
+        bucket: "my-bucket".into(),
+        region: "us-east-1".into(),
+        endpoint: None,
+        prefix: "slatedb-etcd".into(),
+        allow_http: false,
+    };
+    let objects = slatedb_etcd::object::Config::S3(s3);
+    let server = Server::start(ServerConfig::single_node("data/member-1", objects)).await?;
     let ready = server.wait_ready(Duration::from_secs(10)).await;
     if ready.is_ok() {
         println!("Client endpoint: {}", server.client_url());
@@ -33,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-`start` validates configuration, binds both listeners, and opens local and object storage.
+`start` validates configuration, binds both listeners, and opens the Raft log and object storage.
 Startup does not wait for leader election.
 This lets the host start all initial members without deadlock.
 If the caller cancels startup, an owned task completes initialization.
@@ -41,7 +49,8 @@ It then shuts down any unclaimed member.
 `wait_ready` confirms a ReadIndex with the quorum and waits for local apply.
 Readiness describes that instant. A later failure can make the member unavailable.
 
-`ServerConfig::single_node` creates member 1 with plaintext loopback transport and an assigned port.
+`ServerConfig::single_node` creates member 1 on the given object store, with plaintext loopback
+transport and an assigned port. Every member needs an S3-compatible store.
 Use `server.config().clone()` to obtain the effective configuration, including assigned ports.
 Preserve that configuration for restart. A production deployment should use fixed advertised URLs.
 
@@ -74,14 +83,14 @@ Create one `ServerConfig` for each member. Set these fields before `Server::star
 | `client_peers` | Map member IDs to their advertised client URLs. |
 | `client_tls`, `peer_tls` | Set certificate, key, and trusted CA paths. |
 | `allow_remote` | Require separate listeners and mutual client and peer TLS for remote hosts. |
-| `object_store` | Select `object::Config::Local` or `object::Config::S3`. |
+| `object_store` | Set `object::Config::S3`. Every member needs an object store. |
 | `log_memory`, `quota_bytes` | Set separate log budgets and the logical data quota. |
 | `snapshot_every` | Set the automatic checkpoint interval. Zero disables it. |
 | `snapshot_min_bytes` | Set the log bytes an automatic checkpoint waits for. Zero disables it. |
 | `log_file_bytes` | Set the size of one Raft log file. Truncation frees whole files. |
 | `auth_token` | Select the same simple or JWT token configuration as the CLI. |
 | `join`, `restore_snapshot` | Select member join or native restore. They cannot both be enabled. |
-| `state_mode`, `view_max_age` | Select shared mode for a new one-voter cluster and its flush age. |
+| `view_max_age` | Set the age of the oldest unflushed write that starts a checkpoint. |
 | `strict_reconfiguration` | Enable quorum health checks for membership changes. |
 
 Start all initial members before waiting for readiness.

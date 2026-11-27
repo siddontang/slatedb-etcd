@@ -20,8 +20,6 @@ pub struct ApiState {
     /// The identity that this member sends. It admits peer traffic with the same identity.
     pub(crate) peer: crate::peer::Identity,
     pub(crate) refusals: std::sync::Arc<Refusals>,
-    /// The object namespace that serves and receives snapshot objects.
-    pub(crate) location: Option<std::sync::Arc<crate::state::transfer::Location>>,
     /// Shared mode: the objects that a received format 6 snapshot names.
     pub(crate) shared: Option<std::sync::Arc<crate::state::shared::Source>>,
     /// Shared mode: the wall clock that a clock probe of the leader reads.
@@ -108,7 +106,6 @@ pub fn router(state: ApiState) -> Router {
         .route("/raft/view-ack", post(view_ack))
         .route(crate::node::PROBE_ROUTE, post(clock_probe))
         .route(crate::node::WRITE_PROBE_ROUTE, post(write_probe))
-        .route(crate::state::transfer::FILE_ROUTE, get(snapshot_file))
         .route("/status", get(status))
         .route("/debug/log-stats", get(log_stats))
         .route("/checkpoint", post(checkpoint))
@@ -176,9 +173,8 @@ async fn raft_message(State(state): State<ApiState>, headers: HeaderMap, body: B
     step_message(state, headers, message, size).await
 }
 
-/// Receive a view snapshot above its checkpoint row. Only this binary has the route, so an
-/// earlier binary answers 404 before its Raft sees the snapshot. The sender names the process
-/// that advertised the capability, and another process of this member refuses with 409.
+/// Receive a view snapshot above its checkpoint row. The sender names the process that advertised
+/// the capability, and another process of this member refuses with 409.
 async fn covered_snapshot(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -247,19 +243,6 @@ async fn step_message(
             Ok(None) => {}
             Err(_) => return StatusCode::BAD_REQUEST.into_response(),
         }
-        // Copy the checkpoint objects before Raft accepts the snapshot. A failed copy fails the
-        // request, so the leader reports the snapshot as failed and retries later.
-        let descriptor =
-            match crate::state::transfer::Descriptor::decode(message.get_snapshot().get_data()) {
-                Ok(descriptor) => descriptor,
-                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-            };
-        if let (Some(descriptor), Some(location)) = (descriptor, &state.location) {
-            if let Err(error) = location.prepare(&descriptor).await {
-                tracing::warn!(%error, "cannot copy snapshot objects");
-                return (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response();
-            }
-        }
     }
     dispatch(state, |tx| Event::PeerFrame(message, size, tx))
         .await
@@ -271,15 +254,11 @@ struct ViewAck {
     member: u64,
     checkpoints: std::collections::HashSet<uuid::Uuid>,
     /// A manual checkpoint on the member asks the leader to publish through this index.
-    #[serde(default)]
     publish: Option<u64>,
-    /// The process of a member that installs a base above its checkpoint row. An earlier
-    /// binary sends none.
-    #[serde(default)]
+    /// The process of a member that installs a base above its checkpoint row.
     coverage: Option<u64>,
-    /// The health of the member's shared writer. An earlier binary sends none, and the leader
-    /// then does not hand it the writer after a writer fault.
-    #[serde(default)]
+    /// The health of the member's shared writer. A member without a writer sends none, and the
+    /// leader then does not hand it the writer after a writer fault.
     writer: Option<crate::node::WriterReport>,
 }
 
@@ -306,8 +285,8 @@ async fn view_ack(
 }
 
 /// Return the wall clock of this member to a clock probe of the shared leader. The leader
-/// times the probe, so the reply reads the clock as late as it can. A replicated member has no
-/// clock check and answers 404.
+/// times the probe, so the reply reads the clock as late as it can. A member without a clock
+/// answers 404.
 async fn clock_probe(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -328,8 +307,8 @@ async fn clock_probe(
 }
 
 /// Run a write probe of the leader before it promotes this member. The member creates and
-/// deletes a scratch object with the store client of its writer. A replicated member has no
-/// shared store and answers 404.
+/// deletes a scratch object with the store client of its writer. A member without a prober
+/// answers 404.
 async fn write_probe(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -352,40 +331,6 @@ async fn write_probe(
         error: error.map(|error| format!("{error:#}")),
     })
     .into_response()
-}
-
-#[derive(Deserialize)]
-struct FileQuery {
-    root: String,
-    path: String,
-}
-
-/// Serve one object of the current database to a peer that copies a snapshot.
-async fn snapshot_file(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Query(query): Query<FileQuery>,
-) -> Response {
-    // A shared member sends format 6 snapshots, and no peer copies its objects. Its location
-    // serves the shared state, so the route must not serve it to any peer.
-    if state.peer.store.is_some() {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    if headers
-        .get(crate::peer::CLUSTER)
-        .and_then(|value| value.to_str().ok())
-        != Some(&state.peer.cluster)
-    {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    let Some(location) = &state.location else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    match location.serve(&query.root, &query.path).await {
-        Ok(Some(result)) => axum::body::Body::from_stream(result.into_stream()).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
-    }
 }
 
 async fn status(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
