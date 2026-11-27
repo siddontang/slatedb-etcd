@@ -1225,13 +1225,28 @@ impl Simulation {
                 }
                 27 => {
                     // The next writer open of the leader reads an object that does not decode.
-                    // The member stays, and a later open step opens the writer.
+                    // The same process stays with a closed writer, and the next open succeeds.
                     if let Some(leader) = leader {
-                        let source = sim.nodes[&leader].writer.source();
+                        let source = sim.nodes[&leader].writer.source().clone();
                         let error = crate::mvcc::storage_fault::stored("an injected data error");
                         *source.fail_writer.lock().unwrap() = Some(error);
+                        let process = sim.processes[&leader];
                         sim.writer_step(&mut writers, leader, WriterStep::Open)
                             .await;
+                        let injected = source.fail_writer.lock().unwrap().take();
+                        assert!(injected.is_none(), "seed {seed}: the open did not fail");
+                        assert!(
+                            sim.nodes.contains_key(&leader),
+                            "seed {seed}: a data error stopped member {leader}"
+                        );
+                        assert_eq!(sim.processes[&leader], process, "seed {seed}");
+                        assert!(!writer_open(&writers, leader), "seed {seed}");
+                        sim.writer_step(&mut writers, leader, WriterStep::Open)
+                            .await;
+                        assert!(
+                            writer_open(&writers, leader),
+                            "seed {seed}: member {leader} did not open the writer again"
+                        );
                     }
                 }
                 _ => {

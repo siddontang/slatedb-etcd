@@ -651,8 +651,8 @@ term `t + 1` can complete after the open for term `t + 2`. A `Fenced` error is t
 not a storage failure. If the member is still the leader, it opens the `Db` again and restarts
 the materializer from the new `last_l0_seq`. The overlay covers everything above the base, and
 `last_l0_seq` is at or above every published checkpoint, so the overlay covers what the
-materializer needs. Other writer errors close the writer, and the member stays. See
-[Writer faults](#writer-faults).
+materializer needs. Other writer errors close the writer, and the member stays. An invariant
+error also stops the member. See [Writer faults](#writer-faults).
 
 **Step down:** stop the publisher, stop the materializer, and close the `Db` without a flush.
 The member already has a view, so it changes nothing else. Leader transfer first flushes and
