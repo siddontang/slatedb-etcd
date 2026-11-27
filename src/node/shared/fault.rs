@@ -863,7 +863,7 @@ impl Writer {
     /// samples or for its bound, and a batch waits for the writer. An idle writer that waits
     /// is no due work, so its wait never becomes a stall.
     pub(super) fn note_clock_wait(&mut self) {
-        let due = self.clock.waiting() && !self.queue.after(self.progress.written(), 1).is_empty();
+        let due = self.clock.waiting() && self.queue.has_after(self.progress.written());
         self.clock_due = due.then(|| self.clock_due.unwrap_or_else(Instant::now));
     }
 }
@@ -901,11 +901,6 @@ impl Node {
     /// leader and its writer keeps retrying. See `Handoff::step`.
     pub(super) fn tick_writer_health(&mut self) {
         let leader = self.raw.raft.state == StateRole::Leader;
-        let candidates = if leader {
-            self.handoff_candidates()
-        } else {
-            vec![]
-        };
         let wait = TICK * HANDOFF_TIMEOUTS * self.raw.raft.election_timeout() as u32;
         let paused = self.worker.control.paused();
         let held = self.apply_held_at.is_some() || paused.is_some();
@@ -934,9 +929,18 @@ impl Node {
         if !leader {
             return;
         }
+        // `Handoff::step` reads the candidates only when a handoff is due.
+        let due = handoff_due(&writer.health, paused.as_ref());
+        let candidates = match due {
+            true => self.handoff_candidates(),
+            false => vec![],
+        };
+        let Some(writer) = &mut self.writer else {
+            return;
+        };
         let health = &writer.health;
         let decision = writer.handoff.step(&Tick {
-            due: handoff_due(health, paused.as_ref()),
+            due,
             stalled: health.stalled(),
             transferee,
             wait,

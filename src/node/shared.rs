@@ -463,7 +463,6 @@ impl Writer {
         self.stop = Some(stop);
         let task = lead(
             Publisher {
-                db: None,
                 admin: self.admin.clone(),
                 source: self.source.clone(),
                 progress: self.progress.clone(),
@@ -857,10 +856,8 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         health.opened();
         // The open starts at `last_l0_seq`. Unflushed writes of an older writer are lost, and
         // the overlay holds them.
-        let mut publisher = publisher.clone();
         publisher.progress.reset(db.manifest().last_l0_seq());
         publisher.progress.rearm();
-        publisher.db = Some(db.clone());
         let admin = slatedb::admin::Admin::builder(
             publisher.source.state(),
             publisher.source.store.clone(),
@@ -884,7 +881,7 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         let running = async {
             tokio::select! {
                 result = materialize(db.clone(), queue.clone(), progress, gate) => result,
-                result = publish(publisher, events.clone()) => result,
+                result = publish(publisher.clone(), db.clone(), events.clone()) => result,
             }
         };
         let outcome = attempt(running, &mut stopped, &mut health).await;
@@ -976,7 +973,6 @@ pub(super) async fn materialize(
 
 #[derive(Clone)]
 struct Publisher {
-    db: Option<Arc<slatedb::Db>>,
     admin: Arc<slatedb::admin::Admin>,
     source: Arc<Source>,
     progress: Arc<Progress>,
@@ -1122,9 +1118,12 @@ async fn stranded(
 /// stays until its publication: a failed pass gives it back to the next writer. A `Db` that
 /// SlateDB closed, also an idle one, ends the task with its stored error. A retention error
 /// only skips that retention.
-async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()> {
+async fn publish(
+    publisher: Publisher,
+    db: Arc<slatedb::Db>,
+    events: mpsc::Sender<Event>,
+) -> Result<()> {
     let Publisher {
-        db,
         admin,
         source,
         progress,
@@ -1135,7 +1134,6 @@ async fn publish(publisher: Publisher, events: mpsc::Sender<Event>) -> Result<()
         applied,
         health,
     } = publisher;
-    let db = db.context("the publisher needs the writer")?;
     let led = Instant::now();
     let epoch = db.manifest().writer_epoch();
     let mut published = view_checkpoints(&admin)
