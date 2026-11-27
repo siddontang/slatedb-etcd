@@ -194,7 +194,9 @@ It bounds queued reads and rejects excess requests with an explicit retryable er
 It also rejects new proposals when the local apply backlog reaches its admission limit.
 Each entry job contains at most 64 entries with a 512 KiB byte target.
 A single larger entry can exceed that byte target. Peer snapshots carry only a descriptor.
-At most 64 state queries, 64 KV reads, and 64 checkpoint requests can wait at the Raft owner.
+At most 64 state queries, 64 serializable KV reads, and 64 checkpoint requests can wait at the
+Raft owner. Confirmed linearizable reads join the KV read queue past that limit; at most 256 of
+them can wait.
 New proposals are rejected at 1,024 committed but unapplied entries.
 These limits bound queued work; they do not impose a total storage quota.
 
@@ -240,13 +242,14 @@ A running wide-read job has a 60-second deadline. This avoids the retries from t
 the old five-second cutoff caused for a large LIST. A shared scan and its exclusive rerun use
 the same deadline, so a rerun that waits for the exclusive slot has less time left to execute.
 Shutdown stops these jobs before closing the state database.
-As in etcd, only the wait for the quorum proof has a limit. A read fails if the quorum does not
-confirm it within five seconds, or if the term, role, or leader changes first. The proof sets
-the lowest applied index that the read may see. The executor pins the applied view current when
-the job starts, so a write applied while the read waits can appear in its result. The read stays
-linearizable whatever happens to leadership later, because the applied index only grows.
-It waits for apply and an executor slot without its own limit: the gRPC handler waits 70 seconds
-for a read reply, and a held apply fails reads above the applied index.
+A read fails if it does not start to run within five seconds, whether it waits for the quorum
+proof, for apply, or for an executor slot. Then clientv3 can retry it on another member. An
+unconfirmed read also fails if the term, role, or leader changes first. The proof sets the
+lowest applied index that the read may see. The executor pins the applied view current when
+the job starts, so a write applied while the read waits can appear in its result. A confirmed
+read stays linearizable whatever happens to leadership later, because the applied index only
+grows. Once it runs, only the job deadline bounds it; the gRPC handler waits 70 seconds for a
+read reply.
 A queued read whose request failed or whose caller left does not start. A scan over budget runs
 again only for the callers that still wait. The response header takes the Raft term at reply
 time and the revision of the pinned view.

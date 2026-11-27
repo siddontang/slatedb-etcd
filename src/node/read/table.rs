@@ -30,6 +30,8 @@ struct PendingRead {
     index: Option<u64>,
     context: Option<u64>,
     retry_ticks: u8,
+    /// The read executor runs the read.
+    running: bool,
 }
 
 struct RevisionWaiter {
@@ -192,6 +194,7 @@ impl ReadIndexTable {
                 index: None,
                 context: None,
                 retry_ticks: 2,
+                running: false,
             },
         );
     }
@@ -296,6 +299,13 @@ impl ReadIndexTable {
         {
             queries.push(self.queries.remove(position).unwrap());
         }
+        for query in &queries {
+            if let Query::Linear(_, _, id) = query {
+                if let Some(read) = self.reads.get_mut(id) {
+                    read.running = true;
+                }
+            }
+        }
         Some(queries)
     }
 
@@ -322,14 +332,14 @@ impl ReadIndexTable {
         Ok(())
     }
 
-    /// Fail the reads whose caller left, and the reads that the quorum has not confirmed within
-    /// 5 s or under the same leader and term. Return the number of batches that lost their proof.
+    /// Fail the reads whose caller left, the reads that have not started to run within 5 s, and
+    /// the reads that the quorum has not confirmed under the same leader and term. Return the
+    /// number of batches that lost their proof.
     ///
-    /// As in etcd, only the ReadIndex wait has this limit. A confirmed read is linearizable at
-    /// its read index whatever happens to leadership later, because the applied index only grows.
-    /// It then waits for apply and an executor slot, and runs up to the executor limit. The gRPC
-    /// handler bounds the whole request; when it gives up, the closed reply drops the read here.
-    /// A held apply fails it earlier; see `fence`.
+    /// A confirmed read is linearizable at its read index whatever happens to leadership later,
+    /// because the applied index only grows. Until it runs, it still has 5 s in all: a stalled
+    /// apply or a busy executor fails it with Unavailable, and the client retries on another
+    /// member. Once it runs, only the executor limit bounds it.
     pub(in crate::node) fn expire(&mut self, term: u64, leader: u64, role: StateRole) -> usize {
         let now = Instant::now();
         let expired: Vec<_> = self
@@ -337,12 +347,12 @@ impl ReadIndexTable {
             .iter()
             .filter(|(_, read)| {
                 read.response.is_closed()
+                    || (!read.running && now.duration_since(read.started) > Duration::from_secs(5))
                     || (read.index.is_none()
                         && (leader == 0
                             || read.leader != leader
                             || read.role != role
-                            || read.term != term
-                            || now.duration_since(read.started) > Duration::from_secs(5)))
+                            || read.term != term))
             })
             .map(|(id, _)| *id)
             .collect();

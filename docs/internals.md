@@ -109,8 +109,9 @@ Historical reads, sorted or filtered Ranges, and read-only transactions also run
 While one of these reads runs or waits, no new scan starts. Wide reads start in queue order.
 Current point reads can pass queued scans and keep at least one task.
 A point-read job has a five-second deadline and a wide-read job has a 60-second deadline.
-For a linearizable read, the five-second limit covers only the quorum confirmation. The proof sets
-the lowest applied index that the read may see; the job reads the view current when it starts.
+A linearizable read that does not start to run within five seconds fails, whether it waits for the
+quorum, for apply, or for a slot. The proof sets the lowest applied index that the read may see;
+the job reads the view current when it starts.
 A scan over budget runs again only for the callers that still wait.
 Shared scans hold at most 3 x (4 MiB + one row) of decoded rows. The exclusive read keeps the old
 single-read bound: its result size, up to the logical data size. The two cases never overlap.
@@ -145,8 +146,9 @@ Forwarded KV results wait for local apply through the leader response revision.
 Lease and Compact results still require a local ReadIndex barrier.
 Later STM reads on that member can then use their revisions.
 Both branches of nested transactions must contain only reads.
-Leadership loss or a five-second timeout before the quorum confirms the read removes it, as does
-cancellation at any time. A confirmed read survives leadership loss. At most 256 reads can wait.
+Leadership loss before the quorum confirms the read removes it. A five-second timeout before the
+read starts to run removes it, as does cancellation at any time. A confirmed read survives
+leadership loss. At most 256 reads can wait.
 The gRPC service admits 192 linearizable KV reads at a time. Up to 8,192 more wait for admission.
 A waiter that gets no slot in ten seconds fails with `Unavailable: request timed out`.
 A cancelled client releases its waiting slot.

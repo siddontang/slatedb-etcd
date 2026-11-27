@@ -486,10 +486,15 @@ mod tests {
     /// plus ten seconds and drops the reply channel.
     #[tokio::test(start_paused = true)]
     async fn a_range_reply_wait_ends_after_the_read_limit() {
+        let started = tokio::time::Instant::now();
         let (call, reply) = start_range().await;
-        tokio::time::advance(crate::node::WIDE_READ_LIMIT + Duration::from_secs(11)).await;
         let status = call.await.unwrap().unwrap_err();
         assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
         assert!(reply.is_closed());
+        // The paused clock jumps to the next timer, so check when the handler gave up.
+        assert_eq!(
+            started.elapsed(),
+            crate::node::WIDE_READ_LIMIT + Duration::from_secs(10)
+        );
     }
 }

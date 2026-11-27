@@ -1022,10 +1022,10 @@ async fn read_index_wait_expires_but_a_running_read_finishes() {
     assert_eq!(node.reads.pending(), 0);
 }
 
-/// As in etcd, only the ReadIndex wait expires. A confirmed read waits for an executor slot past
-/// 5 s and through a leader change, and returns its rows. An unconfirmed read fails on both.
+/// A confirmed read waits for an executor slot through a leader change, runs past 5 s, and
+/// returns its rows. An unconfirmed read fails on the leader change.
 #[tokio::test]
-async fn a_confirmed_read_outlives_the_read_index_wait_and_a_leader_change() {
+async fn a_confirmed_read_outlives_a_leader_change_and_runs_past_5_s() {
     use crate::proto::etcdserverpb::response_op::Response as Resp;
     let dir = tempfile::tempdir().unwrap();
     let mut node = leader_node(dir.path()).await;
@@ -1042,10 +1042,6 @@ async fn a_confirmed_read_outlives_the_read_index_wait_and_a_leader_change() {
     node.drive_ready().await.unwrap();
     confirm_read(&mut node, &id).await;
     assert_eq!(node.reads.queued(), 1);
-    node.reads
-        .set_started(Some(id), Instant::now() - Duration::from_secs(6));
-    node.expire_reads();
-    assert_eq!(node.reads.queued(), 1);
 
     let (tx, unconfirmed) = oneshot::channel();
     node.linear_read(wide_range(b"m", b"z"), tx);
@@ -1059,8 +1055,12 @@ async fn a_confirmed_read_outlives_the_read_index_wait_and_a_leader_change() {
     node.complete_read(output).unwrap();
     node.schedule_reads();
     assert_eq!(node.read_executor.len(), 1);
-    // The term changes again while the read runs.
+    // The read runs past 5 s, and the term changes again.
+    node.reads
+        .set_started(Some(id), Instant::now() - Duration::from_secs(6));
     node.raw.raft.become_follower(term + 2, 0);
+    node.expire_reads();
+    assert_eq!(node.reads.pending(), 1);
     let output = node.step_read().await.unwrap().unwrap();
     node.complete_read(output).unwrap();
     let mut range = confirmed
@@ -1080,6 +1080,37 @@ async fn a_confirmed_read_outlives_the_read_index_wait_and_a_leader_change() {
     let keys: Vec<_> = range.kvs.iter().map(|kv| kv.key[0]).collect();
     assert_eq!(keys, (b'a'..b'i').collect::<Vec<_>>());
     assert_eq!(node.reads.pending(), 0);
+}
+
+/// A confirmed read that has not started to run within 5 s fails, as on main, so that the client
+/// can retry on another member. Only a running read gets the wide-read limit.
+#[tokio::test]
+async fn a_confirmed_read_that_waits_5_s_for_the_executor_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    put_letters(&mut node).await;
+    let (tx, _held) = oneshot::channel();
+    node.enqueue_query(sorted_read(tx));
+    node.drive_ready().await.unwrap();
+    assert_eq!(node.read_executor.len(), 1);
+
+    let (tx, confirmed) = oneshot::channel();
+    node.linear_read_auth(wide_range(b"a", b"m"), None, ClientResponse::Kv(tx));
+    let id = node.reads.ids().next().unwrap();
+    node.drive_ready().await.unwrap();
+    confirm_read(&mut node, &id).await;
+    assert_eq!(node.reads.queued(), 1);
+    node.reads
+        .set_started(Some(id), Instant::now() - Duration::from_secs(4));
+    node.expire_reads();
+    assert_eq!(node.reads.queued(), 1);
+    node.reads
+        .set_started(Some(id), Instant::now() - Duration::from_secs(6));
+    node.expire_reads();
+    assert_eq!(node.reads.queued(), 0);
+    assert_eq!(node.reads.pending(), 0);
+    let error = confirmed.await.unwrap().unwrap_err();
+    assert!(error.error.contains("timed out"), "{}", error.error);
 }
 
 /// A sorted serializable Range of every key. It runs in the exclusive slot.

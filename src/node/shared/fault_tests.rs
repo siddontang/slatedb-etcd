@@ -1600,7 +1600,9 @@ async fn a_flush_error_rewrites_the_overlay_into_the_next_checkpoint() {
 }
 
 /// The overlay limits hold while the writer fails: proposals fail at the soft limit, and apply
-/// pauses at the hard limit. Both end after the store recovers.
+/// pauses at the hard limit. Both end after the store recovers. A linearizable Range above the
+/// paused apply fails with Unavailable within the 5 s read wait, so a client can retry on another
+/// member, and succeeds after the recovery.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_overlay_limits_hold_while_the_writer_fails() {
     let limit = 64 * 1024;
@@ -1630,6 +1632,23 @@ async fn the_overlay_limits_hold_while_the_writer_fails() {
     let mut kv = KvClient::new(channel.clone());
     let rejected = kv.put(put("k-late", "x")).await.unwrap_err();
     assert!(rejected.message().contains("too many"), "{rejected}");
+    eventually("a committed entry that waits for apply", async || {
+        let status = status(&server).await;
+        status["applied_index"].as_u64() < status["commit_index"].as_u64()
+    })
+    .await;
+    let linear = RangeRequest {
+        key: b"k".to_vec(),
+        range_end: b"l".to_vec(),
+        ..Default::default()
+    };
+    let started = Instant::now();
+    let failed = tokio::time::timeout(Duration::from_secs(9), kv.range(linear.clone()))
+        .await
+        .expect("the read must fail before the 10 s client deadline")
+        .unwrap_err();
+    assert_eq!(failed.code(), tonic::Code::Unavailable, "{failed}");
+    assert!(started.elapsed() >= Duration::from_secs(4), "{failed}");
     // Apply alone can fill the overlay, so the pause can come before the first failed flush.
     eventually("a failed flush", async || {
         health(&status(&server).await)["consecutive_failures"].as_u64() > Some(0)
@@ -1643,6 +1662,7 @@ async fn the_overlay_limits_hold_while_the_writer_fails() {
             && status["applied_index"] == status["commit_index"]
     })
     .await;
+    kv.range(linear).await.unwrap();
     kv.put(put("k-after", "x")).await.unwrap();
     server.shutdown().await.unwrap();
 }
