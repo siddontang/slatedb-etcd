@@ -339,6 +339,7 @@ impl Node {
                         self.raw.apply_conf_change(change)?;
                         self.membership_checkpoint = self.state.applied;
                         self.tick_clock(false);
+                        self.prune_write_proofs();
                     }
                     if let Some(LeaseCommand::Expire { id, generation }) = command.lease {
                         self.lease_expiring.remove(&(id, generation));
@@ -421,6 +422,7 @@ impl Node {
             Output::Adopted(conf) => {
                 shared::reconcile_conf(&mut self.raw, &conf)?;
                 self.tick_clock(false);
+                self.prune_write_proofs();
             }
             Output::RejectedBase(rejected) => self.reject_base(rejected),
             Output::Checkpoint(built) => {

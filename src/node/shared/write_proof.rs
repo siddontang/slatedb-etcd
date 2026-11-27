@@ -294,6 +294,20 @@ impl Proofs {
         true
     }
 
+    /// This member leads in `term`, or does not lead with `None`. A new term or a step down
+    /// drops every record, so `/status` shows no proof of an earlier term.
+    pub(in crate::node) fn lead(&mut self, term: Option<u64>) {
+        if term != Some(self.term) {
+            self.term = term.unwrap_or(0);
+            self.members.clear();
+        }
+    }
+
+    /// Keep only the records of the members for which `keep` is true.
+    pub(in crate::node) fn retain(&mut self, keep: impl Fn(u64) -> bool) {
+        self.members.retain(|member, _| keep(*member));
+    }
+
     /// Drop the proof and the running probe of `member`, whose process changed.
     pub(in crate::node) fn forget(&mut self, member: u64) {
         self.members.remove(&member);
@@ -305,12 +319,18 @@ impl Proofs {
             .members
             .iter()
             .map(|(member, record)| {
+                let ms = |time: Duration| time.as_millis() as u64;
+                let until = |end: Instant| ms(end.saturating_duration_since(now));
+                // A probe with no reply by its deadline no longer runs.
+                let probing = record.pending.filter(|(_, sent)| now < *sent + REPLY_WAIT);
                 json!({
                     "member": member,
                     "process": record.process,
                     "proven": record.proven.is_some_and(|sent| now < sent + PROOF_LIFETIME),
-                    "proof_age_ms": record.proven.map(|sent| (now - sent).as_millis() as u64),
-                    "probing": record.pending.is_some(),
+                    "proof_age_ms": record.proven.map(|sent| ms(now - sent)),
+                    "proof_valid_ms": record.proven.map(|sent| until(sent + PROOF_LIFETIME)),
+                    "probing": probing.is_some(),
+                    "probe_timed_out": record.pending.is_some() && probing.is_none(),
                     "failed": record.failed,
                     "failures": record.failures,
                 })
@@ -356,6 +376,25 @@ impl Node {
             tonic::Code::FailedPrecondition,
             &refusal.message,
         ))
+    }
+
+    /// Drop the write proofs of members that left the Raft configuration.
+    pub(in crate::node) fn prune_write_proofs(&mut self) {
+        let conf = self.raw.raft.prs().conf().to_conf_state();
+        let Some(writer) = &mut self.writer else {
+            return;
+        };
+        let members: std::collections::HashSet<u64> = [
+            &conf.voters,
+            &conf.learners,
+            &conf.voters_outgoing,
+            &conf.learners_next,
+        ]
+        .into_iter()
+        .flatten()
+        .copied()
+        .collect();
+        writer.proofs.retain(|member| members.contains(&member));
     }
 
     /// Send the write probe `nonce` to `member`. Its reply comes back as `Event::WriteProbed`.

@@ -17,6 +17,56 @@ use slatedb::object_store::ObjectStore;
 
 const SECOND: Duration = Duration::from_secs(1);
 
+/// `/status` shows a probe with no reply by its deadline as timed out, not as running. A
+/// proof shows its true age and the time that it still counts.
+#[test]
+fn the_status_expires_a_probe_at_its_reply_deadline() {
+    let mut proofs = Proofs::default();
+    let sent = Instant::now();
+    let nonce = start(&mut proofs, sent);
+    let member = |proofs: &Proofs, now| proofs.status(now)["members"][0].clone();
+    assert_eq!(member(&proofs, sent)["probing"], true);
+    let late = member(&proofs, sent + REPLY_WAIT);
+    assert_eq!(
+        (&late["probing"], &late["probe_timed_out"]),
+        (&json!(false), &json!(true))
+    );
+
+    // The next check counts the timeout as a failure, and a probe starts after its backoff.
+    let late = sent + REPLY_WAIT;
+    proofs.check(late, 3, 2, Some(7)).unwrap_err();
+    assert_eq!(member(&proofs, late)["probe_timed_out"], false);
+    let sent = late + RETRY_FIRST;
+    let next = start(&mut proofs, sent);
+    assert_ne!(next, nonce);
+    let nonce = next;
+    assert!(proofs.complete(sent, 3, 2, Some(7), proven(nonce, 7)));
+    let shown = member(&proofs, sent + 10 * SECOND);
+    assert_eq!(shown["proof_age_ms"], 10_000);
+    assert_eq!(shown["proof_valid_ms"], 50_000);
+    assert_eq!(shown["probing"], false);
+    let shown = member(&proofs, sent + PROOF_LIFETIME);
+    assert_eq!(
+        (&shown["proven"], &shown["proof_valid_ms"]),
+        (&json!(false), &json!(0))
+    );
+}
+
+/// A new term of this leader drops the records of the earlier term at once, before any check.
+#[test]
+fn a_new_term_drops_the_records_at_once() {
+    let mut proofs = Proofs::default();
+    proofs.lead(Some(3));
+    let now = Instant::now();
+    let nonce = start(&mut proofs, now);
+    assert!(proofs.complete(now, 3, 2, Some(7), proven(nonce, 7)));
+    proofs.lead(Some(3));
+    assert_eq!(proofs.status(now)["members"].as_array().unwrap().len(), 1);
+    proofs.lead(Some(5));
+    assert_eq!(proofs.status(now)["members"], json!([]));
+    assert_eq!(proofs.status(now)["term"], 5);
+}
+
 /// A prober of member 2 on `faults`, and the scratch objects under its shared state.
 fn prober(faults: &Arc<FaultStore>) -> Prober {
     let store: Arc<dyn ObjectStore> = faults.clone();
@@ -366,6 +416,47 @@ async fn prove(node: &mut Node) {
     node.handle(event, &mut responses).await.unwrap();
     node.check_write_proof(&C::Promote(2)).unwrap();
     assert_eq!(shown(node)[0]["proven"], true);
+}
+
+/// A step down drops the records at once, so a follower shows no proof of its old term.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_step_down_drops_the_records_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = shared_leader(dir.path()).await;
+    prove(&mut node).await;
+    let term = node.raw.raft.term;
+    node.raw.raft.become_follower(term + 1, raft::INVALID_ID);
+    node.sync_writer();
+    assert_eq!(shown(&node), json!([]));
+}
+
+/// The leader drops the record of a member that leaves the configuration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_member_loses_its_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = shared_leader(dir.path()).await;
+    let change = async |node: &mut Node, request| {
+        let (tx, _reply) = oneshot::channel();
+        let command = RaftCommand::Cluster {
+            id: uuid::Uuid::new_v4().to_string(),
+            request,
+            credentials: Default::default(),
+        };
+        node.propose(command, tx).unwrap();
+        settle(node).await;
+    };
+    let learner = crate::proto::etcdserverpb::Member {
+        id: 2,
+        name: "node-2".into(),
+        peer_ur_ls: vec!["http://127.0.0.1:2".into()],
+        client_ur_ls: vec!["http://127.0.0.1:2".into()],
+        is_learner: true,
+    };
+    change(&mut node, C::Add(learner)).await;
+    prove(&mut node).await;
+    change(&mut node, C::Remove(2)).await;
+    assert!(!node.raw.raft.prs().conf().learners().contains(&2));
+    assert_eq!(shown(&node), json!([]));
 }
 
 async fn channel(server: &Server) -> tonic::transport::Channel {

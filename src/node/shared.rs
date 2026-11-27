@@ -1456,6 +1456,7 @@ impl Node {
         // A new leader probes the voters at once. Its first write waits for their samples.
         self.tick_clock(true);
         if let Some(writer) = &mut self.writer {
+            writer.proofs.lead(leader.then_some(term));
             writer.sync(leader, term, &self.events);
         }
     }
