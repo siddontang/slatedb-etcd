@@ -3,7 +3,10 @@
 use super::super::tests::{eventually, status};
 use super::*;
 use crate::cluster::Command as C;
-use crate::object::faults::{FaultStore, FAIL_STATE_DELETE, LOSE_STATE_PUT_REPLY, READ_ONLY_STATE};
+use crate::object::faults::{
+    FaultStore, DETACH_STATE_PUT, FAIL_STATE_DELETE, GONE_STATE_DELETE, LOSE_STATE_PUT_REPLY,
+    READ_ONLY_STATE,
+};
 use crate::proto::etcdserverpb::{
     cluster_client::ClusterClient, MemberAddRequest, MemberListRequest, MemberPromoteRequest,
 };
@@ -31,16 +34,13 @@ async fn scratch(store: &dyn ObjectStore) -> Vec<String> {
         .collect()
 }
 
-/// A successful probe creates its scratch object in the shared state, with its member and
-/// process in the name, and deletes it.
+/// A successful probe creates the scratch object of its member and process in the shared
+/// state, and deletes it.
 #[tokio::test]
 async fn a_successful_probe_leaves_no_scratch_object() {
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
-    prober(&faults).probe(11).await.unwrap();
-    let name = format!(
-        "root/shared/state/.probe/2-{}-11",
-        crate::peer::process_id()
-    );
+    prober(&faults).probe().await.unwrap();
+    let name = format!("root/shared/state/.probe/2-{}", crate::peer::process_id());
     assert!(faults.written.lock().unwrap().contains(&name));
     assert!(scratch(faults.as_ref()).await.is_empty());
 }
@@ -52,8 +52,8 @@ async fn a_read_only_member_fails_each_probe_at_the_create() {
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     faults.set(READ_ONLY_STATE);
     let prober = prober(&faults);
-    for nonce in 1..=3 {
-        let error = prober.probe(nonce).await.unwrap_err();
+    for _ in 0..3 {
+        let error = prober.probe().await.unwrap_err();
         assert!(format!("{error:#}").contains("cannot create"), "{error:#}");
     }
     assert!(scratch(faults.as_ref()).await.is_empty());
@@ -66,13 +66,13 @@ async fn a_refused_delete_leaves_at_most_one_scratch_object() {
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     faults.set(FAIL_STATE_DELETE);
     let prober = prober(&faults);
-    for nonce in 1..=5 {
-        let error = prober.probe(nonce).await.unwrap_err();
+    for _ in 0..5 {
+        let error = prober.probe().await.unwrap_err();
         assert!(format!("{error:#}").contains("cannot delete"), "{error:#}");
     }
     assert_eq!(scratch(faults.as_ref()).await.len(), 1);
     faults.set(0);
-    prober.probe(6).await.unwrap();
+    prober.probe().await.unwrap();
     assert!(scratch(faults.as_ref()).await.is_empty());
 }
 
@@ -83,9 +83,38 @@ async fn a_lost_create_reply_is_cleaned_by_the_next_probe() {
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     faults.set(LOSE_STATE_PUT_REPLY);
     let prober = prober(&faults);
-    prober.probe(1).await.unwrap_err();
+    prober.probe().await.unwrap_err();
     assert_eq!(scratch(faults.as_ref()).await.len(), 1);
-    prober.probe(2).await.unwrap();
+    prober.probe().await.unwrap();
+    assert!(scratch(faults.as_ref()).await.is_empty());
+}
+
+/// A create that times out can reach the store after the next probe cleaned and proved. It
+/// lands on the one key of this process, so the member keeps at most one scratch object. The
+/// probe after it deletes that object and creates its own.
+#[tokio::test]
+async fn a_late_create_leaves_at_most_one_scratch_object() {
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let prober = prober(&faults);
+    for _ in 0..3 {
+        faults.set(DETACH_STATE_PUT);
+        prober.probe().await.unwrap_err();
+        prober.probe().await.unwrap();
+        faults.land().await.unwrap();
+        assert_eq!(scratch(faults.as_ref()).await.len(), 1);
+    }
+    prober.probe().await.unwrap();
+    assert!(scratch(faults.as_ref()).await.is_empty());
+}
+
+/// The delete after a confirmed create must succeed. A refused delete fails the probe, also
+/// when the object is gone, because that shows no delete access.
+#[tokio::test]
+async fn a_refused_delete_of_a_gone_object_fails_the_probe() {
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    faults.set(GONE_STATE_DELETE);
+    let error = prober(&faults).probe().await.unwrap_err();
+    assert!(format!("{error:#}").contains("cannot delete"), "{error:#}");
     assert!(scratch(faults.as_ref()).await.is_empty());
 }
 

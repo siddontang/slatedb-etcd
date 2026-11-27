@@ -23,6 +23,8 @@ pub(crate) struct FaultStore {
     /// The paths of puts and copy targets, and of reads, for access tests.
     pub written: std::sync::Mutex<std::collections::BTreeSet<String>>,
     pub read: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// The put that `DETACH_STATE_PUT` kept.
+    detached: std::sync::Mutex<Option<(Path, PutPayload, PutOptions)>>,
 }
 
 pub(crate) const FAIL_PUT: u8 = 1;
@@ -70,6 +72,12 @@ pub(crate) const FAIL_STATE_DELETE: u8 = 20;
 pub(crate) const LOSE_STATE_PUT_REPLY: u8 = 21;
 /// Fail every put and every delete in the shared database, like a read-only credential.
 pub(crate) const READ_ONLY_STATE: u8 = 22;
+/// Report a timeout for the next put in the shared database, and keep the put. `land` writes it
+/// later, like a request that reaches the store after its caller stopped waiting.
+pub(crate) const DETACH_STATE_PUT: u8 = 23;
+/// Delete each object in the shared database, then report a refusal, like a refused delete of
+/// an object that another client removed.
+pub(crate) const GONE_STATE_DELETE: u8 = 24;
 
 impl FaultStore {
     pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
@@ -82,7 +90,15 @@ impl FaultStore {
             delay_ms: std::sync::atomic::AtomicU64::new(120),
             written: Default::default(),
             read: Default::default(),
+            detached: Default::default(),
         }
+    }
+
+    /// Write the put that `DETACH_STATE_PUT` kept.
+    pub async fn land(&self) -> Result<PutResult> {
+        let detached = self.detached.lock().unwrap().take();
+        let (path, payload, options) = detached.expect("no detached put");
+        self.inner.put_opts(&path, payload, options).await
     }
 
     pub fn set(&self, mode: u8) {
@@ -162,6 +178,19 @@ impl ObjectStore for FaultStore {
         {
             self.entered.add_permits(1);
             return Err(error());
+        }
+        let order = Ordering::SeqCst;
+        if state(path)
+            && self
+                .mode
+                .compare_exchange(DETACH_STATE_PUT, 0, order, order)
+                .is_ok()
+        {
+            *self.detached.lock().unwrap() = Some((path.clone(), payload, options));
+            return Err(Error::Generic {
+                store: "injected",
+                source: std::io::Error::new(std::io::ErrorKind::TimedOut, "detached put").into(),
+            });
         }
         let order = Ordering::SeqCst;
         if state(path)
@@ -282,9 +311,10 @@ impl ObjectStore for FaultStore {
         &self,
         paths: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
+        let mode = self.mode.load(Ordering::SeqCst);
         if !matches!(
-            self.mode.load(Ordering::SeqCst),
-            FAIL_STATE_DELETE | READ_ONLY_STATE
+            mode,
+            FAIL_STATE_DELETE | READ_ONLY_STATE | GONE_STATE_DELETE
         ) {
             return self.inner.delete_stream(paths);
         }
@@ -295,10 +325,13 @@ impl ObjectStore for FaultStore {
                 let inner = inner.clone();
                 async move {
                     let path = path?;
-                    if state(&path) {
-                        return Err(error());
+                    if !state(&path) {
+                        return inner.delete(&path).await.map(|()| path);
                     }
-                    inner.delete(&path).await.map(|()| path)
+                    if mode == GONE_STATE_DELETE {
+                        inner.delete(&path).await?;
+                    }
+                    Err(error())
                 }
             })
             .boxed()

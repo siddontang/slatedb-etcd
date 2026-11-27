@@ -2,11 +2,12 @@
 //! `docs/shared-state.md`.
 //!
 //! A learner can use read-only credentials, but a voter can become the writer. So before the
-//! leader proposes a promotion, the learner creates one scratch object with `PutMode::Create`
-//! under `shared/state/.probe/` and deletes it. It uses the store client of its own writer.
-//! SlateDB 0.18.1 writes each manifest version with `PutMode::Create`
-//! (`slatedb-txn-obj-0.18.1/src/object_store.rs:383`), so a create and a delete show the access
-//! that the writer needs.
+//! leader proposes a promotion, the learner creates the scratch object
+//! `shared/state/.probe/<member>-<process>` with `PutMode::Create` and deletes it. It uses the
+//! store client of its own writer. SlateDB 0.18.1 writes each manifest version with
+//! `PutMode::Create` (`slatedb-txn-obj-0.18.1/src/object_store.rs:383`), so a create and a
+//! delete show the access that the writer needs. The nonce is only for the freshness check of
+//! the leader.
 //!
 //! The leader binds each probe to its term, the member, and the process of the member, with a
 //! random nonce. It accepts only the reply to that nonce, from that process and from the same
@@ -55,13 +56,15 @@ pub struct WriteProbeReply {
 }
 
 /// The write probes of this member, on its own writer's store client.
+///
+/// Each process of the member uses one scratch key. A create that times out can still reach the
+/// store later, also after a later probe. It then lands on the same key, so this process leaves
+/// at most one scratch object. The next create finds it and deletes it first.
 pub(crate) struct Prober {
     member: u64,
     source: Arc<Source>,
-    /// The scratch object of an earlier probe that can still exist: its create or its delete
-    /// failed. A probe removes it before it creates another, so this member leaves at most one
-    /// scratch object. The lock also lets only one probe run at a time.
-    leftover: tokio::sync::Mutex<Option<Path>>,
+    /// Only one probe runs at a time.
+    running: tokio::sync::Mutex<()>,
 }
 
 impl Prober {
@@ -69,7 +72,7 @@ impl Prober {
         Self {
             member,
             source,
-            leftover: Default::default(),
+            running: Default::default(),
         }
     }
 
@@ -78,49 +81,52 @@ impl Prober {
         self.member
     }
 
-    /// Create and delete one scratch object for `nonce`, in at most `PROBE_TIME`.
-    pub(crate) async fn probe(&self, nonce: u64) -> Result<()> {
-        tokio::time::timeout(PROBE_TIME, self.run(nonce))
+    /// The scratch key of this process.
+    fn path(&self) -> Path {
+        let name = format!("{}-{}", self.member, crate::peer::process_id());
+        Path::from(format!("{}/{SCRATCH}/{name}", self.source.state()))
+    }
+
+    /// Create and delete the scratch object, in at most `PROBE_TIME`.
+    pub(crate) async fn probe(&self) -> Result<()> {
+        tokio::time::timeout(PROBE_TIME, self.run())
             .await
             .map_err(|_| anyhow::anyhow!("the write probe timed out"))?
     }
 
-    async fn run(&self, nonce: u64) -> Result<()> {
-        let mut leftover = self.leftover.lock().await;
-        if let Some(path) = leftover.clone() {
-            self.remove(&path)
-                .await
-                .with_context(|| format!("cannot delete {path} of an earlier write probe"))?;
-            *leftover = None;
+    async fn run(&self) -> Result<()> {
+        let _running = self.running.lock().await;
+        let path = self.path();
+        let created = || format!("cannot create {path}");
+        match self.create(&path).await {
+            // An earlier probe of this process left its object: its delete failed, or its
+            // create landed late. Delete it and create once more.
+            Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
+                self.delete(&path)
+                    .await
+                    .with_context(|| format!("cannot delete {path} of an earlier write probe"))?;
+                self.create(&path).await.with_context(created)?;
+            }
+            result => result.with_context(created)?,
         }
-        let name = format!("{}-{}-{nonce}", self.member, crate::peer::process_id());
-        let path = Path::from(format!("{}/{SCRATCH}/{name}", self.source.state()));
-        // A create that fails or times out can still reach the store.
-        *leftover = Some(path.clone());
+        // This delete proves the delete access. A refused delete fails the probe, also when the
+        // object is gone.
+        self.delete(&path)
+            .await
+            .with_context(|| format!("cannot delete {path}"))
+    }
+
+    async fn create(&self, path: &Path) -> slatedb::object_store::Result<()> {
         let payload = PutPayload::from_static(b"write probe\n");
-        self.source
-            .store
-            .put_opts(&path, payload, PutOptions::from(PutMode::Create))
-            .await
-            .with_context(|| format!("cannot create {path}"))?;
-        self.remove(&path)
-            .await
-            .with_context(|| format!("cannot delete {path}"))?;
-        *leftover = None;
+        let options = PutOptions::from(PutMode::Create);
+        self.source.store.put_opts(path, payload, options).await?;
         Ok(())
     }
 
-    /// Delete `path`. A refused delete of an object that does not exist is no leak: a learner
-    /// with read-only access cannot delete, and its create stored nothing.
-    async fn remove(&self, path: &Path) -> Result<()> {
-        use slatedb::object_store::Error::NotFound;
-        let error = match self.source.store.delete(path).await {
-            Ok(()) | Err(NotFound { .. }) => return Ok(()),
-            Err(error) => error,
-        };
-        match self.source.store.head(path).await {
-            Err(NotFound { .. }) => Ok(()),
-            _ => Err(error.into()),
+    async fn delete(&self, path: &Path) -> slatedb::object_store::Result<()> {
+        match self.source.store.delete(path).await {
+            Err(slatedb::object_store::Error::NotFound { .. }) => Ok(()),
+            result => result,
         }
     }
 }

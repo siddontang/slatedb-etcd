@@ -344,7 +344,7 @@ async fn write_probe(
     if probe.member != prober.member() {
         return (StatusCode::CONFLICT, "the probe names another member").into_response();
     }
-    let error = prober.probe(probe.nonce).await.err();
+    let error = prober.probe().await.err();
     Json(crate::node::WriteProbeReply {
         nonce: probe.nonce,
         process: crate::peer::process_id(),
