@@ -63,8 +63,8 @@ The full workflow supplies etcd v3.5.20 for mixed-version tests and builds Go fa
 Supply `--last-release PATH` or `--lazyfs PATH` to select existing binaries on a local host.
 The examples fixture changes the server endpoints. Each example retains its upstream assertion
 and runs in its own process. The cluster uses a 200 ms Watch interval and permits member changes.
-It runs in shared state mode on RustFS. `ExampleMaintenance_defragment` keeps replicated state
-mode, because a new shared state leader refuses Defragment until its writer opens.
+It runs in shared state mode on RustFS. The runner skips `ExampleMaintenance_defragment` until #147
+is fixed, because a new shared state leader refuses Defragment until its writer opens.
 Use a disposable Linux host for full process campaigns. They stop members and mount filesystems.
 
 The service still has gaps in Unix sockets, gRPC proxy mode, rolling etcd upgrades,

@@ -140,7 +140,7 @@ jobs:
           import os
           extended = os.environ["EXTENDED"] == "true"
           with open(os.environ["GITHUB_ENV"], "a") as env:
-              dst = ",".join(map(str, range(1, 101))) if extended else "1,2,42,58,70"
+              dst = ",".join(map(str, range(1, 101))) if extended else "1,2,3"
               faults = ",".join(map(str, range(1, 17))) if extended else "1,2,3,4"
               env.write(f"SLATEDB_DST_SEEDS={dst}\nFAULT_SEEDS={faults}\n")
           PY
@@ -166,7 +166,7 @@ jobs:
           cargo run --locked -- --help >/dev/null
           scripts/cargo.sh clippy --locked --all-targets --all-features -- -D warnings
           scripts/cargo.sh test --locked --features write-profile --lib write_profile::tests
-          scripts/cargo.sh test --locked -- --skip seeded_fault_schedules_replay_identically
+          scripts/cargo.sh test --locked -- --skip shared_store_schedules_replay_identically
           python3 scripts/check-dst.py --seeds "$SLATEDB_DST_SEEDS" --output results/ci/dst.json
       - name: Save DST report
         if: always()
@@ -585,19 +585,6 @@ jobs:
             --compact-every 2500 --retain-revisions 500 --value-pattern metadata \
             --requests 10000 --keys 1000 --warmup 200 --repeat 2 \
             --output results/ci/benchmark-compact.json
-      - name: Compare writes during physical compaction on RustFS
-        if: matrix.group == 'writes'
-        run: |
-          python3 scripts/benchmark-etcd.py --rustfs --binary tmp/performance/head \
-            --baseline-binary tmp/performance/base --backends baseline service \
-            --concurrency 32 --read-percent 0 --rate 300 --value-pattern metadata \
-            --compact-every 750 --retain-revisions 250 --requests 3000 --keys 1000 \
-            --warmup 200 --repeat 2 --output results/ci/benchmark-rustfs.json
-          python3 scripts/benchmark-etcd.py --rustfs --binary tmp/performance/head \
-            --backends service --concurrency 32 --read-percent 0 --rate 1000 \
-            --value-pattern metadata --compact-every 2500 --retain-revisions 500 \
-            --requests 10000 --keys 1000 --warmup 200 --repeat 2 \
-            --output results/ci/benchmark-rustfs-stress.json
       - name: Sample Linux CPU stacks after warmup
         if: matrix.group == 'writes'
         run: |

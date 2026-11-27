@@ -10,7 +10,7 @@ Use `tmp/test-results/` for local output unless you intend to update a retained 
 | `etcd-admin-recovery.json` | Learner lifecycle, strict promotion, and minority queries |
 | `etcd-compatibility.json` | Local client profile recorded during the administration work |
 | `etcd-core-fault-tests.json` | Eight process fault checks |
-| `dst.json` | 100 deterministic seeds, each replayed twice |
+| `dst.json` | Three shared state seeds, each replayed twice |
 | `robustness.json` | Four process campaigns checked by the etcd model, Knossos, and Elle |
 | `etcd-upstream.json` | Earlier imported-suite record; predates administration support |
 | `fault-tests.json` | Original three-replica experiment |
