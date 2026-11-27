@@ -5,11 +5,15 @@
 //!
 //! - **Behind:** a new writer waits until its clock passes the manifest tick. Over the skew
 //!   limit it does not start. See `Clock::pass`.
-//! - **Ahead:** the leader probes the clock of each voter. The bound of a tick is the `m`-th
-//!   largest clock of all voters plus the skew limit, where `m` is a majority. The leader reads
-//!   its own clock fresh at each check. A skew is measured only when no majority can support
-//!   the leader clock, also with each missing voter on the leader's side. Otherwise it is
-//!   uncertain, and ticks stay at the bound. See `Clock::verdict`.
+//! - **Cap:** the leader probes the clock of each voter. The bound of a tick is the `m`-th
+//!   largest clock of all voters plus the skew limit, where `m` is a majority. Each batch gets
+//!   the tick `max(last, min(now, bound))`. So a persisted tick is at most the skew limit above
+//!   the voter-majority clock estimated at admission, from fresh samples. The leader reads its
+//!   own clock fresh at each check. See `Clock::verdict`.
+//!
+//! A leader clock above the bound is a diagnostic only: `/status` shows it as `ahead_ms`, and
+//! its ticks stay at the bound. It is measured only when no majority can support the leader
+//! clock, also with each missing voter on the leader's side. Otherwise it is uncertain.
 //!
 //! `Gate` is the SlateDB clock of one writer `Db`. It belongs to the term of its open, and it
 //! freezes when that term ends. See `Gate`.
@@ -106,7 +110,7 @@ struct Voters {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Bound {
     /// The `m`-th largest voter clock plus the skew limit. A tick at or below it is at most the
-    /// skew limit above a majority of the voters.
+    /// skew limit above the voter-majority clock estimated at admission.
     pub cap: i64,
     /// The leader clock now.
     pub real: i64,
@@ -132,7 +136,7 @@ impl Voters {
     }
 }
 
-/// The decision of the ahead check at one time.
+/// The decision of the clock check at one time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Verdict {
     /// This member does not lead. No tick is authorized.
@@ -145,7 +149,8 @@ pub(super) enum Verdict {
     /// that supports it. This is no measured skew: ticks stay at the cap, and no alarm rises.
     Uncertain(Bound),
     /// The leader clock is above the bound also at the high edge of each window, and also when
-    /// each missing voter agrees with the leader. It is `by` milliseconds ahead.
+    /// each missing voter agrees with the leader. It is `by` milliseconds ahead. This is a
+    /// diagnostic only: ticks stay at the cap.
     Ahead { by: i64, bound: Bound },
     /// The leader clock is within the bound.
     Admit(Bound),
@@ -155,7 +160,6 @@ pub(super) enum Verdict {
 /// and the high edge of its window. The leader's own entry has equal edges.
 #[derive(Clone, Copy, Debug)]
 struct Entry {
-    id: u64,
     low: i64,
     high: i64,
 }
@@ -163,7 +167,6 @@ struct Entry {
 /// The clocks of the voters at one monotonic time `now`: the leader read now, and each peer
 /// with a fresh sample.
 struct Order {
-    me: u64,
     majority: usize,
     entries: Vec<Entry>,
     /// Voters other than the leader without a fresh sample.
@@ -177,7 +180,6 @@ impl Order {
         if held.voters.contains_key(&held.me) {
             let own = real.saturating_sub(now);
             entries.push(Entry {
-                id: held.me,
                 low: own,
                 high: own,
             });
@@ -190,7 +192,6 @@ impl Order {
                 .filter(|sample| now - sample.at < FRESH_MS);
             match fresh {
                 Some(sample) => entries.push(Entry {
-                    id,
                     low: sample.low,
                     high: sample.high,
                 }),
@@ -198,7 +199,6 @@ impl Order {
             }
         }
         Self {
-            me: held.me,
             majority: held.voters.len() / 2 + 1,
             entries,
             missing,
@@ -363,9 +363,10 @@ impl Clock {
     ///
     /// The bound is the `m`-th largest clock of all voters plus the skew limit, where `m` is a
     /// majority. The leader reads its own clock now. `cap` uses the low edge of each peer
-    /// window, so a tick at or below it is never too far ahead of a majority. A measured skew
-    /// uses the high edges and counts each missing voter as one that agrees with the leader, so
-    /// neither a slow reply nor a missing one alone refuses.
+    /// window, so a tick at or below it is at most the skew limit above the voter-majority clock
+    /// estimated at admission. The `ahead` diagnostic uses the high edges and counts each missing
+    /// voter as one that agrees with the leader, so neither a slow reply nor a missing one alone
+    /// raises it.
     pub(super) fn verdict(&self) -> Verdict {
         self.decide().2
     }
@@ -452,7 +453,7 @@ impl Clock {
         self.note(&self.verdict());
     }
 
-    /// This member stopped leading. Its samples and its alarms of the ahead check end. A writer
+    /// This member stopped leading. Its samples and its `ahead` diagnostic end. A writer
     /// `Db` of the ended term keeps its last tick. See `Gate`.
     pub(in crate::node) fn stand_down(&self) {
         // A stand-down does not make a clock managed: a test of the writer alone stays so.
@@ -460,25 +461,6 @@ impl Clock {
         self.note_ahead(None);
         self.uncertain.store(false, Ordering::Relaxed);
         self.waiting.store(false, Ordering::Relaxed);
-    }
-
-    /// The voters that the ahead check would refuse as leader: their clock is above the `m`-th
-    /// largest voter clock plus the skew limit. The order is the one of `verdict`, with the
-    /// leader's own clock read now. A voter without a fresh sample is not in the set.
-    pub(in crate::node) fn above(&self) -> HashSet<u64> {
-        let held = self.voters.lock().unwrap();
-        let order = Order::new(&held, (self.mono_ms)(), (self.now_ms)());
-        drop(held);
-        let Some(mth) = order.mth(|entry| entry.low, 0) else {
-            return HashSet::new();
-        };
-        let limit = mth.saturating_add(self.max_skew.as_millis() as i64);
-        order
-            .entries
-            .iter()
-            .filter(|entry| entry.id != order.me && entry.low.saturating_add(order.now) > limit)
-            .map(|entry| entry.id)
-            .collect()
     }
 
     /// The alarm of the clock checks: `behind`, `ahead`, or none.
@@ -516,7 +498,7 @@ impl Clock {
         let _ = tokio::time::timeout(most, sampled).await;
     }
 
-    /// Wait until the ahead check can decide, and return the SlateDB clock of a new writer.
+    /// Wait until the clock check can decide, and return the SlateDB clock of a new writer.
     ///
     /// The gate belongs to the term that this member leads now. A leader of several voters
     /// waits for the samples of a majority before its open, and its `Db` never reads a time
@@ -607,30 +589,12 @@ const NO_SAMPLES: &str = "too few voters have a fresh clock sample";
 /// The wait reason of a writer whose last tick is above the bound.
 const ABOVE_CAP: &str = "the last tick is above the clock bound of a voter majority";
 
-/// A batch refusal: the leader clock is ahead of a voter majority over the skew limit. The
-/// writer reports it as a `Fault::Clock`.
-#[derive(Debug)]
-pub(in crate::node) struct ClockAhead {
-    pub by_ms: i64,
-}
-
-impl std::fmt::Display for ClockAhead {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the local clock is {} ms ahead of a voter majority over the skew limit",
-            self.by_ms
-        )
-    }
-}
-
-impl std::error::Error for ClockAhead {}
-
 /// The SlateDB clock of one writer `Db`.
 ///
 /// `admit` fixes the tick of each batch before the materializer submits it:
 /// `max(last, min(now, cap))`. The tick must be at or below the cap, so a retained `last` that
-/// a backward step left above the bound waits. Until the batch completes, `now` returns exactly
+/// a backward step left above the bound waits. So a persisted tick is at most the skew limit
+/// above a voter majority. Until the batch completes, `now` returns exactly
 /// that tick, so the batch writer of SlateDB stamps the batch with it. A later step of the wall
 /// clock or a change of the samples cannot change it.
 ///
@@ -681,8 +645,6 @@ enum Step {
     Pinned(Verdict),
     /// Wait for a sample, at most the time given, then decide again.
     Wait(&'static str, Duration, Option<Verdict>),
-    /// The leader clock is ahead of a voter majority by the given milliseconds.
-    Refuse(Verdict, i64),
     /// The term of the gate ended.
     Ended,
 }
@@ -741,7 +703,7 @@ impl Gate {
         clock.with_verdict(|_, lead, verdict| self.owned(lead, verdict).is_some())
     }
 
-    /// A clock with no ahead check, for tests that drive the materializer alone.
+    /// A clock with no cap, for tests that drive the materializer alone.
     #[cfg(test)]
     pub(in crate::node) fn unchecked() -> Arc<Self> {
         Arc::new(Self::new(None, Mode::Test, None))
@@ -818,38 +780,31 @@ impl Gate {
     }
 
     /// Fix the tick of the next batch. Wait while too few voters have a fresh sample, or while
-    /// the cap is below the last tick, as after an open above the cap or a backward step.
-    /// Refuse the batch with a `ClockAhead` error when the leader clock is ahead of a voter
-    /// majority. The batch then stays in the overlay, and the next writer writes it again.
-    /// After the term of the gate ends, no batch gets a tick: the call waits until the node
-    /// stops the writer task. The verdict and the pin of the tick run in one
-    /// `Clock::with_verdict`.
-    pub(in crate::node) async fn admit(&self) -> Result<Admitted<'_>> {
+    /// the cap is below the last tick, as after an open above the cap or a backward step. A
+    /// leader clock above the cap gets the cap. After the term of the gate ends, no batch gets
+    /// a tick: the call waits until the node stops the writer task. The verdict and the pin of
+    /// the tick run in one `Clock::with_verdict`.
+    pub(in crate::node) async fn admit(&self) -> Admitted<'_> {
         let Some(clock) = &self.clock else {
-            return Ok(Admitted { gate: self });
+            return Admitted { gate: self };
         };
         loop {
             let step = clock.with_verdict(|_, lead, verdict| self.step(lead, verdict));
             match step {
                 Step::Unpinned => {
                     clock.set_waiting(None);
-                    return Ok(Admitted { gate: self });
+                    return Admitted { gate: self };
                 }
                 Step::Pinned(verdict) => {
                     clock.note(&verdict);
                     clock.set_waiting(None);
-                    return Ok(Admitted { gate: self });
+                    return Admitted { gate: self };
                 }
                 Step::Wait(reason, wait, verdict) => {
                     if let Some(verdict) = verdict {
                         clock.note(&verdict);
                     }
                     clock.wait(reason, wait).await;
-                }
-                Step::Refuse(verdict, by) => {
-                    clock.set_waiting(None);
-                    clock.note(&verdict);
-                    return Err(ClockAhead { by_ms: by }.into());
                 }
                 Step::Ended => {
                     clock.set_waiting(None);
@@ -869,8 +824,10 @@ impl Gate {
             Verdict::Off | Verdict::Single(_) if !guarded => return Step::Unpinned,
             Verdict::Off => return Step::Ended,
             Verdict::Waiting => return Step::Wait(NO_SAMPLES, RECHECK, None),
-            Verdict::Ahead { by, .. } => return Step::Refuse(verdict, by),
-            Verdict::Single(bound) | Verdict::Uncertain(bound) | Verdict::Admit(bound) => bound,
+            Verdict::Single(bound)
+            | Verdict::Uncertain(bound)
+            | Verdict::Ahead { bound, .. }
+            | Verdict::Admit(bound) => bound,
         };
         let mut ticks = self.ticks.lock().unwrap();
         let tick = ticks.last.max(bound.real.min(bound.cap));

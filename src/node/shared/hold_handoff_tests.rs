@@ -8,7 +8,6 @@ fn candidate(id: u64, matched: u64) -> Candidate {
         id,
         matched,
         process: Some(id),
-        clock_ahead: false,
     }
 }
 

@@ -182,7 +182,7 @@ checkpoint of it, its base, under an in-memory overlay of the newer applied batc
 | `--view-max-age` | `10s` | Age of the oldest unflushed write that starts a flush and checkpoint. |
 | `--view-pin-max` | `5m` | Age after which a read view fails with a retryable error. |
 | `--overlay-max-bytes` | 1073741824 | Leader admission limit of the overlay. Apply waits at 2x. |
-| `--max-clock-skew` | `5s` | Writer clock limit: behind the manifest, or ahead of voters. |
+| `--max-clock-skew` | `5s` | Writer clock limit: behind the manifest, or above voters. |
 | `--view-retention` | `off` | `off` keeps all view checkpoints. `fenced` deletes unpinned ones. |
 
 Rules and limits:
@@ -207,10 +207,10 @@ Rules and limits:
   error, sets `clock_alarm` to `behind` in `/status`, exports
   `slatedb_etcd_shared_clock_skew_milliseconds`, and tries again with a backoff. After three
   refusals the leader hands over the lead.
-- A leader of several voters probes the clock of each voter every 500 ms. It writes no tick more
-  than `--max-clock-skew` above the clocks of a voter majority. A leader clock that is further
-  ahead refuses each batch and sets `clock_alarm` to `ahead`. After three refusals the leader
-  hands over the lead. No client request fails, because the overlay keeps the batches.
+- A leader of several voters probes the clock of each voter every 500 ms. It caps each tick at
+  `--max-clock-skew` above the voter-majority clock that it estimates at admission. A leader
+  clock that is further ahead writes at the cap and sets `clock_alarm` to `ahead`. This is a
+  diagnostic, not a fault.
 - A writer without fresh clock samples of a voter majority waits. `/status` shows
   `clock.waiting`, and `slatedb_etcd_shared_writer_clock_waiting` is 1. A wait that holds a
   batch for 30 s is a `stalled` fault. A skew that missing voters could still support is

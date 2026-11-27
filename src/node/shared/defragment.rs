@@ -55,7 +55,7 @@ impl Defragment {
         let lost = || {
             KvError::new(
                 tonic::Code::Unavailable,
-                "etcdserver: the leader changed during Defragment; retry",
+                "the leader changed during Defragment; retry",
             )
         };
         let term = self.term;
@@ -73,7 +73,7 @@ impl Defragment {
             } else if fault::id_time_refused(&error) {
                 KvError::new(
                     tonic::Code::Unavailable,
-                    "etcdserver: a newer compaction job stands above the writer clock; retry",
+                    "a newer compaction job stands above the writer clock; retry",
                 )
             } else {
                 KvError::storage(error)
@@ -106,7 +106,7 @@ impl Defragment {
         let timeout = || {
             KvError::new(
                 tonic::Code::Unavailable,
-                "etcdserver: Defragment did not publish its checkpoint in time; retry",
+                "Defragment did not publish its checkpoint in time; retry",
             )
         };
         loop {

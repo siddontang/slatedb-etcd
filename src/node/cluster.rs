@@ -646,10 +646,7 @@ mod tests {
             let gate = gate.clone();
             async move {
                 let admitted = tokio::time::timeout(Duration::from_millis(300), gate.admit());
-                admitted
-                    .await
-                    .map(|admitted| admitted.unwrap().done())
-                    .is_ok()
+                admitted.await.map(|admitted| admitted.done()).is_ok()
             }
         };
         assert!(admit(&gate).await, "a lone voter waited");
