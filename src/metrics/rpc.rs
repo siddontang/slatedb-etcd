@@ -54,7 +54,7 @@ pub(crate) struct Method {
 }
 
 impl Observer {
-    pub fn new(registry: &Registry, level: crate::server::MetricsLevel) -> Result<Self> {
+    pub fn new(registry: &Registry, level: super::MetricsLevel) -> Result<Self> {
         let vector = |name, help, labels: &[&str]| -> Result<IntCounterVec> {
             let value = IntCounterVec::new(Opts::new(name, help), labels)?;
             registry.register(Box::new(value.clone()))?;
@@ -79,8 +79,8 @@ impl Observer {
             &["type", "client_api_version"],
         )?;
         let duration = match level {
-            crate::server::MetricsLevel::Basic => None,
-            crate::server::MetricsLevel::Extensive => Some(super::state::register(
+            super::MetricsLevel::Basic => None,
+            super::MetricsLevel::Extensive => Some(super::state::register(
                 registry,
                 prometheus::HistogramVec::new(
                     prometheus::HistogramOpts::new(

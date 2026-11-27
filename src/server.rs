@@ -15,13 +15,7 @@ use crate::grpc::app::{App, Listener};
 use crate::node::{Event, LogMemory, Node, NodeOptions};
 use crate::proto::etcdserverpb::{request_op, RangeRequest, RequestOp};
 
-/// Select the etcd Prometheus collection level.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
-pub enum MetricsLevel {
-    #[default]
-    Basic,
-    Extensive,
-}
+pub use crate::metrics::MetricsLevel;
 
 /// The default age limit of unflushed shared-mode writes.
 pub const DEFAULT_VIEW_MAX_AGE: Duration = Duration::from_secs(10);

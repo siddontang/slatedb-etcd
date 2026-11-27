@@ -139,6 +139,13 @@ pub enum Event {
     },
 }
 
+/// A metrics scrape asks the event loop for a sample.
+impl From<oneshot::Sender<crate::metrics::Sample>> for Event {
+    fn from(response: oneshot::Sender<crate::metrics::Sample>) -> Self {
+        Event::Metrics(response)
+    }
+}
+
 /// Flush SlateDB for log truncation about once per L0 SST instead of once per entry interval.
 pub const DEFAULT_SNAPSHOT_MIN_BYTES: u64 = 64 * 1024 * 1024;
 
