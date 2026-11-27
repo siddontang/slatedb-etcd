@@ -1972,7 +1972,8 @@ async fn only_a_lone_voter_leads_before_its_first_event() {
         let (status, first) = oneshot::channel();
         events.send(Event::Status(status)).await.unwrap();
         let (stop, stopped) = oneshot::channel::<()>();
-        let run = tokio::spawn(node.run_until(receiver, async {
+        let (_, peers) = mpsc::channel(1);
+        let run = tokio::spawn(node.run_until(receiver, peers, async {
             let _ = stopped.await;
         }));
         let first = match tokio::time::timeout(Duration::from_secs(10), first)
