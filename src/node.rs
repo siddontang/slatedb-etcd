@@ -1559,9 +1559,7 @@ impl Node {
                 waiting.push((index, response));
             }
         }
-        for (index, response) in waiting {
-            self.checkpoints.wait(index, response);
-        }
+        self.checkpoints.requeue(waiting);
         if self.checkpoints.waiting() > 0 {
             self.schedule_apply()?;
         }

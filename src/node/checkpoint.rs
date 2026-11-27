@@ -181,10 +181,19 @@ impl Checkpointer {
         self.waiters.push((index, response));
     }
 
-    /// Take the waiting requests. The caller calls `wait` again for each request that still
-    /// waits.
+    /// Take the waiting requests. The caller gives back the requests that still wait with
+    /// `requeue`.
     pub(super) fn take_waiters(&mut self) -> Vec<(u64, Response)> {
         std::mem::take(&mut self.waiters)
+    }
+
+    /// Give back the requests that still wait after `take_waiters`.
+    pub(super) fn requeue(&mut self, waiting: Vec<(u64, Response)>) {
+        if self.waiters.is_empty() {
+            self.waiters = waiting;
+        } else {
+            self.waiters.extend(waiting);
+        }
     }
 
     /// The highest index of a waiting request.
