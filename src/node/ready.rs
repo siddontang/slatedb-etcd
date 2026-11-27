@@ -84,7 +84,7 @@ impl Node {
             self.join_queued_ready()?;
             // raft-rs permits leader replication before local persistence.
             self.send(early);
-            for (peer, snapshot) in std::mem::take(&mut self.send_failures) {
+            for (peer, snapshot) in self.links.take_failures() {
                 self.raw.report_unreachable(peer);
                 if snapshot {
                     self.raw.report_snapshot(peer, SnapshotStatus::Failure);

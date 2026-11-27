@@ -26,6 +26,7 @@ mod cluster;
 mod compaction;
 mod forwarding;
 mod lease;
+mod links;
 mod log;
 mod maintenance;
 mod proposal;
@@ -43,7 +44,6 @@ mod schedule;
 mod shared;
 mod step;
 mod watch;
-use crate::peer::transport_to;
 use apply::{AppliedState, Completion, Header, Job, Output, Query, Reply, Work, Worker};
 use response::ClientResponse;
 pub use response::KvReply;
@@ -256,7 +256,6 @@ pub struct Node {
     /// The cluster and the shared store that this member names on its peer traffic.
     peer: crate::peer::Identity,
     last_observed_leader: u64,
-    traffic: BTreeMap<u64, std::sync::Arc<crate::metrics::PeerTraffic>>,
     watch_feed: watch::Publisher,
     forwarding: forwarding::Publisher,
     compaction: compaction::Flush,
@@ -264,7 +263,6 @@ pub struct Node {
     published_at: Option<Instant>,
     events: mpsc::Sender<Event>,
     manual_transport: bool,
-    peer_health: BTreeMap<u64, Instant>,
     raw: RawNode<log::Cache>,
     log_worker: log::Worker,
     log_queue: VecDeque<LogTask>,
@@ -297,17 +295,14 @@ pub struct Node {
     prefer_query: bool,
     apply_delay_ms: u64,
     options: NodeOptions,
-    senders: BTreeMap<u64, mpsc::Sender<Message>>,
-    /// The URL that each peer sender uses on its next dial.
-    peer_addresses: BTreeMap<u64, tokio::sync::watch::Sender<String>>,
-    transports: tokio::task::JoinSet<()>,
+    /// The queue, transport task, meter, and health of each peer link. See `links`.
+    links: links::PeerLinks,
     pending: HashMap<String, Pending>,
     put_proposals: proposal::Group,
     waiting_proposals: proposal::Waiting,
     blocked: BTreeSet<u64>,
     installed_snapshots: u64,
     recovered_from_index: u64,
-    send_failures: Vec<(u64, bool)>,
     /// The checkpoint schedule and the manual checkpoint requests. See `checkpoint`.
     checkpoints: checkpoint::Checkpointer,
     // Full backlog checks by cause: apply lag, queued log jobs, queued log bytes,
@@ -504,32 +499,15 @@ impl Node {
             store: Some(state.store_id().to_string()),
         };
         state.set_open_retries(!manual_apply);
-        let mut traffic = BTreeMap::<u64, std::sync::Arc<crate::metrics::PeerTraffic>>::new();
-        let mut transports = tokio::task::JoinSet::new();
-        let mut peer_addresses = BTreeMap::new();
-        let senders = if let Some(senders) = transport_override {
-            senders
-        } else {
-            let mut senders = BTreeMap::new();
-            for (&peer, address) in &options.peers {
-                if peer == options.id {
-                    continue;
-                }
-                let (tx, rx) = mpsc::channel(256);
-                senders.insert(peer, tx);
-                let (address_tx, address_rx) = tokio::sync::watch::channel(address.clone());
-                peer_addresses.insert(peer, address_tx);
-                transports.spawn(transport_to(
-                    peer,
-                    address_rx,
-                    identity.clone(),
-                    rx,
-                    events.clone(),
-                    options.transport.clone(),
-                    traffic.entry(peer).or_default().clone(),
-                ));
-            }
-            senders
+        let links = match transport_override {
+            Some(senders) => links::PeerLinks::manual(senders),
+            None => links::PeerLinks::dial(
+                options.id,
+                &options.peers,
+                &identity,
+                &events,
+                &options.transport,
+            ),
         };
         let applied = AppliedState::new(&state)?;
         let metrics = std::sync::Arc::new(crate::metrics::Member::new(
@@ -582,7 +560,6 @@ impl Node {
             clock_in_manual: false,
             metrics,
             last_observed_leader: 0,
-            traffic,
             watch_feed: watch::Publisher::new(crate::watch::FeedState {
                 view: applied.read.clone(),
                 header: ResponseHeader::default(),
@@ -598,7 +575,6 @@ impl Node {
             published_at: None,
             events,
             manual_transport: manual_apply,
-            peer_health: BTreeMap::new(),
             raw,
             log_worker,
             log_queue: VecDeque::new(),
@@ -627,16 +603,13 @@ impl Node {
             apply_delay_ms: 0,
             options,
             peer: identity,
-            senders,
-            peer_addresses,
-            transports,
+            links,
             pending: HashMap::new(),
             put_proposals: proposal::Group::default(),
             waiting_proposals: proposal::Waiting::default(),
             blocked: BTreeSet::new(),
             installed_snapshots: 0,
             recovered_from_index,
-            send_failures: vec![],
             checkpoints: checkpoint::Checkpointer::new(next_checkpoint),
             backlog_rejects: [0; 5],
             request_timeout: REQUEST_TIMEOUT,
@@ -754,7 +727,7 @@ impl Node {
         };
         // A stopped owner no longer applies entries. Its last view must not serve reads.
         self.forwarding.publish_local(None);
-        self.transports.shutdown().await;
+        self.links.shutdown().await;
         // Keep the Raft directory locked until the state worker has stopped.
         self.compaction.cancel();
         self.writer.stop().await;
@@ -880,11 +853,7 @@ impl Node {
 
     async fn handle(&mut self, event: Event, step_responses: &mut Vec<Response>) -> Result<()> {
         let event = if let Event::PeerFrame(message, bytes, tx) = event {
-            if let Some(meter) = self.traffic.get(&message.from) {
-                meter
-                    .received
-                    .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
-            }
+            self.links.received(message.from, bytes);
             Event::Step(message, tx)
         } else {
             event
@@ -1130,17 +1099,13 @@ impl Node {
                         self.state.compact_revision
                     },
                     auth_revision: self.state.auth.revision,
-                    traffic: self
-                        .traffic
-                        .iter()
-                        .map(|(&id, meter)| (id, meter.clone()))
-                        .collect(),
+                    traffic: self.links.traffic(),
                     peers: self
                         .state
                         .members
                         .members
                         .keys()
-                        .map(|&id| (id, self.peer_health.contains_key(&id)))
+                        .map(|&id| (id, self.links.connected_since(id).is_some()))
                         .collect(),
                 });
             }
@@ -1226,15 +1191,7 @@ impl Node {
                 snapshot,
                 success,
             } => {
-                if success {
-                    self.peer_health.entry(peer).or_insert_with(Instant::now);
-                } else if self.peer_health.remove(&peer).is_some() {
-                    if let Some(meter) = self.traffic.get(&peer) {
-                        meter
-                            .disconnected
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
+                self.links.reported(peer, success);
                 if snapshot {
                     self.raw.report_snapshot(
                         peer,
@@ -1444,19 +1401,7 @@ impl Node {
             } else {
                 crate::failpoint::hit("raft-before-follower-send");
             }
-            let peer = message.to;
-            let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
-            let sent = !self.blocked.contains(&peer)
-                && self
-                    .senders
-                    .get(&peer)
-                    .is_some_and(|sender| sender.try_send(message).is_ok());
-            if !sent {
-                if let Some(meter) = self.traffic.get(&peer) {
-                    meter.failed(1);
-                }
-                self.send_failures.push((peer, snapshot));
-            }
+            self.links.send(message, &self.blocked);
         }
     }
 
