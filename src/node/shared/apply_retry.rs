@@ -353,7 +353,8 @@ impl Executor {
 
     /// Rebase the state at `applied`. A failed load leaves the state as it was, and a failed
     /// replay leaves a state below `applied`. Both run the rebase again after a storage error
-    /// of a read. A snapshot that covers `applied + 1` ends the wait. See
+    /// of a read. A missing object or corrupt data holds, as for an install: a follower then
+    /// asks for a snapshot. A snapshot that covers `applied + 1` ends the wait. See
     /// `StateMachine::adopt_base`.
     async fn rebase_retrying(&mut self, header: Header, applied: u64) -> Result<Waited> {
         let mut retry = Retry::default();
@@ -366,7 +367,10 @@ impl Executor {
                 return Err(error);
             };
             let index = applied + 1;
-            if retry.wait(&mut self.signals, index, fault, &error).await? == Waited::Covered {
+            let waited = retry
+                .wait_base(&mut self.signals, index, fault, &error)
+                .await?;
+            if waited == Waited::Covered {
                 retry.done(&self.signals);
                 return Ok(Waited::Covered);
             }

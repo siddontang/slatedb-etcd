@@ -1822,6 +1822,55 @@ async fn automatic_checkpoints_wait_for_appended_log_bytes() {
     assert!(!node.checkpoint_running);
 }
 
+/// A Checkpoint job fails on a storage read. The node goes on and keeps its Raft snapshot
+/// record. It waits before the next checkpoint, and that checkpoint replaces the record.
+#[tokio::test]
+async fn a_failed_checkpoint_read_keeps_the_node_and_its_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    let index = node.state.applied;
+    let record = node.raw.store().snapshot_index();
+    assert!(index > record);
+    // A membership change makes a checkpoint at `index` due.
+    node.state.view.0 = index;
+    node.membership_checkpoint = index;
+    assert_eq!(node.checkpoint_due(), Some(false));
+    node.checkpoint_running = true;
+    let conf = node.state.members.conf();
+    let failed = apply::Built {
+        index,
+        conf: conf.clone(),
+        result: Err(anyhow::Error::new(crate::mvcc::storage_fault::Classified {
+            fault: crate::mvcc::storage_fault::StorageFault::Transient,
+            message: "the store failed".into(),
+        })),
+    };
+    node.finish_output(Output::Checkpoint(Some(failed)))
+        .unwrap();
+    assert!(!node.checkpoint_running);
+    // The next checkpoint waits, so apply can run other jobs meanwhile.
+    assert_eq!(node.checkpoint_due(), None);
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    assert!(!node.checkpoint_running);
+    assert_eq!(node.raw.store().snapshot_index(), record);
+    // The wait ends, and the next checkpoint succeeds.
+    node.checkpoint_retry_at = None;
+    assert_eq!(node.checkpoint_due(), Some(false));
+    node.checkpoint_running = true;
+    let image = PreparedCheckpoint::write(&dir.path().join("raft"), b"image".to_vec().into());
+    let built = apply::Built {
+        index,
+        conf,
+        result: Ok(Some(image.unwrap())),
+    };
+    node.finish_output(Output::Checkpoint(Some(built))).unwrap();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    assert_eq!(node.raw.store().snapshot_index(), index);
+    assert!(!node.checkpoint_running);
+}
+
 #[tokio::test]
 async fn state_behind_a_truncated_log_stops_startup() {
     let dir = tempfile::tempdir().unwrap();

@@ -504,7 +504,18 @@ impl Executor {
                 }
             },
             Job::Checkpoint { delay, dir } => {
-                let (index, conf, job) = self.state.checkpoint_parts().await?;
+                // The node decides if the error stops it. See `Node::checkpoint_built`.
+                let (index, conf, job) = match self.state.checkpoint_parts().await {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        let built = Built {
+                            index: self.state.applied,
+                            conf: Default::default(),
+                            result: Err(error),
+                        };
+                        return self.completion(Output::Checkpoint(Some(built)), early, None);
+                    }
+                };
                 let build = async move {
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;

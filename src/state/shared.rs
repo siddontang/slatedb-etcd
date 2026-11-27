@@ -699,8 +699,8 @@ pub(crate) async fn retain(
 
 /// Open the newest `view-` checkpoint at or below index `limit` that holds the membership.
 ///
-/// A checkpoint that retention deleted after the listing is skipped. An older base can then need
-/// log entries that the member truncated, and the replay of the rebase fails on them.
+/// A checkpoint that retention deleted after the listing is skipped. The rebase does not use a
+/// base below its base index.
 async fn newest_base_through(
     admin: &slatedb::admin::Admin,
     source: &Source,
@@ -1237,10 +1237,14 @@ impl Shared {
         true
     }
 
-    /// Make `base` the whole state and drop the overlay. Install and rebase use this.
-    fn reset(&mut self, base: Arc<Base>) {
+    /// Make `base` the whole state through `index` and drop the overlay. Install and rebase
+    /// use this. A base above its row goes out at `index` at once.
+    fn reset(&mut self, base: Arc<Base>, index: u64) {
         self.overlay.reset(base.applied);
-        let index = base.applied;
+        if index > base.applied {
+            self.extensions += 1;
+            self.overlay.cover(index);
+        }
         self.set_base(base, index);
     }
 

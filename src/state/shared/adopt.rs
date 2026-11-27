@@ -8,14 +8,21 @@ impl StateMachine {
     /// hold the matching boundary: a received snapshot, or a log that covers `F`.
     ///
     /// `term` is the Raft term at `F` when the caller knows it. A known checkpoint term must
-    /// match it.
+    /// match it. `above` gives a base index above `F` and the Raft term there, when the caller
+    /// knows that no entry in between changed state. The base then goes out at that index at
+    /// once, so no reader sees the base index at `F`.
     ///
     /// The candidate loads and passes its checks on a view of the base alone first. Only then
     /// does the state drop its overlay and its materializer queue. A failed read leaves the
     /// state as it was, so the caller can try again. A storage error of a load read keeps its
     /// class, because the load changes nothing. Any other load error comes from the rows of the
     /// base, so it is corrupt stored data.
-    pub(crate) async fn adopt_base(&mut self, base: Arc<Base>, term: u64) -> Result<()> {
+    pub(crate) async fn adopt_base(
+        &mut self,
+        base: Arc<Base>,
+        term: u64,
+        above: Option<(u64, u64)>,
+    ) -> Result<()> {
         let reads = StateView::Shared(SharedView::new(
             base.clone(),
             Arc::from([Arc::default()]),
@@ -44,9 +51,13 @@ impl StateMachine {
                 next.applied_term
             );
         }
+        if let Some((index, term)) = above {
+            next.extend_base(index, term)?;
+        }
         // The candidate is valid. Nothing below fails, so the switch is whole.
+        let index = next.shared.base_index;
         std::mem::swap(&mut next.shared, &mut self.shared);
-        next.shared.reset(base);
+        next.shared.reset(base, index);
         next.reads = next.shared.live();
         if next.applied_term == 0 {
             next.applied_term = term;
@@ -76,6 +87,10 @@ impl StateMachine {
     /// The log can start above the newest checkpoint row: a member truncates through its base
     /// index. If no newer checkpoint reaches that index, the rebase opens the current base again
     /// and raises it to its index. `term` gives the Raft term at an index of the local log.
+    ///
+    /// The base index never goes down. So when the current base is gone and no checkpoint has
+    /// its row from the base index to `limit`, the rebase fails with a missing object and
+    /// changes nothing. An older checkpoint cannot serve, and a newer one needs a snapshot.
     pub(crate) async fn rebase(
         &mut self,
         limit: u64,
@@ -100,9 +115,14 @@ impl StateMachine {
                     .await
                     .map_err(mark)?
             }
-            (Some(base), _) => base,
-            (None, _) => {
-                bail!("the shared state has no view checkpoint at or below the rebase index")
+            _ => {
+                return Err(anyhow::Error::new(crate::mvcc::storage_fault::Classified {
+                    fault: crate::mvcc::storage_fault::StorageFault::Missing,
+                    message: format!(
+                        "the base is gone, and no view checkpoint has a row from the base \
+                         index {index} to the rebase index {limit}"
+                    ),
+                }))
             }
         };
         tracing::warn!(
@@ -113,19 +133,17 @@ impl StateMachine {
         );
         let extend = index > row && (row..index).contains(&base.applied);
         // Read the term first, so a failed log read leaves the state as it was.
-        let term = extend.then(|| term(index)).transpose()?;
-        self.adopt_base(base, 0).await?;
-        if let Some(term) = term {
-            self.extend_base(index, term)?;
-        }
-        Ok(())
+        let above = extend
+            .then(|| term(index).map(|term| (index, term)))
+            .transpose()?;
+        self.adopt_base(base, 0, above).await
     }
 
     /// Adopt the opened base above the applied index. A paused member uses this when its log
     /// commits the base index, so the Raft log needs no change. `term` is the log term there.
     pub(crate) async fn adopt_opened(&mut self, base: Arc<Base>, term: u64) -> Result<()> {
         ensure!(base.applied > self.applied, "the opened base is not ahead");
-        self.adopt_base(base, term).await
+        self.adopt_base(base, term, None).await
     }
 
     /// Install a format 6 snapshot: the checkpoint that Raft sent. The receive handler opened it.
@@ -188,10 +206,10 @@ impl StateMachine {
             base.applied
         );
         let row_term = if base.applied == index { term } else { 0 };
-        self.adopt_base(base, row_term).await?;
+        self.adopt_base(base, row_term, Some((index, term))).await?;
         // The state holds the base now, and the base pins its checkpoint.
         reader.take();
-        self.extend_base(index, term)
+        Ok(())
     }
 }
 

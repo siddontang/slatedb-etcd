@@ -470,19 +470,29 @@ setup, one read pass then ran at about 9,500 ops/s in both modes.
 
 ## Rebase
 
-A member rebases when its overlay is over the limit, or when a read or apply step finds a
-missing SST. Today a storage error in apply stops the node (`node/apply.rs:507-670`). In shared
-mode a missing SST rebases the member instead. Every other storage error still stops the node.
+A member rebases when an apply read finds a missing SST. See [Read faults](#read-faults). A
+storage error in apply does not stop the node. A paused member over the overlay limit adopts an
+opened base instead of a rebase. See the memory limit in [Overlay](#overlay).
 
-1. Stop apply and fail pending local reads with a retryable error.
-2. Open the newest `view-` checkpoint `C`.
-3. [Install](#install) `C`: a local rebuild if `F(C) <= applied`, otherwise an adopt.
-4. Resume apply above the new `applied`.
+1. Keep the entries that the job applied, with their replies. Publish no view until the rebase
+   ends.
+2. Open the newest `view-` checkpoint `C` with `F(C)` from the base index to `applied`. Skip a
+   checkpoint that is gone.
+3. [Install](#install) `C` as a local rebuild, and replay the local log to `applied`.
+4. Apply the rest of the job again.
 
 A rebase rescans the live data. It is the cost of losing a base, not of a leader change. The
 log can start above the newest checkpoint row. If no newer checkpoint reaches the base index,
 the rebase opens the current base again at its base index, with the log term there. If the base
 checkpoint is gone, it takes a checkpoint in the same range as a restart does.
+
+The base index never goes down (invariant 6). So a rebase does not use a checkpoint below the
+base index, also when the base is gone and only an older checkpoint is left. A rebase does not
+adopt a checkpoint above `applied` either. When no checkpoint is in the range, the rebase fails
+with a missing object and changes nothing. A missing object or corrupt data in a rebase holds
+apply on the next entry, as for an install. A held follower asks its leader for a snapshot, and
+the install of that snapshot adopts a base above the held entry. A transient error runs the
+rebase again after the backoff.
 
 ## Log truncation and Raft snapshots
 
@@ -832,8 +842,9 @@ serializable read, and the diagnostic reads use one rule, which the writer rule 
 - **Transient:** SlateDB `Unavailable` or a closed database, an object store error from a call
   outside SlateDB, or a store call past its deadline. The request fails with `Unavailable`, and
   the client retries.
-- **Missing:** a `Data` error with a missing object below it, or a read that held its view past
-  `--view-pin-max`. The request fails with `Unavailable`. The retry reads a newer view.
+- **Missing:** a `Data` error with a missing object below it, the open of a deleted checkpoint,
+  or a read that held its view past `--view-pin-max`. The request fails with `Unavailable`. The
+  retry reads a newer view.
 - **Corrupt:** any other SlateDB kind, or a stored row that does not decode. The request fails
   with `DataLoss`. The member logs an error and counts it in `slatedb_etcd_read_corrupt_total`.
 
@@ -880,6 +891,10 @@ A rebase replay that fails leaves the state below the end of the applied prefix 
 snapshot then ends the job, the job reports that end and no state. The entries that the node
 queued behind it end early and report the same index. The node starts no other job until the
 install, so a state read such as Status, HashKV, or a backup waits in its queue until then.
+
+A Checkpoint job reads the base membership for the ConfState of its Raft snapshot record. A
+storage error there fails only that checkpoint. The member keeps its record, and the next
+checkpoint starts after 1 s. Apply runs other jobs meanwhile.
 
 An early Put reply evaluates its entries before the state write, and they can be uncommitted. A
 storage error there does not retry, because a new leader can replace the entries. Early replies

@@ -54,6 +54,13 @@ impl Node {
         if self.base_below_record() {
             return None;
         }
+        // A failed checkpoint lets other apply jobs run before the next one.
+        if self
+            .checkpoint_retry_at
+            .is_some_and(|at| Instant::now() < at)
+        {
+            return None;
+        }
         // Shared mode records its base `F`. The log stays above the base, so the record needs
         // no flush, and any member can send it.
         let applied = self.checkpointable();
