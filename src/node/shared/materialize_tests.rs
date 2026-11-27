@@ -49,6 +49,7 @@ async fn an_idle_materializer_waits_past_a_released_batch() {
         queue,
         progress.clone(),
         clock::Gate::unchecked(),
+        0,
     ));
     let mut polls = 0;
     tokio::select! {

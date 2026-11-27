@@ -64,6 +64,7 @@ async fn the_materializer_writes_whole_batches_with_their_sequences() {
         replay.queue(),
         progress.clone(),
         clock::Gate::unchecked(),
+        0,
     ));
     progress.wait_written(4).await.unwrap();
     assert_eq!(db.snapshot().unwrap().seq(), 4);
@@ -91,9 +92,9 @@ fn flushes_follow_the_oldest_write_and_publication_requests() {
     // An idle writer has no deadline and no flush.
     assert_eq!(progress.deadline(long), None);
     assert_eq!(progress.take_flush(Duration::ZERO), (false, None));
-    progress.wrote(1);
+    progress.wrote(0, 1);
     let deadline = progress.deadline(long).unwrap();
-    progress.wrote(2);
+    progress.wrote(0, 2);
     // A later write keeps the deadline of the oldest unflushed write.
     assert_eq!(progress.deadline(long), Some(deadline));
     assert_eq!(progress.take_flush(long), (false, None));
@@ -103,7 +104,7 @@ fn flushes_follow_the_oldest_write_and_publication_requests() {
     // A request waits until the materializer writes its sequence.
     progress.request(3);
     assert_eq!(progress.take_flush(long), (false, None));
-    progress.wrote(3);
+    progress.wrote(0, 3);
     assert_eq!(progress.take_flush(long), (true, Some(3)));
     assert_eq!(progress.take_flush(long), (false, None));
     // A request that the written sequence already covers is due at once.

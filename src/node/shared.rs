@@ -28,6 +28,10 @@ pub(super) struct Progress {
     /// The sequence of the newest batch in the shared `Db`.
     written: tokio::sync::watch::Sender<u64>,
     wake: tokio::sync::Notify,
+    /// Tests: the next `wrote` takes the pair. It sends on the first and waits on the second
+    /// before it changes the progress.
+    #[cfg(test)]
+    hold: Mutex<Option<clock::ReadHold>>,
 }
 
 #[derive(Default)]
@@ -42,6 +46,9 @@ struct Inner {
     requested: Option<Instant>,
     /// The time of the oldest republish that no publication served yet.
     republished: Option<Instant>,
+    /// The writer opens so far. Only the materializer of the newest open moves `written`. A
+    /// stopped materializer of an older open can end after the newer open.
+    owner: u64,
 }
 
 impl Progress {
@@ -50,6 +57,8 @@ impl Progress {
             inner: Mutex::default(),
             written: tokio::sync::watch::channel(written).0,
             wake: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            hold: Mutex::default(),
         }
     }
 
@@ -57,9 +66,21 @@ impl Progress {
         *self.written.borrow()
     }
 
-    fn wrote(&self, seq: u64) {
-        self.written.send_replace(seq);
+    /// The materializer of open `owner` wrote `seq`.
+    fn wrote(&self, owner: u64, seq: u64) {
+        #[cfg(test)]
+        {
+            let hold = self.hold.lock().unwrap().take();
+            if let Some((reached, resume)) = hold {
+                let _ = reached.send(());
+                let _ = resume.recv();
+            }
+        }
         let mut inner = self.inner.lock().unwrap();
+        if inner.owner != owner {
+            return;
+        }
+        self.written.send_replace(seq);
         let first = inner.dirty_since.is_none();
         inner.dirty_since.get_or_insert_with(Instant::now);
         let requested = inner.publish_through.is_some_and(|through| seq >= through);
@@ -73,9 +94,13 @@ impl Progress {
     /// Start again after a writer open at `written`. The writes that the age limit tracked
     /// were in the old writer. A publication request and a republish stay: a manual checkpoint
     /// or a Defragment can ask before the new writer opens, or a failed pass gives them back.
-    fn reset(&self, written: u64) {
+    /// Return the owner of the new open.
+    fn reset(&self, written: u64) -> u64 {
+        let mut inner = self.inner.lock().unwrap();
+        inner.owner += 1;
+        inner.dirty_since = None;
         self.written.send_replace(written);
-        self.inner.lock().unwrap().dirty_since = None;
+        inner.owner
     }
 
     /// Publish a new checkpoint at the current sequence, for a changed layout.
@@ -464,7 +489,7 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         health.opened();
         // The open starts at `last_l0_seq`. Unflushed writes of an older writer are lost, and
         // the overlay holds them.
-        publisher.progress.reset(db.manifest().last_l0_seq());
+        let owner = publisher.progress.reset(db.manifest().last_l0_seq());
         publisher.progress.rearm();
         let admin = slatedb::admin::Admin::builder(
             publisher.source.state(),
@@ -488,7 +513,7 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         let progress = publisher.progress.clone();
         let running = async {
             tokio::select! {
-                result = materialize(db.clone(), queue.clone(), progress, gate) => result,
+                result = materialize(db.clone(), queue.clone(), progress, gate, owner) => result,
                 result = publish(publisher.clone(), db.clone(), events.clone()) => result,
             }
         };
@@ -538,7 +563,8 @@ async fn bootstrap_wait(source: &Source) -> Result<Option<String>> {
     )
 }
 
-/// Copy overlay batches into the shared `Db` in order, each with its own sequence.
+/// Copy overlay batches into the shared `Db` in order, each with its own sequence. `owner` is
+/// the open of `db`. See `Progress::reset`.
 ///
 /// The writer opened at `last_l0_seq`. The batches at or below the written sequence are already
 /// in the `Db`. A batch that spans it is written whole: its rows are final values, so the result
@@ -554,6 +580,7 @@ pub(super) async fn materialize(
     queue: Arc<Queue>,
     progress: Arc<Progress>,
     gate: Arc<clock::Gate>,
+    owner: u64,
 ) -> Result<()> {
     let mut next = progress.written();
     let mut pushed = queue.subscribe();
@@ -574,7 +601,7 @@ pub(super) async fn materialize(
                 .await?;
             admitted.done();
             next = seq;
-            progress.wrote(seq);
+            progress.wrote(owner, seq);
         }
     }
 }
