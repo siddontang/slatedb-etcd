@@ -90,6 +90,10 @@ access.
   member namespace. A replicated owner claim stops the start.
 - Each member, also a learner, writes its own `member-<id>/binding.json` at its first start.
 - A learner only reads `shared/`. Give it the voter statements before you promote it.
+  Promotion fails until the learner creates and deletes a scratch object under
+  `shared/state/.probe/`. Give that prefix the same write policy as the rest of `shared/state/`.
+  A policy that allows writes only to `.probe/` passes the check, but the new voter cannot write
+  the state.
 - Scope each credential to the cluster prefix `<prefix>/<sha256(cluster-id)>/`. Do not give a
   member access to the prefixes of other clusters.
 - A credential that can delete objects can delete the state of every member. Keep backups and
