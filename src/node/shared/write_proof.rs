@@ -102,16 +102,18 @@ impl Prober {
             // An earlier probe of this process left its object: its delete failed, or its
             // create landed late. Delete it and create once more.
             Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
-                self.delete(&path)
+                self.clean(&path)
                     .await
                     .with_context(|| format!("cannot delete {path} of an earlier write probe"))?;
                 self.create(&path).await.with_context(created)?;
             }
             result => result.with_context(created)?,
         }
-        // This delete proves the delete access. A refused delete fails the probe, also when the
-        // object is gone.
-        self.delete(&path)
+        // This delete proves the delete access. Any error fails the probe, also `NotFound` after
+        // the confirmed create.
+        self.source
+            .store
+            .delete(&path)
             .await
             .with_context(|| format!("cannot delete {path}"))
     }
@@ -123,7 +125,8 @@ impl Prober {
         Ok(())
     }
 
-    async fn delete(&self, path: &Path) -> slatedb::object_store::Result<()> {
+    /// Delete the object of an earlier probe. One that is already gone needs no delete.
+    async fn clean(&self, path: &Path) -> slatedb::object_store::Result<()> {
         match self.source.store.delete(path).await {
             Err(slatedb::object_store::Error::NotFound { .. }) => Ok(()),
             result => result,
@@ -267,10 +270,15 @@ impl Proofs {
         process: Option<u64>,
         replied: Replied,
     ) -> bool {
-        let Some(process) = process else {
+        // A reply adds no record. One whose record a new term, a step down, a new process, or
+        // a removal dropped is ignored.
+        let Some(record) = self
+            .members
+            .get_mut(&member)
+            .filter(|record| self.term == term && Some(record.process) == process)
+        else {
             return false;
         };
-        let record = self.record(term, member, process);
         let Some((nonce, sent)) = record.pending else {
             return false;
         };
@@ -279,7 +287,10 @@ impl Proofs {
         }
         record.pending = None;
         // Another process of the member ran the probe. It proves nothing about this one.
-        if replied.process.is_some_and(|replier| replier != process) {
+        if replied
+            .process
+            .is_some_and(|replier| Some(replier) != process)
+        {
             return false;
         }
         match replied.outcome {

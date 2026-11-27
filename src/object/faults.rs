@@ -78,6 +78,8 @@ pub(crate) const DETACH_STATE_PUT: u8 = 23;
 /// Delete each object in the shared database, then report a refusal, like a refused delete of
 /// an object that another client removed.
 pub(crate) const GONE_STATE_DELETE: u8 = 24;
+/// Delete each object in the shared database, then report it as not found.
+pub(crate) const NOT_FOUND_STATE_DELETE: u8 = 25;
 
 impl FaultStore {
     pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
@@ -312,10 +314,13 @@ impl ObjectStore for FaultStore {
         paths: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
         let mode = self.mode.load(Ordering::SeqCst);
-        if !matches!(
-            mode,
-            FAIL_STATE_DELETE | READ_ONLY_STATE | GONE_STATE_DELETE
-        ) {
+        let faulty = [
+            FAIL_STATE_DELETE,
+            READ_ONLY_STATE,
+            GONE_STATE_DELETE,
+            NOT_FOUND_STATE_DELETE,
+        ];
+        if !faulty.contains(&mode) {
             return self.inner.delete_stream(paths);
         }
         use futures::StreamExt;
@@ -328,8 +333,14 @@ impl ObjectStore for FaultStore {
                     if !state(&path) {
                         return inner.delete(&path).await.map(|()| path);
                     }
-                    if mode == GONE_STATE_DELETE {
+                    if mode == GONE_STATE_DELETE || mode == NOT_FOUND_STATE_DELETE {
                         inner.delete(&path).await?;
+                    }
+                    if mode == NOT_FOUND_STATE_DELETE {
+                        return Err(Error::NotFound {
+                            path: path.to_string(),
+                            source: "injected".into(),
+                        });
                     }
                     Err(error())
                 }

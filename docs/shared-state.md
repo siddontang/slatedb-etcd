@@ -130,7 +130,7 @@ the configuration change.
    `shared/state/.probe/<member>-<process>` with `PutMode::Create` and deletes it. The key has no
    nonce. SlateDB 0.18.1 writes each manifest version with `PutMode::Create`
    (`slatedb-txn-obj-0.18.1/src/object_store.rs:383`), so a create and a delete show the access
-   of a writer. A refused delete fails the probe, also when the object is gone.
+   of a writer. Any error of that delete fails the probe, also `NotFound`.
 3. The leader accepts only the reply to that nonce, from that process, with the store ID of the
    claim, within 15 s of the send. A proof counts for 60 s from the send. A late or repeated reply
    does not extend it. A new learner process drops the proof and the running probe when its

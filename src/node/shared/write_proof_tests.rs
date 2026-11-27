@@ -5,7 +5,7 @@ use super::*;
 use crate::cluster::Command as C;
 use crate::object::faults::{
     FaultStore, DETACH_STATE_PUT, FAIL_STATE_DELETE, GONE_STATE_DELETE, LOSE_STATE_PUT_REPLY,
-    READ_ONLY_STATE,
+    NOT_FOUND_STATE_DELETE, READ_ONLY_STATE,
 };
 use crate::proto::etcdserverpb::{
     cluster_client::ClusterClient, MemberAddRequest, MemberListRequest, MemberPromoteRequest,
@@ -166,6 +166,16 @@ async fn a_refused_delete_of_a_gone_object_fails_the_probe() {
     let error = prober(&faults).probe().await.unwrap_err();
     assert!(format!("{error:#}").contains("cannot delete"), "{error:#}");
     assert!(scratch(faults.as_ref()).await.is_empty());
+}
+
+/// After a confirmed create, a delete that reports `NotFound` fails the probe. The store gave
+/// no proof of the delete access.
+#[tokio::test]
+async fn a_not_found_delete_after_the_create_fails_the_probe() {
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    faults.set(NOT_FOUND_STATE_DELETE);
+    let error = prober(&faults).probe().await.unwrap_err();
+    assert!(format!("{error:#}").contains("cannot delete"), "{error:#}");
 }
 
 /// A successful reply of process `process` to `nonce`.
@@ -407,30 +417,38 @@ fn shown(node: &Node) -> Value {
     node.writer.as_ref().unwrap().status()["write_proofs"]["members"].clone()
 }
 
-/// Record a proof of process 7 of member 2 on `node`.
-async fn prove(node: &mut Node) {
+/// Record a proof of process 7 of member 2 on `node`. Return the nonce of its probe.
+async fn prove(node: &mut Node) -> u64 {
     let mut responses = vec![];
     node.handle(frame(7), &mut responses).await.unwrap();
     node.check_write_proof(&C::Promote(2)).unwrap_err();
-    let event = proven_reply(node, pending(node), 7);
+    let nonce = pending(node);
+    let event = proven_reply(node, nonce, 7);
     node.handle(event, &mut responses).await.unwrap();
     node.check_write_proof(&C::Promote(2)).unwrap();
     assert_eq!(shown(node)[0]["proven"], true);
+    nonce
 }
 
-/// A step down drops the records at once, so a follower shows no proof of its old term.
+/// A step down drops the records at once, so a follower shows no proof of its old term. A late
+/// reply does not bring a record back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_step_down_drops_the_records_at_once() {
     let dir = tempfile::tempdir().unwrap();
     let mut node = shared_leader(dir.path()).await;
-    prove(&mut node).await;
+    let nonce = prove(&mut node).await;
     let term = node.raw.raft.term;
     node.raw.raft.become_follower(term + 1, raft::INVALID_ID);
     node.sync_writer();
     assert_eq!(shown(&node), json!([]));
+    // A late reply adds no record.
+    let event = proven_reply(&node, nonce, 7);
+    node.handle(event, &mut vec![]).await.unwrap();
+    assert_eq!(shown(&node), json!([]));
 }
 
-/// The leader drops the record of a member that leaves the configuration.
+/// The leader drops the record of a member that leaves the configuration. A late reply does
+/// not bring it back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_removed_member_loses_its_record() {
     let dir = tempfile::tempdir().unwrap();
@@ -453,9 +471,13 @@ async fn a_removed_member_loses_its_record() {
         is_learner: true,
     };
     change(&mut node, C::Add(learner)).await;
-    prove(&mut node).await;
+    let nonce = prove(&mut node).await;
     change(&mut node, C::Remove(2)).await;
     assert!(!node.raw.raft.prs().conf().learners().contains(&2));
+    assert_eq!(shown(&node), json!([]));
+    // A late reply adds no record.
+    let event = proven_reply(&node, nonce, 7);
+    node.handle(event, &mut vec![]).await.unwrap();
     assert_eq!(shown(&node), json!([]));
 }
 
