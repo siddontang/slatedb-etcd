@@ -1,7 +1,6 @@
 # Shared state: one writer and read-only followers
 
-**Status:** accepted design for an opt-in prototype. Nothing in this document is implemented.
-It extends [object storage snapshots](object-snapshots.md) and changes parts of the
+**Status:** accepted design. Shared state is the only state mode. It changes parts of the
 [architecture](architecture.md) contract. Source facts are from `b1fc78d` and SlateDB 0.18.1.
 
 ## Problem
@@ -22,9 +21,8 @@ SSTs after that, so the pool decays back to N copies. This design keeps one copy
 4. Make a leader change cost no more than today. No member may replay or rescan state for it.
 5. Never return wrong data. A missing object can fail a read, but it cannot change a result.
 
-Non-goals: local filesystem storage, cross-bucket members, and online conversion of an existing
-cluster. Members on different hosts cannot share a local directory, so local mode keeps the
-current design.
+Non-goals: local filesystem storage, cross-bucket members, and conversion of an existing
+cluster. Every cluster, also a single member, uses an S3-compatible store.
 
 ## Summary
 
@@ -88,21 +86,20 @@ The design depends on these rules. Later sections refer to them by number.
 6. **Monotonic base.** A member's base index never goes down.
 7. **Fail closed.** A read that cannot find an object fails. No path substitutes other data.
 
-## Storage layout and mode
+## Storage layout
 
 ```text
 <prefix>/<sha256(cluster-id)>/
-    shared/owner.json          cluster claim, mode, and store ID, created with PutMode::Create
+    shared/owner.json          cluster claim, quota, voters, and store ID, PutMode::Create
     shared/bootstrap.json      written once after the first checkpoint, PutMode::Create
     shared/state/              the one SlateDB: manifest/, compacted/, wal/ fence files
     shared/state/.probe/       scratch objects of the write probe before a promotion
-    member-<id>/binding.json   member identity and mode check, no state
+    member-<id>/binding.json   member identity, no state
 ```
 
-- The cluster selects `--state-mode shared` at bootstrap. The mode and the quota are stored in
-  the claim. Each member's local binding repeats the mode and root. A member with a different
-  mode or root refuses to start.
-- `shared` requires S3. All members must use the same bucket, endpoint, region, and prefix.
+- The quota is stored in the claim at bootstrap. Each member's local binding repeats the root. A
+  member with a different root refuses to start.
+- Every member requires S3. All members must use the same bucket, endpoint, region, and prefix.
   Members send the store ID of the claim with their peer traffic. A member refuses peer traffic
   with another ID or no ID, so members on different stores form no quorum. A shared member
   serves no snapshot objects to peers. Its local binding records the ID, so a restart refuses a
@@ -114,8 +111,8 @@ The design depends on these rules. Later sections refer to them by number.
   [Promotion](#promotion).
 - A credential that can delete objects can delete the data of every member. Keep recovery
   copies under separate credentials.
-- A member refuses to open an existing cluster in a different mode.
-- `replicated` stays the default and keeps the current `member-<id>/state-N` layout.
+- A data directory of replicated state mode, or of a member-local store, is not supported. A
+  member refuses to start on it.
 
 ## Promotion
 
@@ -247,10 +244,9 @@ them.
 `covers` is the **coverage**: the leader certifies that the checkpoint is the whole state at each
 index from `F` through `covers`. The leader reads `pushed` and the covered index from one
 applied state. It sets `covers` to its covered index only when no batch of its own is above
-`F`, materialized or not. Otherwise `covers` is `F`. An entry of an earlier binary has no
-`covers`, which means `F`. An announcement of the current base only raises its coverage, so it
-opens nothing and creates no checkpoint. The coverage belongs to the checkpoint ID. Another
-checkpoint at the same `F`, such as a Defragment output, does not get it.
+`F`, materialized or not. Otherwise `covers` is `F`. An announcement of the current base only
+raises its coverage, so it opens nothing and creates no checkpoint. The coverage belongs to the
+checkpoint ID. Another checkpoint at the same `F`, such as a Defragment output, does not get it.
 
 In shared mode an entry that changes no state writes **no batch**. This covers empty entries and
 `ViewCheckpoint`. Today such entries still write `meta/applied`. Here that write would make the
@@ -272,8 +268,7 @@ equal, so either member can use a checkpoint of the other.
 Two inputs to apply could differ by member. With a shared base, a member's view would change
 when its base switches. Shared mode removes both inputs:
 
-- **Quota.** Shared mode stores the quota in the cluster claim, and every member reads it from
-  there. It ignores the replicated `etcd/quota` row and `SetQuota` entries.
+- **Quota.** The cluster claim stores the quota, and every member reads it from there.
 - **Membership.** Only a `SeedMembers` entry and configuration changes write `etcd/members`.
   The bootstrap membership of each member stays in memory. A restore writes the row once in
   the shared database. The cluster claim compares only the voter IDs.
@@ -417,9 +412,9 @@ waits for the next checkpoint.
 
 ### Base cache warm
 
-A replicated member caches SST indexes, filters, and `etcd/current/` blocks when it flushes an L0
-SST. SlateDB also caches the index and filters of compaction output. A shared-mode member writes
-no SST, so every first read of a block in a new base was an S3 GET.
+The leader caches SST indexes, filters, and `etcd/current/` blocks when it flushes an L0 SST.
+SlateDB also caches the index and filters of compaction output. A follower writes no SST, so
+every first read of a block in a new base was an S3 GET.
 
 A member therefore loads the same entries with `DbReader::warm_sst` when it adopts an announced
 base, before the switch. L0 SSTs get indexes, filters, and `etcd/current/` blocks. Sorted run SSTs
@@ -434,13 +429,12 @@ new L0 SST, on each member. These rules apply:
 - A publication, a snapshot receipt, a restart, and a manual apply such as DST open a base with no
   warm. They do not wait for SST reads.
 
-Benchmark note: three members on one host with MinIO, 100,000 preloaded keys of 256 B, 64
-clients. Before this step, followers missed 41% of their data block lookups. Linearizable random
-reads ran at 11,300 ops/s with a p99 of 59 ms, and replicated mode at 27,400 ops/s with a p99 of
-5.5 ms. With this step, followers missed none. Linearizable reads ran at 29,400 ops/s with a p99
-of 5.1 ms, and serializable reads at 32,800 ops/s with a p99 of 4.6 ms. Before this step, a
-second pass on the same cluster already ran at 24,600 ops/s. So cold blocks were the cause, not
-the cost of the overlay or the base reader.
+Benchmark note: three members on one host with MinIO, 100,000 preloaded keys of 256 B, 64 clients.
+Before this step, followers missed 41% of their data block lookups. Linearizable random reads ran at
+11,300 ops/s with a p99 of 59 ms. With this step, followers missed none. Linearizable reads ran at
+29,400 ops/s with a p99 of 5.1 ms, and serializable reads at 32,800 ops/s with a p99 of 4.6 ms.
+Before this step, a second pass on the same cluster already ran at 24,600 ops/s. So cold blocks were
+the cause, not the cost of the overlay or the base reader.
 
 Each follower now downloads about the current-row bytes of every write once. In a run of
 100,000 puts of 256 B (put-c256), cluster-wide S3 GET response bytes rose from 2.5 MiB to
@@ -506,30 +500,18 @@ checkpoint is gone, it takes a checkpoint in the same range as a restart does.
   retry, and the pin holds, so the announcement entries do not move the target. Raft accepts a
   snapshot at or above the follower's commit index, which the leader's log holds, and that
   clears the follower's request. The pin ends when the peer gets a snapshot, or at a term
-  change. Replicated mode uses the same rule. A follower can get a snapshot at its own record
-  index. It then stores nothing, because its log ends there.
-- **Earlier binaries:** a record above its checkpoint row holds the row after its encoded
-  fields. An earlier binary ignores those bytes, but it installs a view snapshot only at its
-  row. Each member sends a random ID of its process with its peer frames and its `ViewAck`, and
-  the report also advertises the coverage capability. The capability holds only for the
-  process that advertised it, so a restart on an earlier binary loses it at its first frame. A
-  member that did not report yet counts as an earlier binary.
+  change. A follower can get a snapshot at its own record index. It then stores nothing,
+  because its log ends there.
+- **Coverage:** a record above its checkpoint row holds the row after its encoded fields. Each
+  member sends a random ID of its process with its peer frames and its `ViewAck`, and the report
+  also advertises the coverage capability. The capability holds only for the process that
+  advertised it. A member that did not report yet has no capability.
   - The leader certifies above a row only while every other member of the configuration has
     the capability. Otherwise it announces at the row and serves no demand above its base.
-  - The log cache sends a record above its row only to a capable peer. For another peer, the
-    leader publishes a checkpoint at its applied index: if no batch is there, apply first stores
-    a batch with only the apply marker and the counters. The leader then records that base at
-    its row and sends it. This costs one flush and one checkpoint.
-  - The same publication serves every demand above the record that no certification can
-    serve: a request of a member without the capability, and any request or follower's manual
-    checkpoint while some member lacks it. The leader publishes at or above the highest of
-    these demands.
   - A snapshot above its row goes to its own route, `/raft/covered`, with the process that
-    advertised the capability. An earlier binary has no such route and answers 404, and
-    another process answers 409, before Raft sees the snapshot. Either answer ends the
-    capability of the process that the snapshot named. A late answer for an earlier process
-    does not change the capability of the current one. So a member that restarts on an earlier
-    binary while the snapshot travels never stores it.
+    advertised the capability. Another process answers 409 before Raft sees the snapshot. The
+    answer ends the capability of the process that the snapshot named. A late answer for an
+    earlier process does not change the capability of the current one.
 - **Record checkpoint:** only a live base pins its checkpoint. After the base moves, retention
   can delete the checkpoint that the record names, and a restart or a rebase then uses another
   checkpoint. The log cache does not send a record that names a checkpoint other than the base,
@@ -553,11 +535,9 @@ checkpoint is gone, it takes a checkpoint in the same range as a restart does.
     unapplied entries from its applied index, which is below the start of the log, and that
     scan stops the process. The window covers the snapshot that Raft holds, the one that the
     log cache staged, and the stored one that waits for apply.
-  - Unlike the guard of a member that waits for a snapshot, this guard has no time limit,
-    because a campaign in the window stops the process. If the only live member with a current
-    log is in the window, the cluster has no leader until its install ends: a checkpoint open
-    in shared mode, or the image copy in replicated mode. Before this guard, that member
-    stopped at its first campaign.
+  - This guard has no time limit, because a campaign in the window stops the process. If the
+    only live member with a current log is in the window, the cluster has no leader until its
+    checkpoint open ends. Before this guard, that member stopped at its first campaign.
 
 ## Install
 
@@ -570,9 +550,8 @@ differ in whether the Raft log changes.
    `StateMachine::open_at` (`state.rs:253-269`). It makes a new `RowCache`, invalidates the Watch
    capture, and clears the compaction plan.
 2. Load the quota counters from `meta/logical-size`, which each batch writes with the apply
-   marker, so install does not scan every `etcd/` row. The batch also writes the eight-byte total
-   to `meta/logical-bytes` for older readers. A base from an older binary has no counter row that
-   matches its apply marker, so install counts the rows once (`state/maintenance.rs`).
+   marker, so install does not scan every `etcd/` row. A base without a counter row that
+   matches its apply marker makes install count the rows once (`state/maintenance.rs`).
 
 **Local rebuild, `F(C) <= applied`.** Rebase and restart use this form. The Raft log does not
 change.
@@ -651,8 +630,8 @@ when it closes the `Db`.
 
 ## Clocks
 
-Shared mode makes SlateDB use clocks from several hosts. Replicated mode never does. SlateDB
-reads the writer clock in these places:
+Shared state makes SlateDB use clocks from several hosts. SlateDB reads the writer clock in
+these places:
 
 - **Write tick:** a writer starts its monotonic clock at the manifest's `last_l0_clock_tick`
   (`db.rs:150-153`). Each batch gets the next tick (`batch_write.rs:204`). If the new leader's
@@ -759,9 +738,7 @@ the first Raft term, and `Clock::pass` of each leader then waits for the restore
 host clock more than `--max-clock-skew` ahead thus makes each leader refuse to start until real
 time passes the tick. Check the clock of the restore host before a restore.
 
-An earlier binary has no `/raft/clock` route and gives no sample. A leader whose current peers
-of a majority run an earlier binary waits. Mixed binary versions are outside the current
-contract, so upgrade all members before the writer of a new leader must start.
+All members must run the same binary version. Mixed binary versions are not supported.
 
 ## Restart
 
@@ -968,13 +945,12 @@ of the incident, and carry the leader's current Raft term. So a voter that stopp
 and failed in a term between, is not a target.
 
 A member sets its mark at each fault and clears it only when its own writer publishes again. It
-sends the age of the mark in each `ViewAck`. An earlier binary sends none and is never a target.
-A mark older than the leader's last publication is a last resort, because another writer
-published after it. The leader tries each voter once per incident, and only its own
-publication ends the incident. Raft ends a transfer that does not complete within an election
-timeout, and the handoff record ends with it. The leader then tries the next voter. If Raft
-still holds the handoff's own transfer after two election timeouts, the leader aborts it, so
-Raft takes proposals again. A MoveLeader transfer is never aborted.
+sends the age of the mark in each `ViewAck`. A mark older than the leader's last publication is a
+last resort, because another writer published after it. The leader tries each voter once per
+incident, and only its own publication ends the incident. Raft ends a transfer that does not
+complete within an election timeout, and the handoff record ends with it. The leader then tries the
+next voter. If Raft still holds the handoff's own transfer after two election timeouts, the leader
+aborts it, so Raft takes proposals again. A MoveLeader transfer is never aborted.
 
 With no target left the leader keeps the lead. After a stall it drops the stalled step and
 opens the writer again, so the writer recovers within 30 s plus the backoff, also when the
@@ -1003,12 +979,12 @@ snapshot above the held entry. See [Read faults](#read-faults).
 - **Snapshot install:** no data copy. It reads the live rows to rebuild the key index.
 - **Follower S3 reads:** each member reads the indexes, filters, and current-row blocks of each
   new L0 SST once, at its base switch. This adds few GET requests but about the current-row
-  bytes of all writes. A replicated member gets the same entries from its own flush.
+  bytes of all writes.
 - **Fault domain:** members no longer hold independent copies. A writer bug or an object loss
   affects all members. HashKV can still detect divergent apply, but not storage corruption.
 - **Isolation:** every voter can write the shared prefix.
 - **Clocks:** writes and leader changes depend on bounded clock skew between hosts.
-- **Two code paths:** local mode keeps the replicated design. Both need tests.
+- **Object store:** every cluster, also a single member, needs an S3-compatible store.
 
 ## Alternatives considered
 
@@ -1031,7 +1007,8 @@ snapshot above the held entry. See [Read faults](#read-faults).
 | 1 | Overlay, views, materializer, publisher, bootstrap on one voter | New mode only |
 | 2 | Base switch, `ViewAck`, retention, install, rebase, format 6, restart | New mode only |
 | 3 | Writer open, fencing, reopen, clock checks, and step-down | New mode only |
-| 4 | Operations, metrics, docs, benchmarks, then an offline converter | New mode only |
+| 4 | Operations, metrics, docs, and benchmarks | New mode only |
+| 5 | Remove replicated state mode and the member-local store | Only mode |
 
 ## Tests
 
@@ -1055,8 +1032,8 @@ snapshot above the held entry. See [Read faults](#read-faults).
   agrees on all members. No read returns a value that the reference does not hold.
 - **Integration:** three members on RustFS or MinIO. Run the linearizability checks during kill,
   partition, and leader-transfer schedules.
-- **Benchmarks:** compare replicated and shared mode on `lai7-8c32`. Measure S3 bytes, S3 PUTs,
-  follower and leader peak RSS, snapshot install time, and read p99.
+- **Benchmarks:** on `lai7-8c32`, measure S3 bytes, S3 PUTs, follower and leader peak RSS,
+  snapshot install time, and read p99.
 - **Failover:** measure the time to the first successful write after an election with a nearly
   full overlay. Do not claim one-election failover before this passes.
 - **View age:** compare 10 s and 30 s under light writes and bursts. Choose the release default
@@ -1073,10 +1050,10 @@ Sig-Codex recommended these answers, and siddontang accepted them on 2026-11-24.
    writes, and long reads can retain more, so enforce a total memory budget and measure peak RSS.
 2. **View age:** start with a 10 s maximum age for dirty data, with no timer work when idle.
    Choose the release default from the 10 s and 30 s comparison in [Tests](#tests).
-3. **Scope:** shared mode for new clusters only in the first release. Replicated mode stays the
-   default.
+3. **Scope:** shared state for new clusters only. Replicated state mode is removed, and its data
+   directories are not supported.
 4. **Write access:** all voters of one trusted cluster share write access, with the credential
-   rules in [Storage layout and mode](#storage-layout-and-mode).
+   rules in [Storage layout](#storage-layout).
 
 ## Appendix: SlateDB 0.18.1 facts
 

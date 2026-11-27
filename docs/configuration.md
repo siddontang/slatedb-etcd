@@ -12,7 +12,7 @@ by default. `--allow-remote` permits remote IPs and DNS names with separate mutu
 | `--listen` | Required client IP and port. |
 | `--allow-remote` | Permit remote addresses with mutual client and peer TLS. |
 | `--peer` | Required, repeatable `ID=IP:PORT` or `ID=URL`. Include the local member. |
-| `--dir` | Required directory for Raft, object binding, and optional local objects. |
+| `--dir` | Required directory for the Raft log and the object store binding. |
 | `--cluster-id` | Shared cluster identity; default `slatedb-raft-poc`. |
 | `--peer-listen` | Separate peer bind address. TLS requires this flag. |
 | `--client-peer` | Repeatable `ID=URL` for advertised client addresses. |
@@ -87,8 +87,7 @@ For example, use `--watch-progress-notify-interval=200ms` for the upstream clien
 | `--snapshot-every` | 10000 | Applied entries between checkpoint opportunities; zero disables it. |
 | `--snapshot-min-bytes` | 67108864 | Log bytes needed before auto truncation; zero disables it. |
 | `--log-file-bytes` | 67108864 | Log file size, at least 65536. Truncation frees whole files. |
-| `--quota-backend-bytes` | 0 | Seeds or changes the cluster quota. Zero selects 2 GiB. |
-| `--quota-reassert` | off | Requests the quota flag again as the newest change. Use it once. |
+| `--quota-backend-bytes` | 0 | Seeds the quota of a new cluster. Zero selects 2 GiB. |
 | `--quota-warning-fraction` | 0.8 | Quota share that raises the early warning; zero disables it. |
 | `--auto-compaction-mode` | periodic | `periodic` keeps a duration; `revision` keeps a count. |
 | `--auto-compaction-retention` | 0 | History to keep. Zero disables automatic compaction. |
@@ -104,7 +103,7 @@ The two state cache budgets add up to 128 MiB by default. Each must be positive.
 Keep the metadata budget above total SST metadata. With 32-byte keys and 256-byte values,
 metadata is about 2% of live SST data.
 
-An automatic checkpoint flushes state to synced local storage and then truncates the Raft log.
+An automatic checkpoint truncates the Raft log through the base index of the member.
 It needs both `--snapshot-every` applied entries and `--snapshot-min-bytes` appended log bytes.
 Small writes therefore keep more log between truncations, and each synced flush covers about one
 L0 table. Delaying truncation keeps more log; it never removes entries early.
@@ -114,23 +113,17 @@ Membership changes and peer snapshot requests do not wait for the byte threshold
 These flags do not bound process RSS, SlateDB, state scans, or snapshot buffers.
 A memtable flush caches the SST index, filters, and current-row blocks; reads cache the rest.
 Compaction reads ahead 2 x 512 KiB per input SST. Each compaction job runs at most two
-subcompactions, because each one buffers SST data until the disk takes it.
-On Linux, SST writes of replicated state on local storage start disk writeback one SST block at
-a time, so Raft log syncs wait behind only a few blocks. Shared state mode and S3 do not pace SST
-writes. While SlateDB's latest write-side sample of unflushed memtable bytes is at least 85 % of
-its `max_unflushed_bytes`, writeback of that member starts 1 MiB at a time, so flushes and
-compaction catch up. A background flush alone does not update the sample.
+subcompactions, because each one buffers SST data until the object store takes it.
 On Linux, jemalloc background threads return freed pages to the OS after 200 ms.
 `_RJEM_MALLOC_CONF` overrides that default.
-A negative quota value disables the quota. The quota is cluster state, so a flag change takes
-effect only when that member leads; see [quota changes](operations.md#change-the-quota).
+A negative quota value disables the quota. The cluster claim stores the quota at the first
+start, and later flag values do not change it; see [quota](operations.md#quota).
 The quota can be exceeded by one operation and does not reserve free disk space.
 Native backups and `Maintenance.Snapshot` stream from a pinned checkpoint with bounded memory.
-The image has no size limit, but each row has a 64 MiB limit. In shared state mode, the overlay
-segments that backups keep after a base switch count against `--overlay-max-bytes`; see
+The image has no size limit, but each row has a 64 MiB limit. The overlay segments that backups
+keep after a base switch count against `--overlay-max-bytes`; see
 [administration](administration.md#maintenance-and-storage).
-Peer snapshots copy SlateDB checkpoint objects and have no size limit; see
-[object storage Raft snapshots](object-snapshots.md).
+A peer snapshot names a checkpoint of the shared database. It copies no data.
 See [log pool accounting](architecture.md#bounded-log-pools) for admission and recovery rules.
 
 ## Automatic compaction
@@ -159,7 +152,7 @@ Compaction runs as an internal request, so Auth does not apply to it.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--s3-bucket` | None | Select an existing S3 bucket instead of local objects. |
+| `--s3-bucket` | None | Required existing S3 bucket. A start without it fails. |
 | `--s3-region` | `us-east-1` | Bucket region. |
 | `--s3-endpoint` | AWS endpoint | Compatible S3 origin URL. |
 | `--s3-prefix` | `slatedb-etcd` | Root prefix for isolated cluster and member namespaces. |
@@ -168,17 +161,15 @@ Compaction runs as an internal request, so Auth does not apply to it.
 See [remote storage](remote-storage.md) for credentials, ownership, retry bounds, and recovery.
 The local Raft log remains necessary. S3 does not replace quorum log durability.
 
-## Shared state mode
+## Shared state
 
-`--state-mode shared` selects the prototype of the shared state design, `docs/shared-state.md`,
-for a new cluster. The leader writes one SlateDB for the whole cluster. Each member reads a
-checkpoint of it, its base, under an in-memory overlay of the newer applied batches.
-`replicated` is the default and keeps the per-member layout. The
-[shared state guide](shared-state-guide.md) covers operation, access, cost, and conversion.
+Shared state, `docs/shared-state.md`, is the only state mode. The leader writes one SlateDB for
+the whole cluster. Each member reads a checkpoint of it, its base, under an in-memory overlay of
+the newer applied batches. The [shared state guide](shared-state-guide.md) covers operation,
+access, and cost.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--state-mode` | `replicated` | State layout of a new cluster: `replicated` or `shared`. |
 | `--view-max-age` | `10s` | Age of the oldest unflushed write that starts a flush and checkpoint. |
 | `--view-pin-max` | `5m` | Age after which a read view fails with a retryable error. |
 | `--overlay-max-bytes` | 1073741824 | Leader admission limit of the overlay. Apply waits at 2x. |
@@ -187,18 +178,17 @@ checkpoint of it, its base, under an in-memory overlay of the newer applied batc
 
 Rules and limits:
 
-- All members use one S3 bucket and prefix. Learners and `--join` members are supported.
+- Every cluster, also a single member, needs an S3-compatible store. All members use one S3
+  bucket and prefix. Learners and `--join` members are supported.
   A member refuses peer traffic from another bucket or prefix. See
   [shared store ID](shared-state-guide.md#shared-store-id).
 - A native backup is exempt from `--view-pin-max`. The overlay segments that backups keep after a
   base switch count against `--overlay-max-bytes` on each member. See
   [backups](shared-state.md#backups).
-- The cluster claim `shared/owner.json` stores the mode, the quota, the initial voters, and a
-  random store ID. Later starts use that quota. A member with other initial voters refuses to
-  open the writer.
-- On S3, `mode.json` under the cluster prefix fixes the mode before any state write. A shared start
-  also refuses a prefix that holds a replicated member namespace.
-- A directory keeps its mode. A member refuses to start in a different mode.
+- The cluster claim `shared/owner.json` stores the quota, the initial voters, and a random store
+  ID. Later starts use that quota. A member with other initial voters refuses to open the writer.
+- A data directory of replicated state mode, or of a member-local store, is not supported. A
+  member refuses to start on it.
 - The leader opens the writer when it takes the lead. The open fences the old writer. The leader
   then checks that it still leads the same term. It waits until its clock passes the manifest
   clock and the times of the newest L0 SST ID and compaction job ID. A fence while it still
@@ -215,8 +205,7 @@ Rules and limits:
   `clock.waiting`, and `slatedb_etcd_shared_writer_clock_waiting` is 1. A wait that holds a
   batch for 30 s is a `stalled` fault. A skew that missing voters could still support is
   uncertain: the ticks stay at the bound, and `clock.uncertain` shows it without an alarm.
-- One voter has no clock probe. An earlier binary has no `/raft/clock` route and gives no
-  sample, so upgrade all members first. See [Clocks](shared-state.md#clocks).
+- One voter has no clock probe. See [Clocks](shared-state.md#clocks).
 - A storage error of the writer keeps the member up. The writer opens again with a backoff, and
   a member whose path fails hands over the lead. See
   [writer faults](shared-state.md#writer-faults).
@@ -249,14 +238,11 @@ Rules and limits:
   each demand, and an idle cluster then appends nothing more.
 - A request of an earlier term can name a suffix that the leader replaced. The leader serves
   each peer at most its last log index, pinned at the first request, so the follower takes a
-  snapshot and then appends. Both state modes do this.
+  snapshot and then appends.
 - A member reports whether it installs a base above its checkpoint row, with the ID of its
-  process. The leader extends coverage only while every member reported it. An earlier binary
-  gets only a snapshot at its checkpoint row: the leader publishes a new checkpoint for it when
-  its record is above the row. While some member lacks the capability, any request above the
-  record or follower's manual checkpoint gets such a checkpoint. A snapshot above its row uses
-  its own route, which an earlier binary refuses before Raft. A refusal ends the capability of
-  the process that the snapshot named, not of a later one.
+  process. The leader extends coverage only while every member reported it. A snapshot above
+  its row uses its own route. A refusal ends the capability of the process that the snapshot
+  named, not of a later one.
 - A restart opens the newest checkpoint. It adopts the checkpoint when the log ends below it. A
   Raft snapshot record above the newest checkpoint row names its checkpoint, and the restart
   opens that one at the record index. If retention deleted it, the restart takes the newest
@@ -289,22 +275,6 @@ member of the new leader pins.
   the SlateDB admin API. Start the members again after the deletion.
 - Checkpoint expiry is future work. It needs recovery after an offline period longer than the
   lifetime, and follower reads across missed renewals.
-- `object::Config::SharedDirectory` lets members of one host share a local directory in tests.
-  A member-local store serves one voter.
-- A local store in shared mode needs a POSIX filesystem with `flock` and atomic rename. SlateDB
-  advances its GC boundary files with conditional updates, and the store orders them with a
-  lock. NFS and other network filesystems are not supported.
-- A local store call fails after 30 s, like an S3 request. Each item of a list and each read
-  of an object body has its own 30 s. A hung filesystem then fails the SlateDB task and does
-  not block it forever.
-- At most 64 local store calls of the process run at once. Each holds a call slot until its
-  filesystem work ends, also after its deadline. A call waits for a slot within its own 30 s.
-  If late calls hold all 64 slots, a new call fails at once. At most 64 blocked calls can
-  finish after their deadline. `slatedb_etcd_local_store_calls_in_flight` reports the slots
-  in use.
-- An update moves the mtime of the object forward. On a filesystem with coarse timestamps,
-  such as HFS+, it moves it by up to 2 s. If the mtime cannot move, the update fails and the
-  object stays.
 
 ## Environment
 

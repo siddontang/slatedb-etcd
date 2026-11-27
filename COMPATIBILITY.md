@@ -96,20 +96,15 @@ untested.
 Native backup and backend Hash formats differ from etcd bbolt.
 Storage format 3 requires fresh directories and object prefixes.
 Old backups and logs are unsupported.
-Native backups and peer snapshots use format 4. This binary installs formats 3 and 4.
+Native backups use format 4.
 Format 4 rows keep a Put value only in the current and history rows.
 Hash records keep a CRC of the value, and Watch journals read the value from history.
 A hash digest starts with a zero byte and a layout version. No etcd `KeyValue` encoding starts
 with a zero byte, so the marker does not depend on which `KeyValue` fields exist.
-Older binaries reject format 4 snapshots and backups. A data directory gets a format 4 identity
-marker in one synced write just before its first hash or Watch journal row, or with its first
-snapshot image. Older binaries then refuse the directory. A directory that this binary only
-opened, without writes, stays readable by older binaries.
-They fail explicitly and do not misread the rows. A downgrade is not supported.
-To upgrade a cluster, upgrade the followers first. Then transfer leadership and upgrade the old
-leader. A follower on an older binary cannot install a snapshot from an upgraded leader.
-An older member that installed a checkpoint with `meta/applied-term` exports that row in its
-backups. Restore such a backup with the newer binary. Older restores reject the row.
+Shared state on an S3-compatible store is the only state mode. Every cluster, also a single
+member, needs an object store. Data directories of the removed replicated state mode or of a
+member-local store are not supported, and a member refuses to start on them.
+Mixed binary versions, rolling upgrades, and downgrades are not supported.
 Use `--restore-snapshot` for native backups; `etcdutl` cannot restore them.
 Save a backup with `etcdctl snapshot save` or the
 [native export tool](docs/operations.md#backups-and-restoration).
@@ -127,8 +122,8 @@ Quota uses logical bytes and can be exceeded by one request. It is not a free-sp
 State scans and full snapshot buffers do not have independent memory quotas.
 KV responses use etcd's send limit of `math.MaxInt32` bytes.
 An unpaginated Range holds its whole response in memory, as on etcd.
-Native backups have no image size limit, but each row has a 64 MiB limit, in both state modes.
-Peer snapshots copy objects and have no size limit.
+Native backups have no image size limit, but each row has a 64 MiB limit.
+Peer snapshots name a shared checkpoint and copy no data.
 Lease remaining TTL is not checkpointed. A new leader resets surviving leases to their full TTL.
 DST does not control wall-clock lease expiry, operating system threads, or partial sector writes.
 The local Jepsen driver does not reproduce the upstream SSH, clock, bit-flip, or lazyfs environment.
