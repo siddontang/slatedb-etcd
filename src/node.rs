@@ -363,6 +363,10 @@ pub struct Node {
     /// Simulation: the leader does not propose compaction steps, as if their reads were slow.
     #[cfg(test)]
     hold_compact_steps: bool,
+    /// Tests: run the clock check of the shared writer also with a manual transport. Probes
+    /// still need the peer routes, so the test gives the samples itself.
+    #[cfg(test)]
+    clock_in_manual: bool,
     /// The quota flag of this member and its `SetQuota` proposals.
     quota: quota::Quota,
     /// The term and index of the first `SeedMembers` proposal of this member in its last term.
@@ -705,6 +709,8 @@ impl Node {
             quota_warned: false,
             #[cfg(test)]
             hold_compact_steps: false,
+            #[cfg(test)]
+            clock_in_manual: false,
             location,
             metrics,
             last_observed_leader: 0,

@@ -65,7 +65,7 @@ pub(in crate::node) struct Probe {
 
 /// Tests: the nonce of `probe`.
 #[cfg(test)]
-pub(super) fn probe_nonce(probe: &Probe) -> u64 {
+pub(in crate::node) fn probe_nonce(probe: &Probe) -> u64 {
     probe.nonce
 }
 
@@ -512,7 +512,7 @@ impl Clock {
     /// waits for the samples of a majority before its open, and its `Db` never reads a time
     /// without a bound. A lone voter gets a gate without a check. Only a clock that no node
     /// manages, in a test, gets a gate with no owner.
-    pub(super) async fn gate(&self) -> Arc<Gate> {
+    pub(in crate::node) async fn gate(&self) -> Arc<Gate> {
         loop {
             let (managed, term, verdict) = self.decide();
             if !managed {
@@ -806,7 +806,7 @@ impl Gate {
     /// After the term of the gate ends, no batch gets a tick: the call waits until the node
     /// stops the writer task. The verdict and the pin of the tick run in one
     /// `Clock::with_verdict`.
-    pub(super) async fn admit(&self) -> Result<Admitted<'_>> {
+    pub(in crate::node) async fn admit(&self) -> Result<Admitted<'_>> {
         let Some(clock) = &self.clock else {
             return Ok(Admitted { gate: self });
         };
@@ -878,13 +878,13 @@ impl Gate {
 
 /// The tick of one batch. A batch that does not complete keeps its tick: its writer stops,
 /// and its clock does not move again.
-pub(super) struct Admitted<'a> {
+pub(in crate::node) struct Admitted<'a> {
     gate: &'a Gate,
 }
 
 impl Admitted<'_> {
     /// SlateDB wrote the batch. Later reads follow the clock again.
-    pub(super) fn done(self) {
+    pub(in crate::node) fn done(self) {
         self.gate.ticks.lock().unwrap().admitted = None;
     }
 }
@@ -935,7 +935,11 @@ impl Node {
         let Some(writer) = &self.writer else {
             return;
         };
-        if self.manual_transport {
+        #[cfg(test)]
+        let manual = self.manual_transport && !self.clock_in_manual;
+        #[cfg(not(test))]
+        let manual = self.manual_transport;
+        if manual {
             return;
         }
         let leader = self.raw.raft.state == StateRole::Leader;
@@ -948,7 +952,7 @@ impl Node {
             .clock
             .configure(self.raw.raft.term, self.options.id, voters.clone());
         writer.clock.observe();
-        if !probe {
+        if !probe || self.manual_transport {
             return;
         }
         for &peer in voters.keys().filter(|peer| **peer != self.options.id) {

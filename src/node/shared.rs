@@ -2029,7 +2029,7 @@ mod fault;
 mod rejected;
 pub(super) use clock::Clock;
 #[cfg(test)]
-pub(super) use clock::Gate;
+pub(super) use clock::{probe_nonce, Gate};
 pub(crate) use clock::{Millis, ProbeReply, ProbeRequest, PROBE_ROUTE};
 use defragment::Defragment;
 #[cfg(test)]
