@@ -1663,28 +1663,31 @@ async fn an_idle_poll_does_not_reopen_older_checkpoints() {
     sim.write(3).await;
     sim.pause(member);
     let store = sim.shared.clone();
-    let manifest_count = || {
-        store
-            .read
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|path| path.ends_with(".manifest"))
-            .count()
-    };
-    store.read.lock().unwrap().clear();
     let admin = sim.nodes[&member].writer.admin().clone();
     let views = crate::state::shared::view_checkpoints(&admin)
         .await
         .unwrap();
-    let list_only = manifest_count();
     let current = sim.base(member).1;
-    assert!(views.len() >= 12 && list_only > 0);
+    assert!(views.len() >= 12);
     assert_eq!(current, Some(views.last().unwrap().1.id));
+    // SlateDB GC reads the newest manifests in the background, so the test names the manifests
+    // of the older checkpoints. The poll must read none of them.
+    let older: Vec<String> = views[..views.len() - 1]
+        .iter()
+        .map(|(_, checkpoint)| format!("{:020}.manifest", checkpoint.manifest_id))
+        .collect();
     for _ in 0..2 {
         store.read.lock().unwrap().clear();
         sim.poll(member).await;
-        assert_eq!(manifest_count(), list_only);
+        let read = store.read.lock().unwrap().clone();
+        let reopened: Vec<_> = read
+            .iter()
+            .filter(|path| older.iter().any(|name| path.ends_with(name.as_str())))
+            .collect();
+        assert!(
+            reopened.is_empty(),
+            "the poll read older manifests: {reopened:?}"
+        );
         assert_eq!(sim.base(member).1, current);
     }
 }
