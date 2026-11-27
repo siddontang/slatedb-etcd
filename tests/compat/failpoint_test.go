@@ -32,15 +32,10 @@ func TestFailpointRecovery(t *testing.T) {
 	}
 	for _, point := range points {
 		t.Run(point, func(t *testing.T) {
-			var args []string
 			// Replicated mode only: shared state mode does not reach these hooks. They are in
 			// the local checkpoint, Raft snapshot install, and compaction flush paths. The
 			// removal of replicated mode must replace these cases.
-			if strings.HasPrefix(point, "snapshot-") || strings.HasPrefix(point, "checkpoint-") ||
-				(strings.HasPrefix(point, "compact-") && strings.HasSuffix(point, "-flush")) {
-				args = []string{"--state-mode", "replicated"}
-			}
-			c := newCluster(t, args...)
+			c := newCluster(t)
 			leader := c.leader()
 			target := leader%3 + 1
 			if point == "raft-before-leader-send" || point == "apply-after-early-reply" {

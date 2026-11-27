@@ -84,14 +84,14 @@ class BenchResults(unittest.TestCase):
             return command[command.index("--s3-prefix") + 1]
 
         command, env = member(3)
-        self.assertEqual(command[command.index("--state-mode") + 1], "shared")
+        self.assertIn("--s3-bucket", command)
         self.assertEqual(env["AWS_SECRET_ACCESS_KEY"], "s")
         # A restart keeps the prefix. Another cluster gets another prefix.
         self.assertEqual(prefix(command), prefix(member(3)[0]))
         self.assertNotEqual(prefix(command), prefix(member(3, "/tmp/other/0")[0]))
         self.assertTrue(prefix(command).startswith("upstream-e2e/run/"))
         single, env = member(1)
-        self.assertNotIn("--state-mode", single)
+        self.assertNotIn("--s3-bucket", single)
         self.assertEqual(env, {})
         with self.assertRaises(ValueError):
             member(3, settings=None)

@@ -132,7 +132,7 @@ func TestCompactionRecovery(t *testing.T) {
 	// Replicated mode only. In shared state mode a restarted member adopts the newest shared
 	// checkpoint when it starts, so it installs no Raft snapshot. The removal of replicated mode
 	// must replace this test.
-	c := newCluster(t, "--state-mode", "replicated")
+	c := newCluster(t)
 	clients := make([]*clientv3.Client, 3)
 	for i, addr := range c.addresses {
 		clients[i] = client(t, []string{addr})

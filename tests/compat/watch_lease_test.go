@@ -240,7 +240,7 @@ func TestWatchLeaseRestartAndSnapshot(t *testing.T) {
 	// Replicated mode only. In shared state mode a restarted member adopts the newest shared
 	// checkpoint when it starts, so it installs no Raft snapshot. The removal of replicated mode
 	// must replace this test.
-	c := newCluster(t, "--state-mode", "replicated")
+	c := newCluster(t)
 	api := client(t, c.addresses)
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()

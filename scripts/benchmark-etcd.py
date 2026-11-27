@@ -125,7 +125,7 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
         memory, resource_errors = [], []
         initial = ",".join(f"node{i+1}=http://{peer}" for i, peer in enumerate(peers))
         sample = {"passed": False, "backend": kind, "members": members, "concurrency": concurrency,
-                  "read_percent": reads, "repeat": repeat, "state_mode": state_mode(kind, members)}
+                  "read_percent": reads, "repeat": repeat}
         try:
             for i in range(members):
                 data = root / f"node{i+1}"
@@ -328,13 +328,6 @@ def main():
         benchmark(args, kinds, store, report)
 
 
-def state_mode(kind, members):
-    """Return the state layout that a backend runs with."""
-    if kind == "etcd":
-        return "local"
-    return "shared" if members > 1 else "replicated"
-
-
 @contextmanager
 def object_store(args, kinds, path, report):
     """Start RustFS for `--rustfs`, and for service clusters of several members without a bucket.
@@ -368,7 +361,6 @@ def new_report(args, kinds):
               "client_target": args.client_target,
               "deployment": f"{args.members} processes per backend; shared host and disk; loopback plaintext",
               "reference_etcd": "v3.6.5", "state_backend": "s3" if args.s3_bucket else "local",
-              "state_modes": {kind: state_mode(kind, args.members) for kind in kinds},
               "raft_snapshot_entries": args.snapshot_entries, "quota_bytes": args.quota_bytes,
               "order_seed": args.seed, "binaries": {},
               "resource_phases": "CPU deltas and peak RSS cover only the measured phase; retained preload memory remains",

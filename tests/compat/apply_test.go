@@ -20,7 +20,7 @@ func TestSlowApplyKeepsRaftLive(t *testing.T) {
 	// Replicated mode only. The test expects the checkpoint to move `snapshot_index` past the
 	// delayed commit. In shared state mode, `snapshot_index` stays at 0 after the checkpoint
 	// reply. The removal of replicated mode must replace this test.
-	c := newCluster(t, "--state-mode", "replicated")
+	c := newCluster(t)
 	leader := c.leader()
 	api := client(t, []string{c.addresses[leader-1]})
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -134,7 +134,7 @@ func TestSnapshotApplyKeepsPeerReplicationLive(t *testing.T) {
 	// Replicated mode only. In shared state mode a restarted member adopts the newest shared
 	// checkpoint when it starts, so it installs no Raft snapshot. The removal of replicated mode
 	// must replace this test.
-	c := newCluster(t, "--state-mode", "replicated")
+	c := newCluster(t)
 	leader := c.leader()
 	lagging := leader%3 + 1
 	api := client(t, []string{c.addresses[leader-1]})

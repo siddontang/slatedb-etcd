@@ -84,7 +84,7 @@ func backend(t *testing.T, kind string) *clientv3.Client {
 			prefix := "downstream/" + hex.EncodeToString(random)
 			// This module cannot import the compat test package. Its flags copy `storeFlags` in
 			// tests/compat/compat_test.go and `shared_args` in scripts/rustfs_fixture.py.
-			flags := []string{"--state-mode", "shared", "--s3-bucket", bucket, "--s3-prefix", prefix,
+			flags := []string{"--s3-bucket", bucket, "--s3-prefix", prefix,
 				"--s3-endpoint", s3}
 			if strings.HasPrefix(s3, "http://") {
 				flags = append(flags, "--s3-allow-http")

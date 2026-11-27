@@ -39,7 +39,7 @@ func checkLargeValues(ctx context.Context, t *testing.T, api *clientv3.Client, m
 // after the stored rows. Every key keeps its acknowledged value, and the cluster accepts a write.
 func TestFailpointSharedRestore(t *testing.T) {
 	const mib = 72
-	source := newClusterSize(t, 1, "--state-mode", "shared")
+	source := newClusterSize(t, 1)
 	api := client(t, source.addresses)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
@@ -61,7 +61,7 @@ func TestFailpointSharedRestore(t *testing.T) {
 	restored := newClusterConfigured(t, 1, func(c *cluster) {
 		c.readyTimeout = 10 * time.Minute
 		c.deferStart = true
-	}, "--state-mode", "shared", "--restore-snapshot", file)
+	}, "--restore-snapshot", file)
 	trigger := filepath.Join(restored.root, "fault-1")
 	require.NoError(t, os.WriteFile(trigger, []byte("shared-restore-after-flush"), 0600))
 	restored.start(1)

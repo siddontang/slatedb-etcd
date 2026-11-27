@@ -234,7 +234,7 @@ def unique_prefix(kind):
 
 
 def shared_args(prefix, env=None, allow_http=None):
-    """Return the flags that start one member in shared state mode on the store of `env`.
+    """Return the flags that start one member on the store of `env`.
 
     All members of one cluster use the same `prefix`, also after a restart. Without
     `SLATEDB_S3_TEST_ENDPOINT`, the member uses the AWS endpoint of the bucket. By default, an
@@ -248,7 +248,7 @@ def shared_args(prefix, env=None, allow_http=None):
     if not bucket:
         raise RuntimeError("A cluster of several members needs RustFS. Use shared_store, or run "
                            "the command through scripts/rustfs_fixture.py")
-    flags = ["--state-mode", "shared", "--s3-bucket", bucket, "--s3-prefix", prefix]
+    flags = ["--s3-bucket", bucket, "--s3-prefix", prefix]
     if endpoint:
         flags += ["--s3-endpoint", endpoint]
         if endpoint.startswith("http://") if allow_http is None else allow_http:

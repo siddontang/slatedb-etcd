@@ -22,7 +22,7 @@ func TestBoundedLogCacheRecoversLaggingFollower(t *testing.T) {
 			// can install a base instead: on Linux CI both cases reported `snapshot_index` 15.
 			// On macOS they caught up from the log in 5 of 5 runs, so an install is not a
 			// stable expectation either. The removal of replicated mode must replace this test.
-			args := []string{"--log-cache-bytes", "1024", "--state-mode", "replicated"}
+			args := []string{"--log-cache-bytes", "1024"}
 			c := newCluster(t, args...)
 			leader := c.leader()
 			offline := leader%3 + 1
