@@ -138,7 +138,8 @@ Each task can resume on another runtime worker after it yields.
 | Checkpoint | The leader publisher flushes state. Blocking workers sync snapshot records. |
 | Other work | Blocking workers handle password checks and metrics encoding. |
 
-The client and peer tasks submit events through a queue with 2,048 slots.
+Client tasks submit events through a queue with 2,048 slots.
+Peer frames and view acknowledgements have 2,048 queue slots that client requests cannot consume.
 The WAL thread publishes checkpoint metadata, or a synced image file, and syncs the truncation.
 It prepares incoming peer snapshots in order before reporting durable completion.
 The owner sends ordered work to WAL and apply. Each worker sends its result back to the owner.

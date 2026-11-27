@@ -21,11 +21,13 @@ async fn server_on(
     tokio::task::JoinHandle<Result<()>>,
     prometheus::IntCounter,
 ) {
-    server_with(store).await
+    server_with(store, mpsc::channel(1).0).await
 }
 
+/// A peer server whose client requests go to `clients`.
 async fn server_with(
     store: Option<&str>,
+    clients: mpsc::Sender<Event>,
 ) -> (
     String,
     mpsc::Receiver<Event>,
@@ -34,13 +36,14 @@ async fn server_with(
 ) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
-    let (events, received) = mpsc::channel(256);
+    let (peers, received) = mpsc::channel(256);
     let refused = prometheus::IntCounter::new("refused", "Refused peer stores.").unwrap();
     let memory = std::sync::Arc::new(slatedb::object_store::memory::InMemory::new());
     let cache = crate::state::StateCache::default();
     let router = crate::api::router(ApiState {
         shared: crate::state::shared::offline_source(memory, "", cache).unwrap(),
-        events,
+        events: clients,
+        peer_events: peers,
         peer: Identity {
             cluster: "stream-test".into(),
             store: store.map(str::to_owned),
@@ -707,4 +710,68 @@ async fn peers_of_another_store_or_no_store_are_refused_before_raft() {
     assert_eq!(refused.get(), 2 + routes);
     drop(messages);
     sender.await.unwrap();
+}
+
+/// A write burst that fills the client queue does not drop peer frames. A dropped frame would
+/// close the peer stream or refuse the HTTP request.
+#[tokio::test]
+async fn a_full_client_queue_does_not_drop_peer_frames() {
+    use crate::proto::etcdserverpb::{request_op::Request as Op, PutRequest, RequestOp};
+    let (clients, _queued) = mpsc::channel(16);
+    let (address, mut received, _task, _) = server_with(None, clients.clone()).await;
+    while clients.capacity() > 0 {
+        let put = RequestOp {
+            request: Some(Op::RequestPut(PutRequest {
+                key: b"k".to_vec(),
+                ..Default::default()
+            })),
+        };
+        let (reply, _) = tokio::sync::oneshot::channel();
+        clients.try_send(Event::Kv(put, reply)).unwrap();
+    }
+
+    let channel = crate::tls::Transport::default().channel(&address).unwrap();
+    let mut request = Request::new(tokio_stream::iter([Frame {
+        sequence: 1,
+        payload: message(false).encode_to_vec(),
+    }]));
+    request
+        .metadata_mut()
+        .insert(CLUSTER, "stream-test".parse().unwrap());
+    let mut receipts = TransportClient::new(channel)
+        .exchange(request)
+        .await
+        .unwrap()
+        .into_inner();
+    step(&mut received, false)
+        .await
+        .send(Ok(json!({})))
+        .unwrap();
+    assert_eq!(receipts.message().await.unwrap().unwrap().sequence, 1);
+
+    let post = Identity::from("stream-test")
+        .headers(reqwest::Client::new().post(format!("http://{address}/raft")))
+        .body(message(false).encode_to_vec())
+        .send();
+    let post = tokio::spawn(post);
+    step(&mut received, false)
+        .await
+        .send(Ok(json!({})))
+        .unwrap();
+    assert_eq!(
+        post.await.unwrap().unwrap().status(),
+        reqwest::StatusCode::OK
+    );
+
+    let ack = Identity::from("stream-test")
+        .headers(reqwest::Client::new().post(format!("http://{address}/raft/view-ack")))
+        .json(&json!({"member": 2, "checkpoints": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ack.status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(matches!(
+        received.recv().await,
+        Some(Event::ViewAck { member: 2, .. })
+    ));
 }

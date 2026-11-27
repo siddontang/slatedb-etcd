@@ -782,16 +782,19 @@ impl Node {
         self.writer.set_clock(now_ms);
     }
 
+    /// Run with no peer queue. Peer frames can still come through `events`.
     pub async fn run(self, events: mpsc::Receiver<Event>) -> Result<()> {
-        self.run_until(events, std::future::pending()).await
+        let (_, peers) = mpsc::channel(1);
+        self.run_until(events, peers, std::future::pending()).await
     }
 
     pub(crate) async fn run_until(
         mut self,
         events: mpsc::Receiver<Event>,
+        peers: mpsc::Receiver<Event>,
         stop: impl std::future::Future<Output = ()>,
     ) -> Result<()> {
-        let owner = self.run_loop(events);
+        let owner = self.run_loop(events, peers);
         #[cfg(feature = "write-profile")]
         let probe = crate::write_profile::Probe::new(crate::write_profile::Stage::Raft);
         #[cfg(feature = "write-profile")]
@@ -812,7 +815,11 @@ impl Node {
         result.and(apply).and(log)
     }
 
-    async fn run_loop(&mut self, mut events: mpsc::Receiver<Event>) -> Result<()> {
+    async fn run_loop(
+        &mut self,
+        mut events: mpsc::Receiver<Event>,
+        mut peers: mpsc::Receiver<Event>,
+    ) -> Result<()> {
         self.publish_watch(None);
         self.publish_local_reads();
         // Schedule committed log recovery before accepting client work.
@@ -864,6 +871,14 @@ impl Node {
                     // Accumulate proposals so concurrent clients can share one durable log write.
                     for _ in 0..63 {
                         let Ok(event) = events.try_recv() else { break; };
+                        self.handle(event, &mut step_responses).await?;
+                    }
+                }
+                // A closed peer queue disables this branch. Batch frames like client events.
+                Some(event) = peers.recv() => {
+                    self.handle(event, &mut step_responses).await?;
+                    for _ in 0..63 {
+                        let Ok(event) = peers.try_recv() else { break; };
                         self.handle(event, &mut step_responses).await?;
                     }
                 }
