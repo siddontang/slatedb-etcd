@@ -73,14 +73,10 @@ impl StateMachine {
                 Ok(((reply, batch, revision, change), deletes)) => {
                     (Ok(reply), batch, revision, change, deletes)
                 }
-                Err(error) => {
-                    ensure!(
-                        error.code != tonic::Code::Internal as i32,
-                        "{}",
-                        error.message
-                    );
+                Err(mvcc::ApplyError::Request(error)) => {
                     (Err(error), WriteBatch::new(), self.revision, None, 0)
                 }
+                Err(mvcc::ApplyError::Unapplied(error)) => return Err(error),
             };
         self.mark_applied(&mut batch, index);
         self.write_batch(batch, index).await?;

@@ -1,8 +1,8 @@
 //! Read applied state through one interface.
 //!
-//! Apply reads the live database. Pinned read views, Watch catch-up, and maintenance scans read a
-//! SlateDB snapshot or the live database. All of them use `StateRead`, so a new state type needs
-//! only an implementation of this trait. Writes still go to the SlateDB `Db`.
+//! Apply reads the overlay and base of the shared state. Pinned read views, Watch catch-up, and
+//! maintenance scans read a pinned view. All of them use `StateRead`, so a new state type needs
+//! only an implementation of this trait. The leader writer writes the SlateDB `Db`.
 //!
 //! The trait is generic, not a trait object. Point reads and scans are on the hot path, and a
 //! trait object would need a boxed future for each call.
@@ -119,7 +119,7 @@ impl StateRead for DbSnapshot {
     }
 }
 
-/// A checkpoint reader. A replicated backup scans its checkpoint through this.
+/// A checkpoint reader.
 impl StateRead for DbReader {
     type Scan<'a> = DbIterator;
 

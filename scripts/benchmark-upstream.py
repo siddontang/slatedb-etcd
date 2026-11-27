@@ -11,6 +11,7 @@ import re
 import subprocess
 import tempfile
 
+from rustfs_fixture import shared_store
 from upstream_source import ROOT, INVENTORY, build_tool, checked_source, start_cluster
 
 
@@ -172,14 +173,18 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     revision = json.loads(INVENTORY.read_text())["revision"]
     results = []
-    for case in selected:
-        for repeat in range(args.repeat):
-            targets = ["service", "etcd"] if repeat % 2 == 0 else ["etcd", "service"]
-            for target in (["etcd-mvcc"] if case.name == "mvcc-put" else targets):
-                result = run_case(case, target, args, tools, revision, repeat)
-                results.append(result)
-                print(target, case.name, "pass" if result["passed"] else "FAIL", flush=True)
-                (args.output / "summary.json").write_text(json.dumps(results, indent=2) + "\n")
+    # Replace an earlier summary before RustFS starts, because the start can fail.
+    (args.output / "summary.json").write_text("[]\n")
+    # Service members run in shared state mode. All cases use one RustFS server.
+    with shared_store():
+        for case in selected:
+            for repeat in range(args.repeat):
+                targets = ["service", "etcd"] if repeat % 2 == 0 else ["etcd", "service"]
+                for target in (["etcd-mvcc"] if case.name == "mvcc-put" else targets):
+                    result = run_case(case, target, args, tools, revision, repeat)
+                    results.append(result)
+                    print(target, case.name, "pass" if result["passed"] else "FAIL", flush=True)
+                    (args.output / "summary.json").write_text(json.dumps(results, indent=2) + "\n")
     raise SystemExit(not all(r["passed"] for r in results))
 
 

@@ -237,6 +237,9 @@ func TestWatchCompactionUsesLocalApply(t *testing.T) {
 }
 
 func TestWatchLeaseRestartAndSnapshot(t *testing.T) {
+	// In shared state mode a restarted member adopts the newest shared checkpoint when it starts,
+	// so it installs no Raft snapshot.
+	t.Skip("needs a shared restart and pause shape; see #149 TestWatchLeaseRestartAndSnapshot")
 	c := newCluster(t)
 	api := client(t, c.addresses)
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)

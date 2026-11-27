@@ -1,37 +1,38 @@
 # Remote state storage and host validation
 
-The service supports local objects and S3-compatible storage. Each replica keeps its Raft log on
-local durable storage. A quorum commits writes through these logs. A normal write does not wait for
-an S3 upload. S3 stores each replica's state, not a shared Raft log.
+Every cluster, also a single member, needs S3-compatible storage. Each replica keeps its Raft log
+on local durable storage. A quorum commits writes through these logs. A normal write does not wait
+for an S3 upload. S3 stores one shared state of the cluster, not a shared Raft log.
 
 ## Namespace ownership
 
-Use `--s3-bucket BUCKET --s3-region REGION` to select S3. The default region is `us-east-1`.
+`--s3-bucket BUCKET` is required. A start without it fails. `--s3-region` defaults to
+`us-east-1`.
 Use `--s3-endpoint https://ENDPOINT` for a compatible service. The bucket must already exist.
 The endpoint cannot contain credentials, a path, a query, or a fragment.
 `--s3-allow-http` permits plaintext only for an isolated test service.
 
-`--s3-prefix` defaults to `slatedb-etcd`. The effective member prefix is:
+`--s3-prefix` defaults to `slatedb-etcd`. The effective cluster prefix is:
 
 ```text
-<prefix>/<sha256(cluster-id)>/member-<id>/
-    owner.json
-    state.namespace
-    state.current
-    state/ or state-N/
+<prefix>/<sha256(cluster-id)>/
+    shared/owner.json
+    shared/state/
+    member-<id>/binding.json
 ```
 
-Each member owns its own manifests and SST files. Members never share writer ownership.
-A Raft snapshot install copies the leader checkpoint into a new `state-N/` database.
-See [object storage snapshots](object-snapshots.md).
-A synced `object-store.json` file binds the local directory to the backend and a random owner ID.
-An atomic conditional PUT claims the remote prefix. A different local owner cannot reuse it.
-A lost claim response is safe to retry with the same directory and identity.
+Only the leader writes the shared SlateDB. A Raft snapshot names a checkpoint of it, so an install
+copies no data. See the [shared state guide](shared-state-guide.md#object-layout).
+A synced `object-store.json` file binds the local directory to the backend, a random owner ID,
+and the store ID of the cluster claim. An atomic conditional PUT claims the member binding. A
+different local owner cannot reuse it. A lost claim response is safe to retry with the same
+directory and identity.
 
 Keep the binding and Raft directory together. Changing the bucket, endpoint, region, prefix,
-cluster, or member requires a new directory and a deliberate restore or member replacement.
-The service rejects implicit local-to-S3 migration. A copied directory must not run concurrently
-with its original. SlateDB writer fencing is a final defense, not an operator lock service.
+cluster, or member requires a new directory and a deliberate restore or member replacement. A data
+directory of replicated state mode or of a member-local store is not supported. A copied directory
+must not run concurrently with its original. SlateDB writer fencing is a final defense, not an
+operator lock service.
 
 A native backup restore requires a new cluster identity or unused S3 prefix.
 Losing the local Raft log can lose committed work that has not reached S3.
@@ -42,9 +43,7 @@ Replace that member from the surviving quorum. Do not treat its S3 prefix as a c
 Credentials come from AWS access-key, session-token, web-identity, container-identity, or instance
 metadata providers. Shared AWS profile files are not read by this adapter.
 Secret values have no command-line flags and do not appear in the binding file.
-Grant access to the selected bucket and prefix for object read, write, list, and delete operations.
-For server-side snapshot copies, also grant object read on the other member prefixes of the
-cluster. Without it, a follower copies snapshot objects through the leader over HTTP.
+Grant access to the cluster prefix as the [shared state guide](shared-state-guide.md) states.
 Conditional object creation and update must work correctly.
 
 The HTTP client uses a three-second connection timeout and a ten-second request timeout.
@@ -76,16 +75,20 @@ Restrict that trust boundary to operators and member processes.
 The S3 suite starts RustFS 1.0.6 on loopback with a temporary bucket and credentials.
 It verifies the release archive checksum before extracting the server.
 The fixture supports Apple Silicon macOS and GNU/Linux on x86-64 and ARM64.
-Run the recovery suite with these commands.
+
+The S3 recovery check is deferred until
+[#149](https://github.com/slatedb/slatedb-etcd/issues/149). Its only test, `TestS3Recovery`, skips
+until it can inject a fault on the shared SSTs that one member reads. A run without a passed test
+fails, so CI does not run this check for now. These commands run it.
 
 ```sh
 scripts/cargo.sh build --locked --release
 python3 scripts/check-s3.py --output results/ci/s3.json
 ```
 
-The suite covers delayed uploads, lost successful PUT responses, failed reads, object outages,
-process crashes, snapshot transfer, and full cluster restart. It verifies acknowledged data and
-checks that pending object work cannot advance the Raft reclamation boundary.
+After #149, the check covers delayed uploads, lost successful PUT responses, failed reads, object
+outages, process crashes, and full cluster restart. It verifies acknowledged data and checks that
+pending object work cannot advance the Raft reclamation boundary.
 
 The DST suite injects delays and errors through the real ObjectStore interface.
 It checks recovery reads, terminal upload errors, and ambiguous successful PUT results.

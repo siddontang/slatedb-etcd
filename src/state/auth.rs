@@ -36,6 +36,10 @@ impl StateMachine {
         self.read_etcd(request).await
     }
 
+    /// Check that `auth` may run `command`. Apply uses the error as the result of the entry.
+    /// That is correct only because the check reads memory: the Auth store and the key index.
+    /// A storage read here would need the return type `ApplyError`, so that a failed read
+    /// leaves the entry unapplied.
     pub async fn authorize(
         &self,
         auth: &crate::auth::Credentials,

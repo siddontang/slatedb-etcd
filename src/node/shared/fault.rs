@@ -22,12 +22,14 @@ const DATA_RETRY_FIRST: Duration = Duration::from_secs(30);
 const DATA_RETRY_CAP: Duration = Duration::from_secs(5 * 60);
 /// Failures in a row after which the leader hands over its leadership.
 const HANDOFF_FAILURES: u32 = 3;
+/// ID time refusals in a row that open the writer again at once. A later one is a clock fault.
+const ID_TIME_REOPENS: u32 = 3;
 /// Due storage work that makes no durable progress for this time is a fault.
 pub(super) const STALL: Duration = Duration::from_secs(30);
 /// A failed writer that takes this long to close logs a warning.
 const SLOW_CLOSE: Duration = Duration::from_secs(30);
 /// Election timeouts that a handoff can take before the leader tries another voter.
-const HANDOFF_TIMEOUTS: u32 = 2;
+pub(super) const HANDOFF_TIMEOUTS: u32 = 2;
 
 /// The class of a writer fault.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,7 +41,8 @@ pub(in crate::node) enum Fault {
     /// SlateDB cannot use the shared database, for example an object is missing or does not
     /// decode. Each later leader can meet the same error.
     Data,
-    /// The local clock is too far behind the clock of the shared writer.
+    /// The local clock is too far behind the clock of the shared writer, or SlateDB refused an
+    /// ID time after `ID_TIME_REOPENS` reopens. See `clock`.
     Clock,
     /// Due storage work made no durable progress for `STALL`.
     Stalled,
@@ -60,36 +63,30 @@ impl Fault {
     }
 }
 
-/// Classify a writer error. The outermost SlateDB error decides, so a missing object that
-/// SlateDB reports as a data error is not a storage error. A stored object that does not decode
-/// is a data error too. An object store error with no SlateDB error around it comes from this
-/// crate's own storage calls.
+/// Classify a writer error. A fence and a lost open race come first. Then the rule of
+/// `storage_fault::classify` holds, so a missing object is a data error, as a stored object that
+/// does not decode is. A writer that SlateDB closed for another reason is a data error too: its
+/// flush failed, and the close hides the cause.
 pub(in crate::node) fn classify(error: &anyhow::Error) -> Fault {
+    use crate::mvcc::storage_fault::StorageFault;
+    if id_time_refused(error) {
+        return Fault::Clock;
+    }
     if fenced(error) || open_conflict(error) {
         return Fault::Fenced;
     }
-    if error
-        .chain()
-        .any(|cause| cause.is::<crate::state::StoredData>())
-    {
-        return Fault::Data;
-    }
-    if let Some(error) = error
+    let closed = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<slatedb::Error>())
-    {
-        return match error.kind() {
-            slatedb::ErrorKind::Unavailable => Fault::Unavailable,
-            _ => Fault::Data,
-        };
+        .is_some_and(|error| matches!(error.kind(), slatedb::ErrorKind::Closed(_)));
+    if closed {
+        return Fault::Data;
     }
-    if error
-        .chain()
-        .any(|cause| cause.is::<slatedb::object_store::Error>())
-    {
-        return Fault::Unavailable;
+    match crate::mvcc::storage_fault::classify(error) {
+        Some(StorageFault::Transient) => Fault::Unavailable,
+        Some(StorageFault::Missing | StorageFault::Corrupt) => Fault::Data,
+        None => Fault::Invariant,
     }
-    Fault::Invariant
 }
 
 /// Return true when `error` is a lost manifest race: another writer wrote the manifest version
@@ -105,6 +102,26 @@ pub(in crate::node) fn open_conflict(error: &anyhow::Error) -> bool {
 }
 
 pub(in crate::node) use crate::state::shared::fenced;
+
+/// Return true when SlateDB refused an ID time or a tick below its newest one: an L0 SST, a
+/// compaction job, or a compaction output (`manifest/invariants.rs`,
+/// `compactions_store/invariants.rs`). SlateDB 0.18.1 reports each as an `Invalid` error whose
+/// message starts with this text, also as the stored error of a `Db` that its compactor task
+/// closed. The stored state is sound: the next open reads a higher floor. See
+/// `clock::stored_floor`.
+pub(in crate::node) fn id_time_refused(error: &anyhow::Error) -> bool {
+    const REFUSAL: &str = "invalid clock tick, must be monotonic";
+    error.chain().any(|cause| {
+        cause.downcast_ref::<slatedb::Error>().is_some_and(|error| {
+            let kind = error.kind();
+            let text = error.to_string();
+            kind == slatedb::ErrorKind::Invalid
+                && text
+                    .strip_prefix(&format!("{kind}: "))
+                    .is_some_and(|message| message.starts_with(REFUSAL))
+        })
+    })
+}
 
 /// Return the stored error of a writer that SlateDB closed. A failed background flush closes
 /// the `Db`, and the status then reports `Panic` for every kind of error. A call on the closed
@@ -128,6 +145,15 @@ pub(super) fn recover(
     health: &TaskHealth,
     reopens: &std::sync::atomic::AtomicU64,
 ) -> Result<Duration> {
+    // Another writer of job records, such as the compactor of an older writer or a late
+    // Defragment, can add a job above the floor after this open read it. SlateDB then refuses
+    // the next ID and closes the `Db`. The next open starts above that job, so it opens again
+    // at once, with no fault. Repeated refusals are a clock fault.
+    if id_time_refused(&error) && health.id_time_reopen() <= ID_TIME_REOPENS {
+        tracing::warn!(term, %error, "SlateDB refused an ID time; open the writer again");
+        reopens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(Duration::ZERO);
+    }
     match classify(&error) {
         Fault::Fenced => {
             // Two quick elections can open writers in reverse term order. The step timer keeps
@@ -206,6 +232,8 @@ struct Record {
     stall_began: Option<Instant>,
     /// The node asked the task to drop its stalled step. The end of the stall clears it.
     restart: bool,
+    /// Writer opens in a row after SlateDB refused an ID time. A publication ends the count.
+    id_time_reopens: u32,
     /// The time of the newest fault, until this member's writer publishes again.
     mark: Option<Instant>,
     /// The time when this member's writer last created and announced a checkpoint.
@@ -252,6 +280,7 @@ impl Health {
         record.consecutive = 0;
         record.since = None;
         record.stall_began = None;
+        record.id_time_reopens = 0;
         record.done();
         TaskHealth {
             health: self.clone(),
@@ -327,16 +356,18 @@ impl Health {
     /// The start of the current incident: the first failure since the last publication, or
     /// the start of the first work that stalled. A voter that reported after it was alive while
     /// this writer failed.
-    fn incident(&self) -> Option<Instant> {
+    pub(super) fn incident(&self) -> Option<Instant> {
         let record = self.record();
         record.since.into_iter().chain(record.stall_began).min()
     }
 
-    /// The report of this member in `ViewAck`, in Raft term `term`.
-    pub(in crate::node) fn report(&self, term: u64) -> WriterReport {
+    /// The report of this member in `ViewAck`, in Raft term `term`. `apply_held_at` is the
+    /// entry that apply holds on. See `WriterReport::apply_held_at`.
+    pub(in crate::node) fn report(&self, term: u64, apply_held_at: Option<u64>) -> WriterReport {
         WriterReport {
             failed_secs: self.record().mark.map(|at| at.elapsed().as_secs()),
             term,
+            apply_held_at,
         }
     }
 
@@ -368,7 +399,7 @@ impl Health {
         self.record().total
     }
 
-    fn published_at(&self) -> Option<Instant> {
+    pub(super) fn published_at(&self) -> Option<Instant> {
         self.record().published
     }
 
@@ -519,8 +550,18 @@ impl TaskHealth {
             record.consecutive = 0;
             record.since = None;
             record.stall_began = None;
+            record.id_time_reopens = 0;
             record.done();
         });
+    }
+
+    /// Count a writer open after SlateDB refused an ID time, and return the count.
+    pub(super) fn id_time_reopen(&self) -> u32 {
+        self.update(|record| {
+            record.id_time_reopens += 1;
+            record.id_time_reopens
+        })
+        .unwrap_or(u32::MAX)
     }
 
     /// Wait until the node asks this task to drop its stalled attempt. A request that the end
@@ -538,14 +579,17 @@ impl TaskHealth {
     }
 }
 
-/// The writer health that a member reports in `ViewAck`. An earlier binary sends none.
+/// The writer health that a member reports in `ViewAck`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriterReport {
     /// Seconds since the newest fault of the member's writer, while its mark holds.
     pub failed_secs: Option<u64>,
     /// The Raft term that the member saw when it sent the report.
-    #[serde(default)]
     pub term: u64,
+    /// The entry that apply holds on after corrupt stored data. It is not a writer mark: no
+    /// publication clears it, and it does not end an incident. It clears only when apply passes
+    /// the entry. A held voter is never a handoff target.
+    pub apply_held_at: Option<u64>,
 }
 
 /// A writer report as the leader received it.
@@ -568,7 +612,7 @@ pub(in crate::node) struct Candidate {
 /// How well a voter suits a writer fault handoff.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Suit {
-    /// No current report from this term, an earlier binary, or a mark from this incident.
+    /// No current report from this term, or a mark from this incident.
     No,
     /// A mark older than this leader's last publication. Another writer published after the
     /// voter's fault, so the fault can be over.
@@ -611,6 +655,9 @@ pub(super) struct Tick<'a> {
     pub term: u64,
     /// The targets of MoveLeader requests in flight. The handoff never aborts their transfer.
     pub moves: &'a [u64],
+    /// Apply on this member holds or waits on a storage error. A publication then does not end
+    /// the incident, so the handoff tries no voter twice.
+    pub held: bool,
 }
 
 /// What the node does after a tick of a writer fault handoff.
@@ -625,8 +672,8 @@ pub(super) struct Decision {
 }
 
 impl Handoff {
-    /// Note the writer report of `member` from process `process`. An earlier binary sends no
-    /// report, and its process is not a target.
+    /// Note the writer report of `member` from process `process`. A member without a report or
+    /// a process is not a target.
     pub(super) fn note(&mut self, member: u64, process: Option<u64>, report: Option<WriterReport>) {
         match (process, report) {
             (Some(process), Some(report)) => {
@@ -661,6 +708,9 @@ impl Handoff {
         let Some(received) = self.reports.get(&candidate.id) else {
             return Suit::No;
         };
+        if received.report.apply_held_at.is_some() {
+            return Suit::No;
+        }
         let current = candidate.process == Some(received.process);
         if !current || self.led.is_none_or(|led| received.at < led) {
             return Suit::No;
@@ -704,11 +754,12 @@ impl Handoff {
     /// a stalled writer drops its attempt and opens again.
     pub(super) fn step(&mut self, tick: &Tick) -> Decision {
         let mut decision = Decision::default();
-        if self.published != tick.published {
-            self.published = tick.published;
+        // A publication of the applied prefix does not end an apply hold.
+        if self.published != tick.published && !tick.held {
             self.tried.clear();
             self.exhausted = false;
         }
+        self.published = tick.published;
         // Raft ends a transfer that does not complete within an election timeout. The record
         // follows Raft, so a later transfer to the same voter is not this one.
         if let Some((target, started)) = self.pending {
@@ -759,122 +810,20 @@ impl Handoff {
     }
 }
 
-/// Order voters for a handoff that is not a writer fault. A voter that suits a writer handoff
-/// comes first, then the longest matched log.
-fn rank(
-    handoff: Option<&Handoff>,
-    published: Option<Instant>,
-    candidates: &[Candidate],
-) -> Option<u64> {
-    candidates
-        .iter()
-        .max_by_key(|candidate| {
-            let suit = handoff.map_or(Suit::No, |handoff| handoff.suit(candidate, published));
-            (suit, candidate.matched)
-        })
-        .map(|candidate| candidate.id)
-}
-
-impl Writer {
-    /// The time since work that the publisher has not started became due: the oldest unflushed
-    /// write at its age limit, or an explicit publication request. A writer that is not open
-    /// holds the progress of an earlier one, so only an open writer counts.
-    pub(super) fn waiting(&self) -> Option<Instant> {
-        if self.open.lock().unwrap().is_none() {
-            return None;
-        }
-        let aged = self.progress.deadline(self.max_age);
-        aged.into_iter().chain(self.progress.requested()).min()
-    }
-}
-
-impl Node {
-    /// The voters other than this member, with their matched log and transport process.
-    pub(in crate::node) fn handoff_candidates(&self) -> Vec<Candidate> {
-        let id = self.options.id;
-        let voters = self.raw.raft.prs().conf().voters();
-        self.raw
-            .raft
-            .prs()
-            .iter()
-            .filter(|(&peer, _)| peer != id && voters.contains(peer))
-            .map(|(&peer, progress)| Candidate {
-                id: peer,
-                matched: progress.matched,
-                process: self.raw.store().process(peer),
-            })
-            .collect()
-    }
-
-    /// Pick the target of a handoff that is not a writer fault: a voter that suits a writer
-    /// handoff first, then the longest matched log. No voter is excluded, so replicated mode and
-    /// a cluster of earlier binaries keep the longest matched log.
-    pub(in crate::node) fn rank_voters(&self) -> Option<u64> {
-        let candidates = self.handoff_candidates();
-        let writer = self.writer.as_ref();
-        let published = writer.and_then(|writer| writer.health.published_at());
-        rank(writer.map(|writer| &writer.handoff), published, &candidates)
-    }
-
-    /// Check the writer health on each tick. A leader whose writer is down hands over its
-    /// leadership to a healthy voter, once per voter and incident. With no target left, it stays
-    /// leader and its writer keeps retrying. See `Handoff::step`.
-    pub(super) fn tick_writer_health(&mut self) {
-        let leader = self.raw.raft.state == StateRole::Leader;
-        let candidates = if leader {
-            self.handoff_candidates()
-        } else {
-            vec![]
-        };
-        let wait = TICK * HANDOFF_TIMEOUTS * self.raw.raft.election_timeout() as u32;
-        let (term, transferee) = (self.raw.raft.term, self.raw.raft.lead_transferee);
-        let mut moves: Vec<u64> = self.transfers.iter().map(|(target, ..)| *target).collect();
-        let Some(writer) = &mut self.writer else {
-            return;
-        };
-        moves.extend(writer.transfer.map(|(target, _)| target));
-        if leader {
-            writer.health.check(writer.waiting());
-        }
-        if let Some(gauges) = &writer.gauges {
-            let health = &writer.health;
-            gauges.failures.set(health.consecutive().into());
-            gauges.pending_closes.set(health.pending_closes() as i64);
-            let counters = [
-                (&gauges.faults, health.total()),
-                (&gauges.aborted_closes, health.aborted_closes()),
-            ];
-            for (counter, total) in counters {
-                counter.inc_by(total.saturating_sub(counter.get()));
-            }
-        }
-        if !leader {
-            return;
-        }
-        let health = &writer.health;
-        let decision = writer.handoff.step(&Tick {
-            due: health.handoff_due(),
-            stalled: health.stalled(),
-            transferee,
-            wait,
-            candidates: &candidates,
-            published: health.published_at(),
-            incident: health.incident(),
-            term,
-            moves: &moves,
-        });
-        if decision.restart {
-            health.restart();
-        }
-        if decision.abort {
-            self.raw.raft.abort_leader_transfer();
-        }
-        if let Some(target) = decision.transfer {
-            self.raw.transfer_leader(target);
-        }
-    }
+/// Return true when the leader must hand over its leadership: its writer is down or stalled,
+/// or apply waits on one entry for longer than `STALL`.
+pub(super) fn handoff_due(health: &Health, paused: Option<&super::apply::Paused>) -> bool {
+    health.handoff_due() || paused.is_some_and(|paused| paused.since.elapsed() >= STALL)
 }
 
 #[cfg(test)]
 #[path = "fault_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "hold_handoff_tests.rs"]
+mod hold_tests;
+
+#[cfg(test)]
+#[path = "clock_handoff_tests.rs"]
+mod clock_tests;

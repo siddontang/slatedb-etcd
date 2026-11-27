@@ -189,6 +189,12 @@ impl Queue {
         batches.range(start..).take(limit).cloned().collect()
     }
 
+    /// Return true when the queue holds a batch above `seq`. Only the newest batch is read.
+    pub(crate) fn has_after(&self, seq: u64) -> bool {
+        let batches = self.batches.lock().unwrap();
+        batches.back().is_some_and(|(batch, _)| *batch > seq)
+    }
+
     /// The sequence of the newest batch. Before any batch it is the base index.
     pub(crate) fn pushed(&self) -> u64 {
         self.position.borrow().pushed

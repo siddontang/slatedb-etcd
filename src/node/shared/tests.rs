@@ -13,6 +13,7 @@ pub(super) fn voter_options(empty_log: bool) -> crate::state::shared::Options {
         overlay_max_bytes: 1 << 30,
         restore: None,
         record: None,
+        store_id: None,
     }
 }
 use crate::state::overlay::Overlay;
@@ -58,7 +59,12 @@ async fn the_materializer_writes_whole_batches_with_their_sequences() {
     let mut replay = Overlay::new(1);
     replay.push(4, batch(4, &[("b", "2"), ("c", "3"), ("d", "4")]));
     let progress = Arc::new(Progress::new(db.manifest().last_l0_seq()));
-    let task = tokio::spawn(materialize(db.clone(), replay.queue(), progress.clone()));
+    let task = tokio::spawn(materialize(
+        db.clone(),
+        replay.queue(),
+        progress.clone(),
+        clock::Gate::unchecked(),
+    ));
     progress.wait_written(4).await.unwrap();
     assert_eq!(db.snapshot().unwrap().seq(), 4);
     assert_eq!(value(&db, "c").await, Some("3".into()));
@@ -121,6 +127,19 @@ pub(super) async fn status(server: &crate::server::Server) -> Value {
     serde_json::from_str(body).unwrap()
 }
 
+/// A writer without write probes, retention, or gauges.
+pub(super) fn new_writer(handles: &Handles, max_age: Duration, clock: Clock) -> Writer {
+    Writer::new(
+        handles,
+        max_age,
+        clock,
+        None,
+        crate::state::ViewRetention::Off,
+        None,
+        None,
+    )
+}
+
 pub(super) async fn eventually(what: &str, mut check: impl std::ops::AsyncFnMut() -> bool) {
     for _ in 0..600 {
         if check().await {
@@ -141,9 +160,10 @@ async fn stall_and_recover(early: bool) {
     let limit = 64 * 1024;
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     let dir = tempfile::tempdir().unwrap();
-    let mut config = crate::server::ServerConfig::single_node(dir.path());
-    config.state_mode = crate::state::StateMode::Shared;
-    config.object_store = crate::object::Config::Test(faults.clone(), "root".into());
+    let mut config = crate::server::ServerConfig::single_node(
+        dir.path(),
+        crate::object::Config::Test(faults.clone(), "root".into()),
+    );
     config.view_max_age = Duration::from_millis(100);
     config.overlay_max_bytes = limit;
     let server = crate::server::Server::start(config).await.unwrap();
@@ -230,9 +250,10 @@ async fn status_answers_before_the_writer_creates_the_manifest() {
     // The claims succeed. The writer cannot create the shared manifest.
     faults.set(STALL_STATE_PUT);
     let dir = tempfile::tempdir().unwrap();
-    let mut config = crate::server::ServerConfig::single_node(dir.path());
-    config.state_mode = crate::state::StateMode::Shared;
-    config.object_store = crate::object::Config::Test(faults.clone(), "root".into());
+    let config = crate::server::ServerConfig::single_node(
+        dir.path(),
+        crate::object::Config::Test(faults.clone(), "root".into()),
+    );
     let server = crate::server::Server::start(config).await.unwrap();
     server.wait_ready(Duration::from_secs(15)).await.unwrap();
     let channel = tonic::transport::Endpoint::from_shared(server.client_url())
@@ -289,7 +310,6 @@ async fn a_restart_refuses_a_base_with_another_term_at_the_record() {
         "test",
         crate::state::StateCache::default(),
         &options,
-        crate::state::transfer::Backend::Local,
     )
     .await
     .unwrap();
@@ -314,9 +334,10 @@ async fn a_slow_prev_kv_catch_up_makes_progress() {
     };
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     let dir = tempfile::tempdir().unwrap();
-    let mut config = crate::server::ServerConfig::single_node(dir.path());
-    config.state_mode = crate::state::StateMode::Shared;
-    config.object_store = crate::object::Config::Test(faults.clone(), "root".into());
+    let mut config = crate::server::ServerConfig::single_node(
+        dir.path(),
+        crate::object::Config::Test(faults.clone(), "root".into()),
+    );
     config.view_max_age = Duration::from_millis(100);
     config.view_pin_max = Duration::from_millis(24);
     // A tiny cache, so history reads go to the store.
@@ -427,7 +448,6 @@ async fn a_fenced_leader_opens_its_writer_again() {
         "test",
         crate::state::StateCache::default(),
         &options,
-        crate::state::transfer::Backend::Local,
     )
     .await
     .unwrap();
@@ -435,12 +455,12 @@ async fn a_fenced_leader_opens_its_writer_again() {
         &[(1, "127.0.0.1:1".to_owned())].into(),
     ));
     state.seed_for_test(1).await.unwrap();
-    let handles = state.shared_handles().unwrap();
+    let handles = state.shared_handles();
     let (events, mut announced) = mpsc::channel(64);
     let clock = Clock::system(Duration::from_secs(5), None);
-    let mut writer = Writer::new(&handles, Duration::from_millis(50), clock);
+    let mut writer = new_writer(&handles, Duration::from_millis(50), clock);
     writer.sync(true, 2, &events);
-    writer.progress.wait_written(1).await.unwrap();
+    writer.progress().wait_written(1).await.unwrap();
     // The leader of term 1 opens late. Its open fences the writer of term 2. The current
     // leader can open again before this open ends, which fails the late open instead.
     let old = handles.source.open_writer().await.ok();
@@ -473,9 +493,9 @@ async fn a_fenced_leader_opens_its_writer_again() {
     .unwrap();
     let value = covered.get(b"etcd/current/after-fence").await.unwrap();
     assert!(value.is_some());
-    assert!(writer.tasks.try_join_next().is_none());
+    assert!(writer.tasks().try_join_next().is_none());
     // The current leader saw the fence and opened its writer again.
-    assert!(writer.reopens.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+    assert!(writer.reopens() >= 1);
     // The writer of term 1 is fenced now. Its next flush cannot commit a manifest.
     if let Some(old) = old {
         let flushed = async {
@@ -550,7 +570,6 @@ pub(super) async fn stranded_checkpoint_on(
         "test",
         crate::state::StateCache::default(),
         &options,
-        crate::state::transfer::Backend::Local,
     )
     .await
     .unwrap();
@@ -558,10 +577,10 @@ pub(super) async fn stranded_checkpoint_on(
         &[(1, "127.0.0.1:1".to_owned())].into(),
     ));
     state.seed_for_test(1).await.unwrap();
-    let handles = state.shared_handles().unwrap();
+    let handles = state.shared_handles();
     let (events, received) = mpsc::channel(64);
     let mut announcements = Announcements(received);
-    let mut first = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut first = new_writer(&handles, STRANDED_AGE, clock());
     first.sync(true, 2, &events);
     let lost = announcements.next(Duration::from_secs(20), true).await;
     first.sync(false, 2, &events);
@@ -586,7 +605,7 @@ async fn a_new_writer_announces_a_stranded_checkpoint() {
     let mut based = handles.based.clone();
     assert_eq!(*based.borrow(), 0);
     let waiter = tokio::spawn(async move { based.wait_for(|base| *base >= 1).await.is_ok() });
-    let mut second = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut second = new_writer(&handles, STRANDED_AGE, clock());
     second.sync(true, 3, &events);
     assert_eq!(
         announcements.next(Duration::from_secs(2), false).await,
@@ -614,12 +633,12 @@ async fn a_new_writer_announces_a_stranded_checkpoint() {
     second.sync(false, 3, &events);
     second.stop().await;
     // A later writer does not announce it either.
-    let mut third = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut third = new_writer(&handles, STRANDED_AGE, clock());
     third.sync(true, 4, &events);
-    third.progress.wait_written(1).await.unwrap();
+    third.progress().wait_written(1).await.unwrap();
     third.request_publication(1);
     announcements.none(limit).await;
-    assert!(third.tasks.try_join_next().is_none());
+    assert!(third.tasks().try_join_next().is_none());
     third.sync(false, 4, &events);
     third.stop().await;
     state.close().await.unwrap();
@@ -629,14 +648,14 @@ async fn a_new_writer_announces_a_stranded_checkpoint() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_stranded_check_is_retried() {
     let (state, handles, events, mut announcements, lost) = stranded_checkpoint().await;
-    let mut second = Writer::new(&handles, STRANDED_AGE, clock());
-    let failures = second.applied.failures.clone();
+    let mut second = new_writer(&handles, STRANDED_AGE, clock());
+    let failures = second.failures();
     failures.store(3, std::sync::atomic::Ordering::Relaxed);
     second.sync(true, 3, &events);
     let limit = RETRY_MAX + Duration::from_secs(1);
     assert_eq!(announcements.next(limit, true).await, lost);
     assert_eq!(failures.load(std::sync::atomic::Ordering::Relaxed), 0);
-    assert!(second.tasks.try_join_next().is_none());
+    assert!(second.tasks().try_join_next().is_none());
     second.sync(false, 3, &events);
     second.stop().await;
     state.close().await.unwrap();
@@ -656,24 +675,17 @@ async fn a_failed_base_open_is_retried_on_an_idle_member() {
         meta_bytes: 1,
         row_bytes: 0,
     };
-    let mut state = StateMachine::open_shared(
-        faults.clone(),
-        "root",
-        "test",
-        cache,
-        &options,
-        crate::state::transfer::Backend::Local,
-    )
-    .await
-    .unwrap();
+    let mut state = StateMachine::open_shared(faults.clone(), "root", "test", cache, &options)
+        .await
+        .unwrap();
     state.members = Arc::new(crate::cluster::Store::initial(
         &[(1, "127.0.0.1:1".to_owned())].into(),
     ));
     state.seed_for_test(1).await.unwrap();
-    let handles = state.shared_handles().unwrap();
+    let handles = state.shared_handles();
     let (events, received) = mpsc::channel(64);
     let mut announcements = Announcements(received);
-    let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut writer = new_writer(&handles, STRANDED_AGE, clock());
     writer.sync(true, 2, &events);
     let id = announcements.next(Duration::from_secs(20), true).await;
     writer.sync(false, 2, &events);
@@ -723,24 +735,17 @@ async fn the_base_advances_under_a_stream_of_announcements() {
         meta_bytes: 1,
         row_bytes: 0,
     };
-    let mut state = StateMachine::open_shared(
-        faults.clone(),
-        "root",
-        "test",
-        cache,
-        &options,
-        crate::state::transfer::Backend::Local,
-    )
-    .await
-    .unwrap();
+    let mut state = StateMachine::open_shared(faults.clone(), "root", "test", cache, &options)
+        .await
+        .unwrap();
     state.members = Arc::new(crate::cluster::Store::initial(
         &[(1, "127.0.0.1:1".to_owned())].into(),
     ));
     state.seed_for_test(1).await.unwrap();
-    let handles = state.shared_handles().unwrap();
+    let handles = state.shared_handles();
     let (events, received) = mpsc::channel(64);
     let mut announcements = Announcements(received);
-    let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut writer = new_writer(&handles, STRANDED_AGE, clock());
     writer.sync(true, 2, &events);
     // Sixteen checkpoints, each after one more write. Raft takes none of them yet.
     let mut checkpoints = vec![announcements.next(Duration::from_secs(20), true).await];
@@ -805,7 +810,7 @@ async fn the_base_advances_under_a_stream_of_announcements() {
 #[tokio::test]
 async fn a_manual_checkpoint_requests_its_publication_after_apply() {
     let (mut state, handles, _events, _announcements, _) = stranded_checkpoint().await;
-    let mut writer = Writer::new(&handles, Duration::from_secs(60), clock());
+    let mut writer = new_writer(&handles, Duration::from_secs(60), clock());
     let index = state.applied + 1;
     // Committed at `index`, applied below it: no request yet.
     assert!(!writer.request_checkpoint(index, index - 1));
@@ -821,7 +826,7 @@ async fn a_manual_checkpoint_requests_its_publication_after_apply() {
     state.apply_etcd(index, &put).await.unwrap();
     assert!(writer.request_checkpoint(index, index));
     assert_eq!(
-        writer.progress.inner.lock().unwrap().publish_through,
+        writer.progress().inner.lock().unwrap().publish_through,
         Some(index)
     );
     assert!(!writer.request_checkpoint(index, index));
@@ -847,20 +852,20 @@ pub(super) async fn adopt_announced(state: &mut StateMachine, id: uuid::Uuid) {
 async fn a_new_writer_announces_a_same_index_checkpoint() {
     let (mut state, handles, events, mut announcements, first) = stranded_checkpoint().await;
     adopt_announced(&mut state, first).await;
-    let mut second = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut second = new_writer(&handles, STRANDED_AGE, clock());
     second.sync(true, 3, &events);
-    second.progress.wait_written(1).await.unwrap();
+    second.progress().wait_written(1).await.unwrap();
     announcements.none(Duration::from_millis(300)).await;
     // The Defragment republish. Its announcement does not apply before the change.
-    second.progress.republish();
+    second.progress().republish();
     let compacted = announcements.next(Duration::from_secs(5), true).await;
     assert_ne!(compacted, first);
     let base = handles.source.open_base(compacted).await.unwrap();
-    assert_eq!(base.applied, state.shared.as_ref().unwrap().base.applied);
+    assert_eq!(base.applied, state.shared.base.applied);
     drop(base);
     second.sync(false, 3, &events);
     second.stop().await;
-    let mut third = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut third = new_writer(&handles, STRANDED_AGE, clock());
     third.sync(true, 4, &events);
     assert_eq!(
         announcements.next(Duration::from_secs(2), true).await,
@@ -893,7 +898,7 @@ async fn a_checkpoint_request_survives_the_writer_open() {
     };
     let index = state.applied + 1;
     state.apply_etcd(index, &put).await.unwrap();
-    let mut writer = Writer::new(&handles, Duration::from_secs(90), clock());
+    let mut writer = new_writer(&handles, Duration::from_secs(90), clock());
     assert!(writer.request_checkpoint(index, index));
     writer.sync(true, 3, &events);
     let id = announcements.next(Duration::from_secs(2), true).await;
@@ -912,14 +917,13 @@ async fn ordinary(store: Arc<dyn ObjectStore>) -> (StateMachine, Handles) {
         "test",
         crate::state::StateCache::default(),
         &options,
-        crate::state::transfer::Backend::Local,
     )
     .await
     .unwrap();
     state.members = Arc::new(crate::cluster::Store::initial(
         &[(1, "127.0.0.1:1".to_owned())].into(),
     ));
-    let handles = state.shared_handles().unwrap();
+    let handles = state.shared_handles();
     (state, handles)
 }
 
@@ -948,7 +952,7 @@ async fn a_restore_after_an_ordinary_bootstrap_fails() {
     state.seed_for_test(1).await.unwrap();
     let (events, received) = mpsc::channel(64);
     let mut announcements = Announcements(received);
-    let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut writer = new_writer(&handles, STRANDED_AGE, clock());
     writer.sync(true, 2, &events);
     announcements.next(Duration::from_secs(20), true).await;
     assert!(handles.source.bootstrapped().await.unwrap());
@@ -999,9 +1003,10 @@ async fn an_ordinary_start_resolves_a_stopped_restore() {
             .await
             .unwrap_err();
         let dir = tempfile::tempdir().unwrap();
-        let mut config = crate::server::ServerConfig::single_node(dir.path());
-        config.state_mode = crate::state::StateMode::Shared;
-        config.object_store = crate::object::Config::Test(store.clone(), "root".into());
+        let config = crate::server::ServerConfig::single_node(
+            dir.path(),
+            crate::object::Config::Test(store.clone(), "root".into()),
+        );
         let started = tokio::time::timeout(
             Duration::from_secs(30),
             crate::server::Server::start(config.clone()),
@@ -1028,9 +1033,10 @@ async fn an_ordinary_start_resolves_a_stopped_restore() {
             .unwrap();
         assert_eq!(source.restored_snapshot().await.unwrap(), Some(digest));
         let dir = tempfile::tempdir().unwrap();
-        let mut config = crate::server::ServerConfig::single_node(dir.path());
-        config.state_mode = crate::state::StateMode::Shared;
-        config.object_store = crate::object::Config::Test(store.clone(), "root".into());
+        let config = crate::server::ServerConfig::single_node(
+            dir.path(),
+            crate::object::Config::Test(store.clone(), "root".into()),
+        );
         let server = crate::server::Server::start(config).await.unwrap();
         server.wait_ready(Duration::from_secs(15)).await.unwrap();
         server.shutdown().await.unwrap();
@@ -1058,7 +1064,7 @@ async fn a_transfer_request_during_the_writer_open_is_published() {
         state.apply_etcd(index, &put).await.unwrap();
     }
     let applied = state.applied;
-    let mut writer = Writer::new(&handles, Duration::from_secs(90), clock());
+    let mut writer = new_writer(&handles, Duration::from_secs(90), clock());
     writer.sync(true, 3, &events);
     // MoveLeader calls this with the applied index. The writer has not opened yet.
     writer.request_publication(applied);
@@ -1078,9 +1084,9 @@ async fn a_transfer_request_during_the_writer_open_is_published() {
 async fn a_defragment_that_loses_the_lead_returns_a_retryable_error() {
     let (mut state, handles, events, mut announcements, first) = stranded_checkpoint().await;
     adopt_announced(&mut state, first).await;
-    let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut writer = new_writer(&handles, STRANDED_AGE, clock());
     writer.sync(true, 3, &events);
-    writer.progress.wait_written(1).await.unwrap();
+    writer.progress().wait_written(1).await.unwrap();
     for n in 0..5 {
         let put = crate::proto::etcdserverpb::RequestOp {
             request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
@@ -1097,17 +1103,14 @@ async fn a_defragment_that_loses_the_lead_returns_a_retryable_error() {
     // The aged flush publishes a checkpoint with an L0 SST. The members adopt it.
     let id = announcements.next(Duration::from_secs(10), true).await;
     adopt_announced(&mut state, id).await;
-    let db = writer.open.lock().unwrap().clone().unwrap();
     let reached = Arc::new(tokio::sync::Notify::new());
     let resume = Arc::new(tokio::sync::Notify::new());
     let defragment = Defragment {
-        db,
         admin: handles.admin.clone(),
-        progress: writer.progress.clone(),
+        owner: None,
         announced: handles.announced.clone(),
-        leadership: writer.leadership.subscribe(),
-        term: 3,
         pause: Some((DefragmentStep::Publish, reached.clone(), resume.clone())),
+        ..writer.defragment(3).unwrap()
     };
     let running = tokio::spawn(defragment.run());
     reached.notified().await;
@@ -1117,22 +1120,19 @@ async fn a_defragment_that_loses_the_lead_returns_a_retryable_error() {
     let error = running.await.unwrap().unwrap_err();
     assert_eq!(error.code, tonic::Code::Unavailable as i32, "{error:?}");
     // The retry on the next leader.
-    let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut writer = new_writer(&handles, STRANDED_AGE, clock());
     writer.sync(true, 4, &events);
-    let db = loop {
-        if let Some(db) = writer.open.lock().unwrap().clone() {
-            break db;
+    let opened = loop {
+        if let Some(opened) = writer.defragment(4) {
+            break opened;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
     let defragment = Defragment {
-        db,
         admin: handles.admin.clone(),
-        progress: writer.progress.clone(),
+        owner: None,
         announced: handles.announced.clone(),
-        leadership: writer.leadership.subscribe(),
-        term: 4,
-        pause: None,
+        ..opened
     };
     let running = tokio::spawn(defragment.run());
     let compacted = announcements.next(Duration::from_secs(20), true).await;
@@ -1169,9 +1169,9 @@ async fn defragment_setup() -> (
 ) {
     let (mut state, handles, events, mut announcements, first) = stranded_checkpoint().await;
     adopt_announced(&mut state, first).await;
-    let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut writer = new_writer(&handles, STRANDED_AGE, clock());
     writer.sync(true, 3, &events);
-    writer.progress.wait_written(1).await.unwrap();
+    writer.progress().wait_written(1).await.unwrap();
     for n in 0..5 {
         let put = crate::proto::etcdserverpb::RequestOp {
             request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
@@ -1200,13 +1200,11 @@ fn defragment(
     )>,
 ) -> Defragment {
     Defragment {
-        db: writer.open.lock().unwrap().clone().unwrap(),
         admin: handles.admin.clone(),
-        progress: writer.progress.clone(),
+        owner: None,
         announced: handles.announced.clone(),
-        leadership: writer.leadership.subscribe(),
-        term,
         pause,
+        ..writer.defragment(term).unwrap()
     }
 }
 
@@ -1238,7 +1236,7 @@ async fn check_delayed_checkpoint(compact_before_defragment: bool) {
     if compact_before_defragment {
         // Rewrite the SSTs without advancing the applied announcement. The delayed
         // checkpoint now shares no input SSTs with the upcoming Defragment.
-        crate::state::maintenance::compact_all(&handles.admin)
+        crate::state::maintenance::compact_all(&handles.admin, &|| Ok(()))
             .await
             .unwrap();
     }
@@ -1368,30 +1366,156 @@ async fn an_old_term_task_end_is_not_a_failure() {
         "test",
         crate::state::StateCache::default(),
         &options,
-        crate::state::transfer::Backend::Local,
     )
     .await
     .unwrap();
-    let handles = state.shared_handles().unwrap();
+    let handles = state.shared_handles();
     let (events, _announced) = mpsc::channel(64);
     let clock = Clock::system(Duration::from_secs(5), None);
-    let mut writer = Some(Writer::new(&handles, Duration::from_millis(50), clock));
-    let leader = writer.as_mut().unwrap();
+    let mut leader = new_writer(&handles, Duration::from_millis(50), clock);
     leader.sync(true, 2, &events);
     leader.sync(false, 2, &events);
     leader.sync(true, 3, &events);
     let failure = tokio::time::timeout(Duration::from_millis(500), async {
         loop {
-            if let WriterEvent::Failed(error) = next(&mut writer).await {
+            if let WriterEvent::Failed(error) = next(&mut leader).await {
                 return error;
             }
         }
     })
     .await;
     assert!(failure.is_err(), "{failure:?}");
-    let mut leader = writer.unwrap();
     leader.sync(false, 3, &events);
     leader.stop().await;
     state.apply(1, None).await.unwrap();
     state.close().await.unwrap();
+}
+
+/// The count of peer requests that `server` refused for their shared store.
+async fn refused_stores(server: &crate::server::Server) -> u64 {
+    let url = format!("http://{}/metrics", server.client_addr());
+    let text = reqwest::get(url).await.unwrap().text().await.unwrap();
+    text.lines()
+        .find_map(|line| line.strip_prefix("slatedb_etcd_peer_store_refusals_total "))
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// Two voters with one cluster ID and one voter list, but on different prefixes, each create
+/// their own store ID. Each voter refuses the other, so no leader is elected and a write fails.
+/// The same voters on one prefix elect a leader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voters_on_different_shared_stores_form_no_quorum() {
+    use crate::proto::etcdserverpb::{kv_client::KvClient, PutRequest};
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    for roots in [["root", "root"], ["root-1", "root-2"]] {
+        let dir = tempfile::tempdir().unwrap();
+        let peers: std::collections::BTreeMap<u64, String> =
+            (1..=2).map(|id| (id, crate::server::test_port())).collect();
+        let mut servers = vec![];
+        for (id, root) in (1..=2).zip(roots) {
+            let mut config = crate::server::ServerConfig::single_node(
+                dir.path().join(id.to_string()),
+                crate::object::Config::Test(store.clone(), root.into()),
+            );
+            config.id = id;
+            config.listen = peers[&id].parse().unwrap();
+            config.peers = peers.clone();
+            config.client_peers = peers.clone();
+            servers.push(crate::server::Server::start(config).await.unwrap());
+        }
+        if roots[0] == roots[1] {
+            for server in &servers {
+                server.wait_ready(Duration::from_secs(15)).await.unwrap();
+            }
+            let mut ids = vec![];
+            for server in &servers {
+                eventually("the shared state status", async || {
+                    status(server).await["shared_state"]["store_id"].is_string()
+                })
+                .await;
+                ids.push(status(server).await["shared_state"]["store_id"].clone());
+                assert_eq!(refused_stores(server).await, 0);
+            }
+            assert_eq!(ids[0], ids[1]);
+        } else {
+            // Without the check, a leader is elected within two election timeouts.
+            let ready = servers[0].wait_ready(Duration::from_secs(4)).await;
+            assert!(ready.is_err(), "the voters formed a quorum");
+            let channel = tonic::transport::Endpoint::from_shared(servers[1].client_url())
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let put = PutRequest {
+                key: b"key".to_vec(),
+                value: b"value".to_vec(),
+                ..Default::default()
+            };
+            let written =
+                tokio::time::timeout(Duration::from_secs(2), KvClient::new(channel).put(put)).await;
+            assert!(!matches!(written, Ok(Ok(_))), "{written:?}");
+            for server in &servers {
+                assert_eq!(status(server).await["leader_id"], 0);
+                eventually("a refused peer store", async || {
+                    refused_stores(server).await > 0
+                })
+                .await;
+            }
+        }
+        for server in servers {
+            server.shutdown().await.unwrap();
+        }
+    }
+}
+
+/// A paused member opens the newest checkpoint at each poll, so an adoption can drop the same
+/// base again and again. `/status` reports the base with its failure count, and only the first
+/// failure logs. The end of the pause ends the report, after an adoption or an install.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_base_is_reported_until_the_pause_ends() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = super::super::tests::options(dir.path());
+    config.object_store = crate::object::Config::Test(store, "root".into());
+    let (events, _) = mpsc::channel(256);
+    let mut node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    let id = uuid::Uuid::new_v4();
+    let rejected = apply::RejectedBase {
+        checkpoint: Some(id),
+        index: 9,
+        fault: crate::mvcc::storage_fault::StorageFault::Corrupt,
+        reason: "invalid members row".into(),
+    };
+    for _ in 0..3 {
+        node.finish_output(Output::RejectedBase(rejected.clone()))
+            .unwrap();
+    }
+    let report =
+        |node: &Node| node.status().unwrap()["shared_state"]["writer"]["rejected_base"].clone();
+    let reported = report(&node);
+    assert_eq!(reported["checkpoint"], id.to_string(), "{reported}");
+    assert_eq!(reported["class"], "corrupt");
+    assert_eq!(reported["index"], 9);
+    assert_eq!(reported["failures"], 3);
+    // Another checkpoint starts a new report.
+    let other = apply::RejectedBase {
+        checkpoint: Some(uuid::Uuid::new_v4()),
+        ..rejected
+    };
+    node.finish_output(Output::RejectedBase(other)).unwrap();
+    assert_eq!(report(&node)["failures"], 1);
+    // The overlay stays above the soft limit: the member still waits, and the report stays.
+    let limit = node.options.overlay_max_bytes;
+    node.writer.set_paused(true);
+    node.state.view = (1, 1, limit + 1);
+    assert!(node.apply_paused());
+    assert_eq!(report(&node)["failures"], 1);
+    // An install or an adoption frees the overlay. The pause ends, and so does the report.
+    node.state.view = (1, 1, 0);
+    assert!(!node.apply_paused());
+    assert_eq!(report(&node), Value::Null);
 }

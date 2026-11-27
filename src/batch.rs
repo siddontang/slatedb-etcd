@@ -26,6 +26,12 @@ enum Original {
     Known(Option<usize>),
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The old rows that the size count read on this thread.
+    pub(crate) static SIZE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl WriteBatch {
     pub fn new() -> Self {
         Self::default()
@@ -137,25 +143,16 @@ impl WriteBatch {
                     None if key.starts_with(crate::mvcc::CURRENT) => {
                         index.get_row(key).map(|meta| meta.row_len)
                     }
-                    None => db.get(key).await?.map(|v| v.len()),
+                    None => {
+                        #[cfg(test)]
+                        SIZE_READS.with(|reads| reads.set(reads.get() + 1));
+                        db.get(key).await?.map(|v| v.len())
+                    }
                 },
             };
             size.replace_row(key, old_len, change.value.as_ref().map(Bytes::len))?;
         }
         Ok(size)
-    }
-
-    /// Return true when the batch puts a row whose key starts with `prefix`.
-    pub(crate) fn puts_under(&self, prefix: &[u8]) -> bool {
-        use std::ops::Bound;
-        self.changes
-            .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
-            .take_while(|(key, _)| key.starts_with(prefix))
-            .any(|(_, change)| change.value.is_some())
-    }
-
-    pub(crate) fn contains(&self, key: &[u8]) -> bool {
-        self.changes.contains_key(key)
     }
 
     pub(crate) fn keys(&self) -> impl Iterator<Item = &Bytes> {

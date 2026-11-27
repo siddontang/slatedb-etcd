@@ -60,7 +60,9 @@ Use a learner when replacing or adding a server. The service allows one learner 
 2. Start the new process with the returned member ID, `--join`, and the same cluster ID.
 3. Supply the full current peer map, including the new member. Configure its client address as
    above.
-4. Wait for snapshot installation and log catch-up. Then call `member promote ID`.
+4. Wait for snapshot installation and log catch-up. Then call `member promote ID`. In shared
+   state mode, the learner must also prove write access to the shared state. The first call
+   then fails with a retryable error and starts the check. Call it again after some seconds.
 5. Use `move-leader ID` when the new voter should become leader.
 
 MemberUpdate changes where members dial that peer. As in etcd, a working connection stays open.
@@ -77,9 +79,9 @@ unavailable.
 Status returns local identity, Raft progress, size estimates, quota, and alarms.
 The gRPC health service checks quorum and local apply progress.
 `--quota-backend-bytes` limits logical data bytes. Zero selects the default 2 GiB limit.
-A negative value disables the limit. The members share one quota; see
-[quota changes](operations.md#change-the-quota). Status returns the flag, as etcd does, unless
-the cluster quota differs from it.
+A negative value disables the limit. The members share the quota of the cluster claim; see
+[quota](operations.md#quota). Status returns the flag, as etcd does, unless the cluster quota
+differs from it.
 The limit can be exceeded by one request. It does not reserve free disk space.
 NOSPACE alarms reject writes; deletion and compaction can free logical space before alarm disarm.
 
@@ -98,7 +100,6 @@ Save it with `etcdctl snapshot save` or the
 [native export tool](operations.md#backups-and-restoration).
 The server pads the membership row with JSON spaces, so the file length passes the etcdctl check.
 It includes auth, membership, alarms, leases, and MVCC metadata.
-Earlier Raft recovery snapshots used this format. Current ones use checkpoint descriptors.
 It is not an etcd bbolt backup and cannot be restored with `etcdutl`.
 
 Restore it with `--restore-snapshot /path/native.snapshot` when starting each new member.
@@ -109,35 +110,14 @@ It retains KV revisions, compaction, leases, users, roles, and alarm types.
 Each lease gets generation 1. The source generation is a Raft index of the old log.
 Remove `--restore-snapshot` when restarting the restored cluster. Existing directories are never
 replaced. A damaged checksum stops restoration before any data directory is created.
-The member pins its applied state in a SlateDB checkpoint and streams the image from it.
+The member pins its applied view and streams the image from it. It creates no checkpoint.
 Writes continue while the stream runs and do not reach the image.
 The server holds a few 64 KiB messages, not the image, so the image has no size limit.
 Restore decodes one row at a time, so one encoded row can have at most 64 MiB.
 The auth row holds all users and roles and is the row that can grow this large.
 A backup checks every row before it sends the first message. It returns ResourceExhausted for a
 larger row, so it never publishes an image that restore rejects.
-The server reads the checkpoint twice: first to count the rows, then to send them.
-The checkpoint lives 10 minutes. While the stream runs, even with a client that stops reading,
-the member renews it every minute, and it deletes it at the end.
-Restore checks the file in one pass and writes the rows in 4 MiB batches in a second pass.
-The second pass must read a file with the checked digest.
-It also holds only a few rows in memory. The restored Raft index is the copied row count plus one.
-A restore holds the Raft directory lock while it writes, and a starting member takes the same lock.
-A restore that loses the lock, or finds the directory in use, leaves the directory unchanged.
-An interrupted restore leaves a `restore-incomplete` file, and startup rejects that directory.
-Remove the directory and restore again.
-With S3 state objects, the restore can have claimed the member namespace
-`<s3-prefix>/<SHA-256 of the cluster ID>/member-<id>/` and written objects there.
-The claim in its `owner.json` names the random owner in the directory's `object-store.json`,
-so a retry with the same settings fails with `S3 namespace belongs to another data directory`.
-Before you remove the directory, compare the two files. Delete the objects under that member
-namespace only when they name the same owner. A different owner means that another data
-directory, possibly a running member, uses the namespace: the restore wrote nothing there.
-When they differ, or the directory is already gone, restore all members with a new cluster ID or
-`--s3-prefix`.
-In [shared state mode](shared-state.md) the member pins its applied view instead and creates no
-checkpoint. The stream reads the view twice, as above, so the image has no size limit. Each row
-has the same 64 MiB limit.
+The server reads the view twice: first to count the rows, then to send them.
 The backup view is exempt from `--view-pin-max`. The stream ends with Unavailable when the client
 takes no message for 60 s. The first pass does not count.
 A member streams at most 4 backups. The overlay segments that they keep after a base switch
@@ -145,8 +125,8 @@ count against `--overlay-max-bytes`. So a backup of a full overlay can start.
 A backup above a limit returns ResourceExhausted; retry it later. When base switches leave the
 kept segments above the limit, the oldest backup ends with Unavailable.
 See [backups](shared-state.md#backups).
-A restore into shared mode also checks the file in one pass and writes 4 MiB batches. It writes
-the rows once into the shared database, so it has no `restore-incomplete` file. Another member
+A restore checks the file in one pass and then writes 4 MiB batches. It writes the rows once into
+the shared database. The second pass must read a file with the checked digest. Another member
 with the same file continues a stopped restore. The restored Raft log starts at N, the copied row
 count plus one. Endpoint status can show a higher applied index after the election. KV responses
 retain the snapshot's MVCC revision until the next modifying transaction. A member serves no

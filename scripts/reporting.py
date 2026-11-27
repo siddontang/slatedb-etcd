@@ -29,3 +29,12 @@ def write_report(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(portable(value), indent=2) + "\n")
+
+
+def write_pending(path, value):
+    """Replace an earlier report with a failed one before a run starts.
+
+    Write this before any step that can fail, such as the start of RustFS. A failed start then
+    leaves no earlier `passed: true` report on disk.
+    """
+    write_report(path, dict(value, passed=False, complete=False, pending=True))

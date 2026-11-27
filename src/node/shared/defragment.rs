@@ -6,6 +6,8 @@ use super::*;
 pub(in crate::node) struct Defragment {
     pub(super) db: Arc<slatedb::Db>,
     pub(super) admin: Arc<slatedb::admin::Admin>,
+    /// The SlateDB clock of `db`. No compaction job is submitted after its term ends.
+    pub(super) owner: Option<Arc<clock::Gate>>,
     pub(super) progress: Arc<Progress>,
     /// The newest applied announcement on this member.
     pub(super) announced: tokio::sync::watch::Receiver<Option<uuid::Uuid>>,
@@ -27,6 +29,18 @@ pub(in crate::node) enum DefragmentStep {
     Publish,
 }
 
+/// The writer term of a Defragment ended before a compaction submission.
+#[derive(Debug)]
+struct TermEnded;
+
+impl std::fmt::Display for TermEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the writer term of this Defragment ended")
+    }
+}
+
+impl std::error::Error for TermEnded {}
+
 /// The longest time that a Defragment waits for its compacted checkpoint.
 const DEFRAGMENT_WAIT: Duration = Duration::from_secs(20);
 
@@ -41,20 +55,28 @@ impl Defragment {
         let lost = || {
             KvError::new(
                 tonic::Code::Unavailable,
-                "etcdserver: the leader changed during Defragment; retry",
+                "the leader changed during Defragment; retry",
             )
         };
         let term = self.term;
         let leads = |leadership: &tokio::sync::watch::Receiver<(bool, u64)>| {
             *leadership.borrow() == (true, term)
         };
-        // A step down closes the writer, so a storage error then means a lost lead.
+        // A step down closes the writer, so a storage error then means a lost lead. The gate
+        // can see the end of the term before the leadership receiver does, so its refusal is a
+        // lost lead too. A refused ID time is no corrupt data: a newer job stands above the
+        // writer clock, and the writer opens again above it. See `fault::id_time_refused`.
         let failed = |leadership: &tokio::sync::watch::Receiver<(bool, u64)>,
                       error: anyhow::Error| {
-            if leads(leadership) {
-                KvError::storage(error)
-            } else {
+            if !leads(leadership) || error.chain().any(|cause| cause.is::<TermEnded>()) {
                 lost()
+            } else if fault::id_time_refused(&error) {
+                KvError::new(
+                    tonic::Code::Unavailable,
+                    "a newer compaction job stands above the writer clock; retry",
+                )
+            } else {
+                KvError::storage(error)
             }
         };
         self.pause_at(DefragmentStep::Flush).await;
@@ -62,8 +84,15 @@ impl Defragment {
             return Err(failed(&self.leadership, error.into()));
         }
         self.pause_at(DefragmentStep::Compact).await;
-        let compacted_manifest_id = match crate::state::maintenance::compact_all(&self.admin).await
-        {
+        // SlateDB checks no writer epoch at a submission, so each one checks the term of the
+        // writer. A job of an ended term could stand above the floor of the next writer.
+        let owner = self.owner.clone();
+        let allowed = move || match owner.as_ref().is_none_or(|gate| gate.current()) {
+            true => Ok(()),
+            false => Err(anyhow::Error::new(TermEnded)),
+        };
+        let compacted = crate::state::maintenance::compact_all(&self.admin, &allowed);
+        let compacted_manifest_id = match compacted.await {
             Ok(id) => id,
             Err(error) => return Err(failed(&self.leadership, error)),
         };
@@ -77,7 +106,7 @@ impl Defragment {
         let timeout = || {
             KvError::new(
                 tonic::Code::Unavailable,
-                "etcdserver: Defragment did not publish its checkpoint in time; retry",
+                "Defragment did not publish its checkpoint in time; retry",
             )
         };
         loop {

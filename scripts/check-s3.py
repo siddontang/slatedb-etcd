@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from reporting import write_report
+from reporting import write_pending, write_report
 from rustfs_fixture import local_rustfs
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +21,8 @@ def main():
     parser.add_argument("--run", default="^TestS3")
     parser.add_argument("--deployment", default="three local processes with a temporary S3 service")
     args = parser.parse_args()
+    # A failed RustFS start must not leave an earlier passed report.
+    write_pending(args.output, {"deployment": args.deployment})
     with local_rustfs() as (env, store):
         result = subprocess.run([sys.executable, str(ROOT / "scripts/check-compat.py"),
                                  "--tags", args.tags, "--run", args.run, "--binary", str(args.binary),

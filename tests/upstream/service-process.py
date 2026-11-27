@@ -3,11 +3,16 @@
 
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 from urllib.parse import urlsplit
+
+# The fixture runs as a symlink in the upstream bin directory. Load the RustFS helpers.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+from rustfs_fixture import shared_args  # noqa: E402
 
 
 def local_url(value):
@@ -18,7 +23,27 @@ def local_url(value):
     return f"{url.scheme}://127.0.0.1:{url.port}"
 
 
-def service_args(argv=None):
+# check-upstream-go.py writes the RustFS server settings next to this fixture. The upstream process
+# runner passes only ETCD_ and ETCDCTL_ variables to a member, so the settings use a file.
+STORE_FILE = "shared-store.json"
+
+
+def shared_store(store, cluster):
+    """Return the flags and the environment of one member.
+
+    The members run in shared state mode on RustFS. `cluster` is the first member's data directory.
+    It names one cluster and stays the same when the members restart. The prefix of the cluster is
+    below the prefix of the run.
+    """
+    if store is None:
+        raise ValueError("A member needs RustFS. Run check-upstream-go.py")
+    prefix = store["prefix"] + "/" + hashlib.sha256(cluster.encode()).hexdigest()[:16]
+    env = {name: value for name, value in store.items() if name.startswith("AWS_")}
+    return shared_args(prefix, store), dict(env, AWS_EC2_METADATA_DISABLED="true")
+
+
+def service_args(argv=None, store=None):
+    """Return the service arguments and the extra environment of one fixture member."""
     parser = argparse.ArgumentParser(allow_abbrev=False)
     for flag in ("name", "initial-cluster", "listen-client-urls", "advertise-client-urls",
                  "listen-peer-urls", "initial-advertise-peer-urls", "data-dir"):
@@ -26,6 +51,7 @@ def service_args(argv=None):
     parser.add_argument("--initial-cluster-state", choices=["new"], default="new")
     parser.add_argument("--initial-cluster-token", default="etcd-cluster")
     parser.add_argument("--fixture-client", action="append", default=[])
+    parser.add_argument("--fixture-cluster")
     parser.add_argument("--snapshot-count")
     parser.add_argument("--listen-metrics-urls")
     passthrough = ("quota-backend-bytes", "strict-reconfig-check", "auth-token", "cert-file",
@@ -64,7 +90,11 @@ def service_args(argv=None):
         value = getattr(args, flag.replace("-", "_"))
         if value is not None:
             command.extend(["--" + flag, value])
-    return command
+    if not args.fixture_cluster:
+        parser.error("A member needs the fixture cluster name")
+    flags, env = shared_store(store, args.fixture_cluster)
+    command.extend(flags)
+    return command, env
 
 
 if __name__ == "__main__":
@@ -77,4 +107,7 @@ if __name__ == "__main__":
         print(output.rstrip())
         print(f"etcd Version: {version}")
     else:
-        os.execv(binary, [binary, *service_args()])
+        settings = Path(sys.argv[0]).absolute().with_name(STORE_FILE)
+        store = json.loads(settings.read_text()) if settings.is_file() else None
+        command, env = service_args(store=store)
+        os.execve(binary, [binary, *command], dict(os.environ, **env))

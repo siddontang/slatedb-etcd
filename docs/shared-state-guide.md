@@ -1,44 +1,79 @@
 # Shared state operator guide
 
-Shared state mode is a prototype. The leader writes one SlateDB for the whole cluster in S3.
-Each member reads a checkpoint of it, its base, under an in-memory overlay of newer applied
-batches. The design is in `docs/shared-state.md`. The flags are in
-[configuration](configuration.md#shared-state-mode).
+Shared state is the only state mode. The leader writes one SlateDB for the whole cluster in an
+S3-compatible store. Each member reads a checkpoint of it, its base, under an in-memory overlay
+of newer applied batches. The design is in `docs/shared-state.md`. The flags are in
+[configuration](configuration.md#shared-state).
 
-## When to use it
+## Properties
 
-Use shared mode when S3 storage and S3 writes cost more than the extra risk below.
+| Property | Shared state |
+| --- | --- |
+| Copies of each SST | One for the cluster |
+| S3 writes, flushes, and compactions | The leader only |
+| Raft snapshot for a new member | A checkpoint name, no data copy |
+| Fault domain | A lost object affects all members |
+| Write access | Every voter can write the shared prefix |
+| Leader change | The writer clock must stay near the voter clocks |
 
-| Property | Replicated mode | Shared mode |
-| --- | --- | --- |
-| Copies of each SST | One for each member | One for the cluster |
-| S3 writes, flushes, and compactions | Each member | The leader only |
-| Raft snapshot for a new member | Copy of the SSTs | A checkpoint name, no data copy |
-| Fault domain | Each member has its own copy | A lost object affects all members |
-| Write access | Each member writes its own prefix | Every voter can write the shared prefix |
-| Leader change | No clock dependency | The new writer waits for the manifest clock |
-
-Keep replicated mode, the default, when members must not share a fault domain. Shared mode is for
-new clusters. A stopped replicated S3 cluster can be converted offline. See
-[Conversion](#convert-a-replicated-cluster).
+Every cluster needs an S3-compatible store, also a single member. A data directory of the removed
+replicated state mode, or of a member-local store, is not supported. A member refuses to start on
+it.
 
 ## Object layout
 
 ```text
 <prefix>/<sha256(cluster-id)>/
-    mode.json                  the cluster mode, written before any state
-    shared/owner.json          the cluster claim: mode, quota, and the initial voters
+    shared/owner.json          the cluster claim: quota, initial voters, and store ID
     shared/bootstrap.json      written once after the first checkpoint
     shared/bootstrap-op.json   the one bootstrap operation: empty, or a snapshot restore
     shared/restore-input.json  the snapshot digest, row count, and membership of a restore
     shared/restore-lease.json  the member that writes the rows of a restore
-    shared/conversion.json     the plan of an offline conversion
     shared/state/              the one SlateDB: manifest/, compacted/, checkpoints
-    member-<id>/binding.json   the member identity and mode. It holds no state.
+    member-<id>/binding.json   the member identity. It holds no state.
 ```
 
 Each member keeps its Raft log in its local data directory. S3 does not replace the log.
 All members use the same bucket, endpoint, region, and prefix.
+
+### Shared store ID
+
+The first voter creates the cluster claim, `shared/owner.json`, with a random store ID. The other
+members read the ID from the claim. A member refuses a claim with no store ID or with an ID that
+is not a UUID. Each member sends the ID with its Raft traffic and view reports. A member refuses
+peer traffic with another ID, or with no ID, before Raft sees it.
+
+So a member with the correct cluster ID and voters, but another bucket or prefix, cannot join the
+quorum. It cannot open the checkpoints of the other store. Both sides increment
+`slatedb_etcd_peer_store_refusals_total` and log this error at most every 10 s:
+
+```text
+ERROR refused a peer on another shared store: all members must use the same bucket and prefix
+local=Some("<this store ID>") peer=Some("<peer store ID>")
+```
+
+`/status` shows the ID as `shared_state.store_id`. Compare it on all members, and compare their
+bucket and prefix flags. Start a member with the wrong flags again with the correct bucket and
+prefix and an empty data directory, because its binding keeps the old location.
+
+A mismatch shows only that two members use different stores. It does not show which store is in
+use or who owns it. Do not delete objects under the other prefix before you verify its owner and
+that no member uses it.
+
+The ID is a property of the objects, not of the location:
+
+- A copy of the whole cluster namespace to another prefix copies the claim and its ID. Members
+  on the copy accept members on the original. Do not run both.
+- A native snapshot restore into a new prefix creates a new claim. That store is independent and
+  has a new ID.
+
+A member records the ID in its local `object-store.json` at its first open. At each later start,
+it refuses a store at the same location with another ID or with no claim, before it writes:
+
+```text
+the data directory belongs to shared store <recorded ID>, but the store at this location has
+store ID <new ID>: the store was replaced. Use the original store, or a new data directory
+```
 
 ## Credentials and access
 
@@ -47,10 +82,13 @@ access.
 
 - Give each voter read and write access to `shared/`. Any voter can become the leader and the
   writer.
-- At startup each member reads `mode.json`, the shared claims, and the owner claim of every
-  member namespace. A replicated owner claim stops the start.
+- At startup each member reads the shared claims.
 - Each member, also a learner, writes its own `member-<id>/binding.json` at its first start.
 - A learner only reads `shared/`. Give it the voter statements before you promote it.
+  Promotion fails until the learner creates and deletes a scratch object under
+  `shared/state/.probe/`. Give that prefix the same write policy as the rest of `shared/state/`.
+  A policy that allows writes only to `.probe/` passes the check, but the new voter cannot write
+  the state.
 - Scope each credential to the cluster prefix `<prefix>/<sha256(cluster-id)>/`. Do not give a
   member access to the prefixes of other clusters.
 - A credential that can delete objects can delete the state of every member. Keep backups and
@@ -62,16 +100,9 @@ An S3 policy has these statements. `<cluster>` is the cluster prefix. A unit tes
 | Role | Action | Resource |
 | --- | --- | --- |
 | All | `s3:ListBucket` | the bucket, with the condition `s3:prefix` = `<cluster>/*` |
-| All | `s3:GetObject` | `<cluster>/mode.json`, `<cluster>/member-*/owner.json` |
 | All | `s3:GetObject`, `s3:PutObject` | `<cluster>/member-<id>/*` |
 | Voter | `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` | `<cluster>/shared/*` |
-| Voter | `s3:PutObject` | `<cluster>/mode.json`, for the first start |
 | Learner | `s3:GetObject` | `<cluster>/shared/*` |
-
-The offline converter also needs `s3:GetObject`, `s3:PutObject`, and `s3:DeleteObject` on
-`<cluster>/member-*/*`. It reads the replicated states, creates and deletes detached checkpoints
-in their manifests, writes bindings, and retires owner claims. The converter test checks these
-keys.
 
 ## Checkpoints and retention
 
@@ -113,11 +144,19 @@ Manual cleanup with `off`:
 ## Clocks
 
 SlateDB starts a writer's clock at the `last_l0_clock_tick` of the manifest. A new leader waits
-until its local clock passes that tick. If the local clock is behind by more than
-`--max-clock-skew`, 5 s by default, the writer does not start. The member logs an error, sets
-`clock_alarm` in `/status`, sets `slatedb_etcd_shared_clock_skew_milliseconds`, and tries again
-with a backoff. After three refusals it hands the lead to a voter without a writer fault. Keep
-host clocks synchronized with NTP.
+until its local clock passes that tick and the time of the newest L0 SST ID. If the local clock
+is behind by more than `--max-clock-skew`, 5 s by default, the writer does not start. The member
+logs an error, sets `clock_alarm` to `behind` in `/status`, sets
+`slatedb_etcd_shared_clock_skew_milliseconds`, and tries again with a backoff.
+
+The leader also probes the clock of each voter every 500 ms. It caps each tick at
+`--max-clock-skew` above the voter-majority clock that it estimates at admission. A leader
+clock that is further ahead writes at the cap and sets `clock_alarm` to `ahead`. While too few
+voters answer the probe, the writer waits and `/status` shows `clock.waiting`.
+
+After three clock refusals the leader hands the lead to a voter without a writer fault. Keep host
+clocks synchronized with NTP, also on the host of a snapshot restore. See
+[Clocks](shared-state.md#clocks).
 
 ## Memory
 
@@ -125,23 +164,23 @@ host clocks synchronized with NTP.
   writes, or more when S3 is slow.
 - The leader rejects client proposals while the overlay is above `--overlay-max-bytes`. Apply
   waits above twice that limit. Raft still persists and acknowledges entries.
-- The leader also holds the memtable of the writer. Expect about two times the unflushed data on
-  the leader.
-- A read view keeps its base for at most `--view-pin-max`. A longer read fails with a retryable
-  error. A native backup is exempt. It ends when its client takes no message for 60 s.
-- Native backups keep the overlay segments of their views after a base switch. These count
-  against `--overlay-max-bytes`, and at most 4 backups stream on a member.
+- `--view-pin-max` is a storage deadline of each read attempt. A read that runs again keeps
+  its view. A native backup has no deadline. It ends when its client takes no message for 60 s.
+- Reads and backups keep the overlay segments of their views after a base switch. Reads have no
+  byte limit on these. Over `--overlay-max-bytes`, the oldest of at most 4 backups is stopped.
+- The leader also holds the writer memtable, and SlateDB limits it. See the
+  [memory bound per member](shared-state.md#overlay) for each term.
 
 ## Operations
 
-| Operation | Shared mode behavior |
+| Operation | Behavior |
 | --- | --- |
-| Put, Txn, and reads | As in replicated mode. A follower reads its own base and overlay |
+| Put, Txn, and reads | A follower reads its own base and overlay |
 | Physical Compact | Each member applies the steps. The reply waits for a covering base |
 | Defragment | Runs on the leader writer. A follower forwards it to the leader |
 | Manual checkpoint, `POST /checkpoint` | Returns when the member's base covers the commit index |
 | Status `db_size` | Read from the shared manifest. All members report about the same value |
-| HashKV and Hash | Computed from the member's view, as in replicated mode |
+| HashKV and Hash | Computed from the member's view |
 | Native backup | Streams the member's view. See [backups](shared-state.md#backups) |
 | `--restore-snapshot` | Seeds a new shared cluster at the copied row count plus one |
 | MoveLeader | Requests a checkpoint first, then transfers the lead within 3 s |
@@ -160,8 +199,8 @@ repeats it while it waits. The request also survives a leader change before the 
 opens.
 
 To restore a native snapshot, use a new cluster prefix and empty member directories. Start each
-member with `--restore-snapshot <file>` and `--state-mode shared`. Each member first checks its
-file in one pass. The image has no size limit. Each row has the 64 MiB limit of a backup.
+member with `--restore-snapshot <file>`. Each member first checks its file in one pass. The image
+has no size limit. Each row has the 64 MiB limit of a backup.
 
 1. Before any writer opens, a member claims the one bootstrap operation,
    `shared/bootstrap-op.json`, as a restore with the snapshot SHA-256 digest.
@@ -195,7 +234,9 @@ to write, so give startup probes and service start timeouts that time. A stopped
 the same restore again while its Raft log is empty. It waits up to 60 s for the lease of its
 stopped attempt to go stale.
 
-To abandon a partial restore, make these checks first:
+### Abandon a partial restore
+
+Make these checks first:
 
 1. Every member process of the cluster is stopped.
 2. `shared/bootstrap-op.json` has `"kind":"restore"`, and its `snapshot` field names your file.
@@ -205,46 +246,12 @@ To abandon a partial restore, make these checks first:
    checkpoint. Only this check tells the two apart.
 3. `shared/bootstrap.json` is missing.
 
-Then delete `shared/` under the cluster prefix and start the restore again. Never delete
-`shared/` of a cluster that has a bootstrap marker: it holds the state of all members.
-
-## Convert a replicated cluster
-
-`slatedb-etcd convert-to-shared` converts a stopped replicated cluster that keeps its state in
-S3. It needs the same S3 credentials as the members.
-
-1. Run `POST /checkpoint` on each member. The conversion uses the flushed state.
-2. Stop all members.
-3. On each member host, run:
-
-   ```sh
-   slatedb-etcd convert-to-shared --id <id> --dir <data dir> --cluster-id <cluster>
-   ```
-
-4. Start all members with `--state-mode shared` and their earlier flags.
-
-The first run is the preflight. It reads the flushed index of each replicated member namespace
-from a detached checkpoint and takes the highest one. Different indexes log a warning. It checks
-the index, the term at the index, the membership, and the end of the copied manifest before it
-changes any claim, so a failed preflight leaves the replicated cluster usable. A state without a
-term takes it from the local Raft log. If that log does not hold the index, run the conversion
-on the source member first.
-
-The run then writes the plan, `shared/conversion.json`, with a create-only put. A concurrent or
-later run uses that plan and deletes only its own detached checkpoints. Until the bootstrap
-marker exists, each run completes the seed: it copies the planned SSTs and manifest into
-`shared/state`, changes the mode claim, writes the cluster claim with the bootstrap voters of the
-Raft logs, publishes the first checkpoint, retires the owner claims of members that the copied
-membership does not hold, and writes the marker. No step deletes a view checkpoint.
-
-Each run then installs the checkpoint as the member's Raft snapshot record and changes the
-member's binding. A member keeps its log entries above the checkpoint and replays them at start.
-
-The conversion refuses a running member, a member of another cluster, a member without S3
-state, and a member outside the copied membership. A shared member refuses to start while an
-active member namespace has a replicated owner claim, so the cluster starts only after every
-active member is converted. The replicated state objects under `member-<id>/state*` stay in
-place. Delete them after you check the converted cluster.
+Then delete every object under `shared/` except `shared/owner.json`: the `shared/state/` database
+and its `shared/state.*` objects, `shared/bootstrap-op.json`, `shared/restore-input.json`, and
+`shared/restore-lease.json`. Keep `shared/owner.json`, because the member directories recorded
+its store ID. Then start the restore again with the same member directories. The restore can
+use another snapshot file. Never delete `shared/` objects of a cluster that has a bootstrap
+marker: they hold the state of all members.
 
 ## Failure modes
 
@@ -261,7 +268,9 @@ place. Delete them after you check the converted cluster.
 | An announcement is lost | The writer announces the checkpoint again with the same backoff |
 | A member reads a deleted SST | The read fails and can retry. Apply rebuilds from a newer base |
 | The new leader's clock is behind | The writer waits, or refuses above `--max-clock-skew` |
+| The leader's clock is ahead of the voters | The writer writes at the cap |
 | All members restart | Each member opens the newest checkpoint and replays its log |
+| A member uses another bucket or prefix | Peers refuse its traffic. It cannot join the quorum |
 | The shared database is lost | All members lose state together. Restore from a backup |
 
 `/status` reports the writer health under `shared_state.writer.health`: the failures in a row,

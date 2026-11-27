@@ -20,24 +20,14 @@ use super::overlay::Overlay;
 use super::view::{Base, SharedView, StateView};
 use super::*;
 
+mod adopt;
 mod restore;
 #[cfg(test)]
-pub(super) mod tests;
+pub(crate) mod tests;
 pub use restore::Restore;
 pub(crate) use restore::{claim_bootstrap, not_restored, BootstrapOp, PROGRESS};
 #[cfg(test)]
 pub(crate) use restore::{seed, Hooks, Stop};
-
-/// The state layout and replication mode of a cluster.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub enum StateMode {
-    /// Each member keeps its own SlateDB.
-    #[default]
-    Replicated,
-    /// The leader writes one SlateDB. Members read checkpoints of it under an overlay.
-    Shared,
-}
 
 /// How the leader deletes old `view-` checkpoints.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -50,15 +40,6 @@ pub enum ViewRetention {
     Fenced,
 }
 
-impl StateMode {
-    pub fn is_replicated(&self) -> bool {
-        *self == Self::Replicated
-    }
-}
-
-/// The eight-byte logical size total after each shared-mode batch, for older readers. The
-/// split by row kind is in the counter row with the apply marker.
-pub(crate) const LOGICAL_BYTES: &[u8] = b"meta/logical-bytes";
 /// The name prefix of the checkpoints that the publisher creates.
 const VIEW: &str = "view-";
 const CLAIM: &str = "shared/owner.json";
@@ -66,141 +47,135 @@ const BOOTSTRAP: &str = "shared/bootstrap.json";
 const STATE: &str = "shared/state";
 /// A received snapshot that Raft did not install releases its checkpoint after this time.
 const RECEIPT_LIFETIME: Duration = Duration::from_secs(60);
-/// The cluster-wide mode claim. Both modes create it before they write state on S3.
-const MODE: &str = "mode.json";
 
 /// The cluster claim. The first member creates it, and every member checks it.
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct Claim {
     version: u32,
     cluster: String,
-    mode: StateMode,
     /// The logical quota of the cluster. Zero disables it. Every member applies this value.
     quota: u64,
     /// The initial voters. Members with another bootstrap set refuse to open the writer.
     voters: Vec<u64>,
+    /// The random ID of this shared store. Members send it with their peer traffic, so members
+    /// on another bucket or prefix refuse each other.
+    store_id: uuid::Uuid,
 }
 
-/// The mode claim of one cluster namespace.
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
-struct ModeClaim {
-    version: u32,
-    cluster: String,
-    mode: StateMode,
+/// The values of a checked cluster claim.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Claimed {
+    pub quota: u64,
+    pub store_id: uuid::Uuid,
 }
 
-/// Create or check the mode claim under `root`. Concurrent first starts in different modes
-/// cannot both pass, because only one `PutMode::Create` succeeds. An existing claim is read
-/// first, so a member with a read-only credential can start.
-pub(crate) async fn claim_mode(
-    store: &dyn ObjectStore,
-    root: &str,
-    cluster: &str,
-    mode: StateMode,
-) -> Result<()> {
-    let path = Path::from(join(root, MODE));
-    let check = |data: &[u8]| -> Result<()> {
-        let existing: ModeClaim =
-            serde_json::from_slice(data).context("invalid cluster mode claim")?;
-        ensure!(
-            existing.version == 1 && existing.cluster == cluster,
-            "the namespace belongs to another cluster"
-        );
-        ensure!(
-            existing.mode == mode,
-            "the cluster uses {:?} state mode",
-            existing.mode
-        );
-        Ok(())
-    };
-    match store.get(&path).await {
-        Ok(result) => return check(&result.bytes().await?),
-        Err(slatedb::object_store::Error::NotFound { .. }) => {}
-        Err(error) => return Err(error).context("cannot read the cluster mode"),
-    }
-    let claim = ModeClaim {
-        version: 1,
-        cluster: cluster.to_owned(),
-        mode,
-    };
-    match store
-        .put_opts(
-            &path,
-            serde_json::to_vec(&claim)?.into(),
-            PutMode::Create.into(),
-        )
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
-            check(&store.get(&path).await?.bytes().await?)
-        }
-        Err(error) => Err(error).context("cannot claim the cluster mode"),
-    }
+/// Parse a cluster claim. A claim without a store ID does not parse.
+fn parse_claim(data: &[u8]) -> Result<Claim> {
+    let claim: Claim =
+        serde_json::from_slice(data).context("invalid cluster claim, or no valid store ID")?;
+    ensure!(
+        !claim.store_id.is_nil(),
+        "the cluster claim has a nil store ID"
+    );
+    Ok(claim)
 }
 
-/// Return true when `root` holds a replicated member namespace. Clusters from before the mode
-/// claim have only these namespaces.
-pub(crate) async fn has_replicated_member(store: &dyn ObjectStore, root: &str) -> Result<bool> {
-    let listing = store.list_with_delimiter(Some(&Path::from(root))).await?;
-    for prefix in listing.common_prefixes {
-        if !prefix
-            .filename()
-            .is_some_and(|name| name.starts_with("member-"))
-        {
-            continue;
-        }
-        match store.head(&prefix.clone().join("owner.json")).await {
-            Ok(_) => return Ok(true),
-            Err(slatedb::object_store::Error::NotFound { .. }) => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(false)
-}
-
-/// Read the quota of an existing claim. A joining member uses this, because it is not one of the
-/// initial voters.
-pub(crate) async fn claimed_quota(
-    store: &dyn ObjectStore,
-    root: &str,
-    cluster: &str,
-) -> Result<u64> {
+/// Read and check an existing claim. Return `None` when the store has no claim.
+async fn read_claim(store: &dyn ObjectStore, root: &str, cluster: &str) -> Result<Option<Claim>> {
     let data = match store.get(&Path::from(join(root, CLAIM))).await {
         Ok(result) => result.bytes().await?,
-        Err(slatedb::object_store::Error::NotFound { .. }) => {
-            bail!("a joining member needs an existing shared cluster")
-        }
+        Err(slatedb::object_store::Error::NotFound { .. }) => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let existing: Claim = serde_json::from_slice(&data).context("invalid cluster claim")?;
+    let existing = parse_claim(&data)?;
     ensure!(
-        existing.version == 1 && existing.cluster == cluster && existing.mode == StateMode::Shared,
+        existing.version == 1 && existing.cluster == cluster,
         "the shared state belongs to another cluster"
     );
-    Ok(existing.quota)
+    Ok(Some(existing))
 }
 
-/// Create or check the shared state claim under `root`. Return the cluster quota.
+/// Read and check an existing claim. Return `None` when the store has no claim.
+pub(crate) async fn claimed(
+    store: &dyn ObjectStore,
+    root: &str,
+    cluster: &str,
+) -> Result<Option<Claimed>> {
+    Ok(read_claim(store, root, cluster)
+        .await?
+        .map(|existing| Claimed {
+            quota: existing.quota,
+            store_id: existing.store_id,
+        }))
+}
+
+/// Read the claim of the store that a data directory is bound to. Refuse a claim with another
+/// store ID, and for an initial voter, a claim with other voters.
+///
+/// This never creates the claim. A claim that disappears during a start stays absent, and the
+/// start fails.
+pub(crate) async fn bound(
+    store: &dyn ObjectStore,
+    root: &str,
+    cluster: &str,
+    store_id: uuid::Uuid,
+    voters: Option<&[u64]>,
+) -> Result<Claimed> {
+    let existing = read_claim(store, root, cluster).await?;
+    let found = existing.as_ref().map(|claim| claim.store_id);
+    let Some(existing) = existing.filter(|claim| claim.store_id == store_id) else {
+        bail!(
+            "the data directory belongs to shared store {store_id}, but the store at this \
+             location has {}: the store was replaced. Use the original store, or a new data \
+             directory",
+            found.map_or("no cluster claim".to_owned(), |id| format!("store ID {id}"))
+        );
+    };
+    if let Some(voters) = voters {
+        let mut voters = voters.to_vec();
+        voters.sort_unstable();
+        ensure!(
+            existing.voters == voters,
+            "the shared state belongs to other initial voters {:?}",
+            existing.voters
+        );
+    }
+    Ok(Claimed {
+        quota: existing.quota,
+        store_id,
+    })
+}
+
+/// Read the claim for a joining member. It is not one of the initial voters, so it never creates
+/// the claim.
+pub(crate) async fn joined(store: &dyn ObjectStore, root: &str, cluster: &str) -> Result<Claimed> {
+    claimed(store, root, cluster)
+        .await?
+        .context("a joining member needs an existing shared cluster")
+}
+
+/// Create or check the shared state claim under `root`. Return the cluster quota and the store
+/// ID.
 ///
 /// The claim holds the initial voters. Two members that each bootstrap a separate one-voter
 /// cluster in the same namespace race on one `PutMode::Create`, so only one opens the writer.
+/// The member that creates the claim also picks the store ID.
 pub(crate) async fn claim(
     store: &dyn ObjectStore,
     root: &str,
     cluster: &str,
     quota: u64,
     voters: &[u64],
-) -> Result<u64> {
+) -> Result<Claimed> {
     let path = Path::from(join(root, CLAIM));
     let mut voters = voters.to_vec();
     voters.sort_unstable();
     let claim = Claim {
         version: 1,
         cluster: cluster.to_owned(),
-        mode: StateMode::Shared,
         quota,
         voters,
+        store_id: uuid::Uuid::new_v4(),
     };
     match store
         .put_opts(
@@ -210,17 +185,15 @@ pub(crate) async fn claim(
         )
         .await
     {
-        Ok(_) => Ok(quota),
+        Ok(_) => Ok(Claimed {
+            quota,
+            store_id: claim.store_id,
+        }),
         Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
-            let data = store.get(&path).await?.bytes().await?;
-            let existing: Claim = serde_json::from_slice(&data).context("invalid cluster claim")?;
+            let existing = parse_claim(&store.get(&path).await?.bytes().await?)?;
             ensure!(
                 existing.version == 1 && existing.cluster == cluster,
                 "the shared state belongs to another cluster"
-            );
-            ensure!(
-                existing.mode == StateMode::Shared,
-                "the cluster uses another state mode"
             );
             ensure!(
                 existing.voters == claim.voters,
@@ -234,7 +207,10 @@ pub(crate) async fn claim(
                     "the cluster claim sets the quota"
                 );
             }
-            Ok(existing.quota)
+            Ok(Claimed {
+                quota: existing.quota,
+                store_id: existing.store_id,
+            })
         }
         Err(error) => Err(error).context("cannot claim the shared state"),
     }
@@ -256,8 +232,9 @@ pub(crate) struct Source {
     pub cache: Arc<dyn slatedb::db_cache::DbCache>,
     /// Opens and deletions of checkpoints. One lock orders them. See `Pins`.
     pins: Mutex<Pins>,
-    /// Bases of received snapshots, with their receive time. Install takes the base. Raft can
-    /// also drop a snapshot, so a receipt expires after `RECEIPT_LIFETIME`.
+    /// Bases of received snapshots that no install took yet, with their receive time. An
+    /// install takes the base and keeps it while it retries. Raft can also drop a snapshot, so a
+    /// receipt expires after `RECEIPT_LIFETIME`.
     received: Mutex<std::collections::HashMap<uuid::Uuid, (std::time::Instant, Arc<Base>)>>,
     /// DST: every open fails, as for a checkpoint that cannot open.
     #[cfg(test)]
@@ -499,6 +476,23 @@ impl Source {
     }
 
     pub async fn open_writer_with(&self, settings: Settings) -> Result<Db> {
+        self.build_writer(settings, None).await
+    }
+
+    /// Open the writer of a leader with `clock` as its SlateDB clock. See
+    /// `node::shared::clock::Gate`.
+    pub async fn open_writer_on(
+        &self,
+        clock: Arc<dyn slatedb_common::clock::SystemClock>,
+    ) -> Result<Db> {
+        self.build_writer(slatedb_settings(), Some(clock)).await
+    }
+
+    async fn build_writer(
+        &self,
+        settings: Settings,
+        clock: Option<Arc<dyn slatedb_common::clock::SystemClock>>,
+    ) -> Result<Db> {
         #[cfg(test)]
         if let Some(error) = self.fail_writer.lock().unwrap().take() {
             return Err(error);
@@ -507,12 +501,14 @@ impl Source {
         if let Some(error) = *self.fail_writers.lock().unwrap() {
             return Err(error());
         }
-        Ok(Db::builder(self.state(), self.store.clone())
+        let mut builder = Db::builder(self.state(), self.store.clone())
             .with_db_cache(self.cache.clone(), 0)
             .with_settings(settings)
-            .with_block_cache_policy(block_cache_policy())
-            .build()
-            .await?)
+            .with_block_cache_policy(block_cache_policy());
+        if let Some(clock) = clock {
+            builder = builder.with_system_clock(clock);
+        }
+        Ok(builder.build().await?)
     }
 
     /// Return true after the first checkpoint was published.
@@ -753,18 +749,22 @@ pub(crate) fn gone(error: &anyhow::Error) -> bool {
 
 /// Open the newest `view-` checkpoint whose row is in `[low, high]` and that holds the
 /// membership. The name gives only a lower bound of the row, so each candidate opens and its own
-/// row decides.
+/// row decides. The search ends at checkpoint `stop`: each older publication has no higher row.
 ///
 /// A record above its checkpoint row needs that checkpoint, or one in this range: the leader
 /// certified that no entry in `(low, high]` changed state, so each checkpoint of this shared
 /// state with its row in the range holds the state at `high`.
-async fn newest_base_between(
+pub(crate) async fn newest_base_between(
     admin: &slatedb::admin::Admin,
     source: &Source,
     low: u64,
     high: u64,
+    stop: Option<uuid::Uuid>,
 ) -> Result<Option<Arc<Base>>> {
     for (seq, checkpoint) in view_checkpoints(admin).await?.into_iter().rev() {
+        if Some(checkpoint.id) == stop {
+            break;
+        }
         if seq > high {
             continue;
         }
@@ -794,7 +794,7 @@ async fn reopen_above_row(
         Err(error) => return Err(error),
     };
     let replacement = match row {
-        Some(row) => newest_base_between(admin, source, row, index).await?,
+        Some(row) => newest_base_between(admin, source, row, index, None).await?,
         None => None,
     };
     replacement.ok_or(error).with_context(|| {
@@ -807,9 +807,8 @@ async fn reopen_above_row(
     })
 }
 
-/// Open the newest `view-` checkpoint that holds the membership. The publisher deletes a
-/// checkpoint without it, but a stop can leave one behind.
-/// The source of the offline converter. It opens no member state.
+/// A source that opens no member state.
+#[cfg(test)]
 pub(crate) fn offline_source(
     store: Arc<dyn ObjectStore>,
     root: &str,
@@ -831,53 +830,8 @@ pub(crate) fn offline_source(
     }))
 }
 
-/// The term at the index of `base`, zero when unknown, and its membership row.
-pub(crate) async fn identity_parts(base: &Base) -> Result<(u64, Option<Vec<u8>>)> {
-    let term = match base.get(APPLIED_TERM).await? {
-        Some(row) => {
-            let row: [u8; 16] = row.as_ref().try_into().context("invalid applied term")?;
-            let index = u64::from_be_bytes(row[..8].try_into()?);
-            let term = u64::from_be_bytes(row[8..].try_into()?);
-            if index == base.applied {
-                term
-            } else {
-                0
-            }
-        }
-        None => 0,
-    };
-    let members = base.get(crate::cluster::KEY).await?.map(|row| row.to_vec());
-    Ok((term, members))
-}
-
-/// Change the mode claim of a stopped replicated cluster to shared. Only the offline converter
-/// does this. A cluster that already has the shared claim keeps it.
-pub(crate) async fn convert_mode(store: &dyn ObjectStore, root: &str, cluster: &str) -> Result<()> {
-    let path = Path::from(join(root, MODE));
-    match store.get(&path).await {
-        Ok(result) => {
-            let existing: ModeClaim = serde_json::from_slice(&result.bytes().await?)
-                .context("invalid cluster mode claim")?;
-            ensure!(
-                existing.version == 1 && existing.cluster == cluster,
-                "the namespace belongs to another cluster"
-            );
-            if existing.mode == StateMode::Shared {
-                return Ok(());
-            }
-        }
-        Err(slatedb::object_store::Error::NotFound { .. }) => {}
-        Err(error) => return Err(error.into()),
-    }
-    let claim = ModeClaim {
-        version: 1,
-        cluster: cluster.to_owned(),
-        mode: StateMode::Shared,
-    };
-    store.put(&path, serde_json::to_vec(&claim)?.into()).await?;
-    Ok(())
-}
-
+/// Open the newest `view-` checkpoint that holds the membership. The publisher deletes a
+/// checkpoint without it, but a stop can leave one behind.
 async fn newest_base(admin: &slatedb::admin::Admin, source: &Source) -> Result<Option<Arc<Base>>> {
     for (_, checkpoint) in view_checkpoints(admin).await?.into_iter().rev() {
         // A checkpoint that retention deleted after the listing is skipped. An older base below
@@ -894,27 +848,11 @@ async fn newest_base(admin: &slatedb::admin::Admin, source: &Source) -> Result<O
 }
 
 /// Return true when `error` comes from an object that the store no longer has, such as an SST
-/// that GC deleted under an old base. Other storage errors still stop the member.
-///
-/// A SlateDB error keeps its kind and its object store source, so the check uses them. Apply
-/// reports some storage errors as text through `KvError`, so the check also matches that text.
+/// that GC deleted under an old base. See `storage_fault::classify`. A read error that crossed a
+/// `KvError` keeps its class.
 pub(crate) fn missing_object(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        if let Some(error) = cause.downcast_ref::<slatedb::Error>() {
-            let mut source = std::error::Error::source(error);
-            while let Some(inner) = source {
-                if matches!(
-                    inner.downcast_ref::<slatedb::object_store::Error>(),
-                    Some(slatedb::object_store::Error::NotFound { .. })
-                ) {
-                    return error.kind() == slatedb::ErrorKind::Data;
-                }
-                source = inner.source();
-            }
-        }
-        let text = cause.to_string();
-        text.contains("Data error") && text.contains("not found")
-    })
+    crate::mvcc::storage_fault::classify(error)
+        == Some(crate::mvcc::storage_fault::StorageFault::Missing)
 }
 
 /// Bases that opened in the background, each with the index that its announcement certified.
@@ -1008,6 +946,9 @@ pub(crate) struct Options {
     pub restore: Option<Restore>,
     /// The checkpoint that the durable Raft snapshot record names, if any.
     pub record: Option<Record>,
+    /// The store ID that the data directory is bound to. With it, the open only reads the claim
+    /// and refuses another ID. A data directory gets it at its first open.
+    pub store_id: Option<uuid::Uuid>,
 }
 
 /// A format 6 Raft snapshot record: a checkpoint, the record index, and the term there. The
@@ -1047,6 +988,8 @@ pub(crate) struct Shared {
     pub(crate) base_index: u64,
     opened: Arc<Opened>,
     pub(crate) source: Arc<Source>,
+    /// The store ID of the cluster claim. Peers of another store refuse this member.
+    pub(crate) store_id: uuid::Uuid,
     /// `ViewCheckpoint` entries that this member applied.
     pub(crate) announcements: u64,
     /// The checkpoint of the newest applied `ViewCheckpoint` entry. A new writer does not
@@ -1166,8 +1109,15 @@ async fn open_once(source: Arc<Source>, opened: Arc<Opened>, id: uuid::Uuid, cov
 }
 
 impl Shared {
-    fn new(base: Arc<Base>, source: Arc<Source>, options: &Options) -> Self {
+    pub(super) fn new(
+        base: Arc<Base>,
+        source: Arc<Source>,
+        store_id: uuid::Uuid,
+        pin_max: Duration,
+        holders: Arc<super::overlay::Holders>,
+    ) -> Self {
         Self {
+            store_id,
             overlay: Overlay::new(base.applied),
             based: Arc::new(tokio::sync::watch::channel(base.applied).0),
             base_id: Arc::new(tokio::sync::watch::channel(base_ref(&base, base.applied)).0),
@@ -1181,18 +1131,18 @@ impl Shared {
             extensions: 0,
             retry_opens: true,
             pending: Arc::default(),
-            pin_max: options.pin_max,
-            holders: Arc::new(super::overlay::Holders::new(options.overlay_max_bytes)),
+            pin_max,
+            holders,
         }
     }
 
     /// The view at `seq`.
     pub(crate) fn view(&self, seq: u64) -> StateView {
-        StateView::Shared(SharedView::new(
-            self.base.clone(),
-            self.overlay.segments(),
-            seq,
-        ))
+        StateView::Shared(self.shared_view(seq))
+    }
+
+    fn shared_view(&self, seq: u64) -> SharedView {
+        SharedView::new(self.base.clone(), self.overlay.segments(), seq)
     }
 
     /// The view that apply reads. It sees every batch that apply adds later.
@@ -1202,7 +1152,12 @@ impl Shared {
 
     /// The view at the covered index, which equals the applied state.
     pub(crate) fn pinned(&self) -> StateView {
-        self.view(self.overlay.queue().covered())
+        StateView::Shared(self.pinned_view())
+    }
+
+    /// The shared view at the covered index. A backup pins it.
+    pub(crate) fn pinned_view(&self) -> SharedView {
+        self.shared_view(self.overlay.queue().covered())
     }
 
     /// Close the open segment and open checkpoint `id` in the background. The announcement
@@ -1341,30 +1296,26 @@ impl StateMachine {
         cluster: &str,
         cache: StateCache,
         options: &Options,
-        backend: transfer::Backend,
     ) -> Result<Self> {
         cache.validate()?;
-        let quota = if options.join {
-            claimed_quota(store.as_ref(), root, cluster).await?
-        } else {
-            claim(
-                store.as_ref(),
-                root,
-                cluster,
-                options.quota,
-                &options.voters,
-            )
-            .await?
+        // The state and the peer identity use the store ID of this one read. A bound data
+        // directory reads the claim only, before any restore or base selection.
+        let voters = (!options.join).then_some(options.voters.as_slice());
+        let claimed = match options.store_id {
+            Some(id) => bound(store.as_ref(), root, cluster, id, voters).await?,
+            None if options.join => joined(store.as_ref(), root, cluster).await?,
+            None => {
+                claim(
+                    store.as_ref(),
+                    root,
+                    cluster,
+                    options.quota,
+                    &options.voters,
+                )
+                .await?
+            }
         };
-        let location = transfer::Location::open(
-            store.clone(),
-            &join(root, STATE),
-            backend,
-            false,
-            cache,
-            None,
-        )
-        .await?;
+        let location = transfer::Location::new(&join(root, STATE), cache);
         let state_root = location.root();
         let source = Arc::new(Source {
             store: store.clone(),
@@ -1417,10 +1368,16 @@ impl StateMachine {
             }
             _ => base,
         };
-        let shared = Shared::new(base, source, options);
-        let holders = shared.holders.clone();
+        let holders = Arc::new(super::overlay::Holders::new(options.overlay_max_bytes));
+        let shared = Shared::new(
+            base,
+            source,
+            claimed.store_id,
+            options.pin_max,
+            holders.clone(),
+        );
         let reads = shared.live();
-        let mut state = Self::load(None, admin, location, rows, reads, Some(shared)).await?;
+        let mut state = Self::load(admin, location, rows, reads, shared).await?;
         holders.register(&state.metrics.registry)?;
         // The state loads at the row, so its counter and term rows match. The record gives the
         // index and the term of the extension.
@@ -1432,20 +1389,20 @@ impl StateMachine {
             );
             state.extend_base(record.index, record.term)?;
         }
-        state.quota = quota;
+        state.quota = claimed.quota;
         state.plan_compaction();
         Ok(state)
     }
 
-    /// Return true in shared state mode.
-    pub(crate) fn is_shared(&self) -> bool {
-        self.shared.is_some()
+    /// The ID of the shared store.
+    pub(crate) fn store_id(&self) -> uuid::Uuid {
+        self.shared.store_id
     }
 
-    /// The handles of the node, in shared mode.
-    pub(crate) fn shared_handles(&self) -> Option<Handles> {
-        let shared = self.shared.as_ref()?;
-        Some(Handles {
+    /// The handles of the node.
+    pub(crate) fn shared_handles(&self) -> Handles {
+        let shared = &self.shared;
+        Handles {
             admin: self.admin.clone(),
             queue: shared.overlay.queue(),
             source: shared.source.clone(),
@@ -1453,13 +1410,13 @@ impl StateMachine {
             announced: shared.announced.subscribe(),
             base_id: shared.base_id.subscribe(),
             opened: shared.opened.clone(),
-        })
+        }
     }
 
     /// Apply a `ViewCheckpoint` entry. It changes no etcd state and writes no batch.
     ///
-    /// `covers` is the index through which the leader certified the checkpoint. An entry of an
-    /// earlier binary has none, and zero means the checkpoint row. The leader proposed the entry
+    /// `covers` is the index through which the leader certified the checkpoint. Zero means the
+    /// checkpoint row. The leader proposed the entry
     /// after it applied `covers`, so a value at or above `index` is not valid.
     pub(crate) async fn apply_view_checkpoint(
         &mut self,
@@ -1467,11 +1424,13 @@ impl StateMachine {
         checkpoint: &str,
         covers: u64,
     ) -> Result<()> {
-        let Some(shared) = &mut self.shared else {
-            // A replicated member stores only the apply position.
+        // The in-memory state of a test stores only the apply position.
+        #[cfg(test)]
+        if let StateView::Memory(_) = &self.reads {
             self.apply(index, None).await?;
             return Ok(());
-        };
+        }
+        let shared = &mut self.shared;
         ensure!(
             index == self.applied + 1,
             "non-contiguous state machine apply"
@@ -1489,18 +1448,13 @@ impl StateMachine {
     /// Set whether a failed open of an announced checkpoint tries again. A manual apply, such
     /// as DST, turns this off to keep its schedule exact.
     pub(crate) fn set_open_retries(&mut self, retry: bool) {
-        if let Some(shared) = &mut self.shared {
-            shared.retry_opens = retry;
-        }
+        self.shared.retry_opens = retry;
     }
 
     /// Wait for the background opens of announced checkpoints. Return true if one ran.
     #[cfg(test)]
     pub(crate) async fn settle_opens(&mut self) -> bool {
-        let Some(shared) = &mut self.shared else {
-            return false;
-        };
-        let opening = std::mem::take(&mut shared.opening);
+        let opening = std::mem::take(&mut self.shared.opening);
         let any = !opening.is_empty();
         for task in opening {
             let _ = task.await;
@@ -1510,132 +1464,12 @@ impl StateMachine {
 
     /// Use a base that finished opening. Apply calls this before each job.
     pub(crate) fn switch_base(&mut self) {
-        if let Some(shared) = &mut self.shared {
-            if shared.switch() {
-                self.reads = shared.live();
-                // The warm of the new base pruned the set while the old base was still live.
-                shared.source.prune_warmed();
-            }
+        let shared = &mut self.shared;
+        if shared.switch() {
+            self.reads = shared.live();
+            // The warm of the new base pruned the set while the old base was still live.
+            shared.source.prune_warmed();
         }
-    }
-
-    /// Make `base` the state at its index `F` and drop the overlay. The Raft log must already
-    /// hold the matching boundary: a received snapshot, or a log that covers `F`.
-    ///
-    /// `term` is the Raft term at `F` when the caller knows it. A known checkpoint term must
-    /// match it.
-    pub(crate) async fn adopt_base(&mut self, base: Arc<Base>, term: u64) -> Result<()> {
-        let mut shared = self
-            .shared
-            .take()
-            .context("adopt needs shared state mode")?;
-        shared.reset(base);
-        let reads = shared.live();
-        let rows = Arc::new(rows::RowCache::new(self.location.cache.row_bytes));
-        let result = Self::load(
-            None,
-            self.admin.clone(),
-            self.location.clone(),
-            rows,
-            reads,
-            Some(shared),
-        )
-        .await;
-        let mut next = result?;
-        if next.applied_term != 0 && term != 0 {
-            ensure!(
-                next.applied_term == term,
-                "checkpoint term {} differs from Raft term {term}",
-                next.applied_term
-            );
-        }
-        if next.applied_term == 0 {
-            next.applied_term = term;
-            next.entry_term = term;
-        }
-        next.metrics = self.metrics.clone();
-        next.quota = self.quota;
-        next.quota_flag = self.quota_flag;
-        // A base before the seed has no row. The bootstrap membership then stays in memory.
-        if next.members_row.is_none() {
-            next.members = self.members.clone();
-        }
-        next.write_batches = self.write_batches;
-        next.row_marker = self.row_marker.take();
-        // The new rows reach watchers through storage catch-up.
-        next.watch_capture = self.watch_capture.take();
-        if let Some(capture) = &mut next.watch_capture {
-            capture.invalidate();
-        }
-        *self = next;
-        self.plan_compaction();
-        Ok(())
-    }
-
-    /// Rebuild the state from the newest checkpoint at or below `limit` after a missing object.
-    /// The caller replays the local log from the new `applied` to `limit`.
-    ///
-    /// The log can start above the newest checkpoint row: a member truncates through its base
-    /// index. If no newer checkpoint reaches that index, the rebase opens the current base again
-    /// and raises it to its index. `term` gives the Raft term at an index of the local log.
-    pub(crate) async fn rebase(
-        &mut self,
-        limit: u64,
-        term: impl FnOnce(u64) -> Result<u64>,
-    ) -> Result<()> {
-        let shared = self
-            .shared
-            .as_ref()
-            .context("rebase needs shared state mode")?;
-        let (current, row, index) = (
-            shared.base.checkpoint,
-            shared.base.applied,
-            shared.base_index,
-        );
-        let newest = newest_base_through(&self.admin, &shared.source, limit).await?;
-        let base = match (newest, current) {
-            (Some(base), _) if base.applied >= index => base,
-            (_, Some(current)) if index > row => {
-                reopen_above_row(&self.admin, &shared.source, current, Some(row), index).await?
-            }
-            (Some(base), _) => base,
-            (None, _) => {
-                bail!("the shared state has no view checkpoint at or below the rebase index")
-            }
-        };
-        tracing::warn!(
-            base = base.applied,
-            index,
-            applied = self.applied,
-            "rebase on a new checkpoint"
-        );
-        let extend = index > row && (row..index).contains(&base.applied);
-        self.adopt_base(base, 0).await?;
-        if extend {
-            self.extend_base(index, term(index)?)?;
-        }
-        Ok(())
-    }
-
-    /// Store a batch that holds only the apply marker and the counters at the applied index.
-    /// The next checkpoint then has its row at that index. An earlier binary installs a view
-    /// snapshot only at its checkpoint row, and a leader uses this for such a member. The batch
-    /// changes no etcd state, so apply derives nothing from it.
-    pub(crate) fn mark_row(&mut self) -> Result<()> {
-        let size = self.logical_bytes;
-        let index = self.applied;
-        let term = self.applied_term;
-        let shared = self.shared.as_mut().context("not in shared state mode")?;
-        if shared.overlay.queue().pushed() >= index {
-            return Ok(());
-        }
-        let mut batch = WriteBatch::new();
-        mark_applied(&mut batch, index, term);
-        batch.put(LOGICAL_BYTES, size.total().to_be_bytes());
-        batch.put(LOGICAL_SIZE, logical_size_row(index, size));
-        shared.overlay.push(index, Arc::new(batch));
-        self.write_batches += 1;
-        Ok(())
     }
 
     /// Raise a base that has an empty overlay from its row `F` to `index`. The caller knows that
@@ -1643,7 +1477,7 @@ impl StateMachine {
     /// of this checkpoint says so. `term` is the Raft term at `index`. The derived state loaded
     /// at `F`, so its counter rows match the base. Only the position and the term change.
     pub(crate) fn extend_base(&mut self, index: u64, term: u64) -> Result<()> {
-        let shared = self.shared.as_mut().context("not in shared state mode")?;
+        let shared = &mut self.shared;
         ensure!(
             self.applied == shared.base.applied && shared.overlay.queue().pushed() == self.applied,
             "only a base without overlay batches can extend"
@@ -1661,66 +1495,12 @@ impl StateMachine {
         Ok(())
     }
 
-    /// Adopt the opened base above the applied index. A paused member uses this when its log
-    /// commits the base index, so the Raft log needs no change. `term` is the log term there.
-    pub(crate) async fn adopt_opened(&mut self, base: Arc<Base>, term: u64) -> Result<()> {
-        ensure!(base.applied > self.applied, "the opened base is not ahead");
-        self.adopt_base(base, term).await
-    }
-
-    /// Install a format 6 snapshot: the checkpoint that Raft sent. The receive handler opened it.
-    pub(crate) async fn install_view(
-        &mut self,
-        descriptor: transfer::ViewDescriptor,
-        index: u64,
-        term: u64,
-    ) -> Result<()> {
-        let shared = self
-            .shared
-            .as_ref()
-            .context("a format 6 snapshot needs shared state mode")?;
-        let id = descriptor.checkpoint()?;
-        // Release the receipt on every path, also for a snapshot that applies nothing.
-        let received = shared.source.take_received(id);
-        if index <= self.applied {
-            // The member applied past the record, so it installs nothing. The checkpoint holds
-            // the state at `index`, so it can still raise the base there. The base index then
-            // stays at or above the record index.
-            if index > shared.base_index {
-                let base = match received {
-                    _ if shared.base.checkpoint == Some(id) => Ok(shared.base.clone()),
-                    Some(base) => Ok(base),
-                    None => shared.source.open_base(id).await,
-                };
-                match base {
-                    Ok(base) => shared.opened.offer(base, index),
-                    Err(error) => tracing::warn!(%error, %id, "cannot open a received checkpoint"),
-                }
-            }
-            return Ok(());
-        }
-        let base = match received {
-            Some(base) => base,
-            None => shared.source.open_base(id).await?,
-        };
-        // The record index can be above the checkpoint row: the leader certified that no entry
-        // in between changed state. The record gives the term at its own index only.
-        ensure!(
-            base.applied <= index,
-            "checkpoint index {} is above snapshot index {index}",
-            base.applied
-        );
-        let row_term = if base.applied == index { term } else { 0 };
-        self.adopt_base(base, row_term).await?;
-        self.extend_base(index, term)
-    }
-
     /// The format 6 snapshot of the current base: its index, data, and ConfState. `None` before
     /// the first checkpoint.
     pub(crate) async fn base_snapshot(
         &self,
     ) -> Result<Option<(u64, Vec<u8>, raft::eraftpb::ConfState)>> {
-        let shared = self.shared.as_ref().context("not in shared state mode")?;
+        let shared = &self.shared;
         let Some(id) = shared.base.checkpoint else {
             return Ok(None);
         };
@@ -1746,21 +1526,28 @@ impl StateMachine {
     /// Opens and installs that raised a base above its row.
     #[cfg(test)]
     pub(crate) fn extensions(&self) -> u64 {
-        self.shared.as_ref().map_or(0, |shared| shared.extensions)
+        self.shared.extensions
+    }
+
+    /// Offer `base` for a switch through `covers`, as if an announcement certified it there. A
+    /// test switches a member to a wrong base with this.
+    #[cfg(test)]
+    pub(crate) fn offer_base(&self, base: Arc<Base>, covers: u64) {
+        self.shared.opened.offer(base, covers);
     }
 
     /// The checkpoint of the base, if any.
     pub(crate) fn base_checkpoint(&self) -> Option<uuid::Uuid> {
-        self.shared.as_ref()?.base.checkpoint
+        self.shared.base.checkpoint
     }
 
-    /// The base index, the applied announcements, and the overlay bytes, in shared mode.
-    pub(crate) fn view_status(&self) -> Option<(u64, u64, u64)> {
-        let shared = self.shared.as_ref()?;
-        Some((
+    /// The base index, the applied announcements, and the overlay bytes.
+    pub(crate) fn view_status(&self) -> (u64, u64, u64) {
+        let shared = &self.shared;
+        (
             shared.base_index,
             shared.announcements,
             shared.overlay.bytes(),
-        ))
+        )
     }
 }

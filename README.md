@@ -23,21 +23,19 @@ Operators can move key-value data to S3 and recover write capacity without defra
 
 | Operator task | etcd | SlateDB etcd |
 | --- | --- | --- |
-| Size storage | Keep a bbolt database on each member's disk | Keep state on local disk or in S3 |
+| Size storage | Keep a bbolt database on each member's disk | Keep one shared copy of state in S3 |
 | Free quota after NOSPACE | Compact history and defragment the database | Delete and compact |
-| Recover a follower | Stream a snapshot from the leader | Copy bulk data within S3 off the leader |
+| Recover a follower | Stream a snapshot from the leader | Open a shared checkpoint, with no copy |
 | Embed a member | Use the Go embed package | Use the Rust API on your Tokio runtime |
 
 The [Rust embedding API](docs/embedding.md) lets an application manage its own member while it
 serves existing etcd v3 clients.
 
-With S3, operators can size the data store separately from each member's local Raft log.
+Operators size the S3 data store separately from each member's local Raft log.
 A normal write commits to a quorum of durable logs without waiting for an S3 upload.
-During follower recovery, a server-side copy keeps bulk data off the leader's network.
-It requires a common bucket, endpoint, region, and read access across member prefixes.
-The HTTP fallback transfers the files through the leader.
-See [remote storage](docs/remote-storage.md) and
-[snapshot transfer](docs/object-snapshots.md#transfer).
+The leader writes one copy of the state. Each member reads checkpoints of it, so a follower
+recovers with no data copy.
+See [remote storage](docs/remote-storage.md) and [shared state](docs/shared-state-guide.md).
 
 After a NOSPACE alarm, etcd counts unused pages in the database file toward its quota.
 Defragmentation shrinks that file and blocks reads and writes on the member while it runs.
@@ -49,7 +47,7 @@ Both services use one Raft write leader and default to a 2 GiB backend quota.
 Use `--quota-backend-bytes` to change the quota. When sizing SlateDB etcd, allow memory for an index
 that grows with the live key count. Native backup and restore stream the image with bounded memory.
 The image has no size limit, but each row has a 64 MiB limit.
-See [snapshot limits](docs/object-snapshots.md#limits).
+See [administration](docs/administration.md#maintenance-and-storage).
 
 [etcd-maintenance]: https://etcd.io/docs/v3.6/op-guide/maintenance/
 
@@ -97,8 +95,8 @@ Native backups and the deprecated backend Hash differ from etcd bbolt.
 Use the native restore flag, not `etcdutl`. Binary Downgrade returns Unimplemented.
 Lease remaining TTL is not checkpointed.
 Large scans and native backups still need memory controls.
-Raft snapshots copy SlateDB checkpoint objects.
-See [object storage snapshots](docs/object-snapshots.md).
+Raft snapshots name a checkpoint of the shared SlateDB.
+See [shared state](docs/shared-state.md).
 See [compatibility results and limits](COMPATIBILITY.md) before choosing a workload.
 
 ## Verification

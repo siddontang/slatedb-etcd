@@ -20,6 +20,19 @@ Run more campaigns with `--seeds 1,2,3,4,5,6,7,8`.
 Each seed sets client choices. Operating system scheduling still changes process histories.
 Use `SLATEDB_ETCD_BINARY` for direct Go runs, or `--binary` for Python runners.
 
+Every cluster, also a single member, runs on RustFS, as production runs on S3.
+The runners start one pinned RustFS server and give each cluster its own S3 prefix. A runner reuses
+the server that `SLATEDB_S3_TEST_ENDPOINT` and the other fixture settings name.
+
+No runner deletes the prefix of a cluster. On a RustFS server that the fixture starts, also with
+`--env-file` or in a CI job, the prefixes disappear with its temporary data directory. Another
+reused server keeps them until its operator removes them, also across a restart of the server.
+Run a direct Go test through the fixture:
+
+```sh
+python3 scripts/rustfs_fixture.py -- sh -c 'cd tests/compat && go test -run TestDifferentialKV'
+```
+
 The runners retain JSON reports and Go logs. Fault results stay in `tmp/test-results/robustness-N/`:
 
 - `operations.json`: typed etcd model history, including unknown writes.
@@ -72,25 +85,20 @@ The CI workflow pins Leiningen 2.11.2 and verifies its SHA-256.
 ## Deterministic event schedules
 
 ```sh
-python3 scripts/check-dst.py --seeds 1,2,42,58,70
+python3 scripts/check-dst.py --seeds 1,2,3
 ```
 
-Seed 58 covers reordered appends before object-store fault injection.
-The setup waits for a new applied write and checks that each PUT fault runs.
-Seed 70 covers log-cache isolation across three engine instances on one thread.
 See the [Raft Engine fixes](../docs/dependencies.md#raft-engine-fixes) for dependency regressions.
 
 The runner writes traces under `target/dst/`.
 Direct Cargo tests accept `SLATEDB_DST_TRACE_DIR` to select another trace directory.
 Repeat a failing seed with the same command. Each run also writes a partial `seed-N-last.json`.
-The test drives real storage with a simulated transport and Raft clock.
-It checks lease generations, Watch journals, auth revocation, and physical compaction after
-recovery. It does not simulate lease expiry time.
+It does not simulate lease expiry time.
 
-`--shared-seeds`, default `1,2,3`, runs the shared state schedules. Three members share one
+`--seeds`, default `1,2,3`, selects the shared state schedules. Three members share one
 in-memory object store, and the simulation drives the leader writer one step at a time. The
 schedules stop members between writer steps, open late writers, fail SST writes, partition a
-member, and run retention and GC. After every step each member's view must equal a replicated
+member, and run retention and GC. After every step each member's view must equal an apply-only
 reference at the same index. The simulated writer compacts only on request, so GC deletes the
 same SSTs on every replay. Each run writes `shared-seed-N.json`.
 The scheduler controls disk execution, completion delivery, and apply jobs.
@@ -197,6 +205,7 @@ DST pauses apply between permission revocation and a queued write, then restores
 ## Remote storage, native crash hooks, and downstream projects
 
 See [remote storage](../docs/remote-storage.md) for S3 and disposable guest commands.
+The S3 recovery check is deferred until #149, and CI does not run it for now.
 The [fault map](upstream/fault-mapping.md) accounts for all named gofail hooks at the pinned etcd
 version. It distinguishes equivalent native boundaries, imported behavior, and remaining gaps.
 

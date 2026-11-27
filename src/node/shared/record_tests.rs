@@ -25,6 +25,7 @@ async fn a_restart_opens_the_record_checkpoint_above_its_row() {
                 overlay_max_bytes: 1 << 30,
                 restore: None,
                 record,
+                store_id: None,
             };
             StateMachine::open_shared(
                 store,
@@ -32,7 +33,6 @@ async fn a_restart_opens_the_record_checkpoint_above_its_row() {
                 "test",
                 crate::state::StateCache::default(),
                 &options,
-                crate::state::transfer::Backend::Local,
             )
             .await
         }
@@ -73,7 +73,7 @@ async fn a_restart_opens_the_record_checkpoint_above_its_row() {
     apply::apply_entries(&mut leader, vec![first], header)
         .await
         .unwrap();
-    let handles = leader.shared_handles().unwrap();
+    let handles = leader.shared_handles();
     let db = handles.source.open_writer().await.unwrap();
     for (seq, batch) in handles.queue.after(0, usize::MAX) {
         db.write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
@@ -127,7 +127,7 @@ async fn a_restart_opens_the_record_checkpoint_above_its_row() {
     assert_eq!(plain.applied, 2);
     assert!(Node::align_log(&mut storage, &plain).is_err());
     plain.close().await.unwrap();
-    // A record at the checkpoint row, as an earlier binary writes it, extends nothing.
+    // A record at the checkpoint row extends nothing.
     let at_row = Record {
         checkpoint: x,
         index: 2,
@@ -143,7 +143,7 @@ async fn a_restart_opens_the_record_checkpoint_above_its_row() {
     let mut member = open(Some(record)).await.unwrap();
     assert_eq!(member.base_checkpoint(), Some(x));
     assert_eq!((member.applied, member.applied_term), (5, 2));
-    assert_eq!(member.view_status().unwrap().0, 5);
+    assert_eq!(member.view_status().0, 5);
     Node::align_log(&mut storage, &member).unwrap();
     member
         .install_snapshot(storage.recovery_snapshot())
@@ -178,8 +178,8 @@ async fn a_restart_opens_the_record_checkpoint_above_its_row() {
 }
 
 /// The shared state of `retired`: checkpoint Z at row 1, then X and Y at row 2, and a leader
-/// that applied no-op entries 3 to 5 in term 2. W has row 3: the leader stored the apply marker
-/// at 3, as it does for an earlier binary, and published it.
+/// that applied entries 3 to 5 in term 2. W has row 3: the leader stored a batch at 3 and
+/// published it.
 struct Retired {
     store: Arc<dyn ObjectStore>,
     leader: StateMachine,
@@ -201,6 +201,7 @@ async fn open_at(
         overlay_max_bytes: 1 << 30,
         restore: None,
         record,
+        store_id: None,
     };
     StateMachine::open_shared(
         store.clone(),
@@ -208,7 +209,6 @@ async fn open_at(
         "test",
         crate::state::StateCache::default(),
         &options,
-        crate::state::transfer::Backend::Local,
     )
     .await
 }
@@ -224,7 +224,7 @@ async fn retired_in(store: Arc<dyn ObjectStore>) -> Retired {
     ));
     leader.entry_term = 1;
     leader.seed_for_test(1).await.unwrap();
-    let handles = leader.shared_handles().unwrap();
+    let handles = leader.shared_handles();
     let db = handles.source.open_writer().await.unwrap();
     let checkpoint = |row| CheckpointOptions {
         name: Some(view_name(row)),
@@ -232,7 +232,7 @@ async fn retired_in(store: Arc<dyn ObjectStore>) -> Retired {
     };
     let mut written = 0;
     let mut materialize = async |leader: &StateMachine| {
-        let queue = leader.shared_handles().unwrap().queue;
+        let queue = leader.shared_handles().queue;
         for (seq, batch) in queue.after(written, usize::MAX) {
             db.write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
                 .await
@@ -272,8 +272,17 @@ async fn retired_in(store: Arc<dyn ObjectStore>) -> Retired {
         .unwrap()
         .id;
     leader.entry_term = 2;
-    leader.apply(3, None).await.unwrap();
-    leader.mark_row().unwrap();
+    // A batch at 3 puts the row of the next checkpoint there.
+    let row = crate::Command {
+        id: "row".into(),
+        request: crate::Request {
+            operations: vec![crate::Operation::Put {
+                key: "row".into(),
+                value: "3".into(),
+            }],
+        },
+    };
+    leader.apply(3, Some(&row)).await.unwrap();
     materialize(&leader).await;
     let w = db
         .create_checkpoint(CheckpointScope::Durable, &checkpoint(3))
@@ -342,7 +351,7 @@ async fn a_restart_without_the_record_checkpoint_uses_one_in_its_range() {
     admin.delete_checkpoint(x).await.unwrap();
     let mut member = open_at(&store, Some(record_of(x))).await.unwrap();
     assert_eq!(member.base_checkpoint(), Some(w));
-    assert_eq!(member.shared_handles().unwrap().opened.newest(), None);
+    assert_eq!(member.shared_handles().opened.newest(), None);
     assert_eq!((member.applied, member.applied_term), (5, 2));
     assert_eq!(member.extensions(), 1);
     assert_eq!(member.loaded_fields(), leader.loaded_fields());
@@ -416,7 +425,7 @@ async fn only_a_gone_checkpoint_is_skipped() {
         w,
         ..
     } = retired_in(faults.clone()).await;
-    let source = leader.shared_handles().unwrap().source;
+    let source = leader.shared_handles().source;
     let admin = leader.admin.clone();
     admin.delete_checkpoint(x).await.unwrap();
     assert!(crate::state::shared::open_present(&source, x)

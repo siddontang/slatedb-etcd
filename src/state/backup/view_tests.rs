@@ -43,7 +43,6 @@ impl Fixture {
                 overlay_max_bytes: limit,
                 ..options()
             },
-            transfer::Backend::Local,
         )
         .await
         .unwrap();
@@ -89,14 +88,14 @@ impl Fixture {
     async fn switch(&mut self) -> uuid::Uuid {
         let base = checkpoint(&self.state, &self.writer, &mut self.written).await;
         let id = base.checkpoint.unwrap();
-        self.state.shared.as_ref().unwrap().offer(base);
+        self.state.shared.offer(base);
         self.state.switch_base();
         assert_eq!(self.state.base_checkpoint(), Some(id));
         id
     }
 
     fn holders(&self) -> Arc<Holders> {
-        self.state.shared.as_ref().unwrap().holders.clone()
+        self.state.shared.holders.clone()
     }
 
     /// Hold new backups before their first pass until the returned semaphore gets a permit.
@@ -115,7 +114,7 @@ impl Fixture {
     }
 
     fn pins(&self, id: uuid::Uuid) -> bool {
-        let source = &self.state.shared.as_ref().unwrap().source;
+        let source = &self.state.shared.source;
         source.pinned().contains(&id)
     }
 
@@ -207,10 +206,6 @@ async fn a_shared_backup_streams_the_view_image() {
     fixture.delete("gone").await;
     fixture.put("kept", "overlay").await;
     fixture.put("new", "overlay").await;
-    // Shared mode ignores a quota row from a converted state.
-    fixture
-        .put_row(quota::KEY, 7_u64.to_be_bytes().to_vec())
-        .await;
     let state = &fixture.state;
     let expected = state.image_job(true).unwrap().await.unwrap();
     let streamed = collect(state.backup().await.unwrap()).await;
@@ -229,7 +224,6 @@ async fn a_shared_backup_streams_the_view_image() {
     };
     assert!(value("gone").is_none());
     assert!(value("kept").is_some() && value("new").is_some());
-    assert!(rows.iter().all(|(key, _)| key != quota::KEY));
     assert_eq!(rows.last().unwrap().0, crate::cluster::KEY);
     assert_eq!(fixture.holders().status(), (0, 0));
     fixture.close().await;
@@ -263,21 +257,22 @@ async fn a_shared_backup_keeps_its_boundary_across_a_base_switch() {
     data.extend_from_slice(&collect(stream).await);
     fixture.released(first, 0).await;
 
-    let dir = tempfile::tempdir().unwrap();
-    let restored = crate::state::tests::restore(dir.path(), data).await;
-    assert_eq!(restored.revision, revision);
-    let (restored_key, restored_revision) = read(&restored, "key").await;
-    assert_eq!(restored_revision, revision);
-    let restored_key = restored_key.unwrap();
-    assert_eq!(restored_key.value, b"boundary");
+    let rows = decode(&data).rows;
+    let version = |name: &str| {
+        let key = current(name);
+        rows.iter()
+            .find(|(row, _)| *row == key)
+            .map(|(_, value)| <KeyValue as prost::Message>::decode(value.as_slice()).unwrap())
+    };
+    let image_key = version("key").unwrap();
+    assert_eq!(image_key.value, b"boundary");
     assert_eq!(
-        (restored_key.mod_revision, restored_key.create_revision),
+        (image_key.mod_revision, image_key.create_revision),
         (key.mod_revision, key.create_revision)
     );
-    assert_eq!(read(&restored, "only").await.0.unwrap(), only);
-    assert!(read(&restored, "gone").await.0.is_none());
-    assert!(read(&restored, "later").await.0.is_none());
-    restored.close().await.unwrap();
+    assert_eq!(version("only").unwrap(), only);
+    assert!(version("gone").is_none());
+    assert!(version("later").is_none());
     fixture.close().await;
 }
 
@@ -413,7 +408,7 @@ async fn an_idle_client_ends_a_shared_backup() {
 async fn fill_overlay(fixture: &mut Fixture, prefix: &str, bytes: u64) -> usize {
     let value = "w".repeat(10 * 1024);
     let mut n = 0;
-    while fixture.state.view_status().unwrap().2 < bytes {
+    while fixture.state.view_status().2 < bytes {
         fixture.put(&format!("{prefix}/{n:03}"), &value).await;
         n += 1;
     }
@@ -502,7 +497,7 @@ async fn a_backup_of_a_full_overlay_starts() {
     const KIB: u64 = 1024;
     let mut fixture = Fixture::with_budget(1, 256 * KIB).await;
     let rows = fill_overlay(&mut fixture, "pending", 600 * KIB).await;
-    assert!(fixture.state.view_status().unwrap().2 > 256 * KIB);
+    assert!(fixture.state.view_status().2 > 256 * KIB);
     // Two backups start, and several budget checks run while they wait.
     let hold = fixture.hold();
     let streams = [
@@ -628,7 +623,7 @@ async fn backups_keep_their_limits_across_an_adoption() {
         let request = put(&format!("k{n:02}"), &value);
         behind.apply_etcd(n, &request).await.unwrap();
     }
-    let holders = behind.shared.as_ref().unwrap().holders.clone();
+    let holders = behind.shared.holders.clone();
     let hold = Arc::new(tokio::sync::Semaphore::new(0));
     *holders.hold.lock().unwrap() = Some(hold.clone());
     let mut streams = vec![];
@@ -638,7 +633,7 @@ async fn backups_keep_their_limits_across_an_adoption() {
     assert_eq!(holders.status(), (MAX_HOLDERS, 0));
     behind.adopt_opened(newer, 4).await.unwrap();
     assert_eq!(behind.applied, 40);
-    let after = &behind.shared.as_ref().unwrap().holders;
+    let after = &behind.shared.holders;
     assert!(Arc::ptr_eq(after, &holders));
     let (count, charged) = holders.status();
     assert!(
@@ -692,7 +687,7 @@ async fn a_backup_ends_during_a_long_run_of_deletes() {
     fixture.state.write_batch(batch, index).await.unwrap();
     fixture.state.applied = index;
     fixture.put("zz", "after the deletes").await;
-    let segment = fixture.state.shared.as_ref().unwrap().overlay.segments()[0].clone();
+    let segment = fixture.state.shared.overlay.segments()[0].clone();
     let before = segment.visits.load(std::sync::atomic::Ordering::Relaxed);
     let hold = fixture.hold();
     let stream = fixture.state.backup().await.unwrap();

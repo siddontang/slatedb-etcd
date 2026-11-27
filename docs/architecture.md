@@ -20,9 +20,9 @@ Startup binds listeners and opens storage.
 Readiness confirms quorum ReadIndex and local apply.
 Shutdown joins workers before releasing storage.
 See [Rust embedding](embedding.md) for the API contract and client examples.
-Each replica keeps its own durable Raft directory and local or S3 object namespace.
+Each replica keeps its own durable Raft directory. All replicas share one SlateDB in an
+S3-compatible store. Only the leader writes it. See [shared state](shared-state.md).
 Remote listeners require separate client and peer ports with mutual TLS.
-No replica shares its manifest or SST ownership with another replica.
 
 KV, Txn, Compact, Watch, Lease, Auth, and Cluster are implemented.
 Maintenance, TLS, backend quotas, and physical compaction have local integration coverage.
@@ -59,14 +59,14 @@ The diagnostic JSON API uses a separate keyspace from the etcd API.
 | Apply owner | Execute committed entries in order and publish matching read views |
 | Read executor | Evaluate bounded KV reads on pinned data and metadata |
 | SlateDB | Store current values, history, event journals, leases, and the apply marker |
-| Snapshot builder | Create a SlateDB checkpoint and describe its objects |
-| Object binding | Bind local identity to an exclusive S3 namespace |
+| Checkpoint publisher | Flush the shared SlateDB, create a `view-` checkpoint, and announce it |
+| Object binding | Bind local identity to the cluster namespace in S3 |
 | Test drivers | Compare etcd behavior and check recovery, histories, and schedules |
 
 ## Persistent layout
 
-Each node stores its Raft log under `<node-dir>/raft`. Local objects use `<node-dir>/objects`.
-S3 objects use an owned cluster/member prefix. A synced binding prevents accidental backend changes.
+Each node stores its Raft log under `<node-dir>/raft`. The state is in the shared S3 cluster
+prefix. A synced binding prevents accidental backend changes.
 See [remote storage](remote-storage.md) for the namespace and claim protocol.
 SlateDB uses these logical keys:
 
@@ -88,13 +88,12 @@ SlateDB uses these logical keys:
 | `etcd/compact-pending` | Physical compaction progress |
 
 The full snapshot preserves these keys together. A checkpoint has one pinned apply boundary.
-The `meta/applied-term` term is valid only when its index equals `meta/applied`. Older binaries
-advance `meta/applied` alone, so a different index or a missing row means an unknown term. The
-next state batch stores the term again. A copied checkpoint with a known term must match the
-Raft snapshot term. At startup, a durable Raft snapshot at the applied index fills an unknown
-term in memory and must match a known term. Logical images and native backups omit the row.
-Install takes the term from the Raft snapshot metadata. A restore starts in term 1 at the copied
-row count plus one, in both state modes.
+The `meta/applied-term` term is valid only when its index equals `meta/applied`. A different
+index or a missing row means an unknown term. The next state batch stores the term again. A
+checkpoint with a known term must match the Raft snapshot term. At startup, a durable Raft
+snapshot at the applied index fills an unknown term in memory and must match a known term.
+Logical images and native backups omit the row. Install takes the term from the Raft snapshot
+metadata. A restore starts in term 1 at the copied row count plus one.
 
 ## Durability and ordering contract
 
@@ -114,7 +113,7 @@ The SlateDB sequence number equals the Raft apply index.
 The etcd MVCC revision is separate. A mutating transaction advances that revision once.
 Reads, lease grants, renewals, and empty deletes do not advance the KV revision.
 
-SlateDB's native WAL is disabled. The replicated Raft log protects committed state before flush.
+SlateDB's native WAL is disabled. The Raft log protects committed state before flush.
 This removes a separate SlateDB WAL write from the normal commit path.
 It does not remove local disk writes or the need for a quorum.
 A timeout or leader change can leave a request's result unknown. There is no retry deduplication.
@@ -136,8 +135,8 @@ Each task can resume on another runtime worker after it yields.
 | WAL | One dedicated `raft-log-io` OS thread per member writes, syncs, and reads the log. |
 | Apply | One Tokio task per member writes SlateDB and publishes revisions in log order. |
 | KV reads | Up to four Tokio tasks read pinned views. Three budgeted scans may share them. |
-| Checkpoint | A task flushes state. Peer images use blocking workers to sync the file. |
-| Other work | Blocking workers handle password checks, metrics encoding, and local object I/O. |
+| Checkpoint | The leader publisher flushes state. Blocking workers sync snapshot records. |
+| Other work | Blocking workers handle password checks and metrics encoding. |
 
 The client and peer tasks submit events through a queue with 2,048 slots.
 The WAL thread publishes checkpoint metadata, or a synced image file, and syncs the truncation.
@@ -434,26 +433,21 @@ Grouping more scan requests needs an overlay that also merges scans and historic
 
 ## Snapshot order and recovery
 
-Automatic and membership checkpoints flush SlateDB at an applied index and then truncate the log.
-Their Raft snapshot holds only the index, term, and configuration. SlateDB is the local image.
-This follows etcd, where the Raft snapshot holds metadata and bbolt holds the state.
-Local object writes sync files and directories, so a flush is durable before truncation.
+Automatic and membership checkpoints truncate the log through the member's base index. Their
+Raft snapshot names the `view-` checkpoint of the base. The checkpoint is durable in S3 before
+truncation. This follows etcd, where the Raft snapshot holds metadata and bbolt holds the state.
 
 A manual checkpoint request waits for the Raft commit index observed when the request arrived.
-It creates a SlateDB checkpoint at the applied index. The image is a small descriptor of it.
-A leader builds the same image when Raft requests a snapshot that local storage cannot supply.
-See [object storage snapshots](object-snapshots.md) for the transfer and cleanup rules.
-Automatic truncation pauses while that request waits or while a peer receives an image.
-A blocking worker writes and syncs each local image under a unique temporary name.
-The WAL worker renames the image and syncs its directory before it publishes the reference.
+It returns when the member's base covers that index. A leader sends the base record when Raft
+requests a snapshot that local storage cannot supply. The follower opens the named checkpoint.
+No data copy takes place. See [shared state](shared-state.md#install).
+A blocking worker writes and syncs each local snapshot record under a unique temporary name.
+The WAL worker renames the record and syncs its directory before it publishes the reference.
 One synced WAL batch publishes its index, size, CRC32C, and metadata with log truncation.
 The worker can then retire the previous file and reclaim covered WAL segments.
 On restart, the worker verifies the referenced file before removing unpublished or retired files.
 
-The follower copies the checkpoint SST objects into its own prefix before Raft accepts the
-snapshot. The copy size does not depend on the peer request limit.
-
-On receipt, persist the file and its WAL reference before installing the snapshot in SlateDB.
+On receipt, persist the record and its WAL reference before installing the snapshot.
 The worker must install it before applying later entries.
 An older active batch can finish before installation, but it must not move state past the snapshot.
 Status must distinguish durable snapshot receipt from completed state installation.
@@ -462,7 +456,8 @@ Raft can acknowledge durable receipt while state installation is still pending.
 On restart:
 
 1. Open raft-engine and verify the node identity.
-2. Open SlateDB and read its durable apply marker.
+2. Open the newest checkpoint, or the checkpoint of the Raft snapshot record, and read its
+   apply marker.
 3. Install a newer durable Raft snapshot if required.
 4. Replay committed entries after the recovered marker.
 5. Serve state only through the recovered and subsequently applied prefix.
@@ -542,14 +537,13 @@ The weight limit covers cached entries; allocator and cache overhead can add res
 Tests compare the counter with a full scan after state changes, restart, and DST recovery.
 
 Compact applies its boundary at once. Bounded Raft steps then remove obsolete rows.
-One background flush per member makes the deletions durable after a physical target finishes.
-The apply worker accepts later entries while the flush runs.
-The leader and any forwarding member wait for their local flush before they return success.
+A physical reply waits until the member's base covers the finished target.
+The apply worker accepts later entries while the reply waits.
 Defragment rewrites SSTs through the SlateDB compactor.
 Both operations run on the apply worker. Slow state work cannot stop Raft heartbeats.
 Compactor failures return RPC errors; they do not stop the Raft owner.
-Native snapshot export includes SHA-256 and uses bounded response chunks. Replicated mode streams
-it from a pinned checkpoint; shared mode builds the image of its pinned view in one buffer.
+Native snapshot export includes SHA-256 and uses bounded response chunks. It streams the image
+from a pinned view.
 Snapshots contain authentication, membership, alarms, leases, and revision metadata together.
 
 ## Monitoring
@@ -560,19 +554,10 @@ messages and final statuses. See the [metrics contract](metrics.md).
 
 ## Target storage and deployment architecture
 
-The S3 deployment retains one independent SlateDB owner per replica.
-Each replica uses a separate object prefix and manifest.
-This is the closest extension of the current recovery contract.
-It can create three copies of SST data and repeat object-store work.
-Cost reduction from shared SSTs is not established by this design.
-
-Shared SST ownership requires a separate design for publication, fencing, retention, and deletion.
-A shared bucket alone does not make multiple manifest writers safe.
-That work must not weaken recovery or let one replica delete another replica's required data.
-
-Raft snapshots now refer to SlateDB checkpoint objects. Each follower copies them into its own
-prefix, so no replica depends on another replica's data after an install.
-See [object storage snapshots](object-snapshots.md).
+The cluster keeps one SlateDB in S3. The leader writes it, and every replica reads checkpoints
+of it under an in-memory overlay. This stores one copy of each SST and repeats no object-store
+work. Publication, fencing, retention, and deletion follow the [shared state](shared-state.md)
+design. The cost is one fault domain: a lost object affects every replica.
 
 Cross-host operation needs secure peer transport, identity checks, and operational controls.
 Measurements must include the real gRPC and MVCC path, remote storage, and independent disks.

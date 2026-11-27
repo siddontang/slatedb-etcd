@@ -7,18 +7,51 @@ async fn server() -> (
     mpsc::Receiver<Event>,
     tokio::task::JoinHandle<Result<()>>,
 ) {
+    let (address, received, task, _) = server_on(None).await;
+    (address, received, task)
+}
+
+/// A peer server of cluster `stream-test` on shared store `store`. It also returns the counter
+/// of refused stores.
+async fn server_on(
+    store: Option<&str>,
+) -> (
+    String,
+    mpsc::Receiver<Event>,
+    tokio::task::JoinHandle<Result<()>>,
+    prometheus::IntCounter,
+) {
+    server_with(store).await
+}
+
+async fn server_with(
+    store: Option<&str>,
+) -> (
+    String,
+    mpsc::Receiver<Event>,
+    tokio::task::JoinHandle<Result<()>>,
+    prometheus::IntCounter,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let (events, received) = mpsc::channel(256);
+    let refused = prometheus::IntCounter::new("refused", "Refused peer stores.").unwrap();
+    let memory = std::sync::Arc::new(slatedb::object_store::memory::InMemory::new());
+    let cache = crate::state::StateCache::default();
     let router = crate::api::router(ApiState {
-        location: None,
-        shared: None,
+        shared: crate::state::shared::offline_source(memory, "", cache).unwrap(),
         events,
-        cluster_id: "stream-test".into(),
+        peer: Identity {
+            cluster: "stream-test".into(),
+            store: store.map(str::to_owned),
+        },
+        refusals: std::sync::Arc::new(crate::api::Refusals::new(refused.clone())),
+        clock: std::sync::Arc::new(|| 0),
+        prober: None,
         fault_controls: false,
     });
     let task = tokio::spawn(crate::tls::serve(listener, router, None));
-    (address, received, task)
+    (address, received, task, refused)
 }
 
 fn message(snapshot: bool) -> Message {
@@ -35,7 +68,7 @@ fn message(snapshot: bool) -> Message {
 }
 
 /// The next event that is not the process notice of a stream or request. A sender of this
-/// binary names its process. A raw test stream, like an earlier binary, names none.
+/// binary names its process. A raw test stream names none.
 async fn next_event(events: &mut mpsc::Receiver<Event>) -> Event {
     loop {
         match tokio::time::timeout(Duration::from_secs(3), events.recv())
@@ -571,73 +604,6 @@ fn covered_snapshot(process: Option<u64>) -> Message {
     message
 }
 
-/// An earlier binary restarted on the member after the leader built a snapshot above its row.
-/// Its server has only the old route, so it answers 404 before its Raft sees the snapshot. The
-/// leader then treats the member as an earlier binary and reports the snapshot as failed.
-#[tokio::test]
-async fn an_earlier_binary_refuses_a_snapshot_above_its_row_before_raft() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let old_route = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let calls = old_route.clone();
-    let router = axum::Router::new().route(
-        "/raft",
-        axum::routing::post(move || {
-            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            async { axum::http::StatusCode::NO_CONTENT }
-        }),
-    );
-    tokio::spawn(async move { axum::serve(listener, router).await });
-    let (events, mut received) = mpsc::channel(8);
-    let traffic = std::sync::Arc::new(crate::metrics::PeerTraffic::default());
-    let client = reqwest::Client::new();
-    let url = format!("http://{address}/raft");
-    spawn_snapshot(
-        &client,
-        &url,
-        "test",
-        covered_snapshot(Some(7)),
-        &traffic,
-        &events,
-        2,
-    );
-    let first = tokio::time::timeout(Duration::from_secs(3), received.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(
-        first,
-        Event::SnapshotRefused {
-            member: 2,
-            target: 7
-        }
-    ));
-    let second = tokio::time::timeout(Duration::from_secs(3), received.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(
-        second,
-        Event::NetworkResult {
-            peer: 2,
-            snapshot: true,
-            success: false
-        }
-    ));
-    assert_eq!(old_route.load(std::sync::atomic::Ordering::Relaxed), 0);
-    // A snapshot at its row has no target, and it still takes the old route.
-    let mut exact = covered_snapshot(None);
-    exact.context.clear();
-    let mut snapshot = exact.take_snapshot();
-    snapshot.data = crate::state::transfer::ViewDescriptor::new(uuid::Uuid::new_v4())
-        .encode()
-        .unwrap();
-    exact.set_snapshot(snapshot);
-    let delivery = post_snapshot(&client, &url, "test", exact, &traffic).await;
-    assert_eq!(delivery, Delivery::Sent);
-    assert_eq!(old_route.load(std::sync::atomic::Ordering::Relaxed), 1);
-}
-
 /// This binary takes a snapshot above its row only when it names this process. A snapshot for
 /// another process of the member gets 409 before Raft, and the sender falls back.
 #[tokio::test]
@@ -650,7 +616,7 @@ async fn a_snapshot_above_its_row_must_name_the_receiver_process() {
         let delivery = post_snapshot(
             &client,
             &url,
-            "stream-test",
+            &"stream-test".into(),
             covered_snapshot(target),
             &traffic,
         )
@@ -663,10 +629,82 @@ async fn a_snapshot_above_its_row_must_name_the_receiver_process() {
     let delivery = post_snapshot(
         &client,
         &url,
-        "stream-test",
+        &"stream-test".into(),
         covered_snapshot(Some(process_id())),
         &traffic,
     )
     .await;
     assert_eq!(delivery, Delivery::Failed);
+}
+
+/// A member on another bucket or prefix cannot open the checkpoints of this store. Its stream,
+/// its snapshots, and its view reports stop before Raft. A peer that names no store, like a
+/// replicated member, is refused too. A sender on the same store gets through.
+#[tokio::test]
+async fn peers_of_another_store_or_no_store_are_refused_before_raft() {
+    let (address, mut received, _task, refused) = server_on(Some("store-a")).await;
+    let channel = crate::tls::Transport::default().channel(&address).unwrap();
+    let mut client = TransportClient::new(channel);
+    for store in [None, Some("store-b")] {
+        let mut request = Request::new(tokio_stream::iter([Frame {
+            sequence: 1,
+            payload: message(false).encode_to_vec(),
+        }]));
+        request
+            .metadata_mut()
+            .insert(CLUSTER, "stream-test".parse().unwrap());
+        if let Some(store) = store {
+            request.metadata_mut().insert(STORE, store.parse().unwrap());
+        }
+        let error = client.exchange(request).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied, "{store:?}");
+        assert_eq!(error.message(), "peer shared store does not match");
+    }
+    let http = reqwest::Client::new();
+    let mut routes = 0;
+    for route in ["/raft", COVERED_ROUTE, "/raft/view-ack"] {
+        for store in [None, Some("store-b")] {
+            let identity = Identity {
+                cluster: "stream-test".into(),
+                store: store.map(str::to_owned),
+            };
+            let request = identity.headers(http.post(format!("http://{address}{route}")));
+            let request = match route {
+                "/raft/view-ack" => request.json(&json!({"member": 2, "checkpoints": []})),
+                _ => request
+                    .header(TARGET_PROCESS, process_id().to_string())
+                    .body(covered_snapshot(Some(process_id())).encode_to_vec()),
+            };
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN, "{route}");
+            routes += 1;
+        }
+    }
+    assert_eq!(refused.get(), 2 + routes);
+    assert!(received.try_recv().is_err());
+
+    // A sender on the same store gets a receipt.
+    let (messages, queue) = mpsc::channel(256);
+    let (events, _completed) = mpsc::channel(16);
+    let identity = Identity {
+        cluster: "stream-test".into(),
+        store: Some("store-a".into()),
+    };
+    let sender = tokio::spawn(transport(
+        2,
+        address,
+        identity,
+        queue,
+        events,
+        crate::tls::Transport::default(),
+        Default::default(),
+    ));
+    messages.send(message(false)).await.unwrap();
+    step(&mut received, false)
+        .await
+        .send(Ok(json!({})))
+        .unwrap();
+    assert_eq!(refused.get(), 2 + routes);
+    drop(messages);
+    sender.await.unwrap();
 }
