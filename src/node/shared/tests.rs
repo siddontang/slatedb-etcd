@@ -1103,7 +1103,7 @@ async fn a_defragment_that_loses_the_lead_returns_a_retryable_error() {
     // The aged flush publishes a checkpoint with an L0 SST. The members adopt it.
     let id = announcements.next(Duration::from_secs(10), true).await;
     adopt_announced(&mut state, id).await;
-    let db = writer.open.lock().unwrap().clone().unwrap();
+    let db = writer.open.lock().unwrap().clone().unwrap().db;
     let reached = Arc::new(tokio::sync::Notify::new());
     let resume = Arc::new(tokio::sync::Notify::new());
     let defragment = Defragment {
@@ -1126,8 +1126,8 @@ async fn a_defragment_that_loses_the_lead_returns_a_retryable_error() {
     let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
     writer.sync(true, 4, &events);
     let db = loop {
-        if let Some(db) = writer.open.lock().unwrap().clone() {
-            break db;
+        if let Some(open) = writer.open.lock().unwrap().clone() {
+            break open.db;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
@@ -1206,7 +1206,7 @@ fn defragment(
     )>,
 ) -> Defragment {
     Defragment {
-        db: writer.open.lock().unwrap().clone().unwrap(),
+        db: writer.open.lock().unwrap().clone().unwrap().db,
         admin: handles.admin.clone(),
         progress: writer.progress.clone(),
         announced: handles.announced.clone(),

@@ -586,7 +586,7 @@ async fn a_defragment_survives_a_failed_publication() {
     let writer = leader.writer.as_ref().unwrap();
     let (reached, resume) = (Arc::default(), Arc::<tokio::sync::Notify>::default());
     let defragment = Defragment {
-        db: writer.open.lock().unwrap().clone().unwrap(),
+        db: writer.open.lock().unwrap().clone().unwrap().db,
         admin: leader.handles.admin.clone(),
         progress: writer.progress.clone(),
         announced: leader.handles.announced.clone(),
@@ -849,7 +849,7 @@ async fn a_stored_row_that_does_not_decode_halts_the_writer() {
     leader.lead(2);
     leader.covered(1, Duration::from_secs(10)).await;
     let writer = leader.writer();
-    let db = writer.open.lock().unwrap().clone().unwrap();
+    let db = writer.open.lock().unwrap().clone().unwrap().db;
     let mut batch = slatedb::WriteBatch::new();
     batch.put(crate::state::APPLIED, b"bad");
     db.write_with_options(batch, &WriteOptions { seqnum: 2 })
@@ -877,7 +877,7 @@ async fn an_idle_writer_that_slatedb_closes_opens_again() {
     leader.covered(1, Duration::from_secs(10)).await;
     let index = leader.put("idle").await;
     faults.set(FAIL_PUT);
-    let failed = leader.writer().open.lock().unwrap().clone().unwrap();
+    let failed = leader.writer().open.lock().unwrap().clone().unwrap().db;
     assert!(failed.flush().await.is_err());
     let health = leader.writer().health.clone();
     eventually("the writer fault", async || health.consecutive() > 0).await;
@@ -886,7 +886,7 @@ async fn an_idle_writer_that_slatedb_closes_opens_again() {
     leader.no_failure(Duration::from_secs(2)).await;
     faults.set(0);
     leader.covered(index, Duration::from_secs(20)).await;
-    let open = leader.writer().open.lock().unwrap().clone().unwrap();
+    let open = leader.writer().open.lock().unwrap().clone().unwrap().db;
     assert!(!Arc::ptr_eq(&open, &failed));
     assert!(health.report(2, None).failed_secs.is_none());
     leader.close().await;
@@ -1031,17 +1031,18 @@ async fn a_clock_wait_stalls_only_with_a_due_batch() {
     leader.close().await;
 }
 
-/// The writer clock of three voters is one hour behind the machine clock. A Defragment
-/// compaction takes its job ID from the writer clock, so the compactor of the writer accepts the
+/// The writer clock of three voters is one hour behind the machine clock. The writer task
+/// pauses just after it publishes its open writer. A Defragment that reads the slot then gets
+/// the `Db` together with an admin on its clock, and the compactor of the writer accepts the
 /// job and its outputs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_defragment_compaction_uses_the_writer_clock() {
+async fn a_defragment_gets_the_open_writer_with_its_clock() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let mut clock = clock();
     let machine = clock.now_ms.clone();
     clock.now_ms = Arc::new(move || machine() - 3_600_000);
-    let voters = [1, 2, 3].map(|id| (id, Some(id))).into_iter().collect();
-    clock.configure(2, 1, voters);
+    let voters = || [1, 2, 3].map(|id| (id, Some(id))).into_iter().collect();
+    clock.configure(2, 1, voters());
     // Both peers agree with the writer clock. Their samples stay fresh.
     let sampling = tokio::spawn({
         let clock = clock.clone();
@@ -1057,20 +1058,33 @@ async fn a_defragment_compaction_uses_the_writer_clock() {
                     };
                     clock.sample(peer, probe, reply, now, now);
                 }
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
     });
-    let mut leader = Leader::open(store, Duration::from_millis(100), clock).await;
+    let mut leader = Leader::open(store, Duration::from_millis(100), clock.clone()).await;
     leader.lead(2);
     leader.covered(1, Duration::from_secs(10)).await;
     leader.put("before").await;
-    let db = leader.writer().open.lock().unwrap().clone().unwrap();
+    leader.covered(2, Duration::from_secs(10)).await;
+    let events = leader.events.clone();
+    leader.writer().sync(false, 2, &events);
+    leader.writer().stop().await;
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    *leader.writer().open_hold.lock().unwrap() = Some((reached.clone(), resume.clone()));
+    clock.configure(3, 1, voters());
+    leader.writer().sync(true, 3, &events);
+    reached.notified().await;
+    let Some(Open { db, admin }) = leader.writer().open.lock().unwrap().clone() else {
+        panic!("the published writer has no slot");
+    };
     db.flush().await.unwrap();
-    let admin = leader.writer().compaction_admin();
     crate::state::maintenance::compact_all(&admin)
         .await
         .unwrap();
+    *leader.writer().open_hold.lock().unwrap() = None;
+    resume.notify_one();
     sampling.abort();
     leader.close().await;
 }
@@ -1808,7 +1822,7 @@ async fn a_replacement_writer_gets_a_fresh_interval_for_a_request() {
     writer.progress.request(through);
     writer.progress.inner.lock().unwrap().requested =
         Some(Instant::now() - STALL - Duration::from_secs(1));
-    let old = writer.open.lock().unwrap().clone().unwrap();
+    let old = writer.open.lock().unwrap().clone().unwrap().db;
     // The overdue request is a stall. Each tick of the node checks the stall and asks for the
     // restart, as for a stall with no target, until the task drops its step.
     let before = writer.health.consecutive();
@@ -1823,7 +1837,7 @@ async fn a_replacement_writer_gets_a_fresh_interval_for_a_request() {
     .await;
     let reopened = async || {
         let open = writer.open.lock().unwrap().clone();
-        open.is_some_and(|open| !Arc::ptr_eq(&open, &old))
+        open.is_some_and(|open| !Arc::ptr_eq(&open.db, &old))
     };
     eventually("the replacement writer", reopened).await;
     assert!(!writer.health.check(writer.waiting()));

@@ -260,8 +260,10 @@ pub(super) struct Writer {
     pub(super) retained: Option<prometheus::IntGauge>,
     /// The writer `Db` while this member leads.
     open: OpenWriter,
-    /// The SlateDB clock of that `Db`. Defragment submits its compaction with it.
-    open_gate: OpenGate,
+    /// Tests: the writer task notifies the first and waits for the second after it publishes
+    /// an open writer.
+    #[cfg(test)]
+    pub(super) open_hold: Hold,
     pub(super) gauges: Option<Gauges>,
     /// The highest manual checkpoint index that requested a publication after apply.
     checkpoint_requested: u64,
@@ -383,7 +385,8 @@ impl Writer {
             retention: crate::state::ViewRetention::Off,
             retained: None,
             open: OpenWriter::default(),
-            open_gate: OpenGate::default(),
+            #[cfg(test)]
+            open_hold: Hold::default(),
             gauges: None,
             checkpoint_requested: 0,
             remote_checkpoint: 0,
@@ -428,21 +431,6 @@ impl Writer {
 
     pub fn running(&self) -> bool {
         self.stop.is_some()
-    }
-
-    /// The admin that submits a Defragment compaction. SlateDB refuses a compaction job whose
-    /// ID time is below the newest job, and an output SST whose ID time is below its job. The
-    /// compactor of the writer takes both times from the writer clock, so the job takes its ID
-    /// from that clock too.
-    pub(super) fn compaction_admin(&self) -> Arc<slatedb::admin::Admin> {
-        match self.open_gate.lock().unwrap().clone() {
-            Some(gate) => Arc::new(
-                slatedb::admin::Admin::builder(self.source.state(), self.source.store.clone())
-                    .with_system_clock(gate)
-                    .build(),
-            ),
-            None => self.admin.clone(),
-        }
     }
 
     /// Open the writer on the leader of `term`. Close it on any other member.
@@ -495,7 +483,8 @@ impl Writer {
                 clock: self.clock.clone(),
                 reopens: self.reopens.clone(),
                 open: self.open.clone(),
-                open_gate: self.open_gate.clone(),
+                #[cfg(test)]
+                open_hold: self.open_hold.clone(),
                 health,
             },
         );
@@ -652,14 +641,29 @@ struct Leading {
     clock: Clock,
     reopens: Arc<std::sync::atomic::AtomicU64>,
     open: OpenWriter,
-    open_gate: OpenGate,
+    #[cfg(test)]
+    open_hold: Hold,
     health: fault::TaskHealth,
 }
 
-/// The writer `Db` while the writer task runs. Defragment flushes and compacts it.
-type OpenWriter = Arc<Mutex<Option<Arc<slatedb::Db>>>>;
-/// The SlateDB clock of the open writer `Db`.
-type OpenGate = Arc<Mutex<Option<Arc<clock::Gate>>>>;
+/// The writer `Db` while the writer task runs, with an admin on its SlateDB clock. Defragment
+/// flushes the `Db` and submits its compaction through the admin.
+///
+/// SlateDB refuses a compaction job whose ID time is below the newest job, and an output SST
+/// whose ID time is below its job. The compactor of the writer takes both times from the gate
+/// of the writer, so the job takes its ID from that gate too. One slot holds the pair, so no
+/// reader sees a `Db` without its admin.
+#[derive(Clone)]
+pub(super) struct Open {
+    pub(super) db: Arc<slatedb::Db>,
+    pub(super) admin: Arc<slatedb::admin::Admin>,
+}
+
+type OpenWriter = Arc<Mutex<Option<Open>>>;
+
+/// Tests: a pause of the writer task. See `Writer::open_hold`.
+#[cfg(test)]
+pub(super) type Hold = Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>;
 
 /// Wait until the member asks the writer task to stop. The result holds no borrow, so the task
 /// stays `Send` across later waits.
@@ -718,7 +722,8 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         clock,
         reopens,
         open,
-        open_gate,
+        #[cfg(test)]
+        open_hold,
         mut health,
     } = leading;
     let current = || *leadership.borrow() == (true, term);
@@ -840,8 +845,24 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         publisher.progress.reset(db.manifest().last_l0_seq());
         publisher.progress.rearm();
         publisher.db = Some(db.clone());
-        *open.lock().unwrap() = Some(db.clone());
-        *open_gate.lock().unwrap() = Some(gate.clone());
+        let admin = slatedb::admin::Admin::builder(
+            publisher.source.state(),
+            publisher.source.store.clone(),
+        )
+        .with_system_clock(gate.clone())
+        .build();
+        *open.lock().unwrap() = Some(Open {
+            db: db.clone(),
+            admin: Arc::new(admin),
+        });
+        #[cfg(test)]
+        {
+            let hold = open_hold.lock().unwrap().clone();
+            if let Some((reached, resume)) = hold {
+                reached.notify_one();
+                resume.notified().await;
+            }
+        }
         let progress = publisher.progress.clone();
         let running = async {
             tokio::select! {
@@ -853,9 +874,8 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         // A later task can own the slot already. Clear only this task's writer.
         {
             let mut slot = open.lock().unwrap();
-            if slot.as_ref().is_some_and(|open| Arc::ptr_eq(open, &db)) {
+            if slot.as_ref().is_some_and(|open| Arc::ptr_eq(&open.db, &db)) {
                 *slot = None;
-                *open_gate.lock().unwrap() = None;
             }
         }
         match outcome {
@@ -1436,13 +1456,14 @@ impl Node {
             return Ok(());
         }
         let writer = self.writer.as_ref().context("shared mode has no writer")?;
-        let Some(db) = writer.open.lock().unwrap().clone() else {
+        // The `Db` and the admin on its clock come as one pair, or the writer is not open.
+        let Some(Open { db, admin }) = writer.open.lock().unwrap().clone() else {
             let _ = response.send(Err(self.error("the shared writer is not open yet")));
             return Ok(());
         };
         let defragment = Defragment {
             db,
-            admin: writer.compaction_admin(),
+            admin,
             progress: writer.progress.clone(),
             announced: writer.applied.announced.clone(),
             leadership: writer.leadership.subscribe(),
