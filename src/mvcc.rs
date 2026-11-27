@@ -338,6 +338,30 @@ fn scan_options() -> slatedb::config::ScanOptions {
     }
 }
 
+/// The most bytes that one object-store read of a Range scan fetches ahead.
+const RANGE_READ_AHEAD: usize = 256 * 1024;
+/// The size of an SST block. A row takes at least one block's share of a read-ahead.
+const ROW_READ_AHEAD: usize = 4096;
+
+/// Scan options of a Range that reads at most `rows` rows, or every row of the interval with
+/// `None`.
+///
+/// By default SlateDB reads one block per object-store GET and starts the next GET only when
+/// the scan reaches that block. A 500-row page of 4-100 KiB rows then made about 500
+/// sequential GETs. Two reads of up to 256 KiB overlap with the scan instead. A scan never reads
+/// past the blocks of its interval, so only a limit cuts a read short. The read-ahead of a
+/// small limit stays near one block per row.
+fn range_scan_options(rows: Option<usize>) -> slatedb::config::ScanOptions {
+    let read_ahead = rows.map_or(RANGE_READ_AHEAD, |rows| {
+        rows.saturating_mul(ROW_READ_AHEAD).min(RANGE_READ_AHEAD)
+    });
+    slatedb::config::ScanOptions {
+        read_ahead_bytes: read_ahead.max(1),
+        max_fetch_tasks: if read_ahead > ROW_READ_AHEAD { 2 } else { 1 },
+        ..scan_options()
+    }
+}
+
 enum ReadDb<'a, R> {
     Live(&'a R),
     /// A pinned view at sequence `seq`. Its point reads share rows through the row cache.
@@ -417,8 +441,15 @@ impl<R: StateRead> ReadDb<'_, R> {
         }
     }
 
-    async fn scan(&self, range: std::ops::Range<Vec<u8>>) -> Result<R::Scan<'_>, slatedb::Error> {
-        self.scan_base()?.scan_range(range, &scan_options()).await
+    /// Scan `range` for at most `rows` rows, or for the whole interval with `None`.
+    async fn scan(
+        &self,
+        range: std::ops::Range<Vec<u8>>,
+        rows: Option<usize>,
+    ) -> Result<R::Scan<'_>, slatedb::Error> {
+        self.scan_base()?
+            .scan_range(range, &range_scan_options(rows))
+            .await
     }
 
     /// Return the last row of `range`, or `None` when the range is empty.
@@ -548,7 +579,7 @@ impl<R: StateRead> View<'_, R> {
             if bounds.is_empty() {
                 return Ok(rows);
             }
-            let mut scan = self.db.scan(bounds).await.map_err(KvError::storage)?;
+            let mut scan = self.db.scan(bounds, None).await.map_err(KvError::storage)?;
             while let Some(row) = scan.next().await.map_err(KvError::storage)? {
                 let kv = KeyValue::decode(row.value).map_err(KvError::storage)?;
                 if contains(&kv.key, key, end) {
@@ -638,7 +669,7 @@ impl<R: StateRead> View<'_, R> {
         let decode = |value: bytes::Bytes| Version::decode(value).map_err(KvError::storage);
         let mut scan = self
             .db
-            .scan(lower..upper.clone())
+            .scan(lower..upper.clone(), None)
             .await
             .map_err(KvError::storage)?;
         let mut next = scan.next().await.map_err(KvError::storage)?;
@@ -758,7 +789,7 @@ impl<R: StateRead> View<'_, R> {
             let mut scan = db
                 .scan_range(
                     crate::watch::key(revision + 1)..crate::watch::key(self.revision + 1),
-                    &scan_options(),
+                    &range_scan_options(None),
                 )
                 .await
                 .map_err(KvError::storage)?;
@@ -794,7 +825,11 @@ impl<R: StateRead> View<'_, R> {
             .map(|(key, _)| key.as_slice())
             .collect();
         let mut older = live.into_iter().peekable();
-        let mut scan = self.db.scan(bounds).await.map_err(KvError::storage)?;
+        let mut scan = self
+            .db
+            .scan(bounds, Some(keep))
+            .await
+            .map_err(KvError::storage)?;
         let mut current = None;
         while rows.len() < keep {
             if current.is_none() {
@@ -966,7 +1001,10 @@ impl<R: StateRead> View<'_, R> {
             return Ok(response);
         }
         let mut budget = self.row_budget;
-        let mut scan = self.db.scan(bounds).await.map_err(KvError::storage)?;
+        // A scan that stops after the limit reads ahead for `limit + 1` rows.
+        let rows = (r.limit > 0 && !full_scan)
+            .then(|| usize::try_from(r.limit).map_or(usize::MAX, |limit| limit.saturating_add(1)));
+        let mut scan = self.db.scan(bounds, rows).await.map_err(KvError::storage)?;
         while let Some(row) = scan.next().await.map_err(KvError::storage)? {
             response.count += 1;
             if r.count_only {
@@ -1548,4 +1586,29 @@ pub(crate) async fn revoke_keys(
     }
     batch.put(REVISION, next.to_be_bytes());
     Ok((batch, next, view.writes.deletes))
+}
+
+#[cfg(test)]
+mod read_ahead_tests {
+    use super::*;
+
+    #[test]
+    fn range_read_ahead_follows_the_rows_a_scan_may_read() {
+        let sized = |rows| {
+            let options = range_scan_options(rows);
+            (
+                options.read_ahead_bytes,
+                options.max_fetch_tasks,
+                options.cache_blocks,
+            )
+        };
+        // A whole interval reads ahead the most, with two reads in flight.
+        assert_eq!(sized(None), (RANGE_READ_AHEAD, 2, true));
+        // A small limit keeps about one block per row, so it fetches little past its rows.
+        assert_eq!(sized(Some(1)), (ROW_READ_AHEAD, 1, true));
+        assert_eq!(sized(Some(10)), (10 * ROW_READ_AHEAD, 2, true));
+        assert_eq!(sized(Some(501)), (RANGE_READ_AHEAD, 2, true));
+        assert_eq!(sized(Some(0)), (1, 1, true));
+        assert_eq!(sized(Some(usize::MAX)), (RANGE_READ_AHEAD, 2, true));
+    }
 }
