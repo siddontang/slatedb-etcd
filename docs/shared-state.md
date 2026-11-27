@@ -655,7 +655,10 @@ already started. SlateDB checks no writer epoch at a submission. A Defragment ch
 its writer before each submission. When a late job stands above the clock, SlateDB refuses the
 next ID and closes the `Db`. The writer recognises that refusal and opens again at once in the
 same term, above the job. This costs one reopen and no fault. After three such reopens in a row
-without a publication, the next refusal is a clock fault.
+without a publication, the next refusal is a clock fault. The refused job can stay `Running`
+for SlateDB's 30 s worker heartbeat timeout, and compaction waits for it. When L0 is at its limit,
+the next flush waits too, and it can reach the 30 s stall limit. That case ends as a `stalled`
+fault.
 When the clock is over `--max-clock-skew` (default 5 s) behind, the writer does not start. The
 member sets `clock_alarm` to `behind`, exports the lag as
 `slatedb_etcd_shared_clock_skew_milliseconds`, and counts a clock fault.
