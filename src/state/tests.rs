@@ -2,6 +2,7 @@ use super::*;
 use crate::proto::etcdserverpb::request_op::Request as Op;
 use crate::proto::etcdserverpb::response_op::Response as Resp;
 use crate::proto::etcdserverpb::{DeleteRangeRequest, PutRequest, RangeRequest};
+use slatedb::config::SizeTieredCompactionSchedulerOptions;
 
 fn put(key: &[u8], value: &[u8]) -> RequestOp {
     RequestOp {
@@ -1071,13 +1072,11 @@ fn slatedb_settings_bound_compaction_buffers() {
     assert_eq!(settings.max_unflushed_bytes, defaults.max_unflushed_bytes);
     assert_eq!(settings.l0_sst_size_bytes, defaults.l0_sst_size_bytes);
     let compactor = settings.compactor_options.as_ref().unwrap();
-    let sources = |key: &str| compactor.scheduler_options.get(key).map(String::as_str);
-    assert_eq!(
-        sources("min_compaction_sources"),
-        Some(MIN_COMPACTION_SOURCES.to_string().as_str())
-    );
-    // SlateDB's default of 8 sources per job bounds the read-ahead buffers of one job.
-    assert_eq!(sources("max_compaction_sources"), None);
+    // Parse the map as SlateDB does, so a changed SlateDB default fails here too.
+    let scheduler = SizeTieredCompactionSchedulerOptions::from(&compactor.scheduler_options);
+    assert_eq!(scheduler.min_compaction_sources, MIN_COMPACTION_SOURCES);
+    // At most 8 sources per job bound the read-ahead buffers of one job.
+    assert_eq!(scheduler.max_compaction_sources, 8);
     assert_eq!(settings.l0_max_ssts, 2 * MIN_COMPACTION_SOURCES);
     assert_eq!(settings.l0_max_ssts_per_key, 2 * MIN_COMPACTION_SOURCES);
     let worker = settings
