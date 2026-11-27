@@ -631,6 +631,79 @@ async fn empty_log_barriers_wait_for_prior_persistence_and_fail_closed() {
 }
 
 #[tokio::test]
+async fn a_slow_log_write_does_not_stop_leader_heartbeats() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    let (sender, mut messages) = mpsc::channel(1024);
+    node.senders.insert(2, sender);
+    let (tx, reply) = oneshot::channel();
+    node.propose(
+        RaftCommand::Lease {
+            origin: 1,
+            id: "slow-write".into(),
+            lease: LeaseCommand::List,
+        },
+        tx,
+    )
+    .unwrap();
+    // The manual log worker holds this write until the test steps it.
+    node.drive_ready().await.unwrap();
+    assert!(node.log_busy);
+    for tick in 0..2 * log::MAX_JOBS {
+        node.tick_raft().unwrap();
+        // A heartbeat response keeps the leader in its quorum check.
+        let mut response = Message::default();
+        response.set_msg_type(MessageType::MsgHeartbeatResponse);
+        response.from = 2;
+        response.to = 1;
+        response.term = node.raw.raft.term;
+        node.raw.step(response).unwrap();
+        node.drive_ready().await.unwrap();
+        let mut heartbeat = false;
+        while let Ok(message) = messages.try_recv() {
+            heartbeat |= message.get_msg_type() == MessageType::MsgHeartbeat;
+        }
+        assert!(heartbeat, "no heartbeat at tick {tick}");
+    }
+    assert_eq!(node.raw.raft.state, StateRole::Leader);
+    // The write, and then the empty Ready jobs as one job.
+    assert_eq!(node.log_queue.len(), 2);
+    let (tx, mut barrier) = oneshot::channel();
+    node.log_queue.back_mut().unwrap().responses.push(tx);
+    let (tx, later) = oneshot::channel();
+    node.propose(
+        RaftCommand::Lease {
+            origin: 1,
+            id: "later-write".into(),
+            lease: LeaseCommand::List,
+        },
+        tx,
+    )
+    .unwrap();
+    node.drive_ready().await.unwrap();
+    // A later write does not join the empty job, so the empty job does not wait for it.
+    assert_eq!(node.log_queue.len(), 3);
+    let completed = node.log_worker.step().unwrap().unwrap();
+    node.complete_log(completed).unwrap();
+    assert!(barrier.try_recv().unwrap().is_ok());
+    assert_eq!(node.log_queue.len(), 1);
+    node.drain_log().await.unwrap();
+    assert!(node.log_queue.is_empty());
+    let mut ack = Message::default();
+    ack.set_msg_type(MessageType::MsgAppendResponse);
+    ack.from = 2;
+    ack.to = 1;
+    ack.term = node.raw.raft.term;
+    ack.index = node.raw.store().last_index().unwrap();
+    node.raw.step(ack).unwrap();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    node.drain_apply().await.unwrap();
+    assert!(reply.await.unwrap().is_ok());
+    assert!(later.await.unwrap().is_ok());
+}
+
+#[tokio::test]
 async fn forwarded_revision_waits_for_apply_without_a_new_quorum_round() {
     let dir = tempfile::tempdir().unwrap();
     let mut node = leader_node(dir.path()).await;

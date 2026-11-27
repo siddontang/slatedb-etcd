@@ -83,6 +83,7 @@ impl Node {
             // Cached entries must be readable before Raft can advance without disk completion.
             self.raw.advance_append_async(ready);
             self.queue_log(job, Some(number), None, messages, reads);
+            self.join_queued_ready()?;
             // raft-rs permits leader replication before local persistence.
             self.send(early);
             for (peer, snapshot) in std::mem::take(&mut self.send_failures) {
@@ -161,12 +162,7 @@ impl Node {
             {
                 let mut task = self.log_queue.pop_front().unwrap();
                 let next = self.log_queue.pop_front().unwrap();
-                task.work.as_mut().unwrap().append(next.work.unwrap())?;
-                task.bytes += next.bytes;
-                task.ready = next.ready.or(task.ready);
-                task.messages.extend(next.messages);
-                task.reads.extend(next.reads);
-                task.responses.extend(next.responses);
+                join_log(&mut task, next)?;
                 self.log_queue.push_front(task);
             }
             if let Some(task) = self.log_queue.front_mut() {
@@ -188,6 +184,30 @@ impl Node {
                 })?;
                 self.log_busy = true;
             }
+        }
+        Ok(())
+    }
+
+    /// Join the last queued Ready job to the queued Ready job before it, as `start_log` would.
+    /// Thus Ready jobs behind a slow write use at most two queue slots, and the owner can take
+    /// each Ready and send its heartbeats. The joined job keeps its place, so it completes after
+    /// all earlier jobs. A job with disk work does not join an empty job before it: `start_log`
+    /// completes the empty job without a wait for that write.
+    fn join_queued_ready(&mut self) -> Result<()> {
+        let count = self.log_queue.len();
+        let joins = count >= 2
+            && match (
+                &self.log_queue[count - 2].work,
+                &self.log_queue[count - 1].work,
+            ) {
+                (Some(job), Some(next)) => {
+                    job.can_batch() && next.can_batch() && (next.is_barrier() || !job.is_barrier())
+                }
+                _ => false,
+            };
+        if joins {
+            let next = self.log_queue.pop_back().unwrap();
+            join_log(self.log_queue.back_mut().unwrap(), next)?;
         }
         Ok(())
     }
@@ -243,4 +263,14 @@ impl Node {
         }
         Ok(())
     }
+}
+
+fn join_log(task: &mut LogTask, next: LogTask) -> Result<()> {
+    task.work.as_mut().unwrap().append(next.work.unwrap())?;
+    task.bytes += next.bytes;
+    task.ready = next.ready.or(task.ready);
+    task.messages.extend(next.messages);
+    task.reads.extend(next.reads);
+    task.responses.extend(next.responses);
+    Ok(())
 }

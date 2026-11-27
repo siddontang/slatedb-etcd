@@ -256,6 +256,8 @@ A FIFO worker persists Ready updates, checkpoint publication, and log reclamatio
 The worker reads disk statistics only for an explicit `/debug/log-stats` request.
 Empty Ready jobs complete on the owner after all earlier jobs finish. They do no disk work.
 Adjacent queued Ready jobs share one durable write without a batching timer.
+A Ready job joins the queued Ready job before it when it is queued. Thus Ready jobs behind a
+slow write use at most two queue slots. A job with disk work does not join an empty job before it.
 The batch keeps the final HardState and log suffix, including overwritten entries.
 Entries, snapshots, terms, and votes require a device sync. Commit-only updates do not.
 On restart, flushed state can prove commit progress that a lost commit marker did not retain.
@@ -340,6 +342,8 @@ A result window serves entries that cannot fit the history cache.
 The owner resumes Raft with `on_entries_fetched` after completion.
 Other misses retry through Raft while the single fetch slot is occupied.
 Slow reads share the FIFO disk worker with writes, but do not stop Raft ticks or heartbeat handling.
+The owner takes no Ready while the queue holds 64 jobs, 16 MiB of entries, or 64 MiB of
+snapshots. Ready jobs alone do not fill the 64 job slots. The byte limits can stop heartbeats.
 
 Each fetch carries a cache generation. Overwrite, compaction, and snapshot replacement advance it.
 The owner discards results from old generations before they can enter the cache.
