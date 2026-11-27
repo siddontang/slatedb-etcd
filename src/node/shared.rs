@@ -1167,7 +1167,13 @@ impl Node {
         self.tick_writer_health();
         let (base, _, bytes) = self.state.view;
         let leader = self.raw.raft.state == StateRole::Leader;
-        let ticks = self.writer.tick(leader, self.state.applied, base, bytes);
+        let ticks = self.writer.tick(
+            leader,
+            self.state.applied,
+            self.committed_ready,
+            base,
+            bytes,
+        );
         // A follower repeats the request of a waiting manual checkpoint.
         if !leader && ticks.is_multiple_of(RETRY_TICKS) {
             if let Some(index) = self

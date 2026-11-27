@@ -486,8 +486,16 @@ impl Writer {
 
     /// Count a node tick. Set the gauges with the base index `base` and the overlay size
     /// `bytes`, request the publication of a follower's manual checkpoint on the leader, and
-    /// poll the checkpoints while apply waits. Return the tick count.
-    pub(super) fn tick(&mut self, leader: bool, applied: u64, base: u64, bytes: u64) -> u64 {
+    /// poll the checkpoints while apply waits. `committed` is the delivered commit index. Return
+    /// the tick count.
+    pub(super) fn tick(
+        &mut self,
+        leader: bool,
+        applied: u64,
+        committed: u64,
+        base: u64,
+        bytes: u64,
+    ) -> u64 {
         self.ticks += 1;
         let ticks = self.ticks;
         if let Some(gauges) = &self.gauges {
@@ -514,14 +522,17 @@ impl Writer {
             }
         }
         if ticks.is_multiple_of(POLL_TICKS) && self.paused {
-            self.poll_checkpoints(base);
+            self.poll_checkpoints(base, committed);
         }
         ticks
     }
 
     /// While apply waits, open the newest checkpoint above the base out of band. A switch job
     /// then releases the segments that it covers, including the open one.
-    fn poll_checkpoints(&self, base: u64) {
+    ///
+    /// The member can adopt only a checkpoint at or below the delivered commit `committed`. So
+    /// the poll skips a newer one, and a later poll opens it after the commit reaches it.
+    fn poll_checkpoints(&self, base: u64, committed: u64) {
         if self.polling.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
@@ -531,7 +542,8 @@ impl Writer {
         let opened = self.opened_slot.clone();
         tokio::spawn(async move {
             let result = async {
-                let Some((seq, checkpoint)) = view_checkpoints(&admin).await?.pop() else {
+                let mut views = view_checkpoints(&admin).await?.into_iter();
+                let Some((seq, checkpoint)) = views.rfind(|(seq, _)| *seq <= committed) else {
                     return anyhow::Ok(());
                 };
                 if seq > base {
@@ -545,6 +557,14 @@ impl Writer {
             }
             polling.store(false, std::sync::atomic::Ordering::Release);
         });
+    }
+
+    /// Tests: wait until the running checkpoint poll ends.
+    #[cfg(test)]
+    pub(in crate::node) async fn polled(&self) {
+        while self.polling.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
     }
 
     /// The writer report of this member in `term`. See `Health::report`.
