@@ -77,15 +77,16 @@ impl Node {
                     .any(|(index, _)| *index <= applied));
         // Automatic checkpoints only truncate the local log. A membership change needs a
         // checkpoint at its index.
+        // A membership checkpoint does not wait for a lagging follower: a new member needs it.
         let forced = self.membership_checkpoint;
         let truncate_due = ((forced > snapshot_index && applied >= forced)
             || (self.next_checkpoint.is_some_and(|index| applied >= index)
-                && self.appended_bytes >= self.options.snapshot_min_bytes))
+                && self.appended_bytes >= self.options.snapshot_min_bytes
+                && !self.follower_needs_log(applied, snapshot_index)))
             && applied > snapshot_index
             && !store.image_wanted()
             && self.checkpoint_waiters.is_empty()
-            && !self.sending_snapshot()
-            && !self.follower_needs_log(applied);
+            && !self.sending_snapshot();
         (image_due || truncate_due).then_some(image_due)
     }
 
@@ -93,12 +94,17 @@ impl Node {
     /// entries. Truncation through `base` would send that follower a snapshot, and its install
     /// loads the whole key index from the checkpoint. A follower further behind does not hold
     /// the log. A new member stored no entry, and it needs a record that holds it.
-    fn follower_needs_log(&self, base: u64) -> bool {
+    ///
+    /// The hold ends when `base` is more than two `snapshot_every` intervals above the `record`
+    /// index, so it delays a truncation by at most one interval. A follower that stays a few
+    /// entries behind a moving base then cannot hold the log for ever.
+    fn follower_needs_log(&self, base: u64, record: u64) -> bool {
         let raft = &self.raw.raft;
+        let every = self.options.snapshot_every;
         raft.state == StateRole::Leader
+            && base - record <= 2 * every
             && raft.prs().iter().any(|(_, progress)| {
-                (1..base).contains(&progress.matched)
-                    && base - progress.matched <= self.options.snapshot_every
+                (1..base).contains(&progress.matched) && base - progress.matched <= every
             })
     }
 

@@ -1857,3 +1857,48 @@ async fn a_follower_a_few_entries_behind_the_base_catches_up_from_the_log() {
     assert_eq!(node.installed_snapshots, 0);
     assert!(sim.nodes[&leader].raw.store().snapshot_index() >= base);
 }
+
+/// #109: a follower stays a few entries behind a moving base, because its append responses
+/// come late. The leader must still truncate. The hold delays a truncation by at most one
+/// `snapshot_every` interval.
+#[tokio::test]
+async fn a_follower_that_stays_behind_does_not_hold_the_log_for_ever() {
+    let mut sim = Simulation::new(43).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(3).await;
+    let leader = sim.leader().unwrap();
+    let member = sim.follower(0);
+    let initial = sim.nodes[&leader].raw.store().snapshot_index();
+    let mut cap = sim.nodes[&leader]
+        .raw
+        .raft
+        .prs()
+        .get(member)
+        .unwrap()
+        .matched;
+    let mut writers = BTreeMap::new();
+    for _ in 0..20 {
+        sim.ack_limit = Some((member, cap));
+        sim.messages.append(&mut sim.delayed);
+        sim.write(3).await;
+        sim.publish_view(&mut writers).await;
+        sim.settle(3).await;
+        let node = &sim.nodes[&leader];
+        let base = node.checkpointable();
+        let matched = node.raw.raft.prs().get(member).unwrap().matched;
+        let record = node.raw.store().snapshot_index();
+        let every = node.options.snapshot_every;
+        assert!(
+            base > matched && base - matched <= every,
+            "base {base} matched {matched}"
+        );
+        assert!(base - record <= 2 * every, "base {base} record {record}");
+        cap = base - 1;
+    }
+    // The leader truncated while the follower still lagged.
+    assert!(sim.nodes[&leader].raw.store().snapshot_index() > initial);
+    sim.ack_limit = None;
+    sim.messages.append(&mut sim.delayed);
+    sim.settle(8).await;
+}
