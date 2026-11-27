@@ -645,8 +645,17 @@ the writer clock near the voter clocks.
 
 **Behind.** The floor of a new writer is the latest of `last_l0_clock_tick`, the time of the
 newest L0 SST ID, and the time of the newest compaction job ID. The writer reads it before its
-open and starts its clock there, because the compactor of the new `Db` takes job IDs at once.
-Step 4 of the leader change waits until the local clock passes the floor.
+open, checks its clock against it, and only then starts its clock there and opens. The compactor
+of the new `Db` takes job IDs at once. Step 4 of the leader change waits again for the floor of
+the opened manifest.
+
+Three writers can still add a job record after that read: the compactor of the old writer,
+which only the new compactor fences, the new compactor, and a Defragment that a submission
+already started. SlateDB checks no writer epoch at a submission. A Defragment checks the term of
+its writer before each submission. When a late job stands above the clock, SlateDB refuses the
+next ID and closes the `Db`. The writer recognises that refusal and opens again at once in the
+same term, above the job. This costs one reopen and no fault. After three such reopens in a row
+without a publication, the next refusal is a clock fault.
 When the clock is over `--max-clock-skew` (default 5 s) behind, the writer does not start. The
 member sets `clock_alarm` to `behind`, exports the lag as
 `slatedb_etcd_shared_clock_skew_milliseconds`, and counts a clock fault.
