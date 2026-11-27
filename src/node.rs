@@ -315,15 +315,11 @@ pub struct Node {
     backlog_rejects: [u64; 5],
     // `REQUEST_TIMEOUT`. Tests that are slow by design raise it.
     request_timeout: Duration,
-    lease_term: u64,
-    lease_deadlines: BTreeMap<i64, (u64, Instant)>,
-    lease_expiring: BTreeSet<(i64, u64)>,
     compact_step: Option<(u64, u64)>,
     compact_ready_at: Option<Instant>,
     compact_plan: compaction::PlanReady,
-    lease_view: Option<std::sync::Arc<BTreeMap<i64, crate::lease::LeaseRecord>>>,
-    /// Whether this leader term has built its lease deadlines.
-    lease_promoted: bool,
+    /// The leader's lease deadlines and its Expire proposals. See `lease::clock`.
+    lease_clock: lease::clock::LeaseClock,
     renewals: lease::Renewals,
     /// The leader writer of the shared state.
     writer: shared::Writer,
@@ -644,14 +640,10 @@ impl Node {
             checkpoints: checkpoint::Checkpointer::new(next_checkpoint),
             backlog_rejects: [0; 5],
             request_timeout: REQUEST_TIMEOUT,
-            lease_term: 0,
-            lease_deadlines: BTreeMap::new(),
-            lease_expiring: BTreeSet::new(),
             compact_step: None,
             compact_ready_at: None,
             compact_plan,
-            lease_view: None,
-            lease_promoted: false,
+            lease_clock: lease::clock::LeaseClock::new(),
             renewals: lease::Renewals::default(),
             writer,
             members_proposed: None,

@@ -335,7 +335,7 @@ impl Node {
                         self.prune_write_proofs();
                     }
                     if let Some(LeaseCommand::Expire { id, generation }) = command.lease {
-                        self.lease_expiring.remove(&(id, generation));
+                        self.lease_clock.expired(id, generation);
                     }
                     match command.reply {
                         Reply::PhysicalCompact {
@@ -370,13 +370,10 @@ impl Node {
                                 if let Ok(response) = &mut outcome.result {
                                     if let LeaseReply::TimeToLive(response) = response {
                                         if response.ttl >= 0 {
-                                            if let Some((_, deadline)) =
-                                                self.lease_deadlines.get(&response.id)
+                                            if let Some(ttl) =
+                                                self.lease_clock.remaining_secs(response.id)
                                             {
-                                                response.ttl = deadline
-                                                    .saturating_duration_since(Instant::now())
-                                                    .as_secs()
-                                                    as i64;
+                                                response.ttl = ttl;
                                             }
                                         }
                                     }
