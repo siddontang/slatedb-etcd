@@ -8,6 +8,11 @@ use raft::GetEntriesContext;
 pub(super) const MAX_JOBS: usize = 64;
 pub(super) const MAX_BYTES: usize = 16 * 1024 * 1024;
 pub(super) const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+/// The owner takes no Ready while this many wait for persistence. Joined jobs keep one Ready
+/// number, but raft-rs keeps a 56-byte record for each Ready until `on_persist_ready`. With
+/// one heartbeat Ready for each 100 ms tick, the limit is 102 s behind a slow write. Other
+/// work also makes Readys, so the limit does not set a time.
+pub(super) const MAX_READYS: usize = 1024;
 
 pub(super) struct Durable {
     pub hard_state: HardState,

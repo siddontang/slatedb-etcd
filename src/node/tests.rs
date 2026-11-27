@@ -650,20 +650,10 @@ async fn a_slow_log_write_does_not_stop_leader_heartbeats() {
     node.drive_ready().await.unwrap();
     assert!(node.log_busy);
     for tick in 0..2 * log::MAX_JOBS {
-        node.tick_raft().unwrap();
-        // A heartbeat response keeps the leader in its quorum check.
-        let mut response = Message::default();
-        response.set_msg_type(MessageType::MsgHeartbeatResponse);
-        response.from = 2;
-        response.to = 1;
-        response.term = node.raw.raft.term;
-        node.raw.step(response).unwrap();
-        node.drive_ready().await.unwrap();
-        let mut heartbeat = false;
-        while let Ok(message) = messages.try_recv() {
-            heartbeat |= message.get_msg_type() == MessageType::MsgHeartbeat;
-        }
-        assert!(heartbeat, "no heartbeat at tick {tick}");
+        assert!(
+            tick_leader(&mut node, &mut messages).await,
+            "no heartbeat at tick {tick}"
+        );
     }
     assert_eq!(node.raw.raft.state, StateRole::Leader);
     // The write, and then the empty Ready jobs as one job.
@@ -701,6 +691,136 @@ async fn a_slow_log_write_does_not_stop_leader_heartbeats() {
     node.drain_apply().await.unwrap();
     assert!(reply.await.unwrap().is_ok());
     assert!(later.await.unwrap().is_ok());
+}
+
+/// Tick the leader with a heartbeat response from peer 2, and tell if a heartbeat went out.
+async fn tick_leader(node: &mut Node, messages: &mut mpsc::Receiver<Message>) -> bool {
+    node.tick_raft().unwrap();
+    // A heartbeat response keeps the leader in its quorum check.
+    let mut response = Message::default();
+    response.set_msg_type(MessageType::MsgHeartbeatResponse);
+    response.from = 2;
+    response.to = 1;
+    response.term = node.raw.raft.term;
+    node.raw.step(response).unwrap();
+    node.drive_ready().await.unwrap();
+    let mut heartbeat = false;
+    while let Ok(message) = messages.try_recv() {
+        heartbeat |= message.get_msg_type() == MessageType::MsgHeartbeat;
+    }
+    heartbeat
+}
+
+#[tokio::test]
+async fn ready_records_behind_a_slow_log_write_are_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    let (sender, mut messages) = mpsc::channel(1024);
+    node.senders.insert(2, sender);
+    let (tx, _reply) = oneshot::channel();
+    node.propose(
+        RaftCommand::Lease {
+            origin: 1,
+            id: "slow-write".into(),
+            lease: LeaseCommand::List,
+        },
+        tx,
+    )
+    .unwrap();
+    node.drive_ready().await.unwrap();
+    assert!(node.log_busy);
+    let readys = |node: &Node| node.log_queue.iter().map(|task| task.readys).sum::<usize>();
+    let mut ticks = 0;
+    while tick_leader(&mut node, &mut messages).await {
+        ticks += 1;
+        assert!(readys(&node) <= log::MAX_READYS);
+    }
+    // The write is one Ready, and each tick is one more.
+    assert_eq!(ticks, log::MAX_READYS - 1);
+    for _ in 0..log::MAX_JOBS {
+        assert!(!tick_leader(&mut node, &mut messages).await);
+        assert_eq!(readys(&node), log::MAX_READYS);
+        assert!(node.raw.has_ready());
+    }
+    assert_eq!(node.raw.raft.state, StateRole::Leader);
+    let completed = node.log_worker.step().unwrap().unwrap();
+    node.complete_log(completed).unwrap();
+    assert!(node.log_queue.is_empty());
+    assert!(tick_leader(&mut node, &mut messages).await);
+}
+
+#[tokio::test]
+async fn follower_responses_wait_for_their_write_and_count_as_queued_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_log(dir.path(), 1);
+    let (events, _) = mpsc::channel(256);
+    let mut node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    let (sender, mut messages) = mpsc::channel(1024);
+    node.senders.insert(2, sender);
+    let leader = |kind: MessageType| {
+        let mut message = Message::default();
+        message.set_msg_type(kind);
+        message.from = 2;
+        message.to = 1;
+        message.term = 2;
+        message.commit = 1;
+        message
+    };
+    let append = |index: u64| {
+        let mut message = leader(MessageType::MsgAppend);
+        message.index = index - 1;
+        message.log_term = if index == 2 { 1 } else { 2 };
+        message.entries.push(Entry {
+            index,
+            term: 2,
+            ..Default::default()
+        });
+        message
+    };
+    let mut sent = |kind: MessageType| {
+        let mut found = vec![];
+        while let Ok(message) = messages.try_recv() {
+            if message.get_msg_type() == kind {
+                found.push(message.index);
+            }
+        }
+        found
+    };
+    // The worker holds the write of entry 2. Entry 4 joins the queued write of entry 3.
+    for index in 2..=4 {
+        node.raw.step(append(index)).unwrap();
+        node.drive_ready().await.unwrap();
+    }
+    assert_eq!(node.log_queue.len(), 2);
+    // The responses wait with the write of entry 4 and count as its bytes.
+    for _ in 0..=log::MAX_BYTES >> 20 {
+        let mut heartbeat = leader(MessageType::MsgHeartbeat);
+        heartbeat.context = vec![0; 1 << 20];
+        node.raw.step(heartbeat).unwrap();
+        node.drive_ready().await.unwrap();
+    }
+    assert_eq!(node.log_queue.len(), 2);
+    assert!(node.log_bytes >= log::MAX_BYTES);
+    assert!(node.raw.has_ready());
+    assert!(sent(MessageType::MsgAppendResponse).is_empty());
+    assert_eq!(node.raw.raft.raft_log.persisted, 1);
+    // Each response waits for the write that makes its entries durable.
+    let completed = node.log_worker.step().unwrap().unwrap();
+    node.complete_log(completed).unwrap();
+    assert_eq!(node.raw.raft.raft_log.persisted, 2);
+    assert_eq!(sent(MessageType::MsgAppendResponse), [2]);
+    let completed = node.log_worker.step().unwrap().unwrap();
+    node.complete_log(completed).unwrap();
+    assert_eq!(node.raw.raft.raft_log.persisted, 4);
+    assert_eq!(sent(MessageType::MsgAppendResponse), [3, 4]);
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    assert!(node.log_queue.is_empty());
+    assert_eq!(node.log_bytes, 0);
 }
 
 #[tokio::test]
