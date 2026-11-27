@@ -91,7 +91,7 @@ async fn reopen_cold(state: StateMachine) -> StateMachine {
     drop(checkpoint(&state, &writer, &mut 0).await);
     writer.close().await.unwrap();
     state.close().await.unwrap();
-    open_cold(state.shared.as_ref().unwrap().source.store.clone()).await
+    open_cold(state.shared.source.store.clone()).await
 }
 
 async fn hash(state: &mut StateMachine) -> Value {
@@ -576,7 +576,7 @@ async fn base_hold(fault: BaseFault) {
     behind.apply_etcd(1, &large("k1")).await.unwrap();
     let id = base.checkpoint.unwrap();
     drop(base);
-    let source = behind.shared.as_ref().unwrap().source.clone();
+    let source = behind.shared.source.clone();
     source.receive(id).await.unwrap();
     let mut snapshot = Snapshot::default();
     snapshot.mut_metadata().index = 4;
@@ -780,7 +780,7 @@ async fn install_keeps_its_base(end: InstallEnd) {
         .checkpoint
         .unwrap();
     behind.apply_etcd(1, &large("k1")).await.unwrap();
-    let source = behind.shared.as_ref().unwrap().source.clone();
+    let source = behind.shared.source.clone();
     source.receive(id).await.unwrap();
     let mut snapshot = Snapshot::default();
     snapshot.mut_metadata().index = 4;

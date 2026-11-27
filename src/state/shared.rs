@@ -1105,7 +1105,13 @@ async fn open_once(source: Arc<Source>, opened: Arc<Opened>, id: uuid::Uuid, cov
 }
 
 impl Shared {
-    fn new(base: Arc<Base>, source: Arc<Source>, store_id: uuid::Uuid, options: &Options) -> Self {
+    pub(super) fn new(
+        base: Arc<Base>,
+        source: Arc<Source>,
+        store_id: uuid::Uuid,
+        pin_max: Duration,
+        holders: Arc<super::overlay::Holders>,
+    ) -> Self {
         Self {
             store_id,
             overlay: Overlay::new(base.applied),
@@ -1121,8 +1127,8 @@ impl Shared {
             extensions: 0,
             retry_opens: true,
             pending: Arc::default(),
-            pin_max: options.pin_max,
-            holders: Arc::new(super::overlay::Holders::new(options.overlay_max_bytes)),
+            pin_max,
+            holders,
         }
     }
 
@@ -1358,10 +1364,16 @@ impl StateMachine {
             }
             _ => base,
         };
-        let shared = Shared::new(base, source, claimed.store_id, options);
-        let holders = shared.holders.clone();
+        let holders = Arc::new(super::overlay::Holders::new(options.overlay_max_bytes));
+        let shared = Shared::new(
+            base,
+            source,
+            claimed.store_id,
+            options.pin_max,
+            holders.clone(),
+        );
         let reads = shared.live();
-        let mut state = Self::load(admin, location, rows, reads, Some(shared)).await?;
+        let mut state = Self::load(admin, location, rows, reads, shared).await?;
         holders.register(&state.metrics.registry)?;
         // The state loads at the row, so its counter and term rows match. The record gives the
         // index and the term of the extension.
@@ -1378,15 +1390,15 @@ impl StateMachine {
         Ok(state)
     }
 
-    /// The ID of the shared store, in shared state mode.
-    pub(crate) fn store_id(&self) -> Option<uuid::Uuid> {
-        Some(self.shared.as_ref()?.store_id)
+    /// The ID of the shared store.
+    pub(crate) fn store_id(&self) -> uuid::Uuid {
+        self.shared.store_id
     }
 
-    /// The handles of the node, in shared mode.
-    pub(crate) fn shared_handles(&self) -> Option<Handles> {
-        let shared = self.shared.as_ref()?;
-        Some(Handles {
+    /// The handles of the node.
+    pub(crate) fn shared_handles(&self) -> Handles {
+        let shared = &self.shared;
+        Handles {
             admin: self.admin.clone(),
             queue: shared.overlay.queue(),
             source: shared.source.clone(),
@@ -1394,7 +1406,7 @@ impl StateMachine {
             announced: shared.announced.subscribe(),
             base_id: shared.base_id.subscribe(),
             opened: shared.opened.clone(),
-        })
+        }
     }
 
     /// Apply a `ViewCheckpoint` entry. It changes no etcd state and writes no batch.
@@ -1408,11 +1420,13 @@ impl StateMachine {
         checkpoint: &str,
         covers: u64,
     ) -> Result<()> {
-        let Some(shared) = &mut self.shared else {
-            // The in-memory state of a test stores only the apply position.
+        // The in-memory state of a test stores only the apply position.
+        #[cfg(test)]
+        if let StateView::Memory(_) = &self.reads {
             self.apply(index, None).await?;
             return Ok(());
-        };
+        }
+        let shared = &mut self.shared;
         ensure!(
             index == self.applied + 1,
             "non-contiguous state machine apply"
@@ -1430,18 +1444,13 @@ impl StateMachine {
     /// Set whether a failed open of an announced checkpoint tries again. A manual apply, such
     /// as DST, turns this off to keep its schedule exact.
     pub(crate) fn set_open_retries(&mut self, retry: bool) {
-        if let Some(shared) = &mut self.shared {
-            shared.retry_opens = retry;
-        }
+        self.shared.retry_opens = retry;
     }
 
     /// Wait for the background opens of announced checkpoints. Return true if one ran.
     #[cfg(test)]
     pub(crate) async fn settle_opens(&mut self) -> bool {
-        let Some(shared) = &mut self.shared else {
-            return false;
-        };
-        let opening = std::mem::take(&mut shared.opening);
+        let opening = std::mem::take(&mut self.shared.opening);
         let any = !opening.is_empty();
         for task in opening {
             let _ = task.await;
@@ -1451,12 +1460,11 @@ impl StateMachine {
 
     /// Use a base that finished opening. Apply calls this before each job.
     pub(crate) fn switch_base(&mut self) {
-        if let Some(shared) = &mut self.shared {
-            if shared.switch() {
-                self.reads = shared.live();
-                // The warm of the new base pruned the set while the old base was still live.
-                shared.source.prune_warmed();
-            }
+        let shared = &mut self.shared;
+        if shared.switch() {
+            self.reads = shared.live();
+            // The warm of the new base pruned the set while the old base was still live.
+            shared.source.prune_warmed();
         }
     }
 
@@ -1465,7 +1473,7 @@ impl StateMachine {
     /// of this checkpoint says so. `term` is the Raft term at `index`. The derived state loaded
     /// at `F`, so its counter rows match the base. Only the position and the term change.
     pub(crate) fn extend_base(&mut self, index: u64, term: u64) -> Result<()> {
-        let shared = self.shared.as_mut().context("not in shared state mode")?;
+        let shared = &mut self.shared;
         ensure!(
             self.applied == shared.base.applied && shared.overlay.queue().pushed() == self.applied,
             "only a base without overlay batches can extend"
@@ -1488,7 +1496,7 @@ impl StateMachine {
     pub(crate) async fn base_snapshot(
         &self,
     ) -> Result<Option<(u64, Vec<u8>, raft::eraftpb::ConfState)>> {
-        let shared = self.shared.as_ref().context("not in shared state mode")?;
+        let shared = &self.shared;
         let Some(id) = shared.base.checkpoint else {
             return Ok(None);
         };
@@ -1514,28 +1522,28 @@ impl StateMachine {
     /// Opens and installs that raised a base above its row.
     #[cfg(test)]
     pub(crate) fn extensions(&self) -> u64 {
-        self.shared.as_ref().map_or(0, |shared| shared.extensions)
+        self.shared.extensions
     }
 
     /// Offer `base` for a switch through `covers`, as if an announcement certified it there. A
     /// test switches a member to a wrong base with this.
     #[cfg(test)]
     pub(crate) fn offer_base(&self, base: Arc<Base>, covers: u64) {
-        self.shared.as_ref().unwrap().opened.offer(base, covers);
+        self.shared.opened.offer(base, covers);
     }
 
     /// The checkpoint of the base, if any.
     pub(crate) fn base_checkpoint(&self) -> Option<uuid::Uuid> {
-        self.shared.as_ref()?.base.checkpoint
+        self.shared.base.checkpoint
     }
 
-    /// The base index, the applied announcements, and the overlay bytes, in shared mode.
-    pub(crate) fn view_status(&self) -> Option<(u64, u64, u64)> {
-        let shared = self.shared.as_ref()?;
-        Some((
+    /// The base index, the applied announcements, and the overlay bytes.
+    pub(crate) fn view_status(&self) -> (u64, u64, u64) {
+        let shared = &self.shared;
+        (
             shared.base_index,
             shared.announcements,
             shared.overlay.bytes(),
-        ))
+        )
     }
 }

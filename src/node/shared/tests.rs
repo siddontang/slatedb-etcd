@@ -442,7 +442,7 @@ async fn a_fenced_leader_opens_its_writer_again() {
         &[(1, "127.0.0.1:1".to_owned())].into(),
     ));
     state.seed_for_test(1).await.unwrap();
-    let handles = state.shared_handles().unwrap();
+    let handles = state.shared_handles();
     let (events, mut announced) = mpsc::channel(64);
     let clock = Clock::system(Duration::from_secs(5), None);
     let mut writer = Writer::new(&handles, Duration::from_millis(50), clock);
@@ -564,7 +564,7 @@ pub(super) async fn stranded_checkpoint_on(
         &[(1, "127.0.0.1:1".to_owned())].into(),
     ));
     state.seed_for_test(1).await.unwrap();
-    let handles = state.shared_handles().unwrap();
+    let handles = state.shared_handles();
     let (events, received) = mpsc::channel(64);
     let mut announcements = Announcements(received);
     let mut first = Writer::new(&handles, STRANDED_AGE, clock());
@@ -669,7 +669,7 @@ async fn a_failed_base_open_is_retried_on_an_idle_member() {
         &[(1, "127.0.0.1:1".to_owned())].into(),
     ));
     state.seed_for_test(1).await.unwrap();
-    let handles = state.shared_handles().unwrap();
+    let handles = state.shared_handles();
     let (events, received) = mpsc::channel(64);
     let mut announcements = Announcements(received);
     let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
@@ -729,7 +729,7 @@ async fn the_base_advances_under_a_stream_of_announcements() {
         &[(1, "127.0.0.1:1".to_owned())].into(),
     ));
     state.seed_for_test(1).await.unwrap();
-    let handles = state.shared_handles().unwrap();
+    let handles = state.shared_handles();
     let (events, received) = mpsc::channel(64);
     let mut announcements = Announcements(received);
     let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
@@ -848,7 +848,7 @@ async fn a_new_writer_announces_a_same_index_checkpoint() {
     let compacted = announcements.next(Duration::from_secs(5), true).await;
     assert_ne!(compacted, first);
     let base = handles.source.open_base(compacted).await.unwrap();
-    assert_eq!(base.applied, state.shared.as_ref().unwrap().base.applied);
+    assert_eq!(base.applied, state.shared.base.applied);
     drop(base);
     second.sync(false, 3, &events);
     second.stop().await;
@@ -910,7 +910,7 @@ async fn ordinary(store: Arc<dyn ObjectStore>) -> (StateMachine, Handles) {
     state.members = Arc::new(crate::cluster::Store::initial(
         &[(1, "127.0.0.1:1".to_owned())].into(),
     ));
-    let handles = state.shared_handles().unwrap();
+    let handles = state.shared_handles();
     (state, handles)
 }
 
@@ -1367,24 +1367,22 @@ async fn an_old_term_task_end_is_not_a_failure() {
     )
     .await
     .unwrap();
-    let handles = state.shared_handles().unwrap();
+    let handles = state.shared_handles();
     let (events, _announced) = mpsc::channel(64);
     let clock = Clock::system(Duration::from_secs(5), None);
-    let mut writer = Some(Writer::new(&handles, Duration::from_millis(50), clock));
-    let leader = writer.as_mut().unwrap();
+    let mut leader = Writer::new(&handles, Duration::from_millis(50), clock);
     leader.sync(true, 2, &events);
     leader.sync(false, 2, &events);
     leader.sync(true, 3, &events);
     let failure = tokio::time::timeout(Duration::from_millis(500), async {
         loop {
-            if let WriterEvent::Failed(error) = next(&mut writer).await {
+            if let WriterEvent::Failed(error) = next(&mut leader).await {
                 return error;
             }
         }
     })
     .await;
     assert!(failure.is_err(), "{failure:?}");
-    let mut leader = writer.unwrap();
     leader.sync(false, 3, &events);
     leader.stop().await;
     state.apply(1, None).await.unwrap();
@@ -1510,12 +1508,12 @@ async fn a_dropped_base_is_reported_until_the_pause_ends() {
     assert_eq!(report(&node)["failures"], 1);
     // The overlay stays above the soft limit: the member still waits, and the report stays.
     let limit = node.options.overlay_max_bytes;
-    node.writer.as_mut().unwrap().paused = true;
-    node.state.view = Some((1, 1, limit + 1));
+    node.writer.paused = true;
+    node.state.view = (1, 1, limit + 1);
     assert!(node.apply_paused());
     assert_eq!(report(&node)["failures"], 1);
     // An install or an adoption frees the overlay. The pause ends, and so does the report.
-    node.state.view = Some((1, 1, 0));
+    node.state.view = (1, 1, 0);
     assert!(!node.apply_paused());
     assert_eq!(report(&node), Value::Null);
 }

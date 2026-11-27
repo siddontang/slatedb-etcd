@@ -588,12 +588,8 @@ pub(super) enum WriterEvent {
     Opened,
 }
 
-/// Wait for the next writer event. A member without shared state waits forever. A stop that
-/// the member requested is not a failure.
-pub(super) async fn next(writer: &mut Option<Writer>) -> WriterEvent {
-    let Some(writer) = writer else {
-        return std::future::pending().await;
-    };
+/// Wait for the next writer event. A stop that the member requested is not a failure.
+pub(super) async fn next(writer: &mut Writer) -> WriterEvent {
     let leading = writer.stop.is_some();
     let current = writer.term;
     let failed = async {
@@ -1430,8 +1426,8 @@ impl Node {
         snapshot.mut_metadata().index = index;
         snapshot.mut_metadata().term = term;
         snapshot.mut_metadata().set_conf_state(state.members.conf());
-        let shared = state.shared.as_ref().context("shared state has no base")?;
-        let checkpoint = shared
+        let checkpoint = state
+            .shared
             .base
             .checkpoint
             .context("the base has no checkpoint")?;
@@ -1446,10 +1442,8 @@ impl Node {
         let term = self.raw.raft.term;
         // A new leader probes the voters at once. Its first write waits for their samples.
         self.tick_clock(true);
-        if let Some(writer) = &mut self.writer {
-            writer.proofs.lead(leader.then_some(term));
-            writer.sync(leader, term, &self.events);
-        }
+        self.writer.proofs.lead(leader.then_some(term));
+        self.writer.sync(leader, term, &self.events);
     }
 
     /// Defragment the shared database. Only the leader has the writer and its compactor, so a
@@ -1471,7 +1465,7 @@ impl Node {
             let _ = response.send(Err(self.error("not leader")));
             return Ok(());
         }
-        let writer = self.writer.as_ref().context("shared mode has no writer")?;
+        let writer = &self.writer;
         // The `Db` and the admin on its clock come as one pair, or the writer is not open.
         let Some(Open { db, admin, gate }) = writer.open.lock().unwrap().clone() else {
             let _ = response.send(Err(self.error("the shared writer is not open yet")));
@@ -1509,19 +1503,13 @@ impl Node {
     /// Propose a checkpoint with row `row` that the publisher created. Only the leader
     /// announces. Return true when Raft took the proposal.
     pub(super) fn announce_view(&mut self, checkpoint: uuid::Uuid, row: u64) -> Result<bool> {
-        let Some(writer) = &self.writer else {
-            return Ok(false);
-        };
-        let base = *writer.applied.base_id.borrow();
-        let covers = demand::coverage(row, base, writer.queue.position());
+        let base = *self.writer.applied.base_id.borrow();
+        let covers = demand::coverage(row, base, self.writer.queue.position());
         self.propose_view(checkpoint, covers)
     }
 
     /// Propose a `ViewCheckpoint` entry that certifies `checkpoint` through `covers`.
     fn propose_view(&mut self, checkpoint: uuid::Uuid, covers: u64) -> Result<bool> {
-        let Some(writer) = &mut self.writer else {
-            return Ok(false);
-        };
         if self.raw.raft.state != StateRole::Leader {
             return Ok(false);
         }
@@ -1535,7 +1523,7 @@ impl Node {
         // proposal, for example during a leader transfer. The publisher then announces again.
         match self.raw.propose(vec![], data) {
             Ok(()) => {
-                writer.announced += 1;
+                self.writer.announced += 1;
                 Ok(true)
             }
             Err(error) => {
@@ -1548,10 +1536,7 @@ impl Node {
     /// The checkpoints that this member pins: live bases, received snapshots, and the
     /// checkpoint of its Raft snapshot record.
     fn pinned_checkpoints(&self) -> HashSet<uuid::Uuid> {
-        let Some(writer) = &self.writer else {
-            return HashSet::new();
-        };
-        let mut pinned = writer.source.pinned();
+        let mut pinned = self.writer.source.pinned();
         let record = self.raw.store().recovery_snapshot().get_data();
         if let Ok(Some(descriptor)) = crate::state::transfer::ViewDescriptor::decode(record) {
             if let Ok(id) = descriptor.checkpoint() {
@@ -1571,15 +1556,14 @@ impl Node {
         health: Option<fault::WriterReport>,
     ) {
         self.raw.store().note_coverage(member, coverage);
-        if let Some(writer) = &mut self.writer {
-            writer.report(member, checkpoints);
-            writer.handoff.note(member, coverage, health);
-            // A follower's manual checkpoint. The publication is due once apply reaches it.
-            // The follower can group entries in other ways, so its base must reach the index.
-            if let Some(index) = publish {
-                writer.remote_checkpoint = writer.remote_checkpoint.max(index);
-                writer.demand = writer.demand.max(index);
-            }
+        let writer = &mut self.writer;
+        writer.report(member, checkpoints);
+        writer.handoff.note(member, coverage, health);
+        // A follower's manual checkpoint. The publication is due once apply reaches it.
+        // The follower can group entries in other ways, so its base must reach the index.
+        if let Some(index) = publish {
+            writer.remote_checkpoint = writer.remote_checkpoint.max(index);
+            writer.demand = writer.demand.max(index);
         }
     }
 
@@ -1587,18 +1571,14 @@ impl Node {
     /// leader's demand for a base.
     pub(super) fn tick_shared(&mut self) -> Result<()> {
         self.certify_base()?;
-        let probe = self
-            .writer
-            .as_ref()
-            .is_some_and(|writer| (writer.ticks + 1) % clock::PROBE_TICKS == 0);
+        let probe = (self.writer.ticks + 1).is_multiple_of(clock::PROBE_TICKS);
         self.tick_clock(probe);
         self.tick_writer_health();
-        let Some(writer) = &mut self.writer else {
-            return Ok(());
-        };
+        let writer = &mut self.writer;
         writer.ticks += 1;
         let ticks = writer.ticks;
-        if let (Some(gauges), Some((base, _, bytes))) = (&writer.gauges, self.state.view) {
+        if let Some(gauges) = &writer.gauges {
+            let (base, _, bytes) = self.state.view;
             gauges.base.set(base as i64);
             gauges.overlay.set(bytes as i64);
             gauges.paused.set(writer.paused.into());
@@ -1622,11 +1602,11 @@ impl Node {
                 writer.remote_checkpoint = 0;
             }
         }
-        if ticks % POLL_TICKS == 0 && writer.paused {
+        if ticks.is_multiple_of(POLL_TICKS) && writer.paused {
             self.poll_checkpoints();
         }
         // A follower repeats the request of a waiting manual checkpoint.
-        if !leader && ticks % RETRY_TICKS == 0 {
+        if !leader && ticks.is_multiple_of(RETRY_TICKS) {
             if let Some(index) = self
                 .checkpoint_waiters
                 .iter()
@@ -1636,7 +1616,7 @@ impl Node {
                 self.send_view_ack(Some(index));
             }
         }
-        if ticks % REPORT_TICKS != 0 {
+        if !ticks.is_multiple_of(REPORT_TICKS) {
             return Ok(());
         }
         self.send_view_ack(None);
@@ -1649,9 +1629,7 @@ impl Node {
         let pinned = self.pinned_checkpoints();
         let leader = self.raw.raft.leader_id;
         if leader == self.options.id {
-            if let Some(writer) = &self.writer {
-                writer.report(leader, pinned);
-            }
+            self.writer.report(leader, pinned);
             return;
         }
         if leader == 0 || self.manual_transport {
@@ -1670,10 +1648,7 @@ impl Node {
         // The member installs a base above its checkpoint row. See `node::shared::demand`.
         // The writer report tells the leader whether this member can take over the writer.
         let term = self.raw.raft.term;
-        let health = self
-            .writer
-            .as_ref()
-            .map(|writer| writer.health.report(term, self.apply_held_at));
+        let health = self.writer.health.report(term, self.apply_held_at);
         let body = json!({"member": self.options.id, "checkpoints": pinned, "publish": publish,
             "coverage": crate::peer::process_id(), "writer": health});
         let client = self.options.transport.http.clone();
@@ -1694,9 +1669,7 @@ impl Node {
     /// While apply waits, open the newest checkpoint above the base out of band. A switch job
     /// then releases the segments that it covers, including the open one.
     fn poll_checkpoints(&mut self) {
-        let Some(writer) = &self.writer else {
-            return;
-        };
+        let writer = &self.writer;
         if writer
             .polling
             .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -1707,7 +1680,7 @@ impl Node {
         let admin = writer.admin.clone();
         let source = writer.source.clone();
         let opened = writer.opened_slot.clone();
-        let base = self.state.view.map_or(0, |(base, _, _)| base);
+        let (base, _, _) = self.state.view;
         tokio::spawn(async move {
             let result = async {
                 let Some((seq, checkpoint)) = view_checkpoints(&admin).await?.pop() else {
@@ -1729,21 +1702,16 @@ impl Node {
     /// Return true when the overlay is over the soft limit. The leader then rejects client
     /// proposals. `ViewCheckpoint` entries are exempt.
     pub(super) fn overlay_full(&self) -> bool {
-        self.state
-            .view
-            .is_some_and(|(_, _, bytes)| bytes > self.options.overlay_max_bytes)
+        let (_, _, bytes) = self.state.view;
+        bytes > self.options.overlay_max_bytes
     }
 
     /// Return true while apply waits for a base switch. Apply waits above twice the soft limit
     /// and resumes below the soft limit. Raft still persists and acknowledges entries.
     pub(super) fn apply_paused(&mut self) -> bool {
-        let Some((_, _, bytes)) = self.state.view else {
-            return false;
-        };
+        let (_, _, bytes) = self.state.view;
         let limit = self.options.overlay_max_bytes;
-        let Some(writer) = &mut self.writer else {
-            return false;
-        };
+        let writer = &mut self.writer;
         if bytes > limit.saturating_mul(2) {
             if !writer.paused {
                 tracing::warn!(
@@ -1767,7 +1735,7 @@ impl Node {
     /// The node takes the base from the slot and verifies that one. A newer open cannot replace
     /// it before the job runs. A base that fails the check goes back to the slot.
     pub(super) fn adoptable(&self) -> Option<(Arc<crate::state::view::Base>, u64)> {
-        let writer = self.writer.as_ref()?;
+        let writer = &self.writer;
         if !writer.paused || self.prepared_puts.is_some() || self.held_puts.is_some() {
             return None;
         }
@@ -1789,19 +1757,16 @@ impl Node {
     /// DST, has no event loop that watches the slot.
     #[cfg(test)]
     pub(super) fn note_offers(&mut self) {
-        if let Some(writer) = &mut self.writer {
-            if writer.opened.has_changed().unwrap_or(false) {
-                writer.opened.borrow_and_update();
-                writer.switch_due = true;
-            }
+        let writer = &mut self.writer;
+        if writer.opened.has_changed().unwrap_or(false) {
+            writer.opened.borrow_and_update();
+            writer.switch_due = true;
         }
     }
 
     /// Take a due switch job.
     pub(super) fn take_switch(&mut self) -> bool {
-        self.writer
-            .as_mut()
-            .is_some_and(|writer| std::mem::take(&mut writer.switch_due))
+        std::mem::take(&mut self.writer.switch_due)
     }
 }
 
@@ -1895,7 +1860,7 @@ impl Node {
             return Ok(false);
         }
         let term = self.raw.raft.term;
-        let writer = self.writer.as_ref().context("shared state mode")?;
+        let writer = &self.writer;
         dst.close().await;
         // The compactor runs only on request, so GC removes the same SSTs on every replay.
         let mut settings = crate::state::slatedb_settings();
@@ -1934,9 +1899,10 @@ impl Node {
 
     /// Write the overlay batches above the written sequence, each with its own sequence.
     pub(super) async fn dst_materialize(&mut self, dst: &mut DstWriter) -> Result<usize> {
-        let (Some(db), Some(writer)) = (&dst.db, &self.writer) else {
+        let Some(db) = &dst.db else {
             return Ok(0);
         };
+        let writer = &self.writer;
         let mut count = 0;
         for (seq, batch) in writer.queue.after(dst.written, usize::MAX) {
             db.write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
@@ -1953,9 +1919,10 @@ impl Node {
         &mut self,
         dst: &mut DstWriter,
     ) -> Result<Option<uuid::Uuid>> {
-        let (Some(db), Some(writer)) = (&dst.db, &self.writer) else {
+        let Some(db) = &dst.db else {
             return Ok(None);
         };
+        let writer = &self.writer;
         db.flush().await?;
         // Compact the L0 SSTs on request before SlateDB would stop writes for them.
         dst_compact(&writer.admin, 4).await?;
@@ -1999,9 +1966,10 @@ impl Node {
         dst: &mut DstWriter,
         reported: &HashSet<uuid::Uuid>,
     ) -> Result<()> {
-        let (Some(_), Some(writer)) = (&dst.db, &self.writer) else {
+        if dst.db.is_none() {
             return Ok(());
-        };
+        }
+        let writer = &self.writer;
         crate::state::shared::retain(
             &writer.admin,
             &writer.source,
@@ -2014,10 +1982,7 @@ impl Node {
 
     /// Return true when a newer writer holds the shared database.
     pub(super) async fn dst_fenced(&self, dst: &DstWriter) -> bool {
-        let Some(writer) = &self.writer else {
-            return false;
-        };
-        match writer.admin.read_manifest(None).await {
+        match self.writer.admin.read_manifest(None).await {
             Ok(Some(manifest)) => manifest.writer_epoch() != dst.epoch,
             _ => false,
         }

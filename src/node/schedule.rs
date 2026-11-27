@@ -47,16 +47,16 @@ impl Node {
         Ok(())
     }
 
-    /// The checkpoint to start once `applied` entries have been applied, if one is due.
+    /// The checkpoint to start, if one is due.
     /// `Some(true)` builds a complete image; `Some(false)` only flushes state and truncates.
-    pub(super) fn checkpoint_due(&self, applied: u64) -> Option<bool> {
+    pub(super) fn checkpoint_due(&self) -> Option<bool> {
         // No checkpoint below the record can replace it. `certify_base` raises the base first.
         if self.base_below_record() {
             return None;
         }
         // Shared mode records its base `F`. The log stays above the base, so the record needs
         // no flush, and any member can send it.
-        let applied = self.checkpointable(applied);
+        let applied = self.checkpointable();
         let store = self.raw.store();
         let snapshot_index = store.snapshot_index();
         // A peer snapshot or a manual checkpoint needs a complete image.
@@ -81,12 +81,10 @@ impl Node {
         (image_due || truncate_due).then_some(image_due)
     }
 
-    /// The index that a checkpoint can cover: `applied`, or the base `F` in shared mode.
-    pub(super) fn checkpointable(&self, applied: u64) -> u64 {
-        match self.state.view {
-            Some((base, _, _)) if self.writer.is_some() => base,
-            _ => applied,
-        }
+    /// The index that a checkpoint can cover: the base `F`.
+    pub(super) fn checkpointable(&self) -> u64 {
+        let (base, _, _) = self.state.view;
+        base
     }
 
     /// Submit committed entries in `(applied, committed]`, up to one apply batch.
@@ -125,7 +123,7 @@ impl Node {
                 || self.installing()
                 || self.prepared_puts.is_some()
                 || !self.queries.is_empty()
-                || (!self.checkpoint_running && self.checkpoint_due(last).is_some())
+                || (!self.checkpoint_running && self.checkpoint_due().is_some())
             {
                 return Ok(());
             }
@@ -206,7 +204,7 @@ impl Node {
             return Ok(());
         }
         if !self.checkpoint_running {
-            if let Some(image) = self.checkpoint_due(self.state.applied) {
+            if let Some(image) = self.checkpoint_due() {
                 return self.start_checkpoint(image);
             }
         }
@@ -288,9 +286,7 @@ impl Node {
         if membership_changed {
             self.sync_members();
             // Each checkpoint must hold the membership that Raft uses.
-            if let Some(writer) = &self.writer {
-                writer.request_publication(self.state.applied);
-            }
+            self.writer.request_publication(self.state.applied);
         }
         Ok(())
     }

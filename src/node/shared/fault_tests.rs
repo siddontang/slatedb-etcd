@@ -426,7 +426,7 @@ fn an_incident_tries_each_voter_once_until_a_publication() {
 struct Leader {
     state: StateMachine,
     handles: crate::state::shared::Handles,
-    writer: Option<Writer>,
+    writer: Writer,
     events: mpsc::Sender<Event>,
     announced: mpsc::Receiver<Event>,
 }
@@ -447,9 +447,9 @@ impl Leader {
             &[(1, "127.0.0.1:1".to_owned())].into(),
         ));
         state.seed_for_test(1).await.unwrap();
-        let handles = state.shared_handles().unwrap();
+        let handles = state.shared_handles();
         let (events, announced) = mpsc::channel(64);
-        let writer = Some(Writer::new(&handles, max_age, clock));
+        let writer = Writer::new(&handles, max_age, clock);
         Self {
             state,
             handles,
@@ -460,7 +460,7 @@ impl Leader {
     }
 
     fn writer(&mut self) -> &mut Writer {
-        self.writer.as_mut().unwrap()
+        &mut self.writer
     }
 
     fn lead(&mut self, term: u64) {
@@ -523,9 +523,9 @@ impl Leader {
 
     async fn close(mut self) {
         let events = self.events.clone();
-        let mut writer = self.writer.take().unwrap();
-        writer.sync(false, writer.term, &events);
-        writer.stop().await;
+        let term = self.writer.term;
+        self.writer.sync(false, term, &events);
+        self.writer.stop().await;
         self.state.close().await.unwrap();
     }
 }
@@ -547,7 +547,7 @@ async fn a_defragment_survives_a_failed_publication() {
     }
     let index = leader.state.applied;
     leader.covered(index, Duration::from_secs(10)).await;
-    let writer = leader.writer.as_ref().unwrap();
+    let writer = &leader.writer;
     let (reached, resume) = (Arc::default(), Arc::<tokio::sync::Notify>::default());
     let defragment = Defragment {
         db: writer.open.lock().unwrap().clone().unwrap().db,
@@ -671,7 +671,7 @@ async fn a_request_behind_a_hung_read_starts_the_watchdog() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     let requested = Instant::now();
     leader.writer().progress.republish();
-    let writer = leader.writer.as_ref().unwrap();
+    let writer = &leader.writer;
     until("the stall", STALL + Duration::from_secs(5), async || {
         writer.health.check(writer.waiting())
     })
@@ -943,16 +943,11 @@ async fn a_clock_over_the_skew_limit_makes_a_handoff_due() {
     lagging.now_ms = Arc::new(move || now() - 60_000);
     let events = first.events.clone();
     first.writer().sync(false, 2, &events);
-    let mut writer = Some(Writer::new(
-        &first.handles,
-        Duration::from_millis(100),
-        lagging,
-    ));
-    writer.as_mut().unwrap().sync(true, 3, &first.events);
-    let health = writer.as_ref().unwrap().health.clone();
+    let mut writer = Writer::new(&first.handles, Duration::from_millis(100), lagging);
+    writer.sync(true, 3, &first.events);
+    let health = writer.health.clone();
     eventually("three clock refusals", async || health.handoff_due()).await;
     assert_eq!(health.status()["last_error_class"], "clock");
-    let mut writer = writer.take().unwrap();
     writer.sync(false, 3, &first.events);
     writer.stop().await;
     first.close().await;
@@ -2071,7 +2066,7 @@ async fn a_request_above_the_written_batch_keeps_its_timer() {
     });
     let requested = Instant::now();
     let through = leader.state.applied + 1;
-    let writer = leader.writer.as_ref().unwrap();
+    let writer = &leader.writer;
     writer.progress.request(through);
     until("the stall", STALL + Duration::from_secs(5), async || {
         // Wake the publisher, as later writes and requests do.
@@ -2126,7 +2121,7 @@ async fn a_replacement_writer_gets_a_fresh_interval_for_a_request() {
     leader.lead(2);
     leader.covered(1, Duration::from_secs(10)).await;
     let through = leader.state.applied + 1;
-    let writer = leader.writer.as_ref().unwrap();
+    let writer = &leader.writer;
     writer.progress.request(through);
     writer.progress.inner.lock().unwrap().requested =
         Some(Instant::now() - STALL - Duration::from_secs(1));
@@ -2158,7 +2153,7 @@ async fn a_replacement_writer_gets_a_fresh_interval_for_a_request() {
     assert!(started.elapsed() >= STALL - Duration::from_secs(1));
     assert_eq!(leader.put("late").await, through);
     leader.covered(through, Duration::from_secs(10)).await;
-    let writer = leader.writer.as_ref().unwrap();
+    let writer = &leader.writer;
     eventually("the served request", async || {
         writer.progress.requested().is_none()
     })
@@ -2300,7 +2295,7 @@ async fn republishes_do_not_hide_a_waiting_request() {
     });
     let requested = Instant::now();
     let through = leader.state.applied + 1;
-    let writer = leader.writer.as_ref().unwrap();
+    let writer = &leader.writer;
     writer.progress.request(through);
     until("the stall", STALL + Duration::from_secs(5), async || {
         writer.progress.republish();

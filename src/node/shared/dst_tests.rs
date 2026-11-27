@@ -38,7 +38,7 @@ impl Simulation {
     /// Member `id` sends its `ViewAck` to the leader, as the peer stream does. DST has no peer
     /// stream, so each tick of a follower delivers one.
     pub(super) fn report_view(&mut self, id: u64) {
-        if self.shared.is_none() || Some(id) == self.isolated {
+        if Some(id) == self.isolated {
             return;
         }
         let Some(leader) = self.leader() else {
@@ -51,14 +51,11 @@ impl Simulation {
         let coverage = self.process(id);
         let node = &self.nodes[&id];
         let term = node.raw.raft.term;
-        let health = node
-            .writer
-            .as_ref()
-            .map(|writer| writer.health.report(term, None));
+        let health = node.writer.health.report(term, None);
         self.nodes
             .get_mut(&leader)
             .unwrap()
-            .view_ack(id, pins, None, coverage, health);
+            .view_ack(id, pins, None, coverage, Some(health));
     }
 
     /// The HTTP routes of a snapshot. A view snapshot above its row goes to its own route with
@@ -100,7 +97,8 @@ impl Simulation {
         let Some(admin) = self
             .nodes
             .values()
-            .find_map(|node| node.writer.as_ref().map(|writer| writer.admin.clone()))
+            .map(|node| node.writer.admin.clone())
+            .next()
         else {
             return;
         };
@@ -191,7 +189,6 @@ impl Simulation {
             .worker
             .state()
             .shared_handles()
-            .unwrap()
             .queue
             .pushed()
     }
@@ -375,7 +372,7 @@ async fn a_follower_manual_checkpoint_completes_with_a_certified_base() {
     assert_eq!(covers, j);
     assert_eq!(sim.pushed(grouped), j + 1);
     assert_eq!(sim.base(grouped).0, j);
-    let admin = sim.nodes[&leader].writer.as_ref().unwrap().admin.clone();
+    let admin = sim.nodes[&leader].writer.admin.clone();
     let views = crate::state::shared::view_checkpoints(&admin)
         .await
         .unwrap()
@@ -421,12 +418,7 @@ async fn a_follower_manual_checkpoint_completes_with_a_certified_base() {
         .await;
     let writer = &writers[&grouped];
     assert_eq!(writer.written, j);
-    let queue = sim.nodes[&grouped]
-        .worker
-        .state()
-        .shared_handles()
-        .unwrap()
-        .queue;
+    let queue = sim.nodes[&grouped].worker.state().shared_handles().queue;
     assert!(queue.after(writer.written, 1).is_empty());
     // The idle materializer waits for the next batch. The timer goes first, so a busy future
     // cannot starve it.
@@ -543,7 +535,7 @@ async fn a_buffered_put_keeps_the_coverage_at_the_checkpoint_row() {
     let record = Record::of(&record).unwrap().unwrap();
     assert!(record.index >= requested);
     assert_ne!(record.checkpoint, checkpoint);
-    let source = sim.nodes[&leader].writer.as_ref().unwrap().source.clone();
+    let source = sim.nodes[&leader].writer.source.clone();
     let served = source.open_base(record.checkpoint).await.unwrap();
     assert!(served.applied > b);
     let current = format!("etcd/current/{key}");
@@ -621,7 +613,7 @@ async fn a_member_restarts_at_a_record_above_its_checkpoint_row() {
         .await
         .unwrap()
         .id;
-    let admin = sim.nodes[&leader].writer.as_ref().unwrap().admin.clone();
+    let admin = sim.nodes[&leader].writer.admin.clone();
     let views = crate::state::shared::view_checkpoints(&admin)
         .await
         .unwrap();
@@ -823,7 +815,7 @@ async fn a_restart_on_another_checkpoint_sends_that_checkpoint() {
         .await
         .unwrap()
         .id;
-    let admin = sim.nodes[&leader].writer.as_ref().unwrap().admin.clone();
+    let admin = sim.nodes[&leader].writer.admin.clone();
     admin.delete_checkpoint(x).await.unwrap();
     if let Some(mut writer) = writers.remove(&leader) {
         writer.close().await;
@@ -869,7 +861,7 @@ async fn a_late_refusal_for_an_earlier_process_keeps_the_capability() {
         .store()
         .note_refused(follower, process + 1000);
     assert!(sim.nodes[&leader].raw.store().coverage_capable(follower));
-    let admin = sim.nodes[&leader].writer.as_ref().unwrap().admin.clone();
+    let admin = sim.nodes[&leader].writer.admin.clone();
     let views = crate::state::shared::view_checkpoints(&admin)
         .await
         .unwrap()
@@ -918,7 +910,7 @@ async fn a_record_of_an_earlier_base_is_rebuilt_from_the_base() {
     assert!(index > record.index && base != Some(x));
     let kept = Record::of(sim.nodes[&leader].raw.store().recovery_snapshot());
     assert_eq!(kept.unwrap().map(|record| record.checkpoint), Some(x));
-    let admin = sim.nodes[&leader].writer.as_ref().unwrap().admin.clone();
+    let admin = sim.nodes[&leader].writer.admin.clone();
     admin.delete_checkpoint(x).await.unwrap();
     assert!(!sim.nodes[&leader].raw.store().has_image());
     let delivered = sim.delivered_views.len();
@@ -960,11 +952,11 @@ async fn a_restart_above_its_record_does_not_send_a_deleted_checkpoint() {
     assert_ne!(sim.base(member).1, Some(x));
     sim.stop(member);
     let leader = sim.leader().unwrap();
-    let admin = sim.nodes[&leader].writer.as_ref().unwrap().admin.clone();
+    let admin = sim.nodes[&leader].writer.admin.clone();
     admin.delete_checkpoint(x).await.unwrap();
     sim.start(member).await;
     let node = &sim.nodes[&member];
-    assert!(node.state.view.unwrap().0 > record.index);
+    assert!(node.state.view.0 > record.index);
     assert_ne!(node.worker.state().base_checkpoint(), Some(x));
     assert_eq!(node.raw.store().snapshot_index(), record.index);
     assert!(!node.raw.store().has_image());
@@ -1033,7 +1025,7 @@ async fn a_record_at_the_applied_index_raises_the_base() {
     sim.settle(4).await;
     let images = sim.nodes[&member].snapshot_images;
     let record = sim.record_at_applied(member).await;
-    let admin = sim.nodes[&leader].writer.as_ref().unwrap().admin.clone();
+    let admin = sim.nodes[&leader].writer.admin.clone();
     admin.delete_checkpoint(record.checkpoint).await.unwrap();
     sim.settle(10).await;
     let (index, base, _) = sim.base(member);
@@ -1070,9 +1062,9 @@ async fn a_failed_raise() {
     sim.write(2).await;
     sim.settle(4).await;
     let node = sim.nodes.get_mut(&member).unwrap();
-    node.writer.as_mut().unwrap().skip_raise = true;
+    node.writer.skip_raise = true;
     let record = sim.record_at_applied(member).await;
-    let admin = sim.nodes[&leader].writer.as_ref().unwrap().admin.clone();
+    let admin = sim.nodes[&leader].writer.admin.clone();
     admin.delete_checkpoint(record.checkpoint).await.unwrap();
     sim.settle(10).await;
     let (index, base, _) = sim.base(member);
@@ -1082,20 +1074,20 @@ async fn a_failed_raise() {
     // No checkpoint job starts below the record, and none resets the flush counter.
     node.appended_bytes = 7;
     let images = node.snapshot_images;
-    assert_eq!(node.checkpoint_due(node.state.applied), None);
+    assert_eq!(node.checkpoint_due(), None);
     node.start_checkpoint(true).unwrap();
     assert!(!node.checkpoint_running);
     assert_eq!((node.appended_bytes, node.snapshot_images), (7, images));
     if let Some(mut writer) = writers.remove(&leader) {
         writer.close().await;
     }
-    let writer = sim.nodes[&member].writer.as_ref().unwrap();
+    let writer = &sim.nodes[&member].writer;
     writer.take_publish_through();
     sim.lead(member).await;
     // No peer asks for a snapshot yet. The record index alone asks for a publication of the
     // batches above the base row.
     sim.settle(2).await;
-    let writer = sim.nodes[&member].writer.as_ref().unwrap();
+    let writer = &sim.nodes[&member].writer;
     assert!(writer.take_publish_through().is_some());
     let delivered = sim.delivered_views.len();
     let node = sim.nodes.get_mut(&other).unwrap();
@@ -1231,7 +1223,7 @@ async fn an_empty_base_sends_a_record_only_after_its_first_base() {
     let other = sim.follower(joining);
     sim.joining = Some(joining);
     sim.replace(joining, 0).await;
-    let source = sim.nodes[&joining].shared_source().unwrap();
+    let source = sim.nodes[&joining].shared_source();
     source
         .fail_opens
         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1245,9 +1237,9 @@ async fn an_empty_base_sends_a_record_only_after_its_first_base() {
     sim.write(2).await;
     sim.settle(4).await;
     let node = sim.nodes.get_mut(&joining).unwrap();
-    node.writer.as_mut().unwrap().skip_raise = true;
+    node.writer.skip_raise = true;
     let record = sim.record_at_applied(joining).await;
-    let admin = sim.nodes[&leader].writer.as_ref().unwrap().admin.clone();
+    let admin = sim.nodes[&leader].writer.admin.clone();
     admin.delete_checkpoint(record.checkpoint).await.unwrap();
     sim.settle(10).await;
     assert_eq!(sim.base(joining).1, None);
@@ -1268,7 +1260,7 @@ async fn an_empty_base_sends_a_record_only_after_its_first_base() {
     sim.publish_view(&mut writers).await;
     for _ in 0..40 {
         sim.settle(1).await;
-        let writer = sim.nodes[&joining].writer.as_ref().unwrap();
+        let writer = &sim.nodes[&joining].writer;
         if writer.take_publish_through().is_some() {
             sim.publish_view(&mut writers).await;
         }

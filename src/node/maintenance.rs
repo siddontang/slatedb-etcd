@@ -41,32 +41,27 @@ impl Node {
         self.transfers.push((target, Instant::now(), response));
         // A shared-mode leader first publishes a checkpoint of its applied state. The members
         // then hold small overlays, and the new leader materializes little.
-        if let Some(writer) = &mut self.writer {
-            let applied = self.state.applied;
-            writer.transfer = Some((target, writer.covering(applied)));
-            writer.request_publication(applied);
-            return self.finish_transfers();
-        }
-        self.raw.transfer_leader(target);
+        let applied = self.state.applied;
+        let writer = &mut self.writer;
+        writer.transfer = Some((target, writer.covering(applied)));
+        writer.request_publication(applied);
         self.finish_transfers()
     }
 
     pub(super) fn finish_transfers(&mut self) -> Result<()> {
-        let base = self.state.view.map_or(0, |(base, _, _)| base);
-        if let Some(writer) = &mut self.writer {
-            // Transfer once a base covers the applied state, or after a bounded wait.
-            let waited = self
-                .transfers
-                .iter()
-                .all(|(_, started, _)| started.elapsed() >= Duration::from_secs(3));
-            if let Some((target, covering)) = writer.transfer {
-                if base >= covering || waited {
-                    writer.transfer = None;
-                    self.raw.transfer_leader(target);
-                }
+        let (base, _, _) = self.state.view;
+        // Transfer once a base covers the applied state, or after a bounded wait.
+        let waited = self
+            .transfers
+            .iter()
+            .all(|(_, started, _)| started.elapsed() >= Duration::from_secs(3));
+        if let Some((target, covering)) = self.writer.transfer {
+            if base >= covering || waited {
+                self.writer.transfer = None;
+                self.raw.transfer_leader(target);
             }
         }
-        let limit = Duration::from_secs(if self.writer.is_some() { 10 } else { 5 });
+        let limit = Duration::from_secs(10);
         let mut pending = vec![];
         for (target, started, response) in std::mem::take(&mut self.transfers) {
             if self.raw.raft.leader_id == target {

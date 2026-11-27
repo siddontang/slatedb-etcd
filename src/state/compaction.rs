@@ -378,11 +378,7 @@ impl StateMachine {
     /// Start reading the next step for the current progress in the background.
     pub(crate) fn plan_compaction(&mut self) {
         // The planner reads a pinned view in the background while apply continues.
-        let state = match &self.shared {
-            Some(shared) => shared.pinned(),
-            // A clone of the in-memory state of a test keeps its rows.
-            None => self.applied_state().clone(),
-        };
+        let state = self.pinned_state();
         self.compaction_plan.start(state, self.compaction.as_ref());
     }
 }

@@ -16,7 +16,6 @@ impl StateMachine {
     /// class, because the load changes nothing. Any other load error comes from the rows of the
     /// base, so it is corrupt stored data.
     pub(crate) async fn adopt_base(&mut self, base: Arc<Base>, term: u64) -> Result<()> {
-        ensure!(self.shared.is_some(), "adopt needs shared state mode");
         let reads = StateView::Shared(SharedView::new(
             base.clone(),
             Arc::from([Arc::default()]),
@@ -25,7 +24,17 @@ impl StateMachine {
         let rows = Arc::new(rows::RowCache::new(self.location.cache.row_bytes));
         let admin = self.admin.clone();
         let location = self.location.clone();
-        let mut next = Self::load_rows(admin, location, rows, reads)
+        // The candidate loads with a `Shared` of its own. Only a valid candidate takes the
+        // current one, whose handles the writer holds.
+        let shared = &self.shared;
+        let own = Shared::new(
+            base.clone(),
+            shared.source.clone(),
+            shared.store_id,
+            shared.pin_max,
+            shared.holders.clone(),
+        );
+        let mut next = Self::load(admin, location, rows, reads, own)
             .await
             .map_err(candidate_fault)?;
         if next.applied_term != 0 && term != 0 {
@@ -36,10 +45,9 @@ impl StateMachine {
             );
         }
         // The candidate is valid. Nothing below fails, so the switch is whole.
-        let mut shared = self.shared.take().expect("checked above");
-        shared.reset(base);
-        next.reads = shared.live();
-        next.shared = Some(shared);
+        std::mem::swap(&mut next.shared, &mut self.shared);
+        next.shared.reset(base);
+        next.reads = next.shared.live();
         if next.applied_term == 0 {
             next.applied_term = term;
             next.entry_term = term;
@@ -73,10 +81,7 @@ impl StateMachine {
         limit: u64,
         term: impl FnOnce(u64) -> Result<u64>,
     ) -> Result<()> {
-        let shared = self
-            .shared
-            .as_ref()
-            .context("rebase needs shared state mode")?;
+        let shared = &self.shared;
         let (current, row, index) = (
             shared.base.checkpoint,
             shared.base.applied,
@@ -136,10 +141,7 @@ impl StateMachine {
         term: u64,
         reader: &mut Option<Arc<Base>>,
     ) -> Result<()> {
-        let shared = self
-            .shared
-            .as_ref()
-            .context("a format 6 snapshot needs shared state mode")?;
+        let shared = &self.shared;
         let id = descriptor.checkpoint()?;
         if index <= self.applied {
             // Release the receipt, also for a snapshot that applies nothing.
