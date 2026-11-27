@@ -3,11 +3,7 @@ use super::*;
 impl Node {
     pub(super) fn enqueue_query(&mut self, query: Query) {
         if matches!(query, Query::Read(..) | Query::Linear(..)) {
-            if self.read_queries.len() >= apply::MAX_QUERIES {
-                query.reject(self.error("too many queued reads"));
-            } else {
-                self.read_queries.push_back(query);
-            }
+            self.reads.queue(query, self.raw.raft.leader_id);
             return;
         }
         if self.queries.len() >= apply::MAX_QUERIES {
@@ -310,7 +306,7 @@ impl Node {
 
     pub(super) fn finish_output(&mut self, output: Output) -> Result<()> {
         match output {
-            Output::SharedLinear(ids, outcome) => self.finish_shared_reads(ids, outcome)?,
+            Output::SharedLinear(ids, outcome) => self.reads.finish_shared(ids, outcome)?,
             Output::Reads(reads) => {
                 for read in reads {
                     self.finish_output(read)?;
@@ -412,7 +408,7 @@ impl Node {
                 let _ = response.send(result);
             }
             Output::Read { response, outcome } => response.kv(outcome)?,
-            Output::Linear { id, outcome } => self.finish_read(id, outcome)?,
+            Output::Linear { id, outcome } => self.reads.finish(id, outcome)?,
             // Raft took the ConfState of a snapshot that it accepted above the adopted base.
             Output::Adopted(conf) if self.installing() => drop(conf),
             Output::Adopted(conf) => {
@@ -513,22 +509,12 @@ impl Node {
         let Some(paused) = self.worker.control.paused().filter(|paused| paused.held) else {
             return;
         };
-        let applied = self.state.applied;
-        let fenced: Vec<_> = self
-            .reads
-            .iter()
-            .filter(|(_, read)| read.index().is_some_and(|index| index > applied))
-            .map(|(id, _)| *id)
-            .collect();
         let message = format!(
             "storage unavailable; apply holds at entry {}: {}",
             paused.index, paused.reason
         );
-        for id in fenced {
-            if let Some(read) = self.reads.remove(&id) {
-                read.into_response().error(self.error(&message));
-            }
-        }
+        self.reads
+            .fence(self.state.applied, &message, self.raw.raft.leader_id);
     }
 
     /// Run the periodic work of a paused apply: the metrics, the alarm, and the snapshot request

@@ -18,9 +18,9 @@ The table gives the responsibility of each module. A module is not always the ow
   `state/read`, `state/shared`, `state/shared/adopt`, and `state/snapshot`.
 - Some modules own a type with private fields, and the other modules call its methods:
   `Writer` in `node/shared/writer`, `EarlyPuts` in `node/quorum_put`, `Checkpointer` in
-  `node/checkpoint`, `Group` in `node/proposal`, `Publisher` in `node/forwarding` and
-  `node/watch`, the log `Worker` in `node/log`, `KeyIndex` in `state/key_index`, `Overlay` in
-  `state/overlay`, and `RowCache` in `state/rows`.
+  `node/checkpoint`, `ReadIndexTable` in `node/read/table`, `Group` in `node/proposal`,
+  `Publisher` in `node/forwarding` and `node/watch`, the log `Worker` in `node/log`, `KeyIndex`
+  in `state/key_index`, `Overlay` in `state/overlay`, and `RowCache` in `state/rows`.
 
 | Module | Responsibility |
 | --- | --- |
@@ -42,6 +42,7 @@ The table gives the responsibility of each module. A module is not always the ow
 | `node/quorum_put` | Evaluate Puts before commit. Reply after commit in the term (`EarlyPuts`) |
 | `state/key_index` | Keep revision metadata for every current key in memory |
 | `node/read` | Confirm Safe ReadIndex and reject obsolete proofs |
+| `node/read/table` | Keep the reads that wait for a ReadIndex proof, the executor, or a revision |
 | `node/read/executor` | Run bounded reads on immutable applied views |
 | `node/lease` | Schedule leader lease expiry from replicated generations |
 | `state/quota` | Track the logical usage. KV, Put, and Lease apply compare it to the quota |

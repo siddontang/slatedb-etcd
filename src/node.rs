@@ -18,9 +18,6 @@ use crate::{ApiError, Command, RaftCommand, Request};
 mod apply;
 mod auto_compaction;
 mod checkpoint;
-/// ReadIndex reads that may wait in the Raft owner's table. One quorum round confirms
-/// every read in a batch, so a larger table lets one round cover more clients.
-pub(crate) const MAX_PENDING_READS: usize = 256;
 /// Apply barriers that may wait for the local state to reach a revision.
 pub(crate) const MAX_APPLY_BARRIERS: usize = apply::MAX_QUERIES;
 mod cache;
@@ -39,6 +36,7 @@ pub(crate) use shared::{Millis, ProbeReply, ProbeRequest, PROBE_ROUTE};
 pub(crate) use shared::{Prober, WriteProbeReply, WriteProbeRequest, WRITE_PROBE_ROUTE};
 mod quorum_put;
 mod read;
+pub(crate) use read::table::MAX_PENDING_READS;
 mod ready;
 mod response;
 mod schedule;
@@ -231,12 +229,6 @@ struct Pending {
     term: u64,
 }
 
-struct RevisionWaiter {
-    revision: i64,
-    response: Response,
-    started: Instant,
-}
-
 struct LogTask {
     id: u64,
     work: Option<log::Job>,
@@ -286,11 +278,8 @@ pub struct Node {
     log_read_fail: bool,
     peer_waiters: Vec<Response>,
     read_executor: read::executor::Executor,
-    read_queries: VecDeque<Query>,
-    reads: BTreeMap<u64, read::PendingRead>,
-    revision_waiters: VecDeque<RevisionWaiter>,
-    read_nonce: [u8; 16],
-    read_sequence: u64,
+    /// The ReadIndex reads, the queued reads, and the revision waits. See `read::table`.
+    reads: read::table::ReadIndexTable,
     state: AppliedState,
     worker: Worker,
     apply_busy: bool,
@@ -627,11 +616,7 @@ impl Node {
             log_read_fail: false,
             peer_waiters: vec![],
             read_executor: read::executor::Executor::new(manual_apply),
-            read_queries: VecDeque::new(),
-            reads: BTreeMap::new(),
-            revision_waiters: VecDeque::new(),
-            read_nonce: *uuid::Uuid::new_v4().as_bytes(),
-            read_sequence: 0,
+            reads: read::table::ReadIndexTable::new(),
             apply_target: applied.applied,
             apply_jobs: VecDeque::new(),
             committed_ready: applied.applied,
@@ -1605,7 +1590,7 @@ impl Node {
             "term": self.raw.raft.term, "commit_index": self.raw.store().commit_index(),
             "applied_index": self.state.applied,
             "state_write_batches": self.state.write_batches,
-            "active_read_jobs": self.read_executor.len(), "queued_reads": self.read_queries.len(),
+            "active_read_jobs": self.read_executor.len(), "queued_reads": self.reads.queued(),
             "durable_applied_index": self.state.durable_applied,
             "snapshot_index": self.raw.store().snapshot_index(),
             "first_log_index": self.raw.store().snapshot_index() + 1, "last_log_index": self.raw.store().durable.last_index,
@@ -1619,8 +1604,8 @@ impl Node {
             "queued_state_reads": self.queries.len(), "apply_delay_ms": self.apply_delay_ms,
             "log_busy": self.log_busy, "queued_log_jobs": self.log_queue.len(),
             "queued_log_bytes": self.log_bytes, "queued_snapshot_bytes": self.log_snapshot_bytes, "log_delay_ms": self.log_delay_ms,
-            "log_fail": self.log_fail, "pending_read_indexes": self.reads.len(),
-            "pending_revision_waiters": self.revision_waiters.len(),
+            "log_fail": self.log_fail, "pending_read_indexes": self.reads.pending(),
+            "pending_revision_waiters": self.reads.revision_waiters(),
             "raft_commit_index": self.raw.raft.raft_log.committed,
             "cached_last_log_index": self.raw.store().last_index()?,
             "log_memory": self.raw.store().stats(),
