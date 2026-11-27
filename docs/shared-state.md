@@ -171,34 +171,50 @@ not store commands.
 - A segment is released when its whole range is at or below `F` of the oldest checkpoint that a
   live view uses (invariant 4). A group that spans `F` stays until a later base covers it.
 
-**Memory limit.** The overlay is one part of a member memory budget. On the leader the budget
-also counts the `Db` memtable and the materializer backlog. `--overlay-max-bytes`, default
-1 GiB, is checked only when the leader admits a new proposal. Over the limit, the leader
-rejects new client proposals with the existing retryable admission error. `ViewCheckpoint`
-proposals are exempt. Apply of committed entries does not wait for this limit. A wait there could
-block the very entry that frees the memory. Only the hard limit below pauses apply.
+**Memory limit.** `--overlay-max-bytes`, default 1 GiB, limits the key and value bytes of the
+segments that the overlay holds. The leader checks it only when it admits a new proposal. Over the
+limit, the leader rejects new client proposals with the existing retryable admission error.
+`ViewCheckpoint` proposals are exempt. Apply of committed entries does not wait for this limit. A
+wait there could block the very entry that frees the memory. Only the hard limit below pauses
+apply.
 
 A member over the limit, leader or follower, frees memory in this order:
 
 1. Switch to the newest checkpoint if it is above the base. This releases the covered segments.
-2. Cancel the oldest reads and Watch scans that pin an old base, with a retryable error.
-   Watch streams resume from their last delivered revision on a new view.
-3. If the overlay is still over the hard limit, `2 × --overlay-max-bytes`, pause apply. The
+2. If the overlay is still over the hard limit, `2 × --overlay-max-bytes`, pause apply. The
    committed entries stay in the durable log, and Raft continues to persist and acknowledge
    new entries. Reads that wait for apply time out with the existing retryable error.
-4. While paused, poll the checkpoint list. Switch out of band to the newest checkpoint above the
+3. While paused, poll the checkpoint list. Switch out of band to the newest checkpoint above the
    base, including one at or below `applied`, and release the segments it covers. Resume
    apply when the overlay is below `--overlay-max-bytes`. If a checkpoint above `applied` appears,
    [rebase](#rebase) onto it. The poll skips a checkpoint with its row above the delivered
    commit, because the member cannot adopt it yet. A later poll opens it after the commit reaches
    it. A checkpoint name is only a lower bound of its row, so the poll checks the opened row.
 
-Step 3 bounds memory during an S3 stall even when the member already has the newest base.
-Step 4 does not need the paused `ViewCheckpoint` entries. A paused leader still materializes its
+Step 2 bounds the overlay during an S3 stall even when the member already has the newest base.
+Step 3 does not need the paused `ViewCheckpoint` entries. A paused leader still materializes its
 applied batches, so it publishes a checkpoint at or below its own `applied` and then switches to
 it. A test stalls S3 on a single voter, recovers S3, and sends no new requests. The voter must
 resume. A second run stalls S3 before the first announcement applies, so the out-of-band switch
 must release the open segment.
+
+The limit counts only the segments that the overlay holds. The member does not cancel reads or
+Watch scans to free memory. Per member, in key and value bytes without map and `Arc` overhead:
+
+- **Held segments:** at most `2 × --overlay-max-bytes`, plus the rows of the apply jobs that
+  were queued at the pause check. At most 4 jobs queue. Each has up to 512 KiB of entries, or
+  one larger entry.
+- **Materializer queue:** it holds the batches of the held segments and shares their `Bytes`.
+  It adds only its map entries.
+- **Leader `Db` memtable:** it holds the written batches that no checkpoint covers yet, with the
+  same `Bytes`. Above `max_unflushed_bytes`, 512 MiB by default, SlateDB stops the writes. The
+  materializer then waits, and the overlay grows instead.
+- **Released segments that backups keep:** about `--overlay-max-bytes`. See [Backups](#backups).
+- **Released segments that reads keep:** no byte limit. A read or a Watch page keeps every
+  segment of its view, also the open one, for at most `--view-pin-max`. So reads keep at most
+  the segments that the overlay held in the last `--view-pin-max`. That is the overlay at the
+  start of that time plus the rows applied in it. These bytes do not pause apply or stop
+  proposals.
 
 ## Views and reads
 
@@ -1024,7 +1040,9 @@ snapshot above the held entry. See [Read faults](#read-faults).
   GC runs. The read must succeed or fail with a retryable error. The Watch must resume with no
   gap and no duplicate.
 - **S3 stall:** stall S3 under write load with one old view pinned. Measure peak memory, check
-  the pause, and check recovery after S3 returns.
+  the pause, and check recovery after S3 returns. Not done yet: the pinned view and the memory
+  measurement. Today `stall_and_recover` and `the_overlay_limits_hold_while_the_writer_fails`
+  stall or fail S3 on a single voter, with no pinned view. They check the pause and the recovery.
 - **Adopt and crash:** adopt a checkpoint above a conflicting log suffix, crash, and force an
   election. Also restart three voters after the first checkpoint with no membership change.
 - **Idle and leaderless runs:** stop writes, or stop all voters, for longer than every retention
