@@ -15,7 +15,8 @@ async fn a_lost_checkpoint_object_rebases_apply() {
 
 /// The base row is 19, and an announcement certified the checkpoint through the empty
 /// entry 20. The member truncated its log through 20. The rebase opens the same checkpoint
-/// at 20 with the record term, and the job reads the log from 21.
+/// at 20 with the record term, and the job reads the log from 21. A reader of the base index
+/// never sees 19.
 #[tokio::test]
 async fn a_lost_checkpoint_object_rebases_apply_above_a_truncated_row() {
     lose_a_checkpoint_object(Lose::AboveRow).await;
@@ -442,6 +443,23 @@ async fn lose_a_checkpoint_object(lose: Lose) {
         preempt.send_replace(24);
         Some(waited)
     });
+    // A reader on another thread records each base index that it sees during the job.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = (lose == Lose::AboveRow).then(|| {
+        let handles = executor.state.shared_handles();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut seen = vec![];
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let index = *handles.based.borrow();
+                let base = handles.base_id.borrow().map(|base| base.index);
+                if seen.last() != Some(&(index, base)) {
+                    seen.push((index, base));
+                }
+            }
+            seen
+        })
+    });
     let job = executor.execute(Work {
         job: Job::Entries(entries[20..].to_vec()),
         header,
@@ -452,6 +470,11 @@ async fn lose_a_checkpoint_object(lose: Lose) {
         .expect("no snapshot ended the waiting job");
     let completion = result.unwrap();
     let waited = covering.await.unwrap();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(reader) = reader {
+        // The rebase installs row 19 at its base index 20 at once. No reader sees 19.
+        assert_eq!(reader.join().unwrap(), [(20, Some(20))]);
+    }
     if deleted {
         assert_eq!(older.is_some(), lose != Lose::Newer);
         // The base did not move down to the older checkpoint.

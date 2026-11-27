@@ -1237,10 +1237,14 @@ impl Shared {
         true
     }
 
-    /// Make `base` the whole state and drop the overlay. Install and rebase use this.
-    fn reset(&mut self, base: Arc<Base>) {
+    /// Make `base` the whole state through `index` and drop the overlay. Install and rebase
+    /// use this. A base above its row goes out at `index` at once.
+    fn reset(&mut self, base: Arc<Base>, index: u64) {
         self.overlay.reset(base.applied);
-        let index = base.applied;
+        if index > base.applied {
+            self.extensions += 1;
+            self.overlay.cover(index);
+        }
         self.set_base(base, index);
     }
 
