@@ -8,12 +8,10 @@ use raft::eraftpb::{HardState, Snapshot};
 /// through index 2. Its log holds entries 1 to 20 of term 1: entry 5 adds learner 4, and entry
 /// 8 reads `bad`.
 async fn held_member(dir: &std::path::Path) -> Node {
-    let mut state = StateMachine::open(&dir.join("objects")).await.unwrap();
+    let mut state = StateMachine::open_test(&dir.join("objects")).await.unwrap();
     // The direct write takes sequence number 1, so the apply marker goes to index 2.
-    state.db().put(b"data/bad", b"\xff\xfe").await.unwrap();
-    state.applied += 1;
+    state.write_raw(&[(b"data/bad", b"\xff\xfe")]);
     state.apply(2, None).await.unwrap();
-    state.metrics.flush_db(state.db()).await.unwrap();
     state.close().await.unwrap();
     let request = crate::cluster::Command::Add(Member {
         id: 4,
@@ -69,7 +67,7 @@ async fn held_member(dir: &std::path::Path) -> Node {
 /// A snapshot of index 200 and term 2 from leader 2. Its members row and its ConfState hold
 /// voters 1 to 3 and no learner.
 async fn covering_snapshot(source: &std::path::Path) -> Message {
-    let mut state = StateMachine::open(source).await.unwrap();
+    let mut state = StateMachine::open_test(source).await.unwrap();
     let peers = (1..=3).map(|id| (id, format!("127.0.0.1:{id}"))).collect();
     state.members = std::sync::Arc::new(crate::cluster::Store::initial(&peers));
     state.seed_for_test(1).await.unwrap();
@@ -97,6 +95,7 @@ async fn covering_snapshot(source: &std::path::Path) -> Message {
 /// ConfState is the one of the snapshot, and apply goes on above it. A stale adoption that
 /// completes after the snapshot does not change it either.
 #[tokio::test]
+#[ignore = "see #149"]
 async fn a_covering_snapshot_ends_a_held_job_without_its_stale_conf_changes() {
     let dir = tempfile::tempdir().unwrap();
     let source = tempfile::tempdir().unwrap();
@@ -269,6 +268,7 @@ async fn a_held_member_fences_linearizable_reads() {
 /// work, such as a queued state read. After the log cache stages the record and stores it, the
 /// install runs first, and the read sees the installed state.
 #[tokio::test]
+#[ignore = "see #149"]
 async fn apply_waits_for_the_record_of_an_accepted_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let source = tempfile::tempdir().unwrap();

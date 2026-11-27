@@ -16,7 +16,7 @@ pub struct Store {
 /// The payload of a `SeedMembers` entry. See `state::cluster`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Seed {
-    /// The JSON names it `members_id`, so an older binary does not decode it as a `CompactStep`.
+    /// The JSON names it `members_id`, so the entry does not decode as a `CompactStep`.
     #[serde(rename = "members_id")]
     pub id: String,
     /// The leader that proposed the entry.

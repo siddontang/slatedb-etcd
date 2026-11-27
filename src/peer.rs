@@ -111,7 +111,7 @@ pub(crate) const STORE: &str = "x-store-id";
 #[derive(Clone, Debug)]
 pub(crate) struct Identity {
     pub cluster: String,
-    /// The store ID of the cluster claim. A replicated member has no shared store.
+    /// The store ID of the cluster claim.
     pub store: Option<String>,
 }
 
@@ -165,19 +165,19 @@ impl Identity {
 
 /// The header and metadata name of the sender's process ID on peer traffic.
 pub(crate) const PROCESS: &str = "x-member-process";
-/// The route of a view snapshot above its checkpoint row. An earlier binary has no such route.
+/// The route of a view snapshot above its checkpoint row.
 pub(crate) const COVERED_ROUTE: &str = "/raft/covered";
 /// The header that names the receiver process of a snapshot on `COVERED_ROUTE`.
 pub(crate) const TARGET_PROCESS: &str = "x-target-process";
 
 /// A random ID of this OS process. A member sends it with its peer traffic and its `ViewAck`
-/// reports, so the leader knows when a member runs a new process, maybe of an earlier binary.
+/// reports, so the leader knows when a member runs a new process.
 pub(crate) fn process_id() -> u64 {
     static ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *ID.get_or_init(|| uuid::Uuid::new_v4().as_u64_pair().0)
 }
 
-/// Read a process ID from peer request headers. An earlier binary sends none.
+/// Read a process ID from peer request headers, if they hold one.
 pub(crate) fn process_of(value: Option<&[u8]>) -> Option<u64> {
     std::str::from_utf8(value?).ok()?.parse().ok()
 }
@@ -397,8 +397,8 @@ enum Delivery {
 }
 
 /// Send one snapshot. The node names a receiver process in the context of a view snapshot above
-/// its checkpoint row, and zero when it knows none. Such a snapshot goes to `COVERED_ROUTE`. An
-/// earlier binary answers 404, and another process 409, before Raft sees the snapshot.
+/// its checkpoint row, and zero when it knows none. Such a snapshot goes to `COVERED_ROUTE`.
+/// Another process answers 409 before Raft sees the snapshot.
 async fn post_snapshot(
     client: &reqwest::Client,
     url: &str,

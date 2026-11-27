@@ -147,9 +147,10 @@ async fn stall_and_recover(early: bool) {
     let limit = 64 * 1024;
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     let dir = tempfile::tempdir().unwrap();
-    let mut config = crate::server::ServerConfig::single_node(dir.path());
-    config.state_mode = crate::state::StateMode::Shared;
-    config.object_store = crate::object::Config::Test(faults.clone(), "root".into());
+    let mut config = crate::server::ServerConfig::single_node(
+        dir.path(),
+        crate::object::Config::Test(faults.clone(), "root".into()),
+    );
     config.view_max_age = Duration::from_millis(100);
     config.overlay_max_bytes = limit;
     let server = crate::server::Server::start(config).await.unwrap();
@@ -236,9 +237,10 @@ async fn status_answers_before_the_writer_creates_the_manifest() {
     // The claims succeed. The writer cannot create the shared manifest.
     faults.set(STALL_STATE_PUT);
     let dir = tempfile::tempdir().unwrap();
-    let mut config = crate::server::ServerConfig::single_node(dir.path());
-    config.state_mode = crate::state::StateMode::Shared;
-    config.object_store = crate::object::Config::Test(faults.clone(), "root".into());
+    let config = crate::server::ServerConfig::single_node(
+        dir.path(),
+        crate::object::Config::Test(faults.clone(), "root".into()),
+    );
     let server = crate::server::Server::start(config).await.unwrap();
     server.wait_ready(Duration::from_secs(15)).await.unwrap();
     let channel = tonic::transport::Endpoint::from_shared(server.client_url())
@@ -295,7 +297,6 @@ async fn a_restart_refuses_a_base_with_another_term_at_the_record() {
         "test",
         crate::state::StateCache::default(),
         &options,
-        crate::state::transfer::Backend::Local,
     )
     .await
     .unwrap();
@@ -320,9 +321,10 @@ async fn a_slow_prev_kv_catch_up_makes_progress() {
     };
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     let dir = tempfile::tempdir().unwrap();
-    let mut config = crate::server::ServerConfig::single_node(dir.path());
-    config.state_mode = crate::state::StateMode::Shared;
-    config.object_store = crate::object::Config::Test(faults.clone(), "root".into());
+    let mut config = crate::server::ServerConfig::single_node(
+        dir.path(),
+        crate::object::Config::Test(faults.clone(), "root".into()),
+    );
     config.view_max_age = Duration::from_millis(100);
     config.view_pin_max = Duration::from_millis(24);
     // A tiny cache, so history reads go to the store.
@@ -433,7 +435,6 @@ async fn a_fenced_leader_opens_its_writer_again() {
         "test",
         crate::state::StateCache::default(),
         &options,
-        crate::state::transfer::Backend::Local,
     )
     .await
     .unwrap();
@@ -556,7 +557,6 @@ pub(super) async fn stranded_checkpoint_on(
         "test",
         crate::state::StateCache::default(),
         &options,
-        crate::state::transfer::Backend::Local,
     )
     .await
     .unwrap();
@@ -662,16 +662,9 @@ async fn a_failed_base_open_is_retried_on_an_idle_member() {
         meta_bytes: 1,
         row_bytes: 0,
     };
-    let mut state = StateMachine::open_shared(
-        faults.clone(),
-        "root",
-        "test",
-        cache,
-        &options,
-        crate::state::transfer::Backend::Local,
-    )
-    .await
-    .unwrap();
+    let mut state = StateMachine::open_shared(faults.clone(), "root", "test", cache, &options)
+        .await
+        .unwrap();
     state.members = Arc::new(crate::cluster::Store::initial(
         &[(1, "127.0.0.1:1".to_owned())].into(),
     ));
@@ -729,16 +722,9 @@ async fn the_base_advances_under_a_stream_of_announcements() {
         meta_bytes: 1,
         row_bytes: 0,
     };
-    let mut state = StateMachine::open_shared(
-        faults.clone(),
-        "root",
-        "test",
-        cache,
-        &options,
-        crate::state::transfer::Backend::Local,
-    )
-    .await
-    .unwrap();
+    let mut state = StateMachine::open_shared(faults.clone(), "root", "test", cache, &options)
+        .await
+        .unwrap();
     state.members = Arc::new(crate::cluster::Store::initial(
         &[(1, "127.0.0.1:1".to_owned())].into(),
     ));
@@ -918,7 +904,6 @@ async fn ordinary(store: Arc<dyn ObjectStore>) -> (StateMachine, Handles) {
         "test",
         crate::state::StateCache::default(),
         &options,
-        crate::state::transfer::Backend::Local,
     )
     .await
     .unwrap();
@@ -1005,9 +990,10 @@ async fn an_ordinary_start_resolves_a_stopped_restore() {
             .await
             .unwrap_err();
         let dir = tempfile::tempdir().unwrap();
-        let mut config = crate::server::ServerConfig::single_node(dir.path());
-        config.state_mode = crate::state::StateMode::Shared;
-        config.object_store = crate::object::Config::Test(store.clone(), "root".into());
+        let config = crate::server::ServerConfig::single_node(
+            dir.path(),
+            crate::object::Config::Test(store.clone(), "root".into()),
+        );
         let started = tokio::time::timeout(
             Duration::from_secs(30),
             crate::server::Server::start(config.clone()),
@@ -1034,9 +1020,10 @@ async fn an_ordinary_start_resolves_a_stopped_restore() {
             .unwrap();
         assert_eq!(source.restored_snapshot().await.unwrap(), Some(digest));
         let dir = tempfile::tempdir().unwrap();
-        let mut config = crate::server::ServerConfig::single_node(dir.path());
-        config.state_mode = crate::state::StateMode::Shared;
-        config.object_store = crate::object::Config::Test(store.clone(), "root".into());
+        let config = crate::server::ServerConfig::single_node(
+            dir.path(),
+            crate::object::Config::Test(store.clone(), "root".into()),
+        );
         let server = crate::server::Server::start(config).await.unwrap();
         server.wait_ready(Duration::from_secs(15)).await.unwrap();
         server.shutdown().await.unwrap();
@@ -1377,7 +1364,6 @@ async fn an_old_term_task_end_is_not_a_failure() {
         "test",
         crate::state::StateCache::default(),
         &options,
-        crate::state::transfer::Backend::Local,
     )
     .await
     .unwrap();
@@ -1429,10 +1415,10 @@ async fn voters_on_different_shared_stores_form_no_quorum() {
             (1..=2).map(|id| (id, crate::server::test_port())).collect();
         let mut servers = vec![];
         for (id, root) in (1..=2).zip(roots) {
-            let mut config =
-                crate::server::ServerConfig::single_node(dir.path().join(id.to_string()));
-            config.state_mode = crate::state::StateMode::Shared;
-            config.object_store = crate::object::Config::Test(store.clone(), root.into());
+            let mut config = crate::server::ServerConfig::single_node(
+                dir.path().join(id.to_string()),
+                crate::object::Config::Test(store.clone(), root.into()),
+            );
             config.id = id;
             config.listen = peers[&id].parse().unwrap();
             config.peers = peers.clone();
@@ -1492,7 +1478,6 @@ async fn a_dropped_base_is_reported_until_the_pause_ends() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let dir = tempfile::tempdir().unwrap();
     let mut config = super::super::tests::options(dir.path());
-    config.state_mode = crate::state::StateMode::Shared;
     config.object_store = crate::object::Config::Test(store, "root".into());
     let (events, _) = mpsc::channel(256);
     let mut node = Node::open_with_transport(config, events, Some(BTreeMap::new()))

@@ -30,12 +30,9 @@ impl Simulation {
         self.settle(10).await;
     }
 
-    /// The process ID that member `id` sends with its traffic. An earlier binary sends none.
+    /// The process ID that member `id` sends with its traffic.
     pub(super) fn process(&self, id: u64) -> Option<u64> {
-        match self.old.contains(&id) {
-            true => None,
-            false => self.processes.get(&id).copied(),
-        }
+        self.processes.get(&id).copied()
     }
 
     /// Member `id` sends its `ViewAck` to the leader, as the peer stream does. DST has no peer
@@ -52,14 +49,12 @@ impl Simulation {
         }
         let pins = self.nodes[&id].dst_pins();
         let coverage = self.process(id);
-        // An earlier binary sends no writer report.
         let node = &self.nodes[&id];
         let term = node.raw.raft.term;
         let health = node
             .writer
             .as_ref()
             .map(|writer| writer.health.report(term, None));
-        let health = coverage.and(health);
         self.nodes
             .get_mut(&leader)
             .unwrap()
@@ -67,8 +62,7 @@ impl Simulation {
     }
 
     /// The HTTP routes of a snapshot. A view snapshot above its row goes to its own route with
-    /// the receiver process that the leader named. An earlier binary has no such route, and
-    /// another process refuses it. Then the transport tells the leader that the named process is
+    /// the receiver process that the leader named. Another process refuses it. Then the transport tells the leader that the named process is
     /// not capable, and reports the snapshot as failed. Return the message that Raft gets, if
     /// any.
     pub(super) async fn receive_snapshot(&mut self, mut message: Message) -> Option<Message> {
@@ -96,29 +90,7 @@ impl Simulation {
         {
             self.delivered_views.push(view.checkpoint().unwrap());
         }
-        if self.old.contains(&to) {
-            self.check_old_install(&message).await;
-        }
         Some(message)
-    }
-
-    /// An earlier binary installs a view snapshot only when the checkpoint row equals the
-    /// snapshot index. Check every view snapshot that such a member receives.
-    async fn check_old_install(&mut self, message: &Message) {
-        let snapshot = message.get_snapshot();
-        let Ok(Some(view)) = crate::state::transfer::ViewDescriptor::decode(snapshot.get_data())
-        else {
-            return;
-        };
-        let source = self.nodes[&message.from].shared_source().unwrap();
-        let base = source.open_base(view.checkpoint().unwrap()).await.unwrap();
-        assert_eq!(
-            base.applied,
-            snapshot.get_metadata().index,
-            "seed {}: an earlier binary got a view snapshot above its row",
-            self.seed
-        );
-        self.old_installs += 1;
     }
 
     /// A member sends only a record whose checkpoint exists. A sendable record names the live
@@ -233,7 +205,7 @@ impl Simulation {
 /// The follower applied through its last index, so it saves the record and installs no state.
 #[tokio::test]
 async fn an_idle_shared_leader_serves_a_snapshot_request_at_the_last_index() {
-    let mut sim = Simulation::with_mode(9, true).await;
+    let mut sim = Simulation::new(9).await;
     sim.settle(4).await;
     let leader = sim.leader().unwrap();
     let mut writers = BTreeMap::new();
@@ -269,59 +241,39 @@ async fn an_idle_shared_leader_serves_a_snapshot_request_at_the_last_index() {
     sim.assert_records_open().await;
 }
 
-/// #117 stops a new member at an earlier binary's `Publish` until a snapshot arrives. A failed
-/// update follows the `Publish`, so the last index is above the last batch. In this idle shared
-/// cluster the leader's announcement covers that index, and the member recovers by snapshot.
+/// Four of five voters restart, and the fifth stays down, so it sends no coverage report. A
+/// follower asks for a snapshot above the base. The leader certifies its base through the
+/// request, and the follower installs the record and catches up.
 #[tokio::test]
-async fn a_guarded_shared_member_recovers_in_an_idle_cluster() {
-    guarded_member(false).await;
-}
-
-/// The same with the leader's apply behind when the member first asks. The target is the request
-/// itself, so the leader serves it once its apply reaches it. The member never applies the
-/// blocked entry.
-#[tokio::test]
-async fn a_guarded_shared_member_recovers_from_a_clamped_target() {
-    guarded_member(true).await;
-}
-
-async fn guarded_member(lagging: bool) {
-    let mut sim = Simulation::with_holds(23, true, BTreeMap::new(), false, true, true).await;
-    sim.settle(3).await;
-    let publish = RaftCommand::Cluster {
-        id: "publish-2".into(),
-        request: crate::cluster::Command::Publish {
-            id: 2,
-            client_urls: vec!["http://localhost:2381".into()],
-        },
-        credentials: Default::default(),
-    };
-    sim.admin_command(publish).await.result.unwrap();
-    sim.propose_noop().await;
-    sim.settle(2).await;
-    let waiting = sim.follower(0);
-    sim.replace(waiting, 0).await;
-    sim.until_waiting(waiting).await;
-    assert!(sim.nodes[&waiting].state.members_row.is_none());
-    let blocked = sim.nodes[&waiting].quota.blocked().unwrap();
+async fn a_request_with_a_voter_down_gets_a_certified_snapshot() {
+    let mut sim = Simulation::with_size(9, 5).await;
+    sim.settle(4).await;
     let mut writers = BTreeMap::new();
     sim.publish_view(&mut writers).await;
-    let leader = sim.leader().unwrap();
-    if lagging {
-        sim.paused_apply = Some(leader);
-        sim.propose_noop().await;
-        for _ in 0..3 {
-            sim.settle(1).await;
-            assert!(sim.nodes[&waiting].state.applied < blocked);
-        }
-        sim.paused_apply = None;
+    sim.settle(10).await;
+    for id in 1..=5 {
+        sim.stop(id);
+    }
+    for id in 1..=4 {
+        sim.start(id).await;
     }
     sim.settle(30).await;
-    let node = &sim.nodes[&waiting];
-    assert_eq!(node.quota.blocked(), None);
-    assert!(node.installed_snapshots > 0);
+    let leader = sim.leader().unwrap();
+    let follower = (1..=4).find(|&id| id != leader).unwrap();
+    let (base, _, _) = sim.base(follower);
+    let node = sim.nodes.get_mut(&follower).unwrap();
+    node.raw.request_snapshot().unwrap();
+    let requested = node.raw.raft.pending_request_snapshot;
+    assert!(requested > base, "requested {requested} at base {base}");
+    sim.settle(100).await;
+    let node = &sim.nodes[&follower];
+    assert_eq!(
+        node.raw.raft.pending_request_snapshot, 0,
+        "the request still waits"
+    );
+    assert!(node.raw.store().snapshot_index() >= requested);
     assert_eq!(node.state.applied, sim.nodes[&leader].state.applied);
-    assert!(node.state.members_row.is_some());
+    sim.assert_records_open().await;
 }
 
 /// #96 in a cluster. Member `grouped` misses two commits and applies a Put and a failed update
@@ -332,7 +284,7 @@ async fn guarded_member(lagging: bool) {
 /// log, and completes a manual checkpoint. After a failover it accepts a write.
 #[tokio::test]
 async fn a_member_that_applied_entries_apart_adopts_the_base_and_leads() {
-    let mut sim = Simulation::with_mode(29, true).await;
+    let mut sim = Simulation::new(29).await;
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
     sim.write(10).await;
@@ -387,7 +339,7 @@ async fn a_member_that_applied_entries_apart_adopts_the_base_and_leads() {
 /// client write are needed.
 #[tokio::test]
 async fn a_follower_manual_checkpoint_completes_with_a_certified_base() {
-    let mut sim = Simulation::with_mode(31, true).await;
+    let mut sim = Simulation::new(31).await;
     // No member truncates, so `grouped` gets the entries and no snapshot.
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
@@ -543,7 +495,7 @@ async fn a_follower_manual_checkpoint_completes_with_a_certified_base() {
 /// holds the Put serves the request, and the receiver reads the Put.
 #[tokio::test]
 async fn a_buffered_put_keeps_the_coverage_at_the_checkpoint_row() {
-    let mut sim = Simulation::with_mode(37, true).await;
+    let mut sim = Simulation::new(37).await;
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
     sim.write(3).await;
@@ -617,7 +569,7 @@ async fn a_buffered_put_keeps_the_coverage_at_the_checkpoint_row() {
 /// that applied through `c`, and it applies the later entries once.
 #[tokio::test]
 async fn a_member_restarts_at_a_record_above_its_checkpoint_row() {
-    let mut sim = Simulation::with_mode(41, true).await;
+    let mut sim = Simulation::new(41).await;
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
     sim.write(3).await;
@@ -720,16 +672,14 @@ impl Simulation {
 /// each leader. A leader serves `min(high, last)` and pins that target, so member 2 restores a
 /// snapshot below `high`, which clears its request, and then takes appends. With `restart`,
 /// member 2 restarts instead, and the old request of the earlier term must not hold back
-/// member 4's request after leadership goes back to member 1. Both state modes use this rule.
-async fn stale_request(shared: bool, restart: bool) {
-    let mut sim = Simulation::with_size(9, shared, 5).await;
+/// member 4's request after leadership goes back to member 1.
+async fn stale_request(restart: bool) {
+    let mut sim = Simulation::with_size(9, 5).await;
     sim.settle(5).await;
     let first = sim.leader().unwrap();
     assert_eq!(first, 1);
     let mut writers = BTreeMap::new();
-    if shared {
-        sim.publish_view(&mut writers).await;
-    }
+    sim.publish_view(&mut writers).await;
     sim.settle(10).await;
     for _ in 0..30 {
         sim.propose_noop().await;
@@ -805,179 +755,15 @@ async fn stale_request(shared: bool, restart: bool) {
 
 #[tokio::test]
 async fn an_earlier_term_request_does_not_hold_back_a_current_one() {
-    stale_request(true, true).await;
+    stale_request(true).await;
 }
 
 #[tokio::test]
 async fn a_requester_of_an_earlier_term_takes_a_snapshot_below_its_request() {
-    stale_request(true, false).await;
-}
-
-#[tokio::test]
-async fn a_replicated_requester_of_an_earlier_term_recovers() {
-    stale_request(false, false).await;
-}
-
-/// Rolling upgrade: member `old` runs an earlier binary. It installs a view snapshot only at its
-/// checkpoint row, and it does not advertise the coverage capability. The leader then never
-/// certifies above a row, and every snapshot of the old member is at its row. After the member
-/// runs this binary and reports, announcements cover the no-op entries again.
-#[tokio::test]
-async fn a_leader_with_an_earlier_binary_follower_announces_at_the_row() {
-    let mut sim = Simulation::with_mode(43, true).await;
-    sim.settle(4).await;
-    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
-    let leader = sim.leader().unwrap();
-    let old = sim.follower(0);
-    sim.old.insert(old);
-    sim.settle(2).await;
-    assert!(!sim.nodes[&leader].extension_allowed());
-    let mut writers = BTreeMap::new();
-    sim.publish_view(&mut writers).await;
-    sim.settle(4).await;
-    // The old member falls behind the truncated log.
-    sim.stop(old);
-    for _ in 0..3 {
-        sim.write(4).await;
-        sim.propose_noop().await;
-        sim.publish_view(&mut writers).await;
-        sim.settle(4).await;
-    }
-    // Each announcement covers exactly its checkpoint row.
-    let source = sim.nodes[&leader].shared_source().unwrap();
-    for (index, checkpoint, covers) in sim.announcements() {
-        let row = source.open_base(checkpoint).await.unwrap().applied;
-        assert_eq!(covers, row, "the announcement at {index}");
-    }
-    let record = sim.nodes[&leader].raw.store().recovery_snapshot().clone();
-    let record = Record::of(&record).unwrap().unwrap();
-    assert_eq!(record.row, None, "the leader recorded {record:?}");
-    sim.start(old).await;
-    sim.settle(20).await;
-    assert!(sim.old_installs > 0);
-    assert_eq!(
-        sim.nodes[&old].state.applied,
-        sim.nodes[&leader].state.applied
-    );
-    // The member upgrades: its next process reports the capability.
-    sim.old.remove(&old);
-    sim.stop(old);
-    sim.start(old).await;
-    sim.settle(2).await;
-    assert!(sim.nodes[&leader].extension_allowed());
-    sim.write(1).await;
-    for step in [WriterStep::Materialize, WriterStep::Checkpoint] {
-        sim.writer_step(&mut writers, leader, step).await;
-    }
-    sim.propose_noop().await;
-    sim.settle(1).await;
-    sim.writer_step(&mut writers, leader, WriterStep::Announce)
-        .await;
-    sim.settle(4).await;
-    let (_, _, covers) = *sim.announcements().last().unwrap();
-    let (base, checkpoint, _) = sim.base(leader);
-    let source = sim.nodes[&leader].shared_source().unwrap();
-    let row = source.open_base(checkpoint.unwrap()).await.unwrap().applied;
-    assert!(
-        covers > row && base > row,
-        "covers {covers}, base {base}, row {row}"
-    );
-}
-
-/// The leader recorded its base above the row while every member advertised the capability.
-/// Then a member is replaced by an earlier binary with the same ID, in the same term, or after
-/// the leader restarts. Its first frame names no process, so it loses the capability. The leader
-/// does not send the record above the row. It stores the apply marker at its applied index,
-/// publishes a checkpoint with its row there, and sends that one.
-async fn replaced_by_an_earlier_binary(restart_leader: bool) {
-    let mut sim = Simulation::with_mode(47, true).await;
-    sim.settle(4).await;
-    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
-    sim.write(10).await;
-    let mut writers = BTreeMap::new();
-    sim.publish_view(&mut writers).await;
-    sim.settle(10).await;
-    let leader = sim.leader().unwrap();
-    let requester = sim.follower(0);
-    sim.nodes
-        .get_mut(&requester)
-        .unwrap()
-        .raw
-        .request_snapshot()
-        .unwrap();
-    sim.settle(20).await;
-    let record = sim.nodes[&leader].raw.store().recovery_snapshot().clone();
-    let record = Record::of(&record).unwrap().unwrap();
-    assert!(
-        record.row.is_some_and(|row| row < record.index),
-        "{record:?}"
-    );
-    let term = sim.nodes[&leader].raw.raft.term;
-    let mut leader = leader;
-    if restart_leader {
-        if let Some(mut writer) = writers.remove(&leader) {
-            writer.close().await;
-        }
-        sim.stop(leader);
-        sim.start(leader).await;
-        sim.settle(30).await;
-        leader = sim.leader().unwrap();
-        let record = sim.nodes[&leader].raw.store().recovery_snapshot().clone();
-        let record = Record::of(&record).unwrap().unwrap();
-        assert!(record.row.is_some_and(|row| row < record.index));
-    }
-    let replaced = sim.follower(0);
-    let installs = sim.old_installs;
-    sim.old.insert(replaced);
-    sim.replace(replaced, 0).await;
-    sim.settle(10).await;
-    assert_eq!(sim.old_installs, installs);
-    assert!(sim.nodes[&leader].raw.store().exact_wanted());
-    sim.publish_view(&mut writers).await;
-    sim.settle(30).await;
-    if !restart_leader {
-        assert_eq!(sim.nodes[&leader].raw.raft.term, term);
-    }
-    assert!(sim.old_installs > installs);
-    assert_eq!(
-        sim.nodes[&replaced].state.applied,
-        sim.nodes[&leader].state.applied
-    );
-    sim.assert_acknowledged(replaced).await;
-}
-
-#[tokio::test]
-async fn a_member_replaced_by_an_earlier_binary_gets_a_snapshot_at_its_row() {
-    replaced_by_an_earlier_binary(false).await;
-}
-
-#[tokio::test]
-async fn a_restarted_leader_sends_an_earlier_binary_a_snapshot_at_its_row() {
-    replaced_by_an_earlier_binary(true).await;
+    stale_request(false).await;
 }
 
 impl Simulation {
-    /// Deliver messages until a view snapshot above its row waits for member `to`. Return false
-    /// when none comes.
-    async fn until_covered_snapshot(&mut self, to: u64) -> bool {
-        for _ in 0..3000 {
-            let waiting = self.messages.iter().any(|message| {
-                message.to == to
-                    && message.get_msg_type() == MessageType::MsgSnapshot
-                    && crate::state::transfer::above_row(message.get_snapshot())
-            });
-            if waiting {
-                return true;
-            }
-            if self.messages.is_empty() {
-                let leader = self.leader().unwrap();
-                self.tick(leader).await;
-            }
-            self.deliver(false).await;
-        }
-        false
-    }
-
     /// Member `requester` asks for a snapshot at its last index, and the leader serves it with a
     /// checkpoint at its row, published by `writers`. Both members then hold a view record.
     /// Return the record of `id`.
@@ -1009,139 +795,12 @@ impl Simulation {
     }
 }
 
-/// Critic's send race. The leader builds a snapshot above its row for the process that
-/// advertised the capability. Before it arrives, the member restarts on an earlier binary. The
-/// earlier binary has no route for it and refuses it before Raft, so it never stores it. The
-/// leader then treats the member as an earlier binary, and the member catches up.
-#[tokio::test]
-async fn a_snapshot_above_its_row_to_a_restarted_earlier_binary_is_refused() {
-    let mut sim = Simulation::with_mode(53, true).await;
-    sim.settle(4).await;
-    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
-    sim.write(10).await;
-    let mut writers = BTreeMap::new();
-    sim.publish_view(&mut writers).await;
-    sim.settle(10).await;
-    let leader = sim.leader().unwrap();
-    let member = sim.follower(0);
-    // The member falls behind, then asks for a snapshot above the base.
-    sim.propose_noop().await;
-    sim.settle(4).await;
-    sim.nodes
-        .get_mut(&member)
-        .unwrap()
-        .raw
-        .request_snapshot()
-        .unwrap();
-    assert!(sim.until_covered_snapshot(member).await);
-    // The same member starts again on an earlier binary before the snapshot arrives.
-    sim.stop(member);
-    sim.old.insert(member);
-    sim.start(member).await;
-    let refused = sim.refused_snapshots;
-    sim.settle(20).await;
-    assert!(sim.refused_snapshots > refused);
-    assert!(!sim.nodes[&leader].raw.store().coverage_capable(member));
-    sim.publish_view(&mut writers).await;
-    sim.settle(30).await;
-    assert_eq!(sim.leader(), Some(leader));
-    let record = Record::of(sim.nodes[&member].raw.store().recovery_snapshot()).unwrap();
-    assert!(record.is_none_or(|record| record.row.is_none()));
-    assert_eq!(
-        sim.nodes[&member].state.applied,
-        sim.nodes[&leader].state.applied
-    );
-    sim.assert_acknowledged(member).await;
-}
-
-/// Critic's stall. An earlier binary asks for a snapshot above the record: one above its row,
-/// or one at its row. Its request feeds the publication of a checkpoint at its row.
-async fn an_earlier_binary_request(above_row: bool) {
-    let mut sim = Simulation::with_mode(59, true).await;
-    sim.settle(4).await;
-    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
-    sim.write(10).await;
-    let mut writers = BTreeMap::new();
-    sim.publish_view(&mut writers).await;
-    sim.settle(10).await;
-    let leader = sim.leader().unwrap();
-    let old = sim.follower(0);
-    if above_row {
-        let record = sim.certify_for(sim.follower(old)).await;
-        assert!(record.row.is_some_and(|row| row < record.index));
-    }
-    sim.old.insert(old);
-    sim.propose_noop().await;
-    sim.settle(4).await;
-    let record = sim.nodes[&leader].raw.store().snapshot_index();
-    let node = sim.nodes.get_mut(&old).unwrap();
-    node.raw.request_snapshot().unwrap();
-    let requested = node.raw.raft.pending_request_snapshot;
-    assert!(requested > record);
-    sim.settle(10).await;
-    assert!(sim.nodes[&leader].raw.store().exact_wanted());
-    sim.publish_view(&mut writers).await;
-    sim.settle(30).await;
-    let node = &sim.nodes[&old];
-    assert_eq!(node.raw.raft.pending_request_snapshot, 0);
-    let served = Record::of(node.raw.store().recovery_snapshot()).unwrap();
-    assert_eq!(served.map(|record| record.row), Some(None));
-    assert!(node.raw.store().snapshot_index() >= requested);
-    assert!(sim.old_installs > 0);
-}
-
-#[tokio::test]
-async fn an_earlier_binary_request_above_a_record_above_its_row_is_served() {
-    an_earlier_binary_request(true).await;
-}
-
-#[tokio::test]
-async fn an_earlier_binary_request_above_a_record_at_its_row_is_served() {
-    an_earlier_binary_request(false).await;
-}
-
-/// Sig-Codex's inverse case. A member of this binary asks above the record while another voter
-/// runs an earlier binary, so no certification can serve it. The leader publishes a checkpoint
-/// at its row instead, with no client write, and the requester recovers.
-#[tokio::test]
-async fn a_request_beside_an_earlier_binary_voter_gets_a_snapshot_at_its_row() {
-    let mut sim = Simulation::with_mode(61, true).await;
-    sim.settle(4).await;
-    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
-    sim.write(10).await;
-    let mut writers = BTreeMap::new();
-    sim.publish_view(&mut writers).await;
-    sim.settle(10).await;
-    let leader = sim.leader().unwrap();
-    let old = sim.follower(0);
-    let member = sim.follower(old);
-    sim.old.insert(old);
-    sim.propose_noop().await;
-    sim.settle(4).await;
-    assert!(!sim.nodes[&leader].extension_allowed());
-    let record = sim.nodes[&leader].raw.store().snapshot_index();
-    let node = sim.nodes.get_mut(&member).unwrap();
-    node.raw.request_snapshot().unwrap();
-    let requested = node.raw.raft.pending_request_snapshot;
-    assert!(requested > record);
-    let acknowledged = sim.acknowledged.len();
-    sim.settle(10).await;
-    sim.publish_view(&mut writers).await;
-    sim.settle(30).await;
-    assert_eq!(sim.acknowledged.len(), acknowledged);
-    let node = &sim.nodes[&member];
-    assert_eq!(node.raw.raft.pending_request_snapshot, 0);
-    assert!(node.raw.store().snapshot_index() >= requested);
-    let served = Record::of(node.raw.store().recovery_snapshot()).unwrap();
-    assert_eq!(served.map(|record| record.row), Some(None));
-}
-
 /// Critic's stale descriptor. Retention deleted checkpoint X of the leader's record above its
 /// row, and the restart opened Y at the record index instead. A new member then needs a
 /// snapshot. The leader records Y at that index and sends it, and it never sends X.
 #[tokio::test]
 async fn a_restart_on_another_checkpoint_sends_that_checkpoint() {
-    let mut sim = Simulation::with_mode(67, true).await;
+    let mut sim = Simulation::new(67).await;
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
     sim.write(10).await;
@@ -1192,79 +851,12 @@ async fn a_restart_on_another_checkpoint_sends_that_checkpoint() {
     }
 }
 
-/// Sig-Codex: the reverse grouping case beside a voter of an earlier binary. No certification
-/// can serve the follower's manual checkpoint, and the leader's base is at its row below the
-/// demand. The leader publishes a checkpoint at its applied index, and the manual checkpoint
-/// completes. Automatic truncation is off, so only that publication can serve it.
-#[tokio::test]
-async fn a_follower_manual_checkpoint_beside_an_earlier_binary_gets_a_row_checkpoint() {
-    let mut sim = Simulation::with_mode(31, true).await;
-    for node in sim.nodes.values_mut() {
-        node.options.snapshot_every = 0;
-        node.next_checkpoint = None;
-    }
-    sim.settle(4).await;
-    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
-    sim.write(10).await;
-    let leader = sim.leader().unwrap();
-    let mut writers = BTreeMap::new();
-    sim.publish_view(&mut writers).await;
-    sim.settle(10).await;
-    let grouped = sim.follower(0);
-    let old = sim.follower(grouped);
-    sim.old.insert(old);
-    sim.isolated = Some(grouped);
-    sim.propose().await;
-    sim.settle(1).await;
-    let j = sim.nodes[&leader].state.applied;
-    sim.propose_noop().await;
-    for step in [
-        WriterStep::Materialize,
-        WriterStep::Checkpoint,
-        WriterStep::Announce,
-    ] {
-        sim.writer_step(&mut writers, leader, step).await;
-    }
-    sim.settle(1).await;
-    sim.isolated = None;
-    sim.settle(4).await;
-    assert!(!sim.nodes[&leader].extension_allowed());
-    assert_eq!(sim.pushed(grouped), j + 1);
-    assert_eq!(sim.base(grouped).0, j);
-    let (tx, mut rx) = oneshot::channel();
-    let node = sim.nodes.get_mut(&grouped).unwrap();
-    node.handle(Event::Checkpoint(tx), &mut vec![])
-        .await
-        .unwrap();
-    let index = *node
-        .checkpoint_waiters
-        .iter()
-        .map(|(i, _)| i)
-        .max()
-        .unwrap();
-    let pins = sim.nodes[&grouped].dst_pins();
-    let coverage = sim.process(grouped);
-    let node = sim.nodes.get_mut(&leader).unwrap();
-    node.view_ack(grouped, pins, Some(index), coverage, None);
-    sim.settle(4).await;
-    sim.finish_checkpoints(grouped);
-    assert!(rx.try_recv().is_err());
-    sim.publish_view(&mut writers).await;
-    sim.settle(10).await;
-    sim.finish_checkpoints(grouped);
-    assert!(rx.try_recv().unwrap().is_ok());
-    let (base, checkpoint, _) = sim.base(grouped);
-    let source = sim.nodes[&leader].shared_source().unwrap();
-    let row = source.open_base(checkpoint.unwrap()).await.unwrap().applied;
-    assert!(base >= index && row >= index, "base {base}, row {row}");
-}
-
 /// Sig-Codex: a 409 for an earlier process of a member arrives after its new process reported
 /// the capability. The new process stays capable, and the leader certifies its base again with
 /// no new checkpoint.
 #[tokio::test]
 async fn a_late_refusal_for_an_earlier_process_keeps_the_capability() {
-    let mut sim = Simulation::with_mode(9, true).await;
+    let mut sim = Simulation::new(9).await;
     sim.settle(4).await;
     let mut writers = BTreeMap::new();
     sim.publish_view(&mut writers).await;
@@ -1302,7 +894,7 @@ async fn a_late_refusal_for_an_earlier_process_keeps_the_capability() {
 /// the base, never X.
 #[tokio::test]
 async fn a_record_of_an_earlier_base_is_rebuilt_from_the_base() {
-    let mut sim = Simulation::with_size(73, true, 5).await;
+    let mut sim = Simulation::with_size(73, 5).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
         node.next_checkpoint = None;
@@ -1346,7 +938,7 @@ async fn a_record_of_an_earlier_base_is_rebuilt_from_the_base() {
 /// never X.
 #[tokio::test]
 async fn a_restart_above_its_record_does_not_send_a_deleted_checkpoint() {
-    let mut sim = Simulation::with_size(79, true, 5).await;
+    let mut sim = Simulation::with_size(79, 5).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
         node.next_checkpoint = None;
@@ -1424,7 +1016,7 @@ impl Simulation {
 /// raises its base to the record from the received checkpoint, and records nothing below it.
 #[tokio::test]
 async fn a_record_at_the_applied_index_raises_the_base() {
-    let mut sim = Simulation::with_mode(83, true).await;
+    let mut sim = Simulation::new(83).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
         node.next_checkpoint = None;
@@ -1459,9 +1051,9 @@ async fn a_record_at_the_applied_index_raises_the_base() {
 /// below the record, no checkpoint job starts and the flush counter keeps its bytes. The
 /// member then leads, and its record index is a demand: it certifies or publishes through it.
 /// The next image replaces the record, and the lagging member never gets the deleted
-/// checkpoint. With an earlier binary present, the exact path publishes at a row.
-async fn a_failed_raise(old: bool) {
-    let mut sim = Simulation::with_mode(83, true).await;
+/// checkpoint.
+async fn a_failed_raise() {
+    let mut sim = Simulation::new(83).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
         node.next_checkpoint = None;
@@ -1475,9 +1067,6 @@ async fn a_failed_raise(old: bool) {
     let leader = sim.leader().unwrap();
     let member = sim.follower(0);
     let other = sim.follower(member);
-    if old {
-        sim.old.insert(other);
-    }
     sim.write(2).await;
     sim.settle(4).await;
     let node = sim.nodes.get_mut(&member).unwrap();
@@ -1503,8 +1092,8 @@ async fn a_failed_raise(old: bool) {
     let writer = sim.nodes[&member].writer.as_ref().unwrap();
     writer.take_publish_through();
     sim.lead(member).await;
-    // No peer asks for a snapshot yet. The record index alone asks for a publication: the
-    // batches above the base row, or a checkpoint at a row for the earlier binary.
+    // No peer asks for a snapshot yet. The record index alone asks for a publication of the
+    // batches above the base row.
     sim.settle(2).await;
     let writer = sim.nodes[&member].writer.as_ref().unwrap();
     assert!(writer.take_publish_through().is_some());
@@ -1537,12 +1126,7 @@ async fn a_failed_raise(old: bool) {
 
 #[tokio::test]
 async fn a_failed_raise_is_served_by_a_demand_at_the_record() {
-    a_failed_raise(false).await;
-}
-
-#[tokio::test]
-async fn a_failed_raise_beside_an_earlier_binary_is_served_at_a_row() {
-    a_failed_raise(true).await;
+    a_failed_raise().await;
 }
 
 /// Architecture: a follower stores a received record above its applied index, and a leadership
@@ -1552,7 +1136,7 @@ async fn a_failed_raise_beside_an_earlier_binary_is_served_at_a_row() {
 /// leads, and certifies or announces nothing above its applied index.
 #[tokio::test]
 async fn a_member_does_not_lead_before_its_install() {
-    let mut sim = Simulation::with_mode(89, true).await;
+    let mut sim = Simulation::new(89).await;
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
     sim.write(10).await;
@@ -1631,7 +1215,7 @@ async fn a_member_does_not_lead_before_its_install() {
 /// member gets a record of the base.
 #[tokio::test]
 async fn an_empty_base_sends_a_record_only_after_its_first_base() {
-    let mut sim = Simulation::with_mode(89, true).await;
+    let mut sim = Simulation::new(89).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
         node.next_checkpoint = None;
@@ -1738,7 +1322,7 @@ impl Simulation {
         seed: u64,
         writers: &mut BTreeMap<u64, shared::DstWriter>,
     ) -> (Self, u64, u64, u64) {
-        let mut sim = Simulation::with_mode(seed, true).await;
+        let mut sim = Simulation::new(seed).await;
         sim.settle(4).await;
         sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
         sim.write(10).await;
@@ -1853,7 +1437,7 @@ async fn a_transfer_after_a_snapshot_in_one_batch_is_ignored() {
 /// follower for a snapshot, and it restarts every member.
 #[tokio::test]
 async fn a_shared_schedule_ends_when_only_the_leader_runs() {
-    let mut sim = Simulation::with_mode(109, true).await;
+    let mut sim = Simulation::new(109).await;
     sim.settle(4).await;
     let leader = sim.leader().unwrap();
     for id in (1..=3).filter(|id| *id != leader) {

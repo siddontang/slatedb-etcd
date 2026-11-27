@@ -29,17 +29,7 @@ async fn a_failed_base_load_keeps_the_state() {
     let open = |cache| {
         let store: Arc<dyn ObjectStore> = faults.clone();
         let options = &options;
-        async move {
-            StateMachine::open_shared(
-                store,
-                "cluster",
-                "test",
-                cache,
-                options,
-                transfer::Backend::Local,
-            )
-            .await
-        }
+        async move { StateMachine::open_shared(store, "cluster", "test", cache, options).await }
     };
     let mut ahead = open(StateCache::default()).await.unwrap();
     let mut behind = open(COLD).await.unwrap();
@@ -108,16 +98,9 @@ async fn a_failed_install_keeps_its_base() {
         let store: Arc<dyn ObjectStore> = faults.clone();
         let options = &options;
         async move {
-            StateMachine::open_shared(
-                store,
-                "cluster",
-                "test",
-                cache,
-                options,
-                transfer::Backend::Local,
-            )
-            .await
-            .unwrap()
+            StateMachine::open_shared(store, "cluster", "test", cache, options)
+                .await
+                .unwrap()
         }
     };
     let mut ahead = open(StateCache::default()).await;

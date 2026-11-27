@@ -62,7 +62,11 @@ async fn current(state: &StateMachine, key: &[u8]) -> Option<KeyValue> {
 }
 
 async fn check(state: &StateMachine) {
-    assert!(state.key_index.matches(state.db()).await.unwrap());
+    assert!(state
+        .key_index
+        .matches(state.applied_state())
+        .await
+        .unwrap());
 }
 
 async fn apply(state: &mut StateMachine, request: &RequestOp) -> ResponseOp {
@@ -103,10 +107,9 @@ async fn events(state: &StateMachine, start: i64) -> Vec<Event> {
 }
 
 #[tokio::test]
-async fn index_follows_puts_transactions_deletes_revocations_snapshots_and_restart() {
+async fn index_follows_puts_transactions_deletes_and_revocations() {
     let dir = tempfile::tempdir().unwrap();
-    let other = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
     let requests = [put(b"a", b"1"), put(b"b", b"1"), put(b"a", b"2")];
     let puts: Vec<_> = requests
         .iter()
@@ -164,30 +167,6 @@ async fn index_follows_puts_transactions_deletes_revocations_snapshots_and_resta
     check(&state).await;
     assert_eq!(state.key_index.len(), 1);
 
-    let mut target = StateMachine::open(other.path()).await.unwrap();
-    target
-        .apply_etcd(1, &put(b"removed-by-snapshot", b"x"))
-        .await
-        .unwrap()
-        .result
-        .unwrap();
-    let mut snapshot = Snapshot::default();
-    snapshot.mut_metadata().index = state.applied;
-    snapshot.set_data(state.snapshot_data().await.unwrap());
-    target.install_snapshot(&snapshot).await.unwrap();
-    check(&target).await;
-    assert!(target.key_index.get(b"removed-by-snapshot").is_none());
-    assert_eq!(target.key_index.get(b"c"), state.key_index.get(b"c"));
-    target.close().await.unwrap();
-
-    state.db().flush().await.unwrap();
-    let expected = *state.key_index.get(b"c").unwrap();
-    state.close().await.unwrap();
-    drop(state);
-    let state = StateMachine::open(dir.path()).await.unwrap();
-    check(&state).await;
-    assert_eq!(state.key_index.get(b"c"), Some(&expected));
-    assert_eq!(state.key_index.len(), 1);
     state.close().await.unwrap();
 }
 
@@ -195,7 +174,7 @@ async fn index_follows_puts_transactions_deletes_revocations_snapshots_and_resta
 async fn indexed_transactions_match_storage_evaluation() {
     use compare::TargetUnion as T;
     let dir = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
     state
         .apply_lease(1, &LeaseCommand::Grant { id: 9, ttl: 30 })
         .await
@@ -262,7 +241,7 @@ async fn indexed_transactions_match_storage_evaluation() {
     ));
     for request in &requests {
         let expected = mvcc::prepare_with_counts(
-            state.db().as_ref(),
+            state.applied_state(),
             None,
             state.revision,
             state.compact_revision,
@@ -271,7 +250,7 @@ async fn indexed_transactions_match_storage_evaluation() {
         )
         .await;
         let actual = mvcc::prepare_with_counts(
-            state.db().as_ref(),
+            state.applied_state(),
             Some(&state.key_index),
             state.revision,
             state.compact_revision,
@@ -297,8 +276,7 @@ async fn indexed_transactions_match_storage_evaluation() {
 #[tokio::test]
 async fn watch_previous_values_match_the_replaced_rows() {
     let dir = tempfile::tempdir().unwrap();
-    let other = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
     // Record each current row before a change. Watch must return it as the previous value.
     let mut expected: Vec<(i64, Vec<u8>, Option<KeyValue>)> = vec![];
     for key in [&b"a"[..], b"b"] {
@@ -405,35 +383,21 @@ async fn watch_previous_values_match_the_replaced_rows() {
     // The physical pass keeps the history version of every event at or after the boundary.
     super::compaction_tests::finish(&mut state).await;
     check_events(events(&state, boundary).await, boundary, boundary);
-
-    let mut snapshot = Snapshot::default();
-    snapshot.mut_metadata().index = state.applied;
-    snapshot.set_data(state.snapshot_data().await.unwrap());
-    let mut restored = StateMachine::open(other.path()).await.unwrap();
-    restored.install_snapshot(&snapshot).await.unwrap();
-    assert_eq!(
-        events(&restored, boundary).await,
-        events(&state, boundary).await
-    );
-    restored.close().await.unwrap();
     state.close().await.unwrap();
 }
 
 #[tokio::test]
 async fn watch_omits_a_missing_previous_value() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut state = StateMachine::open_memory().await.unwrap();
     apply(&mut state, &put(b"a", b"first")).await;
     let first = state.revision;
     apply(&mut state, &put(b"a", b"second")).await;
     assert!(events(&state, first + 1).await[0].prev_kv.is_some());
 
     // Like etcd, Watch leaves prev_kv empty when the previous version cannot be found.
-    state
-        .db()
-        .delete(crate::mvcc::history_key(b"a", first))
-        .await
-        .unwrap();
+    let mut batch = WriteBatch::new();
+    batch.delete(crate::mvcc::history_key(b"a", first));
+    state.write_memory(&batch);
     let events = events(&state, first + 1).await;
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].kv.as_ref().unwrap().value, b"second");

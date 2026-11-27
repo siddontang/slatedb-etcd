@@ -125,7 +125,7 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
         memory, resource_errors = [], []
         initial = ",".join(f"node{i+1}=http://{peer}" for i, peer in enumerate(peers))
         sample = {"passed": False, "backend": kind, "members": members, "concurrency": concurrency,
-                  "read_percent": reads, "repeat": repeat, "state_mode": state_mode(kind, members)}
+                  "read_percent": reads, "repeat": repeat}
         try:
             for i in range(members):
                 data = root / f"node{i+1}"
@@ -145,19 +145,11 @@ def run_sample(args, tools, binary, kind, concurrency, reads, repeat, observer=N
                     workers = getattr(args, "service_runtime_workers", None)
                     if kind == "service" and workers is not None:
                         command += ["--runtime-workers", str(workers)]
-                    if members > 1:
-                        # Only the fixture's RustFS server sets `s3_allow_http` on its own. For
-                        # a caller's endpoint, the caller's flag stays.
-                        store = {"SLATEDB_S3_TEST_BUCKET": args.s3_bucket,
-                                 "SLATEDB_S3_TEST_ENDPOINT": args.s3_endpoint}
-                        command += shared_args(prefix, store, allow_http=args.s3_allow_http)
-                    else:
-                        if args.s3_bucket:
-                            command += ["--s3-bucket", args.s3_bucket]
-                        if args.s3_endpoint:
-                            command += ["--s3-endpoint", args.s3_endpoint]
-                        if args.s3_allow_http:
-                            command += ["--s3-allow-http"]
+                    # Only the fixture's RustFS server sets `s3_allow_http` on its own. For a
+                    # caller's endpoint, the caller's flag stays.
+                    store = {"SLATEDB_S3_TEST_BUCKET": args.s3_bucket,
+                             "SLATEDB_S3_TEST_ENDPOINT": args.s3_endpoint}
+                    command += shared_args(prefix, store, allow_http=args.s3_allow_http)
                     for j in range(members):
                         command += ["--peer", f"{j+1}={peers[j]}", "--client-peer", f"{j+1}={clients[j]}"]
                 log = open(root / f"node{i+1}.log", "w")
@@ -328,23 +320,16 @@ def main():
         benchmark(args, kinds, store, report)
 
 
-def state_mode(kind, members):
-    """Return the state layout that a backend runs with."""
-    if kind == "etcd":
-        return "local"
-    return "shared" if members > 1 else "replicated"
-
-
 @contextmanager
 def object_store(args, kinds, path, report):
-    """Start RustFS for `--rustfs`, and for service clusters of several members without a bucket.
+    """Start RustFS for `--rustfs`, and for service clusters without a bucket.
 
-    Several service members run in shared state mode, as production runs on S3. First replace the
-    report at `path` with the failed `report`. Yield the store description, or None for
-    local state.
+    Service members run in shared state mode, as production runs on S3. First replace the report
+    at `path` with the failed `report`. Yield the store description, or None for etcd alone or a
+    caller's bucket.
     """
-    several = args.members > 1 and any(kind != "etcd" for kind in kinds)
-    if not args.rustfs and (args.s3_bucket or not several):
+    service = any(kind != "etcd" for kind in kinds)
+    if not args.rustfs and (args.s3_bucket or not service):
         write_pending(path, report)
         yield None
         return
@@ -368,7 +353,6 @@ def new_report(args, kinds):
               "client_target": args.client_target,
               "deployment": f"{args.members} processes per backend; shared host and disk; loopback plaintext",
               "reference_etcd": "v3.6.5", "state_backend": "s3" if args.s3_bucket else "local",
-              "state_modes": {kind: state_mode(kind, args.members) for kind in kinds},
               "raft_snapshot_entries": args.snapshot_entries, "quota_bytes": args.quota_bytes,
               "order_seed": args.seed, "binaries": {},
               "resource_phases": "CPU deltas and peak RSS cover only the measured phase; retained preload memory remains",

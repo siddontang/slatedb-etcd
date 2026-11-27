@@ -635,7 +635,9 @@ mod tests {
     #[tokio::test]
     async fn ordinary_put_stores_the_value_only_in_current_and_history() {
         let dir = tempfile::tempdir().unwrap();
-        let state = crate::state::StateMachine::open(dir.path()).await.unwrap();
+        let state = crate::state::StateMachine::open_test(dir.path())
+            .await
+            .unwrap();
         let request = RequestOp {
             request: Some(Op::RequestPut(PutRequest {
                 key: b"key".to_vec(),
@@ -644,7 +646,7 @@ mod tests {
             })),
         };
         let view = CurrentView {
-            db: state.db().as_ref(),
+            db: state.applied_state(),
             rows: &state.current,
             index: &state.key_index,
         };

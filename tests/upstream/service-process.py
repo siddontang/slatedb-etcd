@@ -29,14 +29,14 @@ STORE_FILE = "shared-store.json"
 
 
 def shared_store(store, cluster):
-    """Return the flags and the environment of one member of a cluster of several members.
+    """Return the flags and the environment of one member.
 
     The members run in shared state mode on RustFS. `cluster` is the first member's data directory.
     It names one cluster and stays the same when the members restart. The prefix of the cluster is
     below the prefix of the run.
     """
     if store is None:
-        raise ValueError("A cluster of several members needs RustFS. Run check-upstream-go.py")
+        raise ValueError("A member needs RustFS. Run check-upstream-go.py")
     prefix = store["prefix"] + "/" + hashlib.sha256(cluster.encode()).hexdigest()[:16]
     env = {name: value for name, value in store.items() if name.startswith("AWS_")}
     return shared_args(prefix, store), dict(env, AWS_EC2_METADATA_DISABLED="true")
@@ -90,12 +90,10 @@ def service_args(argv=None, store=None):
         value = getattr(args, flag.replace("-", "_"))
         if value is not None:
             command.extend(["--" + flag, value])
-    env = {}
-    if len(peers) > 1:
-        if not args.fixture_cluster:
-            parser.error("A cluster of several members needs the fixture cluster name")
-        flags, env = shared_store(store, args.fixture_cluster)
-        command.extend(flags)
+    if not args.fixture_cluster:
+        parser.error("A member needs the fixture cluster name")
+    flags, env = shared_store(store, args.fixture_cluster)
+    command.extend(flags)
     return command, env
 
 

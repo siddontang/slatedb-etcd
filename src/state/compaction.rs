@@ -183,6 +183,7 @@ impl Planner {
         self.plan.as_ref().map_or(0, |_| self.generation)
     }
 
+    #[cfg(test)]
     pub fn clear(&mut self) {
         self.plan = None;
     }
@@ -376,14 +377,11 @@ impl StateMachine {
 
     /// Start reading the next step for the current progress in the background.
     pub(crate) fn plan_compaction(&mut self) {
-        // The planner reads in the background while apply continues. Replicated mode reads the
-        // live database, whose compacted history rows do not change. Shared mode pins a view.
+        // The planner reads a pinned view in the background while apply continues.
         let state = match &self.shared {
-            // A clone of the in-memory state keeps its rows.
-            #[cfg(test)]
-            None if self.is_memory() => self.applied_state().clone(),
-            None => StateView::Live(self.db().clone()),
             Some(shared) => shared.pinned(),
+            // A clone of the in-memory state of a test keeps its rows.
+            None => self.applied_state().clone(),
         };
         self.compaction_plan.start(state, self.compaction.as_ref());
     }

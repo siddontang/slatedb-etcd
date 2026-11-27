@@ -412,12 +412,11 @@ impl Executor {
         }
     }
 
-    /// Install a snapshot. Raft already accepted it, so only a newer snapshot can replace it. In
-    /// shared mode a storage error of the base load leaves the state as it was. A transient
-    /// error runs the install again. A missing object or corrupt data holds it, as for an
-    /// adoption. A newer snapshot ends the wait with `Waited::Covered`. A replicated install is
-    /// not staged, so its errors stop apply. The job keeps the base of the checkpoint across its
-    /// tries, and it drops the base when it ends.
+    /// Install a snapshot. Raft already accepted it, so only a newer snapshot can replace it. A
+    /// storage error of the base load leaves the state as it was. A transient error runs the
+    /// install again. A missing object or corrupt data holds it, as for an adoption. A newer
+    /// snapshot ends the wait with `Waited::Covered`. The job keeps the base of the checkpoint
+    /// across its tries, and it drops the base when it ends.
     pub(super) async fn install_retrying(&mut self, snapshot: &Snapshot) -> Result<Waited> {
         let mut retry = Retry::default();
         let index = snapshot.get_metadata().index + 1;
@@ -426,9 +425,8 @@ impl Executor {
         let mut reader = None;
         loop {
             let installed = Box::pin(self.state.install_snapshot_with(snapshot, &mut reader)).await;
-            let staged = self.state.is_shared();
             let (fault, error) = match installed.map_err(|error| (retryable(&error), error)) {
-                Err((Some(fault), error)) if staged => (fault, error),
+                Err((Some(fault), error)) => (fault, error),
                 installed => {
                     retry.done(&self.signals);
                     return installed

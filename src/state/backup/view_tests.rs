@@ -43,7 +43,6 @@ impl Fixture {
                 overlay_max_bytes: limit,
                 ..options()
             },
-            transfer::Backend::Local,
         )
         .await
         .unwrap();
@@ -207,10 +206,6 @@ async fn a_shared_backup_streams_the_view_image() {
     fixture.delete("gone").await;
     fixture.put("kept", "overlay").await;
     fixture.put("new", "overlay").await;
-    // Shared mode ignores a quota row from a converted state.
-    fixture
-        .put_row(quota::KEY, 7_u64.to_be_bytes().to_vec())
-        .await;
     let state = &fixture.state;
     let expected = state.image_job(true).unwrap().await.unwrap();
     let streamed = collect(state.backup().await.unwrap()).await;
@@ -229,7 +224,6 @@ async fn a_shared_backup_streams_the_view_image() {
     };
     assert!(value("gone").is_none());
     assert!(value("kept").is_some() && value("new").is_some());
-    assert!(rows.iter().all(|(key, _)| key != quota::KEY));
     assert_eq!(rows.last().unwrap().0, crate::cluster::KEY);
     assert_eq!(fixture.holders().status(), (0, 0));
     fixture.close().await;
@@ -263,21 +257,22 @@ async fn a_shared_backup_keeps_its_boundary_across_a_base_switch() {
     data.extend_from_slice(&collect(stream).await);
     fixture.released(first, 0).await;
 
-    let dir = tempfile::tempdir().unwrap();
-    let restored = crate::state::tests::restore(dir.path(), data).await;
-    assert_eq!(restored.revision, revision);
-    let (restored_key, restored_revision) = read(&restored, "key").await;
-    assert_eq!(restored_revision, revision);
-    let restored_key = restored_key.unwrap();
-    assert_eq!(restored_key.value, b"boundary");
+    let rows = decode(&data).rows;
+    let version = |name: &str| {
+        let key = current(name);
+        rows.iter()
+            .find(|(row, _)| *row == key)
+            .map(|(_, value)| <KeyValue as prost::Message>::decode(value.as_slice()).unwrap())
+    };
+    let image_key = version("key").unwrap();
+    assert_eq!(image_key.value, b"boundary");
     assert_eq!(
-        (restored_key.mod_revision, restored_key.create_revision),
+        (image_key.mod_revision, image_key.create_revision),
         (key.mod_revision, key.create_revision)
     );
-    assert_eq!(read(&restored, "only").await.0.unwrap(), only);
-    assert!(read(&restored, "gone").await.0.is_none());
-    assert!(read(&restored, "later").await.0.is_none());
-    restored.close().await.unwrap();
+    assert_eq!(version("only").unwrap(), only);
+    assert!(version("gone").is_none());
+    assert!(version("later").is_none());
     fixture.close().await;
 }
 

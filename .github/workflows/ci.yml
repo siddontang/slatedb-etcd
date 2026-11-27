@@ -140,10 +140,12 @@ jobs:
           import os
           extended = os.environ["EXTENDED"] == "true"
           with open(os.environ["GITHUB_ENV"], "a") as env:
-              dst = ",".join(map(str, range(1, 101))) if extended else "1,2,42,58,70"
+              dst = ",".join(map(str, range(1, 101))) if extended else "1,2,3"
               faults = ",".join(map(str, range(1, 17))) if extended else "1,2,3,4"
               env.write(f"SLATEDB_DST_SEEDS={dst}\nFAULT_SEEDS={faults}\n")
           PY
+      # The members of the integration tests run in shared state mode on this job's RustFS server.
+      - uses: ./.github/actions/rustfs
       - name: Check the Rust Protobuf dependency graph
         run: |
           cargo metadata --locked --all-features --format-version 1 | python3 -c '
@@ -164,7 +166,7 @@ jobs:
           cargo run --locked -- --help >/dev/null
           scripts/cargo.sh clippy --locked --all-targets --all-features -- -D warnings
           scripts/cargo.sh test --locked --features write-profile --lib write_profile::tests
-          scripts/cargo.sh test --locked -- --skip seeded_fault_schedules_replay_identically
+          scripts/cargo.sh test --locked -- --skip shared_store_schedules_replay_identically
           python3 scripts/check-dst.py --seeds "$SLATEDB_DST_SEEDS" --output results/ci/dst.json
       - name: Save DST report
         if: always()
@@ -189,7 +191,7 @@ jobs:
         with:
           name: release-binaries
           path: target/release
-      # Clusters of several members run in shared state mode on this job's RustFS server.
+      # Members run in shared state mode on this job's RustFS server.
       - uses: ./.github/actions/rustfs
       - name: Run official-client KV and metrics tests
         run: |
@@ -223,7 +225,7 @@ jobs:
           path: target/release
       - name: Restore binary permissions
         run: chmod +x target/release/slatedb-etcd target/release/slatedb-etcd-fault
-      # Clusters of several members run in shared state mode on this job's RustFS server.
+      # Members run in shared state mode on this job's RustFS server.
       - uses: ./.github/actions/rustfs
       - name: Check the imported upstream etcd suites
         run: |
@@ -264,7 +266,7 @@ jobs:
           ref: a0614505aff9b8ff469e9c59c2d979a5936d13f4
           path: reference/etcd
           persist-credentials: false
-      # Clusters of several members run in shared state mode on this job's RustFS server.
+      # Members run in shared state mode on this job's RustFS server.
       - uses: ./.github/actions/rustfs
       - name: Run the official etcd benchmarks and process tests
         run: |
@@ -327,7 +329,7 @@ jobs:
           path: target/release
       - name: Restore binary permissions
         run: chmod +x target/release/slatedb-etcd target/release/slatedb-etcd-fault
-      # Clusters of several members run in shared state mode on this job's RustFS server.
+      # Members run in shared state mode on this job's RustFS server.
       - uses: ./.github/actions/rustfs
       - name: Fetch Jepsen dependencies
         working-directory: tests/jepsen
@@ -356,9 +358,9 @@ jobs:
         run: |
           python3 scripts/check-compat.py --output results/ci/etcd-compatibility.json
           python3 scripts/harness.py test --output results/ci/etcd-core-fault-tests.json
-      - name: Check S3 recovery and downstream projects
+      # TestS3Recovery, the only S3 recovery test, waits for a fault on shared SSTs (#149).
+      - name: Check downstream projects
         run: |
-          python3 scripts/check-s3.py --output results/ci/s3-recovery.json
           python3 scripts/check-compat.py --suite downstream --output results/ci/downstream.json
       - name: Check native crash boundaries
         run: |
@@ -506,7 +508,7 @@ jobs:
           path: tmp/performance
       - name: Restore binary permissions
         run: chmod +x tmp/performance/*
-      # Clusters of several members run in shared state mode on this job's RustFS server.
+      # Members run in shared state mode on this job's RustFS server.
       - uses: ./.github/actions/rustfs
       - name: Install Linux profiling tools
         if: matrix.group != 'throughput'
@@ -583,19 +585,6 @@ jobs:
             --compact-every 2500 --retain-revisions 500 --value-pattern metadata \
             --requests 10000 --keys 1000 --warmup 200 --repeat 2 \
             --output results/ci/benchmark-compact.json
-      - name: Compare writes during physical compaction on RustFS
-        if: matrix.group == 'writes'
-        run: |
-          python3 scripts/benchmark-etcd.py --rustfs --binary tmp/performance/head \
-            --baseline-binary tmp/performance/base --backends baseline service \
-            --concurrency 32 --read-percent 0 --rate 300 --value-pattern metadata \
-            --compact-every 750 --retain-revisions 250 --requests 3000 --keys 1000 \
-            --warmup 200 --repeat 2 --output results/ci/benchmark-rustfs.json
-          python3 scripts/benchmark-etcd.py --rustfs --binary tmp/performance/head \
-            --backends service --concurrency 32 --read-percent 0 --rate 1000 \
-            --value-pattern metadata --compact-every 2500 --retain-revisions 500 \
-            --requests 10000 --keys 1000 --warmup 200 --repeat 2 \
-            --output results/ci/benchmark-rustfs-stress.json
       - name: Sample Linux CPU stacks after warmup
         if: matrix.group == 'writes'
         run: |

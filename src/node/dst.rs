@@ -5,7 +5,7 @@ use crate::lease::{LeaseCommand, LeaseReply};
 use crate::mvcc::Outcome;
 use crate::proto::etcdserverpb::request_op::Request as Op;
 use crate::proto::etcdserverpb::response_op::Response as Resp;
-use crate::proto::etcdserverpb::{PutRequest, RangeRequest, WatchCreateRequest};
+use crate::proto::etcdserverpb::{PutRequest, RangeRequest};
 use crate::state::shared::Record;
 use crate::state::{StateRead, StateScan};
 
@@ -51,7 +51,6 @@ struct RevisionRequest {
 struct Simulation {
     seed: u64,
     root: tempfile::TempDir,
-    stores: BTreeMap<u64, std::sync::Arc<crate::object::faults::FaultStore>>,
     nodes: BTreeMap<u64, Node>,
     links: BTreeMap<(u64, u64), mpsc::Receiver<Message>>,
     messages: Vec<Message>,
@@ -70,7 +69,6 @@ struct Simulation {
     paused_flush: Option<u64>,
     paused_reads: Option<u64>,
     paused_log: Option<u64>,
-    held_log: Option<(u64, log::Completion)>,
     expected_log_failure: Option<u64>,
     log_failures: usize,
     random: u64,
@@ -94,19 +92,10 @@ struct Simulation {
     base_checks: u64,
     /// The `--quota-backend-bytes` value of each member. Zero selects 2 GiB.
     quotas: BTreeMap<u64, i64>,
-    /// Started members are directories of an earlier binary that propose no `SetQuota`.
-    upgraded: bool,
-    /// Started members propose no `SeedMembers`, like an earlier binary.
-    hold_members: bool,
     /// The number of voters.
     members: u64,
     /// The process ID of each started member, new at each start.
     processes: BTreeMap<u64, u64>,
-    /// Shared mode: members that run an earlier binary. They send no process ID and do not
-    /// advertise the coverage capability, and they install a view snapshot only at its row.
-    old: BTreeSet<u64>,
-    /// View snapshots that an earlier binary received, each checked at its row.
-    old_installs: u64,
     /// View snapshots above their row that the receiver refused before Raft saw them.
     refused_snapshots: u64,
     /// The checkpoints of the view snapshots that Raft received. IDs are random, so they stay
@@ -149,67 +138,33 @@ fn client_urls(id: u64, members: u64) -> BTreeMap<u64, String> {
 }
 
 impl Simulation {
-    /// Start three replicated members. Their quota flags differ, but none rejects a write.
+    /// Start three members on one fault-injectable in-memory store, with a reference state that
+    /// checks each member state after every step.
     async fn new(seed: u64) -> Self {
-        let quotas = BTreeMap::from([(1, 0), (2, 1 << 30), (3, -1)]);
-        Self::with_options(seed, false, quotas, false, false).await
+        Self::with_options(seed, BTreeMap::new(), true).await
     }
 
-    async fn with_mode(seed: u64, shared: bool) -> Self {
-        Self::with_options(seed, shared, BTreeMap::new(), shared, false).await
+    /// Start three members. `reference` checks each member state against a reference state
+    /// after every step.
+    async fn with_options(seed: u64, quotas: BTreeMap<u64, i64>, reference: bool) -> Self {
+        Self::build(seed, quotas, reference, 3).await
     }
 
-    /// Start three members. Shared mode gives them one fault-injectable in-memory store.
-    /// `reference` checks each member state against a reference state after every step.
-    /// `upgraded` starts the members as directories of an earlier binary that propose no
-    /// `SetQuota` until `release_quota`.
-    async fn with_options(
-        seed: u64,
-        shared: bool,
-        quotas: BTreeMap<u64, i64>,
-        reference: bool,
-        upgraded: bool,
-    ) -> Self {
-        Self::with_holds(seed, shared, quotas, reference, upgraded, false).await
+    /// Start a simulation with `members` voters and a reference state.
+    async fn with_size(seed: u64, members: u64) -> Self {
+        Self::build(seed, BTreeMap::new(), true, members).await
     }
 
-    /// Like `with_options`. `hold_members` also starts the members without `SeedMembers`, so
-    /// each one stores its own flags, like an earlier binary.
-    async fn with_holds(
-        seed: u64,
-        shared: bool,
-        quotas: BTreeMap<u64, i64>,
-        reference: bool,
-        upgraded: bool,
-        hold_members: bool,
-    ) -> Self {
-        Self::build(seed, shared, quotas, reference, upgraded, hold_members, 3).await
-    }
-
-    /// Start a simulation with `members` voters. Shared mode has a reference state.
-    async fn with_size(seed: u64, shared: bool, members: u64) -> Self {
-        Self::build(seed, shared, BTreeMap::new(), shared, false, false, members).await
-    }
-
-    async fn build(
-        seed: u64,
-        shared: bool,
-        quotas: BTreeMap<u64, i64>,
-        reference: bool,
-        upgraded: bool,
-        hold_members: bool,
-        members: u64,
-    ) -> Self {
+    async fn build(seed: u64, quotas: BTreeMap<u64, i64>, reference: bool, members: u64) -> Self {
         let root = tempfile::tempdir().unwrap();
         let reference = if reference {
-            Some(reference::Reference::open(&root.path().join("reference"), shared).await)
+            Some(reference::Reference::open(&root.path().join("reference")).await)
         } else {
             None
         };
         let mut sim = Self {
             seed,
             root,
-            stores: BTreeMap::new(),
             nodes: BTreeMap::new(),
             links: BTreeMap::new(),
             messages: vec![],
@@ -227,7 +182,6 @@ impl Simulation {
             paused_flush: None,
             paused_reads: None,
             paused_log: None,
-            held_log: None,
             expected_log_failure: None,
             log_failures: 0,
             random: seed.max(1),
@@ -235,23 +189,17 @@ impl Simulation {
             trace: vec![],
             installed_snapshots: 0,
             proposed: BTreeSet::new(),
-            shared: shared.then(|| {
-                std::sync::Arc::new(crate::object::faults::FaultStore::new(std::sync::Arc::new(
-                    slatedb::object_store::memory::InMemory::new(),
-                )))
-            }),
+            shared: Some(std::sync::Arc::new(crate::object::faults::FaultStore::new(
+                std::sync::Arc::new(slatedb::object_store::memory::InMemory::new()),
+            ))),
             reference,
             digests: BTreeMap::new(),
             checked: BTreeMap::new(),
             view_checks: 0,
             base_checks: 0,
             quotas,
-            upgraded,
-            hold_members,
             members,
             processes: BTreeMap::new(),
-            old: BTreeSet::new(),
-            old_installs: 0,
             refused_snapshots: 0,
             delivered_views: vec![],
             extended: 0,
@@ -282,64 +230,24 @@ impl Simulation {
             senders.insert(peer, tx);
             self.links.insert((id, peer), rx);
         }
-        let store = match &self.shared {
-            Some(store) => store.clone(),
-            None => self
-                .stores
-                .entry(id)
-                .or_insert_with(|| {
-                    let path = self.root.path().join(id.to_string()).join("objects");
-                    std::fs::create_dir_all(&path).unwrap();
-                    std::sync::Arc::new(crate::object::faults::FaultStore::new(
-                        std::sync::Arc::new(
-                            slatedb::object_store::local::LocalFileSystem::new_with_prefix(path)
-                                .unwrap(),
-                        ),
-                    ))
-                })
-                .clone(),
-        };
-        let shared = self.shared.is_some();
+        let store = self.shared.clone().expect("a shared store");
         let flag = self.quotas.get(&id).copied().unwrap_or(0);
-        if self.upgraded {
-            // An earlier binary created the directory, so this binary did not create it empty.
-            let dir = self.root.path().join(id.to_string());
-            std::fs::create_dir_all(&dir).unwrap();
-            let startup = quota::Startup {
-                member: id,
-                flag,
-                shared,
-                empty: false,
-                reassert: false,
-                now: 0,
-            };
-            quota::Quota::open(&dir, startup).unwrap();
-        }
         // Box the large open future, so the schedule future fits the test thread stack.
-        let mut node = Box::pin(Node::open_with_transport(
+        let node = Box::pin(Node::open_with_transport(
             NodeOptions {
                 client_peers: client_urls(id, self.members),
                 transport: crate::tls::Transport::default(),
                 require_peer_tls: false,
-                state_mode: if shared {
-                    crate::state::StateMode::Shared
-                } else {
-                    crate::state::StateMode::Replicated
-                },
                 view_max_age: std::time::Duration::from_secs(10),
                 view_pin_max: std::time::Duration::from_secs(300),
                 overlay_max_bytes: 1 << 30,
                 max_clock_skew: std::time::Duration::from_secs(5),
                 view_retention: Default::default(),
                 restore: None,
-                object_store: crate::object::Config::Test(
-                    store,
-                    if shared { "root" } else { "state" }.into(),
-                ),
+                object_store: crate::object::Config::Test(store, "root".into()),
                 strict_reconfiguration: false,
                 join: self.joining == Some(id),
                 quota_bytes: flag,
-                quota_reassert: false,
                 quota_warning_fraction: 0.0,
                 auto_compaction: None,
                 id,
@@ -348,8 +256,8 @@ impl Simulation {
                 peers: (1..=self.members)
                     .map(|n| (n, format!("127.0.0.1:{n}")))
                     .collect(),
-                // Shared members truncate often, so a lagging member needs a format 6 snapshot.
-                snapshot_every: if shared { 8 } else { 0 },
+                // Members truncate often, so a lagging member needs a format 6 snapshot.
+                snapshot_every: 8,
                 snapshot_min_bytes: 0,
                 log_file_bytes: 256 * 1024,
                 log_memory: LogMemory {
@@ -363,8 +271,6 @@ impl Simulation {
         ))
         .await
         .unwrap();
-        node.quota.hold = self.upgraded;
-        node.hold_members = self.hold_members;
         self.nodes.insert(id, node);
         let process = self.processes.values().max().map_or(1, |last| last + 1);
         self.processes.insert(id, process);
@@ -413,13 +319,9 @@ impl Simulation {
                 node.drain_reads().await.unwrap();
             }
             if self.paused_flush != Some(id) && node.compaction.active() {
-                // A shared flush only waits for a covering base, which a later writer step
-                // publishes. So a shared simulation polls it once and goes on.
-                let completed = if self.shared.is_some() {
-                    futures::FutureExt::now_or_never(node.compaction.next())
-                } else {
-                    Some(node.compaction.next().await)
-                };
+                // A flush only waits for a covering base, which a later writer step publishes.
+                // So the simulation polls it once and goes on.
+                let completed = futures::FutureExt::now_or_never(node.compaction.next());
                 if let Some(completed) = completed {
                     node.finish_compaction_flush(completed.unwrap()).unwrap();
                 }
@@ -598,9 +500,7 @@ impl Simulation {
                 }
             }
         }
-        if self.shared.is_some() {
-            self.settle_opens().await;
-        }
+        self.settle_opens().await;
         if self.reference.is_some() {
             self.check_reference().await;
         }
@@ -736,121 +636,6 @@ impl Simulation {
         self.drive().await;
     }
 
-    async fn read(&mut self) {
-        let candidates: Vec<_> = self
-            .nodes
-            .iter()
-            .filter_map(|(&id, node)| (node.raw.raft.leader_id != 0).then_some(id))
-            .collect();
-        if candidates.is_empty() {
-            return;
-        }
-        let id = candidates[self.choose(candidates.len())];
-        let count = self.choose(6) + 3;
-        let point = if self.choose(2) == 0 {
-            self.acknowledged
-                .first_key_value()
-                .map(|(key, value)| (key.clone(), value.clone()))
-        } else {
-            None
-        };
-        for offset in 0..count {
-            let (tx, rx) = oneshot::channel();
-            let node = self.nodes.get_mut(&id).unwrap();
-            node.linear_read_auth(
-                RequestOp {
-                    request: Some(Op::RequestRange(RangeRequest {
-                        key: point
-                            .as_ref()
-                            .map_or_else(|| b"key-".to_vec(), |(key, _)| key.as_bytes().to_vec()),
-                        range_end: if point.is_some() {
-                            vec![]
-                        } else {
-                            b"key.".to_vec()
-                        },
-                        ..Default::default()
-                    })),
-                },
-                None,
-                ClientResponse::Kv(tx),
-            );
-            // Issue one batch, cancel its first client, then queue later reads.
-            if offset == 1 {
-                node.drive_ready().await.unwrap();
-                self.reads.pop();
-                self.trace.push(format!("cancel read {id}"));
-            }
-            self.trace.push(format!("read {id}"));
-            self.reads.push(ReadRequest {
-                node: id,
-                known: point.as_ref().map_or_else(
-                    || self.acknowledged.clone(),
-                    |(key, value)| [(key.clone(), value.clone())].into_iter().collect(),
-                ),
-                reply: rx,
-            });
-        }
-        self.drive().await;
-    }
-
-    async fn checkpoint(&mut self) {
-        for node in self.nodes.values_mut() {
-            let index = node.state.applied;
-            if index <= node.raw.store().snapshot_index() {
-                continue;
-            }
-            // Build the same checkpoint descriptor that a peer snapshot request builds.
-            let data = node
-                .worker
-                .state()
-                .checkpoint_job(true)
-                .await
-                .unwrap()
-                .await
-                .unwrap()
-                .unwrap();
-            node.handle(
-                Event::SnapshotBuilt(apply::Built {
-                    index,
-                    conf: node.worker.state().members.conf(),
-                    result: PreparedCheckpoint::write(&node.options.dir.join("raft"), data.into())
-                        .map(Some),
-                }),
-                &mut vec![],
-            )
-            .await
-            .unwrap();
-            self.trace
-                .push(format!("snapshot {} {index}", node.options.id));
-        }
-        self.drive().await;
-    }
-
-    /// Flush state and truncate each log without an image, as automatic checkpoints do.
-    async fn truncate(&mut self) {
-        for (&id, node) in &mut self.nodes {
-            let index = node.state.applied;
-            if index <= node.raw.store().snapshot_index() {
-                continue;
-            }
-            let conf = node.worker.state().members.conf();
-            let job = node.worker.state().checkpoint_job(false).await.unwrap();
-            assert!(job.await.unwrap().is_none());
-            node.handle(
-                Event::SnapshotBuilt(apply::Built {
-                    index,
-                    conf,
-                    result: Ok(None),
-                }),
-                &mut vec![],
-            )
-            .await
-            .unwrap();
-            self.trace.push(format!("truncate {id} {index}"));
-        }
-        self.drive().await;
-    }
-
     async fn assert_acknowledged(&self, id: u64) {
         let state = self.nodes[&id].worker.state();
         for (key, value) in &self.acknowledged {
@@ -885,194 +670,6 @@ impl Simulation {
         }
     }
 
-    async fn restart_between_checkpoint_file_and_reference(&mut self) {
-        self.checkpoint().await;
-        let id = self.choose(3) as u64 + 1;
-        let storage = self.nodes[&id].log_worker.storage();
-        let saved = storage.recovery_snapshot().clone();
-        let index = saved.get_metadata().index;
-        assert!(index > 0);
-        // Keep a synced local image pending while Raft processes more messages.
-        let dir = self.root.path().join(id.to_string()).join("raft");
-        let file = dir.join(format!("checkpoint-{index:016x}.data"));
-        // The image is a small checkpoint descriptor. Recovery tests cover compressed images.
-        assert!(std::fs::metadata(file).unwrap().len() > 0);
-        let staged = PreparedCheckpoint::write(&dir, saved.data.clone().into()).unwrap();
-        self.read().await;
-        self.drive().await;
-        assert_eq!(self.nodes[&id].raw.store().snapshot_index(), index);
-        drop(staged);
-        self.stop(id);
-        let orphan = dir.join(format!("checkpoint-{:016x}.data", index + 1));
-        std::fs::write(&orphan, b"unpublished snapshot").unwrap();
-        self.start(id).await;
-        assert_eq!(
-            self.nodes[&id].log_worker.storage().recovery_snapshot(),
-            &saved
-        );
-        assert!(!orphan.exists());
-        self.trace
-            .push(format!("reject unpublished checkpoint {id} {index}"));
-    }
-
-    async fn object_faults(&mut self) {
-        use crate::object::faults::{FAIL_GET, FAIL_PUT, LOSE_PUT_REPLY, PAUSE_PUT};
-        let id = self.choose(3) as u64 + 1;
-        let store = self.stores[&id].clone();
-        let node = &self.nodes[&id];
-        let before = node.raw.store().snapshot_index();
-        let first = node.raw.store().first_index().unwrap();
-        store.set(PAUSE_PUT);
-        let index = node.state.applied;
-        let conf = node.worker.state().members.conf();
-        let job = tokio::spawn(node.worker.state().snapshot_job().unwrap());
-        tokio::time::timeout(Duration::from_secs(10), store.entered.acquire())
-            .await
-            .unwrap()
-            .unwrap()
-            .forget();
-        self.trace.push(format!("pause object put {id}"));
-        // Raft can commit and ReadIndex can complete while the checkpoint waits for S3.
-        self.propose().await;
-        for _ in 0..100 {
-            self.deliver(false).await;
-        }
-        self.read().await;
-        assert!(!job.is_finished());
-        assert_eq!(self.nodes[&id].raw.store().snapshot_index(), before);
-        assert_eq!(self.nodes[&id].raw.store().first_index().unwrap(), first);
-        store.release.add_permits(1);
-        let data = job.await.unwrap().unwrap();
-        let staged =
-            PreparedCheckpoint::write(&self.nodes[&id].options.dir.join("raft"), data.into())
-                .unwrap();
-        if self.choose(2) == 0 {
-            self.nodes
-                .get_mut(&id)
-                .unwrap()
-                .handle(
-                    Event::SnapshotBuilt(apply::Built {
-                        index,
-                        conf,
-                        result: Ok(Some(staged)),
-                    }),
-                    &mut vec![],
-                )
-                .await
-                .unwrap();
-            self.drive().await;
-            self.trace.push(format!("publish object checkpoint {id}"));
-        } else {
-            self.trace
-                .push(format!("drop object checkpoint completion {id}"));
-        }
-        self.stop(id);
-        store.set(FAIL_GET);
-        assert!(StateMachine::open_store(store.clone(), "state")
-            .await
-            .is_err());
-        self.trace.push(format!("fail object recovery read {id}"));
-        store.set(0);
-        self.start(id).await;
-        for _ in 0..25 {
-            for member in 1..=3 {
-                self.tick(member).await;
-            }
-            for _ in 0..30 {
-                self.deliver(false).await;
-            }
-        }
-        // A successful PUT with a lost reply must keep the same immutable object.
-        self.propose_before_object_fault(id).await;
-        let before = self.nodes[&id].raw.store().snapshot_index();
-        while let Ok(permit) = store.entered.try_acquire() {
-            permit.forget();
-        }
-        store.set(LOSE_PUT_REPLY);
-        self.nodes[&id]
-            .worker
-            .state()
-            .snapshot_job()
-            .unwrap()
-            .await
-            .unwrap();
-        assert_eq!(self.nodes[&id].raw.store().snapshot_index(), before);
-        store.entered.try_acquire().unwrap().forget();
-        self.trace
-            .push(format!("recover lost object put reply {id}"));
-        self.propose_before_object_fault(id).await;
-        let before = self.nodes[&id].raw.store().snapshot_index();
-        let first = self.nodes[&id].raw.store().first_index().unwrap();
-        store.set(FAIL_PUT);
-        let result = tokio::time::timeout(
-            Duration::from_secs(10),
-            self.nodes[&id].worker.state().snapshot_job().unwrap(),
-        )
-        .await
-        .unwrap();
-        assert!(result.is_err());
-        store.entered.try_acquire().unwrap().forget();
-        assert_eq!(self.nodes[&id].raw.store().snapshot_index(), before);
-        assert_eq!(self.nodes[&id].raw.store().first_index().unwrap(), first);
-        self.trace
-            .push(format!("fail object checkpoint without log GC {id}"));
-        self.stop(id);
-        store.set(0);
-        self.start(id).await;
-        for _ in 0..25 {
-            for member in 1..=3 {
-                self.tick(member).await;
-            }
-            for _ in 0..30 {
-                self.deliver(false).await;
-            }
-        }
-        for (key, value) in &self.acknowledged {
-            let outcome = self.nodes[&id]
-                .worker
-                .state()
-                .read_etcd(&RequestOp {
-                    request: Some(Op::RequestRange(RangeRequest {
-                        key: key.as_bytes().to_vec(),
-                        ..Default::default()
-                    })),
-                })
-                .await
-                .unwrap();
-            let Some(Resp::ResponseRange(response)) = outcome.result.unwrap().response else {
-                panic!("expected range");
-            };
-            assert_eq!(response.kvs.len(), 1);
-            assert_eq!(response.kvs[0].value, value.as_bytes());
-        }
-    }
-
-    async fn propose_before_object_fault(&mut self, id: u64) {
-        let leader = self.leader().unwrap();
-        self.propose().await;
-        let index = self.nodes[&leader].raw.raft.raft_log.last_index();
-        let key = format!("key-{}", self.next_request);
-        for _ in 0..100 {
-            self.deliver(false).await;
-        }
-        // Reordered appends can leave the follower waiting for a heartbeat with the commit index.
-        // A clean state flush does not PUT an object and cannot exercise a PUT fault.
-        for _ in 0..100 {
-            if self.nodes[&id].state.applied >= index && self.acknowledged.contains_key(&key) {
-                self.trace
-                    .push(format!("object fault apply barrier {id} {index}"));
-                return;
-            }
-            for member in 1..=3 {
-                self.tick(member).await;
-            }
-            for _ in 0..30 {
-                self.deliver(false).await;
-            }
-        }
-        panic!("object fault setup did not apply {key} at index {index} on node {id}");
-    }
-
     async fn lease(&mut self, lease: LeaseCommand) {
         let leader = self.leader().unwrap();
         let (tx, mut rx) = oneshot::channel();
@@ -1101,1018 +698,6 @@ impl Simulation {
         }
         panic!("lease command did not commit");
     }
-
-    async fn admin_command(&mut self, command: RaftCommand) -> Outcome<Value> {
-        let leader = self.leader().unwrap();
-        self.trace.push(format!("admin {}", command.id()));
-        let (tx, mut rx) = oneshot::channel();
-        self.nodes
-            .get_mut(&leader)
-            .unwrap()
-            .propose(command, tx)
-            .unwrap();
-        self.drive().await;
-        for _ in 0..500 {
-            self.deliver(false).await;
-            if let Ok(result) = rx.try_recv() {
-                return serde_json::from_value(result.unwrap()).unwrap();
-            }
-        }
-        panic!("admin command did not commit");
-    }
-
-    async fn admin_recovery(&mut self) {
-        use crate::auth::{Command as A, Credentials};
-        use crate::proto::etcdserverpb::*;
-        let root = Credentials {
-            user: Some("root".into()),
-            time: 100,
-            ..Default::default()
-        };
-        let writer = Credentials {
-            user: Some("writer".into()),
-            time: 100,
-            ..Default::default()
-        };
-        let commands = [
-            A::UserAdd(AuthUserAddRequest {
-                name: "root".into(),
-                ..Default::default()
-            }),
-            A::UserGrantRole(AuthUserGrantRoleRequest {
-                user: "root".into(),
-                role: "root".into(),
-            }),
-            A::UserAdd(AuthUserAddRequest {
-                name: "writer".into(),
-                hashed_password: "hash".into(),
-                ..Default::default()
-            }),
-            A::RoleAdd(AuthRoleAddRequest {
-                name: "writer".into(),
-            }),
-            A::RoleGrantPermission(AuthRoleGrantPermissionRequest {
-                name: "writer".into(),
-                perm: Some(crate::proto::authpb::Permission {
-                    perm_type: 2,
-                    key: b"a".to_vec(),
-                    range_end: b"z".to_vec(),
-                }),
-            }),
-            A::UserGrantRole(AuthUserGrantRoleRequest {
-                user: "writer".into(),
-                role: "writer".into(),
-            }),
-            A::Enable(AuthEnableRequest {}),
-            A::IssueToken {
-                name: "writer".into(),
-                password: "hash".into(),
-                token: "dst-token".into(),
-                expires: 150,
-            },
-        ];
-        for (i, auth) in commands.into_iter().enumerate() {
-            self.admin_command(RaftCommand::Auth {
-                id: format!("auth-{i}"),
-                auth,
-                credentials: root.clone(),
-            })
-            .await
-            .result
-            .unwrap();
-        }
-        let token = Credentials {
-            token: "dst-token".into(),
-            time: 100,
-            ..Default::default()
-        };
-        let leader = self.leader().unwrap();
-        assert!(self.nodes[&leader]
-            .state
-            .auth
-            .range(&token, b"admin", b"", true)
-            .is_ok());
-        let expired = Credentials {
-            time: 150,
-            ..token.clone()
-        };
-        assert!(self.nodes[&leader]
-            .state
-            .auth
-            .range(&expired, b"admin", b"", true)
-            .is_err());
-        let lagging = leader % 3 + 1;
-        self.isolated = Some(lagging);
-        self.paused_apply = Some(leader);
-        let (revoke_tx, mut revoke_rx) = oneshot::channel();
-        let (put_tx, mut put_rx) = oneshot::channel();
-        let node = self.nodes.get_mut(&leader).unwrap();
-        node.propose(
-            RaftCommand::Auth {
-                id: "revoke".into(),
-                credentials: root.clone(),
-                auth: A::RoleRevokePermission(AuthRoleRevokePermissionRequest {
-                    role: "writer".into(),
-                    key: b"a".to_vec(),
-                    range_end: b"z".to_vec(),
-                }),
-            },
-            revoke_tx,
-        )
-        .unwrap();
-        node.propose(
-            RaftCommand::Etcd {
-                id: "denied-put".into(),
-                origin: leader,
-                etcd: RequestOp {
-                    request: Some(Op::RequestPut(PutRequest {
-                        key: b"admin".to_vec(),
-                        value: b"forbidden".to_vec(),
-                        ..Default::default()
-                    })),
-                },
-            }
-            .secure(Some(writer.clone())),
-            put_tx,
-        )
-        .unwrap();
-        self.drive().await;
-        for _ in 0..200 {
-            self.deliver(false).await;
-        }
-        assert!(revoke_rx.try_recv().is_err());
-        assert!(put_rx.try_recv().is_err());
-        self.paused_apply = None;
-        self.drive().await;
-        let revoked: Outcome<Value> =
-            serde_json::from_value(revoke_rx.await.unwrap().unwrap()).unwrap();
-        revoked.result.unwrap();
-        let denied: Outcome<Value> =
-            serde_json::from_value(put_rx.await.unwrap().unwrap()).unwrap();
-        assert_eq!(
-            denied.result.unwrap_err().code,
-            tonic::Code::PermissionDenied as i32
-        );
-        self.trace.push("revocation fences queued write".into());
-        let first = self.nodes[&leader].state.revision;
-        let physical = |id: &str, revision| {
-            RaftCommand::Compact {
-                id: id.into(),
-                compact: CompactionRequest {
-                    revision,
-                    physical: true,
-                },
-            }
-            .secure(Some(root.clone()))
-        };
-        self.paused_flush = Some(leader);
-        let (tx, mut first_reply) = oneshot::channel();
-        self.nodes
-            .get_mut(&leader)
-            .unwrap()
-            .propose(physical("physical", first), tx)
-            .unwrap();
-        self.drive().await;
-        for _ in 0..500 {
-            if self.nodes[&leader].compaction.active() {
-                break;
-            }
-            self.deliver(false).await;
-        }
-        let store = self.stores[&leader].clone();
-        while let Ok(permit) = store.entered.try_acquire() {
-            permit.forget();
-        }
-        store.set(crate::object::faults::PAUSE_PUT);
-        let node = self.nodes.get_mut(&leader).unwrap();
-        assert_eq!(node.state.compact_revision, first);
-        let first_index = node.state.applied;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::select! {
-                result = node.compaction.next() => panic!("unexpected flush completion: {result:?}"),
-                entered = store.entered.acquire() => entered.unwrap().forget(),
-            }
-        })
-        .await
-        .expect("the compaction flush must reach the object store");
-        let (retry, mut retry_reply) = oneshot::channel();
-        self.nodes
-            .get_mut(&leader)
-            .unwrap()
-            .propose(physical("physical-retry", first), retry)
-            .unwrap();
-        self.admin_command(
-            RaftCommand::Etcd {
-                id: "put-during-flush".into(),
-                origin: leader,
-                etcd: RequestOp {
-                    request: Some(Op::RequestPut(PutRequest {
-                        key: b"flush-progress".to_vec(),
-                        value: b"applied".to_vec(),
-                        ..Default::default()
-                    })),
-                },
-            }
-            .secure(Some(root.clone())),
-        )
-        .await
-        .result
-        .unwrap();
-        let revision = self.nodes[&leader].state.revision;
-        assert!(revision > first);
-        let (tx, mut second_reply) = oneshot::channel();
-        self.nodes
-            .get_mut(&leader)
-            .unwrap()
-            .propose(physical("second-physical", revision), tx)
-            .unwrap();
-        self.drive().await;
-        // Replicated steps remove the rows. Their final flush queues behind the held flush.
-        for _ in 0..500 {
-            let state = &self.nodes[&leader].state;
-            if state.compact_revision == revision && !state.compaction_pending {
-                break;
-            }
-            self.deliver(false).await;
-        }
-        let node = self.nodes.get_mut(&leader).unwrap();
-        assert_eq!(node.state.compact_revision, revision);
-        assert_eq!(node.state.physical_revision, revision);
-        assert!(matches!(
-            first_reply.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        assert!(*node.forwarding.subscribe().compact.borrow() < first);
-        store.release.add_permits(1);
-        let flushed = node.compaction.next().await.unwrap();
-        assert_eq!(flushed, (first_index, first));
-        node.finish_compaction_flush(flushed).unwrap();
-        let reply: Outcome<Value> =
-            serde_json::from_value(first_reply.await.unwrap().unwrap()).unwrap();
-        reply.result.unwrap();
-        assert!(matches!(
-            second_reply.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        assert!(matches!(
-            retry_reply.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        assert_eq!(*node.forwarding.subscribe().compact.borrow(), first);
-        self.paused_flush = None;
-        self.drive().await;
-        let retried: Outcome<Value> =
-            serde_json::from_value(retry_reply.await.unwrap().unwrap()).unwrap();
-        assert_eq!(
-            retried.result.unwrap_err().code,
-            tonic::Code::OutOfRange as i32
-        );
-        let reply: Outcome<Value> =
-            serde_json::from_value(second_reply.await.unwrap().unwrap()).unwrap();
-        reply.result.unwrap();
-        assert_eq!(
-            *self.nodes[&leader].forwarding.subscribe().compact.borrow(),
-            revision
-        );
-        self.trace
-            .push("a later write applied during the held compaction flush".into());
-        self.checkpoint().await;
-        self.stop(lagging);
-        self.start(lagging).await;
-        self.isolated = None;
-        for _ in 0..50 {
-            for id in 1..=3 {
-                self.tick(id).await;
-            }
-            for _ in 0..30 {
-                self.deliver(false).await;
-            }
-        }
-        for node in self.nodes.values() {
-            assert_eq!(node.state.compact_revision, revision);
-            let state = node.worker.state();
-            assert_eq!(
-                state.logical_usage(),
-                crate::state::maintenance::count_logical_usage(state.db().as_ref())
-                    .await
-                    .unwrap()
-            );
-            assert!(state.key_index.matches(state.db()).await.unwrap());
-            assert!(node.state.auth.range(&writer, b"admin", b"", true).is_err());
-            assert!(node.state.auth.range(&token, b"admin", b"", true).is_err());
-            let value = node
-                .worker
-                .state()
-                .read_etcd(&RequestOp {
-                    request: Some(Op::RequestRange(RangeRequest {
-                        key: b"admin".to_vec(),
-                        ..Default::default()
-                    })),
-                })
-                .await
-                .unwrap();
-            let Some(Resp::ResponseRange(value)) = value.result.unwrap().response else {
-                panic!()
-            };
-            assert!(value.kvs.is_empty());
-        }
-        self.trace
-            .push("auth and physical compact recovered".into());
-    }
-
-    /// Renew a lease in leader memory, as the gRPC KeepAlive path does.
-    async fn renew(&mut self, member: u64, lease: i64) -> std::result::Result<i64, ApiError> {
-        let (tx, mut rx) = oneshot::channel();
-        self.trace.push(format!("renew {member} {lease}"));
-        self.nodes
-            .get_mut(&member)
-            .unwrap()
-            .keep_alive(lease, None, tx)
-            .unwrap();
-        self.drive().await;
-        for _ in 0..300 {
-            if let Ok(result) = rx.try_recv() {
-                let outcome: Outcome<LeaseReply> = serde_json::from_value(result?).unwrap();
-                let Ok(LeaseReply::KeepAlive(response)) = outcome.result else {
-                    panic!("expected a KeepAlive reply");
-                };
-                return Ok(response.ttl);
-            }
-            self.deliver(false).await;
-        }
-        panic!("renewal on {member} did not finish");
-    }
-
-    /// Retry a renewal that a slow host cancelled for a stale proof.
-    async fn renew_on_leader(&mut self, lease: i64) -> i64 {
-        for _ in 0..3 {
-            let leader = self.leader().unwrap();
-            match self.renew(leader, lease).await {
-                Ok(ttl) => return ttl,
-                Err(error) => assert!(error.error.contains("renewal cancelled"), "{error:?}"),
-            }
-            self.settle(25).await;
-        }
-        panic!("leader did not renew lease {lease}");
-    }
-
-    /// An isolated leader cannot renew in memory. The next leader extends inherited leases.
-    async fn renew_under_partition(&mut self) {
-        self.settle(25).await;
-        let ttl = self.nodes[&self.leader().unwrap()].state.leases[&77].ttl;
-        assert_eq!(self.renew_on_leader(77).await, ttl);
-        let old = self.leader().unwrap();
-        let last = self.nodes[&old].raw.raft.raft_log.last_index();
-        assert_eq!(self.renew(old, 78).await.unwrap(), 0, "unknown lease");
-        assert_eq!(
-            self.nodes[&old].raw.raft.raft_log.last_index(),
-            last,
-            "an in-memory renewal must not append a log entry"
-        );
-
-        // Cut the leader off. Its proof cannot reach a quorum, and check_quorum demotes it.
-        self.isolated = Some(old);
-        self.trace.push(format!("isolate renewing leader {old}"));
-        let (tx, mut rx) = oneshot::channel();
-        self.nodes
-            .get_mut(&old)
-            .unwrap()
-            .keep_alive(77, None, tx)
-            .unwrap();
-        self.settle(25).await;
-        let error = rx
-            .try_recv()
-            .expect("the isolated renewal must finish")
-            .expect_err("an isolated leader must not renew");
-        assert!(
-            error.error.contains("renewal cancelled") || error.error == "not leader",
-            "{error:?}"
-        );
-        let node = self.nodes.get_mut(&old).unwrap();
-        assert_ne!(node.raw.raft.state, StateRole::Leader);
-        // The run loop syncs deadlines after each event. A follower keeps none.
-        node.sync_lease_deadlines();
-        assert!(node.lease_deadlines.is_empty() && node.renewals.is_empty());
-        // A member that is no longer leader rejects new renewals, so the gRPC layer forwards them.
-        assert_eq!(self.renew(old, 77).await.unwrap_err().error, "not leader");
-
-        // The majority side elects a leader that gives the inherited lease its TTL plus the
-        // longest election timeout, so no renewal the old leader replied to can outlive it.
-        let new = self.leader().expect("the majority must elect a leader");
-        assert_ne!(new, old);
-        let node = self.nodes.get_mut(&new).unwrap();
-        node.sync_lease_deadlines();
-        let remaining = node.lease_deadlines[&77]
-            .1
-            .saturating_duration_since(Instant::now());
-        assert!(
-            remaining > Duration::from_secs(ttl as u64),
-            "seed {}: {remaining:?}",
-            self.seed
-        );
-        assert_eq!(self.renew_on_leader(77).await, ttl);
-
-        self.isolated = None;
-        self.trace.push("heal renewing leader".into());
-        self.settle(25).await;
-        assert_eq!(self.renew_on_leader(77).await, ttl);
-    }
-
-    async fn batch_and_pinned_reads(&mut self) {
-        let leader = self.leader().unwrap();
-        self.paused_reads = Some(leader);
-        let old_revision = self.nodes[&leader].state.revision;
-        let (tx, read) = oneshot::channel();
-        self.nodes
-            .get_mut(&leader)
-            .unwrap()
-            .enqueue_query(Query::Read(
-                RequestOp {
-                    request: Some(Op::RequestRange(RangeRequest {
-                        key: b"batch-key".to_vec(),
-                        serializable: true,
-                        ..Default::default()
-                    })),
-                },
-                None,
-                ClientResponse::Kv(tx),
-            ));
-        self.drive().await;
-        assert!(self.nodes[&leader].read_executor.len() > 0);
-        self.paused_apply = Some(leader);
-        let before = self.nodes[&leader].state.write_batches;
-        let mut replies = vec![];
-        // Keep one large value through Watch replay, compaction, and checkpoint recovery.
-        let batch_value = |index: usize| match index {
-            3 => vec![],
-            7 => vec![0, 255, 0, 127],
-            15 => vec![b'v'; 64 * 1024],
-            _ => format!("v{index}").into_bytes(),
-        };
-        for index in 0..16 {
-            let (tx, rx) = oneshot::channel();
-            self.nodes
-                .get_mut(&leader)
-                .unwrap()
-                .propose(
-                    RaftCommand::Etcd {
-                        id: format!("batch-{index}"),
-                        origin: leader,
-                        etcd: RequestOp {
-                            request: Some(Op::RequestPut(PutRequest {
-                                key: b"batch-key".to_vec(),
-                                value: batch_value(index),
-                                prev_kv: index % 2 == 0,
-                                ..Default::default()
-                            })),
-                        },
-                    },
-                    ClientResponse::Kv(tx),
-                )
-                .unwrap();
-            replies.push(rx);
-        }
-        self.drive().await;
-        for _ in 0..150 {
-            self.deliver(false).await;
-        }
-        self.paused_apply = None;
-        self.drive().await;
-        for _ in 0..150 {
-            self.deliver(false).await;
-        }
-        let writes = self.nodes[&leader].state.write_batches - before;
-        assert!(writes < 16, "put burst did not share storage writes");
-        for (offset, mut reply) in replies.into_iter().enumerate() {
-            let Some(Resp::ResponsePut(value)) = reply
-                .try_recv()
-                .unwrap()
-                .unwrap()
-                .into_outcome()
-                .result
-                .unwrap()
-                .response
-            else {
-                panic!("expected put");
-            };
-            assert_eq!(
-                value.header.unwrap().revision,
-                old_revision + offset as i64 + 1
-            );
-            assert_eq!(
-                value.prev_kv.map(|kv| kv.value),
-                offset
-                    .checked_sub(1)
-                    .filter(|_| offset % 2 == 0)
-                    .map(batch_value)
-            );
-        }
-        self.paused_reads = None;
-        self.drive().await;
-        let Some(Resp::ResponseRange(value)) = read
-            .await
-            .unwrap()
-            .unwrap()
-            .into_outcome()
-            .result
-            .unwrap()
-            .response
-        else {
-            panic!("expected range");
-        };
-        assert!(value.kvs.is_empty());
-        assert_eq!(value.header.unwrap().revision, old_revision);
-        self.trace.push(format!(
-            "pinned read across batch {leader} {old_revision} {writes}"
-        ));
-        self.stop(leader);
-        self.start(leader).await;
-        for _ in 0..25 {
-            for id in 1..=3 {
-                self.tick(id).await;
-            }
-            for _ in 0..30 {
-                self.deliver(false).await;
-            }
-        }
-        for node in self.nodes.values() {
-            let state = node.worker.state();
-            let page = state
-                .watch(
-                    &WatchCreateRequest {
-                        key: b"batch-key".to_vec(),
-                        start_revision: old_revision + 1,
-                        prev_kv: true,
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .await
-                .unwrap();
-            let events: Vec<_> = page.responses.into_iter().flat_map(|r| r.events).collect();
-            assert_eq!(events.len(), 16);
-            for (offset, event) in events.iter().enumerate() {
-                let kv = event.kv.as_ref().unwrap();
-                assert_eq!(kv.mod_revision, old_revision + offset as i64 + 1);
-                assert_eq!(kv.value, batch_value(offset));
-                assert_eq!(kv.create_revision, old_revision + 1);
-                assert_eq!(kv.version, offset as i64 + 1);
-                let previous = offset
-                    .checked_sub(1)
-                    .map(|i| events[i].kv.as_ref().unwrap());
-                assert_eq!(event.prev_kv.as_ref(), previous);
-            }
-            assert_eq!(
-                state.logical_usage(),
-                crate::state::maintenance::count_logical_usage(state.db().as_ref())
-                    .await
-                    .unwrap()
-            );
-            assert!(state.key_index.matches(state.db()).await.unwrap());
-        }
-        self.trace.push("batched put history recovered".into());
-    }
-
-    async fn crash_after_quorum_reply(&mut self) {
-        let leader = self.leader().unwrap();
-        let revision = self.nodes[&leader].state.revision + 1;
-        let (tx, mut rx) = oneshot::channel();
-        self.paused_log = Some(leader);
-        let node = self.nodes.get_mut(&leader).unwrap();
-        node.propose(
-            RaftCommand::Etcd {
-                id: "quorum-crash".into(),
-                origin: leader,
-                etcd: RequestOp {
-                    request: Some(Op::RequestPut(PutRequest {
-                        key: b"quorum-crash".to_vec(),
-                        value: b"committed".to_vec(),
-                        ..Default::default()
-                    })),
-                },
-            },
-            ClientResponse::Kv(tx),
-        )
-        .unwrap();
-        self.drive().await;
-        for _ in 0..100 {
-            self.deliver(false).await;
-        }
-        let Some(Resp::ResponsePut(put)) = rx
-            .try_recv()
-            .unwrap()
-            .unwrap()
-            .into_outcome()
-            .result
-            .unwrap()
-            .response
-        else {
-            panic!("expected a quorum Put reply");
-        };
-        assert_eq!(put.header.unwrap().revision, revision);
-        let node = &self.nodes[&leader];
-        let index = node.quorum_reply_index;
-        assert!(index > node.log_worker.storage().last_index().unwrap());
-        assert!(index > node.state.applied);
-        assert!(!node.forwarding.subscribe().applied(revision));
-        for (&id, node) in &self.nodes {
-            if id != leader {
-                assert!(node.log_worker.storage().last_index().unwrap() >= index);
-            }
-        }
-        self.trace.push(format!(
-            "crash after quorum reply {leader} {index} {revision}"
-        ));
-        for id in 1..=3 {
-            self.stop(id);
-        }
-        self.paused_log = None;
-        for id in 1..=3 {
-            self.start(id).await;
-        }
-        for _ in 0..35 {
-            for id in 1..=3 {
-                self.tick(id).await;
-            }
-            for _ in 0..30 {
-                self.deliver(false).await;
-            }
-        }
-        for node in self.nodes.values() {
-            let read = RequestOp {
-                request: Some(Op::RequestRange(RangeRequest {
-                    key: b"quorum-crash".to_vec(),
-                    ..Default::default()
-                })),
-            };
-            let result = node
-                .worker
-                .state()
-                .read_etcd(&read)
-                .await
-                .unwrap()
-                .result
-                .unwrap();
-            let Some(Resp::ResponseRange(range)) = result.response else {
-                panic!("expected range");
-            };
-            assert_eq!(range.kvs[0].mod_revision, revision);
-            assert_eq!(range.kvs[0].value, b"committed");
-        }
-    }
-
-    async fn run(seed: u64) -> Vec<String> {
-        let mut sim = Self::new(seed).await;
-        for _ in 0..100 {
-            sim.deliver(false).await;
-        }
-        sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
-        let generation = sim.nodes[&sim.leader().unwrap()].state.leases[&77].generation;
-        sim.lease(LeaseCommand::KeepAlive { id: 77 }).await;
-        sim.lease(LeaseCommand::Expire { id: 77, generation }).await;
-        sim.object_faults().await;
-        let failed = sim.leader().unwrap();
-        sim.expected_log_failure = Some(failed);
-        sim.nodes.get_mut(&failed).unwrap().log_fail = true;
-        sim.propose().await;
-        assert_eq!(sim.log_failures, 1);
-        sim.start(failed).await;
-        for _ in 0..25 {
-            for id in 1..=3 {
-                sim.tick(id).await;
-            }
-            for _ in 0..30 {
-                sim.deliver(false).await;
-            }
-        }
-        let leader = sim.leader().unwrap();
-        for node in sim.nodes.values() {
-            assert_eq!(node.forwarding.subscribe().leader(), leader);
-        }
-        // Fail a cache-miss read through the real disk executor, then restart the node.
-        for _ in 0..8 {
-            sim.propose().await;
-            for _ in 0..60 {
-                sim.deliver(false).await;
-            }
-        }
-        let reader = sim.leader().unwrap();
-        let node = sim.nodes.get_mut(&reader).unwrap();
-        let low = node.raw.store().first_index().unwrap();
-        assert!(matches!(
-            node.raw
-                .store()
-                .entries(low, low + 1, None, raft::GetEntriesContext::empty(true)),
-            Err(raft::Error::Store(
-                raft::StorageError::LogTemporarilyUnavailable
-            ))
-        ));
-        node.log_read_fail = true;
-        sim.expected_log_failure = Some(reader);
-        sim.drive().await;
-        assert_eq!(sim.log_failures, 2);
-        sim.start(reader).await;
-        for _ in 0..25 {
-            for id in 1..=3 {
-                sim.tick(id).await;
-            }
-            for _ in 0..30 {
-                sim.deliver(false).await;
-            }
-        }
-        // Hold a real SendAppend fetch while a higher term cancels its Raft context.
-        let reader = sim.leader().unwrap();
-        sim.paused_log = Some(reader);
-        let node = sim.nodes.get_mut(&reader).unwrap();
-        let low = node.raw.store().first_index().unwrap();
-        let peer = reader % 3 + 1;
-        let progress = node.raw.raft.mut_prs().get_mut(peer).unwrap();
-        progress.matched = 0;
-        progress.become_probe();
-        progress.next_idx = low;
-        node.raw.raft.send_append(peer);
-        assert!(node.raw.store().stats()["read_reserved"].as_u64().unwrap() > 0);
-        node.drive_ready().await.unwrap();
-        let completed = node.log_worker.step().unwrap().unwrap();
-        assert!(completed.fetched.is_some());
-        node.raw.raft.become_follower(node.raw.raft.term + 1, 0);
-        node.complete_log(completed).unwrap();
-        assert!(node
-            .raw
-            .raft
-            .msgs
-            .iter()
-            .all(|m| m.get_msg_type() != MessageType::MsgAppend));
-        sim.trace.push(format!("late log read {reader}"));
-        sim.paused_log = None;
-        for _ in 0..25 {
-            for id in 1..=3 {
-                sim.tick(id).await;
-            }
-            for _ in 0..30 {
-                sim.deliver(false).await;
-            }
-        }
-        let mut offline = 0;
-        for step in 0..400 {
-            match step {
-                30 => {
-                    sim.paused_apply = sim.leader();
-                    sim.trace
-                        .push(format!("pause apply {:?}", sim.paused_apply));
-                }
-                60 => {
-                    sim.paused_apply = None;
-                    sim.trace.push("resume apply".into());
-                }
-                65 => {
-                    sim.paused_log = sim.leader();
-                    sim.trace.push(format!("pause log {:?}", sim.paused_log));
-                }
-                67 => sim.propose().await,
-                68 => {
-                    if let Some(id) = sim.paused_log {
-                        if let Some(node) = sim.nodes.get_mut(&id) {
-                            while node.log_busy {
-                                let bytes = node.log_queue.front().unwrap().bytes;
-                                let completion = node.log_worker.step().unwrap().unwrap();
-                                if bytes > 0 {
-                                    sim.trace.push(format!("hold durable log completion {id}"));
-                                    sim.held_log = Some((id, completion));
-                                    break;
-                                }
-                                node.complete_log(completion).unwrap();
-                                node.drive_ready().await.unwrap();
-                            }
-                        }
-                    }
-                }
-                90 => {
-                    if let Some((id, completion)) = sim.held_log.take() {
-                        if let Some(node) = sim.nodes.get_mut(&id) {
-                            node.complete_log(completion).unwrap();
-                            sim.trace.push(format!("release log completion {id}"));
-                        } else {
-                            sim.trace.push(format!("crash before log completion {id}"));
-                        }
-                    }
-                    sim.paused_log = None;
-                    sim.trace.push("resume log".into());
-                }
-                70 => sim.stop(3),
-                95 => sim.start(3).await,
-                140 => {
-                    sim.isolated = sim.leader();
-                    sim.trace.push(format!("isolate {:?}", sim.isolated));
-                }
-                185 => {
-                    sim.isolated = None;
-                    sim.trace.push("heal".into());
-                }
-                220 => {
-                    // A fault schedule can reach this step during an election.
-                    offline = sim.leader().unwrap_or(1) % 3 + 1;
-                    sim.stop(offline);
-                }
-                260 => {
-                    // Establish a new committed prefix while the selected follower stays offline.
-                    for _ in 0..25 {
-                        for id in 1..=3 {
-                            sim.tick(id).await;
-                        }
-                        for _ in 0..30 {
-                            sim.deliver(false).await;
-                        }
-                    }
-                    for _ in 0..5 {
-                        sim.propose().await;
-                        for _ in 0..100 {
-                            sim.deliver(false).await;
-                        }
-                    }
-                    // The offline follower must now catch up from an image built on demand.
-                    sim.truncate().await;
-                }
-                300 => {
-                    sim.paused_log = Some(offline);
-                    sim.trace.push(format!("pause snapshot log {offline}"));
-                    sim.start(offline).await;
-                }
-                320 => {
-                    sim.paused_log = None;
-                    sim.trace.push("resume snapshot log".into());
-                }
-                350 => {
-                    for id in 1..=3 {
-                        sim.stop(id);
-                    }
-                    for id in 1..=3 {
-                        sim.start(id).await;
-                    }
-                }
-                _ => {}
-            }
-            let id = sim.choose(3) as u64 + 1;
-            sim.tick(id).await;
-            if step % 17 == 0 {
-                sim.read().await;
-            }
-            if step % 10 == 0 {
-                sim.propose().await;
-            }
-            for _ in 0..12 {
-                sim.deliver(true).await;
-            }
-        }
-        sim.isolated = None;
-        for _ in 0..100 {
-            for id in 1..=3 {
-                sim.tick(id).await;
-            }
-            for _ in 0..30 {
-                sim.deliver(false).await;
-            }
-        }
-        assert!(
-            sim.acknowledged.len() >= 10,
-            "seed {seed}: insufficient writes"
-        );
-        assert!(
-            sim.read_count >= 5,
-            "seed {seed}: insufficient read index checks"
-        );
-        assert!(
-            sim.revision_count >= 10,
-            "seed {seed}: insufficient revision barriers"
-        );
-        let snapshots = sim.installed_snapshots
-            + sim
-                .nodes
-                .values()
-                .map(|n| n.installed_snapshots)
-                .sum::<u64>();
-        assert!(snapshots > 0, "seed {seed}: no snapshot transfer");
-        let mut expected_events = None;
-        for node in sim.nodes.values() {
-            let state = node.worker.state();
-            let mut rows = state.db().scan_prefix(b"etcd/", ..).await.unwrap();
-            let mut size = 0;
-            while let Some(row) = rows.next().await.unwrap() {
-                size += (row.key.len() + row.value.len()) as u64;
-            }
-            assert_eq!(state.logical_size(), size, "seed {seed}");
-            assert!(
-                state.key_index.matches(state.db()).await.unwrap(),
-                "seed {seed}"
-            );
-            assert!(node.state.leases[&77].generation > generation);
-            let mut request = WatchCreateRequest {
-                key: vec![0],
-                range_end: vec![0],
-                start_revision: 1,
-                prev_kv: true,
-                ..Default::default()
-            };
-            let mut events = vec![];
-            loop {
-                let page = node.worker.state().watch(&request, None).await.unwrap();
-                assert_eq!(page.compact_revision, 0);
-                for response in page.responses {
-                    events.extend(response.events);
-                }
-                if page.next_revision > node.state.revision {
-                    break;
-                }
-                request.start_revision = page.next_revision;
-            }
-            assert_eq!(events.len() as i64, node.state.revision - 1);
-            for (i, event) in events.iter().enumerate() {
-                assert_eq!(event.r#type, 0);
-                assert_eq!(event.kv.as_ref().unwrap().mod_revision, i as i64 + 2);
-                assert_eq!(event.kv.as_ref().unwrap().lease, 77);
-            }
-            if let Some(expected) = &expected_events {
-                assert_eq!(&events, expected);
-            } else {
-                expected_events = Some(events.clone());
-            }
-            for (key, value) in &sim.acknowledged {
-                let outcome = node
-                    .worker
-                    .state()
-                    .read_etcd(&RequestOp {
-                        request: Some(Op::RequestRange(RangeRequest {
-                            key: key.as_bytes().to_vec(),
-                            ..Default::default()
-                        })),
-                    })
-                    .await
-                    .unwrap();
-                let Some(Resp::ResponseRange(response)) = outcome.result.unwrap().response else {
-                    panic!("expected range");
-                };
-                assert_eq!(
-                    response.kvs.len(),
-                    1,
-                    "seed {seed}: lost acknowledged key {key}"
-                );
-                assert_eq!(response.kvs[0].value, value.as_bytes());
-                assert_eq!(
-                    events
-                        .iter()
-                        .filter(|event| event.kv.as_ref().unwrap().key == key.as_bytes())
-                        .count(),
-                    1
-                );
-            }
-        }
-        // The members have other flags, but they apply the quota of the first leader.
-        let quotas: BTreeSet<_> = sim
-            .nodes
-            .values()
-            .map(|node| {
-                (
-                    node.state.cluster_quota.map(|q| q.bytes),
-                    node.state.quota_bytes,
-                )
-            })
-            .collect();
-        assert_eq!(quotas.len(), 1, "seed {seed}: {quotas:?}");
-        assert!(quotas.iter().all(|(cluster, _)| cluster.is_some()));
-        sim.renew_under_partition().await;
-        sim.batch_and_pinned_reads().await;
-        sim.crash_after_quorum_reply().await;
-        sim.admin_recovery().await;
-        sim.restart_between_checkpoint_file_and_reference().await;
-        sim.trace.clone()
-    }
-}
-
-#[tokio::test]
-async fn seeded_fault_schedules_replay_identically() {
-    let seeds = std::env::var("SLATEDB_DST_SEEDS").unwrap_or_else(|_| "1,2,42,58,70".into());
-    for seed in seeds.split(',').map(|s| s.parse::<u64>().unwrap()) {
-        eprintln!("DST seed {seed}: starting");
-        let first = Simulation::run(seed).await;
-        let second = Simulation::run(seed).await;
-        let trace_dir =
-            std::env::var("SLATEDB_DST_TRACE_DIR").unwrap_or_else(|_| "target/dst".into());
-        std::fs::create_dir_all(&trace_dir).unwrap();
-        std::fs::write(
-            format!("{trace_dir}/seed-{seed}.json"),
-            serde_json::to_vec_pretty(&first).unwrap(),
-        )
-        .unwrap();
-        if first != second {
-            std::fs::write(
-                format!("{trace_dir}/seed-{seed}-replay.json"),
-                serde_json::to_vec_pretty(&second).unwrap(),
-            )
-            .unwrap();
-        }
-        assert_eq!(first, second, "seed {seed}: simulation schedule changed");
-        eprintln!("DST seed {seed}: {} events replayed", first.len());
-    }
 }
 
 impl Simulation {
@@ -2134,14 +719,6 @@ impl Simulation {
         panic!("member {id} did not become the leader");
     }
 
-    /// Restart `id` with the quota flag `flag`.
-    async fn restart_with(&mut self, id: u64, flag: i64) {
-        self.stop(id);
-        self.quotas.insert(id, flag);
-        self.start(id).await;
-        self.settle(2).await;
-    }
-
     /// Propose `count` Puts on the leader and deliver their messages.
     async fn write(&mut self, count: usize) {
         for _ in 0..count {
@@ -2151,38 +728,6 @@ impl Simulation {
             }
         }
         self.settle(1).await;
-    }
-
-    /// Return the cluster quota that every member applied. Members must agree on the state.
-    fn cluster_quota(&self) -> Option<i64> {
-        let first = &self.nodes[&1].state;
-        for (&id, node) in &self.nodes {
-            let state = &node.state;
-            assert_eq!(state.applied, first.applied, "member {id}");
-            assert_eq!(state.revision, first.revision, "member {id}");
-            assert_eq!(state.usage.total(), first.usage.total(), "member {id}");
-            assert_eq!(state.cluster_quota, first.cluster_quota, "member {id}");
-            assert_eq!(
-                state.members_row.as_ref().map(|row| &row.digest),
-                first.members_row.as_ref().map(|row| &row.digest),
-                "member {id}"
-            );
-            assert_eq!(state.members_mismatch, None, "member {id}");
-            assert_eq!(
-                node.worker.state().alarms.len(),
-                self.nodes[&1].worker.state().alarms.len(),
-                "member {id}"
-            );
-        }
-        first.cluster_quota.map(|quota| quota.bytes)
-    }
-
-    /// Let the members propose `SetQuota` entries, as after an upgrade.
-    fn release_quota(&mut self) {
-        self.upgraded = false;
-        for node in self.nodes.values_mut() {
-            node.quota.hold = false;
-        }
     }
 
     /// Replace member `id` with an empty data directory and the quota flag `flag`.
@@ -2199,96 +744,10 @@ impl Simulation {
             progress.become_probe();
         }
         std::fs::remove_dir_all(self.root.path().join(id.to_string())).unwrap();
-        self.stores.remove(&id);
         self.checked.remove(&id);
         self.terms.remove(&id);
-        let upgraded = std::mem::replace(&mut self.upgraded, false);
         self.quotas.insert(id, flag);
         self.start(id).await;
-        self.upgraded = upgraded;
-        if let Some(node) = self.nodes.get_mut(&id) {
-            node.quota.hold = upgraded;
-        }
-    }
-
-    /// Deliver messages until member `id` waits for a snapshot.
-    async fn until_waiting(&mut self, id: u64) {
-        for _ in 0..2000 {
-            if self.nodes[&id].quota.blocked().is_some() {
-                return;
-            }
-            if self.messages.is_empty() {
-                let leader = self.leader().unwrap();
-                self.tick(leader).await;
-            }
-            self.deliver(false).await;
-        }
-        panic!("member {id} does not wait for a snapshot");
-    }
-
-    /// Settle `rounds` times. Member `id` must not lead while it waits for a snapshot.
-    async fn settle_without(&mut self, id: u64, rounds: usize) {
-        for _ in 0..rounds {
-            for member in 1..=3 {
-                self.tick(member).await;
-                self.assert_not_leading(id);
-            }
-            for _ in 0..30 {
-                self.deliver(false).await;
-                self.assert_not_leading(id);
-            }
-        }
-    }
-
-    /// Member `id` does not lead while it waits for a snapshot. After the install it may lead,
-    /// for example when a transfer to it arrives after the snapshot.
-    fn assert_not_leading(&self, id: u64) {
-        if self.leader() == Some(id) {
-            let node = &self.nodes[&id];
-            assert_eq!(node.quota.blocked(), None, "member {id} leads");
-            // An independent check: `replace` starts the member with no install.
-            assert!(
-                node.installed_snapshots > 0,
-                "member {id} leads before an install"
-            );
-        }
-    }
-
-    /// Transfer leadership from `leader` to member `id`, which waits for a snapshot. Hold the
-    /// snapshots for the member until the transfer reaches it, so the transfer arrives while it
-    /// waits. It stays a follower.
-    async fn transfer_while_waiting(&mut self, leader: u64, id: u64) {
-        let is = |message: &Message, kind| message.to == id && message.get_msg_type() == kind;
-        self.nodes.get_mut(&leader).unwrap().raw.transfer_leader(id);
-        let mut held = vec![];
-        for _ in 0..2000 {
-            let (snapshots, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.messages)
-                .into_iter()
-                .partition(|message| is(message, MessageType::MsgSnapshot));
-            held.extend(snapshots);
-            self.messages = rest;
-            let transfer = self
-                .messages
-                .iter()
-                .position(|message| is(message, MessageType::MsgTimeoutNow));
-            if let Some(position) = transfer {
-                let message = self.messages.remove(position);
-                assert!(self.nodes[&id].quota.blocked().is_some());
-                self.trace.push(format!("transfer to waiting member {id}"));
-                let node = self.nodes.get_mut(&id).unwrap();
-                node.step_peer(message).unwrap();
-                node.drive_ready().await.unwrap();
-                self.drive().await;
-                assert_eq!(self.nodes[&id].raw.raft.state, StateRole::Follower);
-                self.messages.extend(held);
-                return;
-            }
-            if self.messages.is_empty() {
-                self.tick(leader).await;
-            }
-            self.deliver(false).await;
-        }
-        panic!("the transfer did not reach member {id}");
     }
 
     /// A follower, not `except`.
@@ -2297,462 +756,6 @@ impl Simulation {
         (1..=self.members)
             .find(|&id| id != leader && id != except)
             .unwrap()
-    }
-
-    /// The indexes of the committed `SetQuota` entries that set `bytes`.
-    fn set_quota_indexes(&self, bytes: i64) -> Vec<u64> {
-        self.committed_entries
-            .iter()
-            .filter_map(|(&index, data)| {
-                let entry = Entry::decode(data.as_slice()).unwrap();
-                match RaftCommand::decode(&entry.data) {
-                    Ok(RaftCommand::SetQuota { bytes: b, .. }) if b == bytes => Some(index),
-                    _ => None,
-                }
-            })
-            .collect()
-    }
-}
-
-/// Members with different quota flags apply one cluster quota. They also have other client URL
-/// text, but store one membership row. Each member state at each applied index equals a
-/// reference state that applies the committed entries in order.
-#[tokio::test]
-async fn members_with_different_quota_flags_switch_quota_at_one_index() {
-    let quotas = BTreeMap::from([(1, 1 << 20), (2, 3000), (3, 1 << 20)]);
-    let mut sim = Simulation::with_options(7, false, quotas, true, false).await;
-    sim.settle(3).await;
-    assert_eq!(sim.leader(), Some(1));
-    // Client Puts use this lease.
-    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
-    // The first leader seeds the cluster quota. Member 2 does not apply its small flag.
-    sim.write(40).await;
-    assert_eq!(sim.cluster_quota(), Some(1 << 20));
-    assert_eq!(sim.acknowledged.len(), 40);
-    // The first leader seeded the row with its own client URL text.
-    assert_eq!(
-        sim.nodes[&3].state.members.members[&3].client_ur_ls,
-        ["http://127.0.0.1:2382"]
-    );
-    assert!(sim.nodes[&2].state.usage.total() > 3000);
-    assert!(sim.nodes[&2].state.quota_mismatch);
-    assert!(!sim.nodes[&1].state.quota_mismatch);
-    // Member 2 leads with its unchanged flag. The cluster quota stays.
-    sim.lead(2).await;
-    sim.write(3).await;
-    assert_eq!(sim.cluster_quota(), Some(1 << 20));
-    // An operator changes the flag of member 3 and restarts it twice. It follows while other
-    // entries commit, and proposes the latest flag when it leads.
-    sim.restart_with(3, 9000).await;
-    sim.restart_with(3, 5000).await;
-    sim.write(3).await;
-    assert_eq!(sim.cluster_quota(), Some(1 << 20));
-    sim.lead(3).await;
-    sim.settle(2).await;
-    assert_eq!(sim.cluster_quota(), Some(5000));
-    assert_eq!(sim.set_quota_indexes(5000).len(), 1);
-    assert!(sim.set_quota_indexes(9000).is_empty());
-    // The size exceeds the new quota, so every member rejects the next Put alike.
-    let acknowledged = sim.acknowledged.len();
-    sim.write(3).await;
-    assert_eq!(sim.acknowledged.len(), acknowledged);
-    assert_eq!(sim.cluster_quota(), Some(5000));
-    assert_eq!(sim.nodes[&1].worker.state().alarms.len(), 1);
-    // Member 2 restarts with its old flag and leads. It does not revert the quota.
-    sim.restart_with(2, 3000).await;
-    sim.lead(2).await;
-    sim.write(1).await;
-    assert_eq!(sim.cluster_quota(), Some(5000));
-    // Member 1 replays its whole log after a restart, under the quota in force at each index.
-    let applied = sim.nodes[&1].state.applied;
-    sim.restart_with(1, 1 << 20).await;
-    sim.settle(2).await;
-    assert!(sim.nodes[&1].state.applied >= applied);
-    assert_eq!(sim.cluster_quota(), Some(5000));
-    assert!(sim.view_checks > 100, "{} view checks", sim.view_checks);
-}
-
-/// Members of an earlier binary applied Puts before the first cluster quota. A member that this
-/// binary creates empty does not apply them under its own small flag. Before the seed it waits
-/// for a snapshot. After the seed, every member truncates its log through the seed, so a new
-/// member installs a snapshot. The reference check compares every member at every index.
-#[tokio::test]
-async fn a_new_member_does_not_replay_the_entries_of_an_earlier_binary() {
-    let quotas = BTreeMap::from([(1, 1 << 20), (2, 1 << 20), (3, 1 << 20)]);
-    let mut sim = Simulation::with_options(11, false, quotas, true, true).await;
-    sim.settle(3).await;
-    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
-    sim.write(40).await;
-    sim.settle(2).await;
-    assert_eq!(sim.cluster_quota(), None);
-    assert_eq!(sim.acknowledged.len(), 40);
-    assert!(sim.nodes[&1].state.usage.total() > 3000);
-    // Before the seed: the new member waits for a snapshot of the leader.
-    let first = sim.follower(0);
-    let installed = sim.nodes[&first].installed_snapshots;
-    sim.replace(first, 3000).await;
-    sim.settle(4).await;
-    sim.settle(4).await;
-    let leader = sim.leader().unwrap();
-    assert_eq!(
-        sim.nodes[&first].state.applied,
-        sim.nodes[&leader].state.applied
-    );
-    assert!(sim.nodes[&first].installed_snapshots > installed || sim.installed_snapshots > 0);
-    assert!(sim.nodes[&first].worker.state().alarms.is_empty());
-    // The upgraded leader seeds the cluster quota. Every member truncates through it.
-    sim.release_quota();
-    sim.settle(2).await;
-    sim.write(3).await;
-    assert_eq!(sim.cluster_quota(), Some(1 << 20));
-    let seed = sim.set_quota_indexes(1 << 20)[0];
-    sim.settle(2).await;
-    for (&id, node) in &sim.nodes {
-        assert!(node.raw.store().snapshot_index() >= seed, "member {id}");
-    }
-    // After the seed: a new member installs a snapshot.
-    let second = sim.follower(first);
-    sim.replace(second, 3000).await;
-    sim.settle(4).await;
-    sim.settle(4).await;
-    sim.write(3).await;
-    assert_eq!(sim.acknowledged.len(), 46);
-    assert_eq!(sim.cluster_quota(), Some(1 << 20));
-    assert!(sim.nodes[&second].raw.store().snapshot_index() >= seed);
-    assert!(sim.view_checks > 100, "{} view checks", sim.view_checks);
-}
-
-/// A member that waits for a snapshot does not lead. The old leader stops, or transfers its
-/// leadership to the member. Another member leads, sends the snapshot, and the member catches up.
-#[tokio::test]
-async fn a_waiting_member_does_not_lead_in_an_election_or_a_transfer() {
-    for transfer in [false, true] {
-        let quotas = BTreeMap::from([(1, 1 << 20), (2, 1 << 20), (3, 1 << 20)]);
-        let mut sim = Simulation::with_options(13, false, quotas, true, true).await;
-        sim.settle(3).await;
-        sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
-        sim.write(20).await;
-        sim.settle(2).await;
-        let leader = sim.leader().unwrap();
-        let waiting = sim.follower(0);
-        sim.replace(waiting, 3000).await;
-        sim.until_waiting(waiting).await;
-        if transfer {
-            sim.transfer_while_waiting(leader, waiting).await;
-        } else {
-            sim.stop(leader);
-            sim.messages
-                .retain(|message| message.to != leader && message.from != leader);
-        }
-        sim.settle_without(waiting, 30).await;
-        let now = sim.leader().unwrap();
-        assert_ne!(now, waiting);
-        assert_eq!(
-            sim.nodes[&waiting].quota.blocked(),
-            None,
-            "transfer {transfer}"
-        );
-        assert_eq!(
-            sim.nodes[&waiting].state.applied,
-            sim.nodes[&now].state.applied
-        );
-        assert!(sim.nodes[&waiting].worker.state().alarms.is_empty());
-        if transfer {
-            // After its install, the member can lead.
-            sim.lead(waiting).await;
-            sim.assert_not_leading(waiting);
-        } else {
-            sim.start(leader).await;
-            sim.settle(3).await;
-        }
-        // The leader seeds the cluster quota with its flag.
-        let seeder = sim.leader().unwrap();
-        sim.release_quota();
-        sim.settle(2).await;
-        sim.write(2).await;
-        sim.settle(2).await;
-        assert_eq!(sim.cluster_quota(), Some(sim.quotas[&seeder]));
-    }
-}
-
-/// The leader replicated its last entry only to a member that waits for a snapshot, then
-/// stopped. Raft on that member still holds the ID of the lost leader. The other member cannot
-/// win without its vote. The waiting member campaigns after three election timeouts, wins, and
-/// hands over leadership, so the group makes progress.
-#[tokio::test]
-async fn a_waiting_member_with_the_only_latest_log_lets_the_group_progress() {
-    let quotas = BTreeMap::from([(1, 1 << 20), (2, 1 << 20), (3, 1 << 20)]);
-    let mut sim = Simulation::with_options(17, false, quotas, true, true).await;
-    sim.settle(3).await;
-    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
-    sim.write(20).await;
-    sim.settle(2).await;
-    let leader = sim.leader().unwrap();
-    let waiting = sim.follower(0);
-    let other = sim.follower(waiting);
-    // The leader cannot build the snapshot, and the other member misses the next entry.
-    sim.paused_apply = Some(leader);
-    sim.replace(waiting, 3000).await;
-    sim.isolated = Some(other);
-    sim.propose().await;
-    sim.until_waiting(waiting).await;
-    for _ in 0..50 {
-        sim.deliver(false).await;
-    }
-    let last = sim.nodes[&leader].raw.raft.raft_log.last_index();
-    assert_eq!(sim.nodes[&waiting].raw.raft.raft_log.last_index(), last);
-    assert!(sim.nodes[&other].raw.raft.raft_log.last_index() < last);
-    sim.stop(leader);
-    sim.messages
-        .retain(|message| message.to != leader && message.from != leader);
-    sim.isolated = None;
-    sim.paused_apply = None;
-    assert_eq!(sim.nodes[&waiting].raw.raft.leader_id, leader);
-    let acknowledged = sim.acknowledged.len();
-    for _ in 0..12 {
-        sim.settle(10).await;
-        if sim.leader().is_some_and(|id| id != waiting) {
-            break;
-        }
-    }
-    let now = sim.leader().expect("the group elects no leader");
-    assert_eq!(now, other);
-    sim.settle(10).await;
-    sim.write(1).await;
-    sim.settle(5).await;
-    assert!(sim.acknowledged.len() > acknowledged);
-}
-
-/// Members of an earlier binary stored their own flags, so their rows differ. They flushed at
-/// different indexes. After a full restart, the member with the lowest applied index leads. Its
-/// first seed is behind the indexes of the other members, so they skip that check. Its second
-/// seed follows the seed of its term, so every member with another row reports it.
-#[tokio::test]
-async fn every_member_with_another_row_reports_it_after_a_full_restart() {
-    let mut sim = Simulation::with_holds(13, false, BTreeMap::new(), false, true, true).await;
-    sim.settle(3).await;
-    assert_eq!(sim.leader(), Some(1));
-    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
-    let mut flushed = vec![];
-    for id in 1..=3 {
-        sim.write(3).await;
-        let node = sim.nodes.get_mut(&id).unwrap();
-        node.worker.state_mut().db().flush().await.unwrap();
-        flushed.push(node.state.applied);
-    }
-    assert!(
-        flushed[0] < flushed[1] && flushed[1] < flushed[2],
-        "{flushed:?}"
-    );
-    let digests: BTreeSet<_> = sim
-        .nodes
-        .values()
-        .map(|node| node.state.members_row.clone().unwrap().digest)
-        .collect();
-    assert_eq!(digests.len(), 3);
-    for id in 1..=3 {
-        sim.stop(id);
-    }
-    sim.hold_members = false;
-    // Member 1 leads before it replays its log.
-    sim.paused_apply = Some(1);
-    for id in 1..=3 {
-        sim.start(id).await;
-    }
-    sim.nodes.get_mut(&1).unwrap().raw.campaign().unwrap();
-    sim.settle(2).await;
-    assert_eq!(sim.leader(), Some(1));
-    assert_eq!(sim.nodes[&1].state.applied, flushed[0]);
-    for id in [2, 3] {
-        let state = &sim.nodes[&id].state;
-        assert_eq!(
-            (state.members_checked, state.members_mismatch),
-            (None, None)
-        );
-    }
-    sim.paused_apply = None;
-    sim.settle(3).await;
-    let term = sim.nodes[&1].raw.raft.term;
-    for (&id, node) in &sim.nodes {
-        let expected = (id != 1).then_some(1);
-        assert_eq!(node.state.members_mismatch, expected, "member {id}");
-        assert_eq!(node.state.members_checked.unwrap().0, term, "member {id}");
-        assert_eq!(
-            node.members_status()["checked"]["term"],
-            term,
-            "member {id}"
-        );
-    }
-}
-
-/// An earlier binary wrote only membership entries. A new member that waits on one does not
-/// lead, in an election or a transfer. In an election, the next leader proposes `SeedMembers`
-/// and `SetQuota` before any other entry of its term, and the member catches up by snapshot.
-#[tokio::test]
-async fn a_member_waiting_on_a_membership_entry_does_not_lead() {
-    for transfer in [false, true] {
-        let mut sim = Simulation::with_holds(17, false, BTreeMap::new(), false, true, true).await;
-        sim.settle(3).await;
-        let leader = sim.leader().unwrap();
-        let publish = RaftCommand::Cluster {
-            id: "publish-2".into(),
-            request: crate::cluster::Command::Publish {
-                id: 2,
-                client_urls: vec!["http://localhost:2381".into()],
-            },
-            credentials: Default::default(),
-        };
-        sim.admin_command(publish).await.result.unwrap();
-        sim.settle(2).await;
-        let waiting = sim.follower(0);
-        sim.replace(waiting, 0).await;
-        sim.until_waiting(waiting).await;
-        assert!(sim.nodes[&waiting].state.members_row.is_none());
-        // Members of this binary lead from here.
-        sim.hold_members = false;
-        for node in sim.nodes.values_mut() {
-            node.hold_members = false;
-        }
-        sim.release_quota();
-        if transfer {
-            sim.transfer_while_waiting(leader, waiting).await;
-        } else {
-            sim.stop(leader);
-            sim.messages
-                .retain(|message| message.to != leader && message.from != leader);
-        }
-        sim.settle_without(waiting, 30).await;
-        let now = sim.leader().unwrap();
-        assert_ne!(now, waiting);
-        assert_eq!(
-            sim.nodes[&waiting].quota.blocked(),
-            None,
-            "transfer {transfer}"
-        );
-        assert_eq!(
-            sim.nodes[&waiting].state.applied,
-            sim.nodes[&now].state.applied
-        );
-        assert!(sim.nodes[&waiting].state.members_row.is_some());
-        if !transfer {
-            let term = sim.nodes[&now].raw.raft.term;
-            let commands: Vec<_> = sim
-                .committed_entries
-                .values()
-                .map(|data| Entry::decode(data.as_slice()).unwrap())
-                .filter(|entry| entry.term == term && !entry.data.is_empty())
-                .map(|entry| RaftCommand::decode(&entry.data).unwrap())
-                .collect();
-            assert!(
-                matches!(
-                    commands.as_slice(),
-                    [
-                        RaftCommand::SeedMembers(_),
-                        RaftCommand::SetQuota { .. },
-                        ..
-                    ]
-                ),
-                "{commands:?}"
-            );
-        }
-    }
-}
-
-/// Members of an earlier binary stored their own flags. Member 1 never flushed, so after a full
-/// restart it leads with no row, and its first seed carries no digest. Once its replay stores
-/// its row, it sends the digest in the same term, and the members with other rows report it.
-#[tokio::test]
-async fn a_leader_without_a_row_sends_its_digest_once_it_has_one() {
-    let mut sim = Simulation::with_holds(19, false, BTreeMap::new(), false, true, true).await;
-    sim.settle(3).await;
-    assert_eq!(sim.leader(), Some(1));
-    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
-    sim.write(3).await;
-    for id in [2, 3] {
-        let node = sim.nodes.get_mut(&id).unwrap();
-        node.worker.state_mut().db().flush().await.unwrap();
-    }
-    for id in 1..=3 {
-        sim.stop(id);
-    }
-    sim.hold_members = false;
-    sim.paused_apply = Some(1);
-    for id in 1..=3 {
-        sim.start(id).await;
-    }
-    assert!(sim.nodes[&1].state.members_row.is_none());
-    sim.nodes.get_mut(&1).unwrap().raw.campaign().unwrap();
-    sim.settle(2).await;
-    assert_eq!(sim.leader(), Some(1));
-    let term = sim.nodes[&1].raw.raft.term;
-    assert!(sim.nodes[&1].state.members_row.is_none());
-    sim.paused_apply = None;
-    sim.settle(3).await;
-    assert_eq!(sim.nodes[&1].raw.raft.term, term);
-    for (&id, node) in &sim.nodes {
-        let expected = (id != 1).then_some(1);
-        assert_eq!(node.state.members_mismatch, expected, "member {id}");
-        assert_eq!(node.state.members_checked.unwrap().0, term, "member {id}");
-    }
-}
-
-#[tokio::test]
-async fn truncation_without_an_image_recovers_and_serves_an_on_demand_snapshot() {
-    let mut sim = Simulation::new(7).await;
-    for _ in 0..100 {
-        sim.deliver(false).await;
-    }
-    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
-    let offline = sim.leader().unwrap() % 3 + 1;
-    sim.stop(offline);
-    for _ in 0..6 {
-        sim.propose().await;
-        for _ in 0..100 {
-            sim.deliver(false).await;
-        }
-    }
-    assert!(sim.acknowledged.len() >= 3);
-    sim.truncate().await;
-    for (&id, node) in &sim.nodes {
-        let store = node.raw.store();
-        assert!(store.snapshot_index() > 0);
-        assert!(!store.has_image());
-        assert_eq!(node.log_worker.storage().recovery_snapshot().data.len(), 0);
-        let dir = sim.root.path().join(id.to_string()).join("raft");
-        assert!(std::fs::read_dir(dir).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with("checkpoint-")
-        }));
-        assert_eq!(node.snapshot_images, 0);
-    }
-    // Restart a truncated member. Flushed state must cover the removed entries.
-    let restarted = sim.leader().unwrap() % 3 + 1;
-    let restarted = if restarted == offline {
-        restarted % 3 + 1
-    } else {
-        restarted
-    };
-    let truncated = sim.nodes[&restarted].raw.store().snapshot_index();
-    sim.stop(restarted);
-    sim.start(restarted).await;
-    let node = &sim.nodes[&restarted];
-    assert_eq!(node.raw.store().snapshot_index(), truncated);
-    assert!(node.state.applied >= truncated);
-    assert_eq!(node.installed_snapshots, 0);
-    sim.assert_acknowledged(restarted).await;
-    sim.settle(25).await;
-    // The returning member needs entries that no live log retains.
-    sim.start(offline).await;
-    sim.settle(60).await;
-    assert!(sim.nodes[&offline].installed_snapshots > 0);
-    assert!(sim.nodes.values().map(|n| n.snapshot_images).sum::<u64>() > 0);
-    sim.propose().await;
-    sim.settle(10).await;
-    for id in 1..=3 {
-        sim.assert_acknowledged(id).await;
     }
 }
 
@@ -2894,7 +897,7 @@ impl Simulation {
     /// crashes between writer steps, late opens of deposed writers, partitions, object store
     /// failures, retention with GC, and reads on old views.
     async fn run_shared(seed: u64) -> Vec<String> {
-        let mut sim = Self::with_mode(seed, true).await;
+        let mut sim = Self::new(seed).await;
         let mut writers = BTreeMap::new();
         for _ in 0..100 {
             sim.deliver(false).await;
@@ -3198,7 +1201,11 @@ impl Simulation {
 
     async fn rows(&self, id: u64) -> Vec<(bytes::Bytes, bytes::Bytes)> {
         let state = self.nodes[&id].worker.state();
-        let mut rows = state.db().scan_prefix(b"etcd/", ..).await.unwrap();
+        let mut rows = state
+            .applied_state()
+            .scan_under(b"etcd/", &Default::default())
+            .await
+            .unwrap();
         let mut all = vec![];
         while let Some(row) = rows.next().await.unwrap() {
             all.push((row.key, row.value));
@@ -3339,14 +1346,14 @@ async fn auto_compaction_survives_leader_changes_mid_compaction() {
         let state = node.worker.state();
         assert_eq!(
             state.logical_usage(),
-            crate::state::maintenance::count_logical_usage(state.db().as_ref())
+            crate::state::maintenance::count_logical_usage(state.applied_state())
                 .await
                 .unwrap()
         );
         // Watch journal rows below the boundary are gone.
         let mut journal = state
-            .db()
-            .scan_prefix(crate::watch::EVENTS, ..)
+            .applied_state()
+            .scan_under(crate::watch::EVENTS, &Default::default())
             .await
             .unwrap();
         while let Some(row) = journal.next().await.unwrap() {
@@ -3450,8 +1457,8 @@ async fn auto_compaction_waits_for_pending_removal() {
         );
         let state = node.worker.state();
         let mut journal = state
-            .db()
-            .scan_prefix(crate::watch::EVENTS, ..)
+            .applied_state()
+            .scan_under(crate::watch::EVENTS, &Default::default())
             .await
             .unwrap();
         while let Some(row) = journal.next().await.unwrap() {

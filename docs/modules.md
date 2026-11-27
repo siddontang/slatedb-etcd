@@ -22,26 +22,24 @@ The CLI and embedded API share the same lifecycle and runtime paths.
 | `node/apply` | Apply committed entries in order and group ordinary puts |
 | `node/proposal` | Group consecutive leader Put proposals within one event turn |
 | `node/quorum_put` | Prepare exact Put results after quorum commit |
-| `state/checkpoint` | Flush an applied prefix, or build a complete image for a peer |
 | `state/key_index` | Keep revision metadata for every current key in memory |
 | `node/read` | Confirm Safe ReadIndex and reject obsolete proofs |
 | `node/read/executor` | Run bounded reads on immutable applied views |
 | `node/lease` | Schedule leader lease expiry from replicated generations |
-| `node/quota` | Keep the local quota flag record and propose the replicated cluster quota |
-| `state/quota` | Store the cluster quota row and select the quota that apply uses |
+| `state/quota` | Check the logical size against the quota of the cluster claim |
 | `node/cluster` | Propose the term-start entries, publish client URLs, and serve member requests |
-| `state/cluster` | Seed, change, and check the replicated membership row |
+| `state/cluster` | Seed, change, and check the membership row |
 | `state` | Open storage and own mutable applied metadata |
 | `state/kv` and `state/put_batch` | Commit MVCC changes and maintain quota accounting |
 | `state/read` | Pin data, revision, Auth, and Lease metadata together |
 | `state/source` | Define the read interface that apply, read views, and Watch catch-up share |
-| `state/view` | Read the live database, a pinned snapshot, or a shared-mode base and overlay |
-| `state/overlay` | Keep shared-mode batches above the base for views and the materializer |
+| `state/view` | Read a shared base and its overlay |
+| `state/overlay` | Keep the batches above the base for views and the materializer |
 | `state/shared` | Claim the shared state, open, switch, adopt, and rebase checkpoint bases |
 | `node/shared` | Run the leader writer with its fence and clock checks, and the overlay limits |
-| `convert` | Convert a stopped replicated S3 cluster to shared state mode offline |
-| `state/auth` and `state/lease` | Apply their replicated domain changes |
-| `state/snapshot` and `state/backup` | Build, install, export, and restore complete state |
+| `status` | Read the Raft snapshot record of a stopped member for `shared-status` |
+| `state/auth` and `state/lease` | Apply their domain changes |
+| `state/backup` and `state/shared/restore` | Export and restore complete state |
 | `state/maintenance` | Execute hashes, alarms, and physical storage work |
 | `state/diagnostic` | Execute the separate diagnostic keyspace API |
 | `mvcc` and `watch` | Define revision, transaction, history, and event semantics |
@@ -70,16 +68,13 @@ Serializable reads use a local view without a quorum proof.
 Watch streams take events from an in-memory feed and scan history on pinned views.
 Administrative scans still use the apply owner.
 
-A checkpoint freezes one applied prefix and flushes it outside Raft.
-The log worker saves the snapshot metadata and truncates its covered entries in one synced batch.
-A manual checkpoint or a peer snapshot request also encodes a complete image.
-Restart installs a newer durable snapshot, then replays the remaining committed entries.
-
-In shared state mode, apply adds each batch to the overlay, not to SlateDB.
+Apply adds each batch to the overlay, not to SlateDB.
 The leader opens the shared `Db` and writes the batches into it with their own sequences.
 The publisher flushes by age, creates one checkpoint per L0 advance, and proposes `ViewCheckpoint`.
 That entry closes an overlay segment. The opened checkpoint becomes the base of later views.
 Each member truncates its log through its base and sends that checkpoint as a format 6 snapshot.
+The log worker saves the snapshot record and truncates its covered entries in one synced batch.
+Restart opens a checkpoint, installs a newer durable snapshot, and replays the remaining entries.
 
 ## Change rules
 

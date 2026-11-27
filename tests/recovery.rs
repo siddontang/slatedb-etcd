@@ -1,8 +1,6 @@
 use raft::eraftpb::{Entry, HardState};
 use raft::{GetEntriesContext, Storage};
-use slatedb_etcd::state::StateMachine;
 use slatedb_etcd::storage::RaftStorage;
-use slatedb_etcd::{Command, Operation, Request};
 
 fn entry(index: u64, term: u64) -> Entry {
     Entry {
@@ -154,115 +152,6 @@ fn node_identity_cannot_be_reused() {
     drop(storage(dir.path()));
     assert!(RaftStorage::open(dir.path(), 2, "test", vec![1, 2, 3]).is_err());
     assert!(RaftStorage::open(dir.path(), 1, "other", vec![1, 2, 3]).is_err());
-}
-
-#[tokio::test]
-async fn restart_finishes_a_snapshot_persisted_before_state_installation() {
-    let source = tempfile::tempdir().unwrap();
-    let destination = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(&source.path().join("objects"))
-        .await
-        .unwrap();
-    state
-        .apply(
-            1,
-            Some(&Command {
-                id: "one".to_owned(),
-                request: Request {
-                    operations: vec![Operation::Put {
-                        key: "key".to_owned(),
-                        value: "snapshot-value".to_owned(),
-                    }],
-                },
-            }),
-        )
-        .await
-        .unwrap();
-    let data = state.snapshot_data().await.unwrap();
-    let mut source_store = storage(&source.path().join("raft"));
-    let hs = HardState {
-        term: 1,
-        vote: 1,
-        commit: 1,
-    };
-    source_store
-        .persist(&[entry(1, 1)], Some(&hs), None)
-        .unwrap();
-    source_store.checkpoint(1, data).unwrap();
-    let snapshot = source_store.recovery_snapshot().clone();
-    {
-        let mut store = storage(&destination.path().join("raft"));
-        // Stop after saving the received snapshot. Do not update SlateDB.
-        store.persist(&[], Some(&hs), Some(&snapshot)).unwrap();
-    }
-    let store = storage(&destination.path().join("raft"));
-    let mut restored = StateMachine::open(&destination.path().join("objects"))
-        .await
-        .unwrap();
-    assert_eq!(restored.applied, 0);
-    restored
-        .install_snapshot(store.recovery_snapshot())
-        .await
-        .unwrap();
-    assert_eq!(restored.applied, 1);
-    assert_eq!(
-        restored.local_value("key").await.unwrap().as_deref(),
-        Some("snapshot-value")
-    );
-    restored
-        .install_snapshot(store.recovery_snapshot())
-        .await
-        .unwrap();
-    assert_eq!(restored.applied, 1);
-}
-
-#[tokio::test]
-async fn background_snapshot_excludes_later_writes() {
-    let source = tempfile::tempdir().unwrap();
-    let destination = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(&source.path().join("objects"))
-        .await
-        .unwrap();
-    let put = |value: &str| Command {
-        id: value.to_owned(),
-        request: Request {
-            operations: vec![Operation::Put {
-                key: "key".to_owned(),
-                value: value.to_owned(),
-            }],
-        },
-    };
-    state.apply(1, Some(&put("before"))).await.unwrap();
-    let job = state.snapshot_job().unwrap();
-    state.apply(2, Some(&put("after"))).await.unwrap();
-    let data = job.await.unwrap();
-    let mut store = storage(&source.path().join("raft"));
-    let hs = HardState {
-        term: 1,
-        vote: 1,
-        commit: 2,
-    };
-    store
-        .persist(&[entry(1, 1), entry(2, 1)], Some(&hs), None)
-        .unwrap();
-    store.checkpoint(1, data).unwrap();
-    let mut restored = StateMachine::open(&destination.path().join("objects"))
-        .await
-        .unwrap();
-    restored
-        .install_snapshot(store.recovery_snapshot())
-        .await
-        .unwrap();
-    assert_eq!(restored.applied, 1);
-    assert_eq!(
-        restored.local_value("key").await.unwrap().as_deref(),
-        Some("before")
-    );
-    restored.apply(2, Some(&put("after"))).await.unwrap();
-    assert_eq!(
-        restored.local_value("key").await.unwrap().as_deref(),
-        Some("after")
-    );
 }
 
 #[test]

@@ -25,7 +25,7 @@ impl StateMachine {
         let rows = Arc::new(rows::RowCache::new(self.location.cache.row_bytes));
         let admin = self.admin.clone();
         let location = self.location.clone();
-        let mut next = Self::load_rows(None, admin, location, rows, reads, true)
+        let mut next = Self::load_rows(admin, location, rows, reads)
             .await
             .map_err(candidate_fault)?;
         if next.applied_term != 0 && term != 0 {
@@ -52,7 +52,6 @@ impl StateMachine {
             next.members = self.members.clone();
         }
         next.write_batches = self.write_batches;
-        next.row_marker = self.row_marker.take();
         // The new rows reach watchers through storage catch-up.
         next.watch_capture = self.watch_capture.take();
         if let Some(capture) = &mut next.watch_capture {

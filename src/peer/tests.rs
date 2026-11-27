@@ -21,12 +21,11 @@ async fn server_on(
     tokio::task::JoinHandle<Result<()>>,
     prometheus::IntCounter,
 ) {
-    server_with(store, None).await
+    server_with(store).await
 }
 
 async fn server_with(
     store: Option<&str>,
-    location: Option<std::sync::Arc<crate::state::transfer::Location>>,
 ) -> (
     String,
     mpsc::Receiver<Event>,
@@ -38,7 +37,6 @@ async fn server_with(
     let (events, received) = mpsc::channel(256);
     let refused = prometheus::IntCounter::new("refused", "Refused peer stores.").unwrap();
     let router = crate::api::router(ApiState {
-        location,
         shared: None,
         events,
         peer: Identity {
@@ -68,7 +66,7 @@ fn message(snapshot: bool) -> Message {
 }
 
 /// The next event that is not the process notice of a stream or request. A sender of this
-/// binary names its process. A raw test stream, like an earlier binary, names none.
+/// binary names its process. A raw test stream names none.
 async fn next_event(events: &mut mpsc::Receiver<Event>) -> Event {
     loop {
         match tokio::time::timeout(Duration::from_secs(3), events.recv())
@@ -604,73 +602,6 @@ fn covered_snapshot(process: Option<u64>) -> Message {
     message
 }
 
-/// An earlier binary restarted on the member after the leader built a snapshot above its row.
-/// Its server has only the old route, so it answers 404 before its Raft sees the snapshot. The
-/// leader then treats the member as an earlier binary and reports the snapshot as failed.
-#[tokio::test]
-async fn an_earlier_binary_refuses_a_snapshot_above_its_row_before_raft() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let old_route = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let calls = old_route.clone();
-    let router = axum::Router::new().route(
-        "/raft",
-        axum::routing::post(move || {
-            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            async { axum::http::StatusCode::NO_CONTENT }
-        }),
-    );
-    tokio::spawn(async move { axum::serve(listener, router).await });
-    let (events, mut received) = mpsc::channel(8);
-    let traffic = std::sync::Arc::new(crate::metrics::PeerTraffic::default());
-    let client = reqwest::Client::new();
-    let url = format!("http://{address}/raft");
-    spawn_snapshot(
-        &client,
-        &url,
-        &"test".into(),
-        covered_snapshot(Some(7)),
-        &traffic,
-        &events,
-        2,
-    );
-    let first = tokio::time::timeout(Duration::from_secs(3), received.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(
-        first,
-        Event::SnapshotRefused {
-            member: 2,
-            target: 7
-        }
-    ));
-    let second = tokio::time::timeout(Duration::from_secs(3), received.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(
-        second,
-        Event::NetworkResult {
-            peer: 2,
-            snapshot: true,
-            success: false
-        }
-    ));
-    assert_eq!(old_route.load(std::sync::atomic::Ordering::Relaxed), 0);
-    // A snapshot at its row has no target, and it still takes the old route.
-    let mut exact = covered_snapshot(None);
-    exact.context.clear();
-    let mut snapshot = exact.take_snapshot();
-    snapshot.data = crate::state::transfer::ViewDescriptor::new(uuid::Uuid::new_v4())
-        .encode()
-        .unwrap();
-    exact.set_snapshot(snapshot);
-    let delivery = post_snapshot(&client, &url, &"test".into(), exact, &traffic).await;
-    assert_eq!(delivery, Delivery::Sent);
-    assert_eq!(old_route.load(std::sync::atomic::Ordering::Relaxed), 1);
-}
-
 /// This binary takes a snapshot above its row only when it names this process. A snapshot for
 /// another process of the member gets 409 before Raft, and the sender falls back.
 #[tokio::test]
@@ -774,52 +705,4 @@ async fn peers_of_another_store_or_no_store_are_refused_before_raft() {
     assert_eq!(refused.get(), 2 + routes);
     drop(messages);
     sender.await.unwrap();
-}
-
-/// The snapshot file route serves the objects of a replicated member. A shared member serves
-/// none, with or without the store ID, because its location holds the shared state.
-#[tokio::test]
-async fn a_shared_member_serves_no_snapshot_file() {
-    use slatedb::object_store::{memory::InMemory, ObjectStoreExt};
-    let objects: std::sync::Arc<dyn slatedb::object_store::ObjectStore> =
-        std::sync::Arc::new(InMemory::new());
-    let location = crate::state::transfer::Location::open(
-        objects.clone(),
-        "state",
-        crate::state::transfer::Backend::Local,
-        false,
-        crate::state::StateCache::default(),
-        None,
-    )
-    .await
-    .unwrap();
-    let root = location.root();
-    let manifest = format!("manifest/{:020}.manifest", 1);
-    objects
-        .put(
-            &format!("{root}/{manifest}").into(),
-            b"manifest".to_vec().into(),
-        )
-        .await
-        .unwrap();
-    let http = reqwest::Client::new();
-    for (store, sent, status) in [
-        (None, None, reqwest::StatusCode::OK),
-        (Some("store-a"), None, reqwest::StatusCode::NOT_FOUND),
-        (
-            Some("store-a"),
-            Some("store-a"),
-            reqwest::StatusCode::NOT_FOUND,
-        ),
-    ] {
-        let (address, _received, _task, _) = server_with(store, Some(location.clone())).await;
-        let identity = Identity {
-            cluster: "stream-test".into(),
-            store: sent.map(str::to_owned),
-        };
-        let route = crate::state::transfer::FILE_ROUTE;
-        let url = format!("http://{address}{route}?root={root}&path={manifest}");
-        let response = identity.headers(http.get(url)).send().await.unwrap();
-        assert_eq!(response.status(), status, "{store:?} {sent:?}");
-    }
 }

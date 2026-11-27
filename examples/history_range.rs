@@ -1,6 +1,7 @@
 //! Time paginated historical LIST pages while the history grows.
 //!
-//! Run with `cargo run --release --example history_range -- [keys] [rounds] [page] [dir]`.
+//! Run with `python3 scripts/rustfs_fixture.py cargo run --release --example history_range --
+//! [keys] [rounds] [page] [dir]`. The member keeps its state on the RustFS server of the fixture.
 //! The member data goes to a new temporary child of `dir`, which the run removes at exit.
 //! The example writes `keys` keys, then overwrites every key `rounds` times. After some rounds it
 //! reads all keys in pages of `page` rows at the first write (`old`) and at the latest write
@@ -107,6 +108,20 @@ fn millis(latencies: &[Duration], quantile: f64) -> f64 {
     latencies[index - 1].as_secs_f64() * 1000.0
 }
 
+/// The object store that `scripts/rustfs_fixture.py` names in the environment, under `prefix`.
+fn object_store(prefix: &str) -> anyhow::Result<slatedb_etcd::object::Config> {
+    let endpoint = std::env::var("SLATEDB_S3_TEST_ENDPOINT").ok();
+    Ok(slatedb_etcd::object::Config::S3(slatedb_etcd::object::S3 {
+        bucket: std::env::var("SLATEDB_S3_TEST_BUCKET")?,
+        region: "us-east-1".into(),
+        allow_http: endpoint
+            .as_deref()
+            .is_some_and(|url| url.starts_with("http://")),
+        endpoint,
+        prefix: prefix.into(),
+    }))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let keys = arg(1, 20_000);
@@ -120,7 +135,9 @@ async fn main() -> anyhow::Result<()> {
     let dir = tempfile::Builder::new()
         .prefix("member-")
         .tempdir_in(&parent)?;
-    let server = Server::start(ServerConfig::single_node(dir.path())).await?;
+    let name = dir.path().file_name().unwrap().to_string_lossy();
+    let store = object_store(&format!("examples/history-range/{name}"))?;
+    let server = Server::start(ServerConfig::single_node(dir.path(), store)).await?;
     let result = async {
         server.wait_ready(Duration::from_secs(10)).await?;
         let mut client = KvClient::connect(server.client_url())

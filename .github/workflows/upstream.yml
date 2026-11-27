@@ -136,7 +136,7 @@ jobs:
           sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3
           echo user_allow_other | sudo tee -a /etc/fuse.conf
           make install-lazyfs
-      # Service clusters of several members run in shared state mode on this job's RustFS server.
+      # Service members run in shared state mode on this job's RustFS server.
       - uses: ./.github/actions/rustfs
         if: matrix.target == 'service'
       - name: Run client examples on fresh clusters

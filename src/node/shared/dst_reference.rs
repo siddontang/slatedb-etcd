@@ -4,48 +4,39 @@ use super::*;
 
 /// The state that each member view must equal at its applied index.
 ///
-/// The reference applies each committed entry in order with `apply::apply_entries`. In shared
-/// mode it applies them to an in-memory state from `StateMachine::open_memory`. That state is a
-/// whole `StateMachine`, as in the members. It shares the apply rules with them: MVCC prepare,
-/// the lease and membership rules, the key index, and the size counters. It leaves out the
-/// storage side of shared mode: the overlay, the base and its switch, the materializer, and the
-/// checkpoints. So the view check finds an error in the storage side of the members. It does
-/// not check the apply rules, because the members and the reference use the same rules.
+/// The reference applies each committed entry in order with `apply::apply_entries`. It applies
+/// them to an in-memory state from `StateMachine::open_memory`. That state is a whole
+/// `StateMachine`, as in the members. It shares the apply rules with them: MVCC prepare, the
+/// lease and membership rules, the key index, and the size counters. It leaves out the storage
+/// side: the overlay, the base and its switch, the materializer, and the checkpoints. So the view
+/// check finds an error in the storage side of the members. It does not check the apply rules,
+/// because the members and the reference use the same rules.
 ///
-/// A replicated state with no flags also applies each entry. Its quota flag disables the check,
-/// unlike the flag of any member. Replicated simulations use only this state, because their
-/// quota rules differ from shared mode. In shared mode the two states must have equal rows and
-/// equal loaded fields after each index. The replicated state has its own storage and the
-/// replicated branches of the apply rules, so the comparison finds an error in the in-memory
-/// state or in the shared branches of the rules.
+/// A state with an overlay and no writer also applies each entry. Its claim quota disables the
+/// check, as the quota of the in-memory state does. The two states must have equal rows and
+/// equal loaded fields after each index, so the comparison finds an error in the in-memory
+/// state.
 pub(super) struct Reference {
-    memory: Option<StateMachine>,
-    replicated: StateMachine,
-    /// The indexes at which the in-memory state and the replicated state were equal.
+    memory: StateMachine,
+    overlay: StateMachine,
+    /// The indexes at which the in-memory state and the overlay state were equal.
     pub(super) compared: u64,
     /// The compared entries of each kind. See `entry_kind`. A kind ends in ` (rejected)` when
     /// the in-memory state applied the entry with an error reply.
     kinds: BTreeMap<String, u64>,
-    /// Shared mode: the loaded fields of the in-memory state after each index.
+    /// The loaded fields of the in-memory state after each index.
     loaded: BTreeMap<u64, String>,
 }
 
 impl Reference {
     /// Open the reference states in `dir`. The seed entry of the first leader gives them the
     /// membership row.
-    pub(super) async fn open(dir: &std::path::Path, shared: bool) -> Self {
-        let memory = if shared {
-            Some(StateMachine::open_memory().await.unwrap())
-        } else {
-            None
-        };
-        let loaded = memory
-            .iter()
-            .map(|m| (m.applied, m.loaded_fields()))
-            .collect();
+    pub(super) async fn open(dir: &std::path::Path) -> Self {
+        let memory = StateMachine::open_memory().await.unwrap();
+        let loaded = BTreeMap::from([(memory.applied, memory.loaded_fields())]);
         Self {
             memory,
-            replicated: StateMachine::open(dir).await.unwrap(),
+            overlay: StateMachine::open_test(dir).await.unwrap(),
             compared: 0,
             kinds: BTreeMap::new(),
             loaded,
@@ -53,10 +44,10 @@ impl Reference {
     }
 
     fn applied(&self) -> u64 {
-        self.replicated.applied
+        self.overlay.applied
     }
 
-    /// The loaded fields of the in-memory state after `index`, in shared mode.
+    /// The loaded fields of the in-memory state after `index`.
     pub(super) fn loaded(&self, index: u64) -> Option<&String> {
         self.loaded.get(&index)
     }
@@ -68,14 +59,12 @@ impl Reference {
             member: 0,
             term: entry.term,
         };
-        let replicated = &mut self.replicated;
-        apply::apply_entries(replicated, vec![entry.clone()], header)
+        let overlay = &mut self.overlay;
+        apply::apply_entries(overlay, vec![entry.clone()], header)
             .await
             .unwrap();
-        let expected = rows_digest(replicated.applied_state()).await.unwrap();
-        let Some(memory) = &mut self.memory else {
-            return expected;
-        };
+        let expected = rows_digest(overlay.applied_state()).await.unwrap();
+        let memory = &mut self.memory;
         let mut kind = entry_kind(&entry);
         let replies = apply::apply_entries(memory, vec![entry], header)
             .await
@@ -89,7 +78,7 @@ impl Reference {
         let fields = memory.loaded_fields();
         assert_eq!(
             fields,
-            replicated.loaded_fields(),
+            overlay.loaded_fields(),
             "the reference fields differ at {index}"
         );
         self.loaded.insert(index, fields);
@@ -161,7 +150,6 @@ fn command_kind(command: &RaftCommand) -> String {
         RaftCommand::Compact { .. } => "compact".into(),
         RaftCommand::CompactStep { .. } => "compact step".into(),
         RaftCommand::ViewCheckpoint { .. } => "view checkpoint".into(),
-        RaftCommand::SetQuota { .. } => "set quota".into(),
         RaftCommand::SeedMembers(_) => "seed members".into(),
         RaftCommand::Cluster { request, .. } => format!("member {}", variant(request)),
         RaftCommand::Maintenance { request, .. } => format!("maintenance {}", variant(request)),
@@ -294,7 +282,7 @@ impl Simulation {
 /// lost the later writes.
 #[tokio::test]
 async fn the_view_check_finds_a_wrong_base_switch_in_an_idle_cluster() {
-    let mut sim = Simulation::with_mode(97, true).await;
+    let mut sim = Simulation::new(97).await;
     sim.settle(4).await;
     // Some Puts attach this lease.
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
@@ -337,7 +325,7 @@ async fn the_view_check_finds_a_wrong_base_switch_in_an_idle_cluster() {
 /// wrong: it is a view of an earlier index. The check must run again for the new process.
 #[tokio::test]
 async fn the_view_check_runs_again_after_a_restart_at_the_same_base() {
-    let mut sim = Simulation::with_mode(101, true).await;
+    let mut sim = Simulation::new(101).await;
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
     let mut writers = BTreeMap::new();
@@ -377,7 +365,7 @@ async fn the_view_check_runs_again_after_a_restart_at_the_same_base() {
 /// comparison with the fields of the reference finds it.
 #[tokio::test]
 async fn the_loaded_check_compares_each_member_with_the_reference() {
-    let mut sim = Simulation::with_mode(103, true).await;
+    let mut sim = Simulation::new(103).await;
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
     // From here the test runs the check, so it sees the result.
@@ -399,7 +387,7 @@ async fn the_loaded_check_compares_each_member_with_the_reference() {
 #[should_panic(expected = "the reference rows differ at 2")]
 async fn the_reference_comparison_covers_diagnostic_rows() {
     let dir = tempfile::tempdir().unwrap();
-    let mut reference = Reference::open(dir.path(), true).await;
+    let mut reference = Reference::open(dir.path()).await;
     let put = RaftCommand::Diagnostic(crate::Command {
         id: "put".into(),
         request: crate::Request {
@@ -418,7 +406,7 @@ async fn the_reference_comparison_covers_diagnostic_rows() {
     reference.apply(entry(1, put.encode().unwrap())).await;
     let mut wrong = crate::WriteBatch::new();
     wrong.put(b"data/k", b"wrong");
-    reference.memory.as_mut().unwrap().write_memory(&wrong);
+    reference.memory.write_memory(&wrong);
     reference.apply(entry(2, vec![])).await;
 }
 
@@ -477,7 +465,7 @@ impl Simulation {
 async fn every_entry_kind_matches_in_a_shared_cluster() {
     use crate::auth::{Command as A, Credentials};
     use crate::proto::etcdserverpb::*;
-    let mut sim = Simulation::with_mode(107, true).await;
+    let mut sim = Simulation::new(107).await;
     sim.settle(4).await;
     let mut writers = BTreeMap::new();
     let leader = sim.leader().unwrap();

@@ -33,14 +33,10 @@ pub(super) struct AppliedState {
     pub view: Option<(u64, u64, u64)>,
     /// Shared mode: the checkpoint of the base.
     pub base_checkpoint: Option<uuid::Uuid>,
-    /// The quota of the last applied `SetQuota` entry. See `StateMachine::cluster_quota`.
-    pub cluster_quota: Option<crate::state::quota::ClusterQuota>,
     /// The quota that apply uses. A non-positive value means no limit.
     pub quota_bytes: i64,
     /// The flag of this member differs from `quota_bytes`.
     pub quota_mismatch: bool,
-    /// The checkpoint that must cover a first cluster quota. See `StateMachine::quota_boundary`.
-    pub quota_boundary: u64,
     /// The stored membership row, if any. See `state::cluster`.
     pub members_row: Option<crate::state::cluster::MembersRow>,
     /// The leader whose row differed from this row at the last check.
@@ -71,10 +67,8 @@ impl AppliedState {
             physical_revision: state.physical_revision(),
             view: state.view_status(),
             base_checkpoint: state.base_checkpoint(),
-            cluster_quota: state.cluster_quota(),
             quota_bytes: state.quota_bytes(),
             quota_mismatch: state.quota_mismatch(),
-            quota_boundary: state.quota_boundary,
             members_row: state.members_row.clone(),
             members_mismatch: state.members_mismatch,
             members_checked: state.members_checked,
@@ -189,9 +183,6 @@ pub(super) enum Job {
     RaiseBase(Snapshot),
     /// Shared mode: switch to a base that finished opening, and publish the new view.
     SwitchBase,
-    /// Shared mode: store the apply marker at the applied index, so the next checkpoint has its
-    /// row there. An earlier binary installs a base only at its row.
-    MarkRow,
     /// Shared mode: adopt this opened base above the applied index. The node verified its index
     /// against the delivered commit, and `term` is the log term there. The job holds the base.
     AdoptBase {
@@ -199,11 +190,10 @@ pub(super) enum Job {
         term: u64,
     },
     Query(Query),
-    /// Flush the applied prefix. Build a full image only when `image` is set.
+    /// Write the Raft snapshot record of the base.
     Checkpoint {
         delay: Duration,
         dir: PathBuf,
-        image: bool,
     },
 }
 
@@ -272,8 +262,6 @@ pub(super) enum Output {
 
 /// The database handles after a snapshot install.
 pub struct Rebound {
-    /// The replicated database. Shared mode has none.
-    pub db: Option<std::sync::Arc<slatedb::Db>>,
     pub admin: std::sync::Arc<slatedb::admin::Admin>,
 }
 
@@ -365,7 +353,6 @@ impl Executor {
                 | Job::Snapshot(_)
                 | Job::PublishPuts(_)
                 | Job::SwitchBase
-                | Job::MarkRow
                 | Job::AdoptBase { .. }
         );
         let copy_state = changes_state || matches!(work.job, Job::Query(Query::Maintenance(..)));
@@ -412,10 +399,6 @@ impl Executor {
             }
             // The switch ran above. The new view goes out with the completion.
             Job::SwitchBase => Output::Entries(Vec::new()),
-            Job::MarkRow => {
-                self.state.mark_row()?;
-                Output::Entries(Vec::new())
-            }
             Job::AdoptBase { base, term } => match self.adopt_retrying(base, term).await? {
                 Adoption::Adopted => Output::Adopted(self.state.members.conf()),
                 // A newer snapshot replaces this adoption.
@@ -439,11 +422,10 @@ impl Executor {
                     early = true;
                     Output::Entries(Vec::new())
                 }
-                // An object snapshot replaces the database. The node rebinds its handles.
+                // The node rebinds its handles.
                 Waited::Again => {
                     self.reported = None;
                     Output::Snapshot(Rebound {
-                        db: self.state.database(),
                         admin: self.state.admin.clone(),
                     })
                 }
@@ -521,8 +503,8 @@ impl Executor {
                     }
                 }
             },
-            Job::Checkpoint { delay, dir, image } => {
-                let (index, conf, job) = self.state.checkpoint_parts(image).await?;
+            Job::Checkpoint { delay, dir } => {
+                let (index, conf, job) = self.state.checkpoint_parts().await?;
                 let build = async move {
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
@@ -603,7 +585,6 @@ impl Executor {
 }
 
 pub(super) struct Worker {
-    database: Option<std::sync::Arc<slatedb::Db>>,
     /// Ends or preempts a job that waits on a storage error, and reads its pause report.
     pub control: Control,
     work: mpsc::Sender<Work>,
@@ -631,7 +612,6 @@ impl Worker {
         state.watch_capture = Some(Default::default());
         let (work, mut jobs) = mpsc::channel::<Work>(PIPELINE_DEPTH);
         let (done, completed) = mpsc::channel(PIPELINE_DEPTH);
-        let database = state.database();
         let (control, signals) = retry::signals();
         let mut executor = Executor {
             state,
@@ -647,7 +627,6 @@ impl Worker {
         #[cfg(test)]
         if manual {
             return Self {
-                database,
                 control,
                 work,
                 completed,
@@ -678,7 +657,6 @@ impl Worker {
         };
         let task = tokio::spawn(worker);
         Self {
-            database,
             control,
             work,
             completed,
@@ -693,17 +671,7 @@ impl Worker {
         self.completed.close();
         self.work = mpsc::channel(1).0;
         if let Some(task) = self.task.take() {
-            match task.await {
-                Ok(result) => result?,
-                Err(error) => {
-                    if let Some(database) = &self.database {
-                        let _ = database
-                            .close_with_options(slatedb::config::CloseOptions { flush_type: None })
-                            .await;
-                    }
-                    return Err(error.into());
-                }
-            }
+            task.await??;
         }
         Ok(())
     }
@@ -715,22 +683,10 @@ impl Worker {
     }
 
     pub async fn next(&mut self) -> Result<Completion> {
-        let completion = self
-            .completed
+        self.completed
             .recv()
             .await
-            .context("apply worker stopped")??;
-        if let Output::Snapshot(rebound) = &completion.output {
-            self.database = rebound.db.clone();
-        }
-        Ok(completion)
-    }
-
-    #[cfg(test)]
-    pub fn database(&self) -> std::sync::Arc<slatedb::Db> {
-        self.database
-            .clone()
-            .expect("replicated state has a database")
+            .context("apply worker stopped")?
     }
 
     #[cfg(test)]
@@ -742,13 +698,7 @@ impl Worker {
     pub async fn step(&mut self) -> Result<Option<Completion>> {
         let (executor, jobs) = self.manual.as_mut().context("worker is not manual")?;
         match jobs.try_recv() {
-            Ok(work) => {
-                let completion = executor.execute(work).await?;
-                if let Output::Snapshot(rebound) = &completion.output {
-                    self.database = rebound.db.clone();
-                }
-                Ok(Some(completion))
-            }
+            Ok(work) => Ok(Some(executor.execute(work).await?)),
             Err(mpsc::error::TryRecvError::Empty) => Ok(None),
             Err(error) => Err(error.into()),
         }
@@ -810,7 +760,6 @@ async fn apply_into(
                 .as_ref()
                 .map_or(entry.data.as_ref(), |change| change.context.as_ref()),
         )?;
-        state.before_entry(&command)?;
         if change.is_none() && super::quorum_put::kv_command(&command).is_some() {
             let mut commands = vec![(entry.index, command)];
             let mut term = entry.term;
@@ -940,21 +889,6 @@ async fn apply_into(
                     .await?;
                 Reply::Encoded(Value::Null)
             }
-            RaftCommand::SetQuota {
-                bytes,
-                seed,
-                requested_at,
-                member,
-                ..
-            } => {
-                let request = crate::state::quota::ClusterQuota {
-                    bytes: *bytes,
-                    requested_at: *requested_at,
-                    member: *member,
-                };
-                state.apply_set_quota(entry.index, request, *seed).await?;
-                Reply::Encoded(Value::Null)
-            }
             RaftCommand::SeedMembers(seed) => {
                 state.apply_seed_members(entry.index, seed).await?;
                 Reply::Encoded(Value::Null)
@@ -985,34 +919,18 @@ pub(super) async fn recover(
     state: &mut StateMachine,
     storage: &RaftStorage,
     header: Header,
-    origin: super::quota::Guards,
 ) -> Result<()> {
-    let mut physical = false;
     while state.applied < storage.commit_index() {
         let low = state.applied + 1;
-        let mut entries = storage.entries(
+        let entries = storage.entries(
             low,
             (low + BATCH_ENTRIES).min(storage.commit_index() + 1),
             Some(BATCH_BYTES),
             raft::GetEntriesContext::empty(false),
         )?;
         ensure!(!entries.is_empty(), "empty recovery batch");
-        // A guarded member stops here and waits for a snapshot. See `node::quota`.
-        if super::quota::guard_replay(state, origin, &mut entries)? {
-            break;
-        }
-        let replies = apply_entries(state, entries, header).await?;
-        physical |= replies.iter().any(|r| {
-            matches!(
-                r.reply,
-                Reply::PhysicalCompact { flush: Some(_), .. } | Reply::CompactFlush { .. }
-            )
-        });
-    }
-    // Shared mode has no local flush. The leader materializer writes the shared database.
-    if physical && !state.is_shared() {
-        state.metrics.flush_db(state.db()).await?;
-        state.durable_applied = state.applied;
+        // The leader materializer writes the shared database, so replay flushes nothing.
+        apply_entries(state, entries, header).await?;
     }
     Ok(())
 }
@@ -1036,11 +954,12 @@ mod tests {
     use crate::proto::etcdserverpb::request_op::Request as Op;
     use crate::proto::etcdserverpb::response_op::Response as Resp;
     use crate::proto::etcdserverpb::*;
+    use crate::state::{StateRead, StateScan};
 
     #[tokio::test]
     async fn kv_groups_stop_at_leases_and_empty_entries() {
         let directory = tempfile::tempdir().unwrap();
-        let mut state = StateMachine::open(directory.path()).await.unwrap();
+        let mut state = StateMachine::open_test(directory.path()).await.unwrap();
         let put = |key: &[u8], value: &[u8], lease| RequestOp {
             request: Some(Op::RequestPut(PutRequest {
                 key: key.to_vec(),
@@ -1109,7 +1028,8 @@ mod tests {
         .unwrap();
         assert_eq!(replies.len(), 7);
         assert_eq!(state.applied, 8);
-        assert_eq!(state.write_batches, 4);
+        // An empty entry changes no state, so it writes no batch.
+        assert_eq!(state.write_batches, 3);
         let Reply::Kv(outcome) = &replies[2].reply else {
             panic!("expected transaction reply");
         };
@@ -1150,7 +1070,7 @@ mod tests {
     /// term must match it.
     async fn stored_term(state: &StateMachine) -> u64 {
         let row = state
-            .db()
+            .applied_state()
             .get(crate::state::APPLIED_TERM)
             .await
             .unwrap()
@@ -1168,7 +1088,7 @@ mod tests {
     async fn every_state_batch_stores_the_term_of_its_last_entry() {
         use crate::proto::authpb::UserAddOptions;
         let directory = tempfile::tempdir().unwrap();
-        let mut state = StateMachine::open(directory.path()).await.unwrap();
+        let mut state = StateMachine::open_test(directory.path()).await.unwrap();
         assert_eq!(state.applied_term, 0);
         let credentials = crate::auth::Credentials::default;
         let etcd = |id: &str, etcd| {
@@ -1179,8 +1099,8 @@ mod tests {
             })
         };
         // Each group applies as one state batch. A group of two puts uses the term of the last.
+        // An empty entry changes no state, so it writes no batch.
         let groups = vec![
-            ("empty entry", vec![None]),
             (
                 "grouped puts",
                 vec![etcd("a", put_op(b"a", b"1")), etcd("b", put_op(b"b", b"2"))],
@@ -1278,11 +1198,6 @@ mod tests {
                 "{name}"
             );
         }
-        state.db().flush().await.unwrap();
-        state.close().await.unwrap();
-        drop(state);
-        let state = StateMachine::open(directory.path()).await.unwrap();
-        assert_eq!((state.applied, state.applied_term), (index, term));
         state.close().await.unwrap();
     }
 
@@ -1342,7 +1257,11 @@ mod tests {
     }
 
     async fn rows(state: &StateMachine) -> Vec<(bytes::Bytes, bytes::Bytes)> {
-        let mut scan = state.db().scan_prefix(b"", ..).await.unwrap();
+        let mut scan = state
+            .applied_state()
+            .scan_under(b"", &Default::default())
+            .await
+            .unwrap();
         let mut rows = vec![];
         while let Some(row) = scan.next().await.unwrap() {
             rows.push((row.key, row.value));
@@ -1440,8 +1359,8 @@ mod tests {
         for quota in [0, 1, 900, 1500, 100000] {
             let left = tempfile::tempdir().unwrap();
             let right = tempfile::tempdir().unwrap();
-            let mut grouped = StateMachine::open(left.path()).await.unwrap();
-            let mut separate = StateMachine::open(right.path()).await.unwrap();
+            let mut grouped = StateMachine::open_test(left.path()).await.unwrap();
+            let mut separate = StateMachine::open_test(right.path()).await.unwrap();
             // Grouped apply stores the entry term. Direct apply calls store `entry_term`.
             separate.entry_term = 1;
             grouped.quota = quota;
@@ -1500,13 +1419,13 @@ mod tests {
             assert_eq!(grouped.logical_size(), separate.logical_size());
             assert_eq!(
                 grouped.logical_usage(),
-                crate::state::maintenance::count_logical_usage(grouped.db().as_ref())
+                crate::state::maintenance::count_logical_usage(grouped.applied_state())
                     .await
                     .unwrap()
             );
             assert_eq!(
                 separate.logical_usage(),
-                crate::state::maintenance::count_logical_usage(separate.db().as_ref())
+                crate::state::maintenance::count_logical_usage(separate.applied_state())
                     .await
                     .unwrap()
             );
@@ -1862,8 +1781,8 @@ mod tests {
 
             let left = tempfile::tempdir().unwrap();
             let right = tempfile::tempdir().unwrap();
-            let mut grouped = StateMachine::open(left.path()).await.unwrap();
-            let mut separate = StateMachine::open(right.path()).await.unwrap();
+            let mut grouped = StateMachine::open_test(left.path()).await.unwrap();
+            let mut separate = StateMachine::open_test(right.path()).await.unwrap();
             // Grouped apply stores the entry term. Direct apply calls store `entry_term`.
             separate.entry_term = 1;
             for state in [&mut grouped, &mut separate] {
@@ -1919,7 +1838,18 @@ mod tests {
                 assert_eq!(left, right, "{context}, reply {offset}");
             }
             assert_eq!(grouped_events, separate_events, "{context}");
-            assert_eq!(rows(&grouped).await, rows(&separate).await, "{context}");
+            // A one-by-one entry that changes no state stores no apply marker. Compare the
+            // other rows.
+            let stored = |rows: Vec<(bytes::Bytes, bytes::Bytes)>| -> Vec<_> {
+                rows.into_iter()
+                    .filter(|(key, _)| !key.starts_with(b"meta/"))
+                    .collect()
+            };
+            assert_eq!(
+                stored(rows(&grouped).await),
+                stored(rows(&separate).await),
+                "{context}"
+            );
             assert_eq!(
                 (grouped.applied, grouped.revision, grouped.logical_size()),
                 (separate.applied, separate.revision, separate.logical_size()),
@@ -1929,26 +1859,14 @@ mod tests {
             assert_eq!(index_rows(&grouped), index_rows(&separate), "{context}");
             assert_eq!(
                 grouped.logical_usage(),
-                crate::state::maintenance::count_logical_usage(grouped.db().as_ref())
+                crate::state::maintenance::count_logical_usage(grouped.applied_state())
                     .await
                     .unwrap(),
                 "{context}"
             );
             assert!(grouped.write_batches < separate.write_batches, "{context}");
-            let expected = (index_rows(&separate), rows(&separate).await);
-            grouped.db().flush().await.unwrap();
             grouped.close().await.unwrap();
             separate.close().await.unwrap();
-            // The applied marker and the rows reopen together.
-            let reopened = StateMachine::open(left.path()).await.unwrap();
-            assert_eq!(reopened.applied, separate.applied, "{context}");
-            assert_eq!(reopened.revision, separate.revision, "{context}");
-            assert_eq!(
-                (index_rows(&reopened), rows(&reopened).await),
-                expected,
-                "{context}"
-            );
-            reopened.close().await.unwrap();
         }
         // Put-only transactions took the direct path, and the one-by-one path checked them.
         assert!(crate::mvcc::DIRECT_TXNS.with(|count| count.get()) > direct);

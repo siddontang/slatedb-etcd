@@ -1,13 +1,11 @@
 //! Drive physical MVCC compaction through small replicated steps.
 //!
-//! Each member flushes SlateDB after a physical target finishes. The flush runs while the apply
-//! worker accepts more entries. In shared mode a member has no database of its own. It waits
-//! until its base checkpoint covers the target instead.
+//! A member has no database of its own. After a physical target finishes, it waits until its
+//! base checkpoint covers the target. The wait runs while the apply worker accepts more entries.
 
 use super::*;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use tokio::sync::watch;
 
 /// The pause between steps lets client entries use the apply worker.
@@ -16,11 +14,9 @@ const STEP_PAUSE: Duration = Duration::from_millis(2);
 type FlushJob = Pin<Box<dyn Future<Output = Result<(u64, i64)>> + Send>>;
 
 pub(super) struct Flush {
-    db: Option<Arc<slatedb::Db>>,
-    meters: Arc<crate::metrics::StateMeters>,
     running: Option<FlushJob>,
     queued: Option<(u64, i64)>,
-    /// Shared mode: the index `F` of the base. A durable target needs a covering base.
+    /// The index `F` of the base. A durable target needs a covering base.
     shared: Option<watch::Receiver<u64>>,
     /// The physical boundary that has reached object storage.
     pub durable: watch::Sender<i64>,
@@ -74,19 +70,12 @@ impl Waiter {
 impl Flush {
     pub fn new(state: &StateMachine) -> Self {
         Self {
-            db: state.database(),
-            meters: state.metrics.clone(),
             running: None,
             queued: None,
             shared: None,
             durable: watch::channel(state.physical_revision()).0,
             replies: vec![],
         }
-    }
-
-    /// Use the database that a snapshot install opened. A running flush finishes on the old one.
-    pub fn rebind(&mut self, db: Option<std::sync::Arc<slatedb::Db>>) {
-        self.db = db;
     }
 
     /// Wait for a covering base instead of a flush. `based` follows the base index `F`.
@@ -103,27 +92,19 @@ impl Flush {
         self.running.is_some()
     }
 
-    /// Flush through `index`. In shared mode `wait` is the batch sequence that holds `index`,
-    /// and the job waits for a base at or above it.
+    /// Make `index` durable. `wait` is the batch sequence that holds `index`, and the job waits
+    /// for a base at or above it.
     pub fn request(&mut self, index: u64, revision: i64, wait: Option<u64>) {
         if self.active() {
             // Apply submits requests in log order. One later flush covers the queued prefix.
             self.queued = Some((index, revision));
             return;
         }
-        let db = self.db.clone();
-        let meters = self.meters.clone();
         let shared = self.shared.clone().zip(wait);
         self.running = Some(Box::pin(async move {
             if let Some((mut based, seq)) = shared {
                 based.wait_for(|base| *base >= seq).await?;
-                return Ok((index, revision));
             }
-            crate::failpoint::hit("compact-before-flush");
-            meters
-                .flush_db(db.as_ref().context("replicated state has a database")?)
-                .await?;
-            crate::failpoint::hit("compact-after-flush");
             Ok((index, revision))
         }));
     }

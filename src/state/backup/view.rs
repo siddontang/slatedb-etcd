@@ -16,8 +16,8 @@ use tokio::sync::mpsc;
 
 use super::{omitted, Chunk, Rows, Stream, TooLarge};
 use crate::state::shared::{Shared, Source};
-use crate::state::view::{Base, SharedView, StateView};
-use crate::state::{quota, StateMachine};
+use crate::state::view::{Base, SharedView};
+use crate::state::StateMachine;
 
 /// A backup ends when the client takes no chunk for this time. Its view is exempt from
 /// `--view-pin-max`, so this bounds the pin of a client that stops reading.
@@ -30,9 +30,7 @@ impl StateMachine {
     /// pass runs in the task, so a large state does not delay apply. It checks the row sizes
     /// before the first chunk.
     pub(in crate::state) fn shared_backup(&self, shared: &Shared) -> Result<Stream> {
-        let StateView::Shared(view) = shared.pinned() else {
-            anyhow::bail!("a shared state pins a shared view");
-        };
+        let view = shared.pinned_view();
         let mut hold = shared
             .holders
             .admit(&view.segments)
@@ -40,9 +38,7 @@ impl StateMachine {
         let image = Rows {
             applied: self.applied,
             members: serde_json::to_vec(self.members.as_ref())?,
-            // Shared mode ignores a cluster quota row from a converted state. A replicated
-            // restore of this image must not use that old value.
-            omit: |key| omitted(key) || key == quota::KEY,
+            omit: omitted,
         };
         let source = shared.source.clone();
         let holders = shared.holders.clone();
