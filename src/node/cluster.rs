@@ -617,7 +617,7 @@ mod tests {
             node.tick().unwrap();
         }
         settle(&mut node).await;
-        let clock = node.writer.clock.clone();
+        let clock = node.writer.clock().clone();
         node.tick_clock(false);
         let gate = clock.gate().await;
         let admit = |gate: &std::sync::Arc<shared::Gate>| {

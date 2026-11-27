@@ -61,9 +61,7 @@ impl Node {
         // A shared-mode leader first publishes a checkpoint of its applied state. The members
         // then hold small overlays, and the new leader materializes little.
         let applied = self.state.applied;
-        let writer = &mut self.writer;
-        writer.transfer = Some((target, writer.covering(applied)));
-        writer.request_publication(applied);
+        self.writer.start_transfer(target, applied);
         self.finish_transfers()
     }
 
@@ -74,11 +72,8 @@ impl Node {
             .transfers
             .iter()
             .all(|(_, started, _)| started.elapsed() >= Duration::from_secs(3));
-        if let Some((target, covering)) = self.writer.transfer {
-            if base >= covering || waited {
-                self.writer.transfer = None;
-                self.raw.transfer_leader(target);
-            }
+        if let Some(target) = self.writer.take_transfer(base, waited) {
+            self.raw.transfer_leader(target);
         }
         let limit = Duration::from_secs(10);
         let mut pending = vec![];

@@ -51,7 +51,7 @@ impl Simulation {
         let coverage = self.process(id);
         let node = &self.nodes[&id];
         let term = node.raw.raft.term;
-        let health = node.writer.health.report(term, None);
+        let health = node.writer.health().report(term, None);
         self.nodes
             .get_mut(&leader)
             .unwrap()
@@ -97,7 +97,7 @@ impl Simulation {
         let Some(admin) = self
             .nodes
             .values()
-            .map(|node| node.writer.admin.clone())
+            .map(|node| node.writer.admin().clone())
             .next()
         else {
             return;
@@ -372,7 +372,7 @@ async fn a_follower_manual_checkpoint_completes_with_a_certified_base() {
     assert_eq!(covers, j);
     assert_eq!(sim.pushed(grouped), j + 1);
     assert_eq!(sim.base(grouped).0, j);
-    let admin = sim.nodes[&leader].writer.admin.clone();
+    let admin = sim.nodes[&leader].writer.admin().clone();
     let views = crate::state::shared::view_checkpoints(&admin)
         .await
         .unwrap()
@@ -535,7 +535,7 @@ async fn a_buffered_put_keeps_the_coverage_at_the_checkpoint_row() {
     let record = Record::of(&record).unwrap().unwrap();
     assert!(record.index >= requested);
     assert_ne!(record.checkpoint, checkpoint);
-    let source = sim.nodes[&leader].writer.source.clone();
+    let source = sim.nodes[&leader].writer.source().clone();
     let served = source.open_base(record.checkpoint).await.unwrap();
     assert!(served.applied > b);
     let current = format!("etcd/current/{key}");
@@ -613,7 +613,7 @@ async fn a_member_restarts_at_a_record_above_its_checkpoint_row() {
         .await
         .unwrap()
         .id;
-    let admin = sim.nodes[&leader].writer.admin.clone();
+    let admin = sim.nodes[&leader].writer.admin().clone();
     let views = crate::state::shared::view_checkpoints(&admin)
         .await
         .unwrap();
@@ -815,7 +815,7 @@ async fn a_restart_on_another_checkpoint_sends_that_checkpoint() {
         .await
         .unwrap()
         .id;
-    let admin = sim.nodes[&leader].writer.admin.clone();
+    let admin = sim.nodes[&leader].writer.admin().clone();
     admin.delete_checkpoint(x).await.unwrap();
     if let Some(mut writer) = writers.remove(&leader) {
         writer.close().await;
@@ -861,7 +861,7 @@ async fn a_late_refusal_for_an_earlier_process_keeps_the_capability() {
         .store()
         .note_refused(follower, process + 1000);
     assert!(sim.nodes[&leader].raw.store().coverage_capable(follower));
-    let admin = sim.nodes[&leader].writer.admin.clone();
+    let admin = sim.nodes[&leader].writer.admin().clone();
     let views = crate::state::shared::view_checkpoints(&admin)
         .await
         .unwrap()
@@ -910,7 +910,7 @@ async fn a_record_of_an_earlier_base_is_rebuilt_from_the_base() {
     assert!(index > record.index && base != Some(x));
     let kept = Record::of(sim.nodes[&leader].raw.store().recovery_snapshot());
     assert_eq!(kept.unwrap().map(|record| record.checkpoint), Some(x));
-    let admin = sim.nodes[&leader].writer.admin.clone();
+    let admin = sim.nodes[&leader].writer.admin().clone();
     admin.delete_checkpoint(x).await.unwrap();
     assert!(!sim.nodes[&leader].raw.store().has_image());
     let delivered = sim.delivered_views.len();
@@ -952,7 +952,7 @@ async fn a_restart_above_its_record_does_not_send_a_deleted_checkpoint() {
     assert_ne!(sim.base(member).1, Some(x));
     sim.stop(member);
     let leader = sim.leader().unwrap();
-    let admin = sim.nodes[&leader].writer.admin.clone();
+    let admin = sim.nodes[&leader].writer.admin().clone();
     admin.delete_checkpoint(x).await.unwrap();
     sim.start(member).await;
     let node = &sim.nodes[&member];
@@ -1025,7 +1025,7 @@ async fn a_record_at_the_applied_index_raises_the_base() {
     sim.settle(4).await;
     let images = sim.nodes[&member].snapshot_images;
     let record = sim.record_at_applied(member).await;
-    let admin = sim.nodes[&leader].writer.admin.clone();
+    let admin = sim.nodes[&leader].writer.admin().clone();
     admin.delete_checkpoint(record.checkpoint).await.unwrap();
     sim.settle(10).await;
     let (index, base, _) = sim.base(member);
@@ -1062,9 +1062,9 @@ async fn a_failed_raise() {
     sim.write(2).await;
     sim.settle(4).await;
     let node = sim.nodes.get_mut(&member).unwrap();
-    node.writer.skip_raise = true;
+    node.writer.skip_raise();
     let record = sim.record_at_applied(member).await;
-    let admin = sim.nodes[&leader].writer.admin.clone();
+    let admin = sim.nodes[&leader].writer.admin().clone();
     admin.delete_checkpoint(record.checkpoint).await.unwrap();
     sim.settle(10).await;
     let (index, base, _) = sim.base(member);
@@ -1237,9 +1237,9 @@ async fn an_empty_base_sends_a_record_only_after_its_first_base() {
     sim.write(2).await;
     sim.settle(4).await;
     let node = sim.nodes.get_mut(&joining).unwrap();
-    node.writer.skip_raise = true;
+    node.writer.skip_raise();
     let record = sim.record_at_applied(joining).await;
-    let admin = sim.nodes[&leader].writer.admin.clone();
+    let admin = sim.nodes[&leader].writer.admin().clone();
     admin.delete_checkpoint(record.checkpoint).await.unwrap();
     sim.settle(10).await;
     assert_eq!(sim.base(joining).1, None);

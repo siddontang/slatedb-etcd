@@ -179,7 +179,7 @@ impl Node {
             return self.submit_apply(Job::RaiseBase(record), self.state.applied);
         }
         // A switch frees overlay memory, so it goes before other work.
-        if self.prepared_puts.is_none() && self.take_switch() {
+        if self.prepared_puts.is_none() && self.writer.take_switch() {
             return self.submit_apply(Job::SwitchBase, self.state.applied);
         }
         if let Some((base, term)) = self.adoptable() {
