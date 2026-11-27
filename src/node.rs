@@ -325,6 +325,8 @@ pub struct Node {
     checkpoint_running: bool,
     // The time before which no checkpoint starts after a failed one.
     checkpoint_retry_at: Option<Instant>,
+    // The appended log bytes that the running checkpoint took. A failed one gives them back.
+    checkpoint_bytes: u64,
     // Full backlog checks by cause: apply lag, queued log jobs, queued log bytes,
     // uncommitted Raft bytes, unapplied log bytes.
     backlog_rejects: [u64; 5],
@@ -677,6 +679,7 @@ impl Node {
             send_failures: vec![],
             checkpoint_running: false,
             checkpoint_retry_at: None,
+            checkpoint_bytes: 0,
             backlog_rejects: [0; 5],
             request_timeout: REQUEST_TIMEOUT,
             appended_bytes: 0,
@@ -1528,7 +1531,7 @@ impl Node {
             self.state.applied,
         )?;
         self.checkpoint_running = true;
-        self.appended_bytes = 0;
+        self.checkpoint_bytes = std::mem::take(&mut self.appended_bytes);
         if image {
             self.snapshot_images += 1;
         }
@@ -1551,6 +1554,8 @@ impl Node {
                 );
                 self.checkpoint_running = false;
                 self.checkpoint_retry_at = Some(Instant::now() + CHECKPOINT_RETRY);
+                // The bytes count again, so an automatic checkpoint stays due after the wait.
+                self.appended_bytes = self.appended_bytes.saturating_add(self.checkpoint_bytes);
                 return Ok(());
             }
             Err(error) => return Err(error),

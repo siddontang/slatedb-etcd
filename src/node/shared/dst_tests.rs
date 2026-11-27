@@ -1688,3 +1688,61 @@ async fn an_idle_poll_does_not_reopen_older_checkpoints() {
         assert_eq!(sim.base(member).1, current);
     }
 }
+
+/// A Checkpoint job that an appended byte count started fails on a storage read. After the wait,
+/// the same checkpoint is due again with no new bytes over the threshold, and a real checkpoint
+/// then advances the record.
+#[tokio::test]
+async fn a_failed_automatic_checkpoint_keeps_its_byte_trigger() {
+    let mut sim = Simulation::new(83).await;
+    for node in sim.nodes.values_mut() {
+        node.options.snapshot_every = 0;
+        node.next_checkpoint = None;
+    }
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(10).await;
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(10).await;
+    let member = sim.follower(0);
+    let node = sim.nodes.get_mut(&member).unwrap();
+    let base = node.checkpointable();
+    let record = node.raw.store().snapshot_index();
+    assert!(base > record, "base {base} record {record}");
+    assert!(!node.apply_busy);
+    // The bytes that the member appended are the automatic threshold.
+    let charged = node.appended_bytes;
+    assert!(charged > 0);
+    node.options.snapshot_min_bytes = charged;
+    node.next_checkpoint = Some(base);
+    node.membership_checkpoint = record;
+    assert_eq!(node.checkpoint_due(), Some(false));
+    node.schedule_apply().unwrap();
+    assert!(node.checkpoint_running);
+    let mut completion = node.worker.step().await.unwrap().unwrap();
+    let crate::node::apply::Output::Checkpoint(Some(built)) = &mut completion.output else {
+        panic!("expected an inline checkpoint");
+    };
+    assert!(built.result.is_ok());
+    built.result = Err(anyhow::Error::new(crate::mvcc::storage_fault::Classified {
+        fault: crate::mvcc::storage_fault::StorageFault::Transient,
+        message: "membership read temporarily unavailable".into(),
+    }));
+    node.complete_apply(completion).unwrap();
+    let before = node.state.applied;
+    assert_eq!(node.checkpoint_due(), None);
+    sim.write(1).await;
+    sim.settle(2).await;
+    let node = sim.nodes.get_mut(&member).unwrap();
+    assert!(node.state.applied > before);
+    assert_eq!(node.raw.store().snapshot_index(), record);
+    // Only one small write came after the failed checkpoint.
+    tokio::time::sleep(std::time::Duration::from_millis(1050)).await;
+    assert_eq!(node.checkpoint_due(), Some(false), "lost the byte trigger");
+    node.schedule_apply().unwrap();
+    node.drain_apply().await.unwrap();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    assert_eq!(node.raw.store().snapshot_index(), base);
+}
