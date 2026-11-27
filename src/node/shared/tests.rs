@@ -64,6 +64,7 @@ async fn the_materializer_writes_whole_batches_with_their_sequences() {
         replay.queue(),
         progress.clone(),
         clock::Gate::unchecked(),
+        0,
     ));
     progress.wait_written(4).await.unwrap();
     assert_eq!(db.snapshot().unwrap().seq(), 4);
@@ -91,9 +92,9 @@ fn flushes_follow_the_oldest_write_and_publication_requests() {
     // An idle writer has no deadline and no flush.
     assert_eq!(progress.deadline(long), None);
     assert_eq!(progress.take_flush(Duration::ZERO), (false, None));
-    progress.wrote(1);
+    progress.wrote(0, 1);
     let deadline = progress.deadline(long).unwrap();
-    progress.wrote(2);
+    progress.wrote(0, 2);
     // A later write keeps the deadline of the oldest unflushed write.
     assert_eq!(progress.deadline(long), Some(deadline));
     assert_eq!(progress.take_flush(long), (false, None));
@@ -103,7 +104,7 @@ fn flushes_follow_the_oldest_write_and_publication_requests() {
     // A request waits until the materializer writes its sequence.
     progress.request(3);
     assert_eq!(progress.take_flush(long), (false, None));
-    progress.wrote(3);
+    progress.wrote(0, 3);
     assert_eq!(progress.take_flush(long), (true, Some(3)));
     assert_eq!(progress.take_flush(long), (false, None));
     // A request that the written sequence already covers is due at once.
@@ -125,6 +126,19 @@ pub(super) async fn status(server: &crate::server::Server) -> Value {
     let body = response.split_once("\r\n\r\n").unwrap().1;
     let body = &body[body.find('{').unwrap()..=body.rfind('}').unwrap()];
     serde_json::from_str(body).unwrap()
+}
+
+/// A writer without write probes, retention, or gauges.
+pub(super) fn new_writer(handles: &Handles, max_age: Duration, clock: Clock) -> Writer {
+    Writer::new(
+        handles,
+        max_age,
+        clock,
+        None,
+        crate::state::ViewRetention::Off,
+        None,
+        None,
+    )
 }
 
 pub(super) async fn eventually(what: &str, mut check: impl std::ops::AsyncFnMut() -> bool) {
@@ -442,12 +456,12 @@ async fn a_fenced_leader_opens_its_writer_again() {
         &[(1, "127.0.0.1:1".to_owned())].into(),
     ));
     state.seed_for_test(1).await.unwrap();
-    let handles = state.shared_handles().unwrap();
+    let handles = state.shared_handles();
     let (events, mut announced) = mpsc::channel(64);
     let clock = Clock::system(Duration::from_secs(5), None);
-    let mut writer = Writer::new(&handles, Duration::from_millis(50), clock);
+    let mut writer = new_writer(&handles, Duration::from_millis(50), clock);
     writer.sync(true, 2, &events);
-    writer.progress.wait_written(1).await.unwrap();
+    writer.progress().wait_written(1).await.unwrap();
     // The leader of term 1 opens late. Its open fences the writer of term 2. The current
     // leader can open again before this open ends, which fails the late open instead.
     let old = handles.source.open_writer().await.ok();
@@ -480,9 +494,9 @@ async fn a_fenced_leader_opens_its_writer_again() {
     .unwrap();
     let value = covered.get(b"etcd/current/after-fence").await.unwrap();
     assert!(value.is_some());
-    assert!(writer.tasks.try_join_next().is_none());
+    assert!(writer.tasks().try_join_next().is_none());
     // The current leader saw the fence and opened its writer again.
-    assert!(writer.reopens.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+    assert!(writer.reopens() >= 1);
     // The writer of term 1 is fenced now. Its next flush cannot commit a manifest.
     if let Some(old) = old {
         let flushed = async {
@@ -564,10 +578,10 @@ pub(super) async fn stranded_checkpoint_on(
         &[(1, "127.0.0.1:1".to_owned())].into(),
     ));
     state.seed_for_test(1).await.unwrap();
-    let handles = state.shared_handles().unwrap();
+    let handles = state.shared_handles();
     let (events, received) = mpsc::channel(64);
     let mut announcements = Announcements(received);
-    let mut first = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut first = new_writer(&handles, STRANDED_AGE, clock());
     first.sync(true, 2, &events);
     let lost = announcements.next(Duration::from_secs(20), true).await;
     first.sync(false, 2, &events);
@@ -592,7 +606,7 @@ async fn a_new_writer_announces_a_stranded_checkpoint() {
     let mut based = handles.based.clone();
     assert_eq!(*based.borrow(), 0);
     let waiter = tokio::spawn(async move { based.wait_for(|base| *base >= 1).await.is_ok() });
-    let mut second = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut second = new_writer(&handles, STRANDED_AGE, clock());
     second.sync(true, 3, &events);
     assert_eq!(
         announcements.next(Duration::from_secs(2), false).await,
@@ -620,12 +634,12 @@ async fn a_new_writer_announces_a_stranded_checkpoint() {
     second.sync(false, 3, &events);
     second.stop().await;
     // A later writer does not announce it either.
-    let mut third = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut third = new_writer(&handles, STRANDED_AGE, clock());
     third.sync(true, 4, &events);
-    third.progress.wait_written(1).await.unwrap();
+    third.progress().wait_written(1).await.unwrap();
     third.request_publication(1);
     announcements.none(limit).await;
-    assert!(third.tasks.try_join_next().is_none());
+    assert!(third.tasks().try_join_next().is_none());
     third.sync(false, 4, &events);
     third.stop().await;
     state.close().await.unwrap();
@@ -635,14 +649,14 @@ async fn a_new_writer_announces_a_stranded_checkpoint() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_stranded_check_is_retried() {
     let (state, handles, events, mut announcements, lost) = stranded_checkpoint().await;
-    let mut second = Writer::new(&handles, STRANDED_AGE, clock());
-    let failures = second.applied.failures.clone();
+    let mut second = new_writer(&handles, STRANDED_AGE, clock());
+    let failures = second.failures();
     failures.store(3, std::sync::atomic::Ordering::Relaxed);
     second.sync(true, 3, &events);
     let limit = RETRY_MAX + Duration::from_secs(1);
     assert_eq!(announcements.next(limit, true).await, lost);
     assert_eq!(failures.load(std::sync::atomic::Ordering::Relaxed), 0);
-    assert!(second.tasks.try_join_next().is_none());
+    assert!(second.tasks().try_join_next().is_none());
     second.sync(false, 3, &events);
     second.stop().await;
     state.close().await.unwrap();
@@ -669,10 +683,10 @@ async fn a_failed_base_open_is_retried_on_an_idle_member() {
         &[(1, "127.0.0.1:1".to_owned())].into(),
     ));
     state.seed_for_test(1).await.unwrap();
-    let handles = state.shared_handles().unwrap();
+    let handles = state.shared_handles();
     let (events, received) = mpsc::channel(64);
     let mut announcements = Announcements(received);
-    let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut writer = new_writer(&handles, STRANDED_AGE, clock());
     writer.sync(true, 2, &events);
     let id = announcements.next(Duration::from_secs(20), true).await;
     writer.sync(false, 2, &events);
@@ -729,10 +743,10 @@ async fn the_base_advances_under_a_stream_of_announcements() {
         &[(1, "127.0.0.1:1".to_owned())].into(),
     ));
     state.seed_for_test(1).await.unwrap();
-    let handles = state.shared_handles().unwrap();
+    let handles = state.shared_handles();
     let (events, received) = mpsc::channel(64);
     let mut announcements = Announcements(received);
-    let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut writer = new_writer(&handles, STRANDED_AGE, clock());
     writer.sync(true, 2, &events);
     // Sixteen checkpoints, each after one more write. Raft takes none of them yet.
     let mut checkpoints = vec![announcements.next(Duration::from_secs(20), true).await];
@@ -797,7 +811,7 @@ async fn the_base_advances_under_a_stream_of_announcements() {
 #[tokio::test]
 async fn a_manual_checkpoint_requests_its_publication_after_apply() {
     let (mut state, handles, _events, _announcements, _) = stranded_checkpoint().await;
-    let mut writer = Writer::new(&handles, Duration::from_secs(60), clock());
+    let mut writer = new_writer(&handles, Duration::from_secs(60), clock());
     let index = state.applied + 1;
     // Committed at `index`, applied below it: no request yet.
     assert!(!writer.request_checkpoint(index, index - 1));
@@ -813,7 +827,7 @@ async fn a_manual_checkpoint_requests_its_publication_after_apply() {
     state.apply_etcd(index, &put).await.unwrap();
     assert!(writer.request_checkpoint(index, index));
     assert_eq!(
-        writer.progress.inner.lock().unwrap().publish_through,
+        writer.progress().inner.lock().unwrap().publish_through,
         Some(index)
     );
     assert!(!writer.request_checkpoint(index, index));
@@ -839,20 +853,20 @@ pub(super) async fn adopt_announced(state: &mut StateMachine, id: uuid::Uuid) {
 async fn a_new_writer_announces_a_same_index_checkpoint() {
     let (mut state, handles, events, mut announcements, first) = stranded_checkpoint().await;
     adopt_announced(&mut state, first).await;
-    let mut second = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut second = new_writer(&handles, STRANDED_AGE, clock());
     second.sync(true, 3, &events);
-    second.progress.wait_written(1).await.unwrap();
+    second.progress().wait_written(1).await.unwrap();
     announcements.none(Duration::from_millis(300)).await;
     // The Defragment republish. Its announcement does not apply before the change.
-    second.progress.republish();
+    second.progress().republish();
     let compacted = announcements.next(Duration::from_secs(5), true).await;
     assert_ne!(compacted, first);
     let base = handles.source.open_base(compacted).await.unwrap();
-    assert_eq!(base.applied, state.shared.as_ref().unwrap().base.applied);
+    assert_eq!(base.applied, state.shared.base.applied);
     drop(base);
     second.sync(false, 3, &events);
     second.stop().await;
-    let mut third = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut third = new_writer(&handles, STRANDED_AGE, clock());
     third.sync(true, 4, &events);
     assert_eq!(
         announcements.next(Duration::from_secs(2), true).await,
@@ -885,7 +899,7 @@ async fn a_checkpoint_request_survives_the_writer_open() {
     };
     let index = state.applied + 1;
     state.apply_etcd(index, &put).await.unwrap();
-    let mut writer = Writer::new(&handles, Duration::from_secs(90), clock());
+    let mut writer = new_writer(&handles, Duration::from_secs(90), clock());
     assert!(writer.request_checkpoint(index, index));
     writer.sync(true, 3, &events);
     let id = announcements.next(Duration::from_secs(2), true).await;
@@ -910,7 +924,7 @@ async fn ordinary(store: Arc<dyn ObjectStore>) -> (StateMachine, Handles) {
     state.members = Arc::new(crate::cluster::Store::initial(
         &[(1, "127.0.0.1:1".to_owned())].into(),
     ));
-    let handles = state.shared_handles().unwrap();
+    let handles = state.shared_handles();
     (state, handles)
 }
 
@@ -939,7 +953,7 @@ async fn a_restore_after_an_ordinary_bootstrap_fails() {
     state.seed_for_test(1).await.unwrap();
     let (events, received) = mpsc::channel(64);
     let mut announcements = Announcements(received);
-    let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut writer = new_writer(&handles, STRANDED_AGE, clock());
     writer.sync(true, 2, &events);
     announcements.next(Duration::from_secs(20), true).await;
     assert!(handles.source.bootstrapped().await.unwrap());
@@ -1051,7 +1065,7 @@ async fn a_transfer_request_during_the_writer_open_is_published() {
         state.apply_etcd(index, &put).await.unwrap();
     }
     let applied = state.applied;
-    let mut writer = Writer::new(&handles, Duration::from_secs(90), clock());
+    let mut writer = new_writer(&handles, Duration::from_secs(90), clock());
     writer.sync(true, 3, &events);
     // MoveLeader calls this with the applied index. The writer has not opened yet.
     writer.request_publication(applied);
@@ -1071,9 +1085,9 @@ async fn a_transfer_request_during_the_writer_open_is_published() {
 async fn a_defragment_that_loses_the_lead_returns_a_retryable_error() {
     let (mut state, handles, events, mut announcements, first) = stranded_checkpoint().await;
     adopt_announced(&mut state, first).await;
-    let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut writer = new_writer(&handles, STRANDED_AGE, clock());
     writer.sync(true, 3, &events);
-    writer.progress.wait_written(1).await.unwrap();
+    writer.progress().wait_written(1).await.unwrap();
     for n in 0..5 {
         let put = crate::proto::etcdserverpb::RequestOp {
             request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
@@ -1090,18 +1104,14 @@ async fn a_defragment_that_loses_the_lead_returns_a_retryable_error() {
     // The aged flush publishes a checkpoint with an L0 SST. The members adopt it.
     let id = announcements.next(Duration::from_secs(10), true).await;
     adopt_announced(&mut state, id).await;
-    let db = writer.open.lock().unwrap().clone().unwrap().db;
     let reached = Arc::new(tokio::sync::Notify::new());
     let resume = Arc::new(tokio::sync::Notify::new());
     let defragment = Defragment {
-        db,
         admin: handles.admin.clone(),
         owner: None,
-        progress: writer.progress.clone(),
         announced: handles.announced.clone(),
-        leadership: writer.leadership.subscribe(),
-        term: 3,
         pause: Some((DefragmentStep::Publish, reached.clone(), resume.clone())),
+        ..writer.defragment(3).unwrap()
     };
     let running = tokio::spawn(defragment.run());
     reached.notified().await;
@@ -1111,23 +1121,19 @@ async fn a_defragment_that_loses_the_lead_returns_a_retryable_error() {
     let error = running.await.unwrap().unwrap_err();
     assert_eq!(error.code, tonic::Code::Unavailable as i32, "{error:?}");
     // The retry on the next leader.
-    let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut writer = new_writer(&handles, STRANDED_AGE, clock());
     writer.sync(true, 4, &events);
-    let db = loop {
-        if let Some(open) = writer.open.lock().unwrap().clone() {
-            break open.db;
+    let opened = loop {
+        if let Some(opened) = writer.defragment(4) {
+            break opened;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
     let defragment = Defragment {
-        db,
         admin: handles.admin.clone(),
         owner: None,
-        progress: writer.progress.clone(),
         announced: handles.announced.clone(),
-        leadership: writer.leadership.subscribe(),
-        term: 4,
-        pause: None,
+        ..opened
     };
     let running = tokio::spawn(defragment.run());
     let compacted = announcements.next(Duration::from_secs(20), true).await;
@@ -1164,9 +1170,9 @@ async fn defragment_setup() -> (
 ) {
     let (mut state, handles, events, mut announcements, first) = stranded_checkpoint().await;
     adopt_announced(&mut state, first).await;
-    let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut writer = new_writer(&handles, STRANDED_AGE, clock());
     writer.sync(true, 3, &events);
-    writer.progress.wait_written(1).await.unwrap();
+    writer.progress().wait_written(1).await.unwrap();
     for n in 0..5 {
         let put = crate::proto::etcdserverpb::RequestOp {
             request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
@@ -1195,14 +1201,11 @@ fn defragment(
     )>,
 ) -> Defragment {
     Defragment {
-        db: writer.open.lock().unwrap().clone().unwrap().db,
         admin: handles.admin.clone(),
         owner: None,
-        progress: writer.progress.clone(),
         announced: handles.announced.clone(),
-        leadership: writer.leadership.subscribe(),
-        term,
         pause,
+        ..writer.defragment(term).unwrap()
     }
 }
 
@@ -1367,24 +1370,22 @@ async fn an_old_term_task_end_is_not_a_failure() {
     )
     .await
     .unwrap();
-    let handles = state.shared_handles().unwrap();
+    let handles = state.shared_handles();
     let (events, _announced) = mpsc::channel(64);
     let clock = Clock::system(Duration::from_secs(5), None);
-    let mut writer = Some(Writer::new(&handles, Duration::from_millis(50), clock));
-    let leader = writer.as_mut().unwrap();
+    let mut leader = new_writer(&handles, Duration::from_millis(50), clock);
     leader.sync(true, 2, &events);
     leader.sync(false, 2, &events);
     leader.sync(true, 3, &events);
     let failure = tokio::time::timeout(Duration::from_millis(500), async {
         loop {
-            if let WriterEvent::Failed(error) = next(&mut writer).await {
+            if let WriterEvent::Failed(error) = next(&mut leader).await {
                 return error;
             }
         }
     })
     .await;
     assert!(failure.is_err(), "{failure:?}");
-    let mut leader = writer.unwrap();
     leader.sync(false, 3, &events);
     leader.stop().await;
     state.apply(1, None).await.unwrap();
@@ -1487,7 +1488,7 @@ async fn a_dropped_base_is_reported_until_the_pause_ends() {
     let rejected = apply::RejectedBase {
         checkpoint: Some(id),
         index: 9,
-        fault: crate::mvcc::storage_fault::StorageFault::Corrupt,
+        fault: crate::storage_fault::StorageFault::Corrupt,
         reason: "invalid members row".into(),
     };
     for _ in 0..3 {
@@ -1510,12 +1511,12 @@ async fn a_dropped_base_is_reported_until_the_pause_ends() {
     assert_eq!(report(&node)["failures"], 1);
     // The overlay stays above the soft limit: the member still waits, and the report stays.
     let limit = node.options.overlay_max_bytes;
-    node.writer.as_mut().unwrap().paused = true;
-    node.state.view = Some((1, 1, limit + 1));
+    node.writer.set_paused(true);
+    node.state.view = (1, 1, limit + 1);
     assert!(node.apply_paused());
     assert_eq!(report(&node)["failures"], 1);
     // An install or an adoption frees the overlay. The pause ends, and so does the report.
-    node.state.view = Some((1, 1, 0));
+    node.state.view = (1, 1, 0);
     assert!(!node.apply_paused());
     assert_eq!(report(&node), Value::Null);
 }

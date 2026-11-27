@@ -17,7 +17,7 @@ pub(super) struct Flush {
     running: Option<FlushJob>,
     queued: Option<(u64, i64)>,
     /// The index `F` of the base. A durable target needs a covering base.
-    shared: Option<watch::Receiver<u64>>,
+    shared: watch::Receiver<u64>,
     /// The physical boundary that has reached object storage.
     pub durable: watch::Sender<i64>,
     /// Physical Compact replies. A long pass can exceed the proposal timeout, so these replies
@@ -68,19 +68,15 @@ impl Waiter {
 }
 
 impl Flush {
-    pub fn new(state: &StateMachine) -> Self {
+    /// Wait for a covering base instead of a flush. `based` follows the base index `F`.
+    pub fn new(state: &StateMachine, based: watch::Receiver<u64>) -> Self {
         Self {
             running: None,
             queued: None,
-            shared: None,
+            shared: based,
             durable: watch::channel(state.physical_revision()).0,
             replies: vec![],
         }
-    }
-
-    /// Wait for a covering base instead of a flush. `based` follows the base index `F`.
-    pub fn share(&mut self, based: watch::Receiver<u64>) {
-        self.shared = Some(based);
     }
 
     pub fn cancel(&mut self) {
@@ -94,17 +90,15 @@ impl Flush {
 
     /// Make `index` durable. `wait` is the batch sequence that holds `index`, and the job waits
     /// for a base at or above it.
-    pub fn request(&mut self, index: u64, revision: i64, wait: Option<u64>) {
+    pub fn request(&mut self, index: u64, revision: i64, wait: u64) {
         if self.active() {
             // Apply submits requests in log order. One later flush covers the queued prefix.
             self.queued = Some((index, revision));
             return;
         }
-        let shared = self.shared.clone().zip(wait);
+        let mut based = self.shared.clone();
         self.running = Some(Box::pin(async move {
-            if let Some((mut based, seq)) = shared {
-                based.wait_for(|base| *base >= seq).await?;
-            }
+            based.wait_for(|base| *base >= wait).await?;
             Ok((index, revision))
         }));
     }
@@ -149,11 +143,9 @@ impl Node {
 
     /// Flush storage through `index` for the physical boundary `revision`.
     pub(super) fn flush_compaction(&mut self, index: u64, revision: i64) {
-        let wait = self.writer.as_ref().map(|writer| writer.covering(index));
+        let wait = self.writer.covering(index);
         // The leader publishes a covering checkpoint now instead of at the age limit.
-        if let Some(writer) = &self.writer {
-            writer.request_publication(index);
-        }
+        self.writer.request_publication(index);
         self.compaction.request(index, revision, wait);
     }
 

@@ -17,9 +17,7 @@ use crate::{ApiError, Command, RaftCommand, Request};
 
 mod apply;
 mod auto_compaction;
-/// ReadIndex reads that may wait in the Raft owner's table. One quorum round confirms
-/// every read in a batch, so a larger table lets one round cover more clients.
-pub(crate) const MAX_PENDING_READS: usize = 256;
+mod checkpoint;
 /// Apply barriers that may wait for the local state to reach a revision.
 pub(crate) const MAX_APPLY_BARRIERS: usize = apply::MAX_QUERIES;
 mod cache;
@@ -28,6 +26,7 @@ mod cluster;
 mod compaction;
 mod forwarding;
 mod lease;
+mod links;
 mod log;
 mod maintenance;
 mod proposal;
@@ -37,15 +36,15 @@ pub(crate) use shared::WriterReport;
 pub(crate) use shared::{Millis, ProbeReply, ProbeRequest, PROBE_ROUTE};
 pub(crate) use shared::{Prober, WriteProbeReply, WriteProbeRequest, WRITE_PROBE_ROUTE};
 mod quorum_put;
-mod quota;
 mod read;
+pub(crate) use read::table::MAX_PENDING_READS;
 mod ready;
 mod response;
 mod schedule;
 mod shared;
+mod step;
 mod watch;
-use crate::peer::transport_to;
-use apply::{AppliedState, Completion, Header, Job, Output, Query, Reply, Work, Worker};
+use apply::{AppliedState, Completion, Header, Job, Output, Query, Reply, Worker};
 use response::ClientResponse;
 pub use response::KvReply;
 
@@ -116,7 +115,7 @@ pub enum Event {
         publish: Option<u64>,
         /// The process of a member that installs a base above its checkpoint row.
         coverage: Option<u64>,
-        /// The health of the member's writer. A member without a writer sends none.
+        /// The health of the member's writer.
         writer: Option<shared::WriterReport>,
     },
     /// The first peer frame of a stream or request came from this process of `member`, if the
@@ -137,6 +136,13 @@ pub enum Event {
         nonce: u64,
         reply: std::result::Result<WriteProbeReply, String>,
     },
+}
+
+/// A metrics scrape asks the event loop for a sample.
+impl From<oneshot::Sender<crate::metrics::Sample>> for Event {
+    fn from(response: oneshot::Sender<crate::metrics::Sample>) -> Self {
+        Event::Metrics(response)
+    }
 }
 
 /// Flush SlateDB for log truncation about once per L0 SST instead of once per entry interval.
@@ -223,25 +229,6 @@ struct Pending {
     term: u64,
 }
 
-struct RevisionWaiter {
-    revision: i64,
-    response: Response,
-    started: Instant,
-}
-
-struct LogTask {
-    id: u64,
-    work: Option<log::Job>,
-    bytes: usize,
-    snapshot_bytes: usize,
-    ready: Option<u64>,
-    checkpoint: Option<u64>,
-    messages: Vec<Message>,
-    reads: Vec<raft::ReadState>,
-    responses: Vec<Response>,
-    stats_response: Option<Response>,
-}
-
 /// Raft tick interval. Election timeouts count these ticks.
 pub(crate) const TICK: Duration = Duration::from_millis(100);
 /// A client write fails if it waits longer than this before proposal, or after it.
@@ -254,7 +241,6 @@ pub struct Node {
     /// The cluster and the shared store that this member names on its peer traffic.
     peer: crate::peer::Identity,
     last_observed_leader: u64,
-    traffic: BTreeMap<u64, std::sync::Arc<crate::metrics::PeerTraffic>>,
     watch_feed: watch::Publisher,
     forwarding: forwarding::Publisher,
     compaction: compaction::Flush,
@@ -262,89 +248,48 @@ pub struct Node {
     published_at: Option<Instant>,
     events: mpsc::Sender<Event>,
     manual_transport: bool,
-    peer_health: BTreeMap<u64, Instant>,
-    membership_checkpoint: u64,
     raw: RawNode<log::Cache>,
     log_worker: log::Worker,
-    log_queue: VecDeque<LogTask>,
-    log_busy: bool,
-    log_sequence: u64,
-    log_bytes: usize,
-    log_snapshot_bytes: usize,
-    log_delay_ms: u64,
-    log_fail: bool,
-    log_read_delay_ms: u64,
-    log_read_fail: bool,
-    peer_waiters: Vec<Response>,
-    built_checkpoint: Option<(u64, raft::eraftpb::ConfState, Option<PreparedCheckpoint>)>,
+    /// The queued log jobs and the step replies that wait for them. See `ready::pipeline`.
+    log: ready::pipeline::LogPipeline,
     read_executor: read::executor::Executor,
-    read_queries: VecDeque<Query>,
-    reads: BTreeMap<u64, read::PendingRead>,
-    revision_waiters: VecDeque<RevisionWaiter>,
-    read_nonce: [u8; 16],
-    read_sequence: u64,
+    /// The ReadIndex reads, the queued reads, and the revision waits. See `read::table`.
+    reads: read::table::ReadIndexTable,
     state: AppliedState,
     worker: Worker,
-    apply_busy: bool,
-    apply_target: u64,
-    /// Submitted apply jobs in order: target index, and whether a later Entries job may follow.
-    apply_jobs: VecDeque<(u64, bool)>,
-    committed_ready: u64,
-    prepared_puts: Option<crate::state::put_batch::PreparedPuts>,
-    /// Replies for `prepared_puts` evaluated before commit. See `quorum_put::HeldPuts`.
-    held_puts: Option<quorum_put::HeldPuts>,
-    /// The term of the entries in the last submitted PreparePuts job.
-    prepare_term: u64,
+    /// The submitted apply jobs, the delivered commit index, and the queued state reads. See
+    /// `schedule::scheduler`.
+    apply: schedule::scheduler::ApplyScheduler,
+    /// Put replies that leave before the local apply. See `quorum_put::EarlyPuts`.
+    early_puts: quorum_put::EarlyPuts,
     /// True while the log above a held entry is past its alarm bound. See `tick_apply_pause`.
     hold_alarm: bool,
     /// The entry that apply held on, until apply passes it. See `WriterReport::apply_held_at`.
     apply_held_at: Option<u64>,
-    /// The last entry of a PreparePuts job that a storage error ended. No early reply runs
-    /// until apply passes it, so the committed path applies those entries and retries.
-    unprepared: u64,
-    quorum_reply_index: u64,
-    /// Watch creations that wait while a Put reply runs ahead of the local apply.
-    watch_waiters: Vec<oneshot::Sender<()>>,
-    queries: VecDeque<Query>,
-    prefer_query: bool,
-    apply_delay_ms: u64,
     options: NodeOptions,
-    senders: BTreeMap<u64, mpsc::Sender<Message>>,
-    /// The URL that each peer sender uses on its next dial.
-    peer_addresses: BTreeMap<u64, tokio::sync::watch::Sender<String>>,
-    transports: tokio::task::JoinSet<()>,
+    /// The queue, transport task, meter, and health of each peer link. See `links`.
+    links: links::PeerLinks,
     pending: HashMap<String, Pending>,
     put_proposals: proposal::Group,
     waiting_proposals: proposal::Waiting,
     blocked: BTreeSet<u64>,
     installed_snapshots: u64,
     recovered_from_index: u64,
-    send_failures: Vec<(u64, bool)>,
-    checkpoint_running: bool,
+    /// The checkpoint schedule and the manual checkpoint requests. See `checkpoint`.
+    checkpoints: checkpoint::Checkpointer,
     // Full backlog checks by cause: apply lag, queued log jobs, queued log bytes,
     // uncommitted Raft bytes, unapplied log bytes.
     backlog_rejects: [u64; 5],
     // `REQUEST_TIMEOUT`. Tests that are slow by design raise it.
     request_timeout: Duration,
-    // Log bytes appended since the last checkpoint started.
-    appended_bytes: u64,
-    // Count full images started for peers or manual checkpoints.
-    snapshot_images: u64,
-    next_checkpoint: Option<u64>,
-    checkpoint_waiters: Vec<(u64, Response)>,
-    snapshot_delay_ms: u64,
-    lease_term: u64,
-    lease_deadlines: BTreeMap<i64, (u64, Instant)>,
-    lease_expiring: BTreeSet<(i64, u64)>,
     compact_step: Option<(u64, u64)>,
     compact_ready_at: Option<Instant>,
     compact_plan: compaction::PlanReady,
-    lease_view: Option<std::sync::Arc<BTreeMap<i64, crate::lease::LeaseRecord>>>,
-    /// Whether this leader term has built its lease deadlines.
-    lease_promoted: bool,
+    /// The leader's lease deadlines and its Expire proposals. See `lease::clock`.
+    lease_clock: lease::clock::LeaseClock,
     renewals: lease::Renewals,
     /// The leader writer of the shared state.
-    writer: Option<shared::Writer>,
+    writer: shared::Writer,
     /// The leader's automatic Compact schedule. `None` when automatic compaction is off.
     auto_compaction: Option<auto_compaction::AutoCompaction>,
     /// Quota usage has reached the warning threshold and the warning is logged.
@@ -356,8 +301,6 @@ pub struct Node {
     /// still need the peer routes, so the test gives the samples itself.
     #[cfg(test)]
     clock_in_manual: bool,
-    /// The quota flag of this member.
-    quota: quota::Quota,
     /// The term and index of the first `SeedMembers` proposal of this member in its last term.
     members_proposed: Option<(u64, u64)>,
     /// The last term in which this member proposed its digest again. See `propose_members`.
@@ -434,17 +377,15 @@ impl Node {
             record: crate::state::shared::Record::of(storage.recovery_snapshot())?,
             store_id: None,
         };
-        let mut state = options
-            .object_store
-            .open(
-                &options.dir,
-                &options.cluster_id,
-                options.id,
-                options.state_cache,
-                &shared,
-            )
-            .await?;
-        let quota = quota::Quota::new(options.effective_quota());
+        let mut state = StateMachine::open_bound(
+            &options.object_store,
+            &options.dir,
+            &options.cluster_id,
+            options.id,
+            options.state_cache,
+            &shared,
+        )
+        .await?;
         let recovered = async {
             // Apply takes the quota from the cluster claim. The flag only shows a difference.
             state.set_quota_flag(options.effective_quota());
@@ -527,35 +468,18 @@ impl Node {
         let manual_apply = transport_override.is_some();
         let identity = crate::peer::Identity {
             cluster: options.cluster_id.clone(),
-            store: state.store_id().map(|id| id.to_string()),
+            store: Some(state.store_id().to_string()),
         };
         state.set_open_retries(!manual_apply);
-        let mut traffic = BTreeMap::<u64, std::sync::Arc<crate::metrics::PeerTraffic>>::new();
-        let mut transports = tokio::task::JoinSet::new();
-        let mut peer_addresses = BTreeMap::new();
-        let senders = if let Some(senders) = transport_override {
-            senders
-        } else {
-            let mut senders = BTreeMap::new();
-            for (&peer, address) in &options.peers {
-                if peer == options.id {
-                    continue;
-                }
-                let (tx, rx) = mpsc::channel(256);
-                senders.insert(peer, tx);
-                let (address_tx, address_rx) = tokio::sync::watch::channel(address.clone());
-                peer_addresses.insert(peer, address_tx);
-                transports.spawn(transport_to(
-                    peer,
-                    address_rx,
-                    identity.clone(),
-                    rx,
-                    events.clone(),
-                    options.transport.clone(),
-                    traffic.entry(peer).or_default().clone(),
-                ));
-            }
-            senders
+        let links = match transport_override {
+            Some(senders) => links::PeerLinks::manual(senders),
+            None => links::PeerLinks::dial(
+                options.id,
+                &options.peers,
+                &identity,
+                &events,
+                &options.transport,
+            ),
         };
         let applied = AppliedState::new(&state)?;
         let metrics = std::sync::Arc::new(crate::metrics::Member::new(
@@ -564,38 +488,33 @@ impl Node {
             state.metrics.registry.clone(),
         )?);
         crate::metrics::reads::READS.register(&state.metrics.registry)?;
-        crate::mvcc::storage_fault::register(&state.metrics.registry)?;
+        crate::storage_fault::register(&state.metrics.registry)?;
         let handles = state.shared_handles();
-        let writer = match &handles {
-            Some(handles) => {
-                let gauge = prometheus::IntGauge::new(
-                    "slatedb_etcd_shared_clock_skew_milliseconds",
-                    "Milliseconds that the local clock is behind the shared writer clock.",
-                )?;
-                state.metrics.registry.register(Box::new(gauge.clone()))?;
-                let clock = shared::Clock::system(options.max_clock_skew, Some(gauge));
-                let retained = prometheus::IntGauge::new(
-                    "slatedb_etcd_shared_view_checkpoints",
-                    "View checkpoints of the shared state. Each one pins its SSTs.",
-                )?;
-                state
-                    .metrics
-                    .registry
-                    .register(Box::new(retained.clone()))?;
-                let mut writer = shared::Writer::new(handles, options.view_max_age, clock);
-                let prober = shared::Prober::new(options.id, handles.source.clone());
-                writer.prober = Some(std::sync::Arc::new(prober));
-                writer.retention = options.view_retention;
-                writer.retained = Some(retained);
-                writer.gauges = Some(shared::Gauges::register(&state.metrics.registry)?);
-                Some(writer)
-            }
-            None => None,
-        };
-        let mut compaction = compaction::Flush::new(&state);
-        if let Some(handles) = handles {
-            compaction.share(handles.based);
-        }
+        let gauge = prometheus::IntGauge::new(
+            "slatedb_etcd_shared_clock_skew_milliseconds",
+            "Milliseconds that the local clock is behind the shared writer clock.",
+        )?;
+        state.metrics.registry.register(Box::new(gauge.clone()))?;
+        let clock = shared::Clock::system(options.max_clock_skew, Some(gauge));
+        let retained = prometheus::IntGauge::new(
+            "slatedb_etcd_shared_view_checkpoints",
+            "View checkpoints of the shared state. Each one pins its SSTs.",
+        )?;
+        state
+            .metrics
+            .registry
+            .register(Box::new(retained.clone()))?;
+        let prober = shared::Prober::new(options.id, handles.source.clone());
+        let writer = shared::Writer::new(
+            &handles,
+            options.view_max_age,
+            clock,
+            Some(std::sync::Arc::new(prober)),
+            options.view_retention,
+            Some(retained),
+            Some(shared::Gauges::register(&state.metrics.registry)?),
+        );
+        let compaction = compaction::Flush::new(&state, handles.based);
         let compact_plan = compaction::PlanReady::new(&state, manual_apply);
         let log_reader = Some(storage.reader());
         let worker = Worker::start(state, events.clone(), manual_apply, log_reader);
@@ -613,7 +532,6 @@ impl Node {
             clock_in_manual: false,
             metrics,
             last_observed_leader: 0,
-            traffic,
             watch_feed: watch::Publisher::new(crate::watch::FeedState {
                 view: applied.read.clone(),
                 header: ResponseHeader::default(),
@@ -629,75 +547,35 @@ impl Node {
             published_at: None,
             events,
             manual_transport: manual_apply,
-            peer_health: BTreeMap::new(),
-            membership_checkpoint: 0,
             raw,
             log_worker,
-            log_queue: VecDeque::new(),
-            log_busy: false,
-            log_sequence: 0,
-            log_bytes: 0,
-            log_snapshot_bytes: 0,
-            log_delay_ms: 0,
-            log_fail: false,
-            log_read_delay_ms: 0,
-            log_read_fail: false,
-            peer_waiters: vec![],
-            built_checkpoint: None,
+            log: ready::pipeline::LogPipeline::new(),
             read_executor: read::executor::Executor::new(manual_apply),
-            read_queries: VecDeque::new(),
-            reads: BTreeMap::new(),
-            revision_waiters: VecDeque::new(),
-            read_nonce: *uuid::Uuid::new_v4().as_bytes(),
-            read_sequence: 0,
-            apply_target: applied.applied,
-            apply_jobs: VecDeque::new(),
-            committed_ready: applied.applied,
-            prepared_puts: None,
-            held_puts: None,
-            prepare_term: 0,
-            unprepared: 0,
+            reads: read::table::ReadIndexTable::new(),
+            apply: schedule::scheduler::ApplyScheduler::new(applied.applied),
+            early_puts: quorum_put::EarlyPuts::default(),
             hold_alarm: false,
             apply_held_at: None,
-            quorum_reply_index: 0,
-            watch_waiters: Vec::new(),
             state: applied,
             worker,
-            apply_busy: false,
-            queries: VecDeque::new(),
-            prefer_query: false,
-            apply_delay_ms: 0,
             options,
             peer: identity,
-            senders,
-            peer_addresses,
-            transports,
+            links,
             pending: HashMap::new(),
             put_proposals: proposal::Group::default(),
             waiting_proposals: proposal::Waiting::default(),
             blocked: BTreeSet::new(),
             installed_snapshots: 0,
             recovered_from_index,
-            send_failures: vec![],
-            checkpoint_running: false,
+            checkpoints: checkpoint::Checkpointer::new(next_checkpoint),
             backlog_rejects: [0; 5],
             request_timeout: REQUEST_TIMEOUT,
-            appended_bytes: 0,
-            snapshot_images: 0,
-            next_checkpoint,
-            checkpoint_waiters: vec![],
-            snapshot_delay_ms: 0,
-            lease_term: 0,
-            lease_deadlines: BTreeMap::new(),
-            lease_expiring: BTreeSet::new(),
             compact_step: None,
             compact_ready_at: None,
             compact_plan,
-            lease_view: None,
-            lease_promoted: false,
+            lease_clock: lease::clock::LeaseClock::new(),
             renewals: lease::Renewals::default(),
             writer,
-            quota,
             members_proposed: None,
             members_rechecked: 0,
             #[cfg(test)]
@@ -763,42 +641,39 @@ impl Node {
     }
 
     /// The shared-mode objects that the snapshot receive path opens.
-    pub(crate) fn shared_source(&self) -> Option<std::sync::Arc<crate::state::shared::Source>> {
-        self.writer.as_ref().map(|writer| writer.source.clone())
+    pub(crate) fn shared_source(&self) -> std::sync::Arc<crate::state::shared::Source> {
+        self.writer.source().clone()
     }
 
     /// Shared mode: the write probes that this member runs for the leader.
     pub(crate) fn write_prober(&self) -> Option<std::sync::Arc<Prober>> {
-        self.writer
-            .as_ref()
-            .and_then(|writer| writer.prober.clone())
+        self.writer.prober()
     }
 
     /// Shared mode: the wall clock that this member returns to a clock probe of the leader.
-    pub(crate) fn probe_clock(&self) -> Option<Millis> {
-        self.writer
-            .as_ref()
-            .map(|writer| writer.clock.now_ms.clone())
+    pub(crate) fn probe_clock(&self) -> Millis {
+        self.writer.clock().now_ms.clone()
     }
 
     /// Tests: skew the wall clock of this member's writer and of its probe replies.
     #[cfg(test)]
     pub(crate) fn set_clock(&mut self, now_ms: Millis) {
-        if let Some(writer) = &mut self.writer {
-            writer.clock.now_ms = now_ms;
-        }
+        self.writer.set_clock(now_ms);
     }
 
+    /// Run with no peer queue. Peer frames can still come through `events`.
     pub async fn run(self, events: mpsc::Receiver<Event>) -> Result<()> {
-        self.run_until(events, std::future::pending()).await
+        let (_, peers) = mpsc::channel(1);
+        self.run_until(events, peers, std::future::pending()).await
     }
 
     pub(crate) async fn run_until(
         mut self,
         events: mpsc::Receiver<Event>,
+        peers: mpsc::Receiver<Event>,
         stop: impl std::future::Future<Output = ()>,
     ) -> Result<()> {
-        let owner = self.run_loop(events);
+        let owner = self.run_loop(events, peers);
         #[cfg(feature = "write-profile")]
         let probe = crate::write_profile::Probe::new(crate::write_profile::Stage::Raft);
         #[cfg(feature = "write-profile")]
@@ -809,19 +684,21 @@ impl Node {
         };
         // A stopped owner no longer applies entries. Its last view must not serve reads.
         self.forwarding.publish_local(None);
-        self.transports.shutdown().await;
+        self.links.shutdown().await;
         // Keep the Raft directory locked until the state worker has stopped.
         self.compaction.cancel();
-        if let Some(writer) = &mut self.writer {
-            writer.stop().await;
-        }
+        self.writer.stop().await;
         self.read_executor.shutdown().await;
         let apply = self.worker.shutdown().await;
         let log = self.log_worker.shutdown().await;
         result.and(apply).and(log)
     }
 
-    async fn run_loop(&mut self, mut events: mpsc::Receiver<Event>) -> Result<()> {
+    async fn run_loop(
+        &mut self,
+        mut events: mpsc::Receiver<Event>,
+        mut peers: mpsc::Receiver<Event>,
+    ) -> Result<()> {
         self.publish_watch(None);
         self.publish_local_reads();
         // Schedule committed log recovery before accepting client work.
@@ -847,7 +724,7 @@ impl Node {
                     self.finish_compaction_flush(target?)?;
                 }
                 completed = self.worker.next() => { self.complete_apply(completed?)?; }
-                event = shared::next(&mut self.writer), if self.writer.is_some() => {
+                event = shared::next(&mut self.writer) => {
                     if let shared::WriterEvent::Failed(error) = event {
                         return Err(error);
                     }
@@ -876,8 +753,16 @@ impl Node {
                         self.handle(event, &mut step_responses).await?;
                     }
                 }
+                // A closed peer queue disables this branch. Batch frames like client events.
+                Some(event) = peers.recv() => {
+                    self.handle(event, &mut step_responses).await?;
+                    for _ in 0..63 {
+                        let Ok(event) = peers.try_recv() else { break; };
+                        self.handle(event, &mut step_responses).await?;
+                    }
+                }
             }
-            self.peer_waiters.extend(step_responses);
+            self.log.add_peer_waiters(step_responses);
             self.drive_ready().await?;
             self.sync_lease_deadlines();
             self.expire_pending();
@@ -925,11 +810,7 @@ impl Node {
 
     async fn handle(&mut self, event: Event, step_responses: &mut Vec<Response>) -> Result<()> {
         let event = if let Event::PeerFrame(message, bytes, tx) = event {
-            if let Some(meter) = self.traffic.get(&message.from) {
-                meter
-                    .received
-                    .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
-            }
+            self.links.received(message.from, bytes);
             Event::Step(message, tx)
         } else {
             event
@@ -969,7 +850,7 @@ impl Node {
                     M::MoveLeader(target) => {
                         self.move_leader(target, credentials.unwrap_or_default(), response)?
                     }
-                    M::Defragment if self.writer.is_some() => {
+                    M::Defragment => {
                         self.defragment_shared(credentials.unwrap_or_default(), response)?
                     }
                     M::Alarm(_) | M::Downgrade(_) => self.propose(
@@ -1054,11 +935,10 @@ impl Node {
             }
             Event::WaitRevision(revision, response) => self.wait_revision(revision, response),
             Event::LogStats(response) => {
-                if self.log_queue.len() >= log::MAX_JOBS {
+                if self.log.jobs_full() {
                     let _ = response.send(Err(self.error("too many pending log jobs")));
                 } else {
-                    self.queue_log(log::Job::Stats, None, None, vec![], vec![]);
-                    self.log_queue.back_mut().unwrap().stats_response = Some(response);
+                    self.log.queue_stats(response);
                 }
             }
             Event::EtcdRead(request, response) => {
@@ -1124,7 +1004,7 @@ impl Node {
                     || !self.options.peers.contains_key(&message.from)
                     || self.blocked.contains(&message.from)
                     || !self.admits_peer(&message)
-                    || self.peer_waiters.len() + step_responses.len() >= 256
+                    || self.log.peer_waiters() + step_responses.len() >= 256
                 {
                     let _ = response.send(Err(self.error("peer message rejected")));
                 } else {
@@ -1147,13 +1027,7 @@ impl Node {
             Event::WatchBarrier(response) => {
                 // etcd creates a Watch at the local revision. Wait like a read so that the
                 // create covers a Put this member already answered.
-                if self.reply_ahead() {
-                    // A stream that closed while it waited drops its receiver.
-                    self.watch_waiters.retain(|waiter| !waiter.is_closed());
-                    self.watch_waiters.push(response);
-                } else {
-                    let _ = response.send(());
-                }
+                self.early_puts.watch_barrier(self.state.applied, response);
             }
             Event::Metrics(response) => {
                 let id = self.options.id;
@@ -1181,17 +1055,13 @@ impl Node {
                         self.state.compact_revision
                     },
                     auth_revision: self.state.auth.revision,
-                    traffic: self
-                        .traffic
-                        .iter()
-                        .map(|(&id, meter)| (id, meter.clone()))
-                        .collect(),
+                    traffic: self.links.traffic(),
                     peers: self
                         .state
                         .members
                         .members
                         .keys()
-                        .map(|&id| (id, self.peer_health.contains_key(&id)))
+                        .map(|&id| (id, self.links.connected_since(id).is_some()))
                         .collect(),
                 });
             }
@@ -1199,20 +1069,18 @@ impl Node {
                 let _ = response.send(Ok(self.status()?));
             }
             Event::Checkpoint(response) => {
-                if self.checkpoint_waiters.len() >= apply::MAX_QUERIES {
+                if self.checkpoints.waiting() >= apply::MAX_QUERIES {
                     let _ = response.send(Err(self.error("too many checkpoint requests")));
                 } else {
                     let committed = self.raw.raft.raft_log.committed;
                     // Shared mode: the leader publishes a checkpoint through the commit index. A
                     // follower asks the leader for that publication.
-                    if let Some(writer) = &self.writer {
-                        if self.raw.raft.state == StateRole::Leader {
-                            writer.request_publication(committed);
-                        } else {
-                            self.send_view_ack(Some(committed));
-                        }
+                    if self.raw.raft.state == StateRole::Leader {
+                        self.writer.request_publication(committed);
+                    } else {
+                        self.send_view_ack(Some(committed));
                     }
-                    self.checkpoint_waiters.push((committed, response));
+                    self.checkpoints.wait(committed, response);
                     self.schedule_apply()?;
                 }
             }
@@ -1238,9 +1106,7 @@ impl Node {
                 // frame of the earlier process then cannot bring that proof back.
                 if changed {
                     self.tick_clock(false);
-                    if let Some(writer) = &mut self.writer {
-                        writer.proofs.forget(member);
-                    }
+                    self.writer.forget_proof(member);
                 }
             }
             Event::SnapshotRefused { member, target } => {
@@ -1252,21 +1118,19 @@ impl Node {
                 reply,
             } => self.write_probed(member, nonce, reply),
             Event::SnapshotDelay(delay_ms, response) => {
-                self.snapshot_delay_ms = delay_ms.min(5000);
+                self.checkpoints.set_delay(delay_ms.min(5000));
                 let _ = response.send(Ok(self.status()?));
             }
             Event::ApplyDelay(delay_ms, response) => {
-                self.apply_delay_ms = delay_ms.min(5000);
+                self.apply.set_delay(delay_ms.min(5000));
                 let _ = response.send(Ok(self.status()?));
             }
             Event::LogReadFault(delay_ms, fail, response) => {
-                self.log_read_delay_ms = delay_ms.min(5000);
-                self.log_read_fail = fail;
+                self.log.set_read_fault(delay_ms.min(5000), fail);
                 let _ = response.send(Ok(self.status()?));
             }
             Event::LogFault(delay_ms, fail, response) => {
-                self.log_delay_ms = delay_ms.min(5000);
-                self.log_fail = fail;
+                self.log.set_fault(delay_ms.min(5000), fail);
                 let _ = response.send(Ok(self.status()?));
             }
             Event::LocalValue(key, response) => {
@@ -1281,15 +1145,7 @@ impl Node {
                 snapshot,
                 success,
             } => {
-                if success {
-                    self.peer_health.entry(peer).or_insert_with(Instant::now);
-                } else if self.peer_health.remove(&peer).is_some() {
-                    if let Some(meter) = self.traffic.get(&peer) {
-                        meter
-                            .disconnected
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
+                self.links.reported(peer, success);
                 if snapshot {
                     self.raw.report_snapshot(
                         peer,
@@ -1328,8 +1184,8 @@ impl Node {
                 .max(self.raw.raft.raft_log.committed)
                 .saturating_sub(self.state.applied)
                 >= apply::MAX_APPLY_LAG,
-            self.log_queue.len() >= log::MAX_JOBS,
-            self.log_bytes >= log::MAX_BYTES,
+            self.log.jobs_full(),
+            self.log.bytes_full(),
             // Raft drops proposals past `max_uncommitted_size`, and clients do not retry
             // a dropped Put. Raft counts each proposed entry until it leaves in a Ready
             // as committed, so this also covers entries that are on disk but need a
@@ -1469,19 +1325,13 @@ impl Node {
         );
     }
 
-    /// A prepared Put reply runs ahead of the local apply. Reads and Watch creation wait until
-    /// the replied entries are applied here.
-    fn reply_ahead(&self) -> bool {
-        self.state.applied < self.quorum_reply_index
-    }
-
     /// Publish the applied view for serializable point reads outside the owner.
     ///
-    /// While a prepared Put reply runs ahead of the local apply (`quorum_reply_index`), reads
-    /// wait in the owner so that a client that saw the reply also reads its effect here.
+    /// While a prepared Put reply runs ahead of the local apply (`EarlyPuts::reads_blocked`),
+    /// reads wait in the owner so that a client that saw the reply also reads its effect here.
     fn publish_local_reads(&self) {
-        let local =
-            (!self.reply_ahead()).then(|| LocalRead::new(self.state.read.clone(), self.header()));
+        let local = (!self.early_puts.reads_blocked(self.state.applied))
+            .then(|| LocalRead::new(self.state.read.clone(), self.header()));
         self.forwarding.publish_local(local);
     }
 
@@ -1505,24 +1355,12 @@ impl Node {
             } else {
                 crate::failpoint::hit("raft-before-follower-send");
             }
-            let peer = message.to;
-            let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
-            let sent = !self.blocked.contains(&peer)
-                && self
-                    .senders
-                    .get(&peer)
-                    .is_some_and(|sender| sender.try_send(message).is_ok());
-            if !sent {
-                if let Some(meter) = self.traffic.get(&peer) {
-                    meter.failed(1);
-                }
-                self.send_failures.push((peer, snapshot));
-            }
+            self.links.send(message, &self.blocked);
         }
     }
 
     fn start_checkpoint(&mut self, image: bool) -> Result<()> {
-        if self.checkpoint_running || self.apply_busy || self.prepared_puts.is_some() {
+        if self.checkpoints.running() || self.apply.busy() || self.early_puts.active() {
             return Ok(());
         }
         // A record built at a base below the record could not replace it. See `certify_base`.
@@ -1530,7 +1368,7 @@ impl Node {
             return Ok(());
         }
         let store = self.raw.store();
-        let advances = self.checkpointable(self.state.applied) > store.snapshot_index();
+        let advances = self.checkpointable() > store.snapshot_index();
         // An image can replace a record without an image at the same index.
         let attaches = image && store.snapshot_index() > 0 && !store.has_image();
         if !advances && !attaches {
@@ -1538,26 +1376,31 @@ impl Node {
         }
         self.submit_apply(
             Job::Checkpoint {
-                delay: Duration::from_millis(self.snapshot_delay_ms),
+                delay: self.checkpoints.delay(),
                 dir: self.options.dir.join("raft"),
             },
             self.state.applied,
         )?;
-        self.checkpoint_running = true;
-        self.appended_bytes = 0;
-        if image {
-            self.snapshot_images += 1;
-        }
+        self.checkpoints.start(image);
         Ok(())
     }
 
     fn checkpoint_built(&mut self, built: apply::Built) -> Result<()> {
-        ensure!(
-            self.built_checkpoint.is_none(),
-            "overlapping checkpoint results"
-        );
-        self.built_checkpoint = Some((built.index, built.conf, built.result?));
-        Ok(())
+        let image = match built.result {
+            Ok(image) => image,
+            // A storage error fails only this checkpoint. The record stays, and the next
+            // checkpoint starts after a wait. Apply runs other jobs meanwhile.
+            Err(error) if crate::storage_fault::classify(&error).is_some() => {
+                self.checkpoints.failed()?;
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    "a checkpoint failed; retry later"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        self.checkpoints.built(built.index, built.conf, image)
     }
 
     /// Return true while a peer receives an image. Truncation would discard that image.
@@ -1573,42 +1416,27 @@ impl Node {
         let mut waiting = vec![];
         let leader = self.raw.raft.state == StateRole::Leader;
         let applied = self.state.applied;
-        for (index, response) in std::mem::take(&mut self.checkpoint_waiters) {
+        for (index, response) in self.checkpoints.take_waiters() {
             if response.is_closed() {
                 continue;
             }
             // Shared mode: the first request can arrive before apply reaches its commit index.
             // The covering publication is due once apply reaches it.
-            if let Some(writer) = &mut self.writer {
-                if leader {
-                    writer.request_checkpoint(index, applied);
-                }
+            if leader {
+                self.writer.request_checkpoint(index, applied);
             }
             // A manual checkpoint completes only with a complete image. In shared mode the
             // image is a view checkpoint, so the member's base must hold the state at `index`.
-            let store = self.raw.store();
-            let done = match &self.writer {
-                Some(writer) => {
-                    index <= self.state.applied
-                        && self
-                            .state
-                            .view
-                            .is_some_and(|(base, _, _)| base >= writer.covering(index))
-                }
-                None => {
-                    index <= store.snapshot_index()
-                        && index <= self.state.applied
-                        && (index == 0 || store.has_image())
-                }
-            };
+            let (base, _, _) = self.state.view;
+            let done = index <= self.state.applied && base >= self.writer.covering(index);
             if done {
                 let _ = response.send(Ok(self.status()?));
             } else {
                 waiting.push((index, response));
             }
         }
-        self.checkpoint_waiters = waiting;
-        if !self.checkpoint_waiters.is_empty() {
+        self.checkpoints.requeue(waiting);
+        if self.checkpoints.waiting() > 0 {
             self.schedule_apply()?;
         }
         Ok(())
@@ -1653,26 +1481,21 @@ impl Node {
             "term": self.raw.raft.term, "commit_index": self.raw.store().commit_index(),
             "applied_index": self.state.applied,
             "state_write_batches": self.state.write_batches,
-            "active_read_jobs": self.read_executor.len(), "queued_reads": self.read_queries.len(),
+            "active_read_jobs": self.read_executor.len(), "queued_reads": self.reads.queued(),
             "durable_applied_index": self.state.durable_applied,
             "snapshot_index": self.raw.store().snapshot_index(),
             "first_log_index": self.raw.store().snapshot_index() + 1, "last_log_index": self.raw.store().durable.last_index,
             "sync_writes": self.raw.store().durable.sync_writes, "pending": self.pending.len(),
             "blocked_peers": self.blocked, "installed_snapshots": self.installed_snapshots,
             "recovered_from_index": self.recovered_from_index,
-            "checkpoint_running": self.checkpoint_running,
-            "snapshot_delay_ms": self.snapshot_delay_ms,
-            "apply_busy": self.apply_busy, "apply_target": self.apply_target,
+            "checkpoint_running": self.checkpoints.running(),
+            "snapshot_delay_ms": self.checkpoints.delay().as_millis() as u64,
             "apply_lag": self.raw.store().commit_index().saturating_sub(self.state.applied),
-            "queued_state_reads": self.queries.len(), "apply_delay_ms": self.apply_delay_ms,
-            "log_busy": self.log_busy, "queued_log_jobs": self.log_queue.len(),
-            "queued_log_bytes": self.log_bytes, "queued_snapshot_bytes": self.log_snapshot_bytes, "log_delay_ms": self.log_delay_ms,
-            "log_fail": self.log_fail, "pending_read_indexes": self.reads.len(),
-            "pending_revision_waiters": self.revision_waiters.len(),
+            "pending_read_indexes": self.reads.pending(),
+            "pending_revision_waiters": self.reads.revision_waiters(),
             "raft_commit_index": self.raw.raft.raft_log.committed,
             "cached_last_log_index": self.raw.store().last_index()?,
             "log_memory": self.raw.store().stats(),
-            "log_read_delay_ms": self.log_read_delay_ms, "log_read_fail": self.log_read_fail,
             "revision": self.state.revision,
             "compact_revision": self.state.compact_revision,
         });
@@ -1680,32 +1503,33 @@ impl Node {
         {
             status["write_profile"] = crate::write_profile::snapshot();
         }
-        status["quorum_reply_index"] = self.quorum_reply_index.into();
+        self.log.status(&mut status);
+        self.apply.status(&mut status);
+        status["quorum_reply_index"] = self.early_puts.reply_index().into();
         status["apply_paused"] = self.pause_status();
         status["apply_held_at"] = self.apply_held_at.into();
         status["quota"] = self.quota_status();
         status["members_row"] = self.members_status();
-        if let (Some(writer), Some((base, applied, bytes))) = (&self.writer, self.state.view) {
-            let record = crate::state::transfer::ViewDescriptor::decode(
-                self.raw.store().recovery_snapshot().get_data(),
-            )
-            .ok()
-            .flatten()
-            .and_then(|view| view.checkpoint().ok());
-            status["shared_state"] = json!({
-                "store_id": self.peer.store,
-                "base_applied_index": base,
-                "base_checkpoint": self.state.base_checkpoint,
-                "record_index": self.raw.store().snapshot_index(),
-                "record_checkpoint": record,
-                "applied_view_checkpoints": applied,
-                "overlay_bytes": bytes,
-                "writer": writer.status(),
-            });
-        }
+        let (base, applied, bytes) = self.state.view;
+        let record = crate::state::transfer::ViewDescriptor::decode(
+            self.raw.store().recovery_snapshot().get_data(),
+        )
+        .ok()
+        .flatten()
+        .and_then(|view| view.checkpoint().ok());
+        status["shared_state"] = json!({
+            "store_id": self.peer.store,
+            "base_applied_index": base,
+            "base_checkpoint": self.state.base_checkpoint,
+            "record_index": self.raw.store().snapshot_index(),
+            "record_checkpoint": record,
+            "applied_view_checkpoints": applied,
+            "overlay_bytes": bytes,
+            "writer": self.writer.status(),
+        });
         status["snapshot_has_image"] = self.raw.store().has_image().into();
         status["snapshot_image_wanted"] = self.raw.store().image_wanted().into();
-        status["snapshot_images_built"] = self.snapshot_images.into();
+        status["snapshot_images_built"] = self.checkpoints.images().into();
         status["backlog_full_checks"] = json!({
             "apply_lag": self.backlog_rejects[0],
             "log_jobs": self.backlog_rejects[1],

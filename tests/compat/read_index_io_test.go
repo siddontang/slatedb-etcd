@@ -28,12 +28,24 @@ func TestReadIndexAndNestedReadTxnDoNotWriteLogs(t *testing.T) {
 	require.NoError(t, err)
 	// A quorum can confirm the Put before the leader finishes its local write.
 	target := state["raft_commit_index"].(float64)
+	// A new leader proposes a second `SeedMembers` entry after its first seed applies. That
+	// entry can follow the Put. Wait until each member applies it, so that only the reads below
+	// can add an entry. The leader proposes no other seed in this term.
 	before := make(map[int]map[string]any)
 	for id := 1; id <= 3; id++ {
 		require.Eventually(t, func() bool {
 			state, err := c.http(id, "/status", nil)
-			if err == nil && state["applied_index"].(float64) >= target &&
-				state["commit_index"].(float64) >= target {
+			if err != nil {
+				return false
+			}
+			row, _ := state["members_row"].(map[string]any)
+			checked, _ := row["checked"].(map[string]any)
+			if checked == nil || checked["term"] != state["term"] {
+				return false
+			}
+			index := max(target, checked["index"].(float64))
+			if state["applied_index"].(float64) >= index &&
+				state["commit_index"].(float64) >= index {
 				before[id] = state
 				return true
 			}
@@ -67,7 +79,7 @@ func TestReadIndexRejectsMinorityLeader(t *testing.T) {
 	c := newCluster(t)
 	leader := c.leader()
 	minority := client(t, []string{c.addresses[leader-1]})
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	_, err := minority.Put(ctx, "fenced-read", "before")
 	require.NoError(t, err)
@@ -85,6 +97,8 @@ func TestReadIndexRejectsMinorityLeader(t *testing.T) {
 	_, err = minority.Get(short, "fenced-read")
 	stop()
 	require.Error(t, err, "isolated leader returned a read without a quorum")
+	// The two followers tick in step, so they can split the vote. Each split costs one election
+	// timeout of 1 s to 2 s. The wait allows several splits.
 	var newLeader int
 	require.Eventually(t, func() bool {
 		for id := 1; id <= 3; id++ {
@@ -98,7 +112,7 @@ func TestReadIndexRejectsMinorityLeader(t *testing.T) {
 			}
 		}
 		return false
-	}, 5*time.Second, 20*time.Millisecond)
+	}, 12*time.Second, 20*time.Millisecond)
 	healthy := client(t, []string{c.addresses[newLeader-1]})
 	_, err = healthy.Put(ctx, "fenced-read", "after")
 	require.NoError(t, err)

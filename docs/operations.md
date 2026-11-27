@@ -126,10 +126,11 @@ Use native backups and a new cluster if storage must move.
 
 ## Binary changes
 
-Storage format 3 uses protobuf KV commands, MVCC history, and Watch journals.
-The Raft identity and native snapshot header require this format.
-Use fresh data directories and object prefixes for this version.
-Old directories and old native backups are not upgrade inputs. There is no format migration.
+Storage format 4 uses protobuf KV commands, tagged JSON commands, MVCC history, and Watch
+journals. The Raft identity requires this format, so a data directory of format 3 does not open.
+Use fresh data directories and object prefixes for this version. There is no format migration.
+Native backups have a separate format, 4, which this version does not change. A native backup of
+the previous binary still restores.
 Mixed binary versions and rolling upgrades are unsupported.
 Data directories of replicated state mode or of a member-local store are not supported. A member
 refuses to start on them.

@@ -1,11 +1,30 @@
 # Module boundaries
 
-The service has one Raft group. Each replica owns its log, state, and object namespace.
+The service has one Raft group. Each replica owns its Raft log and its in-memory overlay.
+All replicas share one SlateDB in S3. Only the leader writes it.
 The CLI and embedded API share the same lifecycle and runtime paths.
 
 ## Ownership
 
-| Module | Owner and responsibility |
+The table gives the responsibility of each module. A module is not always the owner of its data:
+
+- `Node` is one type. Its `impl` blocks are in `node.rs`, `node/auto_compaction`,
+  `node/cluster`, `node/compaction`, `node/lease`, `node/maintenance`, `node/proposal`,
+  `node/quorum_put`, `node/read`, `node/ready`, `node/schedule`, `node/shared`, and `node/step`.
+  A method in each of these files can read and write each `Node` field.
+- `StateMachine` is one type too. Its `impl` blocks are in `state.rs`, `state/auth`,
+  `state/backup`, `state/checkpoint`, `state/cluster`, `state/compaction`, `state/diagnostic`,
+  `state/kv`, `state/lease`, `state/maintenance`, `state/put_batch`, `state/quota`,
+  `state/read`, `state/shared`, `state/shared/adopt`, and `state/snapshot`.
+- Some modules own a type with private fields, and the other modules call its methods:
+  `Writer` in `node/shared/writer`, `EarlyPuts` in `node/quorum_put`, `Checkpointer` in
+  `node/checkpoint`, `ReadIndexTable` in `node/read/table`, `LeaseClock` in `node/lease/clock`,
+  `PeerLinks` in `node/links`, `LogPipeline` in `node/ready/pipeline`, `ApplyScheduler` in
+  `node/schedule/scheduler`, `Group` in `node/proposal`, `Publisher` in `node/forwarding` and
+  `node/watch`, the log `Worker` in `node/log`, `KeyIndex` in `state/key_index`, `Overlay` in
+  `state/overlay`, and `RowCache` in `state/rows`.
+
+| Module | Responsibility |
 | --- | --- |
 | `metrics/rpc` | Count gRPC messages, status, and optional call duration |
 | `metrics/peer` | Measure send failures, disconnects, and peer round trips |
@@ -16,38 +35,49 @@ The CLI and embedded API share the same lifecycle and runtime paths.
 | `command` | Encode and decode internal Raft commands |
 | `node` | Own RawNode, admission, elections, and client completion |
 | `node/ready` | Order Ready delivery, durable completions, and peer acknowledgements |
+| `node/ready/pipeline` | Queue the log jobs in order, count their bytes, and hold step replies |
+| `node/links` | Keep the queue, sender task, meter, and health of each outgoing peer link |
 | `node/log` and `node/cache` | Isolate disk work and bound retained log memory |
 | `node/schedule` | Dispatch state work and publish completed apply positions |
+| `node/schedule/scheduler` | Keep the apply jobs in order, the delivered commit, and state reads |
+| `node/checkpoint` | Decide when a checkpoint starts, and keep manual checkpoint requests |
 | `node/watch` | Publish applied views and Watch event batches to local streams |
 | `node/apply` | Apply committed entries in order and group ordinary puts |
 | `node/proposal` | Group consecutive leader Put proposals within one event turn |
-| `node/quorum_put` | Prepare exact Put results after quorum commit |
+| `node/quorum_put` | Evaluate Puts before commit. Reply after commit in the term (`EarlyPuts`) |
 | `state/key_index` | Keep revision metadata for every current key in memory |
 | `node/read` | Confirm Safe ReadIndex and reject obsolete proofs |
+| `node/read/table` | Keep the reads that wait for a ReadIndex proof, the executor, or a revision |
 | `node/read/executor` | Run bounded reads on immutable applied views |
 | `node/lease` | Schedule leader lease expiry from replicated generations |
-| `state/quota` | Check the logical size against the quota of the cluster claim |
+| `node/lease/clock` | Keep the leader's lease deadlines and its Expire proposals until they apply |
+| `state/quota` | Track the logical usage. KV, Put, and Lease apply compare it to the quota |
 | `node/cluster` | Propose the term-start entries, publish client URLs, and serve member requests |
 | `state/cluster` | Seed, change, and check the membership row |
 | `state` | Open storage and own mutable applied metadata |
-| `state/kv` and `state/put_batch` | Commit MVCC changes and maintain quota accounting |
+| `state/kv` and `state/put_batch` | Commit MVCC changes |
 | `state/read` | Pin data, revision, Auth, and Lease metadata together |
 | `state/source` | Define the read interface that apply, read views, and Watch catch-up share |
 | `state/view` | Read a shared base and its overlay |
 | `state/overlay` | Keep the batches above the base for views and the materializer |
-| `state/shared` | Claim the shared state, open, switch, adopt, and rebase checkpoint bases |
-| `node/shared` | Run the leader writer with its fence and clock checks, and the overlay limits |
+| `state/shared` | Open the claimed shared state, and switch, adopt, and rebase checkpoint bases |
+| `node/shared` | Run the materializer and publisher with fence and clock checks |
+| `node/shared/writer` | Own the writer task state, the apply pause, base switches, and proofs |
 | `status` | Read the Raft snapshot record of a stopped member for `shared-status` |
 | `state/auth` and `state/lease` | Apply their domain changes |
 | `state/backup` and `state/shared/restore` | Export and restore complete state |
 | `state/maintenance` | Execute hashes, alarms, and physical storage work |
 | `state/diagnostic` | Execute the separate diagnostic keyspace API |
 | `mvcc` and `watch` | Define revision, transaction, history, and event semantics |
+| `mvcc/hash` | Encode the HashKV rows that Put writes |
+| `batch` | Hold the rows of one state write |
+| `error` and `storage_fault` | Define the request error and classify storage errors |
 | `storage`, `peer`, `tls`, and `object` | Bind durable logs, transport, security, and objects |
+| `object/cluster_claim` | Create and check the cluster claim, `shared/owner.json` |
 | `peer/receive` | Bound incoming Raft work and return ordered processing receipts |
 
 Domain modules extend the same StateMachine. They do not add independent mutable state owners.
-The read view contains immutable metadata and a pinned SlateDB snapshot.
+The read view contains immutable metadata, a pinned base checkpoint, and overlay segments.
 Only completed apply work can publish a new view.
 Views share unchanged Auth and Lease maps. Apply completions also share membership metadata.
 Their mutation paths copy retained maps before changing them.
@@ -80,7 +110,8 @@ Restart opens a checkpoint, installs a newer durable snapshot, and replays the r
 
 Keep etcd response headers, errors, revisions, transactions, and permissions in the compatibility
 contract. Internal API and storage changes need no old-version adapter.
-Storage format 3 rejects older directories and snapshots. Mixed-version clusters are unsupported.
+Storage format 4 rejects older data directories. Native backups have a separate format.
+Mixed-version clusters are unsupported.
 
 Use a named domain module for new state transitions. Keep one ordered mutation owner.
 Do not read live storage with revision or Auth metadata from a different applied position.

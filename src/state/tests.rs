@@ -42,7 +42,7 @@ async fn history_len(state: &StateMachine) -> usize {
 #[test]
 fn native_snapshot_bytes_use_fixed_width_lengths() {
     let bytes = hex::decode(concat!(
-        "03000000",         // Format 3.
+        "04000000",         // Format 4.
         "2a00000000000000", // Applied index 42.
         "0100000000000000", // One row.
         "01000000000000006b",
@@ -50,7 +50,7 @@ fn native_snapshot_bytes_use_fixed_width_lengths() {
     ))
     .unwrap();
     let data: SnapshotData = crate::codec::decode(&bytes).unwrap();
-    assert_eq!(data.version, crate::STORAGE_FORMAT);
+    assert_eq!(data.version, crate::SNAPSHOT_FORMAT);
     assert_eq!(data.applied, 42);
     assert_eq!(data.rows, vec![(vec![b'k'], vec![0, 127])]);
     assert_eq!(crate::codec::encode(&data).unwrap(), bytes);
@@ -619,7 +619,7 @@ async fn direct_put_txns_write_value_once_rows_like_the_evaluator() {
             assert!(kv.value.is_empty(), "request {i}, event {sub}");
             let hash = get(
                 &direct,
-                crate::state::maintenance::hash_key(revision, sub as i64, false),
+                crate::mvcc::hash::hash_key(revision, sub as i64, false),
             )
             .await;
             assert!(hash.len() < 64, "request {i}, event {sub}");
@@ -630,7 +630,7 @@ async fn direct_put_txns_write_value_once_rows_like_the_evaluator() {
             .encode_to_vec();
             let seed = crc32c::crc32c(b"seed");
             assert_eq!(
-                crate::state::maintenance::hash_append(seed, &hash).unwrap(),
+                crate::mvcc::hash::hash_append(seed, &hash).unwrap(),
                 (crc32c::crc32c_append(seed, &full), full.len() as u64),
                 "request {i}, event {sub}"
             );

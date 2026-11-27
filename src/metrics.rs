@@ -22,7 +22,13 @@ use prometheus::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-use crate::node::Event;
+/// Select the etcd Prometheus collection level.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum MetricsLevel {
+    #[default]
+    Basic,
+    Extensive,
+}
 
 #[derive(Clone)]
 pub(crate) struct Wal {
@@ -82,7 +88,7 @@ pub struct Sample {
     pub(crate) pending: usize,
     pub(crate) quota: i64,
     /// Logical bytes by row kind. The total is the quota usage.
-    pub(crate) usage: crate::batch::Usage,
+    pub(crate) usage: crate::state::Usage,
     /// The quota usage that raises the early warning. `None` disables the warning.
     pub(crate) warning_bytes: Option<u64>,
     /// The flag of this member differs from `quota`.
@@ -178,23 +184,28 @@ impl Member {
     }
 
     /// Register the per-RPC and watch meters of the client listener.
-    pub(crate) fn rpc(
-        &self,
-        level: crate::server::MetricsLevel,
-    ) -> Result<(Arc<WatchMeters>, Arc<RpcObserver>)> {
+    pub(crate) fn rpc(&self, level: MetricsLevel) -> Result<(Arc<WatchMeters>, Arc<RpcObserver>)> {
         let watch = Arc::new(WatchMeters::new(&self.registry)?);
         let rpc = rpc::Observer::new(&self.registry, level)?;
         Ok((watch, Arc::new(rpc)))
     }
 
-    pub fn scrape_router(self: &Arc<Self>, events: mpsc::Sender<Event>) -> axum::Router {
+    /// Serve scrapes. A scrape sends a sample request on `events`. The owner of the member state
+    /// makes the event type from the request and replies with a `Sample`.
+    pub fn scrape_router<E>(self: &Arc<Self>, events: mpsc::Sender<E>) -> axum::Router
+    where
+        E: From<oneshot::Sender<Sample>> + Send + 'static,
+    {
         axum::Router::new()
-            .route("/metrics", axum::routing::get(scrape))
+            .route("/metrics", axum::routing::get(scrape::<E>))
             .with_state((self.clone(), events))
     }
 }
 
-async fn scrape(State((member, events)): State<(Arc<Member>, mpsc::Sender<Event>)>) -> Response {
+async fn scrape<E>(State((member, events)): State<(Arc<Member>, mpsc::Sender<E>)>) -> Response
+where
+    E: From<oneshot::Sender<Sample>> + Send + 'static,
+{
     let _active = Active::new(&member.scraping);
     let collect_member = member.clone();
     let collect = async move {
@@ -202,7 +213,7 @@ async fn scrape(State((member, events)): State<(Arc<Member>, mpsc::Sender<Event>
         let permit = member.permits.clone().try_acquire_owned()?;
         let (tx, rx) = oneshot::channel();
         events
-            .send(Event::Metrics(tx))
+            .send(E::from(tx))
             .await
             .map_err(|_| anyhow::anyhow!("member stopped"))?;
         let sample = rx.await?;

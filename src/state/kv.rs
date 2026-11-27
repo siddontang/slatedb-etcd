@@ -109,10 +109,7 @@ impl StateMachine {
         request: &crate::proto::etcdserverpb::WatchCreateRequest,
         through: Option<i64>,
     ) -> Result<crate::watch::WatchPage> {
-        let state = match &self.shared {
-            None => self.applied_state().clone(),
-            Some(shared) => shared.pinned(),
-        };
+        let state = self.pinned_state();
         crate::watch::read(
             &state,
             through.unwrap_or(self.revision).min(self.revision),

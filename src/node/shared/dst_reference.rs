@@ -166,7 +166,7 @@ fn command_kind(command: &RaftCommand) -> String {
 pub(super) struct ViewPoint {
     applied: u64,
     checkpoint: Option<uuid::Uuid>,
-    base_index: Option<u64>,
+    base_index: u64,
     process: Option<u64>,
 }
 
@@ -175,7 +175,7 @@ impl ViewPoint {
         Self {
             applied: state.applied,
             checkpoint: state.base_checkpoint,
-            base_index: state.view.map(|(index, _, _)| index),
+            base_index: state.view.0,
             process,
         }
     }
@@ -185,7 +185,7 @@ impl Simulation {
     /// Shared mode: compare the loaded fields of each member with the in-memory reference at
     /// its index. A member that opens or installs a base above its row must also equal it.
     fn check_loaded(&self) -> Result<(), String> {
-        let Some(reference) = self.reference.as_ref().filter(|_| self.shared.is_some()) else {
+        let Some(reference) = &self.reference else {
             return Ok(());
         };
         for (&id, node) in &self.nodes {
@@ -214,7 +214,7 @@ impl Simulation {
         ] {
             let open = writers
                 .get(&leader)
-                .is_some_and(|writer| writer.db.is_some());
+                .is_some_and(|writer| writer.db().is_some());
             if matches!(step, WriterStep::Open) && open {
                 continue;
             }
@@ -225,7 +225,7 @@ impl Simulation {
     /// The base index, the checkpoint, and the overlay bytes of member `id`.
     pub(super) fn base(&self, id: u64) -> (u64, Option<uuid::Uuid>, u64) {
         let state = self.nodes[&id].worker.state();
-        let (index, _, bytes) = state.view_status().unwrap();
+        let (index, _, bytes) = state.view_status();
         (index, state.base_checkpoint(), bytes)
     }
 
@@ -303,7 +303,7 @@ async fn the_view_check_finds_a_wrong_base_switch_in_an_idle_cluster() {
     // From here the test runs the check, so it sees the result.
     let reference = sim.reference.take();
     let node = &sim.nodes[&follower];
-    let base = node.shared_source().unwrap();
+    let base = node.shared_source();
     let base = base.open_base(old.unwrap()).await.unwrap();
     node.worker.state().offer_base(base, applied);
     for _ in 0..3 {

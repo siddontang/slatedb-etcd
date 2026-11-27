@@ -30,6 +30,12 @@ mod coverage;
 #[path = "shared/dst_reference.rs"]
 mod reference;
 
+/// The overlay limit of the shared schedules. A member pauses apply above twice its limit, and a
+/// leader refuses client writes above it. Member 3 has a quarter of the limit, so it can wait
+/// while the leader still takes writes. So the schedules reach the pause, the checkpoint poll,
+/// and the adoption of a base above the applied index (#103).
+const SHARED_OVERLAY_LIMIT: u64 = 640;
+
 struct ClientRequest {
     key: String,
     value: String,
@@ -63,6 +69,8 @@ struct Simulation {
     committed_entries: BTreeMap<u64, Vec<u8>>,
     terms: BTreeMap<u64, u64>,
     isolated: Option<u64>,
+    ack_limit: Option<(u64, u64)>,
+    delayed: Vec<Message>,
     /// A member that starts as a joiner, as after MemberAdd. With no log it has an empty base.
     joining: Option<u64>,
     paused_apply: Option<u64>,
@@ -78,7 +86,7 @@ struct Simulation {
     /// Every value that a client proposed. A read must not return another value.
     proposed: BTreeSet<(String, String)>,
     /// Shared mode: the one object store of all members.
-    shared: Option<std::sync::Arc<crate::object::faults::FaultStore>>,
+    shared: std::sync::Arc<crate::object::faults::FaultStore>,
     /// Shared mode and quota checks: the state that applies the committed entries in order.
     reference: Option<reference::Reference>,
     /// The reference digest of the `data/` and `etcd/` rows after each index.
@@ -94,6 +102,8 @@ struct Simulation {
     quotas: BTreeMap<u64, i64>,
     /// The number of voters.
     members: u64,
+    /// The `--overlay-max-bytes` value of members 1 and 2. Member 3 has a quarter of it.
+    overlay_max_bytes: u64,
     /// The process ID of each started member, new at each start.
     processes: BTreeMap<u64, u64>,
     /// View snapshots above their row that the receiver refused before Raft saw them.
@@ -144,18 +154,29 @@ impl Simulation {
         Self::with_options(seed, BTreeMap::new(), true).await
     }
 
+    /// Start three members with the overlay limit of the shared schedules.
+    async fn shared(seed: u64) -> Self {
+        Self::build(seed, BTreeMap::new(), true, 3, SHARED_OVERLAY_LIMIT).await
+    }
+
     /// Start three members. `reference` checks each member state against a reference state
     /// after every step.
     async fn with_options(seed: u64, quotas: BTreeMap<u64, i64>, reference: bool) -> Self {
-        Self::build(seed, quotas, reference, 3).await
+        Self::build(seed, quotas, reference, 3, 1 << 30).await
     }
 
     /// Start a simulation with `members` voters and a reference state.
     async fn with_size(seed: u64, members: u64) -> Self {
-        Self::build(seed, BTreeMap::new(), true, members).await
+        Self::build(seed, BTreeMap::new(), true, members, 1 << 30).await
     }
 
-    async fn build(seed: u64, quotas: BTreeMap<u64, i64>, reference: bool, members: u64) -> Self {
+    async fn build(
+        seed: u64,
+        quotas: BTreeMap<u64, i64>,
+        reference: bool,
+        members: u64,
+        overlay_max_bytes: u64,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let reference = if reference {
             Some(reference::Reference::open(&root.path().join("reference")).await)
@@ -177,6 +198,8 @@ impl Simulation {
             committed_entries: BTreeMap::new(),
             terms: BTreeMap::new(),
             isolated: None,
+            ack_limit: None,
+            delayed: Vec::new(),
             joining: None,
             paused_apply: None,
             paused_flush: None,
@@ -189,9 +212,9 @@ impl Simulation {
             trace: vec![],
             installed_snapshots: 0,
             proposed: BTreeSet::new(),
-            shared: Some(std::sync::Arc::new(crate::object::faults::FaultStore::new(
+            shared: std::sync::Arc::new(crate::object::faults::FaultStore::new(
                 std::sync::Arc::new(slatedb::object_store::memory::InMemory::new()),
-            ))),
+            )),
             reference,
             digests: BTreeMap::new(),
             checked: BTreeMap::new(),
@@ -199,6 +222,7 @@ impl Simulation {
             base_checks: 0,
             quotas,
             members,
+            overlay_max_bytes,
             processes: BTreeMap::new(),
             refused_snapshots: 0,
             delivered_views: vec![],
@@ -230,7 +254,7 @@ impl Simulation {
             senders.insert(peer, tx);
             self.links.insert((id, peer), rx);
         }
-        let store = self.shared.clone().expect("a shared store");
+        let store = self.shared.clone();
         let flag = self.quotas.get(&id).copied().unwrap_or(0);
         // Box the large open future, so the schedule future fits the test thread stack.
         let node = Box::pin(Node::open_with_transport(
@@ -240,7 +264,10 @@ impl Simulation {
                 require_peer_tls: false,
                 view_max_age: std::time::Duration::from_secs(10),
                 view_pin_max: std::time::Duration::from_secs(300),
-                overlay_max_bytes: 1 << 30,
+                overlay_max_bytes: match id {
+                    3 => self.overlay_max_bytes / 4,
+                    _ => self.overlay_max_bytes,
+                },
                 max_clock_skew: std::time::Duration::from_secs(5),
                 view_retention: Default::default(),
                 restore: None,
@@ -271,6 +298,9 @@ impl Simulation {
         ))
         .await
         .unwrap();
+        // The compactor runs only on request, so GC removes the same SSTs on every replay.
+        let compaction = &node.writer.source().manual_compaction;
+        compaction.store(true, std::sync::atomic::Ordering::Relaxed);
         self.nodes.insert(id, node);
         let process = self.processes.values().max().map_or(1, |last| last + 1);
         self.processes.insert(id, process);
@@ -512,7 +542,7 @@ impl Simulation {
         for node in self.nodes.values_mut() {
             node.worker.state_mut().settle_opens().await;
             // An announcement of the current base offers it at once, with no open.
-            node.note_offers();
+            node.writer.note_offers();
         }
     }
 
@@ -522,6 +552,14 @@ impl Simulation {
         }
         let index = self.choose(self.messages.len());
         let mut message = self.messages.remove(index);
+        if self.ack_limit.is_some_and(|(id, max)| {
+            message.from == id
+                && message.get_msg_type() == MessageType::MsgAppendResponse
+                && message.index > max
+        }) {
+            self.delayed.push(message);
+            return;
+        }
         self.trace.push(format!(
             "message {} {} {:?} {} {}",
             message.from,
@@ -750,6 +788,28 @@ impl Simulation {
         self.start(id).await;
     }
 
+    /// Tick member `id`. When its apply waits, the ticks up to its next checkpoint poll pass, and
+    /// the member adopts a base that the poll opens. See `Node::dst_poll`.
+    async fn shared_tick(&mut self, id: u64) {
+        self.tick(id).await;
+        let Some(node) = self.nodes.get_mut(&id) else {
+            return;
+        };
+        if node.dst_poll().await {
+            self.trace.push(format!("poll {id}"));
+            self.drive().await;
+        }
+    }
+
+    /// Run out the election timer of every member, as after a long time with no leader. The next
+    /// tick of a member starts an election, and no member refuses it for its leader lease.
+    fn expire_elections(&mut self) {
+        for node in self.nodes.values_mut() {
+            let raft = &mut node.raw.raft;
+            raft.election_elapsed = raft.election_elapsed.max(2 * raft.election_timeout());
+        }
+    }
+
     /// A follower, not `except`.
     fn follower(&self, except: u64) -> u64 {
         let leader = self.leader().unwrap();
@@ -757,6 +817,75 @@ impl Simulation {
             .find(|&id| id != leader && id != except)
             .unwrap()
     }
+}
+
+/// Compact every L0 SST and sorted run into one run when the L0 has `limit` SSTs or more, and
+/// wait until the compaction ends. DST turns off the compactor of the writer. See
+/// `Source::manual_compaction`.
+pub(super) async fn dst_compact(admin: &slatedb::admin::Admin, limit: usize) -> Result<()> {
+    use slatedb::compactor::{CompactionSpec, CompactionStatus, SourceId};
+    let manifest = admin
+        .read_manifest(None)
+        .await?
+        .context("missing manifest")?;
+    if manifest.l0().len() < limit {
+        return Ok(());
+    }
+    let mut sources: Vec<_> = manifest
+        .l0()
+        .iter()
+        .map(|view| SourceId::SstView(view.id))
+        .collect();
+    sources.extend(
+        manifest
+            .compacted()
+            .iter()
+            .map(|run| SourceId::SortedRun(run.id)),
+    );
+    let destination = manifest
+        .compacted()
+        .iter()
+        .map(|run| run.id)
+        .min()
+        .unwrap_or(0);
+    let job = admin
+        .submit_compaction(CompactionSpec::new(sources, destination))
+        .await?;
+    for _ in 0..400 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        match admin.read_compaction(job.id(), None).await? {
+            Some(job) if matches!(job.status(), CompactionStatus::Completed) => {
+                // The compactor commits the manifest after the job. Wait for the new L0.
+                let manifest = admin
+                    .read_manifest(None)
+                    .await?
+                    .context("missing manifest")?;
+                if manifest.l0().len() < limit {
+                    return Ok(());
+                }
+            }
+            Some(job) if matches!(job.status(), CompactionStatus::Failed) => {
+                anyhow::bail!("a DST compaction failed")
+            }
+            _ => {}
+        }
+    }
+    anyhow::bail!("a DST compaction timed out")
+}
+
+/// Flush the open writer of a checkpoint step. Then compact the L0 SSTs on request before SlateDB
+/// would stop writes for them.
+async fn flush(node: &Node, writer: &shared::DstWriter) -> Result<()> {
+    let Some(db) = writer.db() else {
+        return Ok(());
+    };
+    db.flush().await?;
+    dst_compact(node.writer.admin(), 4).await
+}
+
+/// Return true when member `id` has an open writer.
+fn writer_open(writers: &BTreeMap<u64, shared::DstWriter>, id: u64) -> bool {
+    writers.get(&id).is_some_and(|writer| writer.db().is_some())
 }
 
 /// The writer steps of a shared-mode schedule.
@@ -770,8 +899,8 @@ enum WriterStep {
 }
 
 impl Simulation {
-    /// Run one writer step on member `id`. A fence closes the writer; the next open step opens
-    /// it again. Any other writer error stops the member, as architecture rule 8 requires.
+    /// Run one writer step on member `id`. An error closes the writer, and the next open step
+    /// opens it again. An invariant error also stops the member, as `fault::recover` does.
     async fn writer_step(
         &mut self,
         writers: &mut BTreeMap<u64, shared::DstWriter>,
@@ -793,7 +922,9 @@ impl Simulation {
         // SlateDB finds a fence at its next manifest write or poll, at a time that the schedule
         // does not fix. The simulated writer checks the epoch first, so a newer writer always
         // fences it at its next step.
-        if writer.db.is_some() && !matches!(step, WriterStep::Open) && node.dst_fenced(writer).await
+        if writer.db().is_some()
+            && !matches!(step, WriterStep::Open)
+            && node.dst_fenced(writer).await
         {
             writer.close().await;
             self.trace.push(format!("writer {id} {step:?} fenced"));
@@ -802,9 +933,12 @@ impl Simulation {
         }
         let result = match step {
             WriterStep::Open => node.dst_open(writer, false).await.map(drop),
-            WriterStep::Materialize => node.dst_materialize(writer).await.map(drop),
-            WriterStep::Checkpoint => node.dst_checkpoint(writer).await.map(drop),
-            WriterStep::Announce => node.dst_announce(writer),
+            WriterStep::Materialize => node.dst_materialize(writer).await,
+            WriterStep::Checkpoint => match flush(node, writer).await {
+                Ok(()) => node.dst_checkpoint(writer).await,
+                error => error,
+            },
+            WriterStep::Announce => node.dst_announce(writer).await,
             WriterStep::Retain => node.dst_retain(writer, &pins).await,
         };
         match result {
@@ -813,14 +947,71 @@ impl Simulation {
                 writer.close().await;
                 self.trace.push(format!("writer {id} {step:?} fenced"));
             }
+            // `fault::recover`: the task abandons the writer and opens it again after a backoff,
+            // and the member stays. Only an invariant error stops the member.
             Err(error) => {
                 writer.close().await;
-                self.trace.push(format!("writer {id} {step:?} failed"));
+                let fault = shared::classify(&error);
+                self.trace
+                    .push(format!("writer {id} {step:?} failed {fault:?}"));
                 tracing::debug!(%error, id, "writer step failed");
-                self.stop(id);
+                if fault == shared::Fault::Invariant {
+                    self.stop(id);
+                }
             }
         }
         self.drive().await;
+    }
+
+    /// Stop the writer of `leader` after a checkpoint step and before its announcement. The
+    /// member crashes when no other member is down, and a later writer finds the checkpoint
+    /// stranded. Otherwise the writer task fails, and it opens the writer again. The first pass
+    /// of its publisher checks for a stranded checkpoint at once (`Retry::new`).
+    async fn strand(
+        &mut self,
+        writers: &mut BTreeMap<u64, shared::DstWriter>,
+        leader: u64,
+        stopped: &mut Option<u64>,
+    ) {
+        if let Some(mut writer) = writers.remove(&leader) {
+            writer.close().await;
+        }
+        if stopped.is_none() && self.choose(2) == 0 {
+            self.stop(leader);
+            *stopped = Some(leader);
+            self.drive().await;
+            return;
+        }
+        self.trace.push(format!("writer {leader} abandoned"));
+        self.drive().await;
+        for step in [WriterStep::Open, WriterStep::Announce] {
+            self.writer_step(writers, leader, step).await;
+        }
+    }
+
+    /// Run an announce step on `leader` during a leader transfer. Raft drops the proposal. Then
+    /// the transfer ends, as at its timeout, and the retry sends the checkpoint again at the next
+    /// announce step. A `MsgTimeoutNow` that the leader sent can still move the lead.
+    async fn announce_in_transfer(
+        &mut self,
+        writers: &mut BTreeMap<u64, shared::DstWriter>,
+        leader: u64,
+    ) {
+        let target = (1..=self.members).find(|id| *id != leader && self.nodes.contains_key(id));
+        if let Some(target) = target {
+            let node = self.nodes.get_mut(&leader).unwrap();
+            node.raw.transfer_leader(target);
+            self.trace.push(format!("transfer {leader} {target}"));
+        }
+        self.writer_step(writers, leader, WriterStep::Announce)
+            .await;
+        if let Some(node) = self.nodes.get_mut(&leader) {
+            node.raw.raft.abort_leader_transfer();
+        }
+        if self.leader() == Some(leader) {
+            self.writer_step(writers, leader, WriterStep::Announce)
+                .await;
+        }
     }
 
     /// Read the keys on a member's published view, as a serializable Range does. A ReadIndex read
@@ -873,9 +1064,7 @@ impl Simulation {
         let Some(node) = self.nodes.values().next() else {
             return;
         };
-        let Some(writer) = &node.writer else {
-            return;
-        };
+        let writer = &node.writer;
         let directory = slatedb::config::GarbageCollectorDirectoryOptions {
             interval: None,
             min_age: std::time::Duration::from_millis(200),
@@ -887,7 +1076,7 @@ impl Simulation {
             ..Default::default()
         };
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        let admin = writer.admin.clone();
+        let admin = writer.admin().clone();
         let _ = admin.run_gc_once(options).await;
         self.trace.push("gc".into());
         self.drive().await;
@@ -895,9 +1084,9 @@ impl Simulation {
 
     /// A shared-mode schedule: one store, writer steps at random points, leader changes,
     /// crashes between writer steps, late opens of deposed writers, partitions, object store
-    /// failures, retention with GC, and reads on old views.
+    /// failures, retention with GC, small overlay limits, and reads on old views.
     async fn run_shared(seed: u64) -> Vec<String> {
-        let mut sim = Self::new(seed).await;
+        let mut sim = Self::shared(seed).await;
         let mut writers = BTreeMap::new();
         for _ in 0..100 {
             sim.deliver(false).await;
@@ -913,7 +1102,7 @@ impl Simulation {
                 sim.drop_clients().await;
             }
             let leader = sim.leader();
-            match sim.choose(34) {
+            match sim.choose(35) {
                 0..=10 => {
                     for _ in 0..4 {
                         sim.deliver(true).await;
@@ -921,7 +1110,11 @@ impl Simulation {
                 }
                 11..=12 => {
                     let id = sim.choose(3) as u64 + 1;
-                    sim.tick(id).await;
+                    // Ticks are rare here, so without this no member campaigns after a crash.
+                    if leader.is_none() {
+                        sim.expire_elections();
+                    }
+                    sim.shared_tick(id).await;
                     // A follower asks for a snapshot at its last index. Announcements and
                     // unmaterialized batches can follow the leader's base row.
                     if sim.choose(2) == 0 {
@@ -951,11 +1144,27 @@ impl Simulation {
                             3 => WriterStep::Announce,
                             _ => WriterStep::Retain,
                         };
-                        let open = writers
-                            .get(&leader)
-                            .is_some_and(|writer: &shared::DstWriter| writer.db.is_some());
+                        let open = writer_open(&writers, leader);
                         let step = if open { step } else { WriterStep::Open };
                         sim.writer_step(&mut writers, leader, step).await;
+                    }
+                }
+                34 => {
+                    // A publication that does not finish: its checkpoint strands, or a leader
+                    // transfer drops its announcement.
+                    if let Some(leader) = leader {
+                        if !writer_open(&writers, leader) {
+                            sim.writer_step(&mut writers, leader, WriterStep::Open)
+                                .await;
+                        }
+                        for step in [WriterStep::Materialize, WriterStep::Checkpoint] {
+                            sim.writer_step(&mut writers, leader, step).await;
+                        }
+                        if sim.choose(2) == 0 {
+                            sim.strand(&mut writers, leader, &mut stopped).await;
+                        } else {
+                            sim.announce_in_transfer(&mut writers, leader).await;
+                        }
                     }
                 }
                 21 => {
@@ -984,8 +1193,6 @@ impl Simulation {
                         let node = sim.nodes.get_mut(&id).unwrap();
                         if node.dst_open(writer, true).await.unwrap_or(false) {
                             sim.trace.push(format!("writer {id} late open"));
-                            // The deposed writer's own next commit fails with a fence.
-                            writer.close().await;
                         }
                     }
                 }
@@ -1013,9 +1220,10 @@ impl Simulation {
                         sim.trace.push("held read".into());
                     }
                 }
-                27 => {
-                    // The object store rejects SST writes for a while.
-                    let store = sim.shared.clone().unwrap();
+                27 if sim.choose(2) == 0 => {
+                    // The object store rejects SST writes for a while. The writer of the leader
+                    // fails, and the leader opens it again.
+                    let store = sim.shared.clone();
                     store.set(crate::object::faults::FAIL_PUT);
                     for _ in 0..5 {
                         sim.deliver(true).await;
@@ -1026,6 +1234,32 @@ impl Simulation {
                     }
                     store.set(0);
                     sim.trace.push("store recovered".into());
+                }
+                27 => {
+                    // The next writer open of the leader reads an object that does not decode.
+                    // The same process stays with a closed writer, and the next open succeeds.
+                    if let Some(leader) = leader {
+                        let source = sim.nodes[&leader].writer.source().clone();
+                        let error = crate::storage_fault::stored("an injected data error");
+                        *source.fail_writer.lock().unwrap() = Some(error);
+                        let process = sim.processes[&leader];
+                        sim.writer_step(&mut writers, leader, WriterStep::Open)
+                            .await;
+                        let injected = source.fail_writer.lock().unwrap().take();
+                        assert!(injected.is_none(), "seed {seed}: the open did not fail");
+                        assert!(
+                            sim.nodes.contains_key(&leader),
+                            "seed {seed}: a data error stopped member {leader}"
+                        );
+                        assert_eq!(sim.processes[&leader], process, "seed {seed}");
+                        assert!(!writer_open(&writers, leader), "seed {seed}");
+                        sim.writer_step(&mut writers, leader, WriterStep::Open)
+                            .await;
+                        assert!(
+                            writer_open(&writers, leader),
+                            "seed {seed}: member {leader} did not open the writer again"
+                        );
+                    }
                 }
                 _ => {
                     if collections < 3 {
@@ -1045,7 +1279,7 @@ impl Simulation {
                 sim.drop_clients().await;
             }
             for id in 1..=3 {
-                sim.tick(id).await;
+                sim.shared_tick(id).await;
             }
             if round < 40 {
                 sim.propose().await;
@@ -1065,9 +1299,7 @@ impl Simulation {
                     WriterStep::Checkpoint,
                     WriterStep::Announce,
                 ] {
-                    let open = writers
-                        .get(&leader)
-                        .is_some_and(|writer: &shared::DstWriter| writer.db.is_some());
+                    let open = writer_open(&writers, leader);
                     if matches!(step, WriterStep::Open) == open {
                         continue;
                     }

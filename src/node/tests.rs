@@ -69,9 +69,9 @@ async fn queued_state_reads_are_bounded_and_complete_without_raft_writes() {
     let (tx, rx) = oneshot::channel();
     node.enqueue_query(Query::Local("overflow".into(), tx));
     assert!(rx.await.unwrap().unwrap_err().error.contains("too many"));
-    assert_eq!(node.queries.len(), apply::MAX_QUERIES);
+    assert_eq!(node.apply.queued(), apply::MAX_QUERIES);
     node.drive_ready().await.unwrap();
-    assert!(node.apply_busy);
+    assert!(node.apply.busy());
     node.drain_apply().await.unwrap();
     for reply in replies {
         let value = reply.await.unwrap().unwrap();
@@ -123,7 +123,7 @@ async fn point_read_batches_stop_before_scans_and_historical_reads() {
         }
         node.complete_read(completion).unwrap();
     }
-    assert!(node.read_queries.is_empty());
+    assert_eq!(node.reads.queued(), 0);
     for reply in replies {
         assert!(reply.await.unwrap().unwrap().into_outcome().result.is_ok());
     }
@@ -159,10 +159,10 @@ async fn waiting_scans_do_not_block_current_point_reads() {
     }
     node.drive_ready().await.unwrap();
     assert_eq!(node.read_executor.len(), 2);
-    assert_eq!(node.read_queries.len(), 1);
-    assert!(!node.read_queries[0].is_point_read());
+    assert_eq!(node.reads.queued(), 1);
+    assert!(!node.reads.queries()[0].is_point_read());
     node.drain_reads().await.unwrap();
-    assert!(node.read_queries.is_empty());
+    assert_eq!(node.reads.queued(), 0);
     for reply in replies {
         assert!(reply.await.unwrap().unwrap().into_outcome().result.is_ok());
     }
@@ -238,11 +238,11 @@ async fn committed_backlog_defers_new_proposals_before_log_growth() {
     ));
     assert_eq!(node.raw.store().last_index().unwrap(), last);
     assert_eq!(node.state.applied, 0);
-    assert!(node.apply_busy);
+    assert!(node.apply.busy());
     let (tx, mut read) = oneshot::channel();
     node.enqueue_query(Query::Local("absent".into(), tx));
     // The query does not jump the batches already queued, and no new batch passes it.
-    let queued = node.apply_jobs.back().unwrap().0;
+    let queued = node.apply.targets().last().unwrap();
     let value = loop {
         let completed = node
             .worker
@@ -373,7 +373,7 @@ async fn received_snapshot_fences_an_older_batch_and_later_entries() {
         .unwrap();
     node.drive_ready().await.unwrap();
     assert_eq!(
-        node.apply_jobs.iter().map(|job| job.0).collect::<Vec<_>>(),
+        node.apply.targets().collect::<Vec<_>>(),
         [apply::APPLY_ENTRIES, seeded]
     );
     let mut state = StateMachine::open_test(source.path()).await.unwrap();
@@ -413,7 +413,7 @@ async fn received_snapshot_fences_an_older_batch_and_later_entries() {
         assert_eq!(node.state.applied, target);
         node.drive_ready().await.unwrap();
     }
-    assert_eq!(node.apply_target, 200);
+    assert_eq!(node.apply.target(), 200);
     let mut append = Message::default();
     append.set_msg_type(MessageType::MsgAppend);
     append.from = 2;
@@ -465,7 +465,7 @@ async fn dropping_the_node_cancels_an_active_worker() {
     let dir = tempfile::tempdir().unwrap();
     let (events, _) = mpsc::channel(256);
     let mut node = Node::open(options(dir.path()), events).await.unwrap();
-    node.apply_delay_ms = 5000;
+    node.apply.set_delay(5000);
     node.submit_apply(Job::Snapshot(Snapshot::default()), 0)
         .unwrap();
     let task = node.worker.abort_handle();
@@ -533,7 +533,7 @@ async fn confirm_read(node: &mut Node, id: &u64) {
     message.from = 2;
     message.to = 1;
     message.term = node.raw.raft.term;
-    message.context = node.read_context(*id);
+    message.context = node.reads.context(*id);
     node.raw.step(message).unwrap();
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
@@ -544,13 +544,13 @@ async fn read_batches_freeze_before_quorum_and_survive_a_cancelled_first_request
     let dir = tempfile::tempdir().unwrap();
     let mut node = leader_node(dir.path()).await;
     let (sender, mut messages) = mpsc::channel(256);
-    node.senders.insert(2, sender);
+    node.links.connect(2, sender);
     let syncs = node.raw.store().durable.sync_writes;
     let (first, cancelled) = oneshot::channel();
     let (second, mut reply) = oneshot::channel();
     node.linear_read(range_request(), first);
     node.linear_read(range_request(), second);
-    let context = *node.reads.keys().next().unwrap();
+    let context = node.reads.ids().next().unwrap();
     node.drive_ready().await.unwrap();
     assert!(node.log_worker.step().unwrap().is_none());
     let mut contexts = vec![];
@@ -559,11 +559,11 @@ async fn read_batches_freeze_before_quorum_and_survive_a_cancelled_first_request
             contexts.push(message.context.to_vec());
         }
     }
-    assert_eq!(contexts, vec![node.read_context(context)]);
+    assert_eq!(contexts, vec![node.reads.context(context)]);
     drop(cancelled);
     let (later, mut late_reply) = oneshot::channel();
     node.linear_read(range_request(), later);
-    let late_context = *node.reads.keys().last().unwrap();
+    let late_context = node.reads.ids().last().unwrap();
     node.drive_ready().await.unwrap();
     assert!(reply.try_recv().is_err());
     confirm_read(&mut node, &context).await;
@@ -588,7 +588,7 @@ async fn empty_log_barriers_wait_for_prior_persistence_and_fail_closed() {
     for fail in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let mut node = leader_node(dir.path()).await;
-        node.queue_log(
+        node.log.queue(
             log::Job::Ready {
                 entries: vec![],
                 hs: Some(node.raw.store().durable.hard_state),
@@ -599,9 +599,9 @@ async fn empty_log_barriers_wait_for_prior_persistence_and_fail_closed() {
             vec![],
             vec![],
         );
-        node.log_fail = fail;
+        node.log.set_fault(0, fail);
         let (tx, mut rx) = oneshot::channel();
-        node.queue_log(
+        node.log.queue(
             log::Job::Ready {
                 entries: vec![],
                 hs: None,
@@ -612,7 +612,7 @@ async fn empty_log_barriers_wait_for_prior_persistence_and_fail_closed() {
             vec![],
             vec![],
         );
-        node.log_queue.back_mut().unwrap().responses.push(tx);
+        node.log.respond_after_last(tx);
         node.start_log().unwrap();
         assert!(rx.try_recv().is_err());
         let completed = node.log_worker.step();
@@ -624,10 +624,203 @@ async fn empty_log_barriers_wait_for_prior_persistence_and_fail_closed() {
         } else {
             node.complete_log(completed.unwrap().unwrap()).unwrap();
             assert!(rx.await.unwrap().is_ok());
-            assert!(node.log_queue.is_empty());
+            assert_eq!(node.log.len(), 0);
             assert!(node.log_worker.step().unwrap().is_none());
         }
     }
+}
+
+#[tokio::test]
+async fn a_slow_log_write_does_not_stop_leader_heartbeats() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    let (sender, mut messages) = mpsc::channel(1024);
+    node.links.connect(2, sender);
+    let (tx, reply) = oneshot::channel();
+    node.propose(
+        RaftCommand::Lease {
+            origin: 1,
+            id: "slow-write".into(),
+            lease: LeaseCommand::List,
+        },
+        tx,
+    )
+    .unwrap();
+    // The manual log worker holds this write until the test steps it.
+    node.drive_ready().await.unwrap();
+    assert!(node.log.busy());
+    for tick in 0..2 * log::MAX_JOBS {
+        assert!(
+            tick_leader(&mut node, &mut messages).await,
+            "no heartbeat at tick {tick}"
+        );
+    }
+    assert_eq!(node.raw.raft.state, StateRole::Leader);
+    // The write, and then the empty Ready jobs as one job.
+    assert_eq!(node.log.len(), 2);
+    let (tx, mut barrier) = oneshot::channel();
+    node.log.respond_after_last(tx);
+    let (tx, later) = oneshot::channel();
+    node.propose(
+        RaftCommand::Lease {
+            origin: 1,
+            id: "later-write".into(),
+            lease: LeaseCommand::List,
+        },
+        tx,
+    )
+    .unwrap();
+    node.drive_ready().await.unwrap();
+    // A later write does not join the empty job, so the empty job does not wait for it.
+    assert_eq!(node.log.len(), 3);
+    let completed = node.log_worker.step().unwrap().unwrap();
+    node.complete_log(completed).unwrap();
+    assert!(barrier.try_recv().unwrap().is_ok());
+    assert_eq!(node.log.len(), 1);
+    node.drain_log().await.unwrap();
+    assert_eq!(node.log.len(), 0);
+    let mut ack = Message::default();
+    ack.set_msg_type(MessageType::MsgAppendResponse);
+    ack.from = 2;
+    ack.to = 1;
+    ack.term = node.raw.raft.term;
+    ack.index = node.raw.store().last_index().unwrap();
+    node.raw.step(ack).unwrap();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    node.drain_apply().await.unwrap();
+    assert!(reply.await.unwrap().is_ok());
+    assert!(later.await.unwrap().is_ok());
+}
+
+/// Tick the leader with a heartbeat response from peer 2, and tell if a heartbeat went out.
+async fn tick_leader(node: &mut Node, messages: &mut mpsc::Receiver<Message>) -> bool {
+    node.tick_raft().unwrap();
+    // A heartbeat response keeps the leader in its quorum check.
+    let mut response = Message::default();
+    response.set_msg_type(MessageType::MsgHeartbeatResponse);
+    response.from = 2;
+    response.to = 1;
+    response.term = node.raw.raft.term;
+    node.raw.step(response).unwrap();
+    node.drive_ready().await.unwrap();
+    let mut heartbeat = false;
+    while let Ok(message) = messages.try_recv() {
+        heartbeat |= message.get_msg_type() == MessageType::MsgHeartbeat;
+    }
+    heartbeat
+}
+
+#[tokio::test]
+async fn ready_records_behind_a_slow_log_write_are_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    let (sender, mut messages) = mpsc::channel(1024);
+    node.links.connect(2, sender);
+    let (tx, _reply) = oneshot::channel();
+    node.propose(
+        RaftCommand::Lease {
+            origin: 1,
+            id: "slow-write".into(),
+            lease: LeaseCommand::List,
+        },
+        tx,
+    )
+    .unwrap();
+    node.drive_ready().await.unwrap();
+    assert!(node.log.busy());
+    let readys = |node: &Node| node.log.readys();
+    let mut ticks = 0;
+    while tick_leader(&mut node, &mut messages).await {
+        ticks += 1;
+        assert!(readys(&node) <= log::MAX_READYS);
+    }
+    // The write is one Ready, and each tick is one more.
+    assert_eq!(ticks, log::MAX_READYS - 1);
+    for _ in 0..log::MAX_JOBS {
+        assert!(!tick_leader(&mut node, &mut messages).await);
+        assert_eq!(readys(&node), log::MAX_READYS);
+        assert!(node.raw.has_ready());
+    }
+    assert_eq!(node.raw.raft.state, StateRole::Leader);
+    let completed = node.log_worker.step().unwrap().unwrap();
+    node.complete_log(completed).unwrap();
+    assert_eq!(node.log.len(), 0);
+    assert!(tick_leader(&mut node, &mut messages).await);
+}
+
+#[tokio::test]
+async fn follower_responses_wait_for_their_write_and_count_as_queued_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_log(dir.path(), 1);
+    let (events, _) = mpsc::channel(256);
+    let mut node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    let (sender, mut messages) = mpsc::channel(1024);
+    node.links.connect(2, sender);
+    let leader = |kind: MessageType| {
+        let mut message = Message::default();
+        message.set_msg_type(kind);
+        message.from = 2;
+        message.to = 1;
+        message.term = 2;
+        message.commit = 1;
+        message
+    };
+    let append = |index: u64| {
+        let mut message = leader(MessageType::MsgAppend);
+        message.index = index - 1;
+        message.log_term = if index == 2 { 1 } else { 2 };
+        message.entries.push(Entry {
+            index,
+            term: 2,
+            ..Default::default()
+        });
+        message
+    };
+    let mut sent = |kind: MessageType| {
+        let mut found = vec![];
+        while let Ok(message) = messages.try_recv() {
+            if message.get_msg_type() == kind {
+                found.push(message.index);
+            }
+        }
+        found
+    };
+    // The worker holds the write of entry 2. Entry 4 joins the queued write of entry 3.
+    for index in 2..=4 {
+        node.raw.step(append(index)).unwrap();
+        node.drive_ready().await.unwrap();
+    }
+    assert_eq!(node.log.len(), 2);
+    // The responses wait with the write of entry 4 and count as its bytes.
+    for _ in 0..=log::MAX_BYTES >> 20 {
+        let mut heartbeat = leader(MessageType::MsgHeartbeat);
+        heartbeat.context = vec![0; 1 << 20];
+        node.raw.step(heartbeat).unwrap();
+        node.drive_ready().await.unwrap();
+    }
+    assert_eq!(node.log.len(), 2);
+    assert!(node.log.bytes() >= log::MAX_BYTES);
+    assert!(node.raw.has_ready());
+    assert!(sent(MessageType::MsgAppendResponse).is_empty());
+    assert_eq!(node.raw.raft.raft_log.persisted, 1);
+    // Each response waits for the write that makes its entries durable.
+    let completed = node.log_worker.step().unwrap().unwrap();
+    node.complete_log(completed).unwrap();
+    assert_eq!(node.raw.raft.raft_log.persisted, 2);
+    assert_eq!(sent(MessageType::MsgAppendResponse), [2]);
+    let completed = node.log_worker.step().unwrap().unwrap();
+    node.complete_log(completed).unwrap();
+    assert_eq!(node.raw.raft.raft_log.persisted, 4);
+    assert_eq!(sent(MessageType::MsgAppendResponse), [3, 4]);
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    assert_eq!(node.log.len(), 0);
+    assert_eq!(node.log.bytes(), 0);
 }
 
 #[tokio::test]
@@ -670,7 +863,7 @@ async fn forwarded_revision_waits_for_apply_without_a_new_quorum_round() {
     assert!(!view.applied(revision));
     node.wait_revision(revision, tx);
     assert!(reply.try_recv().is_err());
-    assert!(node.reads.is_empty());
+    assert_eq!(node.reads.pending(), 0);
     // A committed result remains valid after leader loss. Local apply is still required.
     node.raw.raft.become_follower(node.raw.raft.term + 1, 0);
     node.drain_apply().await.unwrap();
@@ -689,12 +882,11 @@ async fn forwarded_revision_waits_for_apply_without_a_new_quorum_round() {
     assert!(rx.await.unwrap().unwrap_err().error.contains("too many"));
     pending.pop();
     node.finish_revision_waiters();
-    assert_eq!(node.revision_waiters.len(), apply::MAX_QUERIES - 1);
-    for waiter in &mut node.revision_waiters {
-        waiter.started = Instant::now() - Duration::from_secs(6);
-    }
+    assert_eq!(node.reads.revision_waiters(), apply::MAX_QUERIES - 1);
+    node.reads
+        .set_revision_waiters_started(Instant::now() - Duration::from_secs(6));
     node.finish_revision_waiters();
-    assert!(node.revision_waiters.is_empty());
+    assert_eq!(node.reads.revision_waiters(), 0);
     for reply in pending {
         assert!(reply
             .await
@@ -713,7 +905,7 @@ async fn read_index_requires_quorum_and_does_not_write_the_log() {
     let syncs = node.raw.store().durable.sync_writes;
     let (tx, mut reply) = oneshot::channel();
     node.linear_read(range_request(), tx);
-    let id = *node.reads.keys().next().unwrap();
+    let id = node.reads.ids().next().unwrap();
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
     node.drain_apply().await.unwrap();
@@ -807,10 +999,10 @@ async fn scans_run_together_and_rerun_alone_over_their_row_budget() {
     // Three scans share the wide slots. The sorted read and later scans wait in queue order.
     // The point read passes them and uses the remaining task.
     assert_eq!(node.read_executor.len(), read::executor::MAX_TASKS);
-    assert_eq!(node.read_queries.len(), 2);
-    assert!(!node.read_executor.can_submit(&node.read_queries[0]));
+    assert_eq!(node.reads.queued(), 2);
+    assert!(!node.read_executor.can_submit(&node.reads.queries()[0]));
     node.drain_reads().await.unwrap();
-    assert!(node.read_queries.is_empty());
+    assert_eq!(node.reads.queued(), 0);
     assert_eq!(node.read_executor.reruns, 1);
     for (request, reply) in requests.iter().zip(replies) {
         let mut result = reply.await.unwrap().unwrap().into_outcome().result.unwrap();
@@ -862,7 +1054,7 @@ async fn confirmed_scans_share_only_matching_requests_and_credentials() {
         node.linear_read_auth(request, Some(credentials), ClientResponse::Kv(tx));
         replies.push(rx);
     }
-    let first = *node.reads.keys().next().unwrap();
+    let first = node.reads.ids().next().unwrap();
     node.drive_ready().await.unwrap();
     assert_eq!(node.read_executor.len(), 0);
     confirm_read(&mut node, &first).await;
@@ -918,12 +1110,12 @@ async fn read_index_waits_for_apply_and_rejects_late_results_after_term_change()
     assert!(node.state.applied < node.raw.store().commit_index());
     let (tx, mut reply) = oneshot::channel();
     node.linear_read(range_request(), tx);
-    let id = *node.reads.keys().next().unwrap();
+    let id = node.reads.ids().next().unwrap();
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
     confirm_read(&mut node, &id).await;
     assert!(reply.try_recv().is_err());
-    assert!(node.queries.is_empty(), "read passed the apply barrier");
+    assert!(!node.apply.has_queries(), "read passed the apply barrier");
     let completed = node.worker.step().await.unwrap().unwrap();
     node.complete_apply(completed).unwrap();
     node.drive_ready().await.unwrap();
@@ -931,7 +1123,7 @@ async fn read_index_waits_for_apply_and_rejects_late_results_after_term_change()
     node.raw.raft.become_follower(node.raw.raft.term + 1, 2);
     node.complete_read(read_result).unwrap();
     assert!(reply.await.unwrap().is_err());
-    assert!(node.reads.is_empty());
+    assert_eq!(node.reads.pending(), 0);
 }
 
 #[tokio::test]
@@ -973,7 +1165,7 @@ async fn log_failure_and_panic_stop_the_node() {
         let dir = tempfile::tempdir().unwrap();
         let (events, receiver) = mpsc::channel(256);
         let mut node = Node::open(options(dir.path()), events).await.unwrap();
-        node.log_fail = !panic;
+        node.log.set_fault(0, !panic);
         let job = if panic {
             log::Job::Panic
         } else {
@@ -987,7 +1179,7 @@ async fn log_failure_and_panic_stop_the_node() {
                 snapshot: None,
             }
         };
-        node.queue_log(job, None, None, vec![], vec![]);
+        node.log.queue(job, None, None, vec![], vec![]);
         node.start_log().unwrap();
         let result = tokio::time::timeout(Duration::from_secs(2), node.run(receiver))
             .await
@@ -1011,7 +1203,7 @@ async fn pending_read_indexes_are_bounded_and_cancelled_on_leader_loss() {
     assert!(rx.await.unwrap().unwrap_err().error.contains("too many"));
     node.raw.raft.become_follower(node.raw.raft.term + 1, 2);
     node.drive_ready().await.unwrap();
-    assert!(node.reads.is_empty());
+    assert_eq!(node.reads.pending(), 0);
     for reply in replies {
         assert!(reply.await.unwrap().is_err());
     }
@@ -1022,8 +1214,8 @@ async fn shutdown_interrupts_the_log_fault_delay() {
     let dir = tempfile::tempdir().unwrap();
     let (events, _) = mpsc::channel(256);
     let mut node = Node::open(options(dir.path()), events).await.unwrap();
-    node.log_delay_ms = 5000;
-    node.queue_log(
+    node.log.set_fault(5000, false);
+    node.log.queue(
         log::Job::Ready {
             entries: vec![],
             hs: Some(HardState {
@@ -1108,7 +1300,7 @@ async fn read_index_retries_after_the_first_commit_in_a_new_term() {
     assert!(!node.raw.raft.commit_to_current_term());
     let (tx, mut reply) = oneshot::channel();
     node.linear_read(range_request(), tx);
-    let id = *node.reads.keys().next().unwrap();
+    let id = node.reads.ids().next().unwrap();
     // The initial request is discarded before the leader commits its no-op entry.
     confirm_read(&mut node, &id).await;
     node.drain_apply().await.unwrap();
@@ -1135,7 +1327,7 @@ async fn read_index_retries_after_the_first_commit_in_a_new_term() {
     // The empty entry and `SeedMembers` of the new leader. Retries append none.
     assert_eq!(node.raw.store().durable.last_index, 2);
     assert_eq!(node.raw.store().durable.sync_writes, syncs);
-    assert!(node.reads.is_empty());
+    assert_eq!(node.reads.pending(), 0);
 }
 
 #[tokio::test]
@@ -1149,7 +1341,7 @@ async fn apply_waits_for_raft_delivery_when_durable_commit_is_ahead() {
     assert_eq!(node.raw.store().commit_index(), 8);
     node.schedule_apply().unwrap();
     assert!(
-        !node.apply_busy,
+        !node.apply.busy(),
         "disk commit alone must not schedule apply"
     );
     node.drive_ready().await.unwrap();
@@ -1191,7 +1383,7 @@ async fn checkpoint_memory_does_not_use_the_entry_admission_budget() {
     let dir = tempfile::tempdir().unwrap();
     let mut node = leader_node(dir.path()).await;
     let size = log::MAX_BYTES + 1;
-    node.queue_log(
+    node.log.queue(
         log::Job::Checkpoint {
             conf: node.state.members.conf(),
             index: node.state.applied,
@@ -1205,8 +1397,8 @@ async fn checkpoint_memory_does_not_use_the_entry_admission_budget() {
         vec![],
         vec![],
     );
-    assert_eq!(node.log_bytes, 0);
-    assert_eq!(node.log_snapshot_bytes, size);
+    assert_eq!(node.log.bytes(), 0);
+    assert_eq!(node.log.snapshot_bytes(), size);
     let (tx, mut rx) = oneshot::channel();
     node.propose(
         RaftCommand::Lease {
@@ -1222,7 +1414,7 @@ async fn checkpoint_memory_does_not_use_the_entry_admission_budget() {
         Err(oneshot::error::TryRecvError::Empty)
     ));
     assert_eq!(node.pending.len(), 1);
-    node.log_bytes = log::MAX_BYTES;
+    node.log.set_bytes(log::MAX_BYTES);
     let (tx, mut rx) = oneshot::channel();
     node.propose(
         RaftCommand::Lease {
@@ -1252,12 +1444,13 @@ async fn a_full_log_queue_cannot_let_apply_pass_the_ready_cursor() {
         .unwrap();
     node.raw.raft.set_max_committed_size_per_ready(1);
     for _ in 0..log::MAX_JOBS - 1 {
-        node.queue_log(log::Job::Stats, None, None, vec![], vec![]);
+        node.log.queue(log::Job::Stats, None, None, vec![], vec![]);
     }
     node.drive_ready().await.unwrap();
-    assert_eq!(node.committed_ready, 1);
+    assert_eq!(node.apply.committed(), 1);
     assert_eq!(
-        node.apply_target, 1,
+        node.apply.target(),
+        1,
         "apply passed the bounded Ready delivery"
     );
     let completed = node.worker.step().await.unwrap().unwrap();
@@ -1283,7 +1476,7 @@ async fn queued_ready_jobs_share_sync_and_keep_the_final_log_suffix() {
         vec![entry(first + 1, 2), entry(first + 2, 2)],
     ] {
         let term = entries.last().unwrap().term;
-        node.queue_log(
+        node.log.queue(
             log::Job::Ready {
                 entries,
                 hs: Some(HardState {
@@ -1299,16 +1492,16 @@ async fn queued_ready_jobs_share_sync_and_keep_the_final_log_suffix() {
             vec![],
         );
         let (tx, rx) = oneshot::channel();
-        node.log_queue.back_mut().unwrap().responses.push(tx);
+        node.log.respond_after_last(tx);
         replies.push(rx);
     }
     // A diagnostic job is a batch boundary.
-    node.queue_log(log::Job::Stats, None, None, vec![], vec![]);
+    node.log.queue(log::Job::Stats, None, None, vec![], vec![]);
     let before = node.log_worker.storage().sync_writes;
-    let charged = node.log_bytes;
+    let charged = node.log.bytes();
     node.start_log().unwrap();
-    assert_eq!(node.log_queue.len(), 2);
-    assert_eq!(node.log_bytes, charged);
+    assert_eq!(node.log.len(), 2);
+    assert_eq!(node.log.bytes(), charged);
     assert!(replies.iter_mut().all(|reply| reply.try_recv().is_err()));
     let completed = node.log_worker.step().unwrap().unwrap();
     let storage = node.log_worker.storage();
@@ -1330,7 +1523,7 @@ async fn queued_ready_jobs_share_sync_and_keep_the_final_log_suffix() {
     for reply in replies {
         assert!(reply.await.unwrap().is_ok());
     }
-    assert_eq!(node.log_bytes, 0);
+    assert_eq!(node.log.bytes(), 0);
     node.drain_log().await.unwrap();
     assert_eq!(node.log_worker.storage().sync_writes, before + 1);
     drop(node);
@@ -1347,9 +1540,9 @@ async fn read_contexts_require_the_current_process_nonce_and_exact_length() {
     let mut node = leader_node(dir.path()).await;
     let (response, mut result) = oneshot::channel();
     node.linear_read(range_request(), response);
-    let id = *node.reads.keys().next().unwrap();
+    let id = node.reads.ids().next().unwrap();
     node.drive_ready().await.unwrap();
-    let valid = node.read_context(id);
+    let valid = node.reads.context(id);
     let mut stale = valid.clone();
     stale[0] ^= 1;
     for context in [
@@ -1362,7 +1555,7 @@ async fn read_contexts_require_the_current_process_nonce_and_exact_length() {
             request_ctx: context,
         }]);
         node.schedule_reads();
-        assert!(node.read_queries.is_empty());
+        assert_eq!(node.reads.queued(), 0);
         assert_eq!(node.read_executor.len(), 0);
         assert!(result.try_recv().is_err());
     }
@@ -1383,7 +1576,7 @@ async fn independent_reads_pin_their_view_and_do_not_wait_for_apply() {
         .await
         .unwrap();
     node.drive_ready().await.unwrap();
-    assert!(node.apply_busy);
+    assert!(node.apply.busy());
     let (tx, reply) = oneshot::channel();
     node.enqueue_query(Query::Read(range_request(), None, ClientResponse::Kv(tx)));
     node.drive_ready().await.unwrap();
@@ -1391,7 +1584,7 @@ async fn independent_reads_pin_their_view_and_do_not_wait_for_apply() {
     node.complete_read(read).unwrap();
     assert!(reply.await.unwrap().unwrap().into_outcome().result.is_ok());
     assert_eq!(node.state.applied, 0);
-    assert!(node.apply_busy);
+    assert!(node.apply.busy());
 
     let (tx, reply) = oneshot::channel();
     node.enqueue_query(Query::Read(range_request(), None, ClientResponse::Kv(tx)));
@@ -1425,11 +1618,11 @@ async fn independent_read_jobs_and_queue_have_separate_bounds() {
         node.drive_ready().await.unwrap();
     }
     assert_eq!(node.read_executor.len(), 4);
-    assert_eq!(node.read_queries.len(), apply::MAX_QUERIES);
+    assert_eq!(node.reads.queued(), apply::MAX_QUERIES);
     let (tx, rx) = oneshot::channel();
     node.enqueue_query(Query::Read(range_request(), None, ClientResponse::Kv(tx)));
     assert!(rx.await.unwrap().is_err());
-    assert!(!node.apply_busy);
+    assert!(!node.apply.busy());
     node.drain_reads().await.unwrap();
     for rx in replies {
         assert!(rx.await.unwrap().unwrap().into_outcome().result.is_ok());
@@ -1580,13 +1773,13 @@ async fn leader_renews_a_lease_without_a_log_append() {
     let mut node = leader_node(dir.path()).await;
     grant_lease(&mut node, 7, 60).await;
     let short = Instant::now() + Duration::from_secs(5);
-    node.lease_deadlines.get_mut(&7).unwrap().1 = short;
+    node.lease_clock.set_deadline(7, short);
     let last = node.raw.store().durable.last_index;
     let syncs = node.raw.store().durable.sync_writes;
     let generation = node.state.leases[&7].generation;
 
     assert_eq!(keep_alive(&mut node, 7).await.unwrap(), 60);
-    assert!(node.lease_deadlines[&7].1 > short + Duration::from_secs(50));
+    assert!(node.lease_clock.deadline(7) > short + Duration::from_secs(50));
     assert_eq!(keep_alive(&mut node, 99).await.unwrap(), 0, "unknown lease");
     assert_eq!(node.raw.store().durable.last_index, last);
     assert_eq!(node.raw.store().durable.sync_writes, syncs);
@@ -1609,7 +1802,8 @@ async fn an_expired_lease_is_not_renewed_before_its_expire_entry_applies() {
     let last = node.raw.raft.raft_log.last_index();
 
     // A renewal before the deadline moves it, so the owner proposes no expiry.
-    node.lease_deadlines.get_mut(&8).unwrap().1 = Instant::now() + Duration::from_millis(200);
+    node.lease_clock
+        .set_deadline(8, Instant::now() + Duration::from_millis(200));
     assert_eq!(keep_alive(&mut node, 8).await.unwrap(), 60);
     tokio::time::sleep(Duration::from_millis(250)).await;
     node.expire_leases().unwrap();
@@ -1617,15 +1811,15 @@ async fn an_expired_lease_is_not_renewed_before_its_expire_entry_applies() {
 
     // Past the deadline, a renewal fails and keeps the pending expiry valid.
     let past = Instant::now() - Duration::from_millis(1);
-    node.lease_deadlines.get_mut(&7).unwrap().1 = past;
+    node.lease_clock.set_deadline(7, past);
     node.expire_leases().unwrap();
     assert_eq!(node.raw.raft.raft_log.last_index(), last + 1);
     assert_eq!(keep_alive(&mut node, 7).await.unwrap(), 0);
-    assert_eq!(node.lease_deadlines[&7].1, past);
+    assert_eq!(node.lease_clock.deadline(7), past);
     commit_with_peer(&mut node).await;
     assert!(!node.state.leases.contains_key(&7));
     assert!(node.state.leases.contains_key(&8));
-    assert!(node.lease_expiring.is_empty());
+    assert_eq!(node.lease_clock.expiring(), 0);
     assert_eq!(keep_alive(&mut node, 7).await.unwrap(), 0);
 }
 
@@ -1634,7 +1828,8 @@ async fn leader_change_cancels_renewals_and_restores_the_full_ttl() {
     let dir = tempfile::tempdir().unwrap();
     let mut node = leader_node(dir.path()).await;
     grant_lease(&mut node, 7, 60).await;
-    node.lease_deadlines.get_mut(&7).unwrap().1 = Instant::now() + Duration::from_secs(1);
+    node.lease_clock
+        .set_deadline(7, Instant::now() + Duration::from_secs(1));
 
     // A proof from the old term cannot renew the lease.
     let (tx, mut reply) = oneshot::channel();
@@ -1655,8 +1850,9 @@ async fn leader_change_cancels_renewals_and_restores_the_full_ttl() {
     node.sync_lease_deadlines();
     let extend = node.promote_extend();
     assert_eq!(extend, Duration::from_secs(2));
-    let remaining = node.lease_deadlines[&7]
-        .1
+    let remaining = node
+        .lease_clock
+        .deadline(7)
         .saturating_duration_since(Instant::now());
     assert!(
         remaining > Duration::from_secs(60) + extend - Duration::from_secs(1),
@@ -1665,8 +1861,9 @@ async fn leader_change_cancels_renewals_and_restores_the_full_ttl() {
 
     // A lease granted later in the same term gets only its TTL.
     grant_lease(&mut node, 8, 60).await;
-    let remaining = node.lease_deadlines[&8]
-        .1
+    let remaining = node
+        .lease_clock
+        .deadline(8)
         .saturating_duration_since(Instant::now());
     assert!(remaining <= Duration::from_secs(60), "{remaining:?}");
 }
@@ -1677,7 +1874,7 @@ async fn a_renewal_with_a_stale_proof_is_cancelled() {
     let mut node = leader_node(dir.path()).await;
     grant_lease(&mut node, 7, 60).await;
     let deadline = Instant::now() + Duration::from_secs(5);
-    node.lease_deadlines.get_mut(&7).unwrap().1 = deadline;
+    node.lease_clock.set_deadline(7, deadline);
 
     let (tx, mut reply) = oneshot::channel();
     node.keep_alive(7, None, tx).unwrap();
@@ -1693,7 +1890,8 @@ async fn a_renewal_with_a_stale_proof_is_cancelled() {
     let error = reply.try_recv().unwrap().unwrap_err();
     assert!(error.error.contains("renewal cancelled"), "{}", error.error);
     assert_eq!(
-        node.lease_deadlines[&7].1, deadline,
+        node.lease_clock.deadline(7),
+        deadline,
         "a stale proof must not move the deadline"
     );
     assert!(node.renewals.is_empty());
@@ -1736,7 +1934,7 @@ async fn committed_batches_queue_behind_running_apply_in_log_order() {
     node.drive_ready().await.unwrap();
     // Raft delivers all committed entries. The worker gets consecutive batches up to the
     // job that holds the configuration change, without a completion between them.
-    let targets: Vec<_> = node.apply_jobs.iter().map(|(target, _)| *target).collect();
+    let targets: Vec<_> = node.apply.targets().collect();
     assert_eq!(
         targets,
         [
@@ -1750,7 +1948,7 @@ async fn committed_batches_queue_behind_running_apply_in_log_order() {
     let (tx, query) = oneshot::channel();
     node.enqueue_query(Query::Local("absent".into(), tx));
     node.drive_ready().await.unwrap();
-    assert_eq!(node.apply_jobs.len(), 3);
+    assert_eq!(node.apply.targets().count(), 3);
     for target in targets {
         let completed = node.worker.step().await.unwrap().unwrap();
         node.complete_apply(completed).unwrap();
@@ -1766,7 +1964,7 @@ async fn committed_batches_queue_behind_running_apply_in_log_order() {
     node.drive_ready().await.unwrap();
     node.drain_apply().await.unwrap();
     assert_eq!(node.state.applied, total);
-    assert!(node.apply_jobs.is_empty() && !node.apply_busy);
+    assert!(node.apply.targets().next().is_none() && !node.apply.busy());
 }
 
 fn seed_puts(dir: &std::path::Path, count: u64) {
@@ -1819,7 +2017,56 @@ async fn automatic_checkpoints_wait_for_appended_log_bytes() {
     assert_eq!(node.state.applied, 100);
     // Small writes keep the log until enough bytes justify a synced SlateDB flush.
     assert_eq!(node.raw.store().snapshot_index(), 0);
-    assert!(!node.checkpoint_running);
+    assert!(!node.checkpoints.running());
+}
+
+/// A Checkpoint job fails on a storage read. The node goes on and keeps its Raft snapshot
+/// record. It waits before the next checkpoint, and that checkpoint replaces the record.
+#[tokio::test]
+async fn a_failed_checkpoint_read_keeps_the_node_and_its_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    let index = node.state.applied;
+    let record = node.raw.store().snapshot_index();
+    assert!(index > record);
+    // A membership change makes a checkpoint at `index` due.
+    node.state.view.0 = index;
+    node.checkpoints.membership_changed(index);
+    assert_eq!(node.checkpoint_due(), Some(false));
+    node.checkpoints.start(false);
+    let conf = node.state.members.conf();
+    let failed = apply::Built {
+        index,
+        conf: conf.clone(),
+        result: Err(anyhow::Error::new(crate::storage_fault::Classified {
+            fault: crate::storage_fault::StorageFault::Transient,
+            message: "the store failed".into(),
+        })),
+    };
+    node.finish_output(Output::Checkpoint(Some(failed)))
+        .unwrap();
+    assert!(!node.checkpoints.running());
+    // The next checkpoint waits, so apply can run other jobs meanwhile.
+    assert_eq!(node.checkpoint_due(), None);
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    assert!(!node.checkpoints.running());
+    assert_eq!(node.raw.store().snapshot_index(), record);
+    // The wait ends, and the next checkpoint succeeds.
+    node.checkpoints.end_retry_wait();
+    assert_eq!(node.checkpoint_due(), Some(false));
+    node.checkpoints.start(false);
+    let image = PreparedCheckpoint::write(&dir.path().join("raft"), b"image".to_vec().into());
+    let built = apply::Built {
+        index,
+        conf,
+        result: Ok(Some(image.unwrap())),
+    };
+    node.finish_output(Output::Checkpoint(Some(built))).unwrap();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    assert_eq!(node.raw.store().snapshot_index(), index);
+    assert!(!node.checkpoints.running());
 }
 
 #[tokio::test]
@@ -1834,6 +2081,7 @@ async fn state_behind_a_truncated_log_stops_startup() {
             5,
             None,
             raft::eraftpb::ConfState::from((vec![1, 2, 3], vec![])),
+            false,
         )
         .unwrap();
     drop(storage);
@@ -1923,7 +2171,8 @@ async fn only_a_lone_voter_leads_before_its_first_event() {
         let (status, first) = oneshot::channel();
         events.send(Event::Status(status)).await.unwrap();
         let (stop, stopped) = oneshot::channel::<()>();
-        let run = tokio::spawn(node.run_until(receiver, async {
+        let (_, peers) = mpsc::channel(1);
+        let run = tokio::spawn(node.run_until(receiver, peers, async {
             let _ = stopped.await;
         }));
         let first = match tokio::time::timeout(Duration::from_secs(10), first)

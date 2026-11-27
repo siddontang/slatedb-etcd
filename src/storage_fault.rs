@@ -1,7 +1,7 @@
 //! Classify the errors that a read or a write of the stored state meets.
 //!
-//! This module uses no other module of the crate, so `mvcc`, `state`, and `node` all sit above
-//! it. A client read, apply,
+//! This module uses no other module of the crate, so `error`, `mvcc`, `state`, and `node` all sit
+//! above it. A client read, apply,
 //! and the shared writer use the same rule. The writer adds its own cases, such as a fence, on
 //! top of it. See "Failure cases" in `docs/shared-state.md`.
 //!
@@ -151,6 +151,10 @@ pub(crate) fn of_slatedb(error: &slatedb::Error) -> StorageFault {
         }
         slatedb::ErrorKind::Unavailable | slatedb::ErrorKind::Closed(_) => StorageFault::Transient,
         slatedb::ErrorKind::Data if has(missing) => StorageFault::Missing,
+        // The open of a deleted checkpoint fails with this text and no store error below it.
+        slatedb::ErrorKind::Data if error.to_string().contains("checkpoint missing") => {
+            StorageFault::Missing
+        }
         _ => StorageFault::Corrupt,
     }
 }
@@ -186,6 +190,8 @@ mod tests {
         let data = slatedb::Error::data("an object is missing".into())
             .with_source(Box::new(std::sync::Arc::new(missing)));
         assert_eq!(classify(&data.into()), Some(StorageFault::Missing));
+        let deleted = slatedb::Error::data("checkpoint missing. checkpoint_id=`x`".into());
+        assert_eq!(classify(&deleted.into()), Some(StorageFault::Missing));
         let checksum = slatedb::Error::data("checksum mismatch".into());
         assert_eq!(classify(&checksum.into()), Some(StorageFault::Corrupt));
         let throttled = anyhow::Error::from(slatedb::Error::unavailable("throttled".into()));

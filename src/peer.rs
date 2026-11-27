@@ -58,7 +58,7 @@ impl Transport for Service {
                 .map(|value| value.as_bytes()),
         );
         let incoming = request.into_inner();
-        let events = self.0.events.clone();
+        let events = self.0.peer_events.clone();
         let (responses, stream) = mpsc::channel(WINDOW);
         tokio::spawn(async move {
             if let Err(error) = receive::run(incoming, events, &responses, process).await {

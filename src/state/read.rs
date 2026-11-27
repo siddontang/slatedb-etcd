@@ -13,21 +13,21 @@ pub(crate) struct ReadView {
     keys: key_index::KeyPin,
     /// Shared mode: the longest time that one read may pin the base. Each read starts its own
     /// deadline, so an old view stays usable for new reads.
-    pin_max: Option<std::time::Duration>,
+    pin_max: std::time::Duration,
 }
 
 impl StateMachine {
     pub(crate) fn read_view(&self) -> Result<Arc<ReadView>> {
         Ok(Arc::new(ReadView {
             metrics: self.metrics.clone(),
-            state: self.pinned_state()?,
+            state: self.pinned_state(),
             rows: self.rows.clone(),
             revision: self.revision,
             compact_revision: self.compact_revision,
             auth: self.auth.clone(),
             leases: self.leases.clone(),
             keys: self.key_index.pin(self.applied),
-            pin_max: self.shared.as_ref().map(|shared| shared.pin_max),
+            pin_max: self.shared.pin_max,
         }))
     }
 }
@@ -62,7 +62,7 @@ impl ReadView {
     /// starts now.
     pub(crate) fn read_state(&self) -> StateView {
         self.state
-            .until(self.pin_max.map(|limit| std::time::Instant::now() + limit))
+            .until(Some(std::time::Instant::now() + self.pin_max))
     }
 
     pub async fn read(

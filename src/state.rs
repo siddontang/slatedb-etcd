@@ -38,6 +38,7 @@ mod snapshot;
 mod source;
 pub(crate) mod transfer;
 pub(crate) mod view;
+pub(crate) use quota::Usage;
 pub(crate) use read::ReadView;
 pub use shared::ViewRetention;
 pub use source::{Row, StateRead, StateScan};
@@ -81,7 +82,7 @@ pub struct StateMachine {
     pub quota: u64,
     /// The effective flag value of this member. It only shows a difference from the claim.
     quota_flag: i64,
-    logical_bytes: crate::batch::Usage,
+    logical_bytes: crate::state::Usage,
     pub(crate) current: current::CurrentRows,
     pub(crate) key_index: key_index::KeyIndex,
     /// Current rows shared by pinned point reads.
@@ -115,8 +116,8 @@ pub struct StateMachine {
     pub(crate) members_checked: Option<(u64, u64)>,
     /// The state that apply reads: the overlay and base.
     reads: StateView,
-    /// The overlay and base. Only the in-memory state of a test has none.
-    pub(crate) shared: Option<shared::Shared>,
+    /// The overlay and base.
+    pub(crate) shared: shared::Shared,
 }
 
 /// Weight budgets of the state cache. Both are separate from Raft log memory.
@@ -235,7 +236,7 @@ pub(crate) fn slatedb_settings() -> Settings {
 /// An entry that changes no state writes no batch, so it moves the apply marker past the
 /// counter. The next open then counts again. A counter without the split by row kind is
 /// counted again too.
-async fn load_logical_size(db: &impl StateRead, applied: u64) -> Result<crate::batch::Usage> {
+async fn load_logical_size(db: &impl StateRead, applied: u64) -> Result<crate::state::Usage> {
     use prost::Message;
     let stored = match db.get(LOGICAL_SIZE).await? {
         Some(row) => {
@@ -262,7 +263,7 @@ async fn load_logical_size(db: &impl StateRead, applied: u64) -> Result<crate::b
 fn stored_usage(
     counter: &crate::proto::state::LogicalSize,
     applied: u64,
-) -> Result<Option<crate::batch::Usage>> {
+) -> Result<Option<crate::state::Usage>> {
     if counter.applied != applied {
         return Ok(None);
     }
@@ -274,7 +275,7 @@ fn stored_usage(
     ) else {
         return Ok(None);
     };
-    let size = crate::batch::Usage {
+    let size = crate::state::Usage {
         current,
         history,
         journal,
@@ -289,7 +290,7 @@ fn stored_usage(
 }
 
 /// Encode the logical size row for `size` after `applied`.
-fn logical_size_row(applied: u64, size: crate::batch::Usage) -> Vec<u8> {
+fn logical_size_row(applied: u64, size: crate::state::Usage) -> Vec<u8> {
     use prost::Message;
     crate::proto::state::LogicalSize {
         applied,
@@ -312,19 +313,7 @@ impl StateMachine {
         location: Arc<transfer::Location>,
         rows: Arc<rows::RowCache>,
         reads: StateView,
-        shared: Option<shared::Shared>,
-    ) -> Result<Self> {
-        let mut state = Self::load_rows(admin, location, rows, reads).await?;
-        state.shared = shared;
-        Ok(state)
-    }
-
-    /// Build the derived state from `reads` without the overlay. The caller adds it.
-    async fn load_rows(
-        admin: Arc<slatedb::admin::Admin>,
-        location: Arc<transfer::Location>,
-        rows: Arc<rows::RowCache>,
-        reads: StateView,
+        shared: shared::Shared,
     ) -> Result<Self> {
         let applied = decode_applied(reads.get(APPLIED).await?)?;
         let applied_term = read_applied_term(&reads, applied).await?;
@@ -375,7 +364,7 @@ impl StateMachine {
             members_mismatch: None,
             members_checked: None,
             reads,
-            shared: None,
+            shared,
         })
     }
 
@@ -408,17 +397,29 @@ impl StateMachine {
     /// Open an empty in-memory state for the reference of the deterministic simulation.
     ///
     /// Apply writes each batch into one sorted map at once. The state has no SlateDB database,
-    /// no overlay, no base, no materializer, and no checkpoint. Apply uses the rules of shared
+    /// no materializer, and no checkpoint. Its shared state is empty, and apply does not use it.
+    /// Apply uses the rules of shared
     /// state mode, because the members of a shared-mode simulation use them. The checkpoint
     /// namespace is in an unused in-memory object store, and no apply path reads it.
     #[cfg(test)]
     pub(crate) async fn open_memory() -> Result<Self> {
         let store = Arc::new(slatedb::object_store::memory::InMemory::new());
         let location = transfer::Location::new("state", StateCache::default());
-        let admin = Arc::new(slatedb::admin::Admin::builder(location.root(), store).build());
+        let admin =
+            Arc::new(slatedb::admin::Admin::builder(location.root(), store.clone()).build());
         let rows = Arc::new(rows::RowCache::new(0));
         let reads = StateView::Memory(view::MemoryView::default());
-        Self::load(admin, location, rows, reads, None).await
+        // The overlay and base stay empty. Apply writes the rows into `reads`.
+        let source = shared::offline_source(store, "", StateCache::default())?;
+        let options = shared::tests::options();
+        let shared = shared::Shared::new(
+            Arc::new(view::Base::empty()),
+            source,
+            uuid::Uuid::nil(),
+            options.pin_max,
+            Arc::new(overlay::Holders::new(options.overlay_max_bytes)),
+        );
+        Self::load(admin, location, rows, reads, shared).await
     }
 
     /// Open a state for a test on the in-memory store of `dir`. A later open of the same `dir`
@@ -458,18 +459,18 @@ impl StateMachine {
             batch.put(key.as_ref(), value.as_ref());
         }
         mark_applied(&mut batch, index, self.entry_term);
-        let shared = self.shared.as_mut().expect("a shared state");
-        shared.overlay.push(index, Arc::new(batch));
+        self.shared.overlay.push(index, Arc::new(batch));
         self.applied = index;
     }
 
     /// Pin the applied state for a read that runs outside apply.
-    pub(crate) fn pinned_state(&self) -> Result<StateView> {
-        let shared = self
-            .shared
-            .as_ref()
-            .context("the state has no shared view")?;
-        Ok(shared.pinned())
+    pub(crate) fn pinned_state(&self) -> StateView {
+        // A clone of the in-memory state of a test keeps its rows.
+        #[cfg(test)]
+        if let StateView::Memory(_) = &self.reads {
+            return self.reads.clone();
+        }
+        self.shared.pinned()
     }
 
     /// Mark `index` applied in `batch`, with the term of its entry from `entry_term`.
@@ -478,10 +479,10 @@ impl StateMachine {
     }
 
     async fn write_batch(&mut self, batch: WriteBatch, index: u64) -> Result<()> {
-        let size = batch
-            .logical_size(self.applied_state(), &self.key_index, self.logical_bytes)
+        let size = self
+            .logical_size_after(&batch, None, self.logical_bytes)
             .await
-            .map_err(crate::mvcc::storage_fault::read_cause)?;
+            .map_err(crate::storage_fault::read_cause)?;
         let size = self.store_batch(batch, index, size).await?;
         self.logical_bytes = size;
         self.applied_term = self.entry_term;
@@ -493,8 +494,8 @@ impl StateMachine {
         &mut self,
         mut batch: WriteBatch,
         index: u64,
-        size: crate::batch::Usage,
-    ) -> Result<crate::batch::Usage> {
+        size: crate::state::Usage,
+    ) -> Result<crate::state::Usage> {
         if batch
             .keys()
             .all(|key| key == APPLIED || key == APPLIED_TERM)
@@ -502,9 +503,7 @@ impl StateMachine {
             // An entry that changes no state writes no batch. Otherwise each announcement would
             // dirty the memtable, and its flush would cause the next announcement. The overlay
             // still records that the state at `index` is the state after its newest batch.
-            if let Some(shared) = &mut self.shared {
-                shared.overlay.cover(index);
-            }
+            self.shared.overlay.cover(index);
             return Ok(size);
         }
         // Drop shared rows before SlateDB may expose the change. See `rows`.
@@ -515,12 +514,11 @@ impl StateMachine {
         }
         self.put_logical_size(&mut batch, index, size);
         let batch = Arc::new(batch);
-        match (&mut self.shared, &mut self.reads) {
+        match &mut self.reads {
             #[cfg(test)]
-            (None, StateView::Memory(rows)) => rows.write(&batch),
-            (None, _) => anyhow::bail!("the state has no overlay"),
+            StateView::Memory(rows) => rows.write(&batch),
             // Apply reads the overlay at once. The leader materializer writes the `Db` later.
-            (Some(shared), _) => shared.overlay.push(index, batch.clone()),
+            StateView::Shared(_) => self.shared.overlay.push(index, batch.clone()),
         }
         self.write_batches += 1;
         for (key, value) in batch.rows() {
@@ -535,7 +533,7 @@ impl StateMachine {
     }
 
     /// Store the logical size `size` at `index` in `batch`.
-    fn put_logical_size(&self, batch: &mut WriteBatch, index: u64, size: crate::batch::Usage) {
+    fn put_logical_size(&self, batch: &mut WriteBatch, index: u64, size: crate::state::Usage) {
         // The counter is outside `etcd/`, so it does not count itself.
         batch.put(LOGICAL_SIZE, logical_size_row(index, size));
     }
@@ -566,7 +564,7 @@ pub(crate) fn applied_term_row(index: u64, term: u64) -> [u8; 16] {
     row
 }
 
-pub(crate) use crate::mvcc::storage_fault::stored;
+pub(crate) use crate::storage_fault::stored;
 
 /// Decode the `meta/applied` row. A state without the row has applied nothing.
 fn decode_applied(row: Option<bytes::Bytes>) -> Result<u64> {

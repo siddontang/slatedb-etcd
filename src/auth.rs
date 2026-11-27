@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tonic::Code;
 
-use crate::mvcc::KvError;
+use crate::error::KvError;
 use crate::proto::authpb::Permission;
 use crate::proto::etcdserverpb::*;
 
@@ -88,6 +88,16 @@ fn invalid(message: &str) -> KvError {
     KvError::new(Code::InvalidArgument, message)
 }
 
+/// Return true when the grant `p` covers `key`. An empty range end grants one key, and `[0]`
+/// grants every key from `p.key`.
+fn covers(p: &Permission, key: &[u8]) -> bool {
+    if p.range_end.is_empty() {
+        key == p.key
+    } else {
+        key >= p.key.as_slice() && (p.range_end == [0] || key < p.range_end.as_slice())
+    }
+}
+
 impl Store {
     pub(crate) fn reset_tokens(&mut self) {
         self.tokens.clear();
@@ -157,10 +167,7 @@ impl Store {
             .collect();
         ranges.sort_by(|a, b| a.key.cmp(&b.key));
         if end.is_empty() {
-            if ranges
-                .iter()
-                .any(|p| crate::mvcc::contains(key, &p.key, &p.range_end))
-            {
+            if ranges.iter().any(|p| covers(p, key)) {
                 return Ok(());
             }
         } else {
@@ -248,7 +255,11 @@ impl Store {
             return Err(denied());
         }
         let mut changed = true;
-        let mut response = json!({"header": crate::mvcc::header(revision)});
+        let header = ResponseHeader {
+            revision,
+            ..Default::default()
+        };
+        let mut response = json!({ "header": header });
         match command {
             Command::Enable(_) => {
                 if !self.users.contains_key("root") {

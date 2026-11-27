@@ -3,6 +3,25 @@ use crate::mvcc::{KvError, Outcome};
 use tonic::Code;
 
 impl Node {
+    /// The quota fields of `/status`.
+    pub(super) fn quota_status(&self) -> Value {
+        json!({
+            "bytes": self.state.quota_bytes,
+            "flag_bytes": self.options.effective_quota(),
+            "flag_mismatch": self.state.quota_mismatch,
+        })
+    }
+
+    /// The `db_size_quota` of Maintenance Status. Like etcd, it is the configured value, unless
+    /// the quota that apply uses differs from it.
+    pub(super) fn status_quota(&self) -> i64 {
+        if self.state.quota_mismatch {
+            self.state.quota_bytes
+        } else {
+            self.options.quota_bytes
+        }
+    }
+
     pub(super) fn move_leader(
         &mut self,
         target: u64,
@@ -41,32 +60,22 @@ impl Node {
         self.transfers.push((target, Instant::now(), response));
         // A shared-mode leader first publishes a checkpoint of its applied state. The members
         // then hold small overlays, and the new leader materializes little.
-        if let Some(writer) = &mut self.writer {
-            let applied = self.state.applied;
-            writer.transfer = Some((target, writer.covering(applied)));
-            writer.request_publication(applied);
-            return self.finish_transfers();
-        }
-        self.raw.transfer_leader(target);
+        let applied = self.state.applied;
+        self.writer.start_transfer(target, applied);
         self.finish_transfers()
     }
 
     pub(super) fn finish_transfers(&mut self) -> Result<()> {
-        let base = self.state.view.map_or(0, |(base, _, _)| base);
-        if let Some(writer) = &mut self.writer {
-            // Transfer once a base covers the applied state, or after a bounded wait.
-            let waited = self
-                .transfers
-                .iter()
-                .all(|(_, started, _)| started.elapsed() >= Duration::from_secs(3));
-            if let Some((target, covering)) = writer.transfer {
-                if base >= covering || waited {
-                    writer.transfer = None;
-                    self.raw.transfer_leader(target);
-                }
-            }
+        let (base, _, _) = self.state.view;
+        // Transfer once a base covers the applied state, or after a bounded wait.
+        let waited = self
+            .transfers
+            .iter()
+            .all(|(_, started, _)| started.elapsed() >= Duration::from_secs(3));
+        if let Some(target) = self.writer.take_transfer(base, waited) {
+            self.raw.transfer_leader(target);
         }
-        let limit = Duration::from_secs(if self.writer.is_some() { 10 } else { 5 });
+        let limit = Duration::from_secs(10);
         let mut pending = vec![];
         for (target, started, response) in std::mem::take(&mut self.transfers) {
             if self.raw.raft.leader_id == target {

@@ -35,7 +35,7 @@ pub(crate) const PROBE_ROUTE: &str = "/raft/clock";
 /// Ticks between two clock probes of the leader: 500 ms.
 pub(super) const PROBE_TICKS: u64 = 5;
 /// The longest wait for the reply to a probe.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+pub(super) const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// A sample counts for this time after its reply: eight probe intervals. The error of an old
 /// sample grows only with the rate difference of two clocks, some milliseconds per minute. A
 /// lost reply must not stop the writer, so several replies in a row can be lost.
@@ -64,7 +64,7 @@ pub(crate) struct ProbeReply {
 #[derive(Clone, Copy, Debug)]
 pub(in crate::node) struct Probe {
     generation: u64,
-    nonce: u64,
+    pub(super) nonce: u64,
 }
 
 /// Tests: the nonce of `probe`.
@@ -878,88 +878,6 @@ impl SystemClock for Gate {
 
     fn ticker<'a>(&'a self, duration: Duration) -> SystemClockTicker<'a> {
         SystemClockTicker::new(&self.default, duration)
-    }
-}
-
-impl Node {
-    /// The voters, each with the process of its last transport frame.
-    fn clock_voters(&self) -> BTreeMap<u64, Option<u64>> {
-        let id = self.options.id;
-        self.raw
-            .raft
-            .prs()
-            .conf()
-            .voters()
-            .ids()
-            .iter()
-            .map(|voter| {
-                let process = match voter == id {
-                    true => Some(crate::peer::process_id()),
-                    false => self.raw.store().process(voter),
-                };
-                (voter, process)
-            })
-            .collect()
-    }
-
-    /// Give the clock check the term and the voters of this leader. With `probe`, send a clock
-    /// probe to each other voter. A manual transport has no peer routes, so the check is off.
-    /// The node also calls it at once when Raft applies a configuration change or a voter
-    /// process changes, so the next batch admission sees the new voters.
-    pub(in crate::node) fn tick_clock(&mut self, probe: bool) {
-        let Some(writer) = &self.writer else {
-            return;
-        };
-        #[cfg(test)]
-        let manual = self.manual_transport && !self.clock_in_manual;
-        #[cfg(not(test))]
-        let manual = self.manual_transport;
-        if manual {
-            return;
-        }
-        let leader = self.raw.raft.state == StateRole::Leader;
-        if !leader {
-            writer.clock.stand_down();
-            return;
-        }
-        let voters = self.clock_voters();
-        writer
-            .clock
-            .configure(self.raw.raft.term, self.options.id, voters.clone());
-        writer.clock.observe();
-        if !probe || self.manual_transport {
-            return;
-        }
-        for &peer in voters.keys().filter(|peer| **peer != self.options.id) {
-            let Some(address) = self
-                .state
-                .members
-                .members
-                .get(&peer)
-                .and_then(|member| member.peer_ur_ls.first())
-            else {
-                continue;
-            };
-            let url = format!("{}{PROBE_ROUTE}", crate::cluster::url(address));
-            let request = self.peer.headers(self.options.transport.http.post(url));
-            let clock = writer.clock.clone();
-            let probe = clock.probe();
-            tokio::spawn(async move {
-                let sent = (clock.mono_ms)();
-                let replied = async {
-                    let body = ProbeRequest { nonce: probe.nonce };
-                    let response = request.timeout(PROBE_TIMEOUT).json(&body).send().await?;
-                    response.error_for_status()?.json::<ProbeReply>().await
-                };
-                match replied.await {
-                    Ok(reply) => {
-                        let received = (clock.mono_ms)();
-                        clock.sample(peer, probe, reply, sent, received);
-                    }
-                    Err(error) => tracing::debug!(%error, peer, "a clock probe failed"),
-                }
-            });
-        }
     }
 }
 

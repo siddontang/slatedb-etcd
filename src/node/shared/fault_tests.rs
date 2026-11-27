@@ -1,7 +1,7 @@
 //! Writer faults in shared mode: classification, the health record, the handoff target, and
 //! the member that stays up while its writer fails.
 
-use super::super::tests::{eventually, status};
+use super::super::tests::{eventually, new_writer, status};
 use super::*;
 use crate::object::faults::{
     FaultStore, CORRUPT_MANIFEST, DELAY_SHARED, FAIL_PUT, FAIL_STATE_PUT, PAUSE_MANIFEST_READ,
@@ -426,7 +426,7 @@ fn an_incident_tries_each_voter_once_until_a_publication() {
 struct Leader {
     state: StateMachine,
     handles: crate::state::shared::Handles,
-    writer: Option<Writer>,
+    writer: Writer,
     events: mpsc::Sender<Event>,
     announced: mpsc::Receiver<Event>,
 }
@@ -447,9 +447,9 @@ impl Leader {
             &[(1, "127.0.0.1:1".to_owned())].into(),
         ));
         state.seed_for_test(1).await.unwrap();
-        let handles = state.shared_handles().unwrap();
+        let handles = state.shared_handles();
         let (events, announced) = mpsc::channel(64);
-        let writer = Some(Writer::new(&handles, max_age, clock));
+        let writer = new_writer(&handles, max_age, clock);
         Self {
             state,
             handles,
@@ -460,7 +460,7 @@ impl Leader {
     }
 
     fn writer(&mut self) -> &mut Writer {
-        self.writer.as_mut().unwrap()
+        &mut self.writer
     }
 
     fn lead(&mut self, term: u64) {
@@ -506,6 +506,13 @@ impl Leader {
     }
 
     async fn put(&mut self, key: &str) -> u64 {
+        let index = self.apply_put(key).await;
+        self.writer().progress().wait_written(index).await.unwrap();
+        index
+    }
+
+    /// Apply a Put. Do not wait for the materializer.
+    async fn apply_put(&mut self, key: &str) -> u64 {
         let put = crate::proto::etcdserverpb::RequestOp {
             request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
                 PutRequest {
@@ -517,15 +524,14 @@ impl Leader {
         };
         let index = self.state.applied + 1;
         self.state.apply_etcd(index, &put).await.unwrap();
-        self.writer().progress.wait_written(index).await.unwrap();
         index
     }
 
     async fn close(mut self) {
         let events = self.events.clone();
-        let mut writer = self.writer.take().unwrap();
-        writer.sync(false, writer.term, &events);
-        writer.stop().await;
+        let term = self.writer.term();
+        self.writer.sync(false, term, &events);
+        self.writer.stop().await;
         self.state.close().await.unwrap();
     }
 }
@@ -547,23 +553,20 @@ async fn a_defragment_survives_a_failed_publication() {
     }
     let index = leader.state.applied;
     leader.covered(index, Duration::from_secs(10)).await;
-    let writer = leader.writer.as_ref().unwrap();
+    let writer = &leader.writer;
     let (reached, resume) = (Arc::default(), Arc::<tokio::sync::Notify>::default());
     let defragment = Defragment {
-        db: writer.open.lock().unwrap().clone().unwrap().db,
         admin: leader.handles.admin.clone(),
         owner: None,
-        progress: writer.progress.clone(),
         announced: leader.handles.announced.clone(),
-        leadership: writer.leadership.subscribe(),
-        term: 2,
         pause: Some((
             DefragmentStep::Publish,
             Arc::clone(&reached),
             resume.clone(),
         )),
+        ..writer.defragment(2).unwrap()
     };
-    let health = writer.health.clone();
+    let health = writer.health().clone();
     let running = tokio::spawn(defragment.run());
     reached.notified().await;
     faults.set(FAIL_STATE_PUT);
@@ -602,13 +605,13 @@ async fn a_hung_bootstrap_read_starts_the_watchdog_and_ends_at_a_step_down() {
     let mut leader = Leader::open(faults.clone(), Duration::from_millis(100), clock()).await;
     faults.set(STALL_BOOTSTRAP_READ);
     leader.lead(2);
-    let health = leader.writer().health.clone();
+    let health = leader.writer().health().clone();
     eventually("the watchdog", async || health.record().due.is_some()).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(health.record().due.is_some());
     let events = leader.events.clone();
     leader.writer().sync(false, 2, &events);
-    let ended = tokio::time::timeout(Duration::from_secs(2), leader.writer().tasks.join_next());
+    let ended = tokio::time::timeout(Duration::from_secs(2), leader.writer().tasks().join_next());
     let (term, result) = ended.await.expect("the task did not end").unwrap().unwrap();
     assert_eq!(term, 2);
     result.unwrap();
@@ -625,7 +628,7 @@ async fn each_writer_start_step_has_its_own_timer() {
     let mut leader = Leader::open(faults.clone(), Duration::from_millis(100), clock()).await;
     faults.set(STALL_BOOTSTRAP_READ);
     leader.lead(2);
-    let health = leader.writer().health.clone();
+    let health = leader.writer().health().clone();
     eventually("the bootstrap step", async || health.record().due.is_some()).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     // The bootstrap read ends. The open of the shared database hangs instead.
@@ -639,8 +642,7 @@ async fn each_writer_start_step_has_its_own_timer() {
     // The open ends. The first read of the publisher hangs instead.
     let reading = Instant::now();
     faults.set(STALL_BOOTSTRAP_READ);
-    let open = leader.writer().open.clone();
-    eventually("the writer open", async || open.lock().unwrap().is_some()).await;
+    eventually("the writer open", async || leader.writer.open().is_some()).await;
     let due = health.record().due.unwrap();
     assert!(
         due >= reading,
@@ -670,10 +672,10 @@ async fn a_request_behind_a_hung_read_starts_the_watchdog() {
     reply.send(true).unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
     let requested = Instant::now();
-    leader.writer().progress.republish();
-    let writer = leader.writer.as_ref().unwrap();
+    leader.writer().progress().republish();
+    let writer = &leader.writer;
     until("the stall", STALL + Duration::from_secs(5), async || {
-        writer.health.check(writer.waiting())
+        writer.health().check(writer.waiting())
     })
     .await;
     assert!(requested.elapsed() >= STALL);
@@ -724,9 +726,9 @@ async fn a_clock_refusal_does_not_wait_for_the_old_close() {
         }
         now() - 60_000
     });
-    let mut writer = Writer::new(&first.handles, Duration::from_millis(100), skewed);
+    let mut writer = new_writer(&first.handles, Duration::from_millis(100), skewed);
     writer.sync(true, 3, &events);
-    let health = writer.health.clone();
+    let health = writer.health().clone();
     eventually("the clock fault", async || {
         health.status()["last_error_class"] == "clock"
     })
@@ -771,7 +773,7 @@ async fn hung_writer(faults: &Arc<FaultStore>, path: &str) -> Arc<slatedb::Db> {
 async fn at_most_one_hung_close_stays_and_a_shutdown_does_not_wait_for_it() {
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     let mut leader = Leader::open(faults.clone(), Duration::from_millis(100), clock()).await;
-    let task = leader.writer().health.begin();
+    let task = leader.writer().health().begin();
     let mut writers = vec![];
     for n in 0..3 {
         let writer = hung_writer(&faults, &format!("hung-{n}")).await;
@@ -779,14 +781,14 @@ async fn at_most_one_hung_close_stays_and_a_shutdown_does_not_wait_for_it() {
         writers.push(writer);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let health = &leader.writer().health;
+    let health = leader.writer().health();
     assert_eq!(health.pending_closes(), 1);
     assert_eq!(health.aborted_closes(), 2);
     // Round 2: a task that ends during the shutdown abandons one more writer. The shutdown
     // still takes that close and aborts it within its limit.
     let late = hung_writer(&faults, "hung-late").await;
     let (ending, closing) = (task.clone(), late.clone());
-    leader.writer().tasks.spawn(async move {
+    leader.writer().tasks().spawn(async move {
         tokio::time::sleep(Duration::from_millis(200)).await;
         ending.abandon(closing);
         (2, Ok(()))
@@ -801,7 +803,7 @@ async fn at_most_one_hung_close_stays_and_a_shutdown_does_not_wait_for_it() {
         "{:?}",
         started.elapsed()
     );
-    assert_eq!(leader.writer().health.pending_closes(), 0);
+    assert_eq!(leader.writer().health().pending_closes(), 0);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(Arc::strong_count(&late), 2, "the late close still runs");
     leader.close().await;
@@ -816,14 +818,14 @@ async fn a_stored_row_that_does_not_decode_halts_the_writer() {
     leader.lead(2);
     leader.covered(1, Duration::from_secs(10)).await;
     let writer = leader.writer();
-    let db = writer.open.lock().unwrap().clone().unwrap().db;
+    let db = writer.open().unwrap().db;
     let mut batch = slatedb::WriteBatch::new();
     batch.put(crate::state::APPLIED, b"bad");
     db.write_with_options(batch, &WriteOptions { seqnum: 2 })
         .await
         .unwrap();
-    writer.progress.request(1);
-    let health = writer.health.clone();
+    writer.progress().request(1);
+    let health = writer.health().clone();
     eventually("the data fault", async || {
         health.status()["last_error_class"] == "data"
     })
@@ -844,18 +846,23 @@ async fn an_idle_writer_that_slatedb_closes_opens_again() {
     leader.covered(1, Duration::from_secs(10)).await;
     let index = leader.put("idle").await;
     faults.set(FAIL_PUT);
-    let failed = leader.writer().open.lock().unwrap().clone().unwrap().db;
+    let failed = leader.writer().open().unwrap().db;
     assert!(failed.flush().await.is_err());
-    let health = leader.writer().health.clone();
+    let health = leader.writer().health().clone();
     eventually("the writer fault", async || health.consecutive() > 0).await;
     assert_eq!(health.status()["last_error_class"], "unavailable");
     leader.writer().request_publication(index);
     leader.no_failure(Duration::from_secs(2)).await;
     faults.set(0);
     leader.covered(index, Duration::from_secs(20)).await;
-    let open = leader.writer().open.lock().unwrap().clone().unwrap().db;
+    let open = leader.writer().open().unwrap().db;
     assert!(!Arc::ptr_eq(&open, &failed));
-    assert!(health.report(2, None).failed_secs.is_none());
+    // `covered` sends the announcement reply and returns at once. The publisher ends the mark
+    // when it processes that reply, so the test can read the health first.
+    eventually("the publication ends the mark", async || {
+        health.report(2, None).failed_secs.is_none()
+    })
+    .await;
     leader.close().await;
 }
 
@@ -870,7 +877,7 @@ async fn a_failed_flush_keeps_the_publication_request() {
     let index = leader.put("requested").await;
     faults.set(FAIL_PUT);
     leader.writer().request_publication(index);
-    let health = leader.writer().health.clone();
+    let health = leader.writer().health().clone();
     eventually("the failed flush", async || health.consecutive() > 0).await;
     leader.no_failure(Duration::from_secs(1)).await;
     faults.set(0);
@@ -888,11 +895,11 @@ async fn a_buffered_write_under_a_long_age_limit_is_not_due() {
     leader.put("buffered").await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let writer = leader.writer();
-    let deadline = writer.progress.deadline(writer.max_age).unwrap();
+    let deadline = writer.progress().deadline(writer.max_age()).unwrap();
     assert!(deadline > Instant::now() + STALL);
-    assert!(!writer.health.check(Some(deadline)));
-    assert!(!writer.health.handoff_due());
-    assert!(writer.health.report(2, None).failed_secs.is_none());
+    assert!(!writer.health().check(Some(deadline)));
+    assert!(!writer.health().handoff_due());
+    assert!(writer.health().report(2, None).failed_secs.is_none());
     leader.close().await;
 }
 
@@ -920,7 +927,7 @@ async fn a_pending_restore_starts_no_watchdog() {
     assert_eq!(claimed, restore);
     leader.lead(2);
     leader.no_failure(Duration::from_secs(3)).await;
-    let health = &leader.writer().health;
+    let health = leader.writer().health();
     assert!(health.record().due.is_none());
     assert!(!health.check(None));
     assert!(!health.handoff_due());
@@ -943,16 +950,11 @@ async fn a_clock_over_the_skew_limit_makes_a_handoff_due() {
     lagging.now_ms = Arc::new(move || now() - 60_000);
     let events = first.events.clone();
     first.writer().sync(false, 2, &events);
-    let mut writer = Some(Writer::new(
-        &first.handles,
-        Duration::from_millis(100),
-        lagging,
-    ));
-    writer.as_mut().unwrap().sync(true, 3, &first.events);
-    let health = writer.as_ref().unwrap().health.clone();
+    let mut writer = new_writer(&first.handles, Duration::from_millis(100), lagging);
+    writer.sync(true, 3, &first.events);
+    let health = writer.health().clone();
     eventually("three clock refusals", async || health.handoff_due()).await;
     assert_eq!(health.status()["last_error_class"], "clock");
-    let mut writer = writer.take().unwrap();
     writer.sync(false, 3, &first.events);
     writer.stop().await;
     first.close().await;
@@ -973,11 +975,11 @@ async fn a_clock_wait_stalls_only_with_a_due_batch() {
     // An earlier term of this member wrote each batch, so no batch waits.
     let applied = leader.state.applied;
     let writer = leader.writer();
-    writer.progress.reset(applied);
+    writer.progress().reset(applied);
     writer.note_clock_wait();
     assert_eq!(writer.waiting(), None);
-    assert!(!writer.health.check(writer.waiting()));
-    assert!(!writer.health.handoff_due());
+    assert!(!writer.health().check(writer.waiting()));
+    assert!(!writer.health().handoff_due());
     // A batch now waits for the writer.
     let index = leader.state.applied + 1;
     let put = crate::proto::etcdserverpb::RequestOp {
@@ -988,13 +990,13 @@ async fn a_clock_wait_stalls_only_with_a_due_batch() {
     leader.state.apply_etcd(index, &put).await.unwrap();
     let writer = leader.writer();
     writer.note_clock_wait();
-    assert!(writer.clock_due.is_some());
-    writer.clock_due = Some(Instant::now() - STALL - Duration::from_secs(1));
+    assert!(writer.clock_due().is_some());
+    writer.set_clock_due(Some(Instant::now() - STALL - Duration::from_secs(1)));
     writer.note_clock_wait();
-    assert!(writer.health.check(writer.waiting()));
-    assert!(writer.health.handoff_due());
-    assert_eq!(writer.health.status()["last_error_class"], "stalled");
-    assert_eq!(writer.clock.alarm_name(), None);
+    assert!(writer.health().check(writer.waiting()));
+    assert!(writer.health().handoff_due());
+    assert_eq!(writer.health().status()["last_error_class"], "stalled");
+    assert_eq!(writer.clock().alarm_name(), None);
     leader.close().await;
 }
 
@@ -1022,20 +1024,92 @@ async fn a_defragment_gets_the_open_writer_with_its_clock() {
     leader.writer().stop().await;
     let reached = Arc::new(tokio::sync::Notify::new());
     let resume = Arc::new(tokio::sync::Notify::new());
-    *leader.writer().open_hold.lock().unwrap() = Some((reached.clone(), resume.clone()));
+    leader
+        .writer()
+        .hold_open(Some((reached.clone(), resume.clone())));
     clock.configure(3, 1, voters());
     leader.writer().sync(true, 3, &events);
     reached.notified().await;
-    let Some(Open { db, admin, .. }) = leader.writer().open.lock().unwrap().clone() else {
+    let Some(Open { db, admin, .. }) = leader.writer().open() else {
         panic!("the published writer has no slot");
     };
     db.flush().await.unwrap();
     crate::state::maintenance::compact_all(&admin, &|| Ok(()))
         .await
         .unwrap();
-    *leader.writer().open_hold.lock().unwrap() = None;
+    leader.writer().hold_open(None);
     resume.notify_one();
     sampling.abort();
+    leader.close().await;
+}
+
+/// Issue #106: the writer task of term 3 starts before the task of term 2 ends. The old
+/// materializer writes a batch to its memtable only, and it pauses before its progress update.
+/// The update comes after the new writer opened. The new materializer must still write the
+/// batch, because the new writer does not have it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_update_of_an_old_materializer_does_not_skip_a_batch() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    // No flush by age. The batch stays in the memtable of the old writer.
+    let mut leader = Leader::open(store, Duration::from_secs(3600), clock()).await;
+    leader.lead(2);
+    leader.covered(1, Duration::from_secs(10)).await;
+    let (reached, paused) = std::sync::mpsc::sync_channel(1);
+    let (resume, resumed) = std::sync::mpsc::sync_channel(1);
+    *leader.writer().progress().hold.lock().unwrap() = Some((reached, resumed));
+    let index = leader.apply_put("k").await;
+    paused.recv_timeout(Duration::from_secs(10)).unwrap();
+    // The new task pauses after its open, before its materializer starts.
+    let (opened, start) = (Arc::default(), Arc::default());
+    leader
+        .writer()
+        .hold_open(Some((Arc::clone(&opened), Arc::clone(&start))));
+    let events = leader.events.clone();
+    leader.writer().sync(true, 3, &events);
+    opened.notified().await;
+    assert!(leader.writer().progress().written() < index);
+    // The old task updates the progress, sees its stop, and ends.
+    resume.send(()).unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(10), leader.writer().tasks().join_next());
+    assert!(matches!(ended.await.unwrap(), Some(Ok((2, Ok(()))))));
+    leader.writer().hold_open(None);
+    start.notify_one();
+    leader.writer().progress().request(index);
+    leader.covered(index, Duration::from_secs(10)).await;
+    leader.close().await;
+}
+
+/// Issue #106: the task of term 2 pauses before its reset. Term 3 opens and writes. Then term
+/// 2 goes on. It must not move the progress back or replace the writer of term 3, because the
+/// progress updates of term 3 then stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_reset_of_an_old_writer_task_changes_nothing() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut leader = Leader::open(store, Duration::from_secs(3600), clock()).await;
+    let (reached, resume) = (Arc::default(), Arc::default());
+    *leader.writer().progress().reset_hold.lock().unwrap() =
+        Some((Arc::clone(&reached), Arc::clone(&resume)));
+    leader.lead(2);
+    reached.notified().await;
+    leader.lead(3);
+    leader.covered(1, Duration::from_secs(10)).await;
+    let index = leader.put("k1").await;
+    let db = leader.writer().open().unwrap().db;
+    // The old task sees the new term, closes its writer, and ends.
+    resume.notify_one();
+    let ended = tokio::time::timeout(Duration::from_secs(10), leader.writer().tasks().join_next());
+    assert!(matches!(ended.await.unwrap(), Some(Ok((2, Ok(()))))));
+    assert_eq!(leader.writer().progress().written(), index);
+    assert!(Arc::ptr_eq(&leader.writer().open().unwrap().db, &db));
+    // The materializer of term 3 still moves the progress.
+    let next = leader.apply_put("k2").await;
+    let written = leader.writer().progress().wait_written(next);
+    tokio::time::timeout(Duration::from_secs(10), written)
+        .await
+        .unwrap()
+        .unwrap();
+    leader.writer().progress().request(next);
+    leader.covered(next, Duration::from_secs(10)).await;
     leader.close().await;
 }
 
@@ -1155,15 +1229,14 @@ fn three_voters() -> BTreeMap<u64, Option<u64>> {
 
 /// End the term of the writer, and open its successor of term 3.
 async fn hand_over(leader: &mut Leader, clock: &Clock) {
-    let old = leader.writer().open.lock().unwrap().clone().unwrap().db;
+    let old = leader.writer().open().unwrap().db;
     let events = leader.events.clone();
     leader.writer().sync(false, 2, &events);
     leader.writer().stop().await;
     clock.configure(3, 1, three_voters());
     leader.writer().sync(true, 3, &events);
-    let open = leader.writer().open.clone();
     eventually("the successor", async || {
-        let slot = open.lock().unwrap().clone();
+        let slot = leader.writer.open();
         slot.is_some_and(|slot| !Arc::ptr_eq(&slot.db, &old))
     })
     .await;
@@ -1177,22 +1250,14 @@ async fn a_defragment_of_an_ended_term_submits_no_job() {
     let (mut leader, clock, sampling) = sampled_leader().await;
     leader.put("before").await;
     leader.covered(2, Duration::from_secs(10)).await;
-    let writer = leader.writer();
-    let open = writer.open.lock().unwrap().clone().unwrap();
     let (reached, resume) = (Arc::default(), Arc::default());
     let defragment = Defragment {
-        db: open.db.clone(),
-        admin: open.admin.clone(),
-        owner: Some(open.gate.clone()),
-        progress: writer.progress.clone(),
-        announced: writer.applied.announced.clone(),
-        leadership: writer.leadership.subscribe(),
-        term: 2,
         pause: Some((
             DefragmentStep::Compact,
             Arc::clone(&reached),
             Arc::clone(&resume),
         )),
+        ..leader.writer().defragment(2).unwrap()
     };
     let paused = tokio::spawn(defragment.run());
     reached.notified().await;
@@ -1206,7 +1271,7 @@ async fn a_defragment_of_an_ended_term_submits_no_job() {
         "a Defragment of an ended term added a job"
     );
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let successor = leader.writer().open.lock().unwrap().clone().unwrap().db;
+    let successor = leader.writer().open().unwrap().db;
     assert!(successor.status().close_reason.is_none());
     sampling.abort();
     leader.close().await;
@@ -1238,20 +1303,19 @@ async fn a_late_job_costs_one_reopen_and_no_handoff() {
     // The late job lands 3 s above the successor's clock. Four new L0 SSTs then make the
     // compactor of the successor schedule a job below it.
     let writer = leader.writer();
-    let reopened = writer.reopens.load(std::sync::atomic::Ordering::Relaxed);
-    let faults = writer.health.total();
-    let first = writer.open.lock().unwrap().clone().unwrap().db;
+    let reopened = writer.reopens();
+    let faults = writer.health().total();
+    let first = writer.open().unwrap().db;
     submit_ahead(&leader, Duration::from_secs(3)).await;
     for n in 0..4 {
         leader.put(&format!("k{n}")).await;
-        let db = leader.writer().open.lock().unwrap().clone().unwrap().db;
+        let db = leader.writer().open().unwrap().db;
         let _ = db.flush().await;
     }
-    let reopens = leader.writer().reopens.clone();
     until(
         "the reopen above the job",
         Duration::from_secs(30),
-        async || reopens.load(std::sync::atomic::Ordering::Relaxed) > reopened,
+        async || leader.writer.reopens() > reopened,
     )
     .await;
     let index = leader.put("after").await;
@@ -1264,19 +1328,24 @@ async fn a_late_job_costs_one_reopen_and_no_handoff() {
     answering.abort();
     // One reopen in the same term, onto a new `Db`, with no fault at all.
     let writer = leader.writer();
-    let reopens = writer.reopens.load(std::sync::atomic::Ordering::Relaxed);
+    let reopens = writer.reopens();
     assert_eq!(reopens, reopened + 1);
-    let second = writer.open.lock().unwrap().clone().unwrap().db;
+    let second = writer.open().unwrap().db;
     assert!(
         !Arc::ptr_eq(&first, &second),
         "the writer did not open a new Db"
     );
-    assert_eq!(writer.term, 3);
-    assert_eq!(*writer.leadership.borrow(), (true, 3));
+    assert_eq!(writer.term(), 3);
+    assert_eq!(writer.leadership(), (true, 3));
     assert!(writer.running());
-    assert_eq!(writer.health.total(), faults, "{}", writer.health.status());
-    assert!(!writer.health.handoff_due());
-    assert_eq!(writer.health.status()["marked"], false);
+    assert_eq!(
+        writer.health().total(),
+        faults,
+        "{}",
+        writer.health().status()
+    );
+    assert!(!writer.health().handoff_due());
+    assert_eq!(writer.health().status()["marked"], false);
     sampling.abort();
     leader.close().await;
 }
@@ -1290,18 +1359,7 @@ async fn a_refused_defragment_job_is_retryable() {
     leader.put("before").await;
     leader.covered(2, Duration::from_secs(10)).await;
     submit_ahead(&leader, Duration::from_secs(3)).await;
-    let writer = leader.writer();
-    let open = writer.open.lock().unwrap().clone().unwrap();
-    let defragment = Defragment {
-        db: open.db.clone(),
-        admin: open.admin.clone(),
-        owner: Some(open.gate.clone()),
-        progress: writer.progress.clone(),
-        announced: writer.applied.announced.clone(),
-        leadership: writer.leadership.subscribe(),
-        term: 2,
-        pause: None,
-    };
+    let defragment = leader.writer().defragment(2).unwrap();
     let error = defragment.run().await.unwrap_err();
     assert_eq!(
         error.code,
@@ -1325,18 +1383,10 @@ async fn a_gate_that_ends_first_gives_the_lost_leader_reply() {
     let (mut leader, clock, sampling) = sampled_leader().await;
     leader.put("before").await;
     leader.covered(2, Duration::from_secs(10)).await;
-    let writer = leader.writer();
-    let open = writer.open.lock().unwrap().clone().unwrap();
     let (_term, leadership) = tokio::sync::watch::channel((true, 2));
     let defragment = Defragment {
-        db: open.db.clone(),
-        admin: open.admin.clone(),
-        owner: Some(open.gate.clone()),
-        progress: writer.progress.clone(),
-        announced: writer.applied.announced.clone(),
         leadership,
-        term: 2,
-        pause: None,
+        ..leader.writer().defragment(2).unwrap()
     };
     clock.stand_down();
     let error = defragment.run().await.unwrap_err();
@@ -1378,13 +1428,13 @@ async fn a_stored_floor_far_ahead_refuses_before_the_open() {
     };
     let before = epoch().await;
     leader.writer().sync(true, 3, &events);
-    let health = leader.writer().health.clone();
+    let health = leader.writer().health().clone();
     eventually("the clock refusal", async || {
         health.status()["last_error_class"] == "clock"
     })
     .await;
-    assert_eq!(leader.writer().clock.alarm_name(), Some("behind"));
-    assert!(leader.writer().open.lock().unwrap().is_none());
+    assert_eq!(leader.writer().clock().alarm_name(), Some("behind"));
+    assert!(leader.writer().open().is_none());
     assert_eq!(
         epoch().await,
         before,
@@ -1423,10 +1473,10 @@ async fn a_data_error_halts_the_writer_and_keeps_the_member() {
     *leader.handles.source.fail_writer.lock().unwrap() = Some(data.into());
     leader.lead(2);
     leader.no_failure(Duration::from_secs(3)).await;
-    let health = leader.writer().health.clone();
+    let health = leader.writer().health().clone();
     assert_eq!(health.status()["last_error_class"], "data");
     assert!(health.handoff_due());
-    assert!(leader.writer().open.lock().unwrap().is_none());
+    assert!(leader.writer().open().is_none());
     // The 30 s wait runs with no step timer, so it cannot turn into a stall.
     assert!(health.record().due.is_none());
     leader.close().await;
@@ -2071,12 +2121,12 @@ async fn a_request_above_the_written_batch_keeps_its_timer() {
     });
     let requested = Instant::now();
     let through = leader.state.applied + 1;
-    let writer = leader.writer.as_ref().unwrap();
-    writer.progress.request(through);
+    let writer = &leader.writer;
+    writer.progress().request(through);
     until("the stall", STALL + Duration::from_secs(5), async || {
         // Wake the publisher, as later writes and requests do.
-        writer.progress.wake.notify_one();
-        writer.health.check(writer.waiting())
+        writer.progress().wake.notify_one();
+        writer.health().check(writer.waiting())
     })
     .await;
     assert!(requested.elapsed() >= STALL);
@@ -2095,20 +2145,14 @@ async fn repeated_open_conflicts_raise_the_stall() {
     let conflict = || slatedb::Error::data("version already exists".into()).into();
     *leader.handles.source.fail_writers.lock().unwrap() = Some(conflict);
     leader.lead(2);
-    let health = leader.writer().health.clone();
+    let health = leader.writer().health().clone();
     let started = Instant::now();
     until("the stall", STALL + Duration::from_secs(5), async || {
         health.check(None)
     })
     .await;
     assert!(started.elapsed() >= STALL - Duration::from_secs(1));
-    assert!(
-        leader
-            .writer()
-            .reopens
-            .load(std::sync::atomic::Ordering::Relaxed)
-            > 10
-    );
+    assert!(leader.writer().reopens() > 10);
     health.restart();
     eventually("the restart", async || health.consecutive() > 0).await;
     *leader.handles.source.fail_writers.lock().unwrap() = None;
@@ -2126,41 +2170,41 @@ async fn a_replacement_writer_gets_a_fresh_interval_for_a_request() {
     leader.lead(2);
     leader.covered(1, Duration::from_secs(10)).await;
     let through = leader.state.applied + 1;
-    let writer = leader.writer.as_ref().unwrap();
-    writer.progress.request(through);
-    writer.progress.inner.lock().unwrap().requested =
+    let writer = &leader.writer;
+    writer.progress().request(through);
+    writer.progress().inner.lock().unwrap().requested =
         Some(Instant::now() - STALL - Duration::from_secs(1));
-    let old = writer.open.lock().unwrap().clone().unwrap().db;
+    let old = writer.open().unwrap().db;
     // The overdue request is a stall. Each tick of the node checks the stall and asks for the
     // restart, as for a stall with no target, until the task drops its step.
-    let before = writer.health.consecutive();
+    let before = writer.health().consecutive();
     eventually("the restart", async || {
-        let restarted = writer.health.consecutive() > before;
+        let restarted = writer.health().consecutive() > before;
         if !restarted {
-            writer.health.check(writer.waiting());
-            writer.health.restart();
+            writer.health().check(writer.waiting());
+            writer.health().restart();
         }
         restarted
     })
     .await;
     let reopened = async || {
-        let open = writer.open.lock().unwrap().clone();
+        let open = writer.open();
         open.is_some_and(|open| !Arc::ptr_eq(&open.db, &old))
     };
     eventually("the replacement writer", reopened).await;
-    assert!(!writer.health.check(writer.waiting()));
+    assert!(!writer.health().check(writer.waiting()));
     let started = Instant::now();
     until("the stall", STALL + Duration::from_secs(5), async || {
-        writer.progress.wake.notify_one();
-        writer.health.check(writer.waiting())
+        writer.progress().wake.notify_one();
+        writer.health().check(writer.waiting())
     })
     .await;
     assert!(started.elapsed() >= STALL - Duration::from_secs(1));
     assert_eq!(leader.put("late").await, through);
     leader.covered(through, Duration::from_secs(10)).await;
-    let writer = leader.writer.as_ref().unwrap();
+    let writer = &leader.writer;
     eventually("the served request", async || {
-        writer.progress.requested().is_none()
+        writer.progress().requested().is_none()
     })
     .await;
     leader.close().await;
@@ -2173,7 +2217,7 @@ async fn a_stranded_checkpoint_serves_a_request() {
     use super::super::tests::{stranded_checkpoint_on, STRANDED_AGE};
     let (state, handles, events, mut announcements, lost) =
         stranded_checkpoint_on(Arc::new(InMemory::new())).await;
-    let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut writer = new_writer(&handles, STRANDED_AGE, clock());
     writer.request_publication(1);
     writer.sync(true, 3, &events);
     let announced = tokio::time::timeout(Duration::from_secs(10), announcements.0.recv());
@@ -2182,12 +2226,12 @@ async fn a_stranded_checkpoint_serves_a_request() {
     };
     assert_eq!(id, lost);
     assert!(
-        writer.progress.requested().is_some(),
+        writer.progress().requested().is_some(),
         "the check dropped the request"
     );
     reply.send(true).unwrap();
     eventually("the served request", async || {
-        writer.progress.requested().is_none()
+        writer.progress().requested().is_none()
     })
     .await;
     writer.sync(false, 3, &events);
@@ -2203,7 +2247,7 @@ async fn a_hung_stranded_check_trips_the_request_timer() {
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     let (mut state, handles, events, mut announcements, lost) =
         stranded_checkpoint_on(faults.clone()).await;
-    let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut writer = new_writer(&handles, STRANDED_AGE, clock());
     writer.sync(true, 3, &events);
     assert_eq!(
         announcements.next(Duration::from_secs(10), true).await,
@@ -2216,7 +2260,7 @@ async fn a_hung_stranded_check_trips_the_request_timer() {
     let requested = Instant::now();
     writer.request_publication(1);
     until("the stall", STALL + Duration::from_secs(5), async || {
-        writer.health.check(writer.waiting())
+        writer.health().check(writer.waiting())
     })
     .await;
     assert!(requested.elapsed() >= STALL - Duration::from_secs(1));
@@ -2256,7 +2300,7 @@ async fn a_failing_stranded_check_retries_at_the_backoff() {
     use std::sync::atomic::Ordering;
     let (mut state, handles, events, mut announcements, lost) =
         stranded_checkpoint_on(Arc::new(InMemory::new())).await;
-    let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
+    let mut writer = new_writer(&handles, STRANDED_AGE, clock());
     writer.sync(true, 3, &events);
     assert_eq!(
         announcements.next(Duration::from_secs(10), true).await,
@@ -2264,7 +2308,7 @@ async fn a_failing_stranded_check_retries_at_the_backoff() {
     );
     adopt_announced(&mut state, lost).await;
     tokio::time::sleep(RETRY_MAX + Duration::from_millis(500)).await;
-    let failures = writer.applied.failures.clone();
+    let failures = writer.failures();
     failures.store(10_000, Ordering::Relaxed);
     writer.request_publication(1);
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -2300,12 +2344,12 @@ async fn republishes_do_not_hide_a_waiting_request() {
     });
     let requested = Instant::now();
     let through = leader.state.applied + 1;
-    let writer = leader.writer.as_ref().unwrap();
-    writer.progress.request(through);
+    let writer = &leader.writer;
+    writer.progress().request(through);
     until("the stall", STALL + Duration::from_secs(5), async || {
-        writer.progress.republish();
+        writer.progress().republish();
         tokio::time::sleep(Duration::from_millis(200)).await;
-        writer.health.check(writer.waiting())
+        writer.health().check(writer.waiting())
     })
     .await;
     assert!(requested.elapsed() >= STALL);

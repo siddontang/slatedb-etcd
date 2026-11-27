@@ -4,15 +4,160 @@ use super::apply::AppliedCommand;
 use super::*;
 use crate::state::put_batch::{KvEntry, PreparedPuts};
 
+/// Put replies that leave before the local apply, and the reads that wait for them.
+///
+/// A prepared group replies before its PublishPuts job writes the state. Until apply passes
+/// the last replied entry, reads and Watch creation on this member wait, so that a client
+/// that saw a reply also reads its effect here. A held group always has its prepared batch.
+#[derive(Default)]
+pub(super) struct EarlyPuts {
+    /// The evaluated group that waits for its PublishPuts job.
+    prepared: Option<PreparedPuts>,
+    /// Replies for `prepared` evaluated before commit.
+    held: Option<HeldPuts>,
+    /// The term of the entries in the last submitted PreparePuts job.
+    term: u64,
+    /// The last entry of a PreparePuts job that a storage error ended. No early reply runs
+    /// until apply passes it, so the committed path applies those entries and retries.
+    unprepared: u64,
+    /// The last entry that has a Put reply out.
+    reply_index: u64,
+    /// Watch creations that wait while a Put reply runs ahead of the local apply.
+    watch_waiters: Vec<oneshot::Sender<()>>,
+}
+
 /// Put replies evaluated before their entries committed.
 ///
 /// The replies leave only after Raft commits `last` in `term`. Raft can replace an
 /// uncommitted entry only after this member sees a higher term, so a term or role change
 /// drops the group. The entries then take the normal apply path.
-pub(super) struct HeldPuts {
+struct HeldPuts {
     term: u64,
     last: u64,
     replies: Vec<AppliedCommand>,
+}
+
+impl EarlyPuts {
+    /// Return true while a prepared group waits for its PublishPuts job. Other apply work
+    /// that changes the state waits for it.
+    pub(super) fn active(&self) -> bool {
+        self.prepared.is_some()
+    }
+
+    /// Return true while a Put reply runs ahead of `applied`. Reads and Watch creation wait
+    /// until the replied entries are applied here.
+    pub(super) fn reads_blocked(&self, applied: u64) -> bool {
+        applied < self.reply_index
+    }
+
+    /// Return true if the Puts after `applied` can take an early reply: no reply runs ahead,
+    /// and no failed PreparePuts job is above `applied`.
+    fn can_prepare(&self, applied: u64) -> bool {
+        !self.reads_blocked(applied) && applied >= self.unprepared
+    }
+
+    /// Record the term of the PreparePuts job that starts now.
+    fn start(&mut self, term: u64) {
+        self.term = term;
+    }
+
+    /// A storage error ended a PreparePuts job through `last`.
+    pub(super) fn fail(&mut self, last: u64) {
+        self.unprepared = last;
+    }
+
+    /// Take the result of a PreparePuts job. Return the replies that can leave now. Keep them
+    /// if Raft has not committed the group, or if the term or role changed.
+    pub(super) fn finish(
+        &mut self,
+        batch: PreparedPuts,
+        replies: Vec<AppliedCommand>,
+        raft: &raft::Raft<log::Cache>,
+    ) -> Option<Vec<AppliedCommand>> {
+        // A term change can replace uncommitted entries at these indices. The held group is
+        // then dropped before any reply leaves.
+        if batch.last > raft.raft_log.committed
+            || raft.term != self.term
+            || raft.state != StateRole::Leader
+        {
+            self.held = Some(HeldPuts {
+                term: self.term,
+                last: batch.last,
+                replies,
+            });
+            self.prepared = Some(batch);
+            return None;
+        }
+        self.reply_index = batch.last;
+        self.prepared = Some(batch);
+        Some(replies)
+    }
+
+    /// Return the held replies once their group commits. Drop the group if its entries can
+    /// still be replaced, or if a state query waits behind it (`queries_waiting`).
+    fn release(
+        &mut self,
+        raft: &raft::Raft<log::Cache>,
+        queries_waiting: bool,
+    ) -> Option<Vec<AppliedCommand>> {
+        let held = self.held.as_ref()?;
+        if raft.term != held.term || raft.state != StateRole::Leader {
+            self.clear();
+            return None;
+        }
+        if held.last > raft.raft_log.committed {
+            if queries_waiting {
+                self.clear();
+            }
+            return None;
+        }
+        let held = self.held.take()?;
+        self.reply_index = held.last;
+        Some(held.replies)
+    }
+
+    /// Take the prepared group for its PublishPuts job once it is committed and has no held
+    /// replies.
+    pub(super) fn take_due(&mut self, committed: u64) -> Option<PreparedPuts> {
+        if self.held.is_some() || self.prepared.as_ref()?.last > committed {
+            return None;
+        }
+        self.prepared.take()
+    }
+
+    /// Drop the prepared group and its held replies.
+    pub(super) fn clear(&mut self) {
+        self.held = None;
+        self.prepared = None;
+    }
+
+    /// Answer a Watch barrier now, or after apply passes the replied entries.
+    pub(super) fn watch_barrier(&mut self, applied: u64, response: oneshot::Sender<()>) {
+        if self.reads_blocked(applied) {
+            // A stream that closed while it waited drops its receiver.
+            self.watch_waiters.retain(|waiter| !waiter.is_closed());
+            self.watch_waiters.push(response);
+        } else {
+            let _ = response.send(());
+        }
+    }
+
+    /// Return false while reads are blocked at `applied`. Otherwise answer the waiting Watch
+    /// barriers and return true.
+    pub(super) fn unblock_reads(&mut self, applied: u64) -> bool {
+        if self.reads_blocked(applied) {
+            return false;
+        }
+        for response in self.watch_waiters.drain(..) {
+            let _ = response.send(());
+        }
+        true
+    }
+
+    /// The last entry that has a Put reply out.
+    pub(super) fn reply_index(&self) -> u64 {
+        self.reply_index
+    }
 }
 
 impl Node {
@@ -20,7 +165,7 @@ impl Node {
     ///
     /// Raft counts the leader's own replica for an entry only after local persistence. So a
     /// commit above the persisted index has a durable quorum on other voters, and an entry
-    /// that is not yet committed gets its reply only when it commits (`hold_puts`).
+    /// that is not yet committed gets its reply only when it commits (`EarlyPuts::finish`).
     pub(super) fn prepare_quorum_puts(&mut self) -> Result<bool> {
         let raft = &self.raw.raft;
         let low = self.state.applied + 1;
@@ -30,7 +175,7 @@ impl Node {
         let last = self.raw.store().last_index()?;
         // A large uncommitted group gains more from one pipelined apply job after commit.
         if low > raft.raft_log.committed
-            && (!self.queries.is_empty() || last.saturating_sub(self.state.applied) > QUICK_REPLY)
+            && (self.apply.has_queries() || last.saturating_sub(self.state.applied) > QUICK_REPLY)
         {
             return Ok(false);
         }
@@ -38,38 +183,14 @@ impl Node {
         self.prepare_puts(high)
     }
 
-    /// Keep the replies of a prepared group that Raft has not committed yet.
-    pub(super) fn hold_puts(&mut self, batch: PreparedPuts, replies: Vec<AppliedCommand>) {
-        self.held_puts = Some(HeldPuts {
-            term: self.prepare_term,
-            last: batch.last,
-            replies,
-        });
-        self.prepared_puts = Some(batch);
-    }
-
-    /// Return the held replies once their group commits. Drop the group if its entries can
-    /// still be replaced, or if a state query waits behind it.
+    /// Return the held replies once their group commits. See `EarlyPuts::release`.
     pub(super) fn release_held_puts(&mut self) -> Option<Vec<AppliedCommand>> {
-        let held = self.held_puts.as_ref()?;
-        let raft = &self.raw.raft;
-        if raft.term != held.term || raft.state != StateRole::Leader {
-            self.held_puts = None;
-            self.prepared_puts = None;
-            return None;
-        }
-        if held.last > raft.raft_log.committed {
-            if !self.queries.is_empty() {
-                self.held_puts = None;
-                self.prepared_puts = None;
-            }
-            return None;
-        }
-        let held = self.held_puts.take()?;
-        self.quorum_reply_index = held.last;
+        let replies = self
+            .early_puts
+            .release(&self.raw.raft, self.apply.has_queries())?;
         // Withdraw the published view before any of these replies leaves.
         self.publish_local_reads();
-        Some(held.replies)
+        Some(replies)
     }
 
     /// Reply to a small committed group of local Puts before the state write.
@@ -78,10 +199,11 @@ impl Node {
     /// reply needs only the evaluated outcome. Reads still wait for the published state.
     pub(super) fn prepare_local_puts(&mut self) -> Result<bool> {
         let low = self.state.applied + 1;
-        if self.committed_ready < low || self.committed_ready - self.state.applied > QUICK_REPLY {
+        let committed = self.apply.committed();
+        if committed < low || committed - self.state.applied > QUICK_REPLY {
             return Ok(false);
         }
-        self.prepare_puts(self.committed_ready + 1)
+        self.prepare_puts(committed + 1)
     }
 
     /// Evaluate the Puts in `[applied + 1, high)` for an early reply.
@@ -91,8 +213,7 @@ impl Node {
         if raft.state != StateRole::Leader
             || self.pending.is_empty()
             || high <= low
-            || self.reply_ahead()
-            || self.state.applied < self.unprepared
+            || !self.early_puts.can_prepare(self.state.applied)
             || raft.pending_conf_index > self.state.applied
             || self.raw.store().durable.hard_state.term != raft.term
         {
@@ -126,7 +247,7 @@ impl Node {
             return Ok(false);
         }
         let term = raft.term;
-        self.prepare_term = term;
+        self.early_puts.start(term);
         self.submit_apply(Job::PreparePuts { commands, term }, self.state.applied)?;
         Ok(true)
     }
@@ -252,7 +373,7 @@ mod tests {
             .into_outcome()
             .result
             .is_ok());
-        assert_eq!(node.quorum_reply_index, index);
+        assert_eq!(node.early_puts.reply_index, index);
         // The Put reply left before the local apply. Serializable reads outside the owner must
         // not use the older view, or a client that saw the reply could miss its write here.
         assert!(node.forwarding.local().is_none());
@@ -275,7 +396,7 @@ mod tests {
             .into_outcome()
             .result
             .is_ok());
-        assert!(node.prepared_puts.is_none());
+        assert!(node.early_puts.prepared.is_none());
         let after = node
             .forwarding
             .local()
@@ -375,7 +496,7 @@ mod tests {
             .result
             .is_ok());
         assert_eq!(node.state.applied, applied);
-        assert_eq!(node.quorum_reply_index, index);
+        assert_eq!(node.early_puts.reply_index, index);
         // A serializable read outside the owner must not use the view from before this reply.
         assert!(node.forwarding.local().is_none());
         // A read must not see the state before the prepared write is published.
@@ -448,21 +569,21 @@ mod tests {
         let index = node.raw.store().last_index().unwrap();
         // The log write is still queued. Prepare runs now and keeps its reply.
         node.drain_apply().await.unwrap();
-        assert!(node.held_puts.is_some());
-        assert_eq!(node.prepared_puts.as_ref().unwrap().last, index);
+        assert!(node.early_puts.held.is_some());
+        assert_eq!(node.early_puts.prepared.as_ref().unwrap().last, index);
         assert!(node.raw.raft.raft_log.committed < index);
         assert!(reply.try_recv().is_err());
         assert_eq!(node.state.applied, applied);
-        assert!(node.quorum_reply_index < index);
+        assert!(node.early_puts.reply_index < index);
         // The local write alone is not a quorum.
         node.drain_log().await.unwrap();
         node.drain_apply().await.unwrap();
         assert!(reply.try_recv().is_err());
-        assert!(node.held_puts.is_some());
+        assert!(node.early_puts.held.is_some());
         ack(&mut node, index);
         node.drive_ready().await.unwrap();
-        assert!(node.held_puts.is_none());
-        assert_eq!(node.quorum_reply_index, index);
+        assert!(node.early_puts.held.is_none());
+        assert_eq!(node.early_puts.reply_index, index);
         assert!(node.forwarding.local().is_none());
         assert!(reply
             .try_recv()
@@ -474,7 +595,7 @@ mod tests {
         node.drain_log().await.unwrap();
         node.drain_apply().await.unwrap();
         assert_eq!(node.state.applied, index);
-        assert!(node.prepared_puts.is_none());
+        assert!(node.early_puts.prepared.is_none());
     }
 
     /// A Watch with no start revision on the replying member starts after the replied Put.
@@ -517,7 +638,7 @@ mod tests {
         node.handle(crate::node::Event::WatchBarrier(tx), &mut Vec::new())
             .await
             .unwrap();
-        assert_eq!(node.watch_waiters.len(), 1);
+        assert_eq!(node.early_puts.watch_waiters.len(), 1);
         node.drive_ready().await.unwrap();
         assert!(barrier.try_recv().is_err());
         node.drain_log().await.unwrap();
@@ -537,7 +658,7 @@ mod tests {
         node.drive_ready().await.unwrap();
         let index = node.raw.store().last_index().unwrap();
         node.drain_apply().await.unwrap();
-        assert!(node.held_puts.is_some());
+        assert!(node.early_puts.held.is_some());
         // A new leader can replace the uncommitted entry.
         let mut heartbeat = Message::default();
         heartbeat.set_msg_type(MessageType::MsgHeartbeat);
@@ -546,9 +667,9 @@ mod tests {
         heartbeat.term = node.raw.raft.term + 1;
         node.raw.step(heartbeat).unwrap();
         node.drive_ready().await.unwrap();
-        assert!(node.held_puts.is_none());
-        assert!(node.prepared_puts.is_none());
-        assert!(node.quorum_reply_index < index);
+        assert!(node.early_puts.held.is_none());
+        assert!(node.early_puts.prepared.is_none());
+        assert!(node.early_puts.reply_index < index);
         node.expire_pending();
         assert!(reply.try_recv().unwrap().is_err());
         node.drain_log().await.unwrap();
@@ -564,7 +685,7 @@ mod tests {
         node.drive_ready().await.unwrap();
         let index = node.raw.store().last_index().unwrap();
         node.drain_apply().await.unwrap();
-        assert!(node.held_puts.is_some());
+        assert!(node.early_puts.held.is_some());
         let (tx, mut status) = oneshot::channel();
         node.enqueue_query(Query::AuthLookup("root".into(), tx));
         node.drive_ready().await.unwrap();

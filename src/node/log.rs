@@ -2,12 +2,17 @@ use super::*;
 use std::sync::{Arc, Condvar, Mutex};
 
 pub(super) use super::cache::Cache;
-use raft::eraftpb::{HardState, Snapshot};
+use raft::eraftpb::{ConfState, HardState, Snapshot};
 use raft::GetEntriesContext;
 
 pub(super) const MAX_JOBS: usize = 64;
 pub(super) const MAX_BYTES: usize = 16 * 1024 * 1024;
 pub(super) const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+/// The owner takes no Ready while this many wait for persistence. Joined jobs keep one Ready
+/// number, but raft-rs keeps a 56-byte record for each Ready until `on_persist_ready`. With
+/// one heartbeat Ready for each 100 ms tick, the limit is 102 s behind a slow write. Other
+/// work also makes Readys, so the limit does not set a time.
+pub(super) const MAX_READYS: usize = 1024;
 
 pub(super) struct Durable {
     pub hard_state: HardState,
@@ -168,10 +173,11 @@ impl Executor {
                 .storage
                 .persist(&entries, hs.as_ref(), snapshot.as_ref())?,
             Job::Checkpoint { index, image, conf } => {
-                let attach = self.storage.replaces_at(index, image.as_ref());
+                let attach = replaces_at(&self.storage, index, image.as_ref());
                 // A received snapshot can make this result obsolete.
                 if index > self.storage.snapshot_index() || attach {
-                    self.storage.publish_checkpoint(index, image, conf)?;
+                    self.storage
+                        .publish_checkpoint(index, image, conf, attach)?;
                 }
             }
             #[cfg(test)]
@@ -184,6 +190,63 @@ impl Executor {
             stats,
         })
     }
+}
+
+/// The log store keeps snapshot images as opaque bytes. These methods read the image format, so
+/// they are here with the log worker and not in `storage`.
+impl RaftStorage {
+    /// Publish the replacement snapshot and truncate its covered log in one synced batch.
+    pub fn checkpoint(&mut self, index: u64, data: Vec<u8>) -> Result<()> {
+        let conf = self
+            .recovery_snapshot()
+            .get_metadata()
+            .get_conf_state()
+            .clone();
+        self.checkpoint_with_conf(index, data, conf)
+    }
+
+    pub fn checkpoint_with_conf(
+        &mut self,
+        index: u64,
+        data: Vec<u8>,
+        conf: ConfState,
+    ) -> Result<()> {
+        let prepared = self.prepare_checkpoint(data)?;
+        let attach = replaces_at(self, index, Some(&prepared));
+        self.publish_checkpoint(index, Some(prepared), conf, attach)
+    }
+
+    /// Return true when the current snapshot record has no transferable image.
+    ///
+    /// Only a view descriptor is transferable. See `transfer::sendable`.
+    pub fn metadata_only(&self) -> bool {
+        self.snapshot_index() > 0
+            && !crate::state::transfer::sendable(&self.recovery_snapshot().data)
+    }
+}
+
+/// Return true when an image at `index` replaces the record at the same index: the record has no
+/// transferable image, or it names another view checkpoint. A restart or a rebase can move the
+/// base to another checkpoint at the record index when retention deleted the one that the record
+/// names. The log worker and `RaftStorage::checkpoint_with_conf` both use this rule.
+fn replaces_at(storage: &RaftStorage, index: u64, image: Option<&PreparedCheckpoint>) -> bool {
+    let Some(image) = image else {
+        return false;
+    };
+    if index != storage.snapshot_index() {
+        return false;
+    }
+    let view = |data: &[u8]| {
+        crate::state::transfer::ViewDescriptor::decode(data)
+            .ok()
+            .flatten()
+            .map(|view| view.checkpoint)
+    };
+    let record = &storage.recovery_snapshot().data;
+    storage.metadata_only()
+        || view(record)
+            .zip(view(&image.data))
+            .is_some_and(|(old, new)| old != new)
 }
 
 pub(super) struct Worker {
@@ -305,5 +368,61 @@ impl Worker {
             Err(mpsc::error::TryRecvError::Empty) => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+    use raft::eraftpb::Entry;
+
+    fn view(checkpoint: uuid::Uuid) -> Vec<u8> {
+        crate::state::transfer::ViewDescriptor::new(checkpoint)
+            .encode()
+            .unwrap()
+    }
+
+    /// An opaque image at the index of a view record does not replace the view, because the view
+    /// is the image that a peer can receive. A view of another checkpoint replaces it.
+    #[test]
+    fn an_opaque_image_does_not_replace_a_view_at_the_same_index() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
+        let entries: Vec<Entry> = (1..=3)
+            .map(|index| Entry {
+                index,
+                term: 1,
+                ..Default::default()
+            })
+            .collect();
+        let hs = HardState {
+            term: 1,
+            vote: 1,
+            commit: 3,
+        };
+        store.persist(&entries, Some(&hs), None).unwrap();
+        let first = view(uuid::Uuid::new_v4());
+        store.checkpoint(3, first.clone()).unwrap();
+        assert!(crate::state::transfer::sendable(
+            &store.recovery_snapshot().data
+        ));
+        assert!(store.checkpoint(3, b"opaque".to_vec()).is_err());
+        let conf = store
+            .recovery_snapshot()
+            .get_metadata()
+            .get_conf_state()
+            .clone();
+        assert!(store
+            .checkpoint_with_conf(3, b"opaque".to_vec(), conf)
+            .is_err());
+        assert_eq!(store.recovery_snapshot().data, first);
+        drop(store);
+        let mut store = RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
+        assert_eq!(store.recovery_snapshot().data, first);
+        let second = view(uuid::Uuid::new_v4());
+        store.checkpoint(3, second.clone()).unwrap();
+        drop(store);
+        let store = RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
+        assert_eq!(store.recovery_snapshot().data, second);
     }
 }

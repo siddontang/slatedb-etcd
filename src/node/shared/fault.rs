@@ -29,7 +29,7 @@ pub(super) const STALL: Duration = Duration::from_secs(30);
 /// A failed writer that takes this long to close logs a warning.
 const SLOW_CLOSE: Duration = Duration::from_secs(30);
 /// Election timeouts that a handoff can take before the leader tries another voter.
-const HANDOFF_TIMEOUTS: u32 = 2;
+pub(super) const HANDOFF_TIMEOUTS: u32 = 2;
 
 /// The class of a writer fault.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +68,7 @@ impl Fault {
 /// does not decode is. A writer that SlateDB closed for another reason is a data error too: its
 /// flush failed, and the close hides the cause.
 pub(in crate::node) fn classify(error: &anyhow::Error) -> Fault {
-    use crate::mvcc::storage_fault::StorageFault;
+    use crate::storage_fault::StorageFault;
     if id_time_refused(error) {
         return Fault::Clock;
     }
@@ -82,7 +82,7 @@ pub(in crate::node) fn classify(error: &anyhow::Error) -> Fault {
     if closed {
         return Fault::Data;
     }
-    match crate::mvcc::storage_fault::classify(error) {
+    match crate::storage_fault::classify(error) {
         Some(StorageFault::Transient) => Fault::Unavailable,
         Some(StorageFault::Missing | StorageFault::Corrupt) => Fault::Data,
         None => Fault::Invariant,
@@ -356,7 +356,7 @@ impl Health {
     /// The start of the current incident: the first failure since the last publication, or
     /// the start of the first work that stalled. A voter that reported after it was alive while
     /// this writer failed.
-    fn incident(&self) -> Option<Instant> {
+    pub(super) fn incident(&self) -> Option<Instant> {
         let record = self.record();
         record.since.into_iter().chain(record.stall_began).min()
     }
@@ -399,7 +399,7 @@ impl Health {
         self.record().total
     }
 
-    fn published_at(&self) -> Option<Instant> {
+    pub(super) fn published_at(&self) -> Option<Instant> {
         self.record().published
     }
 
@@ -812,119 +812,8 @@ impl Handoff {
 
 /// Return true when the leader must hand over its leadership: its writer is down or stalled,
 /// or apply waits on one entry for longer than `STALL`.
-fn handoff_due(health: &Health, paused: Option<&super::apply::Paused>) -> bool {
+pub(super) fn handoff_due(health: &Health, paused: Option<&super::apply::Paused>) -> bool {
     health.handoff_due() || paused.is_some_and(|paused| paused.since.elapsed() >= STALL)
-}
-
-impl Writer {
-    /// The time since work that the publisher has not started became due: the oldest unflushed
-    /// write at its age limit, or an explicit publication request. A writer that is not open
-    /// holds the progress of an earlier one, so only an open writer counts. A batch that waits
-    /// for clock samples or for its clock bound counts too, open writer or not. See
-    /// `note_clock_wait`.
-    pub(super) fn waiting(&self) -> Option<Instant> {
-        if self.open.lock().unwrap().is_none() {
-            return self.clock_due;
-        }
-        let aged = self.progress.deadline(self.max_age);
-        aged.into_iter()
-            .chain(self.progress.requested())
-            .chain(self.clock_due)
-            .min()
-    }
-
-    /// Note on a leader tick whether the clock check holds due work: the writer waits for
-    /// samples or for its bound, and a batch waits for the writer. An idle writer that waits
-    /// is no due work, so its wait never becomes a stall.
-    pub(super) fn note_clock_wait(&mut self) {
-        let due = self.clock.waiting() && self.queue.has_after(self.progress.written());
-        self.clock_due = due.then(|| self.clock_due.unwrap_or_else(Instant::now));
-    }
-}
-
-impl Node {
-    /// The voters other than this member, with their matched log and transport process.
-    pub(in crate::node) fn handoff_candidates(&self) -> Vec<Candidate> {
-        let id = self.options.id;
-        let voters = self.raw.raft.prs().conf().voters();
-        self.raw
-            .raft
-            .prs()
-            .iter()
-            .filter(|(&peer, _)| peer != id && voters.contains(peer))
-            .map(|(&peer, progress)| Candidate {
-                id: peer,
-                matched: progress.matched,
-                process: self.raw.store().process(peer),
-            })
-            .collect()
-    }
-
-    /// Check the writer health on each tick. A leader whose writer is down hands over its
-    /// leadership to a healthy voter, once per voter and incident. With no target left, it stays
-    /// leader and its writer keeps retrying. See `Handoff::step`.
-    pub(super) fn tick_writer_health(&mut self) {
-        let leader = self.raw.raft.state == StateRole::Leader;
-        let wait = TICK * HANDOFF_TIMEOUTS * self.raw.raft.election_timeout() as u32;
-        let paused = self.worker.control.paused();
-        let held = self.apply_held_at.is_some() || paused.is_some();
-        let (term, transferee) = (self.raw.raft.term, self.raw.raft.lead_transferee);
-        let mut moves: Vec<u64> = self.transfers.iter().map(|(target, ..)| *target).collect();
-        let Some(writer) = &mut self.writer else {
-            return;
-        };
-        moves.extend(writer.transfer.map(|(target, _)| target));
-        if leader {
-            writer.note_clock_wait();
-            writer.health.check(writer.waiting());
-        }
-        if let Some(gauges) = &writer.gauges {
-            let health = &writer.health;
-            gauges.failures.set(health.consecutive().into());
-            gauges.pending_closes.set(health.pending_closes() as i64);
-            let counters = [
-                (&gauges.faults, health.total()),
-                (&gauges.aborted_closes, health.aborted_closes()),
-            ];
-            for (counter, total) in counters {
-                counter.inc_by(total.saturating_sub(counter.get()));
-            }
-        }
-        if !leader {
-            return;
-        }
-        // `Handoff::step` reads the candidates only when a handoff is due.
-        let due = handoff_due(&writer.health, paused.as_ref());
-        let candidates = match due {
-            true => self.handoff_candidates(),
-            false => vec![],
-        };
-        let Some(writer) = &mut self.writer else {
-            return;
-        };
-        let health = &writer.health;
-        let decision = writer.handoff.step(&Tick {
-            due,
-            stalled: health.stalled(),
-            transferee,
-            wait,
-            candidates: &candidates,
-            published: health.published_at(),
-            incident: health.incident(),
-            term,
-            moves: &moves,
-            held,
-        });
-        if decision.restart {
-            health.restart();
-        }
-        if decision.abort {
-            self.raw.raft.abort_leader_transfer();
-        }
-        if let Some(target) = decision.transfer {
-            self.raw.transfer_leader(target);
-        }
-    }
 }
 
 #[cfg(test)]

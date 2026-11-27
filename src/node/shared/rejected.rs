@@ -5,7 +5,6 @@
 //! corrupt read. `/status` shows the last dropped base until the pause ends.
 
 use super::*;
-use crate::mvcc::storage_fault::{StorageFault, CORRUPT_READS};
 
 /// The last base that an adoption dropped, with its failure count.
 #[derive(Default)]
@@ -13,7 +12,7 @@ pub(super) struct Rejected(Option<(apply::RejectedBase, u64)>);
 
 impl Rejected {
     /// Count a failure of `rejected`. Return true for the first failure of its checkpoint.
-    fn note(&mut self, rejected: &apply::RejectedBase) -> bool {
+    pub(super) fn note(&mut self, rejected: &apply::RejectedBase) -> bool {
         let (failures, first) = match &self.0 {
             Some((last, failures)) if last.checkpoint == rejected.checkpoint => {
                 (failures + 1, false)
@@ -40,27 +39,6 @@ impl Rejected {
                 "failures": failures,
             }),
             None => Value::Null,
-        }
-    }
-}
-
-impl Node {
-    /// Report a base that an adoption dropped.
-    pub(in crate::node) fn reject_base(&mut self, rejected: apply::RejectedBase) {
-        if rejected.fault == StorageFault::Corrupt {
-            CORRUPT_READS.inc();
-        }
-        let Some(writer) = &mut self.writer else {
-            return;
-        };
-        if writer.rejected.note(&rejected) {
-            tracing::error!(
-                checkpoint = ?rejected.checkpoint,
-                index = rejected.index,
-                fault = ?rejected.fault,
-                reason = rejected.reason,
-                "drop a base that does not load; keep the current base"
-            );
         }
     }
 }
