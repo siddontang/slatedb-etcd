@@ -1192,7 +1192,7 @@ async fn a_join_waits_for_a_pending_restore() {
     let path = dir.path().join("snapshot");
     fixture(&path, 20).await;
     let store = store();
-    shared::claim(store.as_ref(), "cluster", "test", 0, &[1])
+    crate::object::cluster_claim::claim(store.as_ref(), "cluster", "test", 0, &[1])
         .await
         .unwrap();
     let stopped = member(store.clone());
@@ -1212,7 +1212,7 @@ async fn a_join_waits_for_a_pending_restore() {
     );
 
     let store = self::store();
-    shared::claim(store.as_ref(), "cluster", "test", 0, &[1])
+    crate::object::cluster_claim::claim(store.as_ref(), "cluster", "test", 0, &[1])
         .await
         .unwrap();
     let slow = checked(
@@ -1369,7 +1369,7 @@ async fn a_failed_open_after_the_publication_starts() {
 async fn a_join_waits_for_the_bootstrap_decision() {
     let claimed = || async {
         let store = store();
-        shared::claim(store.as_ref(), "cluster", "test", 0, &[1])
+        crate::object::cluster_claim::claim(store.as_ref(), "cluster", "test", 0, &[1])
             .await
             .unwrap();
         store
@@ -1445,8 +1445,8 @@ async fn an_abandoned_restore_keeps_the_store_id_and_restores_another_image() {
                 restore: Some(restore),
                 ..options()
             };
-            crate::object::Config::TestS3(store, s3)
-                .open(&dir, "test", 1, StateCache::default(), &options)
+            let config = crate::object::Config::TestS3(store, s3);
+            StateMachine::open_bound(&config, &dir, "test", 1, StateCache::default(), &options)
                 .await
         }
     };
@@ -1485,7 +1485,7 @@ async fn an_abandoned_restore_keeps_the_store_id_and_restores_another_image() {
 
     // A different store at the same location is refused.
     let other: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    shared::claim(other.as_ref(), &root, "test", 0, &[1])
+    crate::object::cluster_claim::claim(other.as_ref(), &root, "test", 0, &[1])
         .await
         .unwrap();
     let retry = checked(&second, URL, Hooks::default());

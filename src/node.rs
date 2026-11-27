@@ -438,16 +438,15 @@ impl Node {
             record: crate::state::shared::Record::of(storage.recovery_snapshot())?,
             store_id: None,
         };
-        let mut state = options
-            .object_store
-            .open(
-                &options.dir,
-                &options.cluster_id,
-                options.id,
-                options.state_cache,
-                &shared,
-            )
-            .await?;
+        let mut state = StateMachine::open_bound(
+            &options.object_store,
+            &options.dir,
+            &options.cluster_id,
+            options.id,
+            options.state_cache,
+            &shared,
+        )
+        .await?;
         let recovered = async {
             // Apply takes the quota from the cluster claim. The flag only shows a difference.
             state.set_quota_flag(options.effective_quota());
