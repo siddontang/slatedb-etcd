@@ -29,6 +29,9 @@ pub(crate) enum StateView {
     Snapshot(Arc<DbSnapshot>),
     /// A shared-mode view.
     Shared(SharedView),
+    /// The in-memory state of a test. See `StateMachine::open_memory`.
+    #[cfg(test)]
+    Memory(MemoryView),
 }
 
 /// A checkpoint under shared-mode views. An empty base precedes the first checkpoint.
@@ -53,7 +56,8 @@ impl Base {
     }
 
     /// Open checkpoint `id` of the database at `root`. The reader writes nothing and does not
-    /// poll, and it shares the member's block cache.
+    /// poll, and it shares the member's block cache. A read ends after the retries of the
+    /// member's database, so apply and client reads see a storage error instead of a hang.
     pub(crate) async fn open(
         store: Arc<dyn slatedb::object_store::ObjectStore>,
         root: &str,
@@ -64,6 +68,7 @@ impl Base {
             .with_reader_mode(DbReaderMode::Checkpoint(id))
             .with_options(DbReaderOptions {
                 skip_wal_replay: true,
+                object_store_max_retries: super::slatedb_settings().object_store_max_retries,
                 ..Default::default()
             })
             .with_db_cache(cache, 0)
@@ -146,6 +151,12 @@ impl Base {
 /// The message of a read that held its view past the pin limit.
 pub(crate) const EXPIRED: &str = "read view expired; retry";
 
+/// The error of a read that held its view past the pin limit. Its source marks the class.
+fn expired_error() -> slatedb::Error {
+    slatedb::Error::unavailable(EXPIRED.to_owned())
+        .with_source(Box::new(crate::mvcc::storage_fault::Expired))
+}
+
 /// A base plus the overlay batches at or below `seq`.
 #[derive(Clone)]
 pub(crate) struct SharedView {
@@ -180,7 +191,7 @@ impl SharedView {
         match self.deadline {
             Some(deadline) => tokio::time::timeout_at(deadline.into(), read)
                 .await
-                .map_err(|_| slatedb::Error::unavailable(EXPIRED.to_owned()))?,
+                .map_err(|_| expired_error())?,
             None => read.await,
         }
     }
@@ -188,9 +199,7 @@ impl SharedView {
     /// Fail when the read holds the view past its deadline. Gets and each scan step check it.
     fn check(&self) -> Result<(), slatedb::Error> {
         match self.deadline {
-            Some(deadline) if std::time::Instant::now() >= deadline => {
-                Err(slatedb::Error::unavailable(EXPIRED.to_owned()))
-            }
+            Some(deadline) if std::time::Instant::now() >= deadline => Err(expired_error()),
             _ => Ok(()),
         }
     }
@@ -457,6 +466,107 @@ impl StateRead for SharedView {
     }
 }
 
+/// The rows of an in-memory state. A clone keeps the rows as they are: the next write copies
+/// the map.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct MemoryView {
+    rows: Arc<std::collections::BTreeMap<Bytes, Bytes>>,
+}
+
+#[cfg(test)]
+impl MemoryView {
+    /// Write the puts and deletes of `batch`.
+    pub(super) fn write(&mut self, batch: &crate::WriteBatch) {
+        let rows = Arc::make_mut(&mut self.rows);
+        for (key, value) in batch.rows() {
+            match value {
+                Some(value) => {
+                    rows.insert(key.clone(), value.clone());
+                }
+                None => {
+                    rows.remove(key);
+                }
+            }
+        }
+    }
+
+    /// Copy the rows from `start` while `keep` is true, in the order of `options`.
+    fn scan(
+        &self,
+        start: &[u8],
+        keep: impl Fn(&[u8]) -> bool,
+        options: &ScanOptions,
+    ) -> MemoryScan {
+        let mut rows: std::collections::VecDeque<Row> = self
+            .rows
+            .range::<[u8], _>((Bound::Included(start), Bound::Unbounded))
+            .take_while(|(key, _)| keep(key))
+            .map(|(key, value)| Row {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect();
+        let descending = matches!(options.order, slatedb::IterationOrder::Descending);
+        if descending {
+            rows.make_contiguous().reverse();
+        }
+        MemoryScan { rows, descending }
+    }
+}
+
+/// The rows of one scan of a `MemoryView`, copied when the scan starts.
+#[cfg(test)]
+pub(crate) struct MemoryScan {
+    rows: std::collections::VecDeque<Row>,
+    descending: bool,
+}
+
+#[cfg(test)]
+impl StateScan for MemoryScan {
+    async fn next(&mut self) -> Result<Option<Row>, slatedb::Error> {
+        Ok(self.rows.pop_front())
+    }
+
+    async fn seek(&mut self, key: &[u8]) -> Result<(), slatedb::Error> {
+        if self.descending {
+            return Err(slatedb::Error::invalid(
+                "seek on a descending memory scan".to_owned(),
+            ));
+        }
+        while self.rows.front().is_some_and(|row| row.key.as_ref() < key) {
+            self.rows.pop_front();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl StateRead for MemoryView {
+    type Scan<'a> = MemoryScan;
+
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>, slatedb::Error> {
+        Ok(self.rows.get(key).cloned())
+    }
+
+    async fn scan_range(
+        &self,
+        range: Range<Vec<u8>>,
+        options: &ScanOptions,
+    ) -> Result<MemoryScan, slatedb::Error> {
+        let end = range.end;
+        Ok(self.scan(&range.start, |key| key < end.as_slice(), options))
+    }
+
+    async fn scan_under(
+        &self,
+        prefix: &[u8],
+        options: &ScanOptions,
+    ) -> Result<MemoryScan, slatedb::Error> {
+        Ok(self.scan(prefix, |key| key.starts_with(prefix), options))
+    }
+}
+
 impl StateView {
     /// The same state for one read that must end by `deadline`. Only shared views pin a base.
     pub(crate) fn until(&self, deadline: Option<std::time::Instant>) -> Self {
@@ -471,6 +581,7 @@ impl StateView {
 }
 
 /// Return true when an error message comes from a read that held its view too long.
+#[cfg(test)]
 pub(crate) fn expired(message: &str) -> bool {
     message.contains(EXPIRED)
 }
@@ -483,6 +594,8 @@ pub(crate) fn expired(message: &str) -> bool {
 pub(crate) enum ViewScan<'a> {
     Db(DbIterator),
     Shared(SharedScan<'a>),
+    #[cfg(test)]
+    Memory(MemoryScan),
 }
 
 impl StateScan for ViewScan<'_> {
@@ -490,6 +603,8 @@ impl StateScan for ViewScan<'_> {
         match self {
             Self::Db(scan) => StateScan::next(scan).await,
             Self::Shared(scan) => scan.next().await,
+            #[cfg(test)]
+            Self::Memory(scan) => scan.next().await,
         }
     }
 
@@ -497,6 +612,8 @@ impl StateScan for ViewScan<'_> {
         match self {
             Self::Db(scan) => StateScan::seek(scan, key).await,
             Self::Shared(scan) => scan.seek(key).await,
+            #[cfg(test)]
+            Self::Memory(scan) => scan.seek(key).await,
         }
     }
 }
@@ -509,6 +626,8 @@ impl StateRead for StateView {
             Self::Live(db) => StateRead::get(db.as_ref(), key).await,
             Self::Snapshot(snapshot) => StateRead::get(snapshot.as_ref(), key).await,
             Self::Shared(view) => view.get(key).await,
+            #[cfg(test)]
+            Self::Memory(view) => view.get(key).await,
         }
     }
 
@@ -521,6 +640,8 @@ impl StateRead for StateView {
             Self::Live(db) => ViewScan::Db(db.scan_range(range, options).await?),
             Self::Snapshot(snapshot) => ViewScan::Db(snapshot.scan_range(range, options).await?),
             Self::Shared(view) => ViewScan::Shared(view.scan_range(range, options).await?),
+            #[cfg(test)]
+            Self::Memory(view) => ViewScan::Memory(view.scan_range(range, options).await?),
         })
     }
 
@@ -533,6 +654,8 @@ impl StateRead for StateView {
             Self::Live(db) => ViewScan::Db(db.scan_under(prefix, options).await?),
             Self::Snapshot(snapshot) => ViewScan::Db(snapshot.scan_under(prefix, options).await?),
             Self::Shared(view) => ViewScan::Shared(view.scan_under(prefix, options).await?),
+            #[cfg(test)]
+            Self::Memory(view) => ViewScan::Memory(view.scan_under(prefix, options).await?),
         })
     }
 }
@@ -918,5 +1041,46 @@ mod tests {
         assert!(warm.get(b"etcd/history/0150").await.is_err());
         faults.set(0);
         db.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn memory_scans_follow_the_range_prefix_and_order() {
+        let mut view = MemoryView::default();
+        let rows = [
+            ("a", Some("1")),
+            ("b/1", Some("2")),
+            ("b/2", Some("3")),
+            ("c", Some("4")),
+        ];
+        view.write(&batch(&rows));
+        let pinned = view.clone();
+        view.write(&batch(&[("b/1", None), ("b/3", Some("5"))]));
+        let keys = |rows: Vec<Row>| rows.into_iter().map(|row| row.key).collect::<Vec<_>>();
+        let all = [row("a", "1"), row("b/2", "3"), row("b/3", "5")];
+        assert_eq!(scan(&view, "a".."c").await, all);
+        assert!(scan(&view, "c".."a").await.is_empty());
+        // A clone keeps the rows of its time.
+        assert_eq!(pinned.get(b"b/1").await.unwrap(), Some("2".into()));
+        assert_eq!(view.get(b"b/1").await.unwrap(), None);
+        let descending = ScanOptions {
+            order: slatedb::IterationOrder::Descending,
+            ..ScanOptions::default()
+        };
+        let mut scan = view.scan_under(b"b/", &descending).await.unwrap();
+        let mut found = vec![];
+        while let Some(row) = scan.next().await.unwrap() {
+            found.push(row);
+        }
+        assert_eq!(keys(found), ["b/3", "b/2"]);
+        let range = b"a".to_vec()..b"d".to_vec();
+        let mut scan = view
+            .scan_range(range, &ScanOptions::default())
+            .await
+            .unwrap();
+        scan.seek(b"b/3").await.unwrap();
+        let mut found = vec![];
+        while let Some(row) = scan.next().await.unwrap() {
+            found.push(row);
+        }
+        assert_eq!(keys(found), ["b/3", "c"]);
     }
 }

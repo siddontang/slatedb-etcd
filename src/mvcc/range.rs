@@ -97,7 +97,7 @@ impl Candidate {
             (Self::History(row, _), true) => Version::decode(row)
                 .map_err(KvError::storage)?
                 .value
-                .ok_or_else(|| KvError::storage("history row lost its value")),
+                .ok_or_else(|| KvError::corrupt("history row lost its value")),
         }
     }
 }

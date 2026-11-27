@@ -17,7 +17,13 @@ func TestBoundedLogCacheRecoversLaggingFollower(t *testing.T) {
 			name = "failed-read"
 		}
 		t.Run(name, func(t *testing.T) {
-			c := newCluster(t, "--log-cache-bytes", "1024")
+			// Replicated mode only. The test expects the lagging follower to catch up from the
+			// log, with `snapshot_index` at 0 on each member. In shared state mode the follower
+			// can install a base instead: on Linux CI both cases reported `snapshot_index` 15.
+			// On macOS they caught up from the log in 5 of 5 runs, so an install is not a
+			// stable expectation either. The removal of replicated mode must replace this test.
+			args := []string{"--log-cache-bytes", "1024", "--state-mode", "replicated"}
+			c := newCluster(t, args...)
 			leader := c.leader()
 			offline := leader%3 + 1
 			c.stop(offline)

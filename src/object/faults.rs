@@ -23,6 +23,8 @@ pub(crate) struct FaultStore {
     /// The paths of puts and copy targets, and of reads, for access tests.
     pub written: std::sync::Mutex<std::collections::BTreeSet<String>>,
     pub read: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// The put that `DETACH_STATE_PUT` kept.
+    detached: std::sync::Mutex<Option<(Path, PutPayload, PutOptions)>>,
 }
 
 pub(crate) const FAIL_PUT: u8 = 1;
@@ -56,7 +58,28 @@ pub(crate) const DELAY_SHARED: u8 = 16;
 /// direct read, so only this mode fails a read that goes through the block cache.
 pub(crate) const LOSE_SST_TWICE: u8 = 10;
 /// Fail every SST read with a retryable error, like a local file with a persistent I/O error.
-pub(crate) const RETRYABLE_SST_GET: u8 = 11;
+pub(crate) const RETRYABLE_SST_GET: u8 = 17;
+/// Report the next two SST reads as missing, like `LOSE_SST_TWICE`. Then fail every read, like
+/// `FAIL_GET`.
+pub(crate) const LOSE_SST_TWICE_THEN_FAIL: u8 = 18;
+/// The second step of `LOSE_SST_TWICE_THEN_FAIL`.
+const LOSE_SST_ONCE_THEN_FAIL: u8 = 19;
+/// Fail every delete in the shared database, like a credential that can create but not delete
+/// objects there.
+pub(crate) const FAIL_STATE_DELETE: u8 = 20;
+/// Store the next put in the shared database, then report a timeout, like a reply that the
+/// network lost.
+pub(crate) const LOSE_STATE_PUT_REPLY: u8 = 21;
+/// Fail every put and every delete in the shared database, like a read-only credential.
+pub(crate) const READ_ONLY_STATE: u8 = 22;
+/// Report a timeout for the next put in the shared database, and keep the put. `land` writes it
+/// later, like a request that reaches the store after its caller stopped waiting.
+pub(crate) const DETACH_STATE_PUT: u8 = 23;
+/// Delete each object in the shared database, then report a refusal, like a refused delete of
+/// an object that another client removed.
+pub(crate) const GONE_STATE_DELETE: u8 = 24;
+/// Delete each object in the shared database, then report it as not found.
+pub(crate) const NOT_FOUND_STATE_DELETE: u8 = 25;
 
 impl FaultStore {
     pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
@@ -69,7 +92,15 @@ impl FaultStore {
             delay_ms: std::sync::atomic::AtomicU64::new(120),
             written: Default::default(),
             read: Default::default(),
+            detached: Default::default(),
         }
+    }
+
+    /// Write the put that `DETACH_STATE_PUT` kept.
+    pub async fn land(&self) -> Result<PutResult> {
+        let detached = self.detached.lock().unwrap().take();
+        let (path, payload, options) = detached.expect("no detached put");
+        self.inner.put_opts(&path, payload, options).await
     }
 
     pub fn set(&self, mode: u8) {
@@ -142,9 +173,40 @@ impl ObjectStore for FaultStore {
         self.written.lock().unwrap().insert(path.to_string());
         self.stall(path).await;
         self.lag(path).await;
-        if self.mode.load(Ordering::SeqCst) == FAIL_STATE_PUT && state(path) {
+        if matches!(
+            self.mode.load(Ordering::SeqCst),
+            FAIL_STATE_PUT | READ_ONLY_STATE
+        ) && state(path)
+        {
             self.entered.add_permits(1);
             return Err(error());
+        }
+        let order = Ordering::SeqCst;
+        if state(path)
+            && self
+                .mode
+                .compare_exchange(DETACH_STATE_PUT, 0, order, order)
+                .is_ok()
+        {
+            *self.detached.lock().unwrap() = Some((path.clone(), payload, options));
+            return Err(Error::Generic {
+                store: "injected",
+                source: std::io::Error::new(std::io::ErrorKind::TimedOut, "detached put").into(),
+            });
+        }
+        let order = Ordering::SeqCst;
+        if state(path)
+            && self
+                .mode
+                .compare_exchange(LOSE_STATE_PUT_REPLY, 0, order, order)
+                .is_ok()
+        {
+            self.inner.put_opts(path, payload, options).await?;
+            self.entered.add_permits(1);
+            return Err(Error::Generic {
+                store: "injected",
+                source: std::io::Error::new(std::io::ErrorKind::TimedOut, "lost reply").into(),
+            });
         }
         if path.as_ref().ends_with(".sst") {
             match self.mode.load(Ordering::SeqCst) {
@@ -201,11 +263,18 @@ impl ObjectStore for FaultStore {
             }
         }
         let mode = self.mode.load(Ordering::SeqCst);
-        if (mode == LOSE_SST_ONCE || mode == LOSE_SST_TWICE) && path.as_ref().ends_with(".sst") {
-            let next = if mode == LOSE_SST_TWICE {
-                LOSE_SST_ONCE
-            } else {
-                0
+        let losing = [
+            LOSE_SST_ONCE,
+            LOSE_SST_TWICE,
+            LOSE_SST_TWICE_THEN_FAIL,
+            LOSE_SST_ONCE_THEN_FAIL,
+        ];
+        if losing.contains(&mode) && path.as_ref().ends_with(".sst") {
+            let next = match mode {
+                LOSE_SST_TWICE => LOSE_SST_ONCE,
+                LOSE_SST_TWICE_THEN_FAIL => LOSE_SST_ONCE_THEN_FAIL,
+                LOSE_SST_ONCE_THEN_FAIL => FAIL_GET,
+                _ => 0,
             };
             self.mode.store(next, Ordering::SeqCst);
             self.entered.add_permits(1);
@@ -244,7 +313,39 @@ impl ObjectStore for FaultStore {
         &self,
         paths: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
-        self.inner.delete_stream(paths)
+        let mode = self.mode.load(Ordering::SeqCst);
+        let faulty = [
+            FAIL_STATE_DELETE,
+            READ_ONLY_STATE,
+            GONE_STATE_DELETE,
+            NOT_FOUND_STATE_DELETE,
+        ];
+        if !faulty.contains(&mode) {
+            return self.inner.delete_stream(paths);
+        }
+        use futures::StreamExt;
+        let inner = self.inner.clone();
+        paths
+            .then(move |path| {
+                let inner = inner.clone();
+                async move {
+                    let path = path?;
+                    if !state(&path) {
+                        return inner.delete(&path).await.map(|()| path);
+                    }
+                    if mode == GONE_STATE_DELETE || mode == NOT_FOUND_STATE_DELETE {
+                        inner.delete(&path).await?;
+                    }
+                    if mode == NOT_FOUND_STATE_DELETE {
+                        return Err(Error::NotFound {
+                            path: path.to_string(),
+                            source: "injected".into(),
+                        });
+                    }
+                    Err(error())
+                }
+            })
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {

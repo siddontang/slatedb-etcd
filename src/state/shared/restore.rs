@@ -745,8 +745,9 @@ impl Every {
 ///
 /// A restore into a cluster that an ordinary start or another snapshot created fails. Members
 /// with the same file wait while one of them holds the lease. A member takes over a lease that
-/// stays unchanged for `STALE` and continues the restore. To abandon a partial restore, stop
-/// every member and delete `shared/` under the cluster prefix.
+/// stays unchanged for `STALE` and continues the restore. To abandon a partial restore, follow
+/// "Abandon a partial restore" in `docs/shared-state-guide.md`. It keeps `shared/owner.json`,
+/// because the member directories recorded its store ID.
 pub(crate) async fn seed(
     source: &Source,
     admin: &slatedb::admin::Admin,
@@ -800,8 +801,9 @@ pub(crate) async fn seed(
                     _ if facts.lease == Lease::Ours => {
                         return Err(error.context(
                             "the restore of this snapshot did not complete; start it again, or \
-                             stop every member and delete shared/ under the cluster prefix (see \
-                             docs/shared-state-guide.md)",
+                             abandon it as in \"Abandon a partial restore\" in \
+                             docs/shared-state-guide.md: stop every member, keep \
+                             shared/owner.json, and delete the other shared/ objects",
                         ))
                     }
                     // The writer of a member that took the lease fences this one.
@@ -866,6 +868,16 @@ async fn write_steps(
                 };
                 db.create_checkpoint(slatedb::config::CheckpointScope::Durable, &options)
                     .await?;
+                // The restore runs before Raft, so no voter clock check applies. Each leader
+                // waits until its clock passes this tick. See "Clocks" in the design.
+                let local_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_millis() as i64);
+                tracing::info!(
+                    clock_tick = db.manifest().last_l0_clock_tick(),
+                    local_ms,
+                    "the restore checkpoint holds the writer clock of this host"
+                );
                 #[cfg(test)]
                 restore.hooks.stop_at(Stop::AfterCheckpoint)?;
             }

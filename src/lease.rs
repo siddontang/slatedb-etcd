@@ -83,21 +83,31 @@ pub async fn load(db: &impl StateRead) -> anyhow::Result<BTreeMap<i64, LeaseReco
 pub type LeaseChange = Option<(i64, Option<LeaseRecord>)>;
 pub type PreparedLease = (LeaseReply, WriteBatch, i64, LeaseChange);
 
-pub async fn prepare(
+/// Evaluate a lease command in apply. `index_keys` must describe the applied current rows of
+/// `db`.
+pub(crate) async fn prepare_with_counts(
     db: &impl StateRead,
+    index_keys: Option<&crate::state::key_index::KeyIndex>,
     revision: i64,
     compact_revision: i64,
     index: u64,
     leases: &BTreeMap<i64, LeaseRecord>,
     command: &LeaseCommand,
-) -> Result<PreparedLease, KvError> {
-    let (prepared, _) =
-        prepare_with_counts(db, None, revision, compact_revision, index, leases, command).await?;
-    Ok(prepared)
+) -> Result<(PreparedLease, u64), mvcc::ApplyError> {
+    let evaluated = evaluate(
+        db,
+        index_keys,
+        revision,
+        compact_revision,
+        index,
+        leases,
+        command,
+    );
+    Ok(evaluated.await?)
 }
 
-/// Evaluate a lease command. `index_keys` must describe the applied current rows of `db`.
-pub(crate) async fn prepare_with_counts(
+/// The body of `prepare_with_counts`, with the raw request error.
+async fn evaluate(
     db: &impl StateRead,
     index_keys: Option<&crate::state::key_index::KeyIndex>,
     revision: i64,
@@ -194,7 +204,7 @@ pub(crate) async fn prepare_with_counts(
         if let Some(record) = record {
             batch.put(
                 key(*id),
-                crate::codec::encode(record).map_err(KvError::storage)?,
+                crate::codec::encode(record).map_err(KvError::invariant)?,
             );
         } else {
             batch.delete(key(*id));

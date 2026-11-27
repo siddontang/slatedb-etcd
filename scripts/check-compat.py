@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 
 from reporting import write_report
+from rustfs_fixture import shared_store
 
 
 def main():
@@ -46,32 +47,36 @@ def main():
         "log": str(log),
         "tests": [],
     }
-    process = subprocess.Popen(
-        command, cwd=root / "tests" / args.suite,
-        env=dict(os.environ, SLATEDB_ETCD_BINARY=str(binary),
-                 SLATEDB_UPSTREAM_ALL="1" if args.all_capabilities else "0"),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )
-    output = []
-    messages = {}
-    for line in process.stdout:
-        output.append(line)
-        try:
-            event = json.loads(line)
-        except ValueError:
-            print(line, end="")
-            continue
-        name = event.get("Test")
-        if name and event.get("Output"):
-            messages.setdefault(name, []).append(event["Output"].strip())
-        if event.get("Action") in ("pass", "fail", "skip") and event.get("Test"):
-            result = {"name": name, "result": event["Action"], "seconds": event.get("Elapsed")}
-            if event["Action"] != "pass":
-                result["details"] = messages.get(name, [])
-            report["tests"].append(result)
-            if "/" not in event["Test"] or event["Action"] != "pass":
-                print(event["Action"], event["Test"], flush=True)
-    code = process.wait()
+    # Clusters of several members run in shared state mode on one RustFS server. A failed start
+    # must not leave an earlier passed report.
+    with shared_store(args.output, report) as store:
+        report["object_store"] = store
+        process = subprocess.Popen(
+            command, cwd=root / "tests" / args.suite,
+            env=dict(os.environ, SLATEDB_ETCD_BINARY=str(binary),
+                     SLATEDB_UPSTREAM_ALL="1" if args.all_capabilities else "0"),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        output = []
+        messages = {}
+        for line in process.stdout:
+            output.append(line)
+            try:
+                event = json.loads(line)
+            except ValueError:
+                print(line, end="")
+                continue
+            name = event.get("Test")
+            if name and event.get("Output"):
+                messages.setdefault(name, []).append(event["Output"].strip())
+            if event.get("Action") in ("pass", "fail", "skip") and event.get("Test"):
+                result = {"name": name, "result": event["Action"], "seconds": event.get("Elapsed")}
+                if event["Action"] != "pass":
+                    result["details"] = messages.get(name, [])
+                report["tests"].append(result)
+                if "/" not in event["Test"] or event["Action"] != "pass":
+                    print(event["Action"], event["Test"], flush=True)
+        code = process.wait()
     log.write_text("".join(output))
     counts = Counter(test["result"] for test in report["tests"])
     report["counts"] = dict(counts)

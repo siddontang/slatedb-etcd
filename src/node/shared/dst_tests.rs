@@ -9,11 +9,16 @@ impl Simulation {
     /// member restarts once. A record above its checkpoint row opens that checkpoint at its row
     /// and raises it.
     pub(super) async fn restart_above_rows(&mut self) {
-        if self.leader().is_some() {
-            let follower = self.follower(0);
-            let node = self.nodes.get_mut(&follower).unwrap();
-            if node.raw.request_snapshot().is_ok() {
-                self.trace.push(format!("request snapshot {follower}"));
+        if let Some(leader) = self.leader() {
+            // A failed writer step can leave a follower stopped. The first running one asks. A
+            // leader can keep its role after both followers stopped, and then none asks.
+            let follower =
+                (1..=self.members).find(|id| *id != leader && self.nodes.contains_key(id));
+            if let Some(follower) = follower {
+                let node = self.nodes.get_mut(&follower).unwrap();
+                if node.raw.request_snapshot().is_ok() {
+                    self.trace.push(format!("request snapshot {follower}"));
+                }
             }
             self.settle(10).await;
         }
@@ -53,7 +58,7 @@ impl Simulation {
         let health = node
             .writer
             .as_ref()
-            .map(|writer| writer.health.report(term));
+            .map(|writer| writer.health.report(term, None));
         let health = coverage.and(health);
         self.nodes
             .get_mut(&leader)
@@ -147,24 +152,6 @@ impl Simulation {
         }
     }
 
-    /// Shared mode: compare the loaded fields of each member with the first member seen at its
-    /// index. A member that opens or installs a base above its row must equal one that applied.
-    pub(super) fn check_loaded(&mut self) {
-        if self.shared.is_none() {
-            return;
-        }
-        for (&id, node) in &self.nodes {
-            let state = node.worker.state();
-            let fields = state.loaded_fields();
-            let first = self.loaded.entry(state.applied).or_insert(fields.clone());
-            assert_eq!(
-                *first, fields,
-                "seed {}: member {id} loaded other fields at {}",
-                self.seed, state.applied
-            );
-        }
-    }
-
     /// Propose a Put on the leader that no client waits for. With `ignore_value` on a missing
     /// key it fails, so it changes no state and stores no batch.
     pub(super) async fn propose_put(&mut self, put: PutRequest) {
@@ -219,25 +206,6 @@ impl Simulation {
             .collect()
     }
 
-    /// Open, materialize, checkpoint, and announce on the leader.
-    async fn publish_view(&mut self, writers: &mut BTreeMap<u64, shared::DstWriter>) {
-        let leader = self.leader().unwrap();
-        for step in [
-            WriterStep::Open,
-            WriterStep::Materialize,
-            WriterStep::Checkpoint,
-            WriterStep::Announce,
-        ] {
-            let open = writers
-                .get(&leader)
-                .is_some_and(|writer| writer.db.is_some());
-            if matches!(step, WriterStep::Open) && open {
-                continue;
-            }
-            self.writer_step(writers, leader, step).await;
-        }
-    }
-
     /// Complete the manual checkpoints of member `id` that its base allows, as the run loop
     /// does after each event.
     fn finish_checkpoints(&mut self, id: u64) {
@@ -254,13 +222,6 @@ impl Simulation {
             .unwrap()
             .queue
             .pushed()
-    }
-
-    /// The base index, the checkpoint, and the overlay bytes of member `id`.
-    fn base(&self, id: u64) -> (u64, Option<uuid::Uuid>, u64) {
-        let state = self.nodes[&id].worker.state();
-        let (index, _, bytes) = state.view_status().unwrap();
-        (index, state.base_checkpoint(), bytes)
     }
 }
 
@@ -523,6 +484,7 @@ async fn a_follower_manual_checkpoint_completes_with_a_certified_base() {
         writer.db.as_ref().unwrap().clone(),
         queue,
         progress,
+        shared::Gate::unchecked(),
     ));
     let mut polls = 0;
     tokio::select! {
@@ -717,7 +679,8 @@ async fn a_member_restarts_at_a_record_above_its_checkpoint_row() {
     let state = sim.nodes[&member].worker.state();
     assert_eq!((state.applied, state.applied_term), (c, term2));
     assert_eq!(state.base_checkpoint(), Some(x));
-    assert_eq!(Some(&state.loaded_fields()), sim.loaded.get(&c));
+    let reference = sim.reference.as_ref().unwrap();
+    assert_eq!(Some(&state.loaded_fields()), reference.loaded(c));
     sim.settle(4).await;
     sim.propose().await;
     sim.settle(4).await;
@@ -1884,4 +1847,19 @@ async fn a_transfer_after_a_snapshot_in_one_batch_is_ignored() {
         sim.nodes[&member].state.applied,
         sim.nodes[&other].state.applied
     );
+}
+
+/// A leader can keep its role after both followers stop. The end of a shared schedule then asks no
+/// follower for a snapshot, and it restarts every member.
+#[tokio::test]
+async fn a_shared_schedule_ends_when_only_the_leader_runs() {
+    let mut sim = Simulation::with_mode(109, true).await;
+    sim.settle(4).await;
+    let leader = sim.leader().unwrap();
+    for id in (1..=3).filter(|id| *id != leader) {
+        sim.stop(id);
+    }
+    assert_eq!(sim.leader(), Some(leader));
+    sim.restart_above_rows().await;
+    assert_eq!(sim.nodes.len(), 3);
 }

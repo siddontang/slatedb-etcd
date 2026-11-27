@@ -42,6 +42,11 @@ type cluster struct {
 	readyTimeout time.Duration
 	// deferStart leaves the members stopped. The test starts them and waits for readiness.
 	deferStart bool
+	// sharedStore puts a cluster of one voter in shared state mode on RustFS too, for example
+	// before a learner joins it. A cluster of several members always uses RustFS.
+	sharedStore bool
+	// storeArgs holds the shared state flags of every member, also of a member that joins later.
+	storeArgs []string
 }
 
 func listenLocal(t *testing.T) net.Listener {
@@ -116,6 +121,9 @@ func newClusterConfigured(t *testing.T, size int, configure func(*cluster), extr
 	if configure != nil {
 		configure(c)
 	}
+	if size > 1 || c.sharedStore {
+		c.storeArgs = sharedStoreArgs(t, root, extraArgs)
+	}
 	t.Log("Process logs and data:", root)
 	t.Cleanup(func() {
 		for id := range c.processes {
@@ -143,10 +151,43 @@ func newClusterConfigured(t *testing.T, size int, configure func(*cluster), extr
 	return c
 }
 
+// sharedStoreArgs returns the flags that put every member of the cluster in `root` in shared state
+// mode on the RustFS server of scripts/check-compat.py. Each cluster has its own S3 prefix. A test
+// that sets `--state-mode` itself keeps its own storage flags.
+func sharedStoreArgs(t *testing.T, root string, args []string) []string {
+	t.Helper()
+	for _, arg := range args {
+		if arg == "--state-mode" || strings.HasPrefix(arg, "--state-mode=") {
+			return nil
+		}
+	}
+	endpoint, bucket := os.Getenv("SLATEDB_S3_TEST_ENDPOINT"), os.Getenv("SLATEDB_S3_TEST_BUCKET")
+	if endpoint == "" || bucket == "" {
+		t.Fatal("A cluster of several members needs RustFS. Run scripts/check-compat.py, or " +
+			"run go test through scripts/rustfs_fixture.py")
+	}
+	return storeFlags(endpoint, bucket, "compat/"+filepath.Base(root))
+}
+
+// storeFlags returns the shared state flags of one member. The Python launchers build the same
+// flags with `shared_args` in scripts/rustfs_fixture.py. The downstream module, which cannot
+// import this test package, has a copy in tests/downstream/storage_test.go.
+func storeFlags(endpoint, bucket, prefix string) []string {
+	flags := []string{"--state-mode", "shared", "--s3-bucket", bucket, "--s3-prefix", prefix}
+	if endpoint != "" {
+		flags = append(flags, "--s3-endpoint", endpoint)
+		if strings.HasPrefix(endpoint, "http://") {
+			flags = append(flags, "--s3-allow-http")
+		}
+	}
+	return flags
+}
+
 func (c *cluster) start(id int) {
 	c.t.Helper()
 	args := []string{"--id", strconv.Itoa(id), "--listen", endpointHost(c.addresses[id-1]), "--dir", filepath.Join(c.root, fmt.Sprintf("node-%d", id)), "--cluster-id", filepath.Base(c.root), "--snapshot-every", fmt.Sprint(c.snapshotEvery), "--enable-fault-controls"}
 	args = append(args, c.args...)
+	args = append(args, c.storeArgs...)
 	peers := c.addresses
 	if len(c.peerAddresses) != 0 {
 		peers = c.peerAddresses
@@ -481,7 +522,10 @@ func mustCall(t *testing.T, c *clientv3.Client, op clientv3.Op) proto.Message {
 }
 
 func TestFailoverAndSnapshotRecovery(t *testing.T) {
-	c := newCluster(t)
+	// Replicated mode only. In shared state mode a restarted member adopts the newest shared
+	// checkpoint when it starts, so it installs no Raft snapshot. The removal of replicated mode
+	// must replace this test.
+	c := newCluster(t, "--state-mode", "replicated")
 	clients := make([]*clientv3.Client, 3)
 	for i, addr := range c.addresses {
 		clients[i] = client(t, []string{addr})

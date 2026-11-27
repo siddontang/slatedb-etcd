@@ -32,14 +32,18 @@ The benchmark records state counters outside the measured resource phase.
 
 ## Run a node manually
 
-Run this command in three terminals. Set `NODE_ID` to 1, 2, and 3, respectively.
+Start RustFS as in the [quick start](getting-started.md#start-three-nodes). Then run this command
+in three terminals. Set `NODE_ID` to 1, 2, and 3, respectively.
 
 ```sh
+. tmp/rustfs.env
 NODE_ID=1
 target/release/slatedb-etcd \
   --id "$NODE_ID" --listen "127.0.0.1:700$NODE_ID" \
   --peer 1=127.0.0.1:7001 --peer 2=127.0.0.1:7002 --peer 3=127.0.0.1:7003 \
-  --dir "tmp/raft-poc/node-$NODE_ID" --cluster-id demo --snapshot-every 1000
+  --dir "tmp/raft-poc/node-$NODE_ID" --cluster-id demo --snapshot-every 1000 \
+  --state-mode shared --s3-bucket "$SLATEDB_S3_TEST_BUCKET" \
+  --s3-endpoint "$SLATEDB_S3_TEST_ENDPOINT" --s3-allow-http
 ```
 
 Check each `/status` endpoint to find the leader. Send requests to that node:

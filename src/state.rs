@@ -478,6 +478,22 @@ impl StateMachine {
         reads: StateView,
         shared: Option<shared::Shared>,
     ) -> Result<Self> {
+        let shared_mode = shared.is_some();
+        let mut state = Self::load_rows(db, admin, location, rows, reads, shared_mode).await?;
+        state.shared = shared;
+        Ok(state)
+    }
+
+    /// Build the derived state from `reads` without the shared-mode overlay. The caller adds
+    /// it. `shared_mode` skips the cluster quota, which only replicated mode stores.
+    async fn load_rows(
+        db: Option<Arc<Db>>,
+        admin: Arc<slatedb::admin::Admin>,
+        location: Arc<transfer::Location>,
+        rows: Arc<rows::RowCache>,
+        reads: StateView,
+        shared_mode: bool,
+    ) -> Result<Self> {
         let applied = decode_applied(reads.get(APPLIED).await?)?;
         let applied_term = read_applied_term(&reads, applied).await?;
         let revision = read_revision(&reads).await?;
@@ -501,9 +517,9 @@ impl StateMachine {
         // A shared base from an older binary has only the total in `shared::LOGICAL_BYTES`, and
         // its apply marker is past any counter row, so the open counts the split again.
         let logical_bytes = load_logical_size(&reads, applied).await?;
-        let (cluster_quota, quota_boundary) = match &shared {
-            Some(_) => (None, 0),
-            None => quota::load(&reads).await?,
+        let (cluster_quota, quota_boundary) = match shared_mode {
+            true => (None, 0),
+            false => quota::load(&reads).await?,
         };
         Ok(Self {
             members: Arc::new(members),
@@ -539,7 +555,7 @@ impl StateMachine {
             members_mismatch: None,
             members_checked: None,
             reads,
-            shared,
+            shared: None,
         })
     }
 
@@ -581,6 +597,41 @@ impl StateMachine {
         &self.reads
     }
 
+    /// Open an empty in-memory state for the reference of the deterministic simulation.
+    ///
+    /// Apply writes each batch into one sorted map at once. The state has no SlateDB database,
+    /// no overlay, no base, no materializer, and no checkpoint. Apply uses the rules of shared
+    /// state mode, because the members of a shared-mode simulation use them. The checkpoint
+    /// namespace is in an unused in-memory object store, and no apply path reads it.
+    #[cfg(test)]
+    pub(crate) async fn open_memory() -> Result<Self> {
+        let store = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let backend = transfer::Backend::Local;
+        let cache = StateCache::default();
+        let location =
+            transfer::Location::open(store.clone(), "state", backend, false, cache, None).await?;
+        let admin = Arc::new(slatedb::admin::Admin::builder(location.root(), store).build());
+        let rows = Arc::new(rows::RowCache::new(0));
+        let reads = StateView::Memory(view::MemoryView::default());
+        Self::load(None, admin, location, rows, reads, None).await
+    }
+
+    /// Return true for a state from `open_memory`.
+    #[cfg(test)]
+    pub(crate) fn is_memory(&self) -> bool {
+        matches!(self.reads, StateView::Memory(_))
+    }
+
+    /// Write `batch` into a state from `open_memory`, outside apply. A test changes the rows
+    /// with this.
+    #[cfg(test)]
+    pub(crate) fn write_memory(&mut self, batch: &WriteBatch) {
+        let StateView::Memory(rows) = &mut self.reads else {
+            panic!("the state is not in memory");
+        };
+        rows.write(batch);
+    }
+
     /// Pin the applied state for a read that runs outside apply.
     pub(crate) fn pinned_state(&self) -> Result<StateView> {
         if let Some(shared) = &self.shared {
@@ -602,7 +653,8 @@ impl StateMachine {
     async fn write_batch(&mut self, batch: WriteBatch, index: u64) -> Result<()> {
         let size = batch
             .logical_size(self.applied_state(), &self.key_index, self.logical_bytes)
-            .await?;
+            .await
+            .map_err(crate::mvcc::storage_fault::read_cause)?;
         let size = self.store_batch(batch, index, size).await?;
         self.logical_bytes = size;
         self.applied_term = self.entry_term;
@@ -657,14 +709,16 @@ impl StateMachine {
         }
         self.put_logical_size(&mut batch, index, size);
         let batch = Arc::new(batch);
-        match &mut self.shared {
-            None => {
+        match (&mut self.shared, &mut self.reads) {
+            #[cfg(test)]
+            (None, StateView::Memory(rows)) => rows.write(&batch),
+            (None, _) => {
                 self.db()
                     .write_with_options(batch.to_storage(), &WriteOptions { seqnum: index })
                     .await?;
             }
             // Apply reads the overlay at once. The leader materializer writes the `Db` later.
-            Some(shared) => shared.overlay.push(index, batch.clone()),
+            (Some(shared), _) => shared.overlay.push(index, batch.clone()),
         }
         self.write_batches += 1;
         if members_saved {
@@ -736,24 +790,7 @@ pub(crate) fn applied_term_row(index: u64, term: u64) -> [u8; 16] {
     row
 }
 
-/// A stored object of the shared state that does not decode, or that contradicts another one.
-/// Each writer reads the same objects, so the error describes the shared store, not the applied
-/// state of one member. A writer task halts on it instead of stopping the member.
-#[derive(Debug)]
-pub(crate) struct StoredData(String);
-
-impl std::fmt::Display for StoredData {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for StoredData {}
-
-/// A `StoredData` error with `message`.
-pub(crate) fn stored(message: impl std::fmt::Display) -> anyhow::Error {
-    anyhow::Error::new(StoredData(message.to_string()))
-}
+pub(crate) use crate::mvcc::storage_fault::stored;
 
 /// Decode the `meta/applied` row. A state without the row has applied nothing.
 fn decode_applied(row: Option<bytes::Bytes>) -> Result<u64> {

@@ -56,10 +56,11 @@ rcgen = "0.14.10"
 time = "0.3"
 async-trait = "0.1"
 futures = "0.3"
+# The SlateDB clock of the shared writer returns `chrono` times.
+chrono = { version = "0.4", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
-chrono = { version = "0.4", default-features = false }
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 tikv-jemallocator = { version = "0.6", optional = true }
