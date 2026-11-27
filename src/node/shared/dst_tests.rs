@@ -1823,3 +1823,37 @@ async fn a_new_writer_announces_a_stranded_checkpoint_until_it_applies() {
     sim.settle(4).await;
     assert_eq!(sim.announcements().len(), announced + 2);
 }
+
+/// #109: a follower misses a few entries, and the leader then moves its base above them. The
+/// leader must keep those entries, so the follower catches up from the log. A snapshot would
+/// make the follower load the whole key index from the checkpoint again.
+#[tokio::test]
+async fn a_follower_a_few_entries_behind_the_base_catches_up_from_the_log() {
+    let mut sim = Simulation::new(43).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(3).await;
+    let leader = sim.leader().unwrap();
+    let member = sim.follower(0);
+    let last = sim.nodes[&member].raw.raft.raft_log.last_index();
+    sim.isolated = Some(member);
+    sim.write(3).await;
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.write(10).await;
+    let (base, _, _) = sim.base(leader);
+    let node = &sim.nodes[&leader];
+    let every = node.options.snapshot_every;
+    assert!(
+        base > last && base - last <= every,
+        "base {base} last {last}"
+    );
+    // The leader keeps the entries that the follower needs.
+    assert!(node.raw.store().snapshot_index() <= last);
+    sim.isolated = None;
+    sim.settle(4).await;
+    let node = &sim.nodes[&member];
+    assert_eq!(node.state.applied, sim.nodes[&leader].state.applied);
+    assert_eq!(node.installed_snapshots, 0);
+    assert!(sim.nodes[&leader].raw.store().snapshot_index() >= base);
+}

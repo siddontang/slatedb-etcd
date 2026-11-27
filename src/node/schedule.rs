@@ -84,8 +84,22 @@ impl Node {
             && applied > snapshot_index
             && !store.image_wanted()
             && self.checkpoint_waiters.is_empty()
-            && !self.sending_snapshot();
+            && !self.sending_snapshot()
+            && !self.follower_needs_log(applied);
         (image_due || truncate_due).then_some(image_due)
+    }
+
+    /// Return true on the leader while a follower is behind `base` by at most `snapshot_every`
+    /// entries. Truncation through `base` would send that follower a snapshot, and its install
+    /// loads the whole key index from the checkpoint. A follower further behind does not hold
+    /// the log. A new member stored no entry, and it needs a record that holds it.
+    fn follower_needs_log(&self, base: u64) -> bool {
+        let raft = &self.raw.raft;
+        raft.state == StateRole::Leader
+            && raft.prs().iter().any(|(_, progress)| {
+                (1..base).contains(&progress.matched)
+                    && base - progress.matched <= self.options.snapshot_every
+            })
     }
 
     /// The index that a checkpoint can cover: the base `F`.
