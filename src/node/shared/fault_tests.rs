@@ -734,9 +734,10 @@ async fn a_clock_refusal_does_not_wait_for_the_old_close() {
     // manifest in the background.
     first.writer().sync(false, 2, &events);
     first.writer().stop().await;
-    // The first clock check holds the next manifest read of the opened writer, and refuses
-    // only once that read waits. The read then holds the close of the refused writer. Each
-    // later check reads the real clock, so the next writer opens.
+    // The first clock check after the open holds the next manifest read of the opened writer,
+    // and refuses only once that read waits. The read then holds the close of the refused
+    // writer. Each later check reads the real clock, so the next writer opens. A check before
+    // the open finds no writer that polls its manifest, so it reads the real clock.
     let armed = Arc::new(AtomicBool::new(true));
     let mut skewed = clock();
     let now = clock().now_ms;
@@ -745,15 +746,16 @@ async fn a_clock_refusal_does_not_wait_for_the_old_close() {
         if !arm.swap(false, Ordering::SeqCst) {
             return now();
         }
-        // The opened writer polls its manifest in the background. Wait until that poll holds
-        // the read. The limit only guards against a hang.
+        // An opened writer polls its manifest in the background every 100 ms. Wait until that
+        // poll holds the read.
         store.set(PAUSE_MANIFEST_READ);
-        let limit = Instant::now() + Duration::from_secs(30);
+        let limit = Instant::now() + Duration::from_millis(500);
         while store.entered.available_permits() == 0 {
-            assert!(
-                Instant::now() < limit,
-                "the writer did not poll its manifest"
-            );
+            if Instant::now() >= limit {
+                store.set(0);
+                arm.store(true, Ordering::SeqCst);
+                return now();
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
         now() - 60_000
@@ -1073,6 +1075,41 @@ async fn a_defragment_gets_the_open_writer_with_its_clock() {
     leader.close().await;
 }
 
+/// SlateDB's default clock plus a fixed lead, for an admin that adds a late job.
+#[derive(Debug)]
+struct AheadBy(Duration, slatedb_common::clock::DefaultSystemClock);
+
+impl slatedb_common::clock::SystemClock for AheadBy {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        self.1.now() + self.0
+    }
+
+    fn sleep<'a>(
+        &'a self,
+        duration: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        self.1.sleep(duration)
+    }
+
+    fn ticker<'a>(&'a self, duration: Duration) -> slatedb_common::clock::SystemClockTicker<'a> {
+        slatedb_common::clock::SystemClockTicker::new(&self.1, duration)
+    }
+}
+
+/// Submit a compaction of every L0 SST, with a job ID `ahead` of the machine clock.
+async fn submit_ahead(leader: &Leader, ahead: Duration) {
+    use slatedb::compactor::{CompactionSpec, SourceId};
+    let source = &leader.handles.source;
+    let clock = AheadBy(ahead, slatedb_common::clock::DefaultSystemClock::new());
+    let admin = slatedb::admin::Admin::builder(source.state(), source.store.clone())
+        .with_system_clock(Arc::new(clock))
+        .build();
+    let manifest = admin.read_manifest(None).await.unwrap().unwrap();
+    let sources = manifest.l0().iter().map(|view| SourceId::SstView(view.id));
+    let spec = CompactionSpec::new(sources.collect(), 0);
+    admin.submit_compaction(spec).await.unwrap();
+}
+
 /// The compaction jobs of the shared state.
 async fn jobs(leader: &Leader) -> usize {
     let source = &leader.handles.source;
@@ -1099,6 +1136,41 @@ fn sample_peers(clock: &Clock) -> tokio::task::JoinHandle<()> {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
+}
+
+/// SlateDB 0.18.1 reports a refused ID time as an `Invalid` error. It is a clock condition. The
+/// writer opens again at once a few times with no fault, and then counts a clock fault.
+#[test]
+fn an_id_time_refusal_opens_the_writer_again_a_few_times() {
+    let refused = || {
+        let error = slatedb::Error::invalid(
+            "invalid clock tick, must be monotonic. last_tick=`50`, next_tick=`30`".into(),
+        );
+        anyhow::Error::from(error).context("the shared writer closed")
+    };
+    assert_eq!(classify(&refused()), Fault::Clock);
+    let other = anyhow::Error::from(slatedb::Error::invalid("an invalid range".into()));
+    assert!(!id_time_refused(&other));
+    let health = Health::default();
+    let task = health.begin();
+    let reopens = std::sync::atomic::AtomicU64::new(0);
+    for _ in 0..ID_TIME_REOPENS {
+        assert_eq!(
+            recover(refused(), 2, &task, &reopens).unwrap(),
+            Duration::ZERO
+        );
+    }
+    assert_eq!(health.consecutive(), 0);
+    assert!(!health.handoff_due());
+    assert_eq!(reopens.load(std::sync::atomic::Ordering::Relaxed), 3);
+    assert!(recover(refused(), 2, &task, &reopens).unwrap() > Duration::ZERO);
+    assert_eq!(health.status()["last_error_class"], "clock");
+    // A publication ends the count.
+    task.published();
+    assert_eq!(
+        recover(refused(), 2, &task, &reopens).unwrap(),
+        Duration::ZERO
+    );
 }
 
 /// A leader of three voters whose samples stay fresh, after its first publication.
@@ -1173,6 +1245,99 @@ async fn a_defragment_of_an_ended_term_submits_no_job() {
     let successor = leader.writer().open.lock().unwrap().clone().unwrap().db;
     assert!(successor.status().close_reason.is_none());
     sampling.abort();
+    leader.close().await;
+}
+
+/// Critic, round 3: a job reaches storage above the successor's floor, as a submission that was
+/// already inside the store update does. SlateDB refuses the successor's next compaction ID and
+/// closes its `Db`. The successor opens again at once above the job, in the same term, with no
+/// fault and no handoff, and it publishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_job_costs_one_reopen_and_no_handoff() {
+    let (mut leader, clock, sampling) = sampled_leader().await;
+    hand_over(&mut leader, &clock).await;
+    // Answer each announcement, and keep the highest announced row.
+    let (_, stub) = mpsc::channel(1);
+    let mut announced = std::mem::replace(&mut leader.announced, stub);
+    let row = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let answering = tokio::spawn({
+        let row = row.clone();
+        async move {
+            while let Some(event) = announced.recv().await {
+                if let Event::ViewCheckpoint(_, at, Some(reply)) = event {
+                    let _ = reply.send(true);
+                    row.fetch_max(at, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+    });
+    // The late job lands 3 s above the successor's clock. Four new L0 SSTs then make the
+    // compactor of the successor schedule a job below it.
+    submit_ahead(&leader, Duration::from_secs(3)).await;
+    for n in 0..4 {
+        leader.put(&format!("k{n}")).await;
+        let db = leader.writer().open.lock().unwrap().clone().unwrap().db;
+        let _ = db.flush().await;
+    }
+    let reopens = leader.writer().reopens.clone();
+    until(
+        "the reopen above the job",
+        Duration::from_secs(30),
+        async || reopens.load(std::sync::atomic::Ordering::Relaxed) > 0,
+    )
+    .await;
+    let index = leader.put("after").await;
+    until(
+        "a checkpoint of the reopened writer",
+        Duration::from_secs(30),
+        async || row.load(std::sync::atomic::Ordering::SeqCst) >= index,
+    )
+    .await;
+    answering.abort();
+    let health = leader.writer().health.clone();
+    assert_eq!(health.consecutive(), 0, "{}", health.status());
+    assert!(!health.handoff_due());
+    assert_eq!(health.status()["marked"], false);
+    sampling.abort();
+    leader.close().await;
+}
+
+/// Sig-Codex, round 3: a stored floor 60 s ahead of the clock refuses the writer before its
+/// open. The writer epoch in the manifest does not move, so no open and no fence happened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stored_floor_far_ahead_refuses_before_the_open() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut leader = Leader::open(store, Duration::from_millis(100), clock()).await;
+    leader.lead(2);
+    leader.covered(1, Duration::from_secs(10)).await;
+    let events = leader.events.clone();
+    leader.writer().sync(false, 2, &events);
+    leader.writer().stop().await;
+    submit_ahead(&leader, Duration::from_secs(60)).await;
+    let source = leader.handles.source.clone();
+    let epoch = || async {
+        let admin = slatedb::admin::Admin::builder(source.state(), source.store.clone()).build();
+        admin
+            .read_manifest(None)
+            .await
+            .unwrap()
+            .unwrap()
+            .writer_epoch()
+    };
+    let before = epoch().await;
+    leader.writer().sync(true, 3, &events);
+    let health = leader.writer().health.clone();
+    eventually("the clock refusal", async || {
+        health.status()["last_error_class"] == "clock"
+    })
+    .await;
+    assert_eq!(leader.writer().clock.alarm_name(), Some("behind"));
+    assert!(leader.writer().open.lock().unwrap().is_none());
+    assert_eq!(
+        epoch().await,
+        before,
+        "the writer opened before its clock check"
+    );
     leader.close().await;
 }
 

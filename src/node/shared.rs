@@ -775,16 +775,27 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
             }
         }
         // The gate starts at the floor of the stored state, so the compactor and the flushes of
-        // the new `Db` take no ID time below it. See `clock::stored_floor`.
+        // the new `Db` take no ID time below it. See `clock::stored_floor`. The behind check of
+        // that floor comes first, so a floor far ahead never reaches the gate or SlateDB.
         let opening = async {
             let stored = clock::stored_floor(&publisher.admin).await?;
+            if !clock.pass(stored).await {
+                return Ok(None);
+            }
             gate.floor(stored);
             let db = publisher.source.open_writer_on(gate.clone()).await?;
-            anyhow::Ok((db, stored))
+            anyhow::Ok(Some((db, stored)))
         };
         let opened = attempt(opening, &mut stopped, &mut health);
         let (db, stored) = match opened.await {
-            Attempt::Done(Ok((db, stored))) => {
+            Attempt::Done(Ok(None)) => {
+                delay = health.failed(
+                    fault::Fault::Clock,
+                    "the local clock is behind the stored writer clock",
+                );
+                continue;
+            }
+            Attempt::Done(Ok(Some((db, stored)))) => {
                 // The open wrote the manifest. The next step has its own timer.
                 health.progressed();
                 fenced = false;

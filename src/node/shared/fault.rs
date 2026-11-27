@@ -22,6 +22,8 @@ const DATA_RETRY_FIRST: Duration = Duration::from_secs(30);
 const DATA_RETRY_CAP: Duration = Duration::from_secs(5 * 60);
 /// Failures in a row after which the leader hands over its leadership.
 const HANDOFF_FAILURES: u32 = 3;
+/// ID time refusals in a row that open the writer again at once. A later one is a clock fault.
+const ID_TIME_REOPENS: u32 = 3;
 /// Due storage work that makes no durable progress for this time is a fault.
 pub(super) const STALL: Duration = Duration::from_secs(30);
 /// A failed writer that takes this long to close logs a warning.
@@ -67,7 +69,7 @@ impl Fault {
 /// flush failed, and the close hides the cause.
 pub(in crate::node) fn classify(error: &anyhow::Error) -> Fault {
     use crate::mvcc::storage_fault::StorageFault;
-    if error.chain().any(|cause| cause.is::<clock::ClockAhead>()) {
+    if error.chain().any(|cause| cause.is::<clock::ClockAhead>()) || id_time_refused(error) {
         return Fault::Clock;
     }
     if fenced(error) || open_conflict(error) {
@@ -101,6 +103,26 @@ pub(in crate::node) fn open_conflict(error: &anyhow::Error) -> bool {
 
 pub(in crate::node) use crate::state::shared::fenced;
 
+/// Return true when SlateDB refused an ID time or a tick below its newest one: an L0 SST, a
+/// compaction job, or a compaction output (`manifest/invariants.rs`,
+/// `compactions_store/invariants.rs`). SlateDB 0.18.1 reports each as an `Invalid` error whose
+/// message starts with this text, also as the stored error of a `Db` that its compactor task
+/// closed. The stored state is sound: the next open reads a higher floor. See
+/// `clock::stored_floor`.
+pub(in crate::node) fn id_time_refused(error: &anyhow::Error) -> bool {
+    const REFUSAL: &str = "invalid clock tick, must be monotonic";
+    error.chain().any(|cause| {
+        cause.downcast_ref::<slatedb::Error>().is_some_and(|error| {
+            let kind = error.kind();
+            let text = error.to_string();
+            kind == slatedb::ErrorKind::Invalid
+                && text
+                    .strip_prefix(&format!("{kind}: "))
+                    .is_some_and(|message| message.starts_with(REFUSAL))
+        })
+    })
+}
+
 /// Return the stored error of a writer that SlateDB closed. A failed background flush closes
 /// the `Db`, and the status then reports `Panic` for every kind of error. A call on the closed
 /// `Db` returns the stored error, which keeps its kind.
@@ -123,6 +145,15 @@ pub(super) fn recover(
     health: &TaskHealth,
     reopens: &std::sync::atomic::AtomicU64,
 ) -> Result<Duration> {
+    // Another writer of job records, such as the compactor of an older writer or a late
+    // Defragment, can add a job above the floor after this open read it. SlateDB then refuses
+    // the next ID and closes the `Db`. The next open starts above that job, so it opens again
+    // at once, with no fault. Repeated refusals are a clock fault.
+    if id_time_refused(&error) && health.id_time_reopen() <= ID_TIME_REOPENS {
+        tracing::warn!(term, %error, "SlateDB refused an ID time; open the writer again");
+        reopens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(Duration::ZERO);
+    }
     match classify(&error) {
         Fault::Fenced => {
             // Two quick elections can open writers in reverse term order. The step timer keeps
@@ -201,6 +232,8 @@ struct Record {
     stall_began: Option<Instant>,
     /// The node asked the task to drop its stalled step. The end of the stall clears it.
     restart: bool,
+    /// Writer opens in a row after SlateDB refused an ID time. A publication ends the count.
+    id_time_reopens: u32,
     /// The time of the newest fault, until this member's writer publishes again.
     mark: Option<Instant>,
     /// The time when this member's writer last created and announced a checkpoint.
@@ -247,6 +280,7 @@ impl Health {
         record.consecutive = 0;
         record.since = None;
         record.stall_began = None;
+        record.id_time_reopens = 0;
         record.done();
         TaskHealth {
             health: self.clone(),
@@ -516,8 +550,18 @@ impl TaskHealth {
             record.consecutive = 0;
             record.since = None;
             record.stall_began = None;
+            record.id_time_reopens = 0;
             record.done();
         });
+    }
+
+    /// Count a writer open after SlateDB refused an ID time, and return the count.
+    pub(super) fn id_time_reopen(&self) -> u32 {
+        self.update(|record| {
+            record.id_time_reopens += 1;
+            record.id_time_reopens
+        })
+        .unwrap_or(u32::MAX)
     }
 
     /// Wait until the node asks this task to drop its stalled attempt. A request that the end

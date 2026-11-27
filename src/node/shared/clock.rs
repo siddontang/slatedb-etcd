@@ -446,7 +446,10 @@ impl Clock {
     /// This member stopped leading. Its samples and its alarms of the ahead check end. A writer
     /// `Db` of the ended term keeps its last tick. See `Gate`.
     pub(in crate::node) fn stand_down(&self) {
+        // A stand-down does not make a clock managed: a test of the writer alone stays so.
+        let managed = self.voters.lock().unwrap().managed;
         self.configure(0, 0, BTreeMap::new());
+        self.voters.lock().unwrap().managed = managed;
         self.note_ahead(None);
         self.uncertain.store(false, Ordering::Relaxed);
         self.waiting.store(false, Ordering::Relaxed);
