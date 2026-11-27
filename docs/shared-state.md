@@ -73,9 +73,10 @@ The design depends on these rules. Later sections refer to them by number.
 1. **Prefix.** The shared `Db` holds the result of entries `1..=last_l0_seq` and nothing else.
    Apply writes one batch at the last index of each group (`put_batch.rs:170-171`). A batch holds
    final row values, so a batch that spans an index is still correct on top of a state below it.
-2. **One state writer.** Only the holder of the current writer epoch can commit L0 or compaction
-   changes. The publisher calls `Db::create_checkpoint`, which writes through the fenced manifest
-   of the writer (`memtable_flusher/manifest_writer.rs`). The admin checkpoint create, refresh,
+2. **One state writer.** Only the holder of the current writer epoch can commit L0 changes and
+   writer checkpoints. Compaction commits use the compactor epoch. The publisher calls
+   `Db::create_checkpoint`, which writes through the fenced manifest of the writer
+   (`memtable_flusher/manifest_writer.rs`). The admin checkpoint create, refresh,
    and delete calls and SlateDB GC write the manifest without an epoch check (`admin.rs:538-626`,
    `garbage_collector.rs:427-450`). Retention deletes through the admin, so it must stay safe
    when a deposed leader runs it.
