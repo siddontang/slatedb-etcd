@@ -86,7 +86,8 @@ pub struct Command {
 }
 
 /// A replicated command. The JSON form names the variant, so a command that this binary does not
-/// know, an unknown field, or a field with a wrong type does not decode. See `command`.
+/// know, an unknown direct field of a command, or a field with a wrong type does not decode. See
+/// `command`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub enum RaftCommand {
