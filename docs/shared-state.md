@@ -472,7 +472,7 @@ setup, one read pass then ran at about 9,500 ops/s in both modes.
 
 A member rebases when an apply read finds a missing SST. See [Read faults](#read-faults). A
 storage error in apply does not stop the node. A paused member over the overlay limit adopts an
-opened base instead of a rebase. See step 4 of the memory limit in [Overlay](#overlay).
+opened base instead of a rebase. See the memory limit in [Overlay](#overlay).
 
 1. Keep the entries that the job applied, with their replies. Publish no view until the rebase
    ends.
