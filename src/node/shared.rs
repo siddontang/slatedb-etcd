@@ -1172,6 +1172,7 @@ impl Node {
             self.state.applied,
             self.committed_ready,
             base,
+            self.state.base_checkpoint,
             bytes,
         );
         // A follower repeats the request of a waiting manual checkpoint.

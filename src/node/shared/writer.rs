@@ -486,14 +486,15 @@ impl Writer {
 
     /// Count a node tick. Set the gauges with the base index `base` and the overlay size
     /// `bytes`, request the publication of a follower's manual checkpoint on the leader, and
-    /// poll the checkpoints while apply waits. `committed` is the delivered commit index. Return
-    /// the tick count.
+    /// poll the checkpoints while apply waits. `committed` is the delivered commit index, and
+    /// `current` is the checkpoint of the base. Return the tick count.
     pub(super) fn tick(
         &mut self,
         leader: bool,
         applied: u64,
         committed: u64,
         base: u64,
+        current: Option<uuid::Uuid>,
         bytes: u64,
     ) -> u64 {
         self.ticks += 1;
@@ -522,7 +523,7 @@ impl Writer {
             }
         }
         if ticks.is_multiple_of(POLL_TICKS) && self.paused {
-            self.poll_checkpoints(base, committed);
+            self.poll_checkpoints(base, current, committed);
         }
         ticks
     }
@@ -533,8 +534,9 @@ impl Writer {
     /// The member can adopt only a base at or below the delivered commit `committed`. So the
     /// poll takes the newest base with its row in `(base, committed]`, and a later poll opens a
     /// newer one after the commit reaches it. The name of a checkpoint is only a lower bound of
-    /// its row, so the poll checks the row of each opened base.
-    fn poll_checkpoints(&self, base: u64, committed: u64) {
+    /// its row, so the poll checks the row of each opened base. It stops at the current
+    /// checkpoint `current`, because each older publication has no higher row.
+    fn poll_checkpoints(&self, base: u64, current: Option<uuid::Uuid>, committed: u64) {
         if self.polling.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
@@ -544,7 +546,8 @@ impl Writer {
         let opened = self.opened_slot.clone();
         tokio::spawn(async move {
             let result = async {
-                let newer = newest_base_between(&admin, &source, base + 1, committed).await?;
+                let newer =
+                    newest_base_between(&admin, &source, base + 1, committed, current).await?;
                 if let Some(newer) = newer {
                     opened.offer(newer, 0);
                 }
