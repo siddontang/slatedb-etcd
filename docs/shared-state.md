@@ -566,8 +566,9 @@ rebase again after the backoff.
   member sends a random ID of its process with its peer frames and its `ViewAck`, and the report
   also advertises the coverage capability. The capability holds only for the process that
   advertised it. A member that did not report yet has no capability.
-  - The leader certifies above a row only while every other member of the configuration has
-    the capability. Otherwise it announces at the row and serves no demand above its base.
+  - The leader certifies above a row without a check of the other members. It sends a record
+    above its row only to a peer whose current process has the capability (`Cache::snapshot`).
+    Another peer waits until it reports the capability.
   - A snapshot above its row goes to its own route, `/raft/covered`, with the process that
     advertised the capability. Another process answers 409 before Raft sees the snapshot. The
     answer ends the capability of the process that the snapshot named. A late answer for an
