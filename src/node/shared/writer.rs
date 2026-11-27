@@ -486,8 +486,17 @@ impl Writer {
 
     /// Count a node tick. Set the gauges with the base index `base` and the overlay size
     /// `bytes`, request the publication of a follower's manual checkpoint on the leader, and
-    /// poll the checkpoints while apply waits. Return the tick count.
-    pub(super) fn tick(&mut self, leader: bool, applied: u64, base: u64, bytes: u64) -> u64 {
+    /// poll the checkpoints while apply waits. `committed` is the delivered commit index, and
+    /// `current` is the checkpoint of the base. Return the tick count.
+    pub(super) fn tick(
+        &mut self,
+        leader: bool,
+        applied: u64,
+        committed: u64,
+        base: u64,
+        current: Option<uuid::Uuid>,
+        bytes: u64,
+    ) -> u64 {
         self.ticks += 1;
         let ticks = self.ticks;
         if let Some(gauges) = &self.gauges {
@@ -514,14 +523,20 @@ impl Writer {
             }
         }
         if ticks.is_multiple_of(POLL_TICKS) && self.paused {
-            self.poll_checkpoints(base);
+            self.poll_checkpoints(base, current, committed);
         }
         ticks
     }
 
     /// While apply waits, open the newest checkpoint above the base out of band. A switch job
     /// then releases the segments that it covers, including the open one.
-    fn poll_checkpoints(&self, base: u64) {
+    ///
+    /// The member can adopt only a base at or below the delivered commit `committed`. So the
+    /// poll takes the newest base with its row in `(base, committed]`, and a later poll opens a
+    /// newer one after the commit reaches it. The name of a checkpoint is only a lower bound of
+    /// its row, so the poll checks the row of each opened base. It stops at the current
+    /// checkpoint `current`, because each older publication has no higher row.
+    fn poll_checkpoints(&self, base: u64, current: Option<uuid::Uuid>, committed: u64) {
         if self.polling.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
@@ -531,13 +546,12 @@ impl Writer {
         let opened = self.opened_slot.clone();
         tokio::spawn(async move {
             let result = async {
-                let Some((seq, checkpoint)) = view_checkpoints(&admin).await?.pop() else {
-                    return anyhow::Ok(());
-                };
-                if seq > base {
-                    opened.offer(source.open_base(checkpoint.id).await?, 0);
+                let newer =
+                    newest_base_between(&admin, &source, base + 1, committed, current).await?;
+                if let Some(newer) = newer {
+                    opened.offer(newer, 0);
                 }
-                Ok(())
+                anyhow::Ok(())
             }
             .await;
             if let Err(error) = result {
@@ -545,6 +559,14 @@ impl Writer {
             }
             polling.store(false, std::sync::atomic::Ordering::Release);
         });
+    }
+
+    /// Tests: wait until the running checkpoint poll ends.
+    #[cfg(test)]
+    pub(in crate::node) async fn polled(&self) {
+        while self.polling.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
     }
 
     /// The writer report of this member in `term`. See `Health::report`.

@@ -749,18 +749,22 @@ pub(crate) fn gone(error: &anyhow::Error) -> bool {
 
 /// Open the newest `view-` checkpoint whose row is in `[low, high]` and that holds the
 /// membership. The name gives only a lower bound of the row, so each candidate opens and its own
-/// row decides.
+/// row decides. The search ends at checkpoint `stop`: each older publication has no higher row.
 ///
 /// A record above its checkpoint row needs that checkpoint, or one in this range: the leader
 /// certified that no entry in `(low, high]` changed state, so each checkpoint of this shared
 /// state with its row in the range holds the state at `high`.
-async fn newest_base_between(
+pub(crate) async fn newest_base_between(
     admin: &slatedb::admin::Admin,
     source: &Source,
     low: u64,
     high: u64,
+    stop: Option<uuid::Uuid>,
 ) -> Result<Option<Arc<Base>>> {
     for (seq, checkpoint) in view_checkpoints(admin).await?.into_iter().rev() {
+        if Some(checkpoint.id) == stop {
+            break;
+        }
         if seq > high {
             continue;
         }
@@ -790,7 +794,7 @@ async fn reopen_above_row(
         Err(error) => return Err(error),
     };
     let replacement = match row {
-        Some(row) => newest_base_between(admin, source, row, index).await?,
+        Some(row) => newest_base_between(admin, source, row, index, None).await?,
         None => None,
     };
     replacement.ok_or(error).with_context(|| {

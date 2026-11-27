@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use crate::mvcc::storage_fault::{StorageFault, CORRUPT_READS};
 use crate::mvcc::{KvError, Outcome};
 use crate::state::overlay::Queue;
-use crate::state::shared::{view_checkpoints, view_name, Handles, Source};
+use crate::state::shared::{newest_base_between, view_checkpoints, view_name, Handles, Source};
 
 /// The newest checkpoints that the publisher keeps. It also keeps every newer checkpoint than
 /// the oldest one that a live base pins.
@@ -1167,7 +1167,14 @@ impl Node {
         self.tick_writer_health();
         let (base, _, bytes) = self.state.view;
         let leader = self.raw.raft.state == StateRole::Leader;
-        let ticks = self.writer.tick(leader, self.state.applied, base, bytes);
+        let ticks = self.writer.tick(
+            leader,
+            self.state.applied,
+            self.committed_ready,
+            base,
+            self.state.base_checkpoint,
+            bytes,
+        );
         // A follower repeats the request of a waiting manual checkpoint.
         if !leader && ticks.is_multiple_of(RETRY_TICKS) {
             if let Some(index) = self

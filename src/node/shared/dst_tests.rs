@@ -1,5 +1,6 @@
 //! Shared-mode simulations of #96: coverage of a base above its row, the leader's demand for a
-//! base, and restarts at a record above the row.
+//! base, and restarts at a record above the row. Also the checkpoint poll of a member whose apply
+//! waits at the overlay hard limit (#103).
 
 use super::*;
 
@@ -1438,4 +1439,252 @@ async fn a_shared_schedule_ends_when_only_the_leader_runs() {
     assert_eq!(sim.leader(), Some(leader));
     sim.restart_above_rows().await;
     assert_eq!(sim.nodes.len(), 3);
+}
+
+impl Simulation {
+    /// Pause apply on member `id`: its overlay limit goes below half of its overlay bytes.
+    fn pause(&mut self, id: u64) {
+        let (_, _, bytes) = self.base(id);
+        assert!(bytes > 0);
+        let node = self.nodes.get_mut(&id).unwrap();
+        node.options.overlay_max_bytes = bytes / 3;
+        assert!(node.apply_paused());
+    }
+
+    /// Run the checkpoint poll of paused member `id`, as its ticks do, and wait for its end.
+    async fn poll(&mut self, id: u64) {
+        let node = self.nodes.get_mut(&id).unwrap();
+        // A paused member polls at every tenth tick.
+        for _ in 0..10 {
+            node.tick_shared().unwrap();
+        }
+        node.writer.polled().await;
+    }
+
+    /// The delivered commit index of member `id`.
+    fn committed(&self, id: u64) -> u64 {
+        self.nodes[&id].committed_ready
+    }
+}
+
+/// #103: a paused member, a checkpoint of the leader above the delivered commit of the member,
+/// and no commit progress. The run loop of the member must not wake again and again for a base
+/// that it cannot adopt. After the commit reaches the checkpoint, the next poll opens it, and the
+/// member adopts it.
+#[tokio::test]
+async fn a_paused_member_waits_for_the_commit_of_a_newer_checkpoint() {
+    let mut sim = Simulation::new(29).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(3).await;
+    let member = sim.follower(0);
+    sim.pause(member);
+    let applied = sim.nodes[&member].state.applied;
+    // The member gets the next entries but does not store them, so its commit stays.
+    sim.paused_log = Some(member);
+    sim.write(3).await;
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(2).await;
+    let (row, checkpoint, _) = sim.base(sim.leader().unwrap());
+    assert!(row > sim.committed(member));
+    sim.poll(member).await;
+    let node = sim.nodes.get_mut(&member).unwrap();
+    let mut wakes = 0;
+    for _ in 0..5 {
+        // The run loop wakes on an offer, and then runs the scheduler.
+        if futures::FutureExt::now_or_never(shared::next(&mut node.writer)).is_some() {
+            wakes += 1;
+        }
+        node.drive_ready().await.unwrap();
+        node.drain_apply().await.unwrap();
+    }
+    assert_eq!(wakes, 0, "wakes with no commit progress");
+    assert_eq!(node.state.applied, applied);
+    // The member stores the entries, and its commit reaches the checkpoint. Apply still waits.
+    sim.paused_log = None;
+    sim.settle(2).await;
+    assert!(sim.committed(member) >= row);
+    assert_eq!(sim.nodes[&member].state.applied, applied);
+    sim.poll(member).await;
+    sim.settle(1).await;
+    assert_eq!(sim.base(member).1, checkpoint);
+    assert_eq!(sim.nodes[&member].installed_snapshots, 0);
+}
+
+/// #103: a paused member, an older checkpoint that its delivered commit covers, and a newer one
+/// above that commit. The poll must open the older one, which the member can adopt.
+#[tokio::test]
+async fn a_paused_member_adopts_the_newest_checkpoint_that_its_log_commits() {
+    let mut sim = Simulation::new(29).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(3).await;
+    let member = sim.follower(0);
+    sim.pause(member);
+    let applied = sim.nodes[&member].state.applied;
+    sim.write(3).await;
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(2).await;
+    let (row, older, _) = sim.base(sim.leader().unwrap());
+    assert!(applied < row && row <= sim.committed(member));
+    sim.isolated = Some(member);
+    sim.write(3).await;
+    sim.publish_view(&mut writers).await;
+    sim.settle(2).await;
+    let (newer, _, _) = sim.base(sim.leader().unwrap());
+    assert!(newer > sim.committed(member));
+    sim.poll(member).await;
+    sim.settle(1).await;
+    let (base, checkpoint, _) = sim.base(member);
+    assert_eq!(checkpoint, older);
+    assert!(base >= row);
+}
+
+/// #103: a flush between the name of a checkpoint and its creation puts the base above the name.
+/// The name is at or below the delivered commit of a paused member, but the base is above it. The
+/// poll must check the opened base, and then adopt the older checkpoint below the commit.
+#[tokio::test]
+async fn a_paused_member_checks_the_opened_base_against_its_commit() {
+    let mut sim = Simulation::new(29).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(3).await;
+    let member = sim.follower(0);
+    let leader = sim.leader().unwrap();
+    sim.pause(member);
+    sim.write(3).await;
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(2).await;
+    let (older_row, older, _) = sim.base(leader);
+    assert!(older_row > sim.nodes[&member].state.applied);
+    let db = writers[&leader].db.clone().unwrap();
+    sim.write(2).await;
+    sim.writer_step(&mut writers, leader, WriterStep::Materialize)
+        .await;
+    db.flush().await.unwrap();
+    let name = db.manifest().last_l0_seq();
+    assert!(older_row < name && name <= sim.committed(member));
+    // A second flush lands before the checkpoint of `name` is created.
+    sim.isolated = Some(member);
+    sim.write(3).await;
+    sim.writer_step(&mut writers, leader, WriterStep::Materialize)
+        .await;
+    db.flush().await.unwrap();
+    let options = slatedb::config::CheckpointOptions {
+        name: Some(crate::state::shared::view_name(name)),
+        ..Default::default()
+    };
+    let newer = db
+        .create_checkpoint(slatedb::config::CheckpointScope::Durable, &options)
+        .await
+        .unwrap()
+        .id;
+    let source = sim.nodes[&member].shared_source();
+    assert!(source.open_base(newer).await.unwrap().applied > sim.committed(member));
+    sim.poll(member).await;
+    let node = sim.nodes.get_mut(&member).unwrap();
+    // The adoption and the apply after it wake the loop. Then the loop must stay quiet.
+    let mut wakes = 0;
+    for turn in 0..10 {
+        if futures::FutureExt::now_or_never(shared::next(&mut node.writer)).is_some() && turn >= 5 {
+            wakes += 1;
+        }
+        node.drive_ready().await.unwrap();
+        node.drain_apply().await.unwrap();
+    }
+    assert_eq!(node.state.base_checkpoint, older);
+    assert_eq!(wakes, 0, "wakes with no commit progress");
+}
+
+/// #103: the name of a checkpoint equals the base of a paused member, but a flush before its
+/// creation put its row above that base and at or below the commit. The poll must adopt it.
+#[tokio::test]
+async fn a_paused_member_adopts_a_checkpoint_named_at_its_base_with_a_newer_row() {
+    let mut sim = Simulation::new(29).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(3).await;
+    let member = sim.follower(0);
+    let leader = sim.leader().unwrap();
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(4).await;
+    let db = writers[&leader].db.clone().unwrap();
+    let name = db.manifest().last_l0_seq();
+    let base = sim.base(member).0;
+    assert_eq!(base, name);
+    // A publication starts at `name`. More entries reach the store before its checkpoint, while
+    // the member pauses with an overlay.
+    sim.write(3).await;
+    sim.pause(member);
+    sim.write(3).await;
+    sim.writer_step(&mut writers, leader, WriterStep::Materialize)
+        .await;
+    db.flush().await.unwrap();
+    let options = slatedb::config::CheckpointOptions {
+        name: Some(crate::state::shared::view_name(name)),
+        ..Default::default()
+    };
+    let id = db
+        .create_checkpoint(slatedb::config::CheckpointScope::Durable, &options)
+        .await
+        .unwrap()
+        .id;
+    let row = sim.nodes[&member]
+        .shared_source()
+        .open_base(id)
+        .await
+        .unwrap()
+        .applied;
+    let applied = sim.nodes[&member].state.applied;
+    assert!(base < applied && applied < row && row <= sim.committed(member));
+    sim.poll(member).await;
+    sim.settle(1).await;
+    assert_eq!(sim.base(member).1, Some(id));
+}
+
+/// #103: a paused member whose base is the newest checkpoint polls again and again. Each poll
+/// must read only the manifests of the list, and must not open the older checkpoints.
+#[tokio::test]
+async fn an_idle_poll_does_not_reopen_older_checkpoints() {
+    let mut sim = Simulation::new(29).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    let mut writers = BTreeMap::new();
+    for _ in 0..12 {
+        sim.write(1).await;
+        sim.publish_view(&mut writers).await;
+        sim.settle(2).await;
+    }
+    let member = sim.follower(0);
+    sim.write(3).await;
+    sim.pause(member);
+    let store = sim.shared.clone();
+    let manifest_count = || {
+        store
+            .read
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.ends_with(".manifest"))
+            .count()
+    };
+    store.read.lock().unwrap().clear();
+    let admin = sim.nodes[&member].writer.admin().clone();
+    let views = crate::state::shared::view_checkpoints(&admin)
+        .await
+        .unwrap();
+    let list_only = manifest_count();
+    let current = sim.base(member).1;
+    assert!(views.len() >= 12 && list_only > 0);
+    assert_eq!(current, Some(views.last().unwrap().1.id));
+    for _ in 0..2 {
+        store.read.lock().unwrap().clear();
+        sim.poll(member).await;
+        assert_eq!(manifest_count(), list_only);
+        assert_eq!(sim.base(member).1, current);
+    }
 }
