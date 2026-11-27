@@ -5,26 +5,39 @@ description: >-
 runs:
   using: composite
   steps:
+    - name: Select the RustFS cache key
+      id: key
+      shell: bash
+      run: |
+        # The key names the pinned release, so a change elsewhere in the fixture keeps the cache.
+        version=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' scripts/rustfs_fixture.py)
+        test -n "$version"
+        echo "key=rustfs-${RUNNER_OS}-${RUNNER_ARCH}-${version}" >> "$GITHUB_OUTPUT"
     - name: Restore the RustFS release archive
-      uses: actions/cache@v4
+      id: restore
+      uses: actions/cache/restore@v4
       with:
         path: tmp/s3-tools
-        key: rustfs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/rustfs_fixture.py') }}
+        key: ${{ steps.key.outputs.key }}
     - name: Start the RustFS server
       shell: bash
       run: |
         # The fixture checks the pinned archive checksum. It deletes the objects when the job ends.
         settings="$RUNNER_TEMP/rustfs.env"
-        nohup python3 scripts/rustfs_fixture.py --env-file "$settings" \
-          > "$RUNNER_TEMP/rustfs.log" 2>&1 &
+        log="$RUNNER_TEMP/rustfs.log"
+        nohup python3 scripts/rustfs_fixture.py --env-file "$settings" > "$log" 2>&1 &
         server=$!
-        for _ in $(seq 1 1200); do
+        # A download can retry for up to 10 minutes.
+        for _ in $(seq 1 7200); do
           if [ -s "$settings" ] || ! kill -0 "$server" 2>/dev/null; then break; fi
           sleep 0.1
         done
         if [ ! -s "$settings" ]; then
-          cat "$RUNNER_TEMP/rustfs.log"
-          echo "RustFS did not start" >&2
+          cat "$log"
+          step=$(grep -o 'RustFS fixture: .*' "$log" | tail -1 | sed 's/RustFS fixture: //')
+          failure=$(grep -o 'RustFS [a-z]* failed: .*' "$log" | tail -1)
+          failure=${failure:-RustFS did not start in its last step: ${step:-none}}
+          echo "::error title=RustFS::$failure"
           exit 1
         fi
         . "$settings"
@@ -34,3 +47,11 @@ runs:
           echo "$name=${!name}" >> "$GITHUB_ENV"
         done
         echo "RustFS serves at $SLATEDB_S3_TEST_ENDPOINT"
+    # Save at once, so a later test failure in the job still keeps the downloaded archive.
+    - name: Save the RustFS release archive
+      if: steps.restore.outputs.cache-hit != 'true'
+      continue-on-error: true
+      uses: actions/cache/save@v4
+      with:
+        path: tmp/s3-tools
+        key: ${{ steps.key.outputs.key }}

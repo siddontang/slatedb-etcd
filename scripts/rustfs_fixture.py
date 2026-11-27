@@ -67,8 +67,16 @@ def install(directory):
         url = f"https://github.com/rustfs/rustfs/releases/download/{VERSION}/{name}"
         with tempfile.TemporaryDirectory(dir=cache) as staging:
             download = Path(staging) / name
-            subprocess.run(["curl", "--fail", "--location", "--silent", "--show-error",
-                            "--retry", "3", "--output", str(download), url], check=True)
+            # GitHub release downloads sometimes return 5xx for minutes. Retry each error.
+            command = ["curl", "--fail", "--location", "--silent", "--show-error",
+                       "--connect-timeout", "30", "--retry", "8", "--retry-all-errors",
+                       "--retry-delay", "5", "--retry-max-time", "600",
+                       "--output", str(download), url]
+            try:
+                subprocess.run(command, check=True)
+            except subprocess.CalledProcessError as error:
+                raise RuntimeError(f"RustFS download failed: curl exit {error.returncode}, "
+                                   f"{url}") from error
             if sha256(download) != checksum:
                 raise ValueError("RustFS archive checksum does not match the pinned release")
             download.replace(archive)
@@ -143,6 +151,7 @@ def local_rustfs():
     access, secret = secrets.token_hex(12), secrets.token_hex(32)
     with tempfile.TemporaryDirectory(prefix="slatedb-rustfs-") as temporary:
         directory = Path(temporary)
+        print("RustFS fixture: download or reuse the release archive", file=sys.stderr, flush=True)
         binary = install(directory)
         data = directory / "data"
         data.mkdir()
@@ -154,10 +163,23 @@ def local_rustfs():
             address = f"127.0.0.1:{listener.getsockname()[1]}"
         endpoint, bucket = "http://" + address, "slatedb-test"
         with (directory / "server.log").open("w") as log:
-            process = subprocess.Popen([str(binary), "server", "--address", address, str(data)],
-                                       stdout=log, stderr=log, env=settings, cwd=directory)
+            print("RustFS fixture: start the server", file=sys.stderr, flush=True)
             try:
-                wait_for_bucket(process, endpoint, bucket, access, secret)
+                process = subprocess.Popen([str(binary), "server", "--address", address,
+                                            str(data)], stdout=log, stderr=log, env=settings,
+                                           cwd=directory)
+            except OSError as error:
+                raise RuntimeError(f"RustFS start failed: {error}") from error
+            try:
+                print("RustFS fixture: wait until the server accepts a bucket", file=sys.stderr,
+                      flush=True)
+                try:
+                    wait_for_bucket(process, endpoint, bucket, access, secret)
+                except Exception as error:
+                    log.flush()
+                    tail = (directory / "server.log").read_text(errors="replace")[-2000:]
+                    raise RuntimeError(f"RustFS readiness failed: {error}\n{tail}") from error
+                print("RustFS fixture: ready", file=sys.stderr, flush=True)
                 env = dict(os.environ, AWS_ACCESS_KEY_ID=access, AWS_SECRET_ACCESS_KEY=secret,
                            AWS_EC2_METADATA_DISABLED="true", SLATEDB_S3_TEST_ENDPOINT=endpoint,
                            SLATEDB_S3_TEST_BUCKET=bucket)

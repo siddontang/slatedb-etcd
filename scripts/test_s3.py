@@ -39,6 +39,19 @@ class BucketReadiness(unittest.TestCase):
                 s3.wait_for_bucket(process, "endpoint", "bucket", "key", "secret")
         self.assertEqual(create.call_count, 3)
 
+    def test_failed_download_names_the_step_and_retries_each_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            failure = s3.subprocess.CalledProcessError(22, "curl")
+            with patch.object(s3, "ROOT", Path(directory)), \
+                    patch.object(s3.platform, "system", return_value="Linux"), \
+                    patch.object(s3.platform, "machine", return_value="x86_64"), \
+                    patch.object(s3.subprocess, "run", side_effect=failure) as download:
+                with self.assertRaisesRegex(RuntimeError, "RustFS download failed: curl exit 22"):
+                    s3.install(Path(directory))
+        command = download.call_args.args[0]
+        self.assertIn("--retry-all-errors", command)
+        self.assertEqual(command[command.index("--retry") + 1], "8")
+
     def test_failed_signature_stops_startup(self):
         process = Mock()
         process.poll.return_value = None
