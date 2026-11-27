@@ -214,7 +214,6 @@ fn candidate(id: u64, matched: u64, process: Option<u64>) -> Candidate {
         id,
         matched,
         process,
-        clock_ahead: false,
     }
 }
 
@@ -314,36 +313,6 @@ fn a_fault_handoff_skips_marks_earlier_binaries_and_old_reports() {
     assert_eq!(rank(Some(&handoff), None, &candidates), Some(2));
     assert_eq!(rank(Some(&handoff), None, &candidates[1..]), Some(6));
     assert_eq!(rank(None, None, &candidates), Some(6));
-}
-
-/// A handoff prefers a voter whose clock a majority supports over a voter with a longer log. A
-/// healthy voter still comes before a stale mark, and a fast voter stays a target: the clock
-/// only orders the voters.
-#[test]
-fn a_handoff_prefers_a_voter_that_a_majority_clock_supports() {
-    let now = Instant::now();
-    let mut handoff = Handoff {
-        led: Some(now - Duration::from_secs(20)),
-        ..Default::default()
-    };
-    let fast = Candidate {
-        clock_ahead: true,
-        ..candidate(2, 90, Some(2))
-    };
-    let candidates = [fast, candidate(3, 10, Some(3))];
-    for id in [2, 3] {
-        handoff.reports.insert(id, received(id, now, None));
-    }
-    assert_eq!(handoff.pick(&tick(&candidates, None)), Some(3));
-    assert_eq!(rank(Some(&handoff), None, &candidates), Some(3));
-    assert_eq!(rank(None, None, &candidates), Some(3));
-    // A stale mark on the correct voter makes the healthy fast voter the target.
-    handoff.reports.insert(3, received(3, now, Some(5)));
-    assert_eq!(handoff.pick(&tick(&candidates, Some(now))), Some(2));
-    // With the correct voter tried, the fast voter is the last target.
-    handoff.reports.insert(3, received(3, now, None));
-    handoff.tried.insert(3);
-    assert_eq!(handoff.pick(&tick(&candidates, None)), Some(2));
 }
 
 /// Items 5 and 8 of the review: the report of a target comes from after the start of the

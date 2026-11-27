@@ -157,15 +157,14 @@ is behind by more than `--max-clock-skew`, 5 s by default, the writer does not s
 logs an error, sets `clock_alarm` to `behind` in `/status`, sets
 `slatedb_etcd_shared_clock_skew_milliseconds`, and tries again with a backoff.
 
-The leader also probes the clock of each voter every 500 ms. It writes no tick more than
+The leader also probes the clock of each voter every 500 ms. It caps each tick at
 `--max-clock-skew` above the clocks of a voter majority. A leader clock that is further ahead
-refuses each batch and sets `clock_alarm` to `ahead`. Client writes still succeed into the
-overlay. While too few voters answer the probe, the writer waits and `/status` shows
-`clock.waiting`.
+writes at the cap and sets `clock_alarm` to `ahead`. While too few voters answer the probe, the
+writer waits and `/status` shows `clock.waiting`.
 
-After three clock refusals the leader hands the lead to a voter without a writer fault, and
-prefers a voter whose clock a majority supports. Keep host clocks synchronized with NTP, also on
-the host of a snapshot restore. See [Clocks](shared-state.md#clocks).
+After three clock refusals the leader hands the lead to a voter without a writer fault. Keep host
+clocks synchronized with NTP, also on the host of a snapshot restore. See
+[Clocks](shared-state.md#clocks).
 
 ## Memory
 
@@ -315,7 +314,7 @@ place. Delete them after you check the converted cluster.
 | An announcement is lost | The writer announces the checkpoint again with the same backoff |
 | A member reads a deleted SST | The read fails and can retry. Apply rebuilds from a newer base |
 | The new leader's clock is behind | The writer waits, or refuses above `--max-clock-skew` |
-| The leader's clock is ahead of the voters | The writer refuses each batch. The lead moves |
+| The leader's clock is ahead of the voters | The writer writes at the cap |
 | All members restart | Each member opens the newest checkpoint and replays its log |
 | A member uses another bucket or prefix | Peers refuse its traffic. It cannot join the quorum |
 | The shared database is lost | All members lose state together. Restore from a backup |

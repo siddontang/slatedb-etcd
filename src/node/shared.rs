@@ -961,9 +961,8 @@ pub(super) async fn materialize(
             continue;
         }
         for (seq, batch) in batches {
-            // The tick of the batch is fixed before SlateDB gets it. A refusal ends the task
-            // with a clock fault, and the batch stays in the overlay. See `clock::Gate`.
-            let admitted = gate.admit().await?;
+            // The tick of the batch is fixed before SlateDB gets it. See `clock::Gate`.
+            let admitted = gate.admit().await;
             #[cfg(test)]
             gate.held().await;
             db.write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })

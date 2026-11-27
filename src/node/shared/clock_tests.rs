@@ -115,7 +115,7 @@ fn a_reply_of_an_earlier_term_process_or_voter_set_gives_no_sample() {
 
 /// Item 1 of the last review: a delayed reply from before a peer's backward step comes after
 /// the reply to a later probe. The later sample holds, so the bound does not use the old fast
-/// clock, and the fast leader stays refused.
+/// clock, and the fast leader stays ahead.
 #[test]
 fn a_delayed_older_reply_never_replaces_a_newer_one() {
     let (clock, time) = leader(&[1, 2, 3]);
@@ -168,10 +168,7 @@ async fn partial_replies_prove_a_skew_only_when_no_majority_can_support_it() {
     assert!(reply(&clock, &time, 2, -10_000, 0));
     assert!(matches!(clock.verdict(), Verdict::Uncertain(_)));
     let gate = clock.gate().await;
-    gate.admit()
-        .await
-        .expect("an uncertain skew refused a batch")
-        .done();
+    gate.admit().await.done();
     assert!(read(&gate) <= time.wall() - 5_000);
     assert_eq!(clock.alarm_name(), None);
     assert!(clock.uncertain());
@@ -218,7 +215,7 @@ async fn the_bound_is_the_majority_clock_of_all_voters() {
     let clock = case(40, [100, 100]);
     let gate = clock.gate().await;
     gate.floor(START + 100);
-    let admitted = gate.admit().await.unwrap();
+    let admitted = gate.admit().await;
     assert_eq!(read(&gate), START + 100);
     admitted.done();
 
@@ -229,7 +226,7 @@ async fn the_bound_is_the_majority_clock_of_all_voters() {
     assert_eq!((by, bound.cap), (5, START + 105));
 }
 
-/// Two fast voters of three are a majority. Neither is refused.
+/// Two fast voters of three are a majority. Neither is ahead.
 #[test]
 fn two_fast_voters_of_three_are_a_majority() {
     let (clock, time) = leader(&[1, 2, 3]);
@@ -237,15 +234,15 @@ fn two_fast_voters_of_three_are_a_majority() {
     assert!(reply(&clock, &time, 2, 0, 2));
     assert!(reply(&clock, &time, 3, -10_000, 2));
     let Verdict::Admit(Bound { cap, real }) = clock.verdict() else {
-        panic!("a fast majority was refused");
+        panic!("a fast majority was ahead");
     };
     assert!(real <= cap);
 }
 
 /// Slow replies widen each window. A correct leader clock is above the low edge, but never above
-/// the high edge, so it is never refused. Its cap stays at the low edge.
+/// the high edge, so it is never ahead. Its cap stays at the low edge.
 #[test]
-fn slow_replies_never_refuse_a_correct_leader() {
+fn slow_replies_never_make_a_correct_leader_ahead() {
     let (clock, time) = leader(&[1, 2, 3, 4, 5]);
     // Each peer reads its correct clock at the send, and each reply takes 8 s.
     let probes: Vec<_> = (2..=5).map(|peer| (peer, clock.probe())).collect();
@@ -255,7 +252,7 @@ fn slow_replies_never_refuse_a_correct_leader() {
         assert!(late(&clock, peer, probe, clock_ms, (sent, time.mono())));
     }
     let Verdict::Admit(Bound { cap, real }) = clock.verdict() else {
-        panic!("slow replies refused a correct leader");
+        panic!("slow replies made a correct leader ahead");
     };
     assert!(cap < real, "the low edge must cap the tick: {cap} {real}");
     // Without any reply in four seconds the leader waits.
@@ -263,9 +260,9 @@ fn slow_replies_never_refuse_a_correct_leader() {
     assert_eq!(clock.verdict(), Verdict::Waiting);
 }
 
-/// One voter, or a member that does not lead, has no ahead check.
+/// One voter, or a member that does not lead, has no cap.
 #[test]
-fn one_voter_has_no_ahead_check() {
+fn one_voter_has_no_cap() {
     let (clock, time) = leader(&[1]);
     time.step(3_600_000);
     assert!(matches!(clock.verdict(), Verdict::Single(_)));
@@ -301,30 +298,31 @@ fn batch(seq: u64) -> Arc<crate::WriteBatch> {
 }
 
 /// A wall clock step of +10 s just before a write, with no new sample. The leader reads its
-/// own clock at each batch, so the next batch is refused as a clock fault.
+/// own clock at each batch, so the next batch gets the cap: at most the skew limit above the
+/// voter majority. The `ahead` diagnostic shows the step.
 #[tokio::test]
-async fn a_step_ahead_before_a_write_is_refused_at_the_next_write() {
+async fn a_step_ahead_before_a_write_is_capped_at_the_next_write() {
     let (clock, time) = leader(&[1, 2, 3]);
     assert!(reply(&clock, &time, 2, 0, 2));
     assert!(reply(&clock, &time, 3, 0, 2));
     let gate = clock.gate().await;
-    let admitted = gate.admit().await.unwrap();
+    let admitted = gate.admit().await;
     assert_eq!(read(&gate), time.wall());
     admitted.done();
     time.step(10_000);
-    let refused = match gate.admit().await {
-        Ok(_) => panic!("a fast leader clock was admitted"),
-        Err(error) => error,
+    let Verdict::Ahead { bound, .. } = clock.verdict() else {
+        panic!("a fast leader was not ahead");
     };
-    assert_eq!(fault::classify(&refused), fault::Fault::Clock);
+    let admitted = gate.admit().await;
+    assert_eq!(read(&gate), bound.cap);
+    assert!(bound.cap <= time.wall() - 10_000 + 5_000);
+    admitted.done();
     assert_eq!(clock.alarm_name(), Some("ahead"));
-    // The SlateDB clock stays at the bound of the majority.
-    assert!(read(&gate) < time.wall() - 4_000);
 }
 
 /// Slow replies widen each window, so the low edge of the bound falls below the floor of the
-/// writer: an earlier writer wrote a tick 1 s ahead of this correct clock. The leader waits
-/// and is never refused. A fast reply ends the wait.
+/// writer: an earlier writer wrote a tick 1 s ahead of this correct clock. The leader waits.
+/// A fast reply ends the wait.
 #[tokio::test]
 async fn slow_replies_make_a_correct_leader_wait() {
     let (clock, time) = leader(&[1, 2, 3]);
@@ -345,14 +343,13 @@ async fn slow_replies_make_a_correct_leader_wait() {
     assert_eq!(read(&gate), last);
     let admit = tokio::spawn({
         let gate = gate.clone();
-        async move { gate.admit().await.map(Admitted::done) }
+        async move { gate.admit().await.done() }
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(reply(&clock, &time, 2, 0, 1));
     tokio::time::timeout(Duration::from_secs(1), admit)
         .await
         .expect("a fast reply did not end the wait")
-        .unwrap()
         .unwrap();
     assert!(!clock.waiting());
     assert_eq!(read(&gate), last);
@@ -481,7 +478,7 @@ async fn a_new_writer_waits_for_the_newest_l0_sst_id() {
     db.close().await.unwrap();
 }
 
-/// One voter has no ahead check. Its writer starts at once, and SlateDB reads its default
+/// One voter has no cap. Its writer starts at once, and SlateDB reads its default
 /// clock, also with a local clock one hour ahead.
 #[tokio::test]
 async fn one_voter_keeps_the_slatedb_clock() {
@@ -490,7 +487,7 @@ async fn one_voter_keeps_the_slatedb_clock() {
     let gate = tokio::time::timeout(Duration::from_secs(1), clock.gate())
         .await
         .expect("one voter waited for samples");
-    let admitted = gate.admit().await.unwrap();
+    let admitted = gate.admit().await;
     let real = DefaultSystemClock::new().now().timestamp_millis();
     assert!((read(&gate) - real).abs() < 1_000);
     admitted.done();
@@ -548,33 +545,6 @@ async fn an_idle_leader_clock_advances_and_never_steps_back() {
     assert!(started.elapsed() >= Duration::from_millis(150));
     assert!(read(&gate) >= before + 3_000_000);
     db.close().await.unwrap();
-}
-
-/// The handoff set holds a voter whose clock is above the `m`-th largest clock plus the skew
-/// limit. The leader reads its own clock now, so a fast leader never makes a correct voter
-/// suspect.
-#[test]
-fn only_a_voter_above_the_majority_clock_is_suspect() {
-    let (clock, time) = leader(&[1, 2, 3]);
-    assert!(reply(&clock, &time, 2, 0, 1));
-    assert!(reply(&clock, &time, 3, 20_000, 1));
-    assert_eq!(clock.above(), HashSet::from([3]));
-    // The leader is faster still. It and member 3 hold the two largest clocks, so no voter is
-    // above them, and the fast leader does not make member 2 suspect.
-    time.step(30_000);
-    assert!(clock.above().is_empty());
-    // A peer 1 ms above the majority clock would not be refused as leader, so it is no suspect.
-    let (clock, time) = leader(&[1, 2, 3]);
-    assert!(reply(&clock, &time, 2, 1, 0));
-    assert!(reply(&clock, &time, 3, 0, 0));
-    assert!(clock.above().is_empty());
-    assert!(reply(&clock, &time, 2, 6_000, 0));
-    assert_eq!(clock.above(), HashSet::from([2]));
-    // With one sample of three voters, the leader and that peer are the majority.
-    let (clock, time) = leader(&[1, 2, 3]);
-    time.step(10_000);
-    assert!(reply(&clock, &time, 2, -10_000, 1));
-    assert!(clock.above().is_empty());
 }
 
 /// A leader clock one hour behind the machine clock, so SlateDB's default clock is far ahead
@@ -707,7 +677,7 @@ async fn a_backward_step_of_a_majority_holds_the_next_batch() {
 async fn a_promoted_voter_turns_on_the_check_before_the_next_batch() {
     let (clock, time) = leader(&[1]);
     let gate = clock.gate().await;
-    gate.admit().await.unwrap().done();
+    gate.admit().await.done();
     configure(&clock, 2, &[1, 2], PROCESS);
     let waited = tokio::time::timeout(Duration::from_millis(300), gate.admit()).await;
     assert!(
@@ -722,8 +692,7 @@ async fn a_promoted_voter_turns_on_the_check_before_the_next_batch() {
     assert!(reply(&clock, &time, 2, 0, 0));
     let admitted = tokio::time::timeout(Duration::from_secs(1), gate.admit())
         .await
-        .expect("the sample did not end the wait")
-        .unwrap();
+        .expect("the sample did not end the wait");
     assert!(read(&gate) <= time.wall().max(frozen));
     admitted.done();
 }
@@ -772,7 +741,7 @@ async fn a_refresh_never_splits_the_admission_of_a_tick() {
     locked.1.recv().unwrap();
     let admit = tokio::spawn({
         let gate = gate.clone();
-        async move { gate.admit().await.map(|admitted| admitted.done()) }
+        async move { gate.admit().await.done() }
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
     let (ended, refresh) = restart_peer(&clock);
@@ -780,7 +749,7 @@ async fn a_refresh_never_splits_the_admission_of_a_tick() {
     release.0.send(()).unwrap();
     holder.join().unwrap();
     refresh.join().unwrap();
-    admit.await.unwrap().unwrap();
+    admit.await.unwrap();
     assert!(
         !early,
         "a refresh ran between the verdict and the pin of a tick"

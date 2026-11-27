@@ -1,5 +1,5 @@
-//! Clock handoffs of three voters: a leader whose clock is ahead of the voters, and a leader
-//! whose clock is behind the shared writer clock.
+//! Clocks of three voters: a leader whose clock is ahead of the voters, and a leader whose
+//! clock is behind the shared writer clock.
 
 use super::super::tests::status;
 use super::tests::{channel, health, publishes, until, Cluster};
@@ -13,42 +13,40 @@ fn wall_ms() -> i64 {
     (Clock::system(Duration::ZERO, None).now_ms)()
 }
 
-/// The floor of the shared manifest: the later of its tick and its newest L0 SST ID time.
-async fn manifest_floor(cluster: &Cluster) -> i64 {
+/// The shared manifest.
+async fn manifest(cluster: &Cluster) -> slatedb::VersionedManifest {
     let admin = slatedb::admin::Admin::builder("root/shared/state", cluster.store.clone()).build();
-    let manifest = admin.read_manifest(None).await.unwrap().unwrap();
-    clock::floor(&manifest)
+    admin.read_manifest(None).await.unwrap().unwrap()
 }
 
 /// Case 2 of issue #101. The leader's clock steps 10 s ahead of two correct voters. A client Put
-/// still succeeds. The leader refuses to materialize it, writes no tick above the voters, and
-/// hands over after three clock faults. The next leader writes the Put at once.
+/// still succeeds. The leader writes it at the cap, with no fault and no handoff. So the manifest
+/// floor stays at most the skew limit above the voter clocks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_fast_leader_hands_over_and_the_next_leader_writes_at_once() {
+async fn a_fast_leader_writes_at_the_cap() {
     let cluster = Cluster::start(|_| {}).await;
     let fast = cluster.leader().await;
     cluster.put("k-before").await.unwrap();
     publishes(&cluster, fast).await;
+    let before = status(cluster.member(fast)).await;
+    let written = before["shared_state"]["writer"]["written"]
+        .as_u64()
+        .unwrap();
     cluster.skew(fast, 10_000);
     cluster.put("k-fast").await.unwrap();
-    let mut next = None;
-    until("a handoff", Duration::from_secs(30), async || {
-        next = cluster.leading().await.filter(|leader| *leader != fast);
-        next.is_some()
+    until("a flush of the Put", Duration::from_secs(30), async || {
+        manifest(&cluster).await.last_l0_seq() > written
     })
     .await;
-    let next = next.unwrap();
-    let moved = Instant::now();
-    let old = status(cluster.member(fast)).await;
-    assert_eq!(health(&old)["last_error_class"], "clock", "{old}");
-    // The next leader's clock agrees with the manifest, so it publishes without a wait.
-    publishes(&cluster, next).await;
-    assert!(
-        moved.elapsed() < Duration::from_secs(5),
-        "{:?}",
-        moved.elapsed()
+    let after = status(cluster.member(fast)).await;
+    assert_eq!(cluster.leading().await, Some(fast));
+    assert_eq!(
+        health(&after)["faults"],
+        health(&before)["faults"],
+        "{after}"
     );
-    assert!(manifest_floor(&cluster).await <= wall_ms() + MAX_SKEW_MS);
+    assert!(after["shared_state"]["writer"]["clock"]["ahead_ms"].as_i64() > Some(0));
+    assert!(clock::floor(&manifest(&cluster).await) <= wall_ms() + MAX_SKEW_MS);
     cluster.shutdown().await;
 }
 
