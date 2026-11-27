@@ -31,6 +31,49 @@ impl Simulation {
         self.settle(10).await;
     }
 
+    /// Publish a base, stop each voter, and start all but the last one. That one sends no
+    /// coverage report. Return the leader and the first follower.
+    async fn restart_all_but_last(&mut self) -> (u64, u64) {
+        self.settle(4).await;
+        let mut writers = BTreeMap::new();
+        self.publish_view(&mut writers).await;
+        self.settle(10).await;
+        for id in 1..=self.members {
+            self.stop(id);
+        }
+        for id in 1..self.members {
+            self.start(id).await;
+        }
+        self.settle(30).await;
+        let leader = self.leader().unwrap();
+        let follower = (1..self.members).find(|&id| id != leader).unwrap();
+        (leader, follower)
+    }
+
+    /// Member `follower` asks for a snapshot at its last index, above its base. Return that
+    /// index.
+    fn request_above_base(&mut self, follower: u64) -> u64 {
+        let (base, _, _) = self.base(follower);
+        let node = self.nodes.get_mut(&follower).unwrap();
+        node.raw.request_snapshot().unwrap();
+        let requested = node.raw.raft.pending_request_snapshot;
+        assert!(requested > base, "requested {requested} at base {base}");
+        requested
+    }
+
+    /// Member `follower` installed a record through `requested` and applied what `leader`
+    /// applied.
+    async fn assert_caught_up(&self, leader: u64, follower: u64, requested: u64) {
+        let node = &self.nodes[&follower];
+        assert_eq!(
+            node.raw.raft.pending_request_snapshot, 0,
+            "the request still waits"
+        );
+        assert!(node.raw.store().snapshot_index() >= requested);
+        assert_eq!(node.state.applied, self.nodes[&leader].state.applied);
+        self.assert_records_open().await;
+    }
+
     /// The process ID that member `id` sends with its traffic.
     pub(super) fn process(&self, id: u64) -> Option<u64> {
         self.processes.get(&id).copied()
@@ -249,33 +292,10 @@ async fn an_idle_shared_leader_serves_a_snapshot_request_at_the_last_index() {
 #[tokio::test]
 async fn a_request_with_a_voter_down_gets_a_certified_snapshot() {
     let mut sim = Simulation::with_size(9, 5).await;
-    sim.settle(4).await;
-    let mut writers = BTreeMap::new();
-    sim.publish_view(&mut writers).await;
-    sim.settle(10).await;
-    for id in 1..=5 {
-        sim.stop(id);
-    }
-    for id in 1..=4 {
-        sim.start(id).await;
-    }
-    sim.settle(30).await;
-    let leader = sim.leader().unwrap();
-    let follower = (1..=4).find(|&id| id != leader).unwrap();
-    let (base, _, _) = sim.base(follower);
-    let node = sim.nodes.get_mut(&follower).unwrap();
-    node.raw.request_snapshot().unwrap();
-    let requested = node.raw.raft.pending_request_snapshot;
-    assert!(requested > base, "requested {requested} at base {base}");
+    let (leader, follower) = sim.restart_all_but_last().await;
+    let requested = sim.request_above_base(follower);
     sim.settle(100).await;
-    let node = &sim.nodes[&follower];
-    assert_eq!(
-        node.raw.raft.pending_request_snapshot, 0,
-        "the request still waits"
-    );
-    assert!(node.raw.store().snapshot_index() >= requested);
-    assert_eq!(node.state.applied, sim.nodes[&leader].state.applied);
-    sim.assert_records_open().await;
+    sim.assert_caught_up(leader, follower, requested).await;
 }
 
 /// #156: two of three voters restart, and the third stays down. A follower asks for a snapshot
@@ -285,36 +305,55 @@ async fn a_request_with_a_voter_down_gets_a_certified_snapshot() {
 #[tokio::test]
 async fn a_request_in_a_bare_majority_gets_a_certified_snapshot() {
     let mut sim = Simulation::new(9).await;
-    sim.settle(4).await;
-    let mut writers = BTreeMap::new();
-    sim.publish_view(&mut writers).await;
-    sim.settle(10).await;
-    for id in 1..=3 {
-        sim.stop(id);
-    }
-    for id in 1..=2 {
-        sim.start(id).await;
-    }
-    sim.settle(30).await;
-    let leader = sim.leader().unwrap();
-    let follower = (1..=2).find(|&id| id != leader).unwrap();
-    let (base, _, _) = sim.base(follower);
-    let node = sim.nodes.get_mut(&follower).unwrap();
-    node.raw.request_snapshot().unwrap();
-    let requested = node.raw.raft.pending_request_snapshot;
-    assert!(requested > base, "requested {requested} at base {base}");
+    let (leader, follower) = sim.restart_all_but_last().await;
+    let requested = sim.request_above_base(follower);
     sim.settle(100).await;
-    let node = &sim.nodes[&follower];
-    assert_eq!(
-        node.raw.raft.pending_request_snapshot, 0,
-        "the request still waits"
-    );
-    assert!(node.raw.store().snapshot_index() >= requested);
-    assert_eq!(node.state.applied, sim.nodes[&leader].state.applied);
+    sim.assert_caught_up(leader, follower, requested).await;
     // The certification commits after the install.
     let (_, _, covers) = *sim.announcements().last().unwrap();
     assert!(covers >= requested, "covers {covers} below {requested}");
-    sim.assert_records_open().await;
+}
+
+/// #156 with a new publication. Two of three voters restart, and the third stays down. A Put
+/// commits above the base while apply waits on the follower, so the follower gets the Put only
+/// through the snapshot that it then asks for. The base holds no Put, so the leader publishes a
+/// checkpoint for the request. The announcement needs the acknowledgement of the follower, so
+/// the leader raises its own base to that checkpoint before the entry commits.
+#[tokio::test]
+async fn a_request_in_a_bare_majority_gets_a_new_checkpoint() {
+    let mut sim = Simulation::new(9).await;
+    let (leader, follower) = sim.restart_all_but_last().await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    let (_, checkpoint, _) = sim.base(leader);
+    sim.paused_apply = Some(follower);
+    sim.propose().await;
+    sim.settle(2).await;
+    let put = sim.nodes[&leader].state.applied;
+    assert_eq!(sim.acknowledged.len(), 1);
+    assert!(sim.nodes[&follower].state.applied < put);
+    let requested = sim.request_above_base(follower);
+    assert!(
+        requested >= put,
+        "requested {requested} below the Put at {put}"
+    );
+    // The follower applies again after Raft stores the snapshot, so it gets the Put from it.
+    let mut writers = BTreeMap::new();
+    for round in 0..100 {
+        if round % 10 == 0 {
+            sim.publish_view(&mut writers).await;
+        }
+        sim.settle(1).await;
+        if sim.nodes[&follower].raw.store().snapshot_index() >= requested {
+            sim.paused_apply = None;
+        }
+    }
+    sim.assert_caught_up(leader, follower, requested).await;
+    assert_ne!(
+        sim.base(follower).1,
+        checkpoint,
+        "the base is not a new checkpoint"
+    );
+    sim.assert_acknowledged(follower).await;
 }
 
 /// #96 in a cluster. Member `grouped` misses two commits and applies a Put and a failed update

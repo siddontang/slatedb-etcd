@@ -641,6 +641,9 @@ struct Publication {
     rechecking: bool,
 }
 
+/// A published checkpoint with its row `F`, and its open base.
+type Published = ((uuid::Uuid, u64), Arc<crate::state::view::Base>);
+
 impl Publication {
     /// Read the newest view checkpoint and the bootstrap marker of `db`.
     async fn new(
@@ -671,7 +674,9 @@ impl Publication {
     }
 
     /// Create the checkpoint of `last`, check its membership, and write the bootstrap marker.
-    /// Return the checkpoint with its row `F`, or `None` when it has no membership.
+    /// Return the checkpoint with its row `F` and its open base, or `None` when it has no
+    /// membership. The caller keeps the base live until the node handles the announcement, so
+    /// the leader can offer it to its own base switch. See `Writer::offer_own`.
     async fn checkpoint(
         &mut self,
         db: &slatedb::Db,
@@ -679,7 +684,7 @@ impl Publication {
         source: &Source,
         health: &fault::TaskHealth,
         last: u64,
-    ) -> Result<Option<(uuid::Uuid, u64)>> {
+    ) -> Result<Option<Published>> {
         let options = CheckpointOptions {
             name: Some(view_name(last)),
             ..Default::default()
@@ -699,7 +704,6 @@ impl Publication {
         }
         tracing::debug!(checkpoint = %checkpoint.id, applied = base.applied, "publish view");
         let row = base.applied;
-        drop(base);
         // The marker comes before the first announcement. The checkpoint already exists, so a
         // restart after the marker still finds a base.
         if !self.bootstrapped {
@@ -707,7 +711,7 @@ impl Publication {
             health.progressed();
             self.bootstrapped = true;
         }
-        Ok(Some((checkpoint.id, row)))
+        Ok(Some(((checkpoint.id, row), base)))
     }
 
     /// Delete the old view checkpoints that no member reported in `reported`.
@@ -819,10 +823,12 @@ async fn publish(
         }
         health.due();
         let created = publication.checkpoint(&db, &admin, &source, &health, last);
-        let Some(id) = created.await? else {
+        let Some((id, base)) = created.await? else {
             continue;
         };
-        let Some(accepted) = announce(&events, id).await else {
+        let announced = announce(&events, &source, id).await;
+        drop(base);
+        let Some(accepted) = announced else {
             return Ok(());
         };
         demand.served();
@@ -878,7 +884,7 @@ async fn reannounce(
             retry.done();
             return Ok(Recheck::Done);
         }
-        let Some(accepted) = announce(events, id).await else {
+        let Some(accepted) = announce(events, source, id).await else {
             return Ok(Recheck::Closed);
         };
         retry.sent(id, accepted);
@@ -901,7 +907,7 @@ async fn reannounce(
         source.mark_bootstrapped(id.0).await?;
         *bootstrapped = true;
     }
-    let Some(accepted) = announce(events, id).await else {
+    let Some(accepted) = announce(events, source, id).await else {
         return Ok(Recheck::Closed);
     };
     retry.sent(id, accepted);
@@ -910,13 +916,33 @@ async fn reannounce(
 
 /// Send checkpoint `id` with its row `F` to the node for its announcement. Return whether Raft
 /// took the proposal, or `None` when the node no longer takes events.
-async fn announce(events: &mpsc::Sender<Event>, (id, row): (uuid::Uuid, u64)) -> Option<bool> {
+///
+/// A base of the checkpoint stays live until the node handles the event, so the leader can offer
+/// it to its own base switch. See `Writer::offer_own`. A new publication keeps its base live. An
+/// announcement again opens the checkpoint, and a failed open only skips that offer.
+async fn announce(
+    events: &mpsc::Sender<Event>,
+    source: &Source,
+    (id, row): (uuid::Uuid, u64),
+) -> Option<bool> {
+    let base = match source.live_base(id) {
+        Some(base) => Some(base),
+        None => source
+            .open_base(id)
+            .await
+            .inspect_err(
+                |error| tracing::debug!(%error, %id, "cannot open an announced checkpoint"),
+            )
+            .ok(),
+    };
     let (reply, accepted) = tokio::sync::oneshot::channel();
     events
         .send(Event::ViewCheckpoint(id, row, Some(reply)))
         .await
         .ok()?;
-    Some(accepted.await.unwrap_or(false))
+    let accepted = accepted.await.unwrap_or(false);
+    drop(base);
+    Some(accepted)
 }
 
 /// Bring Raft's voters and learners to `target` with single membership changes.
@@ -1058,10 +1084,16 @@ impl Node {
     }
 
     /// Propose a checkpoint with row `row` that the publisher created. Only the leader
-    /// announces. Return true when Raft took the proposal.
+    /// announces. Return true when Raft took the proposal. While a demand waits, the leader also
+    /// offers the checkpoint to its own base switch. See `Writer::offer_own`.
     pub(super) fn announce_view(&mut self, checkpoint: uuid::Uuid, row: u64) -> Result<bool> {
         let covers = self.writer.coverage(row);
-        self.propose_view(checkpoint, covers)
+        let accepted = self.propose_view(checkpoint, covers)?;
+        let (wanted, record) = self.demands();
+        if accepted && self.writer.demand_unmet(wanted, record) {
+            self.writer.offer_own(checkpoint, covers);
+        }
+        Ok(accepted)
     }
 
     /// Propose a `ViewCheckpoint` entry that certifies `checkpoint` through `covers`.
@@ -1266,13 +1298,7 @@ impl Node {
         if self.installing() {
             return Ok(());
         }
-        let record = self.raw.store().snapshot_index();
-        let wanted = self.raw.store().wanted_index();
-        // A base below the record cannot replace the record, so the record index is a demand.
-        let record = match self.base_below_record() {
-            true => record,
-            false => 0,
-        };
+        let (wanted, record) = self.demands();
         let Some((checkpoint, covers, ticks)) = self.writer.certify(wanted, record) else {
             return Ok(());
         };
@@ -1280,6 +1306,17 @@ impl Node {
             self.writer.certified(checkpoint, covers, ticks);
         }
         Ok(())
+    }
+
+    /// The snapshot request that a peer waits for, and the record index while the base is below
+    /// it. A base below the record cannot replace the record, so the record index is a demand.
+    fn demands(&self) -> (u64, u64) {
+        let wanted = self.raw.store().wanted_index();
+        let record = match self.base_below_record() {
+            true => self.raw.store().snapshot_index(),
+            false => 0,
+        };
+        (wanted, record)
     }
 
     /// Tell the log cache which checkpoint and index the base has. See `Cache::has_image`.
@@ -1599,8 +1636,8 @@ pub(super) struct DstWriter {
     /// The owner of the progress. See `Progress::reset`.
     owner: u64,
     publication: Option<Publication>,
-    /// A checkpoint with its row that the next announce step sends.
-    pending: Option<(uuid::Uuid, u64)>,
+    /// A checkpoint with its row and open base that the next announce step sends.
+    pending: Option<Published>,
 }
 
 #[cfg(test)]
@@ -1703,7 +1740,7 @@ impl Node {
             return Ok(());
         };
         let publisher = self.writer.publisher(fault::Health::default().begin());
-        let pending = dst.pending.take();
+        let (pending, base) = dst.pending.take().unzip();
         let (events, mut received) = mpsc::channel(1);
         let sent = async move {
             let Publication {
@@ -1713,7 +1750,7 @@ impl Node {
             } = publication;
             match pending {
                 Some(id) => {
-                    if let Some(accepted) = announce(&events, id).await {
+                    if let Some(accepted) = announce(&events, &publisher.source, id).await {
                         retry.sent(id, accepted);
                     }
                 }
@@ -1739,6 +1776,8 @@ impl Node {
             anyhow::Ok(())
         };
         let (sent, handled) = tokio::join!(sent, handled);
+        // The base stays live until the node handled the announcement, as in `publish`.
+        drop(base);
         sent.and(handled)
     }
 
