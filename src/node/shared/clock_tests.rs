@@ -890,3 +890,25 @@ async fn a_new_writer_starts_at_the_newest_compaction_job() {
     assert!(db.status().close_reason.is_none());
     db.close().await.unwrap();
 }
+
+/// Sig-Codex, round 4: the clock steps back while a new writer waits for its floor. The next
+/// wakeup reads the clock again and refuses, with the alarm, instead of an endless wait.
+#[tokio::test]
+async fn a_backward_step_during_the_floor_wait_refuses() {
+    let (clock, time) = leader(&[1, 2, 3]);
+    let waiting = tokio::spawn({
+        let (clock, tick) = (clock.clone(), time.wall() + 300);
+        async move { clock.pass(tick).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!waiting.is_finished());
+    assert_eq!(clock.alarm_name(), None);
+    time.step(-10_000);
+    let passed = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("the wait did not see the backward step")
+        .unwrap();
+    assert!(!passed);
+    assert_eq!(clock.alarm_name(), Some("behind"));
+    assert!(clock.skew.load(Ordering::Relaxed) > 10_000);
+}

@@ -268,26 +268,27 @@ impl Clock {
     }
 
     /// Wait until the local clock passes `tick`. Return false, and raise the alarm, when the
-    /// local clock is behind by more than the limit.
+    /// local clock is behind by more than the limit. Each wakeup reads the clock again, so a
+    /// backward step during the wait also refuses.
     pub async fn pass(&self, tick: i64) -> bool {
-        // A new database has the minimum tick, so the subtraction saturates.
-        let skew = tick.saturating_sub((self.now_ms)()).max(0);
-        self.skew.store(skew, Ordering::Relaxed);
-        if let Some(gauge) = &self.gauge {
-            gauge.set(skew);
-        }
-        if skew > self.max_skew.as_millis() as i64 {
-            if !self.alarm.swap(true, Ordering::Relaxed) {
-                tracing::error!(
-                    skew_ms = skew,
-                    "the local clock is behind the shared writer"
-                );
-            }
-            return false;
-        }
-        self.alarm.store(false, Ordering::Relaxed);
         loop {
+            // A new database has the minimum tick, so the subtraction saturates.
             let behind = tick.saturating_sub((self.now_ms)());
+            let skew = behind.max(0);
+            self.skew.store(skew, Ordering::Relaxed);
+            if let Some(gauge) = &self.gauge {
+                gauge.set(skew);
+            }
+            if skew > self.max_skew.as_millis() as i64 {
+                if !self.alarm.swap(true, Ordering::Relaxed) {
+                    tracing::error!(
+                        skew_ms = skew,
+                        "the local clock is behind the shared writer"
+                    );
+                }
+                return false;
+            }
+            self.alarm.store(false, Ordering::Relaxed);
             if behind < 0 {
                 return true;
             }
