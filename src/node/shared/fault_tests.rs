@@ -506,6 +506,13 @@ impl Leader {
     }
 
     async fn put(&mut self, key: &str) -> u64 {
+        let index = self.apply_put(key).await;
+        self.writer().progress().wait_written(index).await.unwrap();
+        index
+    }
+
+    /// Apply a Put. Do not wait for the materializer.
+    async fn apply_put(&mut self, key: &str) -> u64 {
         let put = crate::proto::etcdserverpb::RequestOp {
             request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
                 PutRequest {
@@ -517,7 +524,6 @@ impl Leader {
         };
         let index = self.state.applied + 1;
         self.state.apply_etcd(index, &put).await.unwrap();
-        self.writer().progress().wait_written(index).await.unwrap();
         index
     }
 
@@ -1029,6 +1035,76 @@ async fn a_defragment_gets_the_open_writer_with_its_clock() {
     leader.writer().hold_open(None);
     resume.notify_one();
     sampling.abort();
+    leader.close().await;
+}
+
+/// Issue #106: the writer task of term 3 starts before the task of term 2 ends. The old
+/// materializer writes a batch to its memtable only, and it pauses before its progress update.
+/// The update comes after the new writer opened. The new materializer must still write the
+/// batch, because the new writer does not have it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_update_of_an_old_materializer_does_not_skip_a_batch() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    // No flush by age. The batch stays in the memtable of the old writer.
+    let mut leader = Leader::open(store, Duration::from_secs(3600), clock()).await;
+    leader.lead(2);
+    leader.covered(1, Duration::from_secs(10)).await;
+    let (reached, paused) = std::sync::mpsc::sync_channel(1);
+    let (resume, resumed) = std::sync::mpsc::sync_channel(1);
+    *leader.writer().progress().hold.lock().unwrap() = Some((reached, resumed));
+    let index = leader.apply_put("k").await;
+    paused.recv_timeout(Duration::from_secs(10)).unwrap();
+    // The new task pauses after its open, before its materializer starts.
+    let (opened, start) = (Arc::default(), Arc::default());
+    leader
+        .writer()
+        .hold_open(Some((Arc::clone(&opened), Arc::clone(&start))));
+    let events = leader.events.clone();
+    leader.writer().sync(true, 3, &events);
+    opened.notified().await;
+    assert!(leader.writer().progress().written() < index);
+    // The old task updates the progress, sees its stop, and ends.
+    resume.send(()).unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(10), leader.writer().tasks().join_next());
+    assert!(matches!(ended.await.unwrap(), Some(Ok((2, Ok(()))))));
+    leader.writer().hold_open(None);
+    start.notify_one();
+    leader.writer().progress().request(index);
+    leader.covered(index, Duration::from_secs(10)).await;
+    leader.close().await;
+}
+
+/// Issue #106: the task of term 2 pauses before its reset. Term 3 opens and writes. Then term
+/// 2 goes on. It must not move the progress back or replace the writer of term 3, because the
+/// progress updates of term 3 then stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_reset_of_an_old_writer_task_changes_nothing() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut leader = Leader::open(store, Duration::from_secs(3600), clock()).await;
+    let (reached, resume) = (Arc::default(), Arc::default());
+    *leader.writer().progress().reset_hold.lock().unwrap() =
+        Some((Arc::clone(&reached), Arc::clone(&resume)));
+    leader.lead(2);
+    reached.notified().await;
+    leader.lead(3);
+    leader.covered(1, Duration::from_secs(10)).await;
+    let index = leader.put("k1").await;
+    let db = leader.writer().open().unwrap().db;
+    // The old task sees the new term, closes its writer, and ends.
+    resume.notify_one();
+    let ended = tokio::time::timeout(Duration::from_secs(10), leader.writer().tasks().join_next());
+    assert!(matches!(ended.await.unwrap(), Some(Ok((2, Ok(()))))));
+    assert_eq!(leader.writer().progress().written(), index);
+    assert!(Arc::ptr_eq(&leader.writer().open().unwrap().db, &db));
+    // The materializer of term 3 still moves the progress.
+    let next = leader.apply_put("k2").await;
+    let written = leader.writer().progress().wait_written(next);
+    tokio::time::timeout(Duration::from_secs(10), written)
+        .await
+        .unwrap()
+        .unwrap();
+    leader.writer().progress().request(next);
+    leader.covered(next, Duration::from_secs(10)).await;
     leader.close().await;
 }
 

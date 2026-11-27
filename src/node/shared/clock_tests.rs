@@ -365,6 +365,7 @@ async fn write(db: &Arc<slatedb::Db>, gate: &Arc<Gate>, seq: u64) {
         queue,
         progress.clone(),
         gate.clone(),
+        0,
     ));
     overlay.push(seq, batch(seq));
     progress.wait_written(seq).await.unwrap();

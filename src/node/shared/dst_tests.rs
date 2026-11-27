@@ -430,6 +430,7 @@ async fn a_follower_manual_checkpoint_completes_with_a_certified_base() {
         queue,
         progress,
         shared::Gate::unchecked(),
+        0,
     ));
     let mut polls = 0;
     tokio::select! {
