@@ -20,8 +20,10 @@ pub(crate) static COUNTED: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_ne
 /// A replicated member on `faults` with no block, metadata, or row cache. Each read of a
 /// flushed row then reads the store.
 fn config(dir: &std::path::Path, faults: &Arc<FaultStore>) -> ServerConfig {
-    let mut config = ServerConfig::single_node(dir);
-    config.object_store = crate::object::Config::Test(faults.clone(), "root".into());
+    let mut config = ServerConfig::single_node(
+        dir,
+        crate::object::Config::Test(faults.clone(), "root".into()),
+    );
     config.state_cache = crate::state::StateCache {
         block_bytes: 1,
         meta_bytes: 1,

@@ -128,8 +128,8 @@ class BenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "report.json"
             output.write_text('{"passed": true, "complete": true}')
-            # One member keeps local state, so the build is the first step that fails.
-            with patch("sys.argv", ["benchmark", "--members", "1", "--output", str(output)]), \
+            # The etcd backend alone needs no RustFS, so the build is the first step that fails.
+            with patch("sys.argv", ["benchmark", "--backends", "etcd", "--output", str(output)]), \
                  patch.object(benchmark.subprocess, "run",
                               side_effect=subprocess.CalledProcessError(1, "go")), \
                  patch.object(benchmark.subprocess, "check_output", return_value="test cpu"):

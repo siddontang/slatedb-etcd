@@ -489,8 +489,10 @@ async fn channel(server: &Server) -> tonic::transport::Channel {
 }
 
 fn shared_config(dir: &std::path::Path, faults: &Arc<FaultStore>) -> ServerConfig {
-    let mut config = ServerConfig::single_node(dir);
-    config.object_store = crate::object::Config::Test(faults.clone(), "root".into());
+    let mut config = ServerConfig::single_node(
+        dir,
+        crate::object::Config::Test(faults.clone(), "root".into()),
+    );
     config.view_max_age = Duration::from_millis(100);
     config.strict_reconfiguration = false;
     config

@@ -1,4 +1,4 @@
-//! Bind each replica to a local directory or an owned S3 namespace.
+//! Bind each member to an owned namespace of an S3-compatible object store.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -14,19 +14,13 @@ use slatedb::object_store::{ClientOptions, ObjectStore, ObjectStoreExt, PutMode,
 
 use crate::state::StateMachine;
 
-pub(crate) mod bounded;
 #[cfg(test)]
 pub(crate) mod faults;
-pub(crate) mod local;
 
-#[derive(Clone, Debug, Default)]
+/// The object store of the shared state. Every cluster needs one, a single member too.
+#[derive(Clone, Debug)]
 pub enum Config {
-    #[default]
-    Local,
     S3(S3),
-    /// A local directory that several members of one host share. Only shared state mode uses
-    /// it. It serves tests and single-host experiments. It is not a production layout.
-    SharedDirectory(std::path::PathBuf),
     #[cfg(test)]
     Test(Arc<dyn ObjectStore>, String),
     /// The S3 layout on another store, for tests.
@@ -65,7 +59,10 @@ pub struct Args {
 impl Args {
     pub fn config(self) -> Result<Config> {
         let Some(bucket) = self.s3_bucket else {
-            return Ok(Config::Local);
+            anyhow::bail!(
+                "an object store is required: set --s3-bucket to a bucket of S3 or another \
+                 S3-compatible store, such as RustFS"
+            );
         };
         let mut config = S3 {
             bucket,
@@ -216,51 +213,21 @@ impl Config {
         cache: crate::state::StateCache,
         shared: &crate::state::shared::Options,
     ) -> Result<StateMachine> {
-        #[cfg(test)]
-        if let Self::Test(store, path) = self {
-            return StateMachine::open_shared(store.clone(), path, cluster, cache, shared).await;
-        }
-        if let Self::SharedDirectory(objects) = self {
-            let binding = bind(dir, cluster, member, None)?;
-            let store: Arc<dyn ObjectStore> = Arc::new(local_store(objects)?);
-            let prefix = format!("member-{member}");
-            let claimed =
-                claim_shared(store.as_ref(), "", &prefix, cluster, &binding, shared).await?;
-            let shared = bind_store(dir, binding, claimed, shared).await?;
-            return StateMachine::open_shared(store, "", cluster, cache, &shared).await;
-        }
         let s3 = match self {
             Self::S3(s3) => {
                 let mut s3 = s3.clone();
                 s3.validate()?;
-                Some(s3)
+                s3
             }
             #[cfg(test)]
-            Self::TestS3(_, s3) => Some(s3.clone()),
-            _ => None,
+            Self::Test(store, path) => {
+                return StateMachine::open_shared(store.clone(), path, cluster, cache, shared).await
+            }
+            #[cfg(test)]
+            Self::TestS3(_, s3) => s3.clone(),
         };
-        let binding = bind(dir, cluster, member, s3)?;
-        let Some(s3) = &binding.s3 else {
-            // A member-local store serves one voter. Several members need a shared store.
-            ensure!(
-                shared.voters.len() == 1 && !shared.join,
-                "several shared-mode members need a shared object store"
-            );
-            let store = Arc::new(local_store(&dir.join("objects"))?);
-            let claimed = match binding.store_id {
-                Some(id) => {
-                    let voters = Some(shared.voters.as_slice());
-                    crate::state::shared::bound(store.as_ref(), "", cluster, id, voters).await?
-                }
-                None => {
-                    let (quota, voters) = (shared.quota, &shared.voters);
-                    crate::state::shared::claim(store.as_ref(), "", cluster, quota, voters).await?
-                }
-            };
-            let shared = bind_store(dir, binding, claimed, shared).await?;
-            return StateMachine::open_shared(store, "", cluster, cache, &shared).await;
-        };
-        let store = self.s3_store(s3)?;
+        let binding = bind(dir, cluster, member, Some(s3.clone()))?;
+        let store = self.s3_store(&s3)?;
         let prefix = s3.member_prefix(cluster, member);
         let root = s3.cluster_prefix(cluster);
         let claimed =
@@ -279,11 +246,6 @@ impl Config {
         }
         s3.store()
     }
-}
-
-/// A shared-mode store in a local directory. Its calls have a deadline and a limit in flight.
-fn local_store(objects: &Path) -> Result<bounded::Bounded<local::LocalStore>> {
-    Ok(bounded::Bounded::new(local::LocalStore::open(objects)?))
 }
 
 /// Read the object store binding of a data directory.

@@ -124,7 +124,7 @@ struct Args {
     /// Repeat as --peer 1=127.0.0.1:7001. Include this node.
     #[arg(long = "peer", required = true)]
     peers: Vec<String>,
-    /// Data directory for this member's Raft log and SlateDB objects.
+    /// Data directory for this member's Raft log and its binding to the object store.
     #[arg(long)]
     dir: PathBuf,
     /// Shared cluster identity. Preserve it when restarting existing data.

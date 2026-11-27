@@ -767,5 +767,4 @@ mod checkpoint_tests {
         let store = RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
         assert_eq!(store.recovery_snapshot().data, second);
     }
-
 }

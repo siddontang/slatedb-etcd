@@ -112,8 +112,8 @@ pub(crate) fn test_port() -> String {
 }
 
 impl ServerConfig {
-    /// Create a local, single-member configuration with an assigned loopback port.
-    pub fn single_node(dir: impl Into<PathBuf>) -> Self {
+    /// Create a single-member configuration on `object_store`, with an assigned loopback port.
+    pub fn single_node(dir: impl Into<PathBuf>, object_store: crate::object::Config) -> Self {
         let address = "127.0.0.1:0";
         Self {
             id: 1,
@@ -128,7 +128,7 @@ impl ServerConfig {
             allow_remote: false,
             client_tls: crate::tls::Options::default(),
             peer_tls: crate::tls::Options::default(),
-            object_store: crate::object::Config::Local,
+            object_store,
             watch_progress_notify_interval: crate::grpc::DEFAULT_WATCH_PROGRESS_INTERVAL,
             snapshot_every: 10_000,
             snapshot_min_bytes: crate::node::DEFAULT_SNAPSHOT_MIN_BYTES,

@@ -2,7 +2,7 @@
 """Run the official etcd benchmark against fresh local clusters."""
 
 import argparse
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack
 from dataclasses import dataclass
 from fractions import Fraction
 import json
@@ -175,8 +175,8 @@ def main():
     results = []
     # Replace an earlier summary before RustFS starts, because the start can fail.
     (args.output / "summary.json").write_text("[]\n")
-    # Several service members run in shared state mode. All cases use one RustFS server.
-    with shared_store() if args.members > 1 else nullcontext():
+    # Service members run in shared state mode. All cases use one RustFS server.
+    with shared_store():
         for case in selected:
             for repeat in range(args.repeat):
                 targets = ["service", "etcd"] if repeat % 2 == 0 else ["etcd", "service"]

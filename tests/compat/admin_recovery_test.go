@@ -210,8 +210,9 @@ func TestNativeSnapshotRestore(t *testing.T) {
 				require.NoError(t, os.WriteFile(test.path, damaged, 0600))
 			}
 			endpoint := address(t)
-			output, err := exec.Command(source.binary, "--id", "1", "--listen", endpoint,
-				"--peer", "1="+endpoint, "--dir", test.dir, "--restore-snapshot", test.path).CombinedOutput()
+			args := append([]string{"--id", "1", "--listen", endpoint, "--peer", "1=" + endpoint,
+				"--dir", test.dir, "--restore-snapshot", test.path}, restored.storeArgs...)
+			output, err := exec.Command(source.binary, args...).CombinedOutput()
 			require.Error(t, err)
 			require.Contains(t, string(output), test.errorText)
 		})

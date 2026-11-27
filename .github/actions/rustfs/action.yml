@@ -1,7 +1,7 @@
 name: Start RustFS
 description: >-
-  Start one pinned RustFS server for the job. Clusters of several members run in shared state
-  mode on it. Later steps reuse it through the exported settings.
+  Start one pinned RustFS server for the job. Members run in shared state mode on it. Later steps
+  reuse it through the exported settings.
 runs:
   using: composite
   steps:

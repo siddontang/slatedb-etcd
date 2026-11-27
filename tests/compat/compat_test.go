@@ -42,9 +42,6 @@ type cluster struct {
 	readyTimeout time.Duration
 	// deferStart leaves the members stopped. The test starts them and waits for readiness.
 	deferStart bool
-	// sharedStore puts a cluster of one voter in shared state mode on RustFS too, for example
-	// before a learner joins it. A cluster of several members always uses RustFS.
-	sharedStore bool
 	// storeArgs holds the shared state flags of every member, also of a member that joins later.
 	storeArgs []string
 }
@@ -121,9 +118,7 @@ func newClusterConfigured(t *testing.T, size int, configure func(*cluster), extr
 	if configure != nil {
 		configure(c)
 	}
-	if size > 1 || c.sharedStore {
-		c.storeArgs = sharedStoreArgs(t, root, extraArgs)
-	}
+	c.storeArgs = sharedStoreArgs(t, root, extraArgs)
 	t.Log("Process logs and data:", root)
 	t.Cleanup(func() {
 		for id := range c.processes {
@@ -163,8 +158,8 @@ func sharedStoreArgs(t *testing.T, root string, args []string) []string {
 	}
 	endpoint, bucket := os.Getenv("SLATEDB_S3_TEST_ENDPOINT"), os.Getenv("SLATEDB_S3_TEST_BUCKET")
 	if endpoint == "" || bucket == "" {
-		t.Fatal("A cluster of several members needs RustFS. Run scripts/check-compat.py, or " +
-			"run go test through scripts/rustfs_fixture.py")
+		t.Fatal("A member needs RustFS. Run scripts/check-compat.py, or run go test through " +
+			"scripts/rustfs_fixture.py")
 	}
 	return storeFlags(endpoint, bucket, "compat/"+filepath.Base(root))
 }

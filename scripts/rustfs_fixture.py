@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Start a pinned RustFS server for local S3 tests, benchmarks, and clusters of several members.
+"""Start a pinned RustFS server for local S3 tests, benchmarks, and clusters.
 
-A cluster of several members runs in shared state mode on RustFS, as production runs on S3.
+Every cluster runs in shared state mode on RustFS, as production runs on S3.
 `python3 scripts/rustfs_fixture.py -- COMMAND...` runs a command with one server, for example a
 direct `go test` run. Without a command, the server runs until Ctrl-C. `--env-file` writes its
 settings as shell exports for other terminals. The server deletes its objects when it stops.
@@ -199,7 +199,7 @@ def local_rustfs():
 
 @contextmanager
 def shared_store(report=None, value=None):
-    """Supply one RustFS server to the clusters of several members in this process and its children.
+    """Supply one RustFS server to the clusters in this process and its children.
 
     If the environment already names a server, for example from an outer runner, use that server.
     Otherwise start one and export its settings to `os.environ` until the context ends. Yield the
@@ -246,8 +246,8 @@ def shared_args(prefix, env=None, allow_http=None):
     env = os.environ if env is None else env
     endpoint, bucket = env.get("SLATEDB_S3_TEST_ENDPOINT"), env.get("SLATEDB_S3_TEST_BUCKET")
     if not bucket:
-        raise RuntimeError("A cluster of several members needs RustFS. Use shared_store, or run "
-                           "the command through scripts/rustfs_fixture.py")
+        raise RuntimeError("A member needs RustFS. Use shared_store, or run the command "
+                           "through scripts/rustfs_fixture.py")
     flags = ["--s3-bucket", bucket, "--s3-prefix", prefix]
     if endpoint:
         flags += ["--s3-endpoint", endpoint]

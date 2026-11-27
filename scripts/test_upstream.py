@@ -62,7 +62,7 @@ class BenchResults(unittest.TestCase):
         cells = list(bench.heatmap_cases())
         self.assertEqual(len({c.name for c in cells}), 392)
 
-    def test_fixture_puts_several_members_on_rustfs(self):
+    def test_fixture_puts_every_member_on_rustfs(self):
         store = {"prefix": "upstream-e2e/run", "SLATEDB_S3_TEST_ENDPOINT": "http://127.0.0.1:9",
                  "SLATEDB_S3_TEST_BUCKET": "b", "AWS_ACCESS_KEY_ID": "k",
                  "AWS_SECRET_ACCESS_KEY": "s"}
@@ -91,8 +91,8 @@ class BenchResults(unittest.TestCase):
         self.assertNotEqual(prefix(command), prefix(member(3, "/tmp/other/0")[0]))
         self.assertTrue(prefix(command).startswith("upstream-e2e/run/"))
         single, env = member(1)
-        self.assertNotIn("--s3-bucket", single)
-        self.assertEqual(env, {})
+        self.assertIn("--s3-bucket", single)
+        self.assertEqual(env["AWS_ACCESS_KEY_ID"], "k")
         with self.assertRaises(ValueError):
             member(3, settings=None)
 

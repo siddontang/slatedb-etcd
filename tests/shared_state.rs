@@ -1,7 +1,8 @@
-//! Shared state mode: check the workload, the publisher, restart, and the store checks. One
-//! voter uses the local object store here.
+//! Shared state mode: check the workload, the publisher, restart, and the store checks. The
+//! clusters use the RustFS server of `scripts/rustfs_fixture.py`.
 
-use std::sync::Arc;
+mod common;
+
 use std::time::Duration;
 
 use slatedb_etcd::proto::etcdserverpb::{
@@ -24,7 +25,7 @@ async fn within(body: impl std::future::Future<Output = ()>) {
 }
 
 fn config(dir: &std::path::Path, view_max_age: Duration) -> ServerConfig {
-    let mut config = ServerConfig::single_node(dir);
+    let mut config = ServerConfig::single_node(dir, common::object_store(dir));
     config.view_max_age = view_max_age;
     config
 }
@@ -210,14 +211,9 @@ async fn views(server: &Server) -> (u64, u64, u64) {
     )
 }
 
-/// The `view-` checkpoints of the local shared state.
+/// The `view-` checkpoints of the shared state of the cluster under `dir`.
 async fn checkpoints(dir: &std::path::Path) -> usize {
-    let store = Arc::new(
-        slatedb::object_store::local::LocalFileSystem::new_with_prefix(dir.join("objects"))
-            .unwrap(),
-    );
-    slatedb::admin::Admin::builder("shared/state", store)
-        .build()
+    common::state_admin(dir)
         .list_checkpoints(None)
         .await
         .unwrap()
@@ -248,8 +244,10 @@ async fn one_write_makes_one_checkpoint_and_one_announcement() {
         })
         .await;
         // The bootstrap marker follows the first checkpoint.
-        let marker = dir.path().join("objects/shared/bootstrap.json");
-        eventually("the bootstrap marker", async || marker.exists()).await;
+        eventually("the bootstrap marker", async || {
+            common::shared_object_exists(dir.path(), "shared/bootstrap.json").await
+        })
+        .await;
         // Startup also applies the member's client URLs. Let those publications settle.
         tokio::time::sleep(age * 5).await;
         let (idle, announced, _) = views(&server).await;
@@ -348,23 +346,6 @@ async fn a_restart_replays_the_log_above_the_newest_checkpoint() {
     .await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn members_need_a_shared_store() {
-    within(async {
-        let age = Duration::from_secs(10);
-        let other = tempfile::tempdir().unwrap();
-        let mut three = config(other.path(), age);
-        three.peers.insert(2, "127.0.0.1:2".into());
-        three.peers.insert(3, "127.0.0.1:3".into());
-        let error = Server::start(three).await.err().unwrap();
-        assert!(
-            format!("{error:#}").contains("shared object store"),
-            "{error:#}"
-        );
-    })
-    .await;
-}
-
 /// Reserve loopback addresses for `members` members.
 /// Free local addresses for `members` members.
 ///
@@ -406,7 +387,7 @@ fn member_config(
     config.snapshot_min_bytes = 0;
     // The health check needs peer traffic first. This test adds a member at once.
     config.strict_reconfiguration = false;
-    config.object_store = slatedb_etcd::object::Config::SharedDirectory(dir.join("shared-objects"));
+    config.object_store = common::object_store(dir);
     config
 }
 
@@ -950,13 +931,7 @@ async fn defragment_and_manual_checkpoints_in_shared_mode() {
             .defragment(DefragmentRequest {})
             .await
             .unwrap();
-        let store = Arc::new(
-            slatedb::object_store::local::LocalFileSystem::new_with_prefix(
-                dir.path().join("shared-objects"),
-            )
-            .unwrap(),
-        );
-        let admin = slatedb::admin::Admin::builder("shared/state", store).build();
+        let admin = common::state_admin(dir.path());
         let manifest = admin.read_manifest(None).await.unwrap().unwrap();
         assert!(manifest.l0().is_empty());
         assert_eq!(manifest.compacted().len(), 1);
@@ -1097,30 +1072,10 @@ async fn a_new_shared_cluster_restores_a_snapshot() {
             .into_inner();
         assert_eq!(after.header.unwrap().revision, revision + 1);
         converge(&servers).await;
-        assert!(checkpoints_in(&dir.path().join("shared-objects")).await >= 1);
+        assert!(checkpoints(dir.path()).await >= 1);
         for server in servers.into_iter().flatten() {
             server.shutdown().await.unwrap();
         }
     })
     .await;
-}
-
-/// The `view-` checkpoints of a shared object directory.
-async fn checkpoints_in(objects: &std::path::Path) -> usize {
-    let store =
-        Arc::new(slatedb::object_store::local::LocalFileSystem::new_with_prefix(objects).unwrap());
-    slatedb::admin::Admin::builder("shared/state", store)
-        .build()
-        .list_checkpoints(None)
-        .await
-        .unwrap()
-        .iter()
-        .filter(|checkpoint| {
-            checkpoint
-                .name
-                .as_deref()
-                .unwrap_or("")
-                .starts_with("view-")
-        })
-        .count()
 }

@@ -147,8 +147,10 @@ async fn stall_and_recover(early: bool) {
     let limit = 64 * 1024;
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     let dir = tempfile::tempdir().unwrap();
-    let mut config = crate::server::ServerConfig::single_node(dir.path());
-    config.object_store = crate::object::Config::Test(faults.clone(), "root".into());
+    let mut config = crate::server::ServerConfig::single_node(
+        dir.path(),
+        crate::object::Config::Test(faults.clone(), "root".into()),
+    );
     config.view_max_age = Duration::from_millis(100);
     config.overlay_max_bytes = limit;
     let server = crate::server::Server::start(config).await.unwrap();
@@ -235,8 +237,10 @@ async fn status_answers_before_the_writer_creates_the_manifest() {
     // The claims succeed. The writer cannot create the shared manifest.
     faults.set(STALL_STATE_PUT);
     let dir = tempfile::tempdir().unwrap();
-    let mut config = crate::server::ServerConfig::single_node(dir.path());
-    config.object_store = crate::object::Config::Test(faults.clone(), "root".into());
+    let config = crate::server::ServerConfig::single_node(
+        dir.path(),
+        crate::object::Config::Test(faults.clone(), "root".into()),
+    );
     let server = crate::server::Server::start(config).await.unwrap();
     server.wait_ready(Duration::from_secs(15)).await.unwrap();
     let channel = tonic::transport::Endpoint::from_shared(server.client_url())
@@ -317,8 +321,10 @@ async fn a_slow_prev_kv_catch_up_makes_progress() {
     };
     let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
     let dir = tempfile::tempdir().unwrap();
-    let mut config = crate::server::ServerConfig::single_node(dir.path());
-    config.object_store = crate::object::Config::Test(faults.clone(), "root".into());
+    let mut config = crate::server::ServerConfig::single_node(
+        dir.path(),
+        crate::object::Config::Test(faults.clone(), "root".into()),
+    );
     config.view_max_age = Duration::from_millis(100);
     config.view_pin_max = Duration::from_millis(24);
     // A tiny cache, so history reads go to the store.
@@ -984,8 +990,10 @@ async fn an_ordinary_start_resolves_a_stopped_restore() {
             .await
             .unwrap_err();
         let dir = tempfile::tempdir().unwrap();
-        let mut config = crate::server::ServerConfig::single_node(dir.path());
-        config.object_store = crate::object::Config::Test(store.clone(), "root".into());
+        let config = crate::server::ServerConfig::single_node(
+            dir.path(),
+            crate::object::Config::Test(store.clone(), "root".into()),
+        );
         let started = tokio::time::timeout(
             Duration::from_secs(30),
             crate::server::Server::start(config.clone()),
@@ -1012,8 +1020,10 @@ async fn an_ordinary_start_resolves_a_stopped_restore() {
             .unwrap();
         assert_eq!(source.restored_snapshot().await.unwrap(), Some(digest));
         let dir = tempfile::tempdir().unwrap();
-        let mut config = crate::server::ServerConfig::single_node(dir.path());
-        config.object_store = crate::object::Config::Test(store.clone(), "root".into());
+        let config = crate::server::ServerConfig::single_node(
+            dir.path(),
+            crate::object::Config::Test(store.clone(), "root".into()),
+        );
         let server = crate::server::Server::start(config).await.unwrap();
         server.wait_ready(Duration::from_secs(15)).await.unwrap();
         server.shutdown().await.unwrap();
@@ -1405,9 +1415,10 @@ async fn voters_on_different_shared_stores_form_no_quorum() {
             (1..=2).map(|id| (id, crate::server::test_port())).collect();
         let mut servers = vec![];
         for (id, root) in (1..=2).zip(roots) {
-            let mut config =
-                crate::server::ServerConfig::single_node(dir.path().join(id.to_string()));
-            config.object_store = crate::object::Config::Test(store.clone(), root.into());
+            let mut config = crate::server::ServerConfig::single_node(
+                dir.path().join(id.to_string()),
+                crate::object::Config::Test(store.clone(), root.into()),
+            );
             config.id = id;
             config.listen = peers[&id].parse().unwrap();
             config.peers = peers.clone();
