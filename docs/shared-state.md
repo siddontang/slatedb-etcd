@@ -168,8 +168,9 @@ not store commands.
   **segments**. `None` is a delete. Values are `Bytes`, so the maps share them with the batches.
 - A `ViewCheckpoint` entry is not a KV entry, so it ends an apply group. A segment closes at each
   `ViewCheckpoint` entry.
-- A segment is released when its whole range is at or below `F` of the oldest checkpoint that a
-  live view uses (invariant 4). A group that spans `F` stays until a later base covers it.
+- A base switch releases each segment with its whole range at or below `F` of the new base. A
+  group that spans `F` stays until a later base covers it. A live view of an older base still
+  keeps the released segments that it holds, until the view ends (invariant 4).
 
 **Memory limit.** `--overlay-max-bytes`, default 1 GiB, limits the key and value bytes of the
 segments that the overlay holds. The leader checks it only when it admits a new proposal. Over the
@@ -210,7 +211,9 @@ Watch scans to free memory. Per member, in key and value bytes without map and `
   the same `Bytes`. A flush can free a memtable before a checkpoint publishes it. Before each
   write, SlateDB waits while its estimate of unflushed memory is above `max_unflushed_bytes`,
   1 GiB by default in SlateDB 0.18.1. The materializer then waits, and the overlay grows instead.
-- **Released segments that backups keep:** about `--overlay-max-bytes`. See [Backups](#backups).
+- **Released segments that backups keep:** `--overlay-max-bytes` is a cancellation threshold.
+  Over it, the oldest backup stream gets a stop signal. Its bytes stay charged until its task
+  drops the view. See [Backups](#backups).
 - **Released segments that reads keep:** no byte limit and no time limit. A read or a Watch page
   keeps every segment of its view, also the open one. `--view-pin-max` is a storage deadline of
   each read attempt, not of the view. A scan over its row budget keeps the same view while it
@@ -355,9 +358,11 @@ cluster with no leader therefore keep their checkpoints.
 
 - Each member reports every checkpoint that a live view still pins to the leader on the peer
   stream (`ViewAck`). A long read or Watch scan on an old view therefore keeps its checkpoint.
-- A view can pin a checkpoint for at most `--view-pin-max` (default 5 minutes). After that the
-  read fails with a retryable error, and a Watch stream resumes from its last delivered revision
-  on a new view. A native backup is the one exception. See [Backups](#backups).
+- `--view-pin-max` (default 5 minutes) is a storage deadline of each read attempt, not a limit
+  of the view. After it, the attempt fails with a retryable error, and a Watch stream resumes
+  from its last delivered revision on a new view. A scan over its row budget keeps the same
+  view, with its base and segments, while it waits to run again. The next attempt starts a new
+  deadline. A native backup has no deadline. See [Backups](#backups).
 - The publisher keeps the two newest checkpoints and every checkpoint that a member reported in
   the last 10 minutes. It deletes the rest.
 - A member that has not reported for 10 minutes loses this protection. It can then hit a missing
