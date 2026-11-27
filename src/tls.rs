@@ -205,14 +205,6 @@ impl ConnectionService for Router {
     }
 }
 
-impl ConnectionService for crate::grpc::app::App {
-    type Body = crate::grpc::app::AppBody;
-
-    fn with_user(self, user: VerifiedUser) -> Self {
-        crate::grpc::app::App::with_user(self, user)
-    }
-}
-
 pub(crate) async fn serve_until<S: ConnectionService>(
     listener: TcpListener,
     app: S,
