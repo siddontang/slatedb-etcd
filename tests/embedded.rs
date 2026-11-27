@@ -147,6 +147,10 @@ async fn start_three_members(
             config.listen = listener.local_addr().unwrap();
             config.peers = peers.clone();
             config.client_peers = peers.clone();
+            // Several members need one shared store.
+            config.object_store = slatedb_etcd::object::Config::SharedDirectory(
+                dir.join(format!("{attempt}-shared")),
+            );
             configure(&mut config);
             drop(listener);
             match Server::start(config).await {
@@ -216,6 +220,7 @@ async fn embedding_validates_before_storage_and_times_out_without_quorum() {
     assert!(Server::start(config.clone()).await.is_err());
     assert!(!config.dir.exists());
     config.peer_listen = None;
+    config.object_store = slatedb_etcd::object::Config::SharedDirectory(dir.path().join("shared"));
     config.peers = BTreeMap::from([
         (1, "127.0.0.1:0".into()),
         (2, busy.local_addr().unwrap().to_string()),
@@ -476,140 +481,6 @@ async fn restore_precedes_autotls_and_preserves_the_nonempty_directory_guard() {
     let error = Server::start(config).await.err().unwrap();
     assert!(error.to_string().contains("new, empty data directory"));
     assert_eq!(std::fs::read(path).unwrap(), cert);
-}
-
-/// Read one key from the member's local state without a quorum round trip.
-async fn local(server: &Server, key: &[u8]) -> Option<Vec<u8>> {
-    let result = KvClient::connect(server.client_url())
-        .await
-        .unwrap()
-        .range(RangeRequest {
-            key: key.to_vec(),
-            serializable: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    result.kvs.first().map(|kv| kv.value.clone())
-}
-
-/// Read a diagnostics endpoint on the client listener over plain HTTP/1.1.
-async fn diagnostics(server: &Server, path: &str) -> serde_json::Value {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut stream = tokio::net::TcpStream::connect(server.client_addr())
-        .await
-        .unwrap();
-    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await.unwrap();
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).await.unwrap();
-    let response = String::from_utf8(response).unwrap();
-    let (head, body) = response.split_once("\r\n\r\n").unwrap();
-    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-    // Axum may send a chunked body; the JSON object lies between the outer braces.
-    let body = &body[body.find('{').unwrap()..=body.rfind('}').unwrap()];
-    serde_json::from_str(body).unwrap()
-}
-
-async fn eventually(what: &str, mut check: impl std::ops::AsyncFnMut() -> bool) {
-    for _ in 0..300 {
-        if check().await {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("timed out waiting for {what}");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn follower_behind_an_imageless_truncation_catches_up_from_an_on_demand_image() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut servers = start_three_members(dir.path(), |config| {
-        // Truncate often, as automatic checkpoints do, without waiting for 64 MiB of log.
-        config.snapshot_every = 16;
-        config.snapshot_min_bytes = 0;
-    })
-    .await;
-    let status = MaintenanceClient::connect(servers[0].as_ref().unwrap().client_url())
-        .await
-        .unwrap()
-        .status(StatusRequest {})
-        .await
-        .unwrap()
-        .into_inner();
-    let leader = status.leader as usize - 1;
-    let lagging = (leader + 1) % 3;
-    put(servers[leader].as_ref().unwrap(), b"before", b"stopped").await;
-    let stopped_at = diagnostics(servers[lagging].as_ref().unwrap(), "/status").await
-        ["last_log_index"]
-        .as_u64()
-        .unwrap();
-    let stopped = servers[lagging].take().unwrap();
-    let restart = stopped.config().clone();
-    stopped.shutdown().await.unwrap();
-
-    let value = |i: usize| format!("{i}:{}", "v".repeat(512));
-    for i in 0..256 {
-        put(
-            servers[leader].as_ref().unwrap(),
-            format!("lag/{i}").as_bytes(),
-            value(i).as_bytes(),
-        )
-        .await;
-    }
-    // Both live members must truncate past the stopped follower without building an image.
-    for id in [leader, 3 - leader - lagging] {
-        let server = servers[id].as_ref().unwrap();
-        eventually("imageless truncation", async || {
-            let status = diagnostics(server, "/status").await;
-            status["snapshot_index"].as_u64().unwrap() > stopped_at
-                && !status["snapshot_has_image"].as_bool().unwrap()
-                && !status["checkpoint_running"].as_bool().unwrap()
-        })
-        .await;
-        let status = diagnostics(server, "/status").await;
-        assert_eq!(status["snapshot_images_built"], 0, "{status}");
-    }
-
-    servers[lagging] = Some(Server::start(restart).await.unwrap());
-    let follower = servers[lagging].as_ref().unwrap();
-    ready(follower).await;
-    eventually("snapshot installation", async || {
-        diagnostics(follower, "/status").await["installed_snapshots"]
-            .as_u64()
-            .unwrap()
-            > 0
-    })
-    .await;
-    // The leader built the image only because the follower asked for one.
-    let status = diagnostics(servers[leader].as_ref().unwrap(), "/status").await;
-    assert!(
-        status["snapshot_images_built"].as_u64().unwrap() > 0,
-        "{status}"
-    );
-    put(servers[leader].as_ref().unwrap(), b"after", b"caught-up").await;
-    eventually("follower convergence", async || {
-        local(follower, b"after").await.as_deref() == Some(&b"caught-up"[..])
-    })
-    .await;
-    // Serializable reads come from the follower's own state.
-    assert_eq!(local(follower, b"before").await.unwrap(), b"stopped");
-    for i in 0..256 {
-        let key = format!("lag/{i}");
-        let found = local(follower, key.as_bytes()).await;
-        assert_eq!(
-            found.as_deref(),
-            Some(value(i).as_bytes()),
-            "follower lost {key}"
-        );
-    }
-    for server in servers.iter().flatten() {
-        assert_eq!(get(server, b"lag/255").await, value(255).as_bytes());
-    }
-    for server in servers.into_iter().flatten() {
-        server.shutdown().await.unwrap();
-    }
 }
 
 /// A host that sets the retention directly gets the flag rules: zero disables automatic

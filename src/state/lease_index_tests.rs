@@ -4,8 +4,6 @@ use super::*;
 use crate::lease::{LeaseCommand, LeaseReply};
 use crate::proto::etcdserverpb::request_op::Request as Op;
 use crate::proto::etcdserverpb::*;
-use crate::proto::mvccpb::KeyValue;
-use prost::Message;
 
 fn put(key: &[u8], value: &[u8], lease: i64) -> RequestOp {
     RequestOp {
@@ -75,16 +73,20 @@ async fn etcd(state: &mut StateMachine, request: &RequestOp) {
 
 /// Check the lease sets against a rebuild from storage and a full scan for every lease.
 async fn check(state: &StateMachine, leases: &[i64]) {
-    assert!(state.key_index.matches(state.db()).await.unwrap());
+    assert!(state
+        .key_index
+        .matches(state.applied_state())
+        .await
+        .unwrap());
     for &id in leases {
-        let scanned = crate::mvcc::scan_lease_keys(state.db().as_ref(), id)
+        let scanned = crate::mvcc::scan_lease_keys(state.applied_state(), id)
             .await
             .unwrap();
         assert_eq!(state.key_index.lease_keys(id), scanned, "lease {id}");
     }
     assert_eq!(
         state.logical_bytes,
-        maintenance::count_logical_usage(state.db().as_ref())
+        maintenance::count_logical_usage(state.applied_state())
             .await
             .unwrap()
     );
@@ -110,10 +112,9 @@ impl Rng {
 }
 
 #[tokio::test]
-async fn lease_sets_match_a_rebuild_after_random_operations_restart_and_snapshots() {
+async fn lease_sets_match_a_rebuild_after_random_operations() {
     let dir = tempfile::tempdir().unwrap();
-    let other = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
     let ids = [1_i64, 2, 3, 4];
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let key = |n: u64| format!("k{n:02}").into_bytes();
@@ -149,7 +150,7 @@ async fn lease_sets_match_a_rebuild_after_random_operations_restart_and_snapshot
                 if state.leases.contains_key(&id) {
                     assert_eq!(
                         keys,
-                        crate::mvcc::scan_lease_keys(state.db().as_ref(), id)
+                        crate::mvcc::scan_lease_keys(state.applied_state(), id)
                             .await
                             .unwrap()
                     );
@@ -167,83 +168,13 @@ async fn lease_sets_match_a_rebuild_after_random_operations_restart_and_snapshot
         "the sequence must leave leased keys"
     );
 
-    // A native snapshot replaces every row of a target with other leased keys.
-    let mut target = StateMachine::open(other.path()).await.unwrap();
-    lease(&mut target, LeaseCommand::Grant { id: 1, ttl: 60 }).await;
-    etcd(&mut target, &put(b"stale", b"x", 1)).await;
-    let mut snapshot = Snapshot::default();
-    snapshot.mut_metadata().index = state.applied;
-    snapshot.set_data(state.snapshot_data().await.unwrap());
-    target.install_snapshot(&snapshot).await.unwrap();
-    check(&target, &ids).await;
-    for id in ids {
-        assert_eq!(
-            target.key_index.lease_keys(id),
-            state.key_index.lease_keys(id)
-        );
-    }
-    target.close().await.unwrap();
-
-    // A restart rebuilds the sets and reads the stored logical size.
-    state.db().flush().await.unwrap();
-    let expected: Vec<_> = ids
-        .iter()
-        .map(|&id| state.key_index.lease_keys(id))
-        .collect();
-    let size = state.logical_bytes;
     state.close().await.unwrap();
-    drop(state);
-    let state = StateMachine::open(dir.path()).await.unwrap();
-    check(&state, &ids).await;
-    let reopened: Vec<_> = ids
-        .iter()
-        .map(|&id| state.key_index.lease_keys(id))
-        .collect();
-    assert_eq!(reopened, expected);
-    assert_eq!(state.logical_bytes, size);
-    state.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn a_checkpoint_install_rebuilds_the_lease_sets_and_keeps_the_size() {
-    let leader_dir = tempfile::tempdir().unwrap();
-    let follower_dir = tempfile::tempdir().unwrap();
-    let mut leader = StateMachine::open(leader_dir.path()).await.unwrap();
-    leader.location.bind(1, "lease-index-test", None, None);
-    lease(&mut leader, LeaseCommand::Grant { id: 5, ttl: 60 }).await;
-    for n in 0..40 {
-        let id = if n % 2 == 0 { 5 } else { 0 };
-        etcd(&mut leader, &put(format!("key-{n}").as_bytes(), b"v", id)).await;
-    }
-    let data = leader
-        .checkpoint_job(true)
-        .await
-        .unwrap()
-        .await
-        .unwrap()
-        .unwrap();
-    let mut snapshot = Snapshot::default();
-    snapshot.mut_metadata().index = transfer::Descriptor::decode(&data)
-        .unwrap()
-        .unwrap()
-        .applied;
-    snapshot.data = data;
-    let mut follower = StateMachine::open(follower_dir.path()).await.unwrap();
-    follower.location.bind(2, "lease-index-test", None, None);
-    lease(&mut follower, LeaseCommand::Grant { id: 5, ttl: 60 }).await;
-    etcd(&mut follower, &put(b"stale", b"x", 5)).await;
-    follower.install_snapshot(&snapshot).await.unwrap();
-    check(&follower, &[5]).await;
-    assert_eq!(follower.key_index.lease_keys(5).len(), 20);
-    assert_eq!(follower.logical_bytes, leader.logical_bytes);
-    follower.close().await.unwrap();
-    leader.close().await.unwrap();
 }
 
 #[tokio::test]
 async fn revoking_a_large_lease_deletes_only_its_keys_in_one_revision() {
     let dir = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
     lease(&mut state, LeaseCommand::Grant { id: 7, ttl: 60 }).await;
     lease(&mut state, LeaseCommand::Grant { id: 8, ttl: 60 }).await;
     let count = 2_000;
@@ -296,7 +227,7 @@ async fn revoking_a_large_lease_deletes_only_its_keys_in_one_revision() {
 #[tokio::test]
 async fn auth_checks_lease_keys_from_the_index() {
     let dir = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
     lease(&mut state, LeaseCommand::Grant { id: 3, ttl: 60 }).await;
     etcd(&mut state, &put(b"secret/a", b"v", 3)).await;
     etcd(&mut state, &put(b"public/a", b"v", 0)).await;
@@ -370,171 +301,5 @@ async fn auth_checks_lease_keys_from_the_index() {
         .await
         .is_ok());
     assert!(state.authorize(&user, &revoke).await.is_ok());
-    state.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn the_logical_size_is_counted_when_the_counter_is_missing_or_stale() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
-    for n in 0..20 {
-        etcd(&mut state, &put(format!("key-{n}").as_bytes(), b"value", 0)).await;
-    }
-    etcd(&mut state, &delete(b"key-1", b"key-2")).await;
-    let size = state.logical_bytes;
-    let stored = state.db().get(LOGICAL_SIZE).await.unwrap().unwrap();
-    let counter = crate::proto::state::LogicalSize::decode(stored).unwrap();
-    assert_eq!(
-        (counter.applied, counter.bytes),
-        (state.applied, size.total())
-    );
-    assert_eq!(
-        (
-            counter.current,
-            counter.history,
-            counter.journal,
-            counter.other
-        ),
-        (
-            Some(size.current),
-            Some(size.history),
-            Some(size.journal),
-            Some(size.other)
-        )
-    );
-    let applied = state.applied;
-
-    // An older binary has no counter row.
-    let options = slatedb::config::WriteOptions {
-        seqnum: applied + 1,
-    };
-    let mut batch = slatedb::WriteBatch::new();
-    batch.delete(LOGICAL_SIZE);
-    batch.put(APPLIED, (applied + 1).to_be_bytes());
-    state
-        .db()
-        .write_with_options(batch, &options)
-        .await
-        .unwrap();
-    state.db().flush().await.unwrap();
-    state.close().await.unwrap();
-    drop(state);
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
-    assert_eq!(state.logical_bytes, size);
-
-    // An older binary leaves a counter behind the apply marker. The value is wrong on purpose.
-    etcd(&mut state, &put(b"new", b"value", 0)).await;
-    let size = state.logical_bytes;
-    let applied = state.applied;
-    let options = slatedb::config::WriteOptions {
-        seqnum: applied + 1,
-    };
-    let mut batch = slatedb::WriteBatch::new();
-    batch.put(
-        LOGICAL_SIZE,
-        crate::proto::state::LogicalSize {
-            applied,
-            bytes: 1,
-            ..Default::default()
-        }
-        .encode_to_vec(),
-    );
-    batch.put(APPLIED, (applied + 1).to_be_bytes());
-    state
-        .db()
-        .write_with_options(batch, &options)
-        .await
-        .unwrap();
-    state.db().flush().await.unwrap();
-    state.close().await.unwrap();
-    drop(state);
-    let state = StateMachine::open(dir.path()).await.unwrap();
-    assert_eq!(state.logical_bytes, size);
-    // The native snapshot leaves the counter out. Older receivers reject unknown keys.
-    let data: SnapshotData =
-        crate::codec::decode(&state.snapshot_job().unwrap().await.unwrap()).unwrap();
-    assert!(data.rows.iter().all(|(key, _)| key != LOGICAL_SIZE));
-    assert!(data
-        .rows
-        .iter()
-        .any(|(key, value)| key.starts_with(crate::mvcc::CURRENT)
-            && KeyValue::decode(value.as_slice()).is_ok()));
-    // A snapshot from an older binary may hold a stale counter. The install ignores it.
-    let mut data = data;
-    data.rows.push((
-        LOGICAL_SIZE.to_vec(),
-        crate::proto::state::LogicalSize {
-            applied: data.applied,
-            bytes: 1,
-            ..Default::default()
-        }
-        .encode_to_vec(),
-    ));
-    let mut snapshot = Snapshot::default();
-    snapshot.mut_metadata().index = data.applied;
-    snapshot.set_data(crate::codec::encode(&data).unwrap());
-    let other = tempfile::tempdir().unwrap();
-    let mut target = StateMachine::open(other.path()).await.unwrap();
-    target.install_snapshot(&snapshot).await.unwrap();
-    // The snapshot also adds the membership row, which the source has not stored.
-    let installed = target.logical_bytes;
-    assert_eq!(
-        installed,
-        maintenance::count_logical_usage(target.db().as_ref())
-            .await
-            .unwrap()
-    );
-    target.db().flush().await.unwrap();
-    target.close().await.unwrap();
-    drop(target);
-    let target = StateMachine::open(other.path()).await.unwrap();
-    assert_eq!(target.logical_bytes, installed);
-    target.close().await.unwrap();
-    state.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn a_counter_without_the_usage_split_is_counted_again() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
-    for n in 0..10 {
-        etcd(&mut state, &put(format!("key-{n}").as_bytes(), b"value", 0)).await;
-    }
-    etcd(&mut state, &put(b"key-1", b"other value", 0)).await;
-    let size = state.logical_bytes;
-    assert!(size.current > 0 && size.history > 0 && size.other > 0);
-    // A binary that stored only the total writes its row with the apply marker. The total is
-    // right and the index matches, but the split is missing, so the open counts the rows.
-    let applied = state.applied + 1;
-    let options = slatedb::config::WriteOptions { seqnum: applied };
-    let mut batch = slatedb::WriteBatch::new();
-    batch.put(
-        LOGICAL_SIZE,
-        crate::proto::state::LogicalSize {
-            applied,
-            bytes: size.total(),
-            ..Default::default()
-        }
-        .encode_to_vec(),
-    );
-    batch.put(APPLIED, applied.to_be_bytes());
-    state
-        .db()
-        .write_with_options(batch, &options)
-        .await
-        .unwrap();
-    state.db().flush().await.unwrap();
-    state.close().await.unwrap();
-    drop(state);
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
-    assert_eq!(state.applied, applied);
-    assert_eq!(state.logical_bytes, size);
-    // The next batch stores the split again.
-    etcd(&mut state, &put(b"new", b"value", 0)).await;
-    let stored = state.db().get(LOGICAL_SIZE).await.unwrap().unwrap();
-    let counter = crate::proto::state::LogicalSize::decode(stored).unwrap();
-    assert_eq!(counter.applied, state.applied);
-    assert_eq!(counter.current, Some(state.logical_bytes.current));
-    assert_eq!(counter.history, Some(state.logical_bytes.history));
     state.close().await.unwrap();
 }

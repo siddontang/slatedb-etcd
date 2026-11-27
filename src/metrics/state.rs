@@ -22,9 +22,6 @@ pub(crate) struct StateMeters {
     pub grants: IntCounter,
     pub revokes: IntCounter,
     pub ttl: Histogram,
-    pub flush: Histogram,
-    pub defrag: Histogram,
-    pub defrag_active: IntGauge,
     pub snapshot: Histogram,
     pub hash: Histogram,
     pub hash_rev: Histogram,
@@ -33,12 +30,6 @@ pub(crate) struct StateMeters {
 }
 
 impl StateMeters {
-    pub async fn flush_db(&self, db: &slatedb::Db) -> Result<()> {
-        let _timer = self.flush.start_timer();
-        db.flush().await?;
-        Ok(())
-    }
-
     pub fn new() -> Result<Self> {
         let registry = Registry::new();
         let histogram = |name, help, start, count| -> Result<Histogram> {
@@ -58,6 +49,27 @@ impl StateMeters {
                 )
                 .buckets(exponential_buckets(0.0001, 2.0, 20)?),
                 &["success"],
+            )?,
+        )?;
+        // etcd exports these. A member has no flush or Defragment of its own, so they stay
+        // at zero.
+        histogram(
+            "etcd_disk_backend_commit_duration_seconds",
+            "Time spent flushing state to backend storage.",
+            0.001,
+            14,
+        )?;
+        histogram(
+            "etcd_disk_backend_defrag_duration_seconds",
+            "Backend defragmentation time.",
+            0.1,
+            13,
+        )?;
+        register(
+            &registry,
+            IntGauge::new(
+                "etcd_disk_defrag_inflight",
+                "Active defragmentation operations.",
             )?,
         )?;
         Ok(Self {
@@ -89,25 +101,6 @@ impl StateMeters {
                 "Granted lease TTL in seconds.",
                 1.0,
                 24,
-            )?,
-            flush: histogram(
-                "etcd_disk_backend_commit_duration_seconds",
-                "Time spent flushing state to backend storage.",
-                0.001,
-                14,
-            )?,
-            defrag: histogram(
-                "etcd_disk_backend_defrag_duration_seconds",
-                "Backend defragmentation time.",
-                0.1,
-                13,
-            )?,
-            defrag_active: register(
-                &registry,
-                IntGauge::new(
-                    "etcd_disk_defrag_inflight",
-                    "Active defragmentation operations.",
-                )?,
             )?,
             snapshot: histogram(
                 "etcd_disk_backend_snapshot_duration_seconds",

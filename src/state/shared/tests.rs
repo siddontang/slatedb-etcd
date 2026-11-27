@@ -1,9 +1,9 @@
-//! Compare shared-mode apply with replicated apply, and check bases, claims, and reopen.
+//! Compare shared-mode apply with the apply-only reference, and check bases, claims, and reopen.
 
 use super::*;
 use crate::proto::etcdserverpb::request_op::Request as Op;
 use crate::proto::etcdserverpb::*;
-use slatedb::config::{CheckpointOptions, CheckpointScope, ScanOptions};
+use slatedb::config::{CheckpointOptions, CheckpointScope, ScanOptions, WriteOptions};
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
 
@@ -22,16 +22,9 @@ pub(crate) fn options() -> shared::Options {
 }
 
 pub(in crate::state) async fn open_shared(store: Arc<dyn ObjectStore>) -> StateMachine {
-    StateMachine::open_shared(
-        store,
-        "cluster",
-        "test",
-        StateCache::default(),
-        &options(),
-        transfer::Backend::Local,
-    )
-    .await
-    .unwrap()
+    StateMachine::open_shared(store, "cluster", "test", StateCache::default(), &options())
+        .await
+        .unwrap()
 }
 
 pub(crate) fn put(key: &str, value: &str) -> RequestOp {
@@ -159,13 +152,11 @@ async fn run(state: &mut StateMachine, reference: &mut StateMachine, inline: boo
 }
 
 #[tokio::test]
-async fn shared_apply_matches_replicated_apply_from_the_overlay() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut reference = StateMachine::open(dir.path()).await.unwrap();
+async fn shared_apply_matches_the_apply_only_reference_from_the_overlay() {
+    let mut reference = StateMachine::open_memory().await.unwrap();
     let mut state = open_shared(Arc::new(InMemory::new())).await;
     run(&mut state, &mut reference, false).await;
-    // The rows exist only in the overlay. A member has no database of its own.
-    assert!(state.database().is_none());
+    // The rows exist only in the overlay.
     assert!(state.write_batches > 0);
     // Each batch stores the logical size, so a later base needs no full scan.
     let stored = state.applied_state().get(shared::LOGICAL_BYTES).await;
@@ -189,13 +180,10 @@ async fn shared_apply_matches_replicated_apply_from_the_overlay() {
 
 #[tokio::test]
 async fn background_and_inline_compaction_steps_read_the_same_overlay_history() {
-    let dir = tempfile::tempdir().unwrap();
     let mut planned = open_shared(Arc::new(InMemory::new())).await;
     let mut inline = open_shared(Arc::new(InMemory::new())).await;
-    let mut first = StateMachine::open(&dir.path().join("first")).await.unwrap();
-    let mut second = StateMachine::open(&dir.path().join("second"))
-        .await
-        .unwrap();
+    let mut first = StateMachine::open_memory().await.unwrap();
+    let mut second = StateMachine::open_memory().await.unwrap();
     run(&mut planned, &mut first, false).await;
     run(&mut inline, &mut second, true).await;
     // The planner read a pinned view of the overlay for the steps.
@@ -397,22 +385,16 @@ async fn bases_switch_monotonically_and_release_covered_segments() {
     for (_, checkpoint) in shared::view_checkpoints(&admin).await.unwrap() {
         admin.delete_checkpoint(checkpoint.id).await.unwrap();
     }
-    let error = StateMachine::open_shared(
-        store,
-        "cluster",
-        "test",
-        StateCache::default(),
-        &options(),
-        transfer::Backend::Local,
-    )
-    .await
-    .err()
-    .unwrap();
+    let error =
+        StateMachine::open_shared(store, "cluster", "test", StateCache::default(), &options())
+            .await
+            .err()
+            .unwrap();
     assert!(error.to_string().contains("no view checkpoint"), "{error}");
 }
 
 #[tokio::test]
-async fn the_cluster_claim_fixes_the_mode_and_the_quota() {
+async fn the_cluster_claim_fixes_the_quota() {
     let store = InMemory::new();
     assert_eq!(
         shared::claim(&store, "root", "one", 5, &[1])
@@ -432,42 +414,6 @@ async fn the_cluster_claim_fixes_the_mode_and_the_quota() {
     assert!(shared::claim(&store, "root", "two", 5, &[1]).await.is_err());
     // A separate one-voter bootstrap in the same namespace refuses before it opens the writer.
     assert!(shared::claim(&store, "root", "one", 5, &[2]).await.is_err());
-    shared::claim_mode(&store, "root", "one", StateMode::Shared)
-        .await
-        .unwrap();
-    assert!(
-        shared::claim_mode(&store, "root", "one", StateMode::Replicated)
-            .await
-            .is_err()
-    );
-}
-
-/// Shared mode keeps the claim quota. A `SetQuota` entry stores only the apply position, so the
-/// overlay gets no batch and the next checkpoint holds no quota row.
-#[tokio::test]
-async fn shared_mode_ignores_a_set_quota_entry() {
-    let mut state = open_shared(Arc::new(InMemory::new())).await;
-    state.quota = 500;
-    state.set_quota_flag(1 << 20);
-    state.apply(1, None).await.unwrap();
-    let batches = state.write_batches;
-    let request = quota::ClusterQuota {
-        bytes: 7,
-        requested_at: 1,
-        member: 1,
-    };
-    state.apply_set_quota(2, request, false).await.unwrap();
-    assert_eq!(state.applied, 2);
-    assert_eq!(state.write_batches, batches);
-    assert_eq!((state.quota, state.quota_bytes()), (500, 500));
-    assert_eq!(state.cluster_quota(), None);
-    assert!(state.quota_mismatch());
-    assert!(state
-        .applied_state()
-        .get(quota::KEY)
-        .await
-        .unwrap()
-        .is_none());
 }
 
 #[tokio::test]
@@ -558,43 +504,26 @@ async fn retention_keeps_the_checkpoint_of_a_live_base() {
 
 #[tokio::test]
 async fn a_shared_export_keeps_the_durable_index() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut shared_state = open_shared(Arc::new(InMemory::new())).await;
-    let mut replicated = StateMachine::open(dir.path()).await.unwrap();
-    for state in [&mut shared_state, &mut replicated] {
-        state.apply_etcd(1, &put("key", "value")).await.unwrap();
-        assert_eq!(state.durable_applied, 0);
-        state.snapshot_data().await.unwrap();
-    }
+    let mut state = open_shared(Arc::new(InMemory::new())).await;
+    state.apply_etcd(1, &put("key", "value")).await.unwrap();
+    assert_eq!(state.durable_applied, 0);
+    state.snapshot_data().await.unwrap();
     // The view scan flushed nothing.
-    assert_eq!(shared_state.durable_applied, 0);
-    // A replicated export flushes the database through the applied index.
-    assert_eq!(replicated.durable_applied, 1);
-    shared_state.close().await.unwrap();
-    replicated.close().await.unwrap();
+    assert_eq!(state.durable_applied, 0);
+    state.close().await.unwrap();
 }
 
-/// A shared-mode backup restores into a new replicated cluster, and the previous format 4 reader
-/// accepts it. The restored quota accounting equals a restore of the same replicated data.
+/// A shared-mode backup has the format 4 image, and the previous format 4 reader accepts it.
 #[tokio::test]
-async fn a_shared_backup_restores_into_a_replicated_cluster() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut reference = StateMachine::open(&dir.path().join("reference"))
-        .await
-        .unwrap();
+async fn a_shared_backup_has_the_format_4_image() {
     let mut state = open_shared(Arc::new(InMemory::new())).await;
     // A small quota raises the space alarm, so the backups also hold an alarm row.
-    for machine in [&mut state, &mut reference] {
-        machine.quota = 400;
-        for n in 0..12_u64 {
-            let index = machine.applied + 1;
-            machine
-                .apply_etcd_quota(index, &request(n), 1)
-                .await
-                .unwrap();
-        }
-        assert!(!machine.alarms.is_empty());
+    state.quota = 400;
+    for n in 0..12_u64 {
+        let index = state.applied + 1;
+        state.apply_etcd_quota(index, &request(n), 1).await.unwrap();
     }
+    assert!(!state.alarms.is_empty());
     let shared_image = state.snapshot_data().await.unwrap();
     let data: SnapshotData = crate::codec::decode(&shared_image).unwrap();
     assert!(data.rows.iter().all(|(key, _)| !derived_key(key)));
@@ -621,80 +550,7 @@ async fn a_shared_backup_restores_into_a_replicated_cluster() {
     let mut stored = data.rows.clone();
     stored.retain(|(key, _)| key != crate::cluster::KEY);
     assert_eq!(padded.rows, stored);
-    let reference_backup =
-        crate::state::tests::backup_bytes(reference.snapshot_data().await.unwrap());
-
-    let restored = {
-        let path = dir.path().join("from-shared");
-        std::fs::create_dir(&path).unwrap();
-        crate::state::tests::restore(&path, streamed).await
-    };
-    let expected = {
-        let path = dir.path().join("from-replicated");
-        std::fs::create_dir(&path).unwrap();
-        crate::state::tests::restore(&path, reference_backup).await
-    };
-    assert_eq!(rows(&restored, b"").await, rows(&expected, b"").await);
-    assert_eq!(restored.logical_size(), expected.logical_size());
-    assert_eq!(
-        restored.logical_usage(),
-        maintenance::count_logical_usage(restored.applied_state())
-            .await
-            .unwrap()
-    );
-    assert_eq!(restored.alarms, expected.alarms);
-    assert_eq!(
-        restored
-            .applied_state()
-            .get(shared::LOGICAL_BYTES)
-            .await
-            .unwrap(),
-        None
-    );
-    for revision in [0, state.revision] {
-        assert_eq!(
-            serde_json::to_value(restored.read_etcd(&range(revision)).await.unwrap()).unwrap(),
-            serde_json::to_value(state.read_etcd(&range(revision)).await.unwrap()).unwrap()
-        );
-    }
-    for machine in [state, reference, restored, expected] {
-        machine.close().await.unwrap();
-    }
-}
-
-/// An image from an exporter that kept the logical size row still installs and restores.
-#[tokio::test]
-async fn readers_drop_a_logical_size_row() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut source = StateMachine::open(&dir.path().join("source"))
-        .await
-        .unwrap();
-    source.apply_etcd(1, &put("key", "value")).await.unwrap();
-    let mut data: SnapshotData =
-        crate::codec::decode(&source.snapshot_data().await.unwrap()).unwrap();
-    data.rows
-        .push((shared::LOGICAL_BYTES.to_vec(), 7_u64.to_be_bytes().to_vec()));
-    let image = crate::codec::encode(&data).unwrap();
-    let path = dir.path().join("restore");
-    std::fs::create_dir(&path).unwrap();
-    let restored =
-        crate::state::tests::restore(&path, crate::state::tests::backup_bytes(image)).await;
-    assert_eq!(
-        restored
-            .applied_state()
-            .get(shared::LOGICAL_BYTES)
-            .await
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        restored.logical_usage(),
-        maintenance::count_logical_usage(restored.applied_state())
-            .await
-            .unwrap()
-    );
-    restored.close().await.unwrap();
-    source.close().await.unwrap();
+    state.close().await.unwrap();
 }
 
 /// The applied index and the split in the counter row of `state`.
@@ -999,7 +855,6 @@ async fn an_old_view_fails_reads_with_a_retryable_error() {
             pin_max: Duration::from_millis(50),
             ..options()
         },
-        transfer::Backend::Local,
     )
     .await
     .unwrap();
@@ -1117,7 +972,6 @@ async fn slow_base() -> (StateMachine, Arc<crate::object::faults::FaultStore>) {
             pin_max: Duration::from_millis(20),
             ..options()
         },
-        transfer::Backend::Local,
     )
     .await
     .unwrap();
@@ -1810,14 +1664,7 @@ async fn manifest_gc_continues_on_a_local_store_after_a_writer_change() {
     ] {
         let data = tempfile::tempdir_in(dir.path()).unwrap();
         let mut state = config
-            .open(
-                data.path(),
-                "cluster",
-                1,
-                StateCache::default(),
-                StateMode::Shared,
-                &options(),
-            )
+            .open(data.path(), "cluster", 1, StateCache::default(), &options())
             .await
             .unwrap();
         state.members = Arc::new(crate::cluster::Store::initial(

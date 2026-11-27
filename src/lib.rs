@@ -1,7 +1,6 @@
 mod batch;
 mod codec;
 mod command;
-pub mod convert;
 mod crc;
 pub use batch::WriteBatch;
 
@@ -21,6 +20,7 @@ mod peer;
 pub mod proto;
 pub mod server;
 pub mod state;
+pub mod status;
 pub mod storage;
 pub mod tls;
 pub mod watch;
@@ -135,30 +135,12 @@ pub enum RaftCommand {
         #[serde(default)]
         covers: u64,
     },
-    /// A replicated-mode leader sets the logical quota of the cluster. A non-positive `bytes`
-    /// disables the check. A `seed` entry applies only when the state has no cluster quota.
-    /// Another entry applies only when its `(requested_at, member, bytes)` is newer than the
-    /// stored request. It changes no etcd state except the `etcd/quota` row. Shared mode ignores
-    /// it.
+    /// A leader proposes this entry at the start of each term. A state without the
+    /// `etcd/members` row stores `members`, so every member stores the same row. A state with
+    /// the row keeps it, and compares it with `digest`. See `state::cluster`.
     ///
     /// The enum is untagged, so this variant must precede `CompactStep`, which matches any `id`.
-    /// The JSON names the id `quota_id`. An older binary then fails to decode the entry and
-    /// stops, instead of applying it as a `CompactStep`.
-    SetQuota {
-        #[serde(rename = "quota_id")]
-        id: String,
-        bytes: i64,
-        seed: bool,
-        /// The wall clock of the operator request on `member`, in milliseconds. Zero for a seed.
-        requested_at: u64,
-        member: u64,
-    },
-    /// A leader proposes this entry at the start of each term, in both state modes. A state
-    /// without the `etcd/members` row stores `members`, so every member stores the same row. A
-    /// state with the row keeps it, and compares it with `digest`. See `state::cluster`.
-    ///
-    /// Like `SetQuota`, this variant precedes `CompactStep`, and the JSON names its id
-    /// `members_id`. An older binary then stops on the entry.
+    /// The JSON names its id `members_id`. An older binary then stops on the entry.
     SeedMembers(cluster::Seed),
     /// The leader proposes bounded physical compaction work after a Compact entry.
     CompactStep {
@@ -189,7 +171,6 @@ impl RaftCommand {
             | Self::Compact { id, .. }
             | Self::CompactStep { id }
             | Self::ViewCheckpoint { id, .. }
-            | Self::SetQuota { id, .. }
             | Self::Lease { id, .. } => id,
             Self::SeedMembers(seed) => &seed.id,
         }

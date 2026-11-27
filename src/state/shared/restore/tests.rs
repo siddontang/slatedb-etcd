@@ -430,7 +430,6 @@ async fn fixture(path: &FilePath, keys: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
         crate::maintenance::ALARMS.to_vec(),
         serde_json::to_vec(&alarms).unwrap(),
     ));
-    rows.push((quota::KEY.to_vec(), 1_i64.to_be_bytes().to_vec()));
     // The membership row stays last, as in every image.
     rows.sort_by(|a, b| {
         let members = |key: &[u8]| key == crate::cluster::KEY;
@@ -512,7 +511,6 @@ async fn a_restore_of_many_batches_completes_at_its_index() {
     assert_eq!(checkpoint.name, Some(view_name(index)));
     let base = member.source.open_base(checkpoint.id).await.unwrap();
     assert!(base.get(PROGRESS).await.unwrap().is_none());
-    assert!(base.get(quota::KEY).await.unwrap().is_none());
     let counter = base.get(LOGICAL_SIZE).await.unwrap().unwrap();
     let counter = <crate::proto::state::LogicalSize as prost::Message>::decode(counter).unwrap();
     let stored = stored_usage(&counter, index).unwrap().unwrap();
@@ -1122,14 +1120,8 @@ async fn a_bootstrapped_cluster_needs_no_restore_object() {
             restore: Some(retry),
             ..options()
         };
-        let opening = StateMachine::open_shared(
-            faulty,
-            "cluster",
-            "test",
-            StateCache::default(),
-            &options,
-            transfer::Backend::Local,
-        );
+        let opening =
+            StateMachine::open_shared(faulty, "cluster", "test", StateCache::default(), &options);
         let state = tokio::time::timeout(limit, opening).await.unwrap().unwrap();
         assert_eq!(state.applied, index, "{failing}");
         state.close().await.unwrap();
@@ -1188,16 +1180,7 @@ async fn open_join(store: Arc<dyn ObjectStore>) -> Result<StateMachine> {
         empty_log: true,
         ..options()
     };
-    let local = transfer::Backend::Local;
-    StateMachine::open_shared(
-        store,
-        "cluster",
-        "test",
-        StateCache::default(),
-        &options,
-        local,
-    )
-    .await
+    StateMachine::open_shared(store, "cluster", "test", StateCache::default(), &options).await
 }
 
 /// A restore stops after its first durable rows. A joining member with an empty log does not
@@ -1463,14 +1446,7 @@ async fn an_abandoned_restore_keeps_the_store_id_and_restores_another_image() {
                 ..options()
             };
             crate::object::Config::TestS3(store, s3)
-                .open(
-                    &dir,
-                    "test",
-                    1,
-                    StateCache::default(),
-                    StateMode::Shared,
-                    &options,
-                )
+                .open(&dir, "test", 1, StateCache::default(), &options)
                 .await
         }
     };

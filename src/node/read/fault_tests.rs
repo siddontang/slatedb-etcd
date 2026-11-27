@@ -172,14 +172,8 @@ fn linear(key: &[u8], id: u64) -> Query {
 async fn a_corrupt_row_fails_coalesced_reads_once() {
     let _counted = COUNTED.lock().await;
     let dir = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
-    state
-        .db()
-        .put(b"etcd/current/bad", b"\xff\xff")
-        .await
-        .unwrap();
-    // The direct write took one sequence number. A view pins the state at the applied index.
-    state.applied += 1;
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
+    state.write_raw(&[(b"etcd/current/bad", b"\xff\xff")]);
     let view = state.read_view().unwrap();
     let header = Header {
         cluster: 1,
@@ -239,7 +233,7 @@ async fn a_hash_record_key_without_its_subrevision_fails_only_hash_kv() {
 async fn a_bad_hash_record_fails_only_hash_kv(key: Vec<u8>, value: Vec<u8>) {
     let _counted = COUNTED.lock().await;
     let dir = tempfile::tempdir().unwrap();
-    let mut state = StateMachine::open(dir.path()).await.unwrap();
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
     let put = RequestOp {
         request: Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(
             PutRequest {
@@ -250,8 +244,7 @@ async fn a_bad_hash_record_fails_only_hash_kv(key: Vec<u8>, value: Vec<u8>) {
         )),
     };
     state.apply_etcd(1, &put).await.unwrap();
-    state.db().put(&key, &value).await.unwrap();
-    state.applied += 1;
+    state.write_raw(&[(&key, &value)]);
     let before = CORRUPT_READS.get();
     let outcome = state
         .maintenance(
@@ -281,8 +274,8 @@ async fn a_bad_hash_record_fails_only_hash_kv(key: Vec<u8>, value: Vec<u8>) {
 async fn a_corrupt_diagnostic_value_fails_with_data_loss() {
     let _counted = COUNTED.lock().await;
     let dir = tempfile::tempdir().unwrap();
-    let state = StateMachine::open(dir.path()).await.unwrap();
-    state.db().put(b"data/bad", b"\xff\xfe").await.unwrap();
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
+    state.write_raw(&[(b"data/bad", b"\xff\xfe")]);
     let before = CORRUPT_READS.get();
     let error = state.local_value("bad").await.unwrap_err();
     let error = crate::mvcc::KvError::read_failure(error);

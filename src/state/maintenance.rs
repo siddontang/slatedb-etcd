@@ -54,16 +54,11 @@ impl StateMachine {
                 }
                 Ok(json!({"header": mvcc::header(self.revision), "hash": hash}))
             }
-            // The shared database belongs to the leader writer. Phase 4 adds Defragment there.
-            Command::Defragment if self.is_shared() => Err(KvError::new(
+            // The shared database belongs to the leader writer. The node runs Defragment there.
+            Command::Defragment => Err(KvError::new(
                 Code::Unimplemented,
                 "shared state mode has no Defragment until phase 4",
             )),
-            Command::Defragment => self
-                .defragment()
-                .await
-                .map_err(KvError::storage)
-                .map(|()| json!({"header": mvcc::header(self.revision)})),
             // gRPC Snapshot streams a backup through `Event::Snapshot`. This command keeps the
             // bounded in-memory image for Rust callers of the maintenance interface.
             Command::Snapshot => {
@@ -163,14 +158,6 @@ impl StateMachine {
             .all_sst_views()
             .map(|v| v.sst.estimate_size())
             .sum())
-    }
-
-    async fn defragment(&mut self) -> Result<()> {
-        let _timer = self.metrics.defrag.start_timer();
-        let _active = crate::metrics::Active::new(&self.metrics.defrag_active);
-        self.metrics.flush_db(self.db()).await?;
-        self.durable_applied = self.applied;
-        compact_all(&self.admin, &|| Ok(())).await.map(drop)
     }
 
     pub(super) async fn hash_kv(&self, revision: i64) -> std::result::Result<Value, KvError> {
@@ -442,7 +429,7 @@ pub(crate) async fn count_logical_usage(db: &impl StateRead) -> Result<crate::ba
 }
 
 /// Compact every L0 SST and sorted run into one sorted run, and wait up to 8 s for the end.
-/// The compactor of the database writer runs the job. Defragment uses this in both state modes.
+/// The compactor of the database writer runs the job. Defragment uses this.
 /// Return the version of the manifest that shows compaction is complete.
 ///
 /// `allowed` runs before each submission. A Defragment of a writer whose term ended must not add

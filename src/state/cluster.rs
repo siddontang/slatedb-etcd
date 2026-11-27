@@ -10,13 +10,13 @@
 //! The bootstrap membership from the flags of a member stays in memory until the seed applies.
 //! The transport and the member API use it. It does not count toward the logical size.
 //!
-//! A leader proposes `SeedMembers` right after its election, before any other entry of its term
-//! except `SetQuota`. An earlier binary has no seed, and it stored the bootstrap membership with
+//! A leader proposes `SeedMembers` right after its election, before any other entry of its term.
+//! An earlier binary has no seed, and it stored the bootstrap membership with
 //! its first batch. So another entry that finds no row comes from a log of an earlier binary.
 //! The batch of that entry then stores the in-memory membership, as that binary did, and the
 //! quota check of that entry already counts it. An upgraded member that replays such a log gets
 //! the row and the decisions of the members that flushed it. A state that this binary created empty never
-//! applies such an entry. The quota guard stops it there and asks for a snapshot; see
+//! applies such an entry. The membership guard stops it there and asks for a snapshot; see
 //! `node::quota`.
 //!
 //! A `SeedMembers` entry also carries the digest of the row of its leader at the applied index of
@@ -60,12 +60,9 @@ pub(super) async fn load(
 }
 
 /// Return true when an earlier binary stored its bootstrap membership before `command`: for
-/// every entry except the term-start entries `SeedMembers` and `SetQuota`.
+/// every entry except the term-start entry `SeedMembers`.
 pub(crate) fn needs_members(command: &crate::RaftCommand) -> bool {
-    !matches!(
-        command,
-        crate::RaftCommand::SeedMembers(_) | crate::RaftCommand::SetQuota { .. }
-    )
+    !matches!(command, crate::RaftCommand::SeedMembers(_))
 }
 
 impl StateMachine {
@@ -225,18 +222,5 @@ impl StateMachine {
             applied: index - 1,
         };
         self.apply_seed_members(index, &seed).await
-    }
-
-    /// Read the row again after a snapshot install replaced the rows. Without the row, keep the
-    /// in-memory membership. It is the bootstrap membership or the membership of a snapshot.
-    pub(super) async fn reload_members(&mut self) -> Result<()> {
-        let (members, row) = load(self.applied_state(), self.applied).await?;
-        if row.is_some() {
-            self.members = Arc::new(members);
-        }
-        self.members_row = row;
-        self.members_unsaved = false;
-        self.members_mismatch = None;
-        Ok(())
     }
 }

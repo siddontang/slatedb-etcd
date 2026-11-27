@@ -318,7 +318,6 @@ async fn elect(node: &mut Node) {
 async fn shared_leader(dir: &std::path::Path) -> Node {
     let mut config = crate::node::tests::options(dir);
     config.peers = BTreeMap::from([(1, "127.0.0.1:1".to_owned())]);
-    config.state_mode = crate::state::StateMode::Shared;
     let store = Arc::new(InMemory::new());
     config.object_store = crate::object::Config::Test(store, "root".into());
     let (events, _) = mpsc::channel(256);
@@ -491,7 +490,6 @@ async fn channel(server: &Server) -> tonic::transport::Channel {
 
 fn shared_config(dir: &std::path::Path, faults: &Arc<FaultStore>) -> ServerConfig {
     let mut config = ServerConfig::single_node(dir);
-    config.state_mode = crate::state::StateMode::Shared;
     config.object_store = crate::object::Config::Test(faults.clone(), "root".into());
     config.view_max_age = Duration::from_millis(100);
     config.strict_reconfiguration = false;

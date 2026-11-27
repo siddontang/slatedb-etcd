@@ -33,7 +33,6 @@ async fn a_restart_opens_the_record_checkpoint_above_its_row() {
                 "test",
                 crate::state::StateCache::default(),
                 &options,
-                crate::state::transfer::Backend::Local,
             )
             .await
         }
@@ -210,7 +209,6 @@ async fn open_at(
         "test",
         crate::state::StateCache::default(),
         &options,
-        crate::state::transfer::Backend::Local,
     )
     .await
 }

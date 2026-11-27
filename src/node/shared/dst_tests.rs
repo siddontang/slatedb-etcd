@@ -233,7 +233,7 @@ impl Simulation {
 /// The follower applied through its last index, so it saves the record and installs no state.
 #[tokio::test]
 async fn an_idle_shared_leader_serves_a_snapshot_request_at_the_last_index() {
-    let mut sim = Simulation::with_mode(9, true).await;
+    let mut sim = Simulation::new(9).await;
     sim.settle(4).await;
     let leader = sim.leader().unwrap();
     let mut writers = BTreeMap::new();
@@ -286,7 +286,7 @@ async fn a_guarded_shared_member_recovers_from_a_clamped_target() {
 }
 
 async fn guarded_member(lagging: bool) {
-    let mut sim = Simulation::with_holds(23, true, BTreeMap::new(), false, true, true).await;
+    let mut sim = Simulation::with_holds(23, BTreeMap::new(), false, true, true).await;
     sim.settle(3).await;
     let publish = RaftCommand::Cluster {
         id: "publish-2".into(),
@@ -332,7 +332,7 @@ async fn guarded_member(lagging: bool) {
 /// log, and completes a manual checkpoint. After a failover it accepts a write.
 #[tokio::test]
 async fn a_member_that_applied_entries_apart_adopts_the_base_and_leads() {
-    let mut sim = Simulation::with_mode(29, true).await;
+    let mut sim = Simulation::new(29).await;
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
     sim.write(10).await;
@@ -387,7 +387,7 @@ async fn a_member_that_applied_entries_apart_adopts_the_base_and_leads() {
 /// client write are needed.
 #[tokio::test]
 async fn a_follower_manual_checkpoint_completes_with_a_certified_base() {
-    let mut sim = Simulation::with_mode(31, true).await;
+    let mut sim = Simulation::new(31).await;
     // No member truncates, so `grouped` gets the entries and no snapshot.
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
@@ -543,7 +543,7 @@ async fn a_follower_manual_checkpoint_completes_with_a_certified_base() {
 /// holds the Put serves the request, and the receiver reads the Put.
 #[tokio::test]
 async fn a_buffered_put_keeps_the_coverage_at_the_checkpoint_row() {
-    let mut sim = Simulation::with_mode(37, true).await;
+    let mut sim = Simulation::new(37).await;
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
     sim.write(3).await;
@@ -617,7 +617,7 @@ async fn a_buffered_put_keeps_the_coverage_at_the_checkpoint_row() {
 /// that applied through `c`, and it applies the later entries once.
 #[tokio::test]
 async fn a_member_restarts_at_a_record_above_its_checkpoint_row() {
-    let mut sim = Simulation::with_mode(41, true).await;
+    let mut sim = Simulation::new(41).await;
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
     sim.write(3).await;
@@ -720,16 +720,14 @@ impl Simulation {
 /// each leader. A leader serves `min(high, last)` and pins that target, so member 2 restores a
 /// snapshot below `high`, which clears its request, and then takes appends. With `restart`,
 /// member 2 restarts instead, and the old request of the earlier term must not hold back
-/// member 4's request after leadership goes back to member 1. Both state modes use this rule.
-async fn stale_request(shared: bool, restart: bool) {
-    let mut sim = Simulation::with_size(9, shared, 5).await;
+/// member 4's request after leadership goes back to member 1.
+async fn stale_request(restart: bool) {
+    let mut sim = Simulation::with_size(9, 5).await;
     sim.settle(5).await;
     let first = sim.leader().unwrap();
     assert_eq!(first, 1);
     let mut writers = BTreeMap::new();
-    if shared {
-        sim.publish_view(&mut writers).await;
-    }
+    sim.publish_view(&mut writers).await;
     sim.settle(10).await;
     for _ in 0..30 {
         sim.propose_noop().await;
@@ -805,17 +803,12 @@ async fn stale_request(shared: bool, restart: bool) {
 
 #[tokio::test]
 async fn an_earlier_term_request_does_not_hold_back_a_current_one() {
-    stale_request(true, true).await;
+    stale_request(true).await;
 }
 
 #[tokio::test]
 async fn a_requester_of_an_earlier_term_takes_a_snapshot_below_its_request() {
-    stale_request(true, false).await;
-}
-
-#[tokio::test]
-async fn a_replicated_requester_of_an_earlier_term_recovers() {
-    stale_request(false, false).await;
+    stale_request(false).await;
 }
 
 /// Rolling upgrade: member `old` runs an earlier binary. It installs a view snapshot only at its
@@ -824,7 +817,7 @@ async fn a_replicated_requester_of_an_earlier_term_recovers() {
 /// runs this binary and reports, announcements cover the no-op entries again.
 #[tokio::test]
 async fn a_leader_with_an_earlier_binary_follower_announces_at_the_row() {
-    let mut sim = Simulation::with_mode(43, true).await;
+    let mut sim = Simulation::new(43).await;
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
     let leader = sim.leader().unwrap();
@@ -890,7 +883,7 @@ async fn a_leader_with_an_earlier_binary_follower_announces_at_the_row() {
 /// does not send the record above the row. It stores the apply marker at its applied index,
 /// publishes a checkpoint with its row there, and sends that one.
 async fn replaced_by_an_earlier_binary(restart_leader: bool) {
-    let mut sim = Simulation::with_mode(47, true).await;
+    let mut sim = Simulation::new(47).await;
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
     sim.write(10).await;
@@ -1015,7 +1008,7 @@ impl Simulation {
 /// leader then treats the member as an earlier binary, and the member catches up.
 #[tokio::test]
 async fn a_snapshot_above_its_row_to_a_restarted_earlier_binary_is_refused() {
-    let mut sim = Simulation::with_mode(53, true).await;
+    let mut sim = Simulation::new(53).await;
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
     sim.write(10).await;
@@ -1057,7 +1050,7 @@ async fn a_snapshot_above_its_row_to_a_restarted_earlier_binary_is_refused() {
 /// Critic's stall. An earlier binary asks for a snapshot above the record: one above its row,
 /// or one at its row. Its request feeds the publication of a checkpoint at its row.
 async fn an_earlier_binary_request(above_row: bool) {
-    let mut sim = Simulation::with_mode(59, true).await;
+    let mut sim = Simulation::new(59).await;
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
     sim.write(10).await;
@@ -1105,7 +1098,7 @@ async fn an_earlier_binary_request_above_a_record_at_its_row_is_served() {
 /// at its row instead, with no client write, and the requester recovers.
 #[tokio::test]
 async fn a_request_beside_an_earlier_binary_voter_gets_a_snapshot_at_its_row() {
-    let mut sim = Simulation::with_mode(61, true).await;
+    let mut sim = Simulation::new(61).await;
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
     sim.write(10).await;
@@ -1141,7 +1134,7 @@ async fn a_request_beside_an_earlier_binary_voter_gets_a_snapshot_at_its_row() {
 /// snapshot. The leader records Y at that index and sends it, and it never sends X.
 #[tokio::test]
 async fn a_restart_on_another_checkpoint_sends_that_checkpoint() {
-    let mut sim = Simulation::with_mode(67, true).await;
+    let mut sim = Simulation::new(67).await;
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
     sim.write(10).await;
@@ -1198,7 +1191,7 @@ async fn a_restart_on_another_checkpoint_sends_that_checkpoint() {
 /// completes. Automatic truncation is off, so only that publication can serve it.
 #[tokio::test]
 async fn a_follower_manual_checkpoint_beside_an_earlier_binary_gets_a_row_checkpoint() {
-    let mut sim = Simulation::with_mode(31, true).await;
+    let mut sim = Simulation::new(31).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
         node.next_checkpoint = None;
@@ -1264,7 +1257,7 @@ async fn a_follower_manual_checkpoint_beside_an_earlier_binary_gets_a_row_checkp
 /// no new checkpoint.
 #[tokio::test]
 async fn a_late_refusal_for_an_earlier_process_keeps_the_capability() {
-    let mut sim = Simulation::with_mode(9, true).await;
+    let mut sim = Simulation::new(9).await;
     sim.settle(4).await;
     let mut writers = BTreeMap::new();
     sim.publish_view(&mut writers).await;
@@ -1302,7 +1295,7 @@ async fn a_late_refusal_for_an_earlier_process_keeps_the_capability() {
 /// the base, never X.
 #[tokio::test]
 async fn a_record_of_an_earlier_base_is_rebuilt_from_the_base() {
-    let mut sim = Simulation::with_size(73, true, 5).await;
+    let mut sim = Simulation::with_size(73, 5).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
         node.next_checkpoint = None;
@@ -1346,7 +1339,7 @@ async fn a_record_of_an_earlier_base_is_rebuilt_from_the_base() {
 /// never X.
 #[tokio::test]
 async fn a_restart_above_its_record_does_not_send_a_deleted_checkpoint() {
-    let mut sim = Simulation::with_size(79, true, 5).await;
+    let mut sim = Simulation::with_size(79, 5).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
         node.next_checkpoint = None;
@@ -1424,7 +1417,7 @@ impl Simulation {
 /// raises its base to the record from the received checkpoint, and records nothing below it.
 #[tokio::test]
 async fn a_record_at_the_applied_index_raises_the_base() {
-    let mut sim = Simulation::with_mode(83, true).await;
+    let mut sim = Simulation::new(83).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
         node.next_checkpoint = None;
@@ -1461,7 +1454,7 @@ async fn a_record_at_the_applied_index_raises_the_base() {
 /// The next image replaces the record, and the lagging member never gets the deleted
 /// checkpoint. With an earlier binary present, the exact path publishes at a row.
 async fn a_failed_raise(old: bool) {
-    let mut sim = Simulation::with_mode(83, true).await;
+    let mut sim = Simulation::new(83).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
         node.next_checkpoint = None;
@@ -1552,7 +1545,7 @@ async fn a_failed_raise_beside_an_earlier_binary_is_served_at_a_row() {
 /// leads, and certifies or announces nothing above its applied index.
 #[tokio::test]
 async fn a_member_does_not_lead_before_its_install() {
-    let mut sim = Simulation::with_mode(89, true).await;
+    let mut sim = Simulation::new(89).await;
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
     sim.write(10).await;
@@ -1631,7 +1624,7 @@ async fn a_member_does_not_lead_before_its_install() {
 /// member gets a record of the base.
 #[tokio::test]
 async fn an_empty_base_sends_a_record_only_after_its_first_base() {
-    let mut sim = Simulation::with_mode(89, true).await;
+    let mut sim = Simulation::new(89).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
         node.next_checkpoint = None;
@@ -1738,7 +1731,7 @@ impl Simulation {
         seed: u64,
         writers: &mut BTreeMap<u64, shared::DstWriter>,
     ) -> (Self, u64, u64, u64) {
-        let mut sim = Simulation::with_mode(seed, true).await;
+        let mut sim = Simulation::new(seed).await;
         sim.settle(4).await;
         sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
         sim.write(10).await;
@@ -1853,7 +1846,7 @@ async fn a_transfer_after_a_snapshot_in_one_batch_is_ignored() {
 /// follower for a snapshot, and it restarts every member.
 #[tokio::test]
 async fn a_shared_schedule_ends_when_only_the_leader_runs() {
-    let mut sim = Simulation::with_mode(109, true).await;
+    let mut sim = Simulation::new(109).await;
     sim.settle(4).await;
     let leader = sim.leader().unwrap();
     for id in (1..=3).filter(|id| *id != leader) {

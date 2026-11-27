@@ -1410,7 +1410,7 @@ impl Node {
     /// rebuild. Otherwise the member adopts the checkpoint as its snapshot record.
     pub(super) fn align_log(storage: &mut RaftStorage, state: &StateMachine) -> Result<()> {
         let index = state.applied;
-        if !state.is_shared() || index == 0 {
+        if index == 0 {
             return Ok(());
         }
         if index == storage.snapshot_index() {

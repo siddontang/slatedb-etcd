@@ -444,7 +444,6 @@ impl Leader {
             "test",
             crate::state::StateCache::default(),
             &options,
-            crate::state::transfer::Backend::Local,
         )
         .await
         .unwrap();
@@ -1439,7 +1438,6 @@ async fn a_data_error_halts_the_writer_and_keeps_the_member() {
 
 fn shared_config(dir: &std::path::Path, faults: &Arc<FaultStore>) -> ServerConfig {
     let mut config = ServerConfig::single_node(dir);
-    config.state_mode = crate::state::StateMode::Shared;
     config.object_store = crate::object::Config::Test(faults.clone(), "root".into());
     config.view_max_age = Duration::from_millis(100);
     config

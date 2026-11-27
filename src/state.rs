@@ -6,11 +6,9 @@ use crate::WriteBatch;
 use anyhow::{ensure, Context, Result};
 use raft::eraftpb::Snapshot;
 use serde::{Deserialize, Serialize};
-use slatedb::config::{Settings, WriteOptions};
+use slatedb::config::Settings;
 use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::db_cache::{DbCache, SplitCache};
-use slatedb::object_store::local::LocalFileSystem;
-use slatedb::Db;
 
 use crate::mvcc::{self, Outcome};
 use crate::proto::etcdserverpb::{CompactionRequest, CompactionResponse, RequestOp};
@@ -41,7 +39,7 @@ mod source;
 pub(crate) mod transfer;
 pub(crate) mod view;
 pub(crate) use read::ReadView;
-pub use shared::{StateMode, ViewRetention};
+pub use shared::ViewRetention;
 pub use source::{Row, StateRead, StateScan};
 use view::StateView;
 #[cfg(test)]
@@ -64,6 +62,7 @@ pub(crate) const APPLIED_TERM: &[u8] = b"meta/applied-term";
 const LOGICAL_SIZE: &[u8] = b"meta/logical-size";
 const DATA: &[u8] = b"data/";
 
+#[cfg(test)]
 #[derive(Deserialize, Serialize)]
 struct SnapshotData {
     version: u32,
@@ -73,21 +72,13 @@ struct SnapshotData {
 
 pub struct StateMachine {
     pub(crate) metrics: Arc<crate::metrics::StateMeters>,
-    /// The replicated database. Shared mode has no writer here: the leader task opens it.
-    database: Option<Arc<Db>>,
     pub auth: Arc<crate::auth::Store>,
     pub members: Arc<crate::cluster::Store>,
     pub(crate) admin: Arc<slatedb::admin::Admin>,
-    /// The quota that apply uses. Zero disables it. See `quota`.
+    /// The quota that apply uses, from the cluster claim. Zero disables it. See `quota`.
     pub quota: u64,
-    /// The effective flag value of this member. Replicated apply uses it without a cluster quota.
+    /// The effective flag value of this member. It only shows a difference from the claim.
     quota_flag: i64,
-    /// The quota of the last applied `SetQuota` entry. `None` in shared mode.
-    cluster_quota: Option<quota::ClusterQuota>,
-    /// The index of a first `SetQuota` entry that followed quota-checked entries, or zero.
-    /// Members checkpoint through it, so no log still holds those entries. The row keeps it, so
-    /// a restart can retry the checkpoint.
-    pub(crate) quota_boundary: u64,
     logical_bytes: crate::batch::Usage,
     pub(crate) current: current::CurrentRows,
     pub(crate) key_index: key_index::KeyIndex,
@@ -129,9 +120,9 @@ pub struct StateMachine {
     pub(crate) members_mismatch: Option<u64>,
     /// The term and index of the last `SeedMembers` entry that compared the row.
     pub(crate) members_checked: Option<(u64, u64)>,
-    /// The state that apply reads: the live database, or the shared-mode overlay and base.
+    /// The state that apply reads: the overlay and base.
     reads: StateView,
-    /// The overlay and base of shared state mode. `None` in replicated mode.
+    /// The overlay and base. Only the in-memory state of a test has none.
     pub(crate) shared: Option<shared::Shared>,
 }
 
@@ -246,36 +237,6 @@ pub(crate) fn slatedb_settings() -> Settings {
     settings
 }
 
-/// SlateDB settings for the state machine of one member; `local_disk` when its store is a
-/// member-local directory.
-///
-/// Compaction rewrites the sorted runs several times while a large data set loads. Each replaced
-/// SST stays until its compactor checkpoint expires and the next GC run. With SlateDB's defaults
-/// (a 15-minute checkpoint and GC every 10 minutes) that took 15 to 25 minutes. On a local
-/// directory GC runs every minute, so a replaced SST leaves 15-16 minutes after the compaction.
-/// Any other store, including one a caller passes to `open_store`, keeps the defaults, because
-/// each GC run lists the SSTs of the store.
-///
-/// The checkpoint lifetime stays at SlateDB's default on every store. A read fails if it still
-/// iterates an input SST after the checkpoint expires and GC deletes it. Several reads scan once
-/// with one iterator: the index rebuild at open, a committed DeleteRange, HashKV, export and the
-/// usage count of an older directory. On a cold, busy volume such a scan can run for minutes.
-pub(crate) fn member_settings(local_disk: bool) -> Settings {
-    let mut settings = slatedb_settings();
-    if !local_disk {
-        return settings;
-    }
-    if let Some(gc) = settings.garbage_collector_options.as_mut() {
-        if let Some(compacted) = gc.compacted_options.as_mut() {
-            compacted.interval = Some(COMPACTED_GC_INTERVAL);
-        }
-    }
-    settings
-}
-
-/// How often SlateDB deletes compacted SSTs that no manifest or checkpoint references.
-const COMPACTED_GC_INTERVAL: Duration = Duration::from_secs(60);
-
 /// Read the stored logical size, or count it when the counter does not match the apply marker.
 ///
 /// Directories from older binaries have no counter. An older binary that writes to a directory
@@ -352,145 +313,25 @@ fn logical_size_row(applied: u64, size: crate::batch::Usage) -> Vec<u8> {
 const CURRENT_END: &[u8] = b"etcd/current0";
 
 impl StateMachine {
-    pub async fn open(dir: &Path) -> Result<Self> {
-        Self::open_with_cache(dir, StateCache::default()).await
-    }
-
-    pub async fn open_with_cache(dir: &Path, cache: StateCache) -> Result<Self> {
-        std::fs::create_dir_all(dir)?;
-        // Log truncation relies on flushed state. Sync local objects like a remote object store,
-        // and pace SST writeback so a large flush does not stall Raft log syncs.
-        let local = LocalFileSystem::new_with_prefix(dir)?.with_fsync(true);
-        #[cfg(target_os = "linux")]
-        let (object_store, metrics) = {
-            let store = crate::object::paced::PacedStore::new(local);
-            // Local SSTs write faster while unflushed memtables pile up.
-            let metrics = store.backlog_recorder(slatedb_settings().max_unflushed_bytes);
-            (Arc::new(store), Some(metrics))
-        };
-        #[cfg(not(target_os = "linux"))]
-        let (object_store, metrics) = (Arc::new(local), None);
-        let local = transfer::Backend::Local;
-        Self::open_location(object_store, "state", cache, local, true, metrics).await
-    }
-
-    pub async fn open_store(
-        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
-        prefix: &str,
-    ) -> Result<Self> {
-        Self::open_store_with_cache(object_store, prefix, StateCache::default()).await
-    }
-
-    pub async fn open_store_with_cache(
-        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
-        prefix: &str,
-        cache: StateCache,
-    ) -> Result<Self> {
-        Self::open_backend(object_store, prefix, cache, transfer::Backend::Local, None).await
-    }
-
-    pub(crate) async fn open_backend(
-        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
-        prefix: &str,
-        cache: StateCache,
-        backend: transfer::Backend,
-        metrics: Option<Arc<dyn slatedb_common::metrics::MetricsRecorder>>,
-    ) -> Result<Self> {
-        Self::open_location(object_store, prefix, cache, backend, false, metrics).await
-    }
-
-    /// Open the state in `object_store`. `local_disk` is true only when this server built the
-    /// store on a member-local directory.
-    async fn open_location(
-        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
-        prefix: &str,
-        cache: StateCache,
-        backend: transfer::Backend,
-        local_disk: bool,
-        metrics: Option<Arc<dyn slatedb_common::metrics::MetricsRecorder>>,
-    ) -> Result<Self> {
-        cache.validate()?;
-        let location =
-            transfer::Location::open(object_store, prefix, backend, local_disk, cache, metrics)
-                .await?;
-        let state = Self::open_at(location.clone(), &location.root()).await?;
-        if let Err(error) = location.remove_orphans().await {
-            tracing::warn!(%error, "cannot delete unused state databases");
-        }
-        Ok(state)
-    }
-
-    /// Open the database at `root` in the namespace of `location`.
-    pub(crate) async fn open_at(location: Arc<transfer::Location>, root: &str) -> Result<Self> {
-        let cache = location.cache;
-        let object_store = location.store();
-        let rows = Arc::new(rows::RowCache::new(cache.row_bytes));
-        let cache = cache.build();
-        let settings = member_settings(location.local_disk);
-        let admin = slatedb::admin::Admin::builder(root, object_store.clone()).build();
-        let mut builder = Db::builder(root, object_store);
-        if let Some(metrics) = &location.metrics {
-            builder = builder.with_metrics_recorder(metrics.clone());
-        }
-        let db = builder
-            .with_db_cache(cache, 0)
-            .with_settings(settings)
-            .with_block_cache_policy(block_cache_policy())
-            .build()
-            .await?;
-        let db = Arc::new(db);
-        let result = async {
-            let applied = decode_applied(db.get(APPLIED).await?)?;
-            ensure!(
-                db.snapshot()?.seq() == applied,
-                "SlateDB sequence and apply marker differ"
-            );
-            let reads = StateView::Live(db.clone());
-            Self::load(
-                Some(db.clone()),
-                Arc::new(admin),
-                location,
-                rows,
-                reads,
-                None,
-            )
-            .await
-        }
-        .await;
-        if result.is_err() {
-            let _ = db
-                .close_with_options(slatedb::config::CloseOptions { flush_type: None })
-                .await;
-        }
-        let mut state = result?;
-        state.plan_compaction();
-        Ok(state)
-    }
-
-    /// Build the derived state from `reads`, the applied state of `db` or of a shared base.
+    /// Build the derived state from `reads`, the applied state of a shared base.
     async fn load(
-        db: Option<Arc<Db>>,
         admin: Arc<slatedb::admin::Admin>,
         location: Arc<transfer::Location>,
         rows: Arc<rows::RowCache>,
         reads: StateView,
         shared: Option<shared::Shared>,
     ) -> Result<Self> {
-        let shared_mode = shared.is_some();
-        let mut state = Self::load_rows(db, admin, location, rows, reads, shared_mode).await?;
+        let mut state = Self::load_rows(admin, location, rows, reads).await?;
         state.shared = shared;
         Ok(state)
     }
 
-    /// Build the derived state from `reads` without the shared-mode overlay. The caller adds
-    /// it. `shared_mode` skips the cluster quota, which only replicated mode stores.
+    /// Build the derived state from `reads` without the overlay. The caller adds it.
     async fn load_rows(
-        db: Option<Arc<Db>>,
         admin: Arc<slatedb::admin::Admin>,
         location: Arc<transfer::Location>,
         rows: Arc<rows::RowCache>,
         reads: StateView,
-        shared_mode: bool,
     ) -> Result<Self> {
         let applied = decode_applied(reads.get(APPLIED).await?)?;
         let applied_term = read_applied_term(&reads, applied).await?;
@@ -511,22 +352,16 @@ impl StateMachine {
             None => vec![],
         };
         let (members, members_row) = cluster::load(&reads, applied).await?;
-        // Both modes store the counter row with the apply marker, so a base needs no full scan.
+        // Each batch stores the counter row with the apply marker, so a base needs no full scan.
         // A shared base from an older binary has only the total in `shared::LOGICAL_BYTES`, and
         // its apply marker is past any counter row, so the open counts the split again.
         let logical_bytes = load_logical_size(&reads, applied).await?;
-        let (cluster_quota, quota_boundary) = match shared_mode {
-            true => (None, 0),
-            false => quota::load(&reads).await?,
-        };
         Ok(Self {
             members: Arc::new(members),
             admin,
             metrics: Arc::new(crate::metrics::StateMeters::new()?),
-            quota: cluster_quota.map_or(0, |quota| quota.bytes.max(0) as u64),
+            quota: 0,
             quota_flag: 0,
-            cluster_quota,
-            quota_boundary,
             current: current::CurrentRows::default(),
             key_index: key_index::KeyIndex::load(&reads).await?,
             rows,
@@ -534,7 +369,6 @@ impl StateMachine {
             write_batches: 0,
             alarms,
             auth: Arc::new(auth),
-            database: db,
             applied,
             applied_term,
             entry_term: applied_term,
@@ -578,19 +412,7 @@ impl StateMachine {
         )
     }
 
-    /// The replicated database, if any.
-    pub(crate) fn database(&self) -> Option<Arc<Db>> {
-        self.database.clone()
-    }
-
-    /// The replicated database. Only replicated paths call this.
-    pub(crate) fn db(&self) -> &Arc<Db> {
-        self.database
-            .as_ref()
-            .expect("replicated state has a database")
-    }
-
-    /// The applied state that apply and the apply owner read. Replicated writes go to `db`.
+    /// The applied state that apply and the apply owner read.
     pub(crate) fn applied_state(&self) -> &StateView {
         &self.reads
     }
@@ -604,14 +426,28 @@ impl StateMachine {
     #[cfg(test)]
     pub(crate) async fn open_memory() -> Result<Self> {
         let store = Arc::new(slatedb::object_store::memory::InMemory::new());
-        let backend = transfer::Backend::Local;
-        let cache = StateCache::default();
-        let location =
-            transfer::Location::open(store.clone(), "state", backend, false, cache, None).await?;
+        let location = transfer::Location::new("state", StateCache::default());
         let admin = Arc::new(slatedb::admin::Admin::builder(location.root(), store).build());
         let rows = Arc::new(rows::RowCache::new(0));
         let reads = StateView::Memory(view::MemoryView::default());
-        Self::load(None, admin, location, rows, reads, None).await
+        Self::load(admin, location, rows, reads, None).await
+    }
+
+    /// Open a state for a test on the in-memory store of `dir`. A later open of the same `dir`
+    /// opens the same store, at its newest checkpoint.
+    #[cfg(test)]
+    pub(crate) async fn open_test(dir: &Path) -> Result<Self> {
+        Self::open_test_store(crate::object::test_store(dir), "cluster").await
+    }
+
+    /// Open a state for a test at `root` in `store`, as the only voter of its cluster.
+    #[cfg(test)]
+    pub(crate) async fn open_test_store(
+        store: Arc<dyn slatedb::object_store::ObjectStore>,
+        root: &str,
+    ) -> Result<Self> {
+        let cache = StateCache::default();
+        Self::open_shared(store, root, "test", cache, &shared::tests::options()).await
     }
 
     /// Return true for a state from `open_memory`.
@@ -630,17 +466,28 @@ impl StateMachine {
         rows.write(batch);
     }
 
+    /// Store `rows` as the state at the next index, outside apply. They reach no derived state,
+    /// so a test stores corrupt rows with this.
+    #[cfg(test)]
+    pub(crate) fn write_raw<K: AsRef<[u8]>, V: AsRef<[u8]>>(&mut self, rows: &[(K, V)]) {
+        let index = self.applied + 1;
+        let mut batch = WriteBatch::new();
+        for (key, value) in rows {
+            batch.put(key.as_ref(), value.as_ref());
+        }
+        mark_applied(&mut batch, index, self.entry_term);
+        let shared = self.shared.as_mut().expect("a shared state");
+        shared.overlay.push(index, Arc::new(batch));
+        self.applied = index;
+    }
+
     /// Pin the applied state for a read that runs outside apply.
     pub(crate) fn pinned_state(&self) -> Result<StateView> {
-        if let Some(shared) = &self.shared {
-            return Ok(shared.pinned());
-        }
-        let snapshot = self.db().snapshot()?;
-        ensure!(
-            snapshot.seq() == self.applied,
-            "read view does not match applied state"
-        );
-        Ok(StateView::Snapshot(snapshot))
+        let shared = self
+            .shared
+            .as_ref()
+            .context("the state has no shared view")?;
+        Ok(shared.pinned())
     }
 
     /// Mark `index` applied in `batch`, with the term of its entry from `entry_term`.
@@ -667,8 +514,7 @@ impl StateMachine {
         size: crate::batch::Usage,
     ) -> Result<crate::batch::Usage> {
         let members_saved = self.members_unsaved;
-        if self.is_shared()
-            && !members_saved
+        if !members_saved
             && batch
                 .keys()
                 .all(|key| key == APPLIED || key == APPLIED_TERM)
@@ -710,11 +556,7 @@ impl StateMachine {
         match (&mut self.shared, &mut self.reads) {
             #[cfg(test)]
             (None, StateView::Memory(rows)) => rows.write(&batch),
-            (None, _) => {
-                self.db()
-                    .write_with_options(batch.to_storage(), &WriteOptions { seqnum: index })
-                    .await?;
-            }
+            (None, _) => anyhow::bail!("the state has no overlay"),
             // Apply reads the overlay at once. The leader materializer writes the `Db` later.
             (Some(shared), _) => shared.overlay.push(index, batch.clone()),
         }
@@ -750,11 +592,9 @@ impl StateMachine {
 
     /// Store the logical size `size` at `index` in `batch`.
     fn put_logical_size(&self, batch: &mut WriteBatch, index: u64, size: crate::batch::Usage) {
-        // The counters are outside `etcd/`, so they do not count themselves. Shared mode also
+        // The counters are outside `etcd/`, so they do not count themselves. The state also
         // keeps the eight-byte total, which older readers of the shared base load.
-        if self.is_shared() {
-            batch.put(shared::LOGICAL_BYTES, size.total().to_be_bytes());
-        }
+        batch.put(shared::LOGICAL_BYTES, size.total().to_be_bytes());
         batch.put(LOGICAL_SIZE, logical_size_row(index, size));
     }
 
@@ -765,11 +605,7 @@ impl StateMachine {
     }
 
     pub(crate) async fn close(&self) -> Result<()> {
-        // Raft keeps acknowledged writes durable. Shutdown does not require a new checkpoint.
-        if let Some(db) = &self.database {
-            db.close_with_options(slatedb::config::CloseOptions { flush_type: None })
-                .await?;
-        }
+        // Raft keeps acknowledged writes durable. A member has no writer of its own here.
         Ok(())
     }
 }

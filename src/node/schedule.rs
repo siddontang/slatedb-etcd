@@ -68,10 +68,9 @@ impl Node {
                     .checkpoint_waiters
                     .iter()
                     .any(|(index, _)| *index <= applied));
-        // Automatic checkpoints only flush state and truncate the local log.
-        // A membership change needs a checkpoint at its index. So does a first cluster quota
-        // after entries of an earlier binary; its row keeps that index across restarts.
-        let forced = self.membership_checkpoint.max(self.state.quota_boundary);
+        // Automatic checkpoints only truncate the local log. A membership change needs a
+        // checkpoint at its index.
+        let forced = self.membership_checkpoint;
         let truncate_due = ((forced > snapshot_index && applied >= forced)
             || (self.next_checkpoint.is_some_and(|index| applied >= index)
                 && self.appended_bytes >= self.options.snapshot_min_bytes))
@@ -397,7 +396,6 @@ impl Node {
                 }
             }
             Output::Snapshot(rebound) => {
-                self.compaction.rebind(rebound.db);
                 self.metrics.rebind(rebound.admin);
                 self.compaction.publish(self.state.physical_revision);
                 self.installed_snapshots += 1;

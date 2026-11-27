@@ -138,7 +138,6 @@ pub(super) struct Cache {
     exact_wanted: Cell<bool>,
     // Shared mode: the checkpoint and the index of this member's base.
     base: Cell<Option<(uuid::Uuid, u64)>>,
-    member: u64,
     pub durable: log::Durable,
 }
 
@@ -164,7 +163,6 @@ impl Cache {
             peers: RefCell::default(),
             exact_wanted: Cell::new(false),
             base: Cell::new(None),
-            member: storage.member(),
             durable,
         };
         let mut low = storage.first_index()?;
@@ -548,7 +546,7 @@ impl Cache {
                 .is_none_or(|(checkpoint, _)| view.checkpoint().ok() != Some(checkpoint)),
             _ => false,
         };
-        crate::state::transfer::sendable(data, self.member) && !stale
+        crate::state::transfer::sendable(data) && !stale
     }
 }
 
@@ -662,7 +660,7 @@ impl Storage for Cache {
     ///
     /// Raft accepts any snapshot at or above the follower's commit index, and that clears the
     /// follower's pending request. The leader's log holds every committed entry, so the target
-    /// is at or above that index. Both state modes use this rule.
+    /// is at or above that index.
     fn snapshot(&self, request_index: u64, to: u64) -> raft::Result<Snapshot> {
         // Raft calls this as soon as it leads, before the node sees the new role. The staged
         // HardState already has the term, because a candidate persists its term before it asks
@@ -1007,16 +1005,17 @@ mod tests {
                 client_peers: BTreeMap::new(),
                 transport: crate::tls::Transport::default(),
                 require_peer_tls: false,
-                state_mode: Default::default(),
                 view_max_age: std::time::Duration::from_secs(10),
                 view_pin_max: std::time::Duration::from_secs(300),
                 overlay_max_bytes: 1 << 30,
                 max_clock_skew: std::time::Duration::from_secs(5),
                 view_retention: Default::default(),
                 restore: None,
-                object_store: crate::object::Config::Local,
+                object_store: crate::object::Config::Test(
+                    crate::object::test_store(dir.path()),
+                    "root".into(),
+                ),
                 quota_bytes: 0,
-                quota_reassert: false,
                 quota_warning_fraction: 0.0,
                 auto_compaction: None,
                 strict_reconfiguration: false,

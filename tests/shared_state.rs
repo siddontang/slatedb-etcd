@@ -1,5 +1,5 @@
-//! Single-voter shared state mode: compare it with replicated mode, and check the publisher,
-//! restart, and mode checks. Shared mode uses the local object store here.
+//! Shared state mode: check the workload, the publisher, restart, and the store checks. One
+//! voter uses the local object store here.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +11,6 @@ use slatedb_etcd::proto::etcdserverpb::{
     RangeRequest, RequestOp, TxnRequest, WatchCreateRequest, WatchRequest,
 };
 use slatedb_etcd::server::{Server, ServerConfig};
-use slatedb_etcd::state::StateMode;
 use tonic::transport::{Channel, Endpoint};
 
 /// Fail a test that runs longer than this instead of letting it hang the suite.
@@ -24,9 +23,8 @@ async fn within(body: impl std::future::Future<Output = ()>) {
         .expect("the test exceeded its deadline");
 }
 
-fn config(dir: &std::path::Path, mode: StateMode, view_max_age: Duration) -> ServerConfig {
+fn config(dir: &std::path::Path, view_max_age: Duration) -> ServerConfig {
     let mut config = ServerConfig::single_node(dir);
-    config.state_mode = mode;
     config.view_max_age = view_max_age;
     config
 }
@@ -174,25 +172,12 @@ async fn workload(channel: Channel) -> Vec<String> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shared_mode_matches_replicated_mode_on_one_voter() {
+async fn one_voter_serves_the_workload() {
     within(async {
         let dir = tempfile::tempdir().unwrap();
-        let mut outputs = vec![];
-        for mode in [StateMode::Replicated, StateMode::Shared] {
-            let config = config(
-                &dir.path().join(format!("{mode:?}")),
-                mode,
-                Duration::from_millis(200),
-            );
-            let (server, channel) = start(config).await;
-            outputs.push(workload(channel).await);
-            server.shutdown().await.unwrap();
-        }
-        assert!(outputs[0].len() > 40);
-        for (replicated, shared) in outputs[0].iter().zip(&outputs[1]) {
-            assert_eq!(replicated, shared);
-        }
-        assert_eq!(outputs[0].len(), outputs[1].len());
+        let (server, channel) = start(config(dir.path(), Duration::from_millis(200))).await;
+        assert!(workload(channel).await.len() > 40);
+        server.shutdown().await.unwrap();
     })
     .await;
 }
@@ -256,7 +241,7 @@ async fn one_write_makes_one_checkpoint_and_one_announcement() {
     within(async {
         let dir = tempfile::tempdir().unwrap();
         let age = Duration::from_millis(200);
-        let (server, channel) = start(config(dir.path(), StateMode::Shared, age)).await;
+        let (server, channel) = start(config(dir.path(), age)).await;
         // The first leader publishes the first checkpoint at once, then marks the bootstrap.
         eventually("the bootstrap checkpoint", async || {
             views(&server).await.0 >= 1
@@ -294,7 +279,7 @@ async fn one_write_makes_one_checkpoint_and_one_announcement() {
         assert_eq!(reply.header.unwrap().revision, revision);
         server.shutdown().await.unwrap();
         // A restart opens the newest checkpoint as its base.
-        let (server, channel) = start(config(dir.path(), StateMode::Shared, age)).await;
+        let (server, channel) = start(config(dir.path(), age)).await;
         assert!(views(&server).await.2 >= base);
         let reply = KvClient::new(channel)
             .range(all())
@@ -312,7 +297,7 @@ async fn a_restart_replays_the_log_above_the_newest_checkpoint() {
     within(async {
         let dir = tempfile::tempdir().unwrap();
         // A long age keeps every write in the overlay after the bootstrap checkpoint.
-        let config = config(dir.path(), StateMode::Shared, Duration::from_secs(60));
+        let config = config(dir.path(), Duration::from_secs(60));
         let (server, channel) = start(config.clone()).await;
         eventually("the bootstrap checkpoint", async || {
             views(&server).await.0 >= 1
@@ -364,20 +349,11 @@ async fn a_restart_replays_the_log_above_the_newest_checkpoint() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_directory_keeps_its_mode_and_members_need_a_shared_store() {
+async fn members_need_a_shared_store() {
     within(async {
-        let dir = tempfile::tempdir().unwrap();
         let age = Duration::from_secs(10);
-        let (server, _) = start(config(dir.path(), StateMode::Replicated, age)).await;
-        server.shutdown().await.unwrap();
-        let error = Server::start(config(dir.path(), StateMode::Shared, age))
-            .await
-            .err()
-            .unwrap();
-        assert!(format!("{error:#}").contains("state mode"), "{error:#}");
-
         let other = tempfile::tempdir().unwrap();
-        let mut three = config(other.path(), StateMode::Shared, age);
+        let mut three = config(other.path(), age);
         three.peers.insert(2, "127.0.0.1:2".into());
         three.peers.insert(3, "127.0.0.1:3".into());
         let error = Server::start(three).await.err().unwrap();
@@ -417,11 +393,10 @@ async fn addresses(members: u64) -> std::collections::BTreeMap<u64, String> {
 
 fn member_config(
     dir: &std::path::Path,
-    mode: StateMode,
     id: u64,
     peers: &std::collections::BTreeMap<u64, String>,
 ) -> ServerConfig {
-    let mut config = config(&dir.join(id.to_string()), mode, Duration::from_millis(200));
+    let mut config = config(&dir.join(id.to_string()), Duration::from_millis(200));
     config.id = id;
     config.listen = peers[&id].parse().unwrap();
     config.peers = peers.clone();
@@ -431,10 +406,7 @@ fn member_config(
     config.snapshot_min_bytes = 0;
     // The health check needs peer traffic first. This test adds a member at once.
     config.strict_reconfiguration = false;
-    if mode == StateMode::Shared {
-        config.object_store =
-            slatedb_etcd::object::Config::SharedDirectory(dir.join("shared-objects"));
-    }
+    config.object_store = slatedb_etcd::object::Config::SharedDirectory(dir.join("shared-objects"));
     config
 }
 
@@ -478,28 +450,26 @@ async fn local_hash(server: &Server, revision: i64) -> Option<u32> {
     Some(hash.hash)
 }
 
-/// Run the workload on three voters, then add a learner. Shared and replicated mode give the
-/// same results and hashes. In shared mode the learner joins from a format 6 snapshot.
+/// Run the workload on three voters, then add a learner. Every voter has the same hash, and the
+/// learner joins from a format 6 snapshot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn three_voters_and_a_learner_share_one_state() {
     within(async {
         use slatedb_etcd::proto::etcdserverpb::{cluster_client::ClusterClient, MemberAddRequest};
-        let mut outputs = vec![];
-        let mut hashes = vec![];
-        for mode in [StateMode::Replicated, StateMode::Shared] {
+        {
             let dir = tempfile::tempdir().unwrap();
             let mut peers = addresses(4).await;
             let learner_address = peers.remove(&4).unwrap();
             let mut servers = vec![];
             for id in 1..=3 {
-                let config = member_config(dir.path(), mode, id, &peers);
+                let config = member_config(dir.path(), id, &peers);
                 servers.push(Server::start(config).await.unwrap());
             }
             for server in &servers {
                 server.wait_ready(Duration::from_secs(15)).await.unwrap();
             }
             let lead = &servers[leader(&servers[0]).await as usize - 1];
-            outputs.push(workload(channel(lead).await).await);
+            assert!(workload(channel(lead).await).await.len() > 40);
             let revision = KvClient::new(channel(lead).await)
                 .range(all())
                 .await
@@ -533,7 +503,7 @@ async fn three_voters_and_a_learner_share_one_state() {
             let id = added.member.unwrap().id;
             let mut joined_peers = peers.clone();
             joined_peers.insert(id, learner_address);
-            let mut learner_config = member_config(dir.path(), mode, id, &joined_peers);
+            let mut learner_config = member_config(dir.path(), id, &joined_peers);
             learner_config.join = true;
             let learner = Server::start(learner_config).await.unwrap();
             let mut learner_hash = None;
@@ -543,7 +513,7 @@ async fn three_voters_and_a_learner_share_one_state() {
             })
             .await;
             assert_eq!(learner_hash.unwrap(), values[0]);
-            if mode == StateMode::Shared {
+            {
                 let joined = status(&learner).await;
                 assert!(
                     joined["installed_snapshots"].as_u64().unwrap() > 0,
@@ -559,14 +529,11 @@ async fn three_voters_and_a_learner_share_one_state() {
                 .await;
                 assert!(status(lead).await["snapshot_index"].as_u64().unwrap() > 0);
             }
-            hashes.push(values[0]);
             learner.shutdown().await.unwrap();
             for server in servers {
                 server.shutdown().await.unwrap();
             }
         }
-        assert_eq!(outputs[0], outputs[1]);
-        assert_eq!(hashes[0], hashes[1]);
     })
     .await;
 }
@@ -579,7 +546,7 @@ async fn a_restarted_follower_adopts_a_checkpoint_above_its_log() {
         let dir = tempfile::tempdir().unwrap();
         let peers = addresses(3).await;
         let configs: Vec<_> = (1..=3)
-            .map(|id| member_config(dir.path(), StateMode::Shared, id, &peers))
+            .map(|id| member_config(dir.path(), id, &peers))
             .collect();
         let mut servers = vec![];
         for config in &configs {
@@ -649,7 +616,7 @@ async fn a_restarted_follower_adopts_a_checkpoint_above_its_log() {
 async fn reads_after_an_idle_pin_limit_succeed() {
     within(async {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = config(dir.path(), StateMode::Shared, Duration::from_millis(200));
+        let mut config = config(dir.path(), Duration::from_millis(200));
         config.view_pin_max = Duration::from_millis(250);
         let (server, channel) = start(config).await;
         let mut kv = KvClient::new(channel.clone());
@@ -706,7 +673,7 @@ async fn reads_after_an_idle_pin_limit_succeed() {
 async fn slow_watchers_get_every_revision_once() {
     within(async {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = config(dir.path(), StateMode::Shared, Duration::from_millis(200));
+        let mut config = config(dir.path(), Duration::from_millis(200));
         config.view_pin_max = Duration::from_millis(30);
         let (server, channel) = start(config).await;
         let mut streams = vec![];
@@ -776,7 +743,7 @@ async fn quiet_cluster(dir: &std::path::Path) -> (Vec<ServerConfig>, Vec<Option<
     let peers = addresses(3).await;
     let configs: Vec<_> = (1..=3)
         .map(|id| {
-            let mut config = member_config(dir, StateMode::Shared, id, &peers);
+            let mut config = member_config(dir, id, &peers);
             config.view_max_age = Duration::from_secs(60);
             config.overlay_max_bytes = 8 << 20;
             config
@@ -1055,12 +1022,8 @@ async fn a_new_shared_cluster_restores_a_snapshot() {
     within(async {
         use slatedb_etcd::proto::etcdserverpb::{SnapshotRequest, StatusRequest};
         let dir = tempfile::tempdir().unwrap();
-        let (source, channel_source) = start(config(
-            &dir.path().join("source"),
-            StateMode::Replicated,
-            Duration::from_secs(1),
-        ))
-        .await;
+        let (source, channel_source) =
+            start(config(&dir.path().join("source"), Duration::from_secs(1))).await;
         let mut kv = KvClient::new(channel_source.clone());
         // A restore batch holds 4 MiB of rows, so these values need several batches.
         let large = "v".repeat(1 << 20);
@@ -1090,7 +1053,7 @@ async fn a_new_shared_cluster_restores_a_snapshot() {
         let peers = addresses(3).await;
         let mut servers = vec![];
         for id in 1..=3 {
-            let mut config = member_config(dir.path(), StateMode::Shared, id, &peers);
+            let mut config = member_config(dir.path(), id, &peers);
             config.restore_snapshot = Some(backup.clone());
             servers.push(Some(Server::start(config).await.unwrap()));
         }

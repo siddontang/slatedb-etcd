@@ -111,7 +111,7 @@ pub(crate) const STORE: &str = "x-store-id";
 #[derive(Clone, Debug)]
 pub(crate) struct Identity {
     pub cluster: String,
-    /// The store ID of the cluster claim. A replicated member has no shared store.
+    /// The store ID of the cluster claim.
     pub store: Option<String>,
 }
 

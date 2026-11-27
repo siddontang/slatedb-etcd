@@ -90,10 +90,9 @@ const FRESH_PREFIX: &str = "a snapshot restore needs a new cluster prefix and em
     docs/shared-state-guide.md)";
 
 /// Return true for the rows of a snapshot that a shared restore does not copy. The completion
-/// batch writes the apply marker, the counters, and the membership row. The cluster claim sets
-/// the quota.
+/// batch writes the apply marker, the counters, and the membership row.
 pub(crate) fn not_restored(key: &[u8]) -> bool {
-    backup::replaced(key) || key == quota::KEY
+    backup::replaced(key)
 }
 
 /// A checked native snapshot that seeds a new shared cluster.

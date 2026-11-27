@@ -140,10 +140,6 @@ struct Args {
     /// Automatic snapshots also wait for this many appended log bytes. Zero uses only the entry interval.
     #[arg(long, default_value_t = slatedb_etcd::node::DEFAULT_SNAPSHOT_MIN_BYTES)]
     snapshot_min_bytes: u64,
-    /// State layout of a new cluster. Shared keeps one SlateDB for the cluster. Its members need
-    /// one S3 bucket and prefix. An existing data directory must keep its mode.
-    #[arg(long, value_enum, default_value = "replicated")]
-    state_mode: slatedb_etcd::state::StateMode,
     /// Shared mode: flush and publish a checkpoint when the oldest unflushed write is this old.
     #[arg(long, default_value = "10s", value_parser = humantime::parse_duration)]
     view_max_age: std::time::Duration,
@@ -183,10 +179,6 @@ struct Args {
     /// Logical quota in bytes. Zero selects 2 GiB. A negative value disables the quota.
     #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
     quota_backend_bytes: i64,
-    /// Request --quota-backend-bytes again as the newest quota change in replicated mode.
-    /// Remove it from later restart commands.
-    #[arg(long)]
-    quota_reassert: bool,
     /// Quota usage fraction that sets the early-warning gauge and log. Zero disables it.
     #[arg(long, default_value_t = slatedb_etcd::server::DEFAULT_QUOTA_WARNING_FRACTION)]
     quota_warning_fraction: f64,
@@ -220,25 +212,6 @@ struct Args {
     log_term_bytes: usize,
 }
 
-/// Convert a stopped replicated S3 member to shared state mode. Run it on every member.
-#[derive(Parser)]
-#[command(name = "slatedb-etcd convert-to-shared")]
-struct ConvertArgs {
-    /// Persistent member ID of the data directory.
-    #[arg(long)]
-    id: u64,
-    /// Data directory of the stopped member.
-    #[arg(long)]
-    dir: PathBuf,
-    /// Shared cluster identity.
-    #[arg(long, default_value = "slatedb-raft-poc")]
-    cluster_id: String,
-    /// Logical quota of the shared cluster claim in bytes. Zero selects 2 GiB. A negative value
-    /// disables the quota.
-    #[arg(long, default_value = "0", allow_negative_numbers = true)]
-    quota_backend_bytes: i64,
-}
-
 /// Print the Raft snapshot record of a stopped member and the view checkpoint that it names.
 #[derive(Parser)]
 #[command(name = "slatedb-etcd shared-status")]
@@ -251,16 +224,9 @@ struct StatusArgs {
 fn main() -> Result<()> {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("shared-status")) {
         let args = StatusArgs::parse_from(std::env::args_os().skip(1));
-        let record = slatedb_etcd::convert::member_record(&args.dir)?;
+        let record = slatedb_etcd::status::member_record(&args.dir)?;
         println!("{}", serde_json::to_string_pretty(&record)?);
         return Ok(());
-    }
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("convert-to-shared")) {
-        let args = ConvertArgs::parse_from(std::env::args_os().skip(1));
-        return tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?
-            .block_on(convert(args));
     }
     let args = Args::parse();
     tokio::runtime::Builder::new_multi_thread()
@@ -273,36 +239,6 @@ fn main() -> Result<()> {
 /// Linux derives this from `sched_getaffinity` and the cgroup CPU quota. Two remains the fallback.
 fn default_workers() -> std::num::NonZeroUsize {
     std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::new(2).unwrap())
-}
-
-async fn convert(args: ConvertArgs) -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-    let quota = match args.quota_backend_bytes {
-        0 => 2 * 1024 * 1024 * 1024,
-        quota => quota.max(0) as u64,
-    };
-    let converted =
-        slatedb_etcd::convert::Conversion::new(args.id, args.dir, args.cluster_id, quota)
-            .run()
-            .await?;
-    println!(
-        "member {} converted: base index {}, term {}, source member {}{}",
-        args.id,
-        converted.index,
-        converted.term,
-        converted.source,
-        if converted.planned {
-            ", planned here"
-        } else {
-            ""
-        }
-    );
-    Ok(())
 }
 
 async fn run(args: Args) -> Result<()> {
@@ -354,7 +290,6 @@ async fn run(args: Args) -> Result<()> {
             row_bytes: args.state_row_cache_bytes,
         },
         quota_bytes: args.quota_backend_bytes,
-        quota_reassert: args.quota_reassert,
         quota_warning_fraction: args.quota_warning_fraction,
         auto_compaction: slatedb_etcd::compactor::Retention::parse(
             args.auto_compaction_mode,
@@ -364,7 +299,6 @@ async fn run(args: Args) -> Result<()> {
         strict_reconfiguration: args.strict_reconfig_check,
         join: args.join,
         restore_snapshot: args.restore_snapshot,
-        state_mode: args.state_mode,
         view_max_age: args.view_max_age,
         view_pin_max: args.view_pin_max,
         overlay_max_bytes: args.overlay_max_bytes,

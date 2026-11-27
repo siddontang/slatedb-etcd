@@ -4,8 +4,6 @@ use super::*;
 pub(crate) struct ReadView {
     metrics: Arc<crate::metrics::StateMeters>,
     state: StateView,
-    /// Keep the database open while the view reads it. A snapshot install replaces it.
-    _database: Option<Arc<Db>>,
     rows: Arc<super::rows::RowCache>,
     pub revision: i64,
     pub compact_revision: i64,
@@ -23,7 +21,6 @@ impl StateMachine {
         Ok(Arc::new(ReadView {
             metrics: self.metrics.clone(),
             state: self.pinned_state()?,
-            _database: self.database.clone(),
             rows: self.rows.clone(),
             revision: self.revision,
             compact_revision: self.compact_revision,
@@ -132,55 +129,9 @@ mod tests {
     use crate::proto::etcdserverpb::*;
 
     #[tokio::test]
-    async fn pinned_read_survives_snapshot_replacement() {
-        let dir = tempfile::tempdir().unwrap();
-        let source_dir = tempfile::tempdir().unwrap();
-        let mut state = StateMachine::open(dir.path()).await.unwrap();
-        let mut source = StateMachine::open(source_dir.path()).await.unwrap();
-        let put = |value: &[u8]| RequestOp {
-            request: Some(Op::RequestPut(PutRequest {
-                key: b"key".to_vec(),
-                value: value.to_vec(),
-                ..Default::default()
-            })),
-        };
-        state.apply_etcd(1, &put(b"old")).await.unwrap();
-        let old = state.read_view().unwrap();
-        source.apply_etcd(1, &put(b"source")).await.unwrap();
-        source.apply_etcd(2, &put(b"new")).await.unwrap();
-        let mut snapshot = Snapshot::default();
-        snapshot.mut_metadata().index = 2;
-        snapshot.data = source.snapshot_job().unwrap().await.unwrap();
-        state.install_snapshot(&snapshot).await.unwrap();
-        let current = state.read_view().unwrap();
-        let request = RequestOp {
-            request: Some(Op::RequestRange(RangeRequest {
-                key: b"key".to_vec(),
-                ..Default::default()
-            })),
-        };
-        for (view, revision, value) in [(old, 2, b"old"), (current, 3, b"new")] {
-            let Some(Resp::ResponseRange(reply)) = view
-                .read(&request, None)
-                .await
-                .unwrap()
-                .result
-                .unwrap()
-                .response
-            else {
-                panic!("expected range");
-            };
-            assert_eq!(reply.header.unwrap().revision, revision);
-            assert_eq!(reply.kvs[0].value, value);
-        }
-        state.close().await.unwrap();
-        source.close().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn shared_rows_match_each_pinned_view() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = StateMachine::open(dir.path()).await.unwrap();
+        let mut state = StateMachine::open_test(dir.path()).await.unwrap();
         let put = |value: &[u8]| RequestOp {
             request: Some(Op::RequestPut(PutRequest {
                 key: b"key".to_vec(),
@@ -244,7 +195,7 @@ mod tests {
     #[tokio::test]
     async fn pinned_reads_keep_data_revision_compaction_and_auth_together() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = StateMachine::open(dir.path()).await.unwrap();
+        let mut state = StateMachine::open_test(dir.path()).await.unwrap();
         let put = |value: &[u8]| RequestOp {
             request: Some(Op::RequestPut(PutRequest {
                 key: b"a".to_vec(),
@@ -337,7 +288,7 @@ mod tests {
     async fn pinned_range_counts_follow_their_snapshot_after_later_writes() {
         use crate::proto::etcdserverpb::{DeleteRangeRequest, TxnRequest};
         let dir = tempfile::tempdir().unwrap();
-        let mut state = StateMachine::open(dir.path()).await.unwrap();
+        let mut state = StateMachine::open_test(dir.path()).await.unwrap();
         let put = |key: &[u8]| RequestOp {
             request: Some(Op::RequestPut(PutRequest {
                 key: key.to_vec(),
@@ -424,7 +375,11 @@ mod tests {
         }
         drop((first, second, third));
         apply(&mut state, put(b"z")).await;
-        assert!(state.key_index.matches(state.db()).await.unwrap());
+        assert!(state
+            .key_index
+            .matches(state.applied_state())
+            .await
+            .unwrap());
         state.close().await.unwrap();
     }
 
@@ -517,14 +472,11 @@ mod tests {
                 x % n
             };
             let dir = tempfile::tempdir().unwrap();
-            let mirror_dir = tempfile::tempdir().unwrap();
-            let mut state = StateMachine::open(dir.path()).await.unwrap();
-            let mut mirror = StateMachine::open(mirror_dir.path()).await.unwrap();
+            let mut state = StateMachine::open_test(dir.path()).await.unwrap();
             let mut model = BTreeSet::new();
             let mut leases: BTreeMap<i64, BTreeSet<Vec<u8>>> = BTreeMap::new();
             let mut next_lease = 1;
             let mut views: Vec<(Arc<ReadView>, BTreeSet<Vec<u8>>)> = vec![];
-            let mut mirror_views: Vec<(Arc<ReadView>, BTreeSet<Vec<u8>>)> = vec![];
             for _ in 0..150 {
                 let key =
                     |random: &mut dyn FnMut(u64) -> u64| format!("k{:02}", random(24)).into_bytes();
@@ -656,25 +608,6 @@ mod tests {
                             .result
                             .unwrap();
                     }
-                    12 => {
-                        // The mirror installs a snapshot of the current state over its old one.
-                        let mut snapshot = Snapshot::default();
-                        snapshot.mut_metadata().index = state.applied;
-                        snapshot.data = state.snapshot_job().unwrap().await.unwrap();
-                        if state.applied > mirror.applied {
-                            mirror.install_snapshot(&snapshot).await.unwrap();
-                            mirror_views.push((mirror.read_view().unwrap(), model.clone()));
-                        }
-                    }
-                    13 if random(4) == 0 => {
-                        // Without a SlateDB WAL, unflushed rows return through Raft replay. Flush
-                        // so the reopened state holds every applied row.
-                        views.clear();
-                        state.db().flush().await.unwrap();
-                        state.close().await.unwrap();
-                        drop(state);
-                        state = StateMachine::open(dir.path()).await.unwrap();
-                    }
                     _ => {
                         views.push((state.read_view().unwrap(), model.clone()));
                         if views.len() > 4 {
@@ -682,16 +615,12 @@ mod tests {
                         }
                     }
                 }
-                for (view, expected) in views.iter().chain(&mirror_views) {
+                for (view, expected) in &views {
                     check_view(view, expected, &mut random).await;
                 }
                 check_view(&state.read_view().unwrap(), &model, &mut random).await;
-                if mirror_views.len() > 3 {
-                    mirror_views.remove(0);
-                }
             }
             views.clear();
-            mirror_views.clear();
             // One more batch folds the remaining history.
             let index = state.applied + 1;
             state
@@ -708,10 +637,12 @@ mod tests {
                 .unwrap()
                 .result
                 .unwrap();
-            assert!(state.key_index.matches(state.db()).await.unwrap());
-            assert!(mirror.key_index.matches(mirror.db()).await.unwrap());
+            assert!(state
+                .key_index
+                .matches(state.applied_state())
+                .await
+                .unwrap());
             state.close().await.unwrap();
-            mirror.close().await.unwrap();
         }
     }
 }

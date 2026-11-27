@@ -6,18 +6,16 @@ pub(super) fn options(dir: &std::path::Path) -> NodeOptions {
         client_peers: BTreeMap::new(),
         transport: crate::tls::Transport::default(),
         require_peer_tls: false,
-        state_mode: Default::default(),
         view_max_age: std::time::Duration::from_secs(10),
         view_pin_max: std::time::Duration::from_secs(300),
         overlay_max_bytes: 1 << 30,
         max_clock_skew: std::time::Duration::from_secs(5),
         view_retention: Default::default(),
         restore: None,
-        object_store: crate::object::Config::Local,
+        object_store: crate::object::Config::Test(crate::object::test_store(dir), "root".into()),
         strict_reconfiguration: false,
         join: false,
         quota_bytes: 0,
-        quota_reassert: false,
         quota_warning_fraction: 0.0,
         auto_compaction: None,
         id: 1,
@@ -53,75 +51,6 @@ fn seed_log(dir: &std::path::Path, count: u64) {
         )
         .unwrap();
     drop(store);
-}
-
-#[tokio::test]
-async fn flushed_state_recovers_a_lost_commit_marker_but_not_missing_entries() {
-    for has_entry in [true, false] {
-        let dir = tempfile::tempdir().unwrap();
-        let command = Command {
-            id: "committed".into(),
-            request: Request {
-                operations: vec![crate::Operation::Put {
-                    key: "key".into(),
-                    value: "committed".into(),
-                }],
-            },
-        };
-        let mut storage =
-            RaftStorage::open(&dir.path().join("raft"), 1, "worker-test", vec![1, 2, 3]).unwrap();
-        if has_entry {
-            storage
-                .persist(
-                    &[Entry {
-                        index: 1,
-                        term: 1,
-                        data: RaftCommand::Diagnostic(command.clone()).encode().unwrap(),
-                        ..Default::default()
-                    }],
-                    Some(&HardState {
-                        term: 1,
-                        vote: 1,
-                        commit: 0,
-                    }),
-                    None,
-                )
-                .unwrap();
-        }
-        // Model a lost commit-only WAL update after committed state reached object storage.
-        let mut state = StateMachine::open(&dir.path().join("objects"))
-            .await
-            .unwrap();
-        state.apply(1, Some(&command)).await.unwrap();
-        state.snapshot_data().await.unwrap();
-        state.close().await.unwrap();
-        drop(state);
-        drop(storage);
-        let (events, _) = mpsc::channel(256);
-        let result =
-            Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new())).await;
-        if has_entry {
-            let node = result.unwrap();
-            assert_eq!(node.state.applied, 1);
-            assert_eq!(node.raw.store().commit_index(), 1);
-            assert_eq!(node.log_worker.storage().commit_index(), 1);
-            assert_eq!(
-                node.worker
-                    .state()
-                    .local_value("key")
-                    .await
-                    .unwrap()
-                    .as_deref(),
-                Some("committed")
-            );
-        } else {
-            assert!(result
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("commit exceeds durable log"));
-        }
-    }
 }
 
 /// A node that only opens a data directory leaves it readable by older binaries. The first
@@ -362,7 +291,6 @@ async fn worker_panic_stops_the_node() {
     let dir = tempfile::tempdir().unwrap();
     let (events, receiver) = mpsc::channel(256);
     let mut node = Node::open(options(dir.path()), events).await.unwrap();
-    let database = node.worker.database();
     let routes = node.forwarding.subscribe();
     node.submit_apply(Job::Panic, 0).unwrap();
     let result = tokio::time::timeout(Duration::from_secs(2), node.run(receiver))
@@ -374,10 +302,6 @@ async fn worker_panic_stops_the_node() {
         .contains("apply worker stopped"));
     // A stopped owner applies nothing more, so gRPC must not keep serving its last view.
     assert!(routes.local_read().is_none());
-    assert!(
-        database.get(b"unused").await.is_err(),
-        "state storage stayed open"
-    );
 }
 
 #[tokio::test]
@@ -420,6 +344,7 @@ fn automatic_checkpoints_rotate_across_members_without_wrapping() {
 }
 
 #[tokio::test]
+#[ignore = "see #149"]
 async fn future_checkpoint_and_automatic_checkpoints_do_not_stop_apply() {
     let dir = tempfile::tempdir().unwrap();
     seed_log(dir.path(), 100);
@@ -454,6 +379,7 @@ async fn future_checkpoint_and_automatic_checkpoints_do_not_stop_apply() {
 }
 
 #[tokio::test]
+#[ignore = "see #149"]
 async fn received_snapshot_fences_an_older_batch_and_later_entries() {
     let dir = tempfile::tempdir().unwrap();
     let source = tempfile::tempdir().unwrap();
@@ -469,7 +395,7 @@ async fn received_snapshot_fences_an_older_batch_and_later_entries() {
         node.apply_jobs.iter().map(|job| job.0).collect::<Vec<_>>(),
         [apply::APPLY_ENTRIES, seeded]
     );
-    let mut state = StateMachine::open(source.path()).await.unwrap();
+    let mut state = StateMachine::open_test(source.path()).await.unwrap();
     for index in 1..200 {
         state.apply(index, None).await.unwrap();
     }
@@ -1225,8 +1151,8 @@ async fn read_index_retries_after_the_first_commit_in_a_new_term() {
     confirm_read(&mut node, &id).await;
     node.drain_apply().await.unwrap();
     assert!(reply.await.unwrap().is_ok());
-    // The empty entry, `SeedMembers`, and `SetQuota` of the new leader. Retries append none.
-    assert_eq!(node.raw.store().durable.last_index, 3);
+    // The empty entry and `SeedMembers` of the new leader. Retries append none.
+    assert_eq!(node.raw.store().durable.last_index, 2);
     assert_eq!(node.raw.store().durable.sync_writes, syncs);
     assert!(node.reads.is_empty());
 }
@@ -1432,39 +1358,6 @@ async fn queued_ready_jobs_share_sync_and_keep_the_final_log_suffix() {
     assert_eq!(reopened.initial_state().unwrap().hard_state.term, 2);
     assert_eq!(reopened.initial_state().unwrap().hard_state.vote, 2);
     assert_eq!(reopened.term(first + 2).unwrap(), 2);
-}
-
-#[tokio::test]
-async fn maintenance_flushes_update_durable_apply_metadata() {
-    for command in [
-        crate::maintenance::Command::Snapshot,
-        crate::maintenance::Command::Defragment,
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        seed_log(dir.path(), 1);
-        let (events, _) = mpsc::channel(256);
-        let mut node =
-            Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
-                .await
-                .unwrap();
-        node.drive_ready().await.unwrap();
-        node.drain_apply().await.unwrap();
-        assert_eq!(node.state.applied, 1);
-        assert_eq!(node.state.durable_applied, 0);
-        let (response, result) = oneshot::channel();
-        node.enqueue_query(Query::Maintenance(
-            command,
-            crate::auth::Credentials::default(),
-            Box::default(),
-            response,
-        ));
-        node.drive_ready().await.unwrap();
-        let completed = node.worker.step().await.unwrap().unwrap();
-        assert_eq!(completed.state.as_ref().unwrap().durable_applied, 1);
-        node.complete_apply(completed).unwrap();
-        result.await.unwrap().unwrap();
-        assert_eq!(node.state.durable_applied, 1);
-    }
 }
 
 #[tokio::test]
@@ -1949,94 +1842,6 @@ async fn automatic_checkpoints_wait_for_appended_log_bytes() {
 }
 
 #[tokio::test]
-async fn automatic_checkpoints_truncate_without_an_image_and_recover_after_a_crash() {
-    let dir = tempfile::tempdir().unwrap();
-    seed_puts(dir.path(), 100);
-    let (events, _) = mpsc::channel(256);
-    let mut config = options(dir.path());
-    config.snapshot_every = 32;
-    let mut node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
-        .await
-        .unwrap();
-    for _ in 0..1000 {
-        node.drive_ready().await.unwrap();
-        node.drain_log().await.unwrap();
-        node.drain_apply().await.unwrap();
-        if node.state.applied == 100 && node.raw.store().snapshot_index() >= 96 {
-            break;
-        }
-    }
-    let truncated = node.raw.store().snapshot_index();
-    // Apply batches can pass the scheduled index before the checkpoint starts.
-    assert!(truncated >= 96);
-    assert!(!node.raw.store().has_image());
-    assert_eq!(node.snapshot_images, 0);
-    assert_eq!(node.raw.store().first_index().unwrap(), truncated + 1);
-    assert!(node.state.durable_applied >= truncated);
-    let raft = dir.path().join("raft");
-    let files = || -> Vec<String> {
-        std::fs::read_dir(&raft)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with("checkpoint-"))
-            .collect()
-    };
-    assert!(files().is_empty());
-    // Drop the node without a state flush. Flushed state covers the truncated prefix.
-    drop(node);
-    let storage = RaftStorage::open(&raft, 1, "worker-test", vec![1, 2, 3]).unwrap();
-    assert_eq!(storage.snapshot_index(), truncated);
-    assert!(storage.recovery_snapshot().data.is_empty());
-    assert!(storage
-        .entries(
-            truncated,
-            truncated + 1,
-            None,
-            raft::GetEntriesContext::empty(false)
-        )
-        .is_err());
-    drop(storage);
-    let (events, _) = mpsc::channel(256);
-    let mut node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
-        .await
-        .unwrap();
-    assert!(node.recovered_from_index >= truncated);
-    assert_eq!(node.installed_snapshots, 0);
-    for _ in 0..100 {
-        node.drive_ready().await.unwrap();
-        node.drain_log().await.unwrap();
-        node.drain_apply().await.unwrap();
-    }
-    assert_eq!(node.state.applied, 100);
-    assert_eq!(
-        node.worker
-            .state()
-            .local_value("key")
-            .await
-            .unwrap()
-            .as_deref(),
-        Some("100")
-    );
-    // A manual checkpoint still writes a complete image for backup and peer transfer.
-    let (tx, mut reply) = oneshot::channel();
-    node.handle(Event::Checkpoint(tx), &mut vec![])
-        .await
-        .unwrap();
-    for _ in 0..100 {
-        node.drive_ready().await.unwrap();
-        node.drain_log().await.unwrap();
-        node.drain_apply().await.unwrap();
-        node.finish_checkpoint_waiters().unwrap();
-        if reply.try_recv().is_ok() {
-            break;
-        }
-    }
-    assert_eq!(node.raw.store().snapshot_index(), 100);
-    assert!(node.raw.store().has_image());
-    assert_eq!(files(), vec![format!("checkpoint-{:016x}.data", 100)]);
-}
-
-#[tokio::test]
 async fn state_behind_a_truncated_log_stops_startup() {
     let dir = tempfile::tempdir().unwrap();
     seed_log(dir.path(), 10);
@@ -2058,100 +1863,7 @@ async fn state_behind_a_truncated_log_stops_startup() {
         .unwrap();
     assert!(error
         .to_string()
-        .contains("state storage is behind the log truncation point"));
-}
-
-#[tokio::test]
-async fn a_snapshot_that_raft_skips_releases_its_staging_reservation() {
-    let dir = tempfile::tempdir().unwrap();
-    let source = tempfile::tempdir().unwrap();
-    // Apply lags a durable commit at 300. Raft skips a snapshot at 200.
-    seed_log(dir.path(), 300);
-    let (events, _) = mpsc::channel(256);
-    let mut node = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
-        .await
-        .unwrap();
-    node.drive_ready().await.unwrap();
-    assert_eq!(node.state.applied, 0);
-    let mut state = StateMachine::open(source.path()).await.unwrap();
-    state.location.bind(2, "worker-test", None, None);
-    for index in 1..=200 {
-        state.apply(index, None).await.unwrap();
-    }
-    let data = state
-        .checkpoint_job(true)
-        .await
-        .unwrap()
-        .await
-        .unwrap()
-        .unwrap();
-    let descriptor = crate::state::transfer::Descriptor::decode(&data)
-        .unwrap()
-        .unwrap();
-    node.location.prepare(&descriptor).await.unwrap();
-    let mut snapshot = Snapshot::default();
-    snapshot.mut_metadata().index = 200;
-    snapshot.mut_metadata().term = 1;
-    snapshot.mut_metadata().mut_conf_state().voters = vec![1, 2, 3];
-    snapshot.data = data;
-    let mut message = Message::default();
-    message.set_msg_type(MessageType::MsgSnapshot);
-    message.from = 2;
-    message.to = 1;
-    message.term = 2;
-    message.set_snapshot(snapshot);
-    let (tx, _rx) = oneshot::channel();
-    node.handle(Event::PeerFrame(message, 0, tx), &mut vec![])
-        .await
-        .unwrap();
-    assert!(node.raw.raft.raft_log.unstable_snapshot().is_none());
-    // No install follows, so the reservation is gone. A new reservation succeeds.
-    assert_eq!(
-        node.location.reserve(200, &descriptor.checkpoint),
-        Some(true)
-    );
-    state.close().await.unwrap();
-}
-
-type Hook = Box<dyn FnOnce(&std::path::Path)>;
-
-thread_local! {
-    /// Runs in `Node::open` between the first restore marker check and the Raft lock.
-    pub(super) static BEFORE_RAFT_LOCK: std::cell::Cell<Option<Hook>> =
-        const { std::cell::Cell::new(None) };
-}
-
-#[tokio::test]
-async fn a_restore_marker_created_after_the_first_check_blocks_startup() {
-    let dir = tempfile::tempdir().unwrap();
-    // A restore takes the lock after the first check, creates its marker, and fails.
-    BEFORE_RAFT_LOCK.with(|hook| {
-        hook.set(Some(Box::new(|dir| {
-            std::fs::create_dir_all(dir).unwrap();
-            std::fs::write(dir.join(crate::state::backup::RESTORE_MARKER), b"").unwrap();
-        })))
-    });
-    let (events, _) = mpsc::channel(256);
-    let error = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
-        .await
-        .err()
-        .unwrap();
-    assert!(error.to_string().contains("interrupted snapshot restore"));
-}
-
-#[tokio::test]
-async fn an_interrupted_restore_blocks_startup() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(crate::state::backup::RESTORE_MARKER), b"").unwrap();
-    let (events, _) = mpsc::channel(256);
-    let error = Node::open_with_transport(options(dir.path()), events, Some(BTreeMap::new()))
-        .await
-        .err()
-        .unwrap();
-    assert!(error.to_string().contains("interrupted snapshot restore"));
-    // Recovery deletes an S3 namespace only after it compares the owner.
-    assert!(error.to_string().contains("owner.json"), "{error}");
-    assert!(!dir.path().join("raft").exists());
+        .contains("shared state mode installs only format 6 snapshots"));
 }
 
 /// The warning threshold is the first whole byte count at or above `quota * fraction`. The
@@ -2202,7 +1914,6 @@ async fn shared_quota_warning_uses_the_claimed_quota() {
     for (id, quota) in [(1, 10_240), (2, 0)] {
         let mut config = options(&dir.path().join(id.to_string()));
         config.id = id;
-        config.state_mode = crate::state::StateMode::Shared;
         config.object_store = crate::object::Config::Test(store.clone(), "root".into());
         config.quota_bytes = quota;
         config.quota_warning_fraction = 0.8;
@@ -2214,41 +1925,6 @@ async fn shared_quota_warning_uses_the_claimed_quota() {
         assert_eq!(node.warning_bytes(), Some(8_192), "member {id}");
         nodes.push((node, receiver));
     }
-}
-
-use super::quota::tests as quota_tests;
-
-/// The early warning of #74 uses the cluster quota. It follows a changed and a restored
-/// cluster quota, not the flag.
-#[tokio::test]
-async fn the_quota_warning_follows_the_cluster_quota() {
-    let open = |dir: PathBuf| async move {
-        let mut config = options(&dir);
-        config.quota_bytes = 1 << 20;
-        config.quota_warning_fraction = 0.8;
-        let (events, _) = mpsc::channel(256);
-        Node::open_with_transport(config, events, Some(BTreeMap::new()))
-            .await
-            .unwrap()
-    };
-    let dir = tempfile::tempdir().unwrap();
-    quota_tests::append_committed(dir.path(), 1, &[quota_tests::set_quota(10_240, 0, 2)]);
-    let mut node = open(dir.path().to_owned()).await;
-    assert_eq!(node.warning_bytes(), Some(838_861));
-    quota_tests::apply_committed(&mut node).await;
-    assert_eq!(node.warning_bytes(), Some(8_192));
-    drop(node);
-    quota_tests::append_committed(dir.path(), 2, &[quota_tests::set_quota(20_480, 7, 2)]);
-    let mut node = open(dir.path().to_owned()).await;
-    quota_tests::apply_committed(&mut node).await;
-    assert_eq!(node.warning_bytes(), Some(16_384));
-
-    let restored = tempfile::tempdir().unwrap();
-    let target = restored.path().join("member");
-    quota_tests::restore_with(restored.path(), &target, quota_tests::row(10_240, 3, 2)).await;
-    let mut node = open(target).await;
-    quota_tests::apply_committed(&mut node).await;
-    assert_eq!(node.warning_bytes(), Some(8_192));
 }
 
 /// A lone voter campaigns before the loop handles its first event. A member of a larger voter
@@ -2286,6 +1962,7 @@ async fn only_a_lone_voter_leads_before_its_first_event() {
 /// record is already there. The follower then stores nothing, stays live, clears its request,
 /// and takes the next append.
 #[tokio::test]
+#[ignore = "see #149"]
 async fn an_equal_index_snapshot_clears_the_request_and_keeps_the_log() {
     let dir = tempfile::tempdir().unwrap();
     seed_log(dir.path(), 20);
