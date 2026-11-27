@@ -193,17 +193,14 @@ pub(super) fn record_changes(
             }
             .encode_to_vec()
         } else {
-            crate::state::maintenance::hash_record(&kv.key, &bytes)
+            super::hash::hash_record(&kv.key, &bytes)
         };
         let bytes = if values_in_history && !deleted {
             without_value(&kv)
         } else {
             bytes
         };
-        batch.put_new(
-            crate::state::maintenance::hash_key(next, sub as i64, deleted),
-            hash,
-        );
+        batch.put_new(super::hash::hash_key(next, sub as i64, deleted), hash);
         rows.push(EventRow {
             r#type: event.r#type,
             kv: bytes,
@@ -562,7 +559,7 @@ async fn put_rows(
         },
     };
     // The hash row holds a digest of the KeyValue, not its bytes.
-    let hash = crate::state::maintenance::hash_record(&p.key, &current);
+    let hash = super::hash::hash_record(&p.key, &current);
     // With values in history, the journal event omits the value. The history row holds it.
     let event_kv = if values_in_history {
         without_value(&kv)
@@ -572,7 +569,7 @@ async fn put_rows(
     let rows = [
         (key.into(), current, old_len),
         (
-            crate::state::maintenance::hash_key(next, sub as i64, false).into(),
+            super::hash::hash_key(next, sub as i64, false).into(),
             hash.into(),
             None,
         ),
@@ -666,13 +663,13 @@ mod tests {
         assert_eq!(KeyValue::decode(current.clone()).unwrap().value.len(), 4096);
         // The hash record gives the CRC of the full KeyValue bytes.
         let hash = batch
-            .get(&crate::state::maintenance::hash_key(revision, 0, false))
+            .get(&crate::mvcc::hash::hash_key(revision, 0, false))
             .unwrap()
             .unwrap();
         assert!(hash.len() < 64);
         let seed = crc32c::crc32c(b"seed");
         assert_eq!(
-            crate::state::maintenance::hash_append(seed, &hash).unwrap(),
+            crate::mvcc::hash::hash_append(seed, &hash).unwrap(),
             (crc32c::crc32c_append(seed, &current), current.len() as u64)
         );
         // The Watch journal names the history version instead of the value.

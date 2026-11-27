@@ -14,6 +14,7 @@ use crate::proto::mvccpb::KeyValue;
 use crate::proto::state::Version;
 use crate::state::{StateRead, StateScan};
 
+pub(crate) mod hash;
 mod put;
 pub(crate) mod storage_fault;
 #[cfg(test)]
