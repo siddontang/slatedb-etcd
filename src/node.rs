@@ -35,6 +35,7 @@ pub use forwarding::ForwardView;
 pub(crate) use forwarding::LocalRead;
 pub(crate) use shared::WriterReport;
 pub(crate) use shared::{Millis, ProbeReply, ProbeRequest, PROBE_ROUTE};
+pub(crate) use shared::{Prober, WriteProbeReply, WriteProbeRequest, WRITE_PROBE_ROUTE};
 mod quorum_put;
 mod quota;
 mod read;
@@ -140,6 +141,13 @@ pub enum Event {
     SnapshotRefused {
         member: u64,
         target: u64,
+    },
+    /// Shared mode: the reply of `member` to the write probe `nonce` of this leader, or the
+    /// error of the request.
+    WriteProbed {
+        member: u64,
+        nonce: u64,
+        reply: std::result::Result<WriteProbeReply, String>,
     },
 }
 
@@ -376,6 +384,9 @@ pub struct Node {
     /// Simulation: the member proposes no `SeedMembers`, like an earlier binary.
     #[cfg(test)]
     pub(super) hold_members: bool,
+    /// Tests: promote a shared learner without its write proof.
+    #[cfg(test)]
+    pub(super) skip_write_proof: bool,
     /// The node compared the flags with the stored membership row.
     members_observed: bool,
 }
@@ -685,6 +696,8 @@ impl Node {
                     .registry
                     .register(Box::new(retained.clone()))?;
                 let mut writer = shared::Writer::new(handles, options.view_max_age, clock);
+                let prober = shared::Prober::new(options.id, handles.source.clone());
+                writer.prober = Some(std::sync::Arc::new(prober));
                 writer.retention = options.view_retention;
                 writer.retained = Some(retained);
                 writer.gauges = Some(shared::Gauges::register(&state.metrics.registry)?);
@@ -803,6 +816,8 @@ impl Node {
             members_rechecked: 0,
             #[cfg(test)]
             hold_members: false,
+            #[cfg(test)]
+            skip_write_proof: false,
             members_observed: false,
         };
         node.sync_members();
@@ -868,6 +883,13 @@ impl Node {
     /// The shared-mode objects that the snapshot receive path opens.
     pub(crate) fn shared_source(&self) -> Option<std::sync::Arc<crate::state::shared::Source>> {
         self.writer.as_ref().map(|writer| writer.source.clone())
+    }
+
+    /// Shared mode: the write probes that this member runs for the leader.
+    pub(crate) fn write_prober(&self) -> Option<std::sync::Arc<Prober>> {
+        self.writer
+            .as_ref()
+            .and_then(|writer| writer.prober.clone())
     }
 
     /// Shared mode: the wall clock that this member returns to a clock probe of the leader.
@@ -1351,14 +1373,24 @@ impl Node {
             Event::PeerProcess { member, process } => {
                 let changed = self.raw.store().process(member) != process;
                 self.raw.store().note_process(member, process);
-                // A new voter process drops its clock sample before the next batch admission.
+                // A new voter process drops its clock sample before the next batch admission. A
+                // new learner process drops its write proof and its running probe at once. A late
+                // frame of the earlier process then cannot bring that proof back.
                 if changed {
                     self.tick_clock(false);
+                    if let Some(writer) = &mut self.writer {
+                        writer.proofs.forget(member);
+                    }
                 }
             }
             Event::SnapshotRefused { member, target } => {
                 self.raw.store().note_refused(member, target);
             }
+            Event::WriteProbed {
+                member,
+                nonce,
+                reply,
+            } => self.write_probed(member, nonce, reply),
             Event::SnapshotDelay(delay_ms, response) => {
                 self.snapshot_delay_ms = delay_ms.min(5000);
                 let _ = response.send(Ok(self.status()?));

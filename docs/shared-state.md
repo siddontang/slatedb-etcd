@@ -95,6 +95,7 @@ The design depends on these rules. Later sections refer to them by number.
     shared/owner.json          cluster claim, mode, and store ID, created with PutMode::Create
     shared/bootstrap.json      written once after the first checkpoint, PutMode::Create
     shared/state/              the one SlateDB: manifest/, compacted/, wal/ fence files
+    shared/state/.probe/       scratch objects of the write probe before a promotion
     member-<id>/binding.json   member identity and mode check, no state
 ```
 
@@ -109,11 +110,43 @@ The design depends on these rules. Later sections refer to them by number.
 - Every voter needs read and write access to `shared/state/`, because any voter can become the
   leader. Per-member write isolation is lost. See [Costs](#costs-and-trade-offs).
 - Scope each voter's credentials to its own cluster prefix. A learner can use read-only
-  credentials. Promotion checks write access before the learner can lead.
+  credentials. Promotion checks write access before the learner can lead. See
+  [Promotion](#promotion).
 - A credential that can delete objects can delete the data of every member. Keep recovery
   copies under separate credentials.
 - A member refuses to open an existing cluster in a different mode.
 - `replicated` stays the default and keeps the current `member-<id>/state-N` layout.
+
+## Promotion
+
+A voter can become the leader and the writer, so a learner proves write access before its
+promotion. The leader keeps the in-sync check of the log and adds this check before it proposes
+the configuration change.
+
+1. The leader asks the learner for a write probe on the peer route `/raft/write-probe`. The probe
+   has a random nonce. The leader binds it to its term, the member, and the member's process,
+   and it records the send time.
+2. The learner uses the store client of its own writer. It creates
+   `shared/state/.probe/<member>-<process>` with `PutMode::Create` and deletes it. The key has no
+   nonce. SlateDB 0.18.1 writes each manifest version with `PutMode::Create`
+   (`slatedb-txn-obj-0.18.1/src/object_store.rs:383`), so a create and a delete show the access
+   of a writer. Any error of that delete fails the probe, also `NotFound`.
+3. The leader accepts only the reply to that nonce, from that process, with the store ID of the
+   claim, within 15 s of the send. A proof counts for 60 s from the send. A late or repeated reply
+   does not extend it. A new learner process drops the proof and the running probe when its
+   first frame arrives. A role change drops every proof.
+4. Without a valid proof, the promotion fails with the retryable `FailedPrecondition`. The error
+   names a missing, failed, or expired proof. The request starts a probe unless one runs. After a
+   failed probe the next one waits 1 s, then 2 s, up to 30 s. Call `member promote` again.
+
+A create can time out and reach the store later, also after a later probe. A delete can fail.
+Each leaves the one object of the key, so a process leaves at most one scratch object. The next
+create then fails with `AlreadyExists`. The learner deletes the object and creates it once more.
+
+`/status` of the leader shows the proofs as `shared_state.writer.write_proofs`, with the age and
+the remaining time of each proof. A probe with no reply by its deadline shows as timed out. The
+leader drops the record of a member that leaves the configuration. The proofs are diagnostic. A
+leader handoff does not use them.
 
 ## Bootstrap
 

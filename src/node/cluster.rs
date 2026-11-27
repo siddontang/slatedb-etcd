@@ -167,7 +167,8 @@ impl Node {
         };
         let checked = permission
             .and_then(|()| self.state.members.validate(&request))
-            .and_then(|()| self.check_membership(&request));
+            .and_then(|()| self.check_membership(&request))
+            .and_then(|()| self.check_write_proof(&request));
         if let Err(error) = checked {
             let _ = response.send(Ok(serde_json::to_value(Outcome::<Value> {
                 result: Err(error),
@@ -632,6 +633,8 @@ mod tests {
             .await
             .unwrap();
         node.clock_in_manual = true;
+        // Learner 2 has no process to run a write probe. See `write_proof` for those tests.
+        node.skip_write_proof = true;
         while node.raw.raft.state != StateRole::Leader {
             node.tick().unwrap();
         }

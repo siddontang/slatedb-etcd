@@ -294,6 +294,10 @@ pub(super) struct Writer {
     pub(super) clock_due: Option<Instant>,
     /// The writer reports of the voters, and the handoff of a writer incident.
     pub(super) handoff: fault::Handoff,
+    /// The write proofs of the learners that this leader promotes. See `write_proof`.
+    pub(super) proofs: write_proof::Proofs,
+    /// The write probes of this member. The node sets it at its open.
+    pub(super) prober: Option<Arc<Prober>>,
 }
 
 /// The shared-mode gauges of one member. The node sets them on each tick.
@@ -403,6 +407,8 @@ impl Writer {
             health: fault::Health::default(),
             clock_due: None,
             handoff: fault::Handoff::default(),
+            proofs: write_proof::Proofs::default(),
+            prober: None,
             progress: Arc::new(Progress::new(0)),
             admin: handles.admin.clone(),
             queue: handles.queue.clone(),
@@ -566,6 +572,7 @@ impl Writer {
             "reports": self.reports.lock().unwrap().len(),
             "health": self.health.status(),
             "handoff": self.handoff.status(),
+            "write_proofs": self.proofs.status(Instant::now()),
         })
     }
 }
@@ -1449,6 +1456,7 @@ impl Node {
         // A new leader probes the voters at once. Its first write waits for their samples.
         self.tick_clock(true);
         if let Some(writer) = &mut self.writer {
+            writer.proofs.lead(leader.then_some(term));
             writer.sync(leader, term, &self.events);
         }
     }
@@ -2041,6 +2049,7 @@ mod defragment;
 mod demand;
 mod fault;
 mod rejected;
+mod write_proof;
 pub(super) use clock::Clock;
 #[cfg(test)]
 pub(super) use clock::{probe_nonce, Gate};
@@ -2051,6 +2060,7 @@ use defragment::DefragmentStep;
 #[cfg(test)]
 pub(super) use fault::fenced;
 pub(crate) use fault::WriterReport;
+pub(crate) use write_proof::{Prober, WriteProbeReply, WriteProbeRequest, WRITE_PROBE_ROUTE};
 #[cfg(test)]
 mod materialize_tests;
 #[cfg(test)]

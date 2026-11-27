@@ -47,6 +47,7 @@ async fn server_with(
         },
         refusals: std::sync::Arc::new(crate::api::Refusals::new(refused.clone())),
         clock: None,
+        prober: None,
         fault_controls: false,
     });
     let task = tokio::spawn(crate::tls::serve(listener, router, None));
