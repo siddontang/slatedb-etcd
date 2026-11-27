@@ -830,40 +830,56 @@ async fn read_index_wait_expires_but_a_running_read_finishes() {
     assert!(node.reads.is_empty());
 }
 
+/// As in etcd, only the ReadIndex wait expires. A confirmed read waits for an executor slot past
+/// 5 s and through a leader change, and returns its rows. An unconfirmed read fails on both.
 #[tokio::test]
-async fn an_expired_queued_read_does_not_start() {
+async fn a_confirmed_read_outlives_the_read_index_wait_and_a_leader_change() {
+    use crate::proto::etcdserverpb::response_op::Response as Resp;
     let dir = tempfile::tempdir().unwrap();
     let mut node = leader_node(dir.path()).await;
+    put_letters(&mut node).await;
     // A sorted Range holds the exclusive slot.
     let (tx, _held) = oneshot::channel();
     node.enqueue_query(sorted_read(tx));
     node.drive_ready().await.unwrap();
     assert_eq!(node.read_executor.len(), 1);
 
-    let (tx, expired) = oneshot::channel();
-    node.linear_read(wide_range(b"a", b"m"), tx);
-    let stale = *node.reads.keys().next().unwrap();
-    let (tx, live) = oneshot::channel();
-    node.linear_read(wide_range(b"m", b"z"), tx);
-    let fresh = *node.reads.keys().find(|id| **id != stale).unwrap();
+    let (tx, confirmed) = oneshot::channel();
+    node.linear_read_auth(wide_range(b"a", b"m"), None, ClientResponse::Kv(tx));
+    let id = *node.reads.keys().next().unwrap();
     node.drive_ready().await.unwrap();
-    confirm_read(&mut node, &stale).await;
-    confirm_read(&mut node, &fresh).await;
-    assert_eq!(node.read_queries.len(), 2);
-
-    node.reads.get_mut(&stale).unwrap().started = Instant::now() - Duration::from_secs(6);
+    confirm_read(&mut node, &id).await;
+    assert_eq!(node.read_queries.len(), 1);
+    node.reads.get_mut(&id).unwrap().started = Instant::now() - Duration::from_secs(6);
     node.expire_reads();
-    assert!(expired.await.unwrap().is_err());
+    assert_eq!(node.read_queries.len(), 1);
 
-    // Both scans could share the wide slots. Only the live one starts.
+    let (tx, unconfirmed) = oneshot::channel();
+    node.linear_read(wide_range(b"m", b"z"), tx);
+    let term = node.raw.raft.term;
+    node.raw.raft.become_follower(term + 1, 0);
+    node.expire_reads();
+    assert!(unconfirmed.await.unwrap().is_err());
+    assert_eq!(node.reads.keys().copied().collect::<Vec<_>>(), vec![id]);
+
     let output = node.read_executor.step().await.unwrap().unwrap();
     node.complete_read(output).unwrap();
     node.schedule_reads();
     assert_eq!(node.read_executor.len(), 1);
-    assert!(node.read_queries.is_empty());
     let output = node.read_executor.step().await.unwrap().unwrap();
     node.complete_read(output).unwrap();
-    assert!(live.await.unwrap().is_ok());
+    let range = confirmed
+        .await
+        .unwrap()
+        .unwrap()
+        .into_outcome()
+        .result
+        .unwrap();
+    let Some(Resp::ResponseRange(range)) = range.response else {
+        panic!("expected a range response");
+    };
+    let keys: Vec<_> = range.kvs.iter().map(|kv| kv.key[0]).collect();
+    assert_eq!(keys, (b'a'..b'i').collect::<Vec<_>>());
     assert!(node.reads.is_empty());
 }
 
@@ -1042,15 +1058,16 @@ async fn confirmed_scans_share_only_matching_requests_and_credentials() {
     node.drive_ready().await.unwrap();
     let delayed = node.read_executor.step().await.unwrap().unwrap();
     assert!(matches!(&delayed, Output::SharedLinear(ids, _) if ids.len() == 2));
+    // The quorum confirmed these reads, so a later term change does not void their result.
     node.raw.raft.become_follower(node.raw.raft.term + 1, 2);
     node.complete_read(delayed).unwrap();
     for rx in &mut replies[3..] {
-        assert!(rx.try_recv().unwrap().is_err());
+        assert!(rx.try_recv().unwrap().is_ok());
     }
 }
 
 #[tokio::test]
-async fn read_index_waits_for_apply_and_rejects_late_results_after_term_change() {
+async fn read_index_waits_for_apply_and_keeps_its_result_after_term_change() {
     let dir = tempfile::tempdir().unwrap();
     let mut node = leader_node(dir.path()).await;
     let (tx, _) = oneshot::channel();
@@ -1087,9 +1104,10 @@ async fn read_index_waits_for_apply_and_rejects_late_results_after_term_change()
     node.complete_apply(completed).unwrap();
     node.drive_ready().await.unwrap();
     let read_result = node.read_executor.step().await.unwrap().unwrap();
+    // The read ran at or above its confirmed read index, so it stays linearizable, as in etcd.
     node.raw.raft.become_follower(node.raw.raft.term + 1, 2);
     node.complete_read(read_result).unwrap();
-    assert!(reply.await.unwrap().is_err());
+    assert!(reply.await.unwrap().is_ok());
     assert!(node.reads.is_empty());
 }
 

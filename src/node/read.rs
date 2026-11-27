@@ -14,8 +14,6 @@ pub(super) struct PendingRead {
     index: Option<u64>,
     context: Option<u64>,
     retry_ticks: u8,
-    /// The read executor runs the read. Its deadline then limits the read.
-    executing: bool,
 }
 
 impl PendingRead {
@@ -100,7 +98,6 @@ impl Node {
                     index: None,
                     context: None,
                     retry_ticks: 2,
-                    executing: false,
                 },
             );
         }
@@ -221,13 +218,6 @@ impl Node {
             {
                 queries.push(self.read_queries.remove(position).unwrap());
             }
-            for query in &queries {
-                if let Query::Linear(_, _, id) = query {
-                    if let Some(read) = self.reads.get_mut(id) {
-                        read.executing = true;
-                    }
-                }
-            }
             self.read_executor
                 .submit(self.state.read.clone(), queries, self.header());
         }
@@ -258,6 +248,14 @@ impl Node {
         Ok(())
     }
 
+    /// Fail the reads whose caller left, and the reads that the quorum has not confirmed within
+    /// 5 s or under the same leader and term.
+    ///
+    /// As in etcd, only the ReadIndex wait has this limit. A confirmed read is linearizable at
+    /// its read index whatever happens to leadership later, because the applied index only grows.
+    /// It then waits for apply and an executor slot, and runs up to the executor limit. The gRPC
+    /// handler bounds the whole request; when it gives up, the closed reply drops the read here.
+    /// A held apply fails it earlier; see `fence_reads`.
     pub(super) fn expire_reads(&mut self) {
         let now = Instant::now();
         let term = self.raw.raft.term;
@@ -267,13 +265,13 @@ impl Node {
             .reads
             .iter()
             .filter(|(_, read)| {
-                leader == 0
-                    || read.leader != leader
-                    || read.role != role
-                    || read.term != term
-                    || read.response.is_closed()
-                    || (!read.executing
-                        && now.duration_since(read.started) > Duration::from_secs(5))
+                read.response.is_closed()
+                    || (read.index.is_none()
+                        && (leader == 0
+                            || read.leader != leader
+                            || read.role != role
+                            || read.term != term
+                            || now.duration_since(read.started) > Duration::from_secs(5)))
             })
             .map(|(id, _)| *id)
             .collect();

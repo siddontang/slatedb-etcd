@@ -231,10 +231,12 @@ A running wide-read job has a 60-second deadline. This avoids the retries from t
 the old five-second cutoff caused for a large LIST. A shared scan and its exclusive rerun use
 the same deadline, so a rerun that waits for the exclusive slot has less time left to execute.
 Shutdown stops these jobs before closing the state database.
-The owner checks the term, role, and leader identity again before returning the result.
-Leadership loss or client cancellation removes the pending request.
-A linearizable read fails if it does not start in the read executor within five seconds after
-the owner accepts it. A queued read whose request failed or whose caller left does not start.
+As in etcd, only the wait for the quorum proof has a limit. A read fails if the quorum does not
+confirm it within five seconds, or if the term, role, or leader changes first. A confirmed read
+is linearizable at its read index whatever happens to leadership later, because the applied
+index only grows. It then waits for apply and an executor slot without its own limit: the gRPC
+handler waits 70 seconds for a read reply, and a held apply fails reads above the applied index.
+A queued read whose request failed or whose caller left does not start.
 At most 64 ReadIndex requests can wait. These requests do not append log entries.
 Unconfirmed requests retry every two Raft ticks until confirmation, cancellation, or timeout.
 Retries cover lost messages and reads dropped before a new leader commits its first entry.
