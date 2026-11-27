@@ -46,6 +46,7 @@ async fn server_with(
             store: store.map(str::to_owned),
         },
         refusals: std::sync::Arc::new(crate::api::Refusals::new(refused.clone())),
+        clock: None,
         fault_controls: false,
     });
     let task = tokio::spawn(crate::tls::serve(listener, router, None));

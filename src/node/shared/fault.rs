@@ -22,6 +22,8 @@ const DATA_RETRY_FIRST: Duration = Duration::from_secs(30);
 const DATA_RETRY_CAP: Duration = Duration::from_secs(5 * 60);
 /// Failures in a row after which the leader hands over its leadership.
 const HANDOFF_FAILURES: u32 = 3;
+/// ID time refusals in a row that open the writer again at once. A later one is a clock fault.
+const ID_TIME_REOPENS: u32 = 3;
 /// Due storage work that makes no durable progress for this time is a fault.
 pub(super) const STALL: Duration = Duration::from_secs(30);
 /// A failed writer that takes this long to close logs a warning.
@@ -39,7 +41,8 @@ pub(in crate::node) enum Fault {
     /// SlateDB cannot use the shared database, for example an object is missing or does not
     /// decode. Each later leader can meet the same error.
     Data,
-    /// The local clock is too far behind the clock of the shared writer.
+    /// The local clock is too far behind the clock of the shared writer, or ahead of a voter
+    /// majority. See `clock`.
     Clock,
     /// Due storage work made no durable progress for `STALL`.
     Stalled,
@@ -66,6 +69,9 @@ impl Fault {
 /// flush failed, and the close hides the cause.
 pub(in crate::node) fn classify(error: &anyhow::Error) -> Fault {
     use crate::mvcc::storage_fault::StorageFault;
+    if error.chain().any(|cause| cause.is::<clock::ClockAhead>()) || id_time_refused(error) {
+        return Fault::Clock;
+    }
     if fenced(error) || open_conflict(error) {
         return Fault::Fenced;
     }
@@ -97,6 +103,26 @@ pub(in crate::node) fn open_conflict(error: &anyhow::Error) -> bool {
 
 pub(in crate::node) use crate::state::shared::fenced;
 
+/// Return true when SlateDB refused an ID time or a tick below its newest one: an L0 SST, a
+/// compaction job, or a compaction output (`manifest/invariants.rs`,
+/// `compactions_store/invariants.rs`). SlateDB 0.18.1 reports each as an `Invalid` error whose
+/// message starts with this text, also as the stored error of a `Db` that its compactor task
+/// closed. The stored state is sound: the next open reads a higher floor. See
+/// `clock::stored_floor`.
+pub(in crate::node) fn id_time_refused(error: &anyhow::Error) -> bool {
+    const REFUSAL: &str = "invalid clock tick, must be monotonic";
+    error.chain().any(|cause| {
+        cause.downcast_ref::<slatedb::Error>().is_some_and(|error| {
+            let kind = error.kind();
+            let text = error.to_string();
+            kind == slatedb::ErrorKind::Invalid
+                && text
+                    .strip_prefix(&format!("{kind}: "))
+                    .is_some_and(|message| message.starts_with(REFUSAL))
+        })
+    })
+}
+
 /// Return the stored error of a writer that SlateDB closed. A failed background flush closes
 /// the `Db`, and the status then reports `Panic` for every kind of error. A call on the closed
 /// `Db` returns the stored error, which keeps its kind.
@@ -119,6 +145,15 @@ pub(super) fn recover(
     health: &TaskHealth,
     reopens: &std::sync::atomic::AtomicU64,
 ) -> Result<Duration> {
+    // Another writer of job records, such as the compactor of an older writer or a late
+    // Defragment, can add a job above the floor after this open read it. SlateDB then refuses
+    // the next ID and closes the `Db`. The next open starts above that job, so it opens again
+    // at once, with no fault. Repeated refusals are a clock fault.
+    if id_time_refused(&error) && health.id_time_reopen() <= ID_TIME_REOPENS {
+        tracing::warn!(term, %error, "SlateDB refused an ID time; open the writer again");
+        reopens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(Duration::ZERO);
+    }
     match classify(&error) {
         Fault::Fenced => {
             // Two quick elections can open writers in reverse term order. The step timer keeps
@@ -197,6 +232,8 @@ struct Record {
     stall_began: Option<Instant>,
     /// The node asked the task to drop its stalled step. The end of the stall clears it.
     restart: bool,
+    /// Writer opens in a row after SlateDB refused an ID time. A publication ends the count.
+    id_time_reopens: u32,
     /// The time of the newest fault, until this member's writer publishes again.
     mark: Option<Instant>,
     /// The time when this member's writer last created and announced a checkpoint.
@@ -243,6 +280,7 @@ impl Health {
         record.consecutive = 0;
         record.since = None;
         record.stall_began = None;
+        record.id_time_reopens = 0;
         record.done();
         TaskHealth {
             health: self.clone(),
@@ -512,8 +550,18 @@ impl TaskHealth {
             record.consecutive = 0;
             record.since = None;
             record.stall_began = None;
+            record.id_time_reopens = 0;
             record.done();
         });
+    }
+
+    /// Count a writer open after SlateDB refused an ID time, and return the count.
+    pub(super) fn id_time_reopen(&self) -> u32 {
+        self.update(|record| {
+            record.id_time_reopens += 1;
+            record.id_time_reopens
+        })
+        .unwrap_or(u32::MAX)
     }
 
     /// Wait until the node asks this task to drop its stalled attempt. A request that the end
@@ -561,6 +609,9 @@ pub(in crate::node) struct Candidate {
     pub matched: u64,
     /// The process of the voter's last transport frame.
     pub process: Option<u64>,
+    /// The voter's clock is above the `m`-th largest clock of the voters. A handoff prefers
+    /// another voter, because this one can meet the ahead check. See `Clock::above`.
+    pub clock_ahead: bool,
 }
 
 /// How well a voter suits a writer fault handoff.
@@ -680,8 +731,8 @@ impl Handoff {
         }
     }
 
-    /// Pick the target of a writer fault handoff: a healthy voter before a stale mark, and then
-    /// the longest matched log. The voter's report must come from after the start of the
+    /// Pick the target of a writer fault handoff: a healthy voter before a stale mark, then a
+    /// voter whose clock a majority supports, and then the longest matched log. The voter's report must come from after the start of the
     /// incident and from the current Raft term, so a voter that stopped or faulted since its
     /// last report is not a target. A voter that this incident tried is not a target either.
     fn pick(&self, tick: &Tick) -> Option<u64> {
@@ -696,7 +747,7 @@ impl Handoff {
             .filter(|candidate| !self.tried.contains(&candidate.id) && fresh(&candidate.id))
             .map(|candidate| (self.suit(candidate, tick.published), candidate))
             .filter(|(suit, _)| *suit != Suit::No)
-            .max_by_key(|(suit, candidate)| (*suit, candidate.matched))
+            .max_by_key(|(suit, candidate)| (*suit, !candidate.clock_ahead, candidate.matched))
             .map(|(_, candidate)| candidate.id)
     }
 
@@ -772,7 +823,7 @@ impl Handoff {
 }
 
 /// Order voters for a handoff that is not a writer fault. A voter that suits a writer handoff
-/// comes first, then the longest matched log. A voter whose apply holds is never a target.
+/// comes first, then a voter whose clock a majority supports, then the longest matched log. A voter whose apply holds is never a target.
 fn rank(
     handoff: Option<&Handoff>,
     published: Option<Instant>,
@@ -783,7 +834,7 @@ fn rank(
         .filter(|candidate| !handoff.is_some_and(|handoff| handoff.held(candidate.id)))
         .max_by_key(|candidate| {
             let suit = handoff.map_or(Suit::No, |handoff| handoff.suit(candidate, published));
-            (suit, candidate.matched)
+            (suit, !candidate.clock_ahead, candidate.matched)
         })
         .map(|candidate| candidate.id)
 }
@@ -797,21 +848,40 @@ fn handoff_due(health: &Health, paused: Option<&super::apply::Paused>) -> bool {
 impl Writer {
     /// The time since work that the publisher has not started became due: the oldest unflushed
     /// write at its age limit, or an explicit publication request. A writer that is not open
-    /// holds the progress of an earlier one, so only an open writer counts.
+    /// holds the progress of an earlier one, so only an open writer counts. A batch that waits
+    /// for clock samples or for its clock bound counts too, open writer or not. See
+    /// `note_clock_wait`.
     pub(super) fn waiting(&self) -> Option<Instant> {
         if self.open.lock().unwrap().is_none() {
-            return None;
+            return self.clock_due;
         }
         let aged = self.progress.deadline(self.max_age);
-        aged.into_iter().chain(self.progress.requested()).min()
+        aged.into_iter()
+            .chain(self.progress.requested())
+            .chain(self.clock_due)
+            .min()
+    }
+
+    /// Note on a leader tick whether the clock check holds due work: the writer waits for
+    /// samples or for its bound, and a batch waits for the writer. An idle writer that waits
+    /// is no due work, so its wait never becomes a stall.
+    pub(super) fn note_clock_wait(&mut self) {
+        let due = self.clock.waiting() && !self.queue.after(self.progress.written(), 1).is_empty();
+        self.clock_due = due.then(|| self.clock_due.unwrap_or_else(Instant::now));
     }
 }
 
 impl Node {
-    /// The voters other than this member, with their matched log and transport process.
+    /// The voters other than this member, with their matched log, transport process, and clock.
+    /// Raft election eligibility does not change: the clock only orders the targets.
     pub(in crate::node) fn handoff_candidates(&self) -> Vec<Candidate> {
         let id = self.options.id;
         let voters = self.raw.raft.prs().conf().voters();
+        let ahead = self
+            .writer
+            .as_ref()
+            .map(|writer| writer.clock.above())
+            .unwrap_or_default();
         self.raw
             .raft
             .prs()
@@ -821,6 +891,7 @@ impl Node {
                 id: peer,
                 matched: progress.matched,
                 process: self.raw.store().process(peer),
+                clock_ahead: ahead.contains(&peer),
             })
             .collect()
     }
@@ -855,6 +926,7 @@ impl Node {
         };
         moves.extend(writer.transfer.map(|(target, _)| target));
         if leader {
+            writer.note_clock_wait();
             writer.health.check(writer.waiting());
         }
         if let Some(gauges) = &writer.gauges {
@@ -904,3 +976,7 @@ mod tests;
 #[cfg(test)]
 #[path = "hold_handoff_tests.rs"]
 mod hold_tests;
+
+#[cfg(test)]
+#[path = "clock_handoff_tests.rs"]
+mod clock_tests;

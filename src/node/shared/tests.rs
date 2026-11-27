@@ -59,7 +59,12 @@ async fn the_materializer_writes_whole_batches_with_their_sequences() {
     let mut replay = Overlay::new(1);
     replay.push(4, batch(4, &[("b", "2"), ("c", "3"), ("d", "4")]));
     let progress = Arc::new(Progress::new(db.manifest().last_l0_seq()));
-    let task = tokio::spawn(materialize(db.clone(), replay.queue(), progress.clone()));
+    let task = tokio::spawn(materialize(
+        db.clone(),
+        replay.queue(),
+        progress.clone(),
+        clock::Gate::unchecked(),
+    ));
     progress.wait_written(4).await.unwrap();
     assert_eq!(db.snapshot().unwrap().seq(), 4);
     assert_eq!(value(&db, "c").await, Some("3".into()));
@@ -1098,12 +1103,13 @@ async fn a_defragment_that_loses_the_lead_returns_a_retryable_error() {
     // The aged flush publishes a checkpoint with an L0 SST. The members adopt it.
     let id = announcements.next(Duration::from_secs(10), true).await;
     adopt_announced(&mut state, id).await;
-    let db = writer.open.lock().unwrap().clone().unwrap();
+    let db = writer.open.lock().unwrap().clone().unwrap().db;
     let reached = Arc::new(tokio::sync::Notify::new());
     let resume = Arc::new(tokio::sync::Notify::new());
     let defragment = Defragment {
         db,
         admin: handles.admin.clone(),
+        owner: None,
         progress: writer.progress.clone(),
         announced: handles.announced.clone(),
         leadership: writer.leadership.subscribe(),
@@ -1121,14 +1127,15 @@ async fn a_defragment_that_loses_the_lead_returns_a_retryable_error() {
     let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
     writer.sync(true, 4, &events);
     let db = loop {
-        if let Some(db) = writer.open.lock().unwrap().clone() {
-            break db;
+        if let Some(open) = writer.open.lock().unwrap().clone() {
+            break open.db;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
     let defragment = Defragment {
         db,
         admin: handles.admin.clone(),
+        owner: None,
         progress: writer.progress.clone(),
         announced: handles.announced.clone(),
         leadership: writer.leadership.subscribe(),
@@ -1201,8 +1208,9 @@ fn defragment(
     )>,
 ) -> Defragment {
     Defragment {
-        db: writer.open.lock().unwrap().clone().unwrap(),
+        db: writer.open.lock().unwrap().clone().unwrap().db,
         admin: handles.admin.clone(),
+        owner: None,
         progress: writer.progress.clone(),
         announced: handles.announced.clone(),
         leadership: writer.leadership.subscribe(),
@@ -1239,7 +1247,7 @@ async fn check_delayed_checkpoint(compact_before_defragment: bool) {
     if compact_before_defragment {
         // Rewrite the SSTs without advancing the applied announcement. The delayed
         // checkpoint now shares no input SSTs with the upcoming Defragment.
-        crate::state::maintenance::compact_all(&handles.admin)
+        crate::state::maintenance::compact_all(&handles.admin, &|| Ok(()))
             .await
             .unwrap();
     }

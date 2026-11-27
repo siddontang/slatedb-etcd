@@ -170,7 +170,7 @@ impl StateMachine {
         let _active = crate::metrics::Active::new(&self.metrics.defrag_active);
         self.metrics.flush_db(self.db()).await?;
         self.durable_applied = self.applied;
-        compact_all(&self.admin).await.map(drop)
+        compact_all(&self.admin, &|| Ok(())).await.map(drop)
     }
 
     pub(super) async fn hash_kv(&self, revision: i64) -> std::result::Result<Value, KvError> {
@@ -444,7 +444,13 @@ pub(crate) async fn count_logical_usage(db: &impl StateRead) -> Result<crate::ba
 /// Compact every L0 SST and sorted run into one sorted run, and wait up to 8 s for the end.
 /// The compactor of the database writer runs the job. Defragment uses this in both state modes.
 /// Return the version of the manifest that shows compaction is complete.
-pub(crate) async fn compact_all(admin: &slatedb::admin::Admin) -> Result<u64> {
+///
+/// `allowed` runs before each submission. A Defragment of a writer whose term ended must not add
+/// a job record, because SlateDB checks no writer epoch at a submission.
+pub(crate) async fn compact_all(
+    admin: &slatedb::admin::Admin,
+    allowed: &(dyn Fn() -> Result<()> + Send + Sync),
+) -> Result<u64> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     loop {
         let manifest = admin
@@ -469,6 +475,7 @@ pub(crate) async fn compact_all(admin: &slatedb::admin::Admin) -> Result<u64> {
         // SlateDB can reuse the destination run ID, so the input SST views identify the input.
         let input: std::collections::HashSet<_> =
             manifest.all_sst_views().map(|view| view.id).collect();
+        allowed()?;
         let job = admin
             .submit_compaction(CompactionSpec::new(sources, destination))
             .await?;

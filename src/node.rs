@@ -34,6 +34,7 @@ mod proposal;
 pub use forwarding::ForwardView;
 pub(crate) use forwarding::LocalRead;
 pub(crate) use shared::WriterReport;
+pub(crate) use shared::{Millis, ProbeReply, ProbeRequest, PROBE_ROUTE};
 mod quorum_put;
 mod quota;
 mod read;
@@ -362,6 +363,10 @@ pub struct Node {
     /// Simulation: the leader does not propose compaction steps, as if their reads were slow.
     #[cfg(test)]
     hold_compact_steps: bool,
+    /// Tests: run the clock check of the shared writer also with a manual transport. Probes
+    /// still need the peer routes, so the test gives the samples itself.
+    #[cfg(test)]
+    clock_in_manual: bool,
     /// The quota flag of this member and its `SetQuota` proposals.
     quota: quota::Quota,
     /// The term and index of the first `SeedMembers` proposal of this member in its last term.
@@ -704,6 +709,8 @@ impl Node {
             quota_warned: false,
             #[cfg(test)]
             hold_compact_steps: false,
+            #[cfg(test)]
+            clock_in_manual: false,
             location,
             metrics,
             last_observed_leader: 0,
@@ -861,6 +868,21 @@ impl Node {
     /// The shared-mode objects that the snapshot receive path opens.
     pub(crate) fn shared_source(&self) -> Option<std::sync::Arc<crate::state::shared::Source>> {
         self.writer.as_ref().map(|writer| writer.source.clone())
+    }
+
+    /// Shared mode: the wall clock that this member returns to a clock probe of the leader.
+    pub(crate) fn probe_clock(&self) -> Option<Millis> {
+        self.writer
+            .as_ref()
+            .map(|writer| writer.clock.now_ms.clone())
+    }
+
+    /// Tests: skew the wall clock of this member's writer and of its probe replies.
+    #[cfg(test)]
+    pub(crate) fn set_clock(&mut self, now_ms: Millis) {
+        if let Some(writer) = &mut self.writer {
+            writer.clock.now_ms = now_ms;
+        }
     }
 
     pub async fn run(self, events: mpsc::Receiver<Event>) -> Result<()> {
@@ -1327,7 +1349,12 @@ impl Node {
                 writer,
             } => self.view_ack(member, checkpoints, publish, coverage, writer),
             Event::PeerProcess { member, process } => {
+                let changed = self.raw.store().process(member) != process;
                 self.raw.store().note_process(member, process);
+                // A new voter process drops its clock sample before the next batch admission.
+                if changed {
+                    self.tick_clock(false);
+                }
             }
             Event::SnapshotRefused { member, target } => {
                 self.raw.store().note_refused(member, target);

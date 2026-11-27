@@ -24,6 +24,8 @@ pub struct ApiState {
     pub(crate) location: Option<std::sync::Arc<crate::state::transfer::Location>>,
     /// Shared mode: the objects that a received format 6 snapshot names.
     pub(crate) shared: Option<std::sync::Arc<crate::state::shared::Source>>,
+    /// Shared mode: the wall clock that a clock probe of the leader reads.
+    pub(crate) clock: Option<crate::node::Millis>,
     /// Serve the fault controls under `/debug`. Off unless a test cluster enables them.
     pub(crate) fault_controls: bool,
 }
@@ -102,6 +104,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/raft", post(raft_message))
         .route(crate::peer::COVERED_ROUTE, post(covered_snapshot))
         .route("/raft/view-ack", post(view_ack))
+        .route(crate::node::PROBE_ROUTE, post(clock_probe))
         .route(crate::state::transfer::FILE_ROUTE, get(snapshot_file))
         .route("/status", get(status))
         .route("/debug/log-stats", get(log_stats))
@@ -297,6 +300,28 @@ async fn view_ack(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
+}
+
+/// Return the wall clock of this member to a clock probe of the shared leader. The leader
+/// times the probe, so the reply reads the clock as late as it can. A replicated member has no
+/// clock check and answers 404.
+async fn clock_probe(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(probe): Json<crate::node::ProbeRequest>,
+) -> Response {
+    if let Err(refusal) = admit(&state, &headers) {
+        return (StatusCode::FORBIDDEN, refusal).into_response();
+    }
+    let Some(clock) = &state.clock else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    Json(crate::node::ProbeReply {
+        nonce: probe.nonce,
+        process: crate::peer::process_id(),
+        clock_ms: clock(),
+    })
+    .into_response()
 }
 
 #[derive(Deserialize)]

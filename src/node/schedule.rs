@@ -338,6 +338,7 @@ impl Node {
                     if let Some(change) = command.change.as_ref().filter(|_| !superseded) {
                         self.raw.apply_conf_change(change)?;
                         self.membership_checkpoint = self.state.applied;
+                        self.tick_clock(false);
                     }
                     if let Some(LeaseCommand::Expire { id, generation }) = command.lease {
                         self.lease_expiring.remove(&(id, generation));
@@ -417,7 +418,10 @@ impl Node {
             Output::Linear { id, outcome } => self.finish_read(id, outcome)?,
             // Raft took the ConfState of a snapshot that it accepted above the adopted base.
             Output::Adopted(conf) if self.installing() => drop(conf),
-            Output::Adopted(conf) => shared::reconcile_conf(&mut self.raw, &conf)?,
+            Output::Adopted(conf) => {
+                shared::reconcile_conf(&mut self.raw, &conf)?;
+                self.tick_clock(false);
+            }
             Output::RejectedBase(rejected) => self.reject_base(rejected),
             Output::Checkpoint(built) => {
                 if let Some(built) = built {

@@ -576,13 +576,15 @@ time therefore grows with the live data size. It does not grow with history or S
 **Become leader at term `t`:**
 
 1. Apply continues into the overlay. Reads and replies continue.
-2. Open the writable `Db` on `shared/state`. The open increments the writer epoch, which fences
-   the old writer (SlateDB `manifest/store.rs:36-51`).
+2. With several voters, wait for the clock samples of a voter majority. Then open the writable
+   `Db` on `shared/state`. The open increments the writer epoch, which fences the old writer
+   (SlateDB `manifest/store.rs:36-51`).
 3. When the open completes, check that the member is still the leader at term `t`. If not,
    close the `Db`.
-4. Wait until the local clock passes the manifest's `last_l0_clock_tick`. See
-   [Clocks](#clocks).
-5. Start the materializer and the publisher.
+4. Wait until the local clock passes the floor: the latest of the manifest's
+   `last_l0_clock_tick`, the time of its newest L0 SST ID, and the time of the newest compaction
+   job ID. See [Clocks](#clocks).
+5. Start the materializer and the publisher. Each batch gets a tick within the clock bound.
 
 Client writes do not wait for steps 2–4. Proposals commit to the log and apply to the overlay at
 once. A slow S3 open grows the overlay until the memory limits apply. The failover test in
@@ -616,16 +618,113 @@ when it closes the `Db`.
 
 ## Clocks
 
-Shared mode makes SlateDB use clocks from several hosts. Replicated mode never does.
+Shared mode makes SlateDB use clocks from several hosts. Replicated mode never does. SlateDB
+reads the writer clock in these places:
 
-- A writer starts its monotonic clock at the manifest's `last_l0_clock_tick` (`db.rs:150-153`).
-  If the new leader's clock is behind, each write sleeps up to 10 s and then fails with
-  `InvalidClockTick` (`clock.rs:53-83`). Step 4 of the leader change waits instead.
-- GC compares SST ID times with its own clock. Its guards are the newest L0 and the compaction
-  low watermark (`compacted_gc.rs:200-232`). Large skew can move these guards.
+- **Write tick:** a writer starts its monotonic clock at the manifest's `last_l0_clock_tick`
+  (`db.rs:150-153`). Each batch gets the next tick (`batch_write.rs:204`). If the new leader's
+  clock is behind, each write sleeps up to 10 s and then fails with `InvalidClockTick`
+  (`clock.rs:53-83`).
+- **SST IDs:** SST IDs are ULIDs with a time from the clock: L0 SSTs at a flush
+  (`memtable_flusher/tracker.rs:425-437`) and compaction outputs
+  (`compactor_executor.rs:797,856`). A new L0 SST whose ID time is below the newest L0 SST ID
+  fails the manifest update (`manifest/invariants.rs:51-83`).
+- **Compaction jobs:** a job ID is a ULID too. SlateDB refuses a new job below the newest job
+  ID, and an output SST below its job ID (`compactions_store/invariants.rs:12-50`). A refused
+  job of the embedded compactor fails its task, and that closes the whole writer `Db`
+  (`dispatcher.rs`, `TaskMonitor::run`). So a Defragment submits its job with the clock of the
+  writer.
+- **Background work:** checkpoint times (`manifest/store.rs:160-175`), GC
+  (`garbage_collector.rs:418-450`), and the compactor read the time. GC compares SST ID times
+  with its own clock. Its guards are the newest L0 and the compaction low watermark
+  (`compacted_gc.rs:200-232`). Retries, polls, and tickers sleep on the clock.
 
-The service exports the skew against `last_l0_clock_tick` as a metric. It refuses to start the
-writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an alarm.
+So a leader with a fast clock wrote ticks and SST IDs in the future. Each later leader with a
+correct clock was behind them and refused to write. Two checks, in `node/shared/clock.rs`, keep
+the writer clock near the voter clocks.
+
+**Behind.** The floor of a new writer is the latest of `last_l0_clock_tick`, the time of the
+newest L0 SST ID, and the time of the newest compaction job ID. The writer reads it before its
+open, checks its clock against it, and only then starts its clock there and opens. The compactor
+of the new `Db` takes job IDs at once. Step 4 of the leader change waits again for the floor of
+the opened manifest.
+
+Three writers can still add a job record after that read: the compactor of the old writer,
+which only the new compactor fences, the new compactor, and a Defragment that a submission
+already started. SlateDB checks no writer epoch at a submission. A Defragment checks the term of
+its writer before each submission. When a late job stands above the clock, SlateDB refuses the
+next ID and closes the `Db`. The writer recognises that refusal and opens again at once in the
+same term, above the job. This costs one reopen and no fault. After three such reopens in a row
+without a publication, the next refusal is a clock fault. The refused job can stay `Running`
+for SlateDB's 30 s worker heartbeat timeout, and compaction waits for it. When L0 is at its limit,
+the next flush waits too, and it can reach the 30 s stall limit. That case ends as a `stalled`
+fault.
+When the clock is over `--max-clock-skew` (default 5 s) behind, the writer does not start. The
+member sets `clock_alarm` to `behind`, exports the lag as
+`slatedb_etcd_shared_clock_skew_milliseconds`, and counts a clock fault.
+
+**Ahead.** The leader posts a probe with a nonce to `/raft/clock` of each voter every 500 ms,
+and once when it takes the lead. The route admits only the cluster and store identity of the
+peer traffic. The voter returns its process and its wall clock.
+
+- The voter read its clock between the send and the reply. The leader keeps one offset per voter
+  to its own monotonic clock, as a window with a low and a high edge. Each projection advances
+  at the leader's monotonic rate.
+- A sample counts for 4 s, eight probe intervals. Its error grows only with the rate difference
+  of two clocks, so several lost replies in a row do not stop the writer.
+- A reply gives no sample when its probe is of an earlier term or another set of voters, when it
+  comes from another process than the voter's current one, or when a newer probe already gave
+  one. A delayed reply thus never replaces a newer sample.
+- With `m` a voter majority, the bound is the `m`-th largest clock of all voters plus
+  `--max-clock-skew`. The leader reads its own clock at each check, with equal edges. For three
+  voters with clocks 40, 100, and 40 and a 5 ms limit, the bound is 45. With 110, 100, and 40 it
+  is 105.
+- The cap of a tick is the bound at the low edges of the peer windows. A leader clock above the
+  bound also at the high edges is measured skew: `clock_alarm` is `ahead`. A slow reply alone
+  never refuses.
+- A missing voter counts as one that agrees with the leader. So the skew is measured only when
+  no majority can support the leader clock. Otherwise it is uncertain: ticks stay at the cap,
+  `/status` shows `clock.uncertain`, and no alarm rises.
+- Too few fresh samples mean waiting, not refusal. A new leader waits for samples before its
+  open, and the materializer waits while samples are missing or the last tick is above the cap.
+  `/status` shows `clock.waiting`, and `slatedb_etcd_shared_writer_clock_waiting` is 1.
+- A wait counts toward the 30 s stall limit only while a batch waits, as other due work does.
+  It then makes a `stalled` fault, not a clock fault. An idle writer waits with no fault.
+- One voter has no probe and no ahead check. Its writer keeps the SlateDB default clock. When a
+  voter joins in the same term, the writer takes the check before its next batch, and it keeps
+  the check until the next open. The node gives the clock the new voters when Raft applies the
+  change, and when a voter process changes.
+
+The writer `Db` uses `clock::Gate` as its SlateDB clock. Before the materializer submits a batch,
+the gate fixes its tick as `max(last, min(now, cap))`. `last` starts at the floor. The gate
+returns exactly that tick until SlateDB wrote the batch, so a later clock jump or sample cannot
+change it. When `last` is above the cap, the batch waits: after an open above the cap, or after
+a backward step of a voter majority. Background work reads `max(last, min(now, cap))`, which
+never steps back, and `last` while samples are missing. Sleeps and tickers keep SlateDB's
+default clock, which follows the monotonic clock.
+
+Each gate belongs to the term of its open. When the member stands down or a new term starts, the
+gate stays at `last`, and no batch gets a tick again. So a flush or a compaction that a stopped
+writer still runs takes no time above the last bound.
+
+A measured skew refuses the batch. The materializer fails with a clock fault, and the batch
+stays in the overlay for the next writer. No client request fails, and no proposal waits for the
+check. Three faults hand over the lead. The handoff places last a voter that the check would
+refuse as leader: its clock is above the `m`-th largest voter clock plus `--max-clock-skew`. The
+leader's own clock, read now, counts in that order. Raft election eligibility does not change.
+No override exists for a tick in the future: the recovery is to wait until real time passes it.
+
+**Bootstrap boundary.** A snapshot restore writes its rows before Raft runs
+(`state/shared/restore.rs`, `own`). That writer uses SlateDB's default clock. Its monotonic
+clock only refuses a tick below the manifest tick. No voter check applies, because no term
+exists yet. The restore logs the tick of its checkpoint with the local time. The ahead check
+starts with the first Raft term, and `Clock::pass` of each leader then waits for the restore
+tick. A restore host clock more than `--max-clock-skew` ahead thus makes each leader refuse to
+start until real time passes the tick. Check the clock of the restore host before a restore.
+
+An earlier binary has no `/raft/clock` route and gives no sample. A leader whose current peers
+of a majority run an earlier binary waits. Mixed binary versions are outside the current
+contract, so upgrade all members before the writer of a new leader must start.
 
 ## Restart
 
@@ -683,6 +782,8 @@ writer when the skew is over `--max-clock-skew` (default 5 s), and it reports an
 | All members restart | Each member installs its base and replays its log |
 | Writer opens in reverse term order | The current leader is fenced, then it opens again |
 | New leader's clock is behind | The writer waits, or refuses and then hands over the lead |
+| Leader's clock is ahead of a voter majority | Batches wait in the overlay. The lead moves |
+| Too few voters answer the clock probe | The writer waits. Batches wait in the overlay |
 | The shared `Db` is lost or corrupted | All members lose state together. Restore from a backup |
 
 ### Read faults
@@ -802,8 +903,8 @@ backend whose calls hang forever with no error can keep old SlateDB workers, bec
 cannot end a pending put. Only a timeout at the object store call bounds them. S3 calls time out
 after 10 s.
 
-A clock over `--max-clock-skew` counts as a storage fault at once. The task does not wait for
-the close of that writer either.
+A clock refusal counts as a writer fault at once: a clock over `--max-clock-skew` behind the
+floor, or ahead of a voter majority. The task does not wait for the close of that writer either.
 
 Due storage work that makes no durable progress for 30 s also counts. Each step of the writer
 task has its own timer: the read of the bootstrap marker and claim, the open, the first reads
@@ -825,8 +926,9 @@ it.
 
 The leader hands its lead to another voter after three faults in a row, after one data fault,
 or after 30 s without durable progress. The target is the voter with the longest matched log
-and no writer fault mark. Its report must come from its current process, arrive after the start
-of the incident, and carry the leader's current Raft term. So a voter that stopped, or that led
+and no writer fault mark. A voter that the clock check would refuse as leader comes after the
+others. Its report must come from its current process, arrive after the start of the
+incident, and carry the leader's current Raft term. So a voter that stopped, or that led
 and failed in a term between, is not a target.
 
 A member sets its mark at each fault and clears it only when its own writer publishes again. It
@@ -869,7 +971,7 @@ snapshot above the held entry. See [Read faults](#read-faults).
 - **Fault domain:** members no longer hold independent copies. A writer bug or an object loss
   affects all members. HashKV can still detect divergent apply, but not storage corruption.
 - **Isolation:** every voter can write the shared prefix.
-- **Clocks:** leader changes depend on bounded clock skew between hosts.
+- **Clocks:** writes and leader changes depend on bounded clock skew between hosts.
 - **Two code paths:** local mode keeps the replicated design. Both need tests.
 
 ## Alternatives considered
@@ -950,6 +1052,8 @@ Paths are under `slatedb-0.18.1/src`.
   `db.rs:141-147`.
 - A writer's clock starts at `last_l0_clock_tick`. A lagging clock fails writes:
   `db.rs:150-153`, `clock.rs:53-83`.
+- A new L0 SST ID time below the newest L0 SST ID fails the manifest update:
+  `manifest/invariants.rs:51-83`.
 - `DbReaderMode::Checkpoint` stays fixed and writes nothing. `skip_wal_replay` skips WAL reads:
   `db_reader.rs:53-75, 288-294, 524-526`.
 - `DbReader` has no forced refresh and no read at a sequence: `db_reader.rs:345, 1073-1500`.

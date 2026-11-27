@@ -583,6 +583,126 @@ mod tests {
         (node, commands)
     }
 
+    /// Drive a one-voter shared node until its log and apply are idle.
+    async fn settle(node: &mut Node) {
+        for _ in 0..5 {
+            node.drive_ready().await.unwrap();
+            node.drain_log().await.unwrap();
+            node.drain_apply().await.unwrap();
+        }
+    }
+
+    /// Propose a membership change on a one-voter node and apply it.
+    async fn change_members(node: &mut Node, request: C) {
+        let (tx, _reply) = oneshot::channel();
+        let command = RaftCommand::Cluster {
+            id: uuid::Uuid::new_v4().to_string(),
+            request,
+            credentials: Default::default(),
+        };
+        node.propose(command, tx).unwrap();
+        settle(node).await;
+    }
+
+    /// The reply of voter 2 from `process` to a new probe, with a correct clock.
+    fn sample(clock: &shared::Clock, process: u64) -> bool {
+        let probe = clock.probe();
+        let now = (clock.mono_ms)();
+        let reply = crate::node::ProbeReply {
+            nonce: shared::probe_nonce(&probe),
+            process,
+            clock_ms: (clock.now_ms)(),
+        };
+        clock.sample(2, probe, reply, now, now)
+    }
+
+    /// The node gives the clock check its voters at the moment they change, with no tick
+    /// between: a promoted learner, a restarted voter process, and an adopted configuration of
+    /// one voter. Each next batch admission follows the new voters.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_clock_check_follows_each_voter_change_before_the_next_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = options(dir.path());
+        config.peers = BTreeMap::from([(1, "127.0.0.1:1".to_owned())]);
+        config.state_mode = crate::state::StateMode::Shared;
+        let store = std::sync::Arc::new(slatedb::object_store::memory::InMemory::new());
+        config.object_store = crate::object::Config::Test(store, "root".into());
+        let (events, _) = mpsc::channel(256);
+        let mut node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
+            .await
+            .unwrap();
+        node.clock_in_manual = true;
+        while node.raw.raft.state != StateRole::Leader {
+            node.tick().unwrap();
+        }
+        settle(&mut node).await;
+        let clock = node.writer.as_ref().unwrap().clock.clone();
+        node.tick_clock(false);
+        let gate = clock.gate().await;
+        let admit = |gate: &std::sync::Arc<shared::Gate>| {
+            let gate = gate.clone();
+            async move {
+                let admitted = tokio::time::timeout(Duration::from_millis(300), gate.admit());
+                admitted
+                    .await
+                    .map(|admitted| admitted.unwrap().done())
+                    .is_ok()
+            }
+        };
+        assert!(admit(&gate).await, "a lone voter waited");
+
+        // Promote a learner. Its sample is missing, so the next batch waits.
+        let member = |is_learner| crate::proto::etcdserverpb::Member {
+            id: 2,
+            name: "node-2".into(),
+            peer_ur_ls: vec!["http://127.0.0.1:2".into()],
+            client_ur_ls: vec!["http://127.0.0.1:2".into()],
+            is_learner,
+        };
+        change_members(&mut node, C::Add(member(true))).await;
+        assert!(admit(&gate).await, "a learner is no voter");
+        change_members(&mut node, C::Promote(2)).await;
+        assert!(node.raw.raft.prs().conf().voters().contains(2));
+        assert!(
+            !admit(&gate).await,
+            "a batch was admitted without the new voter"
+        );
+
+        // The voter's process becomes known, and its sample admits the batch.
+        let mut responses = vec![];
+        let process = |process| Event::PeerProcess {
+            member: 2,
+            process: Some(process),
+        };
+        node.handle(process(7), &mut responses).await.unwrap();
+        assert!(sample(&clock, 7));
+        assert!(
+            admit(&gate).await,
+            "the voter's sample did not admit the batch"
+        );
+
+        // The voter restarts. Its old sample and a late reply of its old process count no more.
+        node.handle(process(8), &mut responses).await.unwrap();
+        assert!(!sample(&clock, 7));
+        assert!(
+            !admit(&gate).await,
+            "a batch was admitted on the sample of an old process"
+        );
+
+        // An adopted base holds one voter again. The gate keeps its check, with the leader's
+        // own clock as the majority.
+        let conf = raft::eraftpb::ConfState {
+            voters: vec![1],
+            ..Default::default()
+        };
+        node.finish_output(Output::Adopted(conf)).unwrap();
+        assert!(!node.raw.raft.prs().conf().voters().contains(2));
+        assert!(
+            admit(&gate).await,
+            "the adopted voters did not reach the gate"
+        );
+    }
+
     /// A leader proposes `SeedMembers`, then `SetQuota`, before the `Publish` of the tick that
     /// elects it. A joining member without the row proposes no seed.
     #[tokio::test]
