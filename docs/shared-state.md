@@ -542,7 +542,14 @@ rebase again after the backoff.
   1. If its base index reaches the demand, it does nothing. The snapshot record follows the base.
   2. It reads the base, then the position. If an unreleased batch is above the base row, it asks
      for a publication and waits for that checkpoint. A batch that a base released holds no
-     change above that base row, so it does not count.
+     change above that base row, so it does not count. While the demand waits, the leader also
+     offers each checkpoint that it announces to its own base switch, with the coverage of the
+     announcement, before the entry commits. The checkpoint is durable and holds the state
+     through its row, so the switch needs no commit, as in step 3. The publisher keeps the base
+     of the checkpoint live until the node handles the announcement. An announcement again
+     opens the checkpoint. A row above the covered index of the leader needs an adopt, so that
+     checkpoint waits for its announcement. This can happen after a leader change, when the old
+     writer left batches in the shared `Db` that the new leader did not apply yet.
   3. Otherwise it announces the same checkpoint again with its covered index. This needs no new
      checkpoint. The entry raises the base index of every member. The applied state of the
      leader already shows the coverage, so the leader offers its base with it when it proposes
