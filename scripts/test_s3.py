@@ -52,6 +52,9 @@ class BucketReadiness(unittest.TestCase):
         command = download.call_args.args[0]
         self.assertIn("--retry-all-errors", command)
         self.assertEqual(command[command.index("--retry") + 1], "8")
+        # The default backoff grows; a fixed delay would give a 504 only about 40 s.
+        self.assertNotIn("--retry-delay", command)
+        self.assertEqual(command[command.index("--max-time") + 1], "120")
 
     def test_failed_signature_stops_startup(self):
         process = Mock()

@@ -67,10 +67,13 @@ def install(directory):
         url = f"https://github.com/rustfs/rustfs/releases/download/{VERSION}/{name}"
         with tempfile.TemporaryDirectory(dir=cache) as staging:
             download = Path(staging) / name
-            # GitHub release downloads sometimes return 5xx for minutes. Retry each error.
+            # GitHub release downloads sometimes return 5xx for minutes. Retry each error with
+            # curl's exponential backoff, about 4 minutes over 8 retries. No retry starts after
+            # 600 s, and each attempt stops after 120 s, so a stalled transfer cannot hold the
+            # job. The CI action waits 12 minutes, which covers both limits.
             command = ["curl", "--fail", "--location", "--silent", "--show-error",
-                       "--connect-timeout", "30", "--retry", "8", "--retry-all-errors",
-                       "--retry-delay", "5", "--retry-max-time", "600",
+                       "--connect-timeout", "30", "--max-time", "120", "--retry", "8",
+                       "--retry-all-errors", "--retry-max-time", "600",
                        "--output", str(download), url]
             try:
                 subprocess.run(command, check=True)
