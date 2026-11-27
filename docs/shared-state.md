@@ -168,8 +168,8 @@ not store commands.
   **segments**. `None` is a delete. Values are `Bytes`, so the maps share them with the batches.
 - A `ViewCheckpoint` entry is not a KV entry, so it ends an apply group. A segment closes at each
   `ViewCheckpoint` entry.
-- A base switch releases each segment with its whole range at or below `F` of the new base. A
-  group that spans `F` stays until a later base covers it. A live view of an older base still
+- A base switch releases each segment with its whole range at or below the new base index. A
+  group that spans that index stays until a later base covers it. A live view of an older base still
   keeps the released segments that it holds, until the view ends (invariant 4).
 
 **Memory limit.** `--overlay-max-bytes`, default 1 GiB, limits the key and value bytes of the
