@@ -271,6 +271,9 @@ impl Simulation {
         ))
         .await
         .unwrap();
+        // The compactor runs only on request, so GC removes the same SSTs on every replay.
+        let compaction = &node.writer.source().manual_compaction;
+        compaction.store(true, std::sync::atomic::Ordering::Relaxed);
         self.nodes.insert(id, node);
         let process = self.processes.values().max().map_or(1, |last| last + 1);
         self.processes.insert(id, process);
@@ -759,6 +762,70 @@ impl Simulation {
     }
 }
 
+/// Compact every L0 SST and sorted run into one run when the L0 has `limit` SSTs or more, and
+/// wait until the compaction ends. DST turns off the compactor of the writer. See
+/// `Source::manual_compaction`.
+pub(super) async fn dst_compact(admin: &slatedb::admin::Admin, limit: usize) -> Result<()> {
+    use slatedb::compactor::{CompactionSpec, CompactionStatus, SourceId};
+    let manifest = admin
+        .read_manifest(None)
+        .await?
+        .context("missing manifest")?;
+    if manifest.l0().len() < limit {
+        return Ok(());
+    }
+    let mut sources: Vec<_> = manifest
+        .l0()
+        .iter()
+        .map(|view| SourceId::SstView(view.id))
+        .collect();
+    sources.extend(
+        manifest
+            .compacted()
+            .iter()
+            .map(|run| SourceId::SortedRun(run.id)),
+    );
+    let destination = manifest
+        .compacted()
+        .iter()
+        .map(|run| run.id)
+        .min()
+        .unwrap_or(0);
+    let job = admin
+        .submit_compaction(CompactionSpec::new(sources, destination))
+        .await?;
+    for _ in 0..400 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        match admin.read_compaction(job.id(), None).await? {
+            Some(job) if matches!(job.status(), CompactionStatus::Completed) => {
+                // The compactor commits the manifest after the job. Wait for the new L0.
+                let manifest = admin
+                    .read_manifest(None)
+                    .await?
+                    .context("missing manifest")?;
+                if manifest.l0().len() < limit {
+                    return Ok(());
+                }
+            }
+            Some(job) if matches!(job.status(), CompactionStatus::Failed) => {
+                anyhow::bail!("a DST compaction failed")
+            }
+            _ => {}
+        }
+    }
+    anyhow::bail!("a DST compaction timed out")
+}
+
+/// Flush the open writer of a checkpoint step. Then compact the L0 SSTs on request before SlateDB
+/// would stop writes for them.
+async fn flush(node: &Node, writer: &shared::DstWriter) -> Result<()> {
+    let Some(db) = writer.db() else {
+        return Ok(());
+    };
+    db.flush().await?;
+    dst_compact(node.writer.admin(), 4).await
+}
+
 /// The writer steps of a shared-mode schedule.
 #[derive(Clone, Copy, Debug)]
 enum WriterStep {
@@ -793,7 +860,9 @@ impl Simulation {
         // SlateDB finds a fence at its next manifest write or poll, at a time that the schedule
         // does not fix. The simulated writer checks the epoch first, so a newer writer always
         // fences it at its next step.
-        if writer.db.is_some() && !matches!(step, WriterStep::Open) && node.dst_fenced(writer).await
+        if writer.db().is_some()
+            && !matches!(step, WriterStep::Open)
+            && node.dst_fenced(writer).await
         {
             writer.close().await;
             self.trace.push(format!("writer {id} {step:?} fenced"));
@@ -802,9 +871,12 @@ impl Simulation {
         }
         let result = match step {
             WriterStep::Open => node.dst_open(writer, false).await.map(drop),
-            WriterStep::Materialize => node.dst_materialize(writer).await.map(drop),
-            WriterStep::Checkpoint => node.dst_checkpoint(writer).await.map(drop),
-            WriterStep::Announce => node.dst_announce(writer),
+            WriterStep::Materialize => node.dst_materialize(writer).await,
+            WriterStep::Checkpoint => match flush(node, writer).await {
+                Ok(()) => node.dst_checkpoint(writer).await,
+                error => error,
+            },
+            WriterStep::Announce => node.dst_announce(writer).await,
             WriterStep::Retain => node.dst_retain(writer, &pins).await,
         };
         match result {
@@ -951,7 +1023,7 @@ impl Simulation {
                         };
                         let open = writers
                             .get(&leader)
-                            .is_some_and(|writer: &shared::DstWriter| writer.db.is_some());
+                            .is_some_and(|writer: &shared::DstWriter| writer.db().is_some());
                         let step = if open { step } else { WriterStep::Open };
                         sim.writer_step(&mut writers, leader, step).await;
                     }
@@ -982,8 +1054,6 @@ impl Simulation {
                         let node = sim.nodes.get_mut(&id).unwrap();
                         if node.dst_open(writer, true).await.unwrap_or(false) {
                             sim.trace.push(format!("writer {id} late open"));
-                            // The deposed writer's own next commit fails with a fence.
-                            writer.close().await;
                         }
                     }
                 }
@@ -1065,7 +1135,7 @@ impl Simulation {
                 ] {
                     let open = writers
                         .get(&leader)
-                        .is_some_and(|writer: &shared::DstWriter| writer.db.is_some());
+                        .is_some_and(|writer: &shared::DstWriter| writer.db().is_some());
                     if matches!(step, WriterStep::Open) == open {
                         continue;
                     }

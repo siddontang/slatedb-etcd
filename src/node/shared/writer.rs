@@ -254,17 +254,7 @@ impl Writer {
         let (stop, stopped) = tokio::sync::watch::channel(false);
         self.stop = Some(stop);
         let task = lead(
-            Publisher {
-                admin: self.admin.clone(),
-                source: self.source.clone(),
-                progress: self.progress.clone(),
-                max_age: self.max_age,
-                reports: self.reports.clone(),
-                retention: self.retention,
-                retained: self.retained.clone(),
-                applied: self.applied.clone(),
-                health: health.clone(),
-            },
+            self.publisher(health.clone()),
             Leading {
                 queue: self.queue.clone(),
                 events: events.clone(),
@@ -280,6 +270,21 @@ impl Writer {
             },
         );
         self.tasks.spawn(async move { (term, task.await) });
+    }
+
+    /// The publisher of a writer task with `health`.
+    pub(super) fn publisher(&self, health: fault::TaskHealth) -> Publisher {
+        Publisher {
+            admin: self.admin.clone(),
+            source: self.source.clone(),
+            progress: self.progress.clone(),
+            max_age: self.max_age,
+            reports: self.reports.clone(),
+            retention: self.retention,
+            retained: self.retained.clone(),
+            applied: self.applied.clone(),
+            health,
+        }
     }
 
     pub async fn stop(&mut self) {
@@ -800,7 +805,7 @@ impl Writer {
         &self.queue
     }
 
-    pub(super) fn progress(&self) -> &Arc<Progress> {
+    pub(in crate::node) fn progress(&self) -> &Arc<Progress> {
         &self.progress
     }
 
@@ -869,11 +874,6 @@ impl Writer {
     /// Skew the wall clock of this writer and of its probe replies.
     pub(in crate::node) fn set_clock(&mut self, now_ms: Millis) {
         self.clock.now_ms = now_ms;
-    }
-
-    /// DST: find a stranded checkpoint, as a new writer does. See `stranded`.
-    pub(super) async fn stranded(&self) -> Result<Option<(uuid::Uuid, u64)>> {
-        stranded(&self.admin, &self.source, &self.applied).await
     }
 }
 
