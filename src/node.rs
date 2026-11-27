@@ -142,6 +142,13 @@ pub enum Event {
         member: u64,
         target: u64,
     },
+    /// Shared mode: the reply of `member` to the write probe `nonce` of this leader, or the
+    /// error of the request.
+    WriteProbed {
+        member: u64,
+        nonce: u64,
+        reply: std::result::Result<WriteProbeReply, String>,
+    },
 }
 
 /// Flush SlateDB for log truncation about once per L0 SST instead of once per entry interval.
@@ -377,6 +384,9 @@ pub struct Node {
     /// Simulation: the member proposes no `SeedMembers`, like an earlier binary.
     #[cfg(test)]
     pub(super) hold_members: bool,
+    /// Tests: promote a shared learner without its write proof.
+    #[cfg(test)]
+    pub(super) skip_write_proof: bool,
     /// The node compared the flags with the stored membership row.
     members_observed: bool,
 }
@@ -806,6 +816,8 @@ impl Node {
             members_rechecked: 0,
             #[cfg(test)]
             hold_members: false,
+            #[cfg(test)]
+            skip_write_proof: false,
             members_observed: false,
         };
         node.sync_members();
@@ -1369,6 +1381,11 @@ impl Node {
             Event::SnapshotRefused { member, target } => {
                 self.raw.store().note_refused(member, target);
             }
+            Event::WriteProbed {
+                member,
+                nonce,
+                reply,
+            } => self.write_probed(member, nonce, reply),
             Event::SnapshotDelay(delay_ms, response) => {
                 self.snapshot_delay_ms = delay_ms.min(5000);
                 let _ = response.send(Ok(self.status()?));

@@ -294,6 +294,8 @@ pub(super) struct Writer {
     pub(super) clock_due: Option<Instant>,
     /// The writer reports of the voters, and the handoff of a writer incident.
     pub(super) handoff: fault::Handoff,
+    /// The write proofs of the learners that this leader promotes. See `write_proof`.
+    pub(super) proofs: write_proof::Proofs,
     /// The write probes of this member. The node sets it at its open.
     pub(super) prober: Option<Arc<Prober>>,
 }
@@ -405,6 +407,7 @@ impl Writer {
             health: fault::Health::default(),
             clock_due: None,
             handoff: fault::Handoff::default(),
+            proofs: write_proof::Proofs::default(),
             prober: None,
             progress: Arc::new(Progress::new(0)),
             admin: handles.admin.clone(),
@@ -569,6 +572,7 @@ impl Writer {
             "reports": self.reports.lock().unwrap().len(),
             "health": self.health.status(),
             "handoff": self.handoff.status(),
+            "write_proofs": self.proofs.status(Instant::now()),
         })
     }
 }
