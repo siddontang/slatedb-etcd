@@ -387,29 +387,6 @@ async fn bases_switch_monotonically_and_release_covered_segments() {
 }
 
 #[tokio::test]
-async fn the_cluster_claim_fixes_the_quota() {
-    let store = InMemory::new();
-    assert_eq!(
-        shared::claim(&store, "root", "one", 5, &[1])
-            .await
-            .unwrap()
-            .quota,
-        5
-    );
-    // A later member uses the claimed quota.
-    assert_eq!(
-        shared::claim(&store, "root", "one", 7, &[1])
-            .await
-            .unwrap()
-            .quota,
-        5
-    );
-    assert!(shared::claim(&store, "root", "two", 5, &[1]).await.is_err());
-    // A separate one-voter bootstrap in the same namespace refuses before it opens the writer.
-    assert!(shared::claim(&store, "root", "one", 5, &[2]).await.is_err());
-}
-
-#[tokio::test]
 async fn a_restart_writes_a_missing_bootstrap_marker() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let mut state = open_shared(store.clone()).await;
@@ -540,7 +517,7 @@ async fn a_shared_backup_has_the_format_4_image() {
 }
 
 /// The applied index and the split in the counter row of `state`.
-async fn stored_counter(state: &StateMachine) -> (u64, Option<crate::batch::Usage>) {
+async fn stored_counter(state: &StateMachine) -> (u64, Option<crate::state::Usage>) {
     use prost::Message;
     let row = state
         .applied_state()
@@ -1441,50 +1418,199 @@ async fn timed_out_warms_keep_the_warm_set_bounded() {
     state.close().await.unwrap();
 }
 
-/// Concurrent first voters create one claim, so they get one store ID. A later voter and a
-/// reader get the same ID. Another prefix gets another ID.
-#[tokio::test]
-async fn the_cluster_claim_holds_one_store_id() {
-    let store = InMemory::new();
-    assert_eq!(shared::claimed(&store, "root", "test").await.unwrap(), None);
-    let (first, second) = tokio::join!(
-        shared::claim(&store, "root", "test", 0, &[1]),
-        shared::claim(&store, "root", "test", 0, &[1])
-    );
-    let id = first.unwrap().store_id;
-    assert_eq!(second.unwrap().store_id, id);
-    let claimed = shared::claimed(&store, "root", "test").await.unwrap();
-    assert_eq!(claimed.unwrap().store_id, id);
-    let other = shared::claim(&store, "other", "test", 0, &[1])
-        .await
-        .unwrap();
-    assert_ne!(other.store_id, id);
+thread_local! {
+    /// A pause between the binding check and the state open. The open signals the first
+    /// `Notify` and waits for the second. A current-thread test runtime keeps it on the
+    /// thread of the test.
+    static BEFORE_STATE_OPEN: std::cell::RefCell<
+        Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    > = Default::default();
 }
 
-/// A claim with no store ID, or with an invalid or nil ID, is refused.
-#[tokio::test]
-async fn a_claim_without_a_valid_store_id_is_refused() {
-    use slatedb::object_store::ObjectStoreExt;
-    let claim = |store_id: Option<&str>| {
-        let mut claim = serde_json::json!({
-            "version": 1, "cluster": "test", "mode": "shared", "quota": 0, "voters": [1],
-        });
-        if let Some(id) = store_id {
-            claim["store_id"] = id.into();
-        }
-        serde_json::to_vec(&claim).unwrap()
+pub(super) async fn before_state_open() {
+    let Some((reached, resume)) = BEFORE_STATE_OPEN.with(|hook| hook.take()) else {
+        return;
     };
-    let nil = uuid::Uuid::nil().to_string();
-    for store_id in [None, Some(""), Some("not-a-uuid"), Some(nil.as_str())] {
-        let store = InMemory::new();
-        store
-            .put(&"root/shared/owner.json".into(), claim(store_id).into())
-            .await
-            .unwrap();
-        let error = shared::claim(&store, "root", "test", 0, &[1])
-            .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("store ID"), "{error:#}");
-        assert!(shared::claimed(&store, "root", "test").await.is_err());
+    reached.notify_one();
+    resume.notified().await;
+}
+
+/// Open member 1 in `dir` with the S3 layout on `store`, close it, and return the store ID
+/// that it sends to its peers.
+async fn open_member(store: Arc<dyn ObjectStore>, dir: &std::path::Path) -> Result<uuid::Uuid> {
+    let options = Options {
+        quota: 0,
+        voters: vec![1],
+        join: false,
+        empty_log: true,
+        pin_max: Duration::from_secs(300),
+        overlay_max_bytes: 1 << 30,
+        restore: None,
+        record: None,
+        store_id: None,
+    };
+    let config = crate::object::Config::TestS3(store, s3());
+    let cache = StateCache::default();
+    let state = StateMachine::open_bound(&config, dir, "cluster", 1, cache, &options).await?;
+    let id = state.store_id();
+    state.close().await?;
+    Ok(id)
+}
+
+/// The object keys that shared members touch at startup. The S3 policy in the shared state
+/// guide grants exactly these. Every member reads the shared claims and the shared state. A
+/// voter writes its own binding and the shared keys. A joining learner writes only its own
+/// binding.
+#[tokio::test]
+async fn shared_members_touch_the_keys_of_the_guide_policy() {
+    use crate::object::faults::FaultStore;
+    let faults = Arc::new(FaultStore::new(Arc::new(InMemory::new())));
+    let config = crate::object::Config::TestS3(faults.clone(), s3());
+    let root = format!("{}/", s3().cluster_prefix("cluster"));
+    let dirs = tempfile::tempdir().unwrap();
+    let open = |member: u64, join: bool| {
+        let config = config.clone();
+        let dir = dirs.path().join(member.to_string());
+        async move {
+            let options = Options {
+                quota: 0,
+                voters: vec![1, 2],
+                join,
+                empty_log: true,
+                pin_max: Duration::from_secs(300),
+                overlay_max_bytes: 1 << 30,
+                restore: None,
+                record: None,
+                store_id: None,
+            };
+            let cache = StateCache::default();
+            StateMachine::open_bound(&config, &dir, "cluster", member, cache, &options)
+                .await
+                .unwrap()
+                .close()
+                .await
+                .unwrap();
+        }
+    };
+    let keys = |set: &std::sync::Mutex<std::collections::BTreeSet<String>>| {
+        let keys: Vec<String> = std::mem::take(&mut *set.lock().unwrap())
+            .into_iter()
+            .map(|key| key.strip_prefix(&root).expect("a cluster key").to_owned())
+            .collect();
+        keys
+    };
+    open(1, false).await;
+    let written = keys(&faults.written);
+    assert!(
+        written
+            .iter()
+            .all(|key| key == "member-1/binding.json" || key.starts_with("shared/")),
+        "{written:?}"
+    );
+    keys(&faults.read);
+    for (member, join) in [(2, false), (3, true)] {
+        open(member, join).await;
+        let written = keys(&faults.written);
+        let own = format!("member-{member}/");
+        assert!(
+            written
+                .iter()
+                .all(|key| key.starts_with(&own) || (!join && key.starts_with("shared/"))),
+            "member {member} wrote {written:?}"
+        );
+        let read = keys(&faults.read);
+        assert!(
+            read.iter()
+                .all(|key| key.starts_with("shared/") || key.starts_with(&own)),
+            "member {member} read {read:?}"
+        );
+    }
+}
+
+/// A member records the store ID of the cluster claim in its local binding. The remote
+/// binding does not hold it, so an unchanged restart opens. A store at the same location with
+/// another claim, or with no claim, was replaced. The member refuses it before any write.
+#[tokio::test]
+async fn a_restart_refuses_a_replaced_shared_store() {
+    use futures::StreamExt;
+    let dirs = tempfile::tempdir().unwrap();
+    let dir = dirs.path().join("1");
+    let open = |store: Arc<dyn ObjectStore>| open_member(store, &dir);
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let sent = open(store.clone()).await.unwrap();
+    let id = crate::object::bound_store_id(&dir).unwrap().unwrap();
+    assert_eq!(sent, id);
+    assert_eq!(open(store.clone()).await.unwrap(), id);
+    assert_eq!(crate::object::bound_store_id(&dir).unwrap(), Some(id));
+
+    let root = s3().cluster_prefix("cluster");
+    store
+        .delete(&format!("{root}/shared/owner.json").into())
+        .await
+        .unwrap();
+    let claimed = crate::object::cluster_claim::claim(store.as_ref(), &root, "cluster", 0, &[1])
+        .await
+        .unwrap();
+    assert_ne!(claimed.store_id, id);
+    let error = open(store).await.unwrap_err();
+    assert!(format!("{error:#}").contains("replaced"), "{error:#}");
+
+    let empty: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let error = open(empty.clone()).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("no cluster claim"),
+        "{error:#}"
+    );
+    assert!(empty.list(None).next().await.is_none());
+    assert_eq!(crate::object::bound_store_id(&dir).unwrap(), Some(id));
+}
+
+/// The claim changes between the binding check and the state open. The open reads the claim
+/// once more, only reads it, and refuses another store ID or a missing claim. It does not
+/// create the claim again.
+#[tokio::test]
+async fn the_state_open_refuses_a_claim_that_changed_after_the_binding_check() {
+    let root = s3().cluster_prefix("cluster");
+    let claim_path: slatedb::object_store::path::Path = format!("{root}/shared/owner.json").into();
+    for replace in [true, false] {
+        let dirs = tempfile::tempdir().unwrap();
+        let dir = dirs.path().join("1");
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let id = open_member(store.clone(), &dir).await.unwrap();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let hook = Some((reached.clone(), resume.clone()));
+        BEFORE_STATE_OPEN.with(|cell| *cell.borrow_mut() = hook);
+        let change = async {
+            reached.notified().await;
+            store.delete(&claim_path).await.unwrap();
+            let mut replacement = None;
+            if replace {
+                let claimed =
+                    crate::object::cluster_claim::claim(store.as_ref(), &root, "cluster", 0, &[1]);
+                replacement = Some(claimed.await.unwrap().store_id);
+            }
+            resume.notify_one();
+            replacement
+        };
+        let (opened, replacement) = tokio::join!(open_member(store.clone(), &dir), change);
+        let error = opened.unwrap_err();
+        assert!(format!("{error:#}").contains("replaced"), "{error:#}");
+        assert_eq!(crate::object::bound_store_id(&dir).unwrap(), Some(id));
+        let claimed = crate::object::cluster_claim::claimed(store.as_ref(), &root, "cluster").await;
+        assert_eq!(
+            claimed.unwrap().map(|claimed| claimed.store_id),
+            replacement
+        );
+    }
+}
+
+fn s3() -> crate::object::S3 {
+    crate::object::S3 {
+        bucket: "test-bucket".into(),
+        region: "us-east-1".into(),
+        endpoint: Some("http://127.0.0.1:9000".into()),
+        prefix: "tests".into(),
+        allow_http: true,
     }
 }

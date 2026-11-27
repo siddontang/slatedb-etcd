@@ -150,7 +150,7 @@ pub(crate) const EXPIRED: &str = "read view expired; retry";
 /// The error of a read that held its view past the pin limit. Its source marks the class.
 fn expired_error() -> slatedb::Error {
     slatedb::Error::unavailable(EXPIRED.to_owned())
-        .with_source(Box::new(crate::mvcc::storage_fault::Expired))
+        .with_source(Box::new(crate::storage_fault::Expired))
 }
 
 /// A base plus the overlay batches at or below `seq`.

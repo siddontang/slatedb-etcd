@@ -169,7 +169,7 @@ async fn confirm_read(node: &mut Node, id: u64) {
     let mut message = Message::default();
     message.set_msg_type(MessageType::MsgHeartbeatResponse);
     (message.from, message.to, message.term) = (2, 1, node.raw.raft.term);
-    message.context = node.read_context(id);
+    message.context = node.reads.context(id);
     node.raw.step(message).unwrap();
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
@@ -179,7 +179,7 @@ async fn confirm_read(node: &mut Node, id: u64) {
 async fn linear_read(node: &mut Node) -> oneshot::Receiver<std::result::Result<Value, ApiError>> {
     let (tx, reply) = oneshot::channel();
     node.linear_read(range(false), tx);
-    let id = *node.reads.keys().last().unwrap();
+    let id = node.reads.ids().last().unwrap();
     node.drive_ready().await.unwrap();
     confirm_read(node, id).await;
     reply
@@ -285,7 +285,7 @@ async fn apply_waits_for_the_record_of_an_accepted_snapshot() {
     let (tx, reply) = oneshot::channel();
     node.enqueue_query(Query::Local("absent".into(), tx));
     node.schedule_apply().unwrap();
-    assert!(!node.apply_busy, "apply ran work before the snapshot");
+    assert!(!node.apply.busy(), "apply ran work before the snapshot");
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
     node.schedule_apply().unwrap();

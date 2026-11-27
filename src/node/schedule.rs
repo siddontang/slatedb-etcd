@@ -1,50 +1,18 @@
 use super::*;
+pub(super) mod scheduler;
 
 impl Node {
     pub(super) fn enqueue_query(&mut self, query: Query) {
         if matches!(query, Query::Read(..) | Query::Linear(..)) {
-            if self.read_queries.len() >= apply::MAX_QUERIES {
-                query.reject(self.error("too many queued reads"));
-            } else {
-                self.read_queries.push_back(query);
-            }
+            self.reads.queue(query, self.raw.raft.leader_id);
             return;
         }
-        if self.queries.len() >= apply::MAX_QUERIES {
-            query.reject(self.error("too many queued state reads"));
-        } else {
-            self.queries.push_back(query);
-        }
-    }
-
-    pub(super) fn next_query_job(&mut self) -> Option<Job> {
-        self.queries.pop_front().map(Job::Query)
+        self.apply.queue_query(query, self.raw.raft.leader_id);
     }
 
     pub(super) fn submit_apply(&mut self, job: Job, target: u64) -> Result<()> {
-        ensure!(!self.apply_busy, "apply worker already has a job");
-        self.enqueue_apply(job, target)
-    }
-
-    /// Queue a job behind any running jobs. The worker runs jobs in submission order.
-    fn enqueue_apply(&mut self, job: Job, target: u64) -> Result<()> {
-        // Only a plain committed-entry job lets another Entries job queue behind it.
-        // A configuration change must reach Raft before the worker applies later entries.
-        let chainable = match &job {
-            Job::Entries(entries) => entries
-                .iter()
-                .all(|entry| entry.entry_type == EntryType::EntryNormal as i32),
-            _ => false,
-        };
-        self.worker.submit(Work {
-            job,
-            header: self.header(),
-            delay: Duration::from_millis(self.apply_delay_ms),
-        })?;
-        self.apply_busy = true;
-        self.apply_target = target;
-        self.apply_jobs.push_back((target, chainable));
-        Ok(())
+        let header = self.header();
+        self.apply.submit(&self.worker, job, target, header)
     }
 
     /// The checkpoint to start, if one is due.
@@ -59,26 +27,45 @@ impl Node {
         let applied = self.checkpointable();
         let store = self.raw.store();
         let snapshot_index = store.snapshot_index();
-        // A peer snapshot or a manual checkpoint needs a complete image.
+        let min_bytes = self.options.snapshot_min_bytes;
+        // Only the automatic checkpoint waits for a lagging follower.
+        let held = self.checkpoints.automatic_due(applied, min_bytes)
+            && self.follower_needs_log(applied, snapshot_index);
+        // A peer snapshot or a manual checkpoint needs a complete image. `has_image` decodes the
+        // record, so it runs only when the base does not already advance it.
         let image_can_advance =
             applied > snapshot_index || (snapshot_index > 0 && !store.has_image());
-        let image_due = image_can_advance
-            && (store.image_wanted()
-                || self
-                    .checkpoint_waiters
-                    .iter()
-                    .any(|(index, _)| *index <= applied));
-        // Automatic checkpoints only truncate the local log. A membership change needs a
-        // checkpoint at its index.
-        let forced = self.membership_checkpoint;
-        let truncate_due = ((forced > snapshot_index && applied >= forced)
-            || (self.next_checkpoint.is_some_and(|index| applied >= index)
-                && self.appended_bytes >= self.options.snapshot_min_bytes))
-            && applied > snapshot_index
-            && !store.image_wanted()
-            && self.checkpoint_waiters.is_empty()
-            && !self.sending_snapshot();
-        (image_due || truncate_due).then_some(image_due)
+        let due = self.checkpoints.due(
+            applied,
+            snapshot_index,
+            image_can_advance,
+            store.image_wanted(),
+            min_bytes,
+            held,
+        );
+        match due {
+            // Truncation would discard the image that a peer receives.
+            Some(false) if self.sending_snapshot() => None,
+            due => due,
+        }
+    }
+
+    /// Return true on the leader while a follower is behind `base` by at most `snapshot_every`
+    /// entries. Truncation through `base` would send that follower a snapshot, and its install
+    /// loads the whole key index from the checkpoint. A follower further behind does not hold
+    /// the log. A new member stored no entry, and it needs a record that holds it.
+    ///
+    /// The hold ends when `base` is more than two `snapshot_every` intervals above the `record`
+    /// index. A follower near `base` can then still get a snapshot. A follower that stays a few
+    /// entries behind a moving base then cannot hold the log for ever.
+    fn follower_needs_log(&self, base: u64, record: u64) -> bool {
+        let raft = &self.raw.raft;
+        let every = self.options.snapshot_every;
+        raft.state == StateRole::Leader
+            && base - record <= 2 * every
+            && raft.prs().iter().any(|(_, progress)| {
+                (1..base).contains(&progress.matched) && base - progress.matched <= every
+            })
     }
 
     /// The index that a checkpoint can cover: the base `F`.
@@ -100,30 +87,20 @@ impl Node {
             Some(apply::BATCH_BYTES),
             raft::GetEntriesContext::empty(false),
         )?;
-        let target = entries.last().context("empty apply batch")?.index;
-        ensure!(
-            target <= self.committed_ready,
-            "apply exceeds delivered commit"
-        );
-        self.prefer_query = true;
-        self.enqueue_apply(Job::Entries(entries), target)
+        let header = self.header();
+        self.apply.submit_entries(&self.worker, entries, header)
     }
 
     /// Keep the worker busy with committed entries while it runs earlier Entries jobs.
     /// Any other work waits until the queue drains, so it still sees the state it expects.
     fn pipeline_apply(&mut self) -> Result<()> {
-        while self.apply_jobs.len() < apply::PIPELINE_DEPTH {
-            let Some(&(last, true)) = self.apply_jobs.back() else {
-                return Ok(());
-            };
-            let committed = self.committed_ready;
-            if last >= committed
-                || self.apply_paused()
+        while let Some((last, committed)) = self.apply.chainable() {
+            if self.apply_paused()
                 || self.raw.store().snapshot_pending()
                 || self.installing()
-                || self.prepared_puts.is_some()
-                || !self.queries.is_empty()
-                || (!self.checkpoint_running && self.checkpoint_due().is_some())
+                || self.early_puts.active()
+                || self.apply.has_queries()
+                || (!self.checkpoints.running() && self.checkpoint_due().is_some())
             {
                 return Ok(());
             }
@@ -154,7 +131,7 @@ impl Node {
 
     pub(super) fn schedule_apply(&mut self) -> Result<()> {
         self.preempt_paused_apply();
-        if self.apply_busy {
+        if self.apply.busy() {
             return self.pipeline_apply();
         }
         // Raft can hold an accepted snapshot as unstable while the log queue is full, and the log
@@ -167,8 +144,7 @@ impl Node {
         if self.state.applied < snapshot_index {
             // The incoming snapshot covers the prepared prefix or establishes a new base.
             // Apply any remaining suffix through the normal committed log path.
-            self.prepared_puts.take();
-            self.held_puts.take();
+            self.early_puts.clear();
             return self.submit_apply(
                 Job::Snapshot(self.raw.store().recovery_snapshot().clone()),
                 snapshot_index,
@@ -179,7 +155,7 @@ impl Node {
             return self.submit_apply(Job::RaiseBase(record), self.state.applied);
         }
         // A switch frees overlay memory, so it goes before other work.
-        if self.prepared_puts.is_none() && self.writer.take_switch() {
+        if !self.early_puts.active() && self.writer.take_switch() {
             return self.submit_apply(Job::SwitchBase, self.state.applied);
         }
         if let Some((base, term)) = self.adoptable() {
@@ -188,12 +164,11 @@ impl Node {
         }
         // Raft delivers committed entries only after local persistence. The commit marker in the
         // log is volatile, so apply need not wait for the log thread to write it.
-        let committed = self.committed_ready;
+        let committed = self.apply.committed();
         let released = self.release_held_puts();
-        if let Some(batch) = &self.prepared_puts {
-            let last = batch.last;
-            if last <= committed && self.held_puts.is_none() {
-                let batch = self.prepared_puts.take().unwrap();
+        if self.early_puts.active() {
+            if let Some(batch) = self.early_puts.take_due(committed) {
+                let last = batch.last;
                 self.submit_apply(Job::PublishPuts(batch), last)?;
             }
             // Send the replies after the PublishPuts wake, so a handler runs on this worker.
@@ -203,16 +178,13 @@ impl Node {
             }
             return Ok(());
         }
-        if !self.checkpoint_running {
+        if !self.checkpoints.running() {
             if let Some(image) = self.checkpoint_due() {
                 return self.start_checkpoint(image);
             }
         }
-        if self.prefer_query {
-            if let Some(job) = self.next_query_job() {
-                self.prefer_query = false;
-                return self.submit_apply(job, self.state.applied);
-            }
+        if let Some(job) = self.apply.take_preferred_query() {
+            return self.submit_apply(job, self.state.applied);
         }
         let paused = self.apply_paused();
         if self.state.applied < committed && !paused {
@@ -225,32 +197,14 @@ impl Node {
         if !paused && self.prepare_quorum_puts()? {
             return Ok(());
         }
-        if let Some(job) = self.next_query_job() {
+        if let Some(job) = self.apply.next_query() {
             return self.submit_apply(job, self.state.applied);
         }
         Ok(())
     }
 
     pub(super) fn complete_apply(&mut self, completed: Completion) -> Result<()> {
-        ensure!(self.apply_busy, "unexpected apply completion");
-        let (target, _) = self
-            .apply_jobs
-            .pop_front()
-            .context("unexpected apply completion")?;
-        // A covering snapshot can end a job at its applied prefix. See `preempt_paused_apply`.
-        ensure!(
-            completed.applied == target || completed.early && completed.applied < target,
-            "apply completion has the wrong index"
-        );
-        ensure!(
-            completed.applied >= self.state.applied,
-            "apply position regressed"
-        );
-        ensure!(
-            completed.applied <= self.committed_ready.max(self.state.applied),
-            "apply completion exceeds delivered commit"
-        );
-        self.apply_busy = !self.apply_jobs.is_empty();
+        self.apply.complete(&completed, self.state.applied)?;
         self.expire_reads();
         // A job that a snapshot ended during a rebase replay sends only its prefix boundary. The
         // snapshot replaces the state. See `apply_retrying`.
@@ -293,31 +247,22 @@ impl Node {
 
     pub(super) fn finish_output(&mut self, output: Output) -> Result<()> {
         match output {
-            Output::SharedLinear(ids, outcome) => self.finish_shared_reads(ids, outcome)?,
+            Output::SharedLinear(ids, outcome) => self.reads.finish_shared(ids, outcome)?,
             Output::Reads(reads) => {
                 for read in reads {
                     self.finish_output(read)?;
                 }
             }
             Output::PreparedPuts(batch, replies) => {
-                // A term change can replace uncommitted entries at these indices. The held group
-                // is then dropped before any reply leaves.
-                let raft = &self.raw.raft;
-                if batch.last > raft.raft_log.committed
-                    || raft.term != self.prepare_term
-                    || raft.state != StateRole::Leader
-                {
-                    self.hold_puts(batch, replies);
+                let Some(replies) = self.early_puts.finish(batch, replies, &self.raw.raft) else {
                     return Ok(());
-                }
-                self.quorum_reply_index = batch.last;
+                };
                 // Withdraw the published view before any of these replies leaves.
                 self.publish_local_reads();
-                self.prepared_puts = Some(batch);
                 self.expire_pending();
                 self.finish_output(Output::Entries(replies))?;
             }
-            Output::Unprepared(last) => self.unprepared = last,
+            Output::Unprepared(last) => self.early_puts.fail(last),
             Output::Entries(replies) => {
                 // Raft takes the ConfState of a snapshot when it accepts it. A snapshot is above
                 // the commit index, so it covers each entry of these replies, and its ConfState
@@ -326,12 +271,12 @@ impl Node {
                 for command in replies {
                     if let Some(change) = command.change.as_ref().filter(|_| !superseded) {
                         self.raw.apply_conf_change(change)?;
-                        self.membership_checkpoint = self.state.applied;
+                        self.checkpoints.membership_changed(self.state.applied);
                         self.tick_clock(false);
                         self.prune_write_proofs();
                     }
                     if let Some(LeaseCommand::Expire { id, generation }) = command.lease {
-                        self.lease_expiring.remove(&(id, generation));
+                        self.lease_clock.expired(id, generation);
                     }
                     match command.reply {
                         Reply::PhysicalCompact {
@@ -366,13 +311,10 @@ impl Node {
                                 if let Ok(response) = &mut outcome.result {
                                     if let LeaseReply::TimeToLive(response) = response {
                                         if response.ttl >= 0 {
-                                            if let Some((_, deadline)) =
-                                                self.lease_deadlines.get(&response.id)
+                                            if let Some(ttl) =
+                                                self.lease_clock.remaining_secs(response.id)
                                             {
-                                                response.ttl = deadline
-                                                    .saturating_duration_since(Instant::now())
-                                                    .as_secs()
-                                                    as i64;
+                                                response.ttl = ttl;
                                             }
                                         }
                                     }
@@ -404,7 +346,7 @@ impl Node {
                 let _ = response.send(result);
             }
             Output::Read { response, outcome } => response.kv(outcome)?,
-            Output::Linear { id, outcome } => self.finish_read(id, outcome)?,
+            Output::Linear { id, outcome } => self.reads.finish(id, outcome)?,
             // Raft took the ConfState of a snapshot that it accepted above the adopted base.
             Output::Adopted(conf) if self.installing() => drop(conf),
             Output::Adopted(conf) => {
@@ -505,22 +447,12 @@ impl Node {
         let Some(paused) = self.worker.control.paused().filter(|paused| paused.held) else {
             return;
         };
-        let applied = self.state.applied;
-        let fenced: Vec<_> = self
-            .reads
-            .iter()
-            .filter(|(_, read)| read.index().is_some_and(|index| index > applied))
-            .map(|(id, _)| *id)
-            .collect();
         let message = format!(
             "storage unavailable; apply holds at entry {}: {}",
             paused.index, paused.reason
         );
-        for id in fenced {
-            if let Some(read) = self.reads.remove(&id) {
-                read.into_response().error(self.error(&message));
-            }
-        }
+        self.reads
+            .fence(self.state.applied, &message, self.raw.raft.leader_id);
     }
 
     /// Run the periodic work of a paused apply: the metrics, the alarm, and the snapshot request

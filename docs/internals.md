@@ -8,9 +8,13 @@ See [module boundaries](modules.md) for ownership and extension rules.
 
 The log stores a protobuf envelope. KV commands contain typed requests and optional credentials.
 Administrative commands use JSON inside the same envelope. The diagnostic HTTP API also uses JSON.
-This avoids JSON number arrays and untagged enum trials on the common replicated KV path.
+This avoids JSON number arrays on the common replicated KV path.
+Each JSON command names its variant, for example `{"CompactStep":{"id":"..."}}`. An unknown
+variant, an unknown direct field of a command, or a field with a wrong type does not decode, and
+apply stops. An unknown field in a deeper request struct is ignored.
 MVCC versions and Watch journals use protobuf messages. Native snapshots retain a binary envelope.
-Format 3 accepts no older data directory or snapshot. There is no migration or dual decoder.
+Storage format 4 rejects a format 3 data directory. There is no migration or dual decoder. The
+native backup format stays 4.
 
 ## Commit and recovery rules
 

@@ -7,7 +7,7 @@ mod retry;
 pub(super) use retry::{Adoption, Control, Paused, RejectedBase, Waited};
 
 pub(super) const BATCH_ENTRIES: u64 = 32;
-/// Committed-entry jobs that may wait in the apply queue behind the running job.
+/// Committed-entry jobs in the apply queue, the running job included.
 pub(super) const PIPELINE_DEPTH: usize = 4;
 /// Committed entries in one apply job. A larger job shares the fixed cost of a state write.
 pub(super) const APPLY_ENTRIES: u64 = 64;
@@ -22,7 +22,7 @@ pub(super) struct AppliedState {
     pub members: std::sync::Arc<crate::cluster::Store>,
     pub read: std::sync::Arc<crate::state::ReadView>,
     pub write_batches: u64,
-    pub usage: crate::batch::Usage,
+    pub usage: crate::state::Usage,
     /// Watch events that this state publishes after the node installs it.
     pub watch: Option<std::sync::Arc<crate::watch::Batch>>,
     pub compaction_pending: bool,
@@ -504,7 +504,18 @@ impl Executor {
                 }
             },
             Job::Checkpoint { delay, dir } => {
-                let (index, conf, job) = self.state.checkpoint_parts().await?;
+                // The node decides if the error stops it. See `Node::checkpoint_built`.
+                let (index, conf, job) = match self.state.checkpoint_parts().await {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        let built = Built {
+                            index: self.state.applied,
+                            conf: Default::default(),
+                            result: Err(error),
+                        };
+                        return self.completion(Output::Checkpoint(Some(built)), early, None);
+                    }
+                };
                 let build = async move {
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;

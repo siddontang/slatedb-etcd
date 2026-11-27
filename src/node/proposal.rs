@@ -313,8 +313,8 @@ mod tests {
         let mut node = super::super::tests::leader_node(dir.path()).await;
         let last = node.raw.raft.raft_log.last_index();
         let start = node.state.revision;
-        let previous_bytes = node.log_bytes;
-        node.log_bytes = log::MAX_BYTES;
+        let previous_bytes = node.log.bytes();
+        node.log.set_bytes(log::MAX_BYTES);
         let mut first = send(&mut node, put_op(b"a", vec![1])).await;
         let mut txn = send(&mut node, txn_op(b"b", vec![2])).await;
         let mut second = send(&mut node, put_op(b"a", vec![3])).await;
@@ -329,7 +329,7 @@ mod tests {
         assert_eq!(node.waiting_proposals.requests.len(), 3);
         assert_eq!(node.raw.raft.raft_log.last_index(), last);
         // A txn arriving with free capacity still queues behind the waiting writes.
-        node.log_bytes = previous_bytes;
+        node.log.set_bytes(previous_bytes);
         let mut late = send(&mut node, txn_op(b"c", vec![4])).await;
         assert_eq!(node.waiting_proposals.requests.len(), 4);
         assert_eq!(node.raw.raft.raft_log.last_index(), last);
@@ -353,7 +353,7 @@ mod tests {
         let mut node = super::super::tests::leader_node(dir.path()).await;
         let last = node.raw.raft.raft_log.last_index();
         let pending = node.pending.len();
-        node.log_bytes = log::MAX_BYTES;
+        node.log.set_bytes(log::MAX_BYTES);
         let expired = send(&mut node, txn_op(b"t", vec![1])).await;
         node.waiting_proposals.requests.front_mut().unwrap().expires = Instant::now();
         drop(send(&mut node, txn_op(b"t", vec![2])).await);
@@ -395,7 +395,7 @@ mod tests {
     async fn a_full_wait_queue_rejects_txns_without_growing() {
         let dir = tempfile::tempdir().unwrap();
         let mut node = super::super::tests::leader_node(dir.path()).await;
-        node.log_bytes = log::MAX_BYTES;
+        node.log.set_bytes(log::MAX_BYTES);
         let mut held = Vec::new();
         for n in 0..MAX_WAITING {
             held.push(send(&mut node, txn_op(b"q", vec![n as u8])).await);
@@ -438,8 +438,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut node = super::super::tests::leader_node(dir.path()).await;
         let last = node.raw.raft.raft_log.last_index();
-        let previous_bytes = node.log_bytes;
-        node.log_bytes = log::MAX_BYTES;
+        let previous_bytes = node.log.bytes();
+        node.log.set_bytes(log::MAX_BYTES);
         let mut waiting: Vec<_> = (0..1000u32)
             .map(|n| waiting_put(&mut node, n.to_be_bytes().repeat(64)))
             .collect();
@@ -451,7 +451,7 @@ mod tests {
             ));
         }
         assert_eq!(node.raw.raft.raft_log.last_index(), last);
-        node.log_bytes = previous_bytes;
+        node.log.set_bytes(previous_bytes);
         for _ in 0..1000 {
             if node.waiting_proposals.is_empty() {
                 break;
@@ -481,8 +481,8 @@ mod tests {
         node.drive_ready().await.unwrap();
         node.drain_log().await.unwrap();
         assert!(node.raw.raft.raft_log.unstable_entries().is_empty());
-        assert!(node.log_queue.is_empty());
-        assert_eq!(node.log_bytes, 0);
+        assert_eq!(node.log.len(), 0);
+        assert_eq!(node.log.bytes(), 0);
         // Each put is in Raft or waits for capacity, and none has a reply.
         assert_eq!(
             node.pending.len() + node.waiting_proposals.len(),
@@ -631,8 +631,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut node = super::super::tests::leader_node(dir.path()).await;
         let last = node.raw.raft.raft_log.last_index();
-        let previous_bytes = node.log_bytes;
-        node.log_bytes = log::MAX_BYTES;
+        let previous_bytes = node.log.bytes();
+        node.log.set_bytes(log::MAX_BYTES);
         let expired = waiting_put(&mut node, vec![]);
         node.waiting_proposals.requests.front_mut().unwrap().expires = Instant::now();
         drop(waiting_put(&mut node, vec![]));
@@ -652,11 +652,11 @@ mod tests {
             Err(oneshot::error::TryRecvError::Empty)
         ));
         assert_eq!(node.raw.raft.raft_log.last_index(), last);
-        node.log_bytes = previous_bytes;
+        node.log.set_bytes(previous_bytes);
         node.drive_ready().await.unwrap();
         assert_eq!(node.raw.raft.raft_log.last_index(), last + 1);
         assert_eq!(node.waiting_proposals.bytes, 0);
-        node.log_bytes = log::MAX_BYTES;
+        node.log.set_bytes(log::MAX_BYTES);
         let stale = waiting_put(&mut node, vec![2]);
         node.raw.raft.become_follower(node.raw.raft.term + 1, 2);
         node.resume_proposals();

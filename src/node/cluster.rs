@@ -228,8 +228,8 @@ impl Node {
             let connected = |id: u64| {
                 id == self.options.id
                     || self
-                        .peer_health
-                        .get(&id)
+                        .links
+                        .connected_since(id)
                         .is_some_and(|since| since.elapsed() >= Duration::from_secs(5))
             };
             let healthy = match request {
@@ -271,42 +271,13 @@ impl Node {
             self.options.peers = peers;
             return;
         }
-        while self.transports.try_join_next().is_some() {}
-        self.traffic.retain(|id, _| peers.contains_key(id));
-        self.senders.retain(|id, _| peers.contains_key(id));
-        self.peer_addresses.retain(|id, _| peers.contains_key(id));
-        for (&id, address) in &peers {
-            if id == self.options.id {
-                continue;
-            }
-            if self.senders.contains_key(&id) {
-                // A running sender keeps its connection and dials the new URL after a failure.
-                if let Some(sender) = self.peer_addresses.get(&id) {
-                    sender.send_if_modified(|old| {
-                        let changed = crate::cluster::url(old) != crate::cluster::url(address);
-                        if changed {
-                            *old = address.clone();
-                        }
-                        changed
-                    });
-                    continue;
-                }
-            }
-            let (tx, rx) = mpsc::channel(256);
-            self.senders.insert(id, tx);
-            self.peer_health.remove(&id);
-            let (address_tx, address_rx) = tokio::sync::watch::channel(address.clone());
-            self.peer_addresses.insert(id, address_tx);
-            self.transports.spawn(transport_to(
-                id,
-                address_rx,
-                self.peer.clone(),
-                rx,
-                self.events.clone(),
-                self.options.transport.clone(),
-                self.traffic.entry(id).or_default().clone(),
-            ));
-        }
+        self.links.sync(
+            self.options.id,
+            &peers,
+            &self.peer,
+            &self.events,
+            &self.options.transport,
+        );
         self.options.peers = peers;
     }
 }

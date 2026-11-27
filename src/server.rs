@@ -15,13 +15,7 @@ use crate::grpc::app::{App, Listener};
 use crate::node::{Event, LogMemory, Node, NodeOptions};
 use crate::proto::etcdserverpb::{request_op, RangeRequest, RequestOp};
 
-/// Select the etcd Prometheus collection level.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
-pub enum MetricsLevel {
-    #[default]
-    Basic,
-    Extensive,
-}
+pub use crate::metrics::MetricsLevel;
 
 /// The default age limit of unflushed shared-mode writes.
 pub const DEFAULT_VIEW_MAX_AGE: Duration = Duration::from_secs(10);
@@ -320,6 +314,7 @@ impl Server {
             transport = peer_options.transport()?;
         }
         let (events, receiver) = mpsc::channel(2048);
+        let (peer_events, peer_receiver) = mpsc::channel(2048);
         let servers = crate::grpc::Servers::new(
             config.id,
             events.clone(),
@@ -368,6 +363,7 @@ impl Server {
         };
         let diagnostics = router(ApiState {
             events: events.clone(),
+            peer_events,
             peer: node.identity(),
             refusals: std::sync::Arc::new(crate::api::Refusals::new(
                 node.metrics.refused_peer_stores.clone(),
@@ -416,7 +412,7 @@ impl Server {
                 stopped(stop.subscribe()),
             ));
         }
-        tasks.spawn(node.run_until(receiver, stopped(stop.subscribe())));
+        tasks.spawn(node.run_until(receiver, peer_receiver, stopped(stop.subscribe())));
         tasks.spawn(crate::tls::serve_until(
             listener,
             client_app,

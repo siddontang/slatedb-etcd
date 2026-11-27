@@ -365,6 +365,7 @@ async fn write(db: &Arc<slatedb::Db>, gate: &Arc<Gate>, seq: u64) {
         queue,
         progress.clone(),
         gate.clone(),
+        0,
     ));
     overlay.push(seq, batch(seq));
     progress.wait_written(seq).await.unwrap();
@@ -595,7 +596,7 @@ async fn an_ended_term_freezes_the_slatedb_clock() {
                 }
             }
         });
-        dst_compact(&admin, 1).await.unwrap();
+        crate::node::dst::dst_compact(&admin, 1).await.unwrap();
         running.abort();
         let _ = running.await;
         let compacted = admin.read_manifest(None).await.unwrap().unwrap();
@@ -621,7 +622,7 @@ async fn an_ended_term_freezes_the_slatedb_clock() {
         db.flush().await.unwrap();
         // The frozen clock holds the time of the compactor too, so the compaction need not
         // end. Any output takes its SST ID from the frozen clock.
-        let _ = dst_compact(&admin, 1).await;
+        let _ = crate::node::dst::dst_compact(&admin, 1).await;
         db.close_with_options(slatedb::config::CloseOptions { flush_type: None })
             .await
             .unwrap();
