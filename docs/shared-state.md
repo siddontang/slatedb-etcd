@@ -206,15 +206,16 @@ Watch scans to free memory. Per member, in key and value bytes without map and `
   one larger entry.
 - **Materializer queue:** it holds the batches of the held segments and shares their `Bytes`.
   It adds only its map entries.
-- **Leader `Db` memtable:** it holds the written batches that no checkpoint covers yet, with the
-  same `Bytes`. Above `max_unflushed_bytes`, 512 MiB by default, SlateDB stops the writes. The
-  materializer then waits, and the overlay grows instead.
+- **Leader `Db` memtable:** it holds the written batches that SlateDB did not flush yet, with
+  the same `Bytes`. A flush can free a memtable before a checkpoint publishes it. Before each
+  write, SlateDB waits while its estimate of unflushed memory is above `max_unflushed_bytes`,
+  1 GiB by default in SlateDB 0.18.1. The materializer then waits, and the overlay grows instead.
 - **Released segments that backups keep:** about `--overlay-max-bytes`. See [Backups](#backups).
-- **Released segments that reads keep:** no byte limit. A read or a Watch page keeps every
-  segment of its view, also the open one, for at most `--view-pin-max`. So reads keep at most
-  the segments that the overlay held in the last `--view-pin-max`. That is the overlay at the
-  start of that time plus the rows applied in it. These bytes do not pause apply or stop
-  proposals.
+- **Released segments that reads keep:** no byte limit and no time limit. A read or a Watch page
+  keeps every segment of its view, also the open one. `--view-pin-max` is a storage deadline of
+  each read attempt, not of the view. A scan over its row budget keeps the same view while it
+  waits to run again, and the next attempt starts a new deadline. These bytes do not pause apply
+  or stop proposals.
 
 ## Views and reads
 
