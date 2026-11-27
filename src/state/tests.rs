@@ -42,7 +42,7 @@ async fn history_len(state: &StateMachine) -> usize {
 #[test]
 fn native_snapshot_bytes_use_fixed_width_lengths() {
     let bytes = hex::decode(concat!(
-        "03000000",         // Format 3.
+        "04000000",         // Format 4.
         "2a00000000000000", // Applied index 42.
         "0100000000000000", // One row.
         "01000000000000006b",
@@ -50,7 +50,7 @@ fn native_snapshot_bytes_use_fixed_width_lengths() {
     ))
     .unwrap();
     let data: SnapshotData = crate::codec::decode(&bytes).unwrap();
-    assert_eq!(data.version, crate::STORAGE_FORMAT);
+    assert_eq!(data.version, crate::SNAPSHOT_FORMAT);
     assert_eq!(data.applied, 42);
     assert_eq!(data.rows, vec![(vec![b'k'], vec![0, 127])]);
     assert_eq!(crate::codec::encode(&data).unwrap(), bytes);

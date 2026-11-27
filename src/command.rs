@@ -128,7 +128,7 @@ mod tests {
         })
     }
 
-    /// `CompactStep` matches any `id`, so `SeedMembers` must decode before it.
+    /// A seed keeps its membership and its digest.
     #[test]
     fn seed_members_does_not_decode_as_a_compaction_step() {
         for digest in [None, Some("0123456789abcdef".to_owned())] {
@@ -148,6 +148,48 @@ mod tests {
             assert_eq!(decoded_digest, digest);
             let members: crate::cluster::Store = serde_json::from_str(&members).unwrap();
             assert_eq!(members.members.len(), 3);
+        }
+    }
+
+    /// An unknown command, an unknown field, or a field with a wrong type does not decode. Apply
+    /// does not retry the error, so the node stops. See issue #110.
+    #[test]
+    fn an_unknown_or_malformed_command_does_not_decode() {
+        let mut nested = serde_json::to_value(
+            RaftCommand::CompactStep { id: "step".into() }
+                .secure(Some(crate::auth::Credentials::default())),
+        )
+        .unwrap();
+        nested["Secured"]["command"] = serde_json::json!({"Future": {"id": "step"}});
+        for json in [
+            // Untagged forms.
+            serde_json::json!({"id": "step"}),
+            serde_json::json!({"id": "lease", "origin": 3, "lease": {"action": "future"}}),
+            serde_json::json!({"id": "compact", "compact": "wrong"}),
+            serde_json::json!({"id": "future", "snapshot": "x"}),
+            // Tagged forms.
+            serde_json::json!({"Future": {"id": "step"}}),
+            serde_json::json!({"Lease": {"id": "lease", "origin": 3, "lease": {"action": "x"}}}),
+            serde_json::json!({"Compact": {"id": "compact", "compact": "wrong"}}),
+            serde_json::json!({"CompactStep": {"id": "step", "snapshot": "x"}}),
+            // Newtype variants: the fields beside `id` belong to the inner struct.
+            serde_json::json!({"Diagnostic": {"id": "diag", "request": {"operations": []},
+                "extra": 1}}),
+            serde_json::json!({"SeedMembers": {"id": "seed", "origin": 1, "members": "{}",
+                "digest": null, "applied": 0, "extra": 1}}),
+            nested,
+        ] {
+            let data = Envelope {
+                payload: Some(Payload::Json(serde_json::to_vec(&json).unwrap())),
+            }
+            .encode_to_vec();
+            match RaftCommand::decode(&data) {
+                Ok(command) => panic!("{json} decoded as {command:?}"),
+                Err(error) => assert!(
+                    crate::mvcc::storage_fault::classify(&error).is_none(),
+                    "{error:#}"
+                ),
+            }
         }
     }
 
