@@ -84,6 +84,16 @@ impl StateMachine {
     }
 
     pub async fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<()> {
+        self.install_snapshot_with(snapshot, &mut None).await
+    }
+
+    /// Install `snapshot`. A shared-mode install keeps the base of its checkpoint in `reader`
+    /// across tries. See `install_view`.
+    pub(crate) async fn install_snapshot_with(
+        &mut self,
+        snapshot: &Snapshot,
+        reader: &mut Option<std::sync::Arc<super::view::Base>>,
+    ) -> Result<()> {
         let index = snapshot.get_metadata().index;
         let term = snapshot.get_metadata().term;
         // Known terms at the same index must agree, for every snapshot format.
@@ -91,7 +101,7 @@ impl StateMachine {
             self.reconcile_term(term)?;
         }
         if let Some(view) = transfer::ViewDescriptor::decode(snapshot.get_data())? {
-            return Box::pin(self.install_view(view, index, term)).await;
+            return Box::pin(self.install_view(view, index, term, reader)).await;
         }
         ensure!(
             !self.is_shared() || index <= self.applied,

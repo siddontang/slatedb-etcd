@@ -1,11 +1,13 @@
 --- a/tests/framework/e2e/cluster.go
 +++ b/tests/framework/e2e/cluster.go
-@@ -528,0 +529,6 @@
+@@ -528,0 +529,8 @@
 +		if etcdCfgs[i].ExecPath == BinPath.Etcd {
 +			for _, member := range etcdCfgs {
 +				etcdCfgs[i].Args = append(etcdCfgs[i].Args,
 +					"--fixture-client="+member.Name+"="+member.ClientURL)
 +			}
++			etcdCfgs[i].Args = append(etcdCfgs[i].Args,
++				"--fixture-cluster="+etcdCfgs[0].DataDirPath)
 +		}
 --- a/tests/framework/e2e/etcd_process.go
 +++ b/tests/framework/e2e/etcd_process.go

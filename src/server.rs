@@ -90,6 +90,9 @@ pub struct ServerConfig {
     pub view_retention: crate::state::ViewRetention,
     /// Serve the `/debug` fault controls (partition, delays, log faults). Off by default.
     pub fault_controls: bool,
+    /// Tests: the wall clock of the shared writer and of its clock probe replies.
+    #[cfg(test)]
+    pub(crate) now_ms: Option<crate::node::Millis>,
 }
 
 /// A free local port for a test member. A port 0 listener returns its port to the pool, and a
@@ -152,6 +155,8 @@ impl ServerConfig {
             max_clock_skew: Duration::from_secs(5),
             view_retention: crate::state::ViewRetention::Off,
             fault_controls: false,
+            #[cfg(test)]
+            now_ms: None,
         }
     }
 }
@@ -376,11 +381,24 @@ impl Server {
             events.clone(),
         )
         .await?;
+        #[cfg(test)]
+        let node = {
+            let mut node = node;
+            if let Some(now_ms) = &config.now_ms {
+                node.set_clock(now_ms.clone());
+            }
+            node
+        };
         let diagnostics = router(ApiState {
             events: events.clone(),
-            cluster_id: config.cluster_id.clone(),
+            peer: node.identity(),
+            refusals: std::sync::Arc::new(crate::api::Refusals::new(
+                node.metrics.refused_peer_stores.clone(),
+            )),
             location: Some(node.location.clone()),
             shared: node.shared_source(),
+            clock: node.probe_clock(),
+            prober: node.write_prober(),
             fault_controls: config.fault_controls,
         });
         // Peer gRPC has no RPC metrics; diagnostics paths never collide with gRPC services.

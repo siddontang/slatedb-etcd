@@ -117,7 +117,10 @@ func TestReadIndexRejectsMinorityLeader(t *testing.T) {
 }
 
 func TestSlowLogKeepsRaftLiveAndFencesReplies(t *testing.T) {
-	c := newCluster(t)
+	// Replicated mode only. The test expects the checkpoint to move `snapshot_index` past the
+	// delayed commit. In shared state mode, `snapshot_index` stays at 0 after the checkpoint
+	// reply. The removal of replicated mode must replace this test.
+	c := newCluster(t, "--state-mode", "replicated")
 	leader := c.leader()
 	api := client(t, []string{c.addresses[leader-1]})
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -211,7 +214,10 @@ func TestLogWriteFailureStopsNodeAndRecoversAcknowledgedState(t *testing.T) {
 }
 
 func TestSlowCheckpointPublicationKeepsRaftLive(t *testing.T) {
-	c := newCluster(t)
+	// Replicated mode only. The test waits for the checkpoint image in the log queue. A shared
+	// state checkpoint goes to the object store and queues no image. The removal of replicated
+	// mode must replace this test.
+	c := newCluster(t, "--state-mode", "replicated")
 	leader := c.leader()
 	api := client(t, []string{c.addresses[leader-1]})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

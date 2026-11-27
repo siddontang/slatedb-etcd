@@ -93,6 +93,7 @@ impl Node {
             || self.pending.is_empty()
             || high <= low
             || self.reply_ahead()
+            || self.state.applied < self.unprepared
             || raft.pending_conf_index > self.state.applied
             || self.raw.store().durable.hard_state.term != raft.term
         {

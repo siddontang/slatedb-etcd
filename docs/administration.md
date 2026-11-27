@@ -60,7 +60,9 @@ Use a learner when replacing or adding a server. The service allows one learner 
 2. Start the new process with the returned member ID, `--join`, and the same cluster ID.
 3. Supply the full current peer map, including the new member. Configure its client address as
    above.
-4. Wait for snapshot installation and log catch-up. Then call `member promote ID`.
+4. Wait for snapshot installation and log catch-up. Then call `member promote ID`. In shared
+   state mode, the learner must also prove write access to the shared state. The first call
+   then fails with a retryable error and starts the check. Call it again after some seconds.
 5. Use `move-leader ID` when the new voter should become leader.
 
 MemberUpdate changes where members dial that peer. As in etcd, a working connection stays open.

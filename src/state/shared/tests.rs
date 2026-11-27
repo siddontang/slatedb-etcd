@@ -7,7 +7,7 @@ use slatedb::config::{CheckpointOptions, CheckpointScope, ScanOptions};
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
 
-pub(in crate::state) fn options() -> shared::Options {
+pub(crate) fn options() -> shared::Options {
     shared::Options {
         quota: 0,
         voters: vec![1],
@@ -17,6 +17,7 @@ pub(in crate::state) fn options() -> shared::Options {
         overlay_max_bytes: 1 << 30,
         restore: None,
         record: None,
+        store_id: None,
     }
 }
 
@@ -33,7 +34,7 @@ pub(in crate::state) async fn open_shared(store: Arc<dyn ObjectStore>) -> StateM
     .unwrap()
 }
 
-pub(in crate::state) fn put(key: &str, value: &str) -> RequestOp {
+pub(crate) fn put(key: &str, value: &str) -> RequestOp {
     RequestOp {
         request: Some(Op::RequestPut(PutRequest {
             key: key.as_bytes().to_vec(),
@@ -261,7 +262,7 @@ async fn no_op_entries_write_no_batch_after_the_membership_seed() {
 }
 
 /// Open the shared writer, as the leader task does.
-pub(in crate::state) async fn writer(state: &StateMachine) -> slatedb::Db {
+pub(crate) async fn writer(state: &StateMachine) -> slatedb::Db {
     let source = state.shared.as_ref().unwrap().source.clone();
     source.open_writer().await.unwrap()
 }
@@ -280,7 +281,7 @@ async fn flush(state: &StateMachine, writer: &slatedb::Db, written: &mut u64) {
 }
 
 /// Write the overlay batches into the shared database, flush, and open a checkpoint of it.
-pub(in crate::state) async fn checkpoint(
+pub(crate) async fn checkpoint(
     state: &StateMachine,
     writer: &slatedb::Db,
     written: &mut u64,
@@ -414,12 +415,18 @@ async fn bases_switch_monotonically_and_release_covered_segments() {
 async fn the_cluster_claim_fixes_the_mode_and_the_quota() {
     let store = InMemory::new();
     assert_eq!(
-        shared::claim(&store, "root", "one", 5, &[1]).await.unwrap(),
+        shared::claim(&store, "root", "one", 5, &[1])
+            .await
+            .unwrap()
+            .quota,
         5
     );
     // A later member uses the claimed quota.
     assert_eq!(
-        shared::claim(&store, "root", "one", 7, &[1]).await.unwrap(),
+        shared::claim(&store, "root", "one", 7, &[1])
+            .await
+            .unwrap()
+            .quota,
         5
     );
     assert!(shared::claim(&store, "root", "two", 5, &[1]).await.is_err());
@@ -1480,7 +1487,7 @@ async fn defragment_replaces_every_input_sorted_run() {
     assert_eq!(manifest.compacted().len(), 2);
     let input: std::collections::HashSet<_> =
         manifest.all_sst_views().map(|view| view.id).collect();
-    maintenance::compact_all(&admin).await.unwrap();
+    maintenance::compact_all(&admin, &|| Ok(())).await.unwrap();
     let checkpoint = db
         .create_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
         .await
@@ -1712,7 +1719,7 @@ async fn the_warm_set_stays_bounded_across_base_switches() {
             warmed.difference(&live).count()
         );
         seen.extend(current.iter().copied());
-        crate::state::maintenance::compact_all(&admin)
+        crate::state::maintenance::compact_all(&admin, &|| Ok(()))
             .await
             .unwrap();
     }
@@ -1764,7 +1771,7 @@ async fn timed_out_warms_keep_the_warm_set_bounded() {
         if cold > 0 && warmed.iter().any(|id| current.contains(id)) {
             partial += 1;
         }
-        crate::state::maintenance::compact_all(&admin)
+        crate::state::maintenance::compact_all(&admin, &|| Ok(()))
             .await
             .unwrap();
     }
@@ -1843,5 +1850,53 @@ async fn manifest_gc_continues_on_a_local_store_after_a_writer_change() {
             "{config:?}: manifest files before and after each GC run: {counts:?}"
         );
         state.close().await.unwrap();
+    }
+}
+
+/// Concurrent first voters create one claim, so they get one store ID. A later voter and a
+/// reader get the same ID. Another prefix gets another ID.
+#[tokio::test]
+async fn the_cluster_claim_holds_one_store_id() {
+    let store = InMemory::new();
+    assert_eq!(shared::claimed(&store, "root", "test").await.unwrap(), None);
+    let (first, second) = tokio::join!(
+        shared::claim(&store, "root", "test", 0, &[1]),
+        shared::claim(&store, "root", "test", 0, &[1])
+    );
+    let id = first.unwrap().store_id;
+    assert_eq!(second.unwrap().store_id, id);
+    let claimed = shared::claimed(&store, "root", "test").await.unwrap();
+    assert_eq!(claimed.unwrap().store_id, id);
+    let other = shared::claim(&store, "other", "test", 0, &[1])
+        .await
+        .unwrap();
+    assert_ne!(other.store_id, id);
+}
+
+/// A claim with no store ID, as from an earlier binary, or with an invalid or nil ID is refused.
+#[tokio::test]
+async fn a_claim_without_a_valid_store_id_is_refused() {
+    use slatedb::object_store::ObjectStoreExt;
+    let claim = |store_id: Option<&str>| {
+        let mut claim = serde_json::json!({
+            "version": 1, "cluster": "test", "mode": "shared", "quota": 0, "voters": [1],
+        });
+        if let Some(id) = store_id {
+            claim["store_id"] = id.into();
+        }
+        serde_json::to_vec(&claim).unwrap()
+    };
+    let nil = uuid::Uuid::nil().to_string();
+    for store_id in [None, Some(""), Some("not-a-uuid"), Some(nil.as_str())] {
+        let store = InMemory::new();
+        store
+            .put(&"root/shared/owner.json".into(), claim(store_id).into())
+            .await
+            .unwrap();
+        let error = shared::claim(&store, "root", "test", 0, &[1])
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("store ID"), "{error:#}");
+        assert!(shared::claimed(&store, "root", "test").await.is_err());
     }
 }

@@ -86,9 +86,16 @@ impl StateMachine {
         };
         // The stored row is the base. Only a log of an earlier binary applies a cluster command
         // without it. That binary used the in-memory membership, and `before_entry` stores it.
-        let stored = self.applied_state().get(crate::cluster::KEY).await?;
+        let stored = self
+            .applied_state()
+            .get(crate::cluster::KEY)
+            .await
+            .map_err(crate::mvcc::storage_fault::read)?;
+        // A stored row that does not decode is corrupt data, so apply holds on the entry.
         let mut members = match &stored {
-            Some(row) => serde_json::from_slice(row)?,
+            Some(row) => serde_json::from_slice(row).map_err(|error| {
+                crate::mvcc::storage_fault::stored(format!("invalid members row: {error}"))
+            })?,
             None => self.members.as_ref().clone(),
         };
         let result = allowed.and_then(|()| members.validate(request)).map(|()| {
@@ -100,18 +107,30 @@ impl StateMachine {
             }
             response
         });
+        // Stage the membership until the batch is stored. A failed store then leaves the
+        // membership of the applied prefix. The size count takes the length of the row read
+        // above, so it reads nothing.
         let mut batch = WriteBatch::new();
+        let mut staged = None;
         if result.is_ok() {
             let value = serde_json::to_vec(&members)?;
-            if stored.as_deref() != Some(value.as_slice()) {
-                self.members_row = Some(MembersRow::new(&value, index));
-                batch.put(crate::cluster::KEY, value);
+            let row = (stored.as_deref() != Some(value.as_slice()))
+                .then(|| MembersRow::new(&value, index));
+            if row.is_some() {
+                let old_len = stored.as_ref().map(|row| row.len());
+                batch.put_known(crate::cluster::KEY, value, old_len);
             }
-            self.members = Arc::new(members);
+            staged = Some((members, row));
         }
         self.mark_applied(&mut batch, index);
         self.write_batch(batch, index).await?;
         self.applied = index;
+        if let Some((members, row)) = staged {
+            if row.is_some() {
+                self.members_row = row;
+            }
+            self.members = Arc::new(members);
+        }
         Ok(Outcome { result })
     }
 
@@ -134,10 +153,14 @@ impl StateMachine {
             "non-contiguous state machine apply"
         );
         let mut batch = WriteBatch::new();
+        // Stage the seeded membership until the batch is stored, as `apply_cluster` does.
+        let mut staged = None;
         match &self.members_row {
             None => {
-                self.members = Arc::new(serde_json::from_str(members)?);
-                self.members_row = Some(MembersRow::new(members.as_bytes(), index));
+                staged = Some((
+                    Arc::new(serde_json::from_str(members)?),
+                    MembersRow::new(members.as_bytes(), index),
+                ));
                 batch.put(crate::cluster::KEY, members.as_bytes());
             }
             Some(row) => {
@@ -163,6 +186,10 @@ impl StateMachine {
         self.mark_applied(&mut batch, index);
         self.write_batch(batch, index).await?;
         self.applied = index;
+        if let Some((members, row)) = staged {
+            self.members = members;
+            self.members_row = Some(row);
+        }
         Ok(())
     }
 

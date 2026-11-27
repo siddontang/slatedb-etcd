@@ -115,9 +115,13 @@ def main():
     args.read_requests, args.seed, args.timeout_seconds = None, 42, 600
     args.quota_bytes = 2 * 1024**3
     args.s3_bucket, args.s3_endpoint, args.s3_allow_http = None, None, False
-    sample = benchmark.run_sample(
-        args, tools, binary, args.backend, args.concurrency, args.read_percent, 0,
-        observer=lambda processes: record(processes, args.output, args.frequency))
+    args.members, args.rustfs = 3, False
+    # Three service members run in shared state mode on RustFS.
+    with benchmark.object_store(args, [args.backend], report_path, report) as store:
+        report["object_store"] = store
+        sample = benchmark.run_sample(
+            args, tools, binary, args.backend, args.concurrency, args.read_percent, 0,
+            observer=lambda processes: record(processes, args.output, args.frequency))
     report["sample"] = sample
     if sample["passed"]:
         views = [("self.txt", "--no-children", "--no-inline", "none"),

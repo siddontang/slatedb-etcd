@@ -7,6 +7,8 @@ import socket
 import subprocess
 import time
 
+from rustfs_fixture import shared_args, shared_store, unique_prefix
+
 ROOT = Path(__file__).resolve().parents[1]
 INVENTORY = ROOT / "tests/upstream/etcd-inventory.json"
 
@@ -41,7 +43,8 @@ def stop(process):
             process.wait()
 
 
-def start_cluster(stack, directory, executable, target, members, ctl, snapshot, quota, extra=()):
+def start_cluster(stack, directory, executable, target, members, ctl, snapshot, quota, extra=(),
+                  shared=True):
     with ExitStack() as reservations:
         ports = []
         for _ in range(2 * members):
@@ -50,6 +53,12 @@ def start_cluster(stack, directory, executable, target, members, ctl, snapshot, 
             ports.append(f"127.0.0.1:{sock.getsockname()[1]}")
     clients, peers = ports[:members], ports[members:]
     cluster = ",".join(f"m{i}=http://{addr}" for i, addr in enumerate(peers))
+    store = []
+    if target != "etcd" and members > 1 and shared:
+        # Several members run in shared state mode on RustFS. An outer `shared_store` supplies one
+        # server for all clusters of a run.
+        stack.enter_context(shared_store())
+        store = shared_args(unique_prefix("upstream"))
     processes = []
     for i, (client, peer) in enumerate(zip(clients, peers)):
         data = directory / f"data-{i}"
@@ -63,7 +72,7 @@ def start_cluster(stack, directory, executable, target, members, ctl, snapshot, 
                     "--snapshot-every", str(snapshot)]
             for j in range(members):
                 argv.extend(["--peer", f"{j+1}={peers[j]}", "--client-peer", f"{j+1}={clients[j]}"])
-        argv.extend(["--quota-backend-bytes", str(quota), *extra])
+        argv.extend(["--quota-backend-bytes", str(quota), *store, *extra])
         log = stack.enter_context((directory / f"member-{i}.log").open("w"))
         process = subprocess.Popen([executable, *argv], stdout=log, stderr=log)
         stack.callback(stop, process)

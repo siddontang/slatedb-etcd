@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 from reporting import write_report
+from rustfs_fixture import shared_args, shared_store, unique_prefix
 
 
 class ApiFailure(Exception):
@@ -362,12 +363,28 @@ def main():
     # Only tests use the fault routes; bench mode must also run binaries that predate the flag.
     extra = (["--log-file-bytes", str(256 * 1024), "--enable-fault-controls"]
              if args.mode == "test" else [])
+    if args.mode == "test":
+        # Replicated mode only. The log truncation check expects `/checkpoint` to move
+        # `snapshot_index`, and a restarted follower to install a Raft snapshot. In shared state
+        # mode the index stays at 0, and a restarted member adopts the newest shared checkpoint.
+        # The removal of replicated mode must replace these checks.
+        run_cluster(args, root, extra, None)
+        return
+    # The three benchmark members run in shared state mode on one RustFS server. A failed start
+    # must not leave an earlier passed report.
+    with shared_store(args.output or root / "report.json", {"mode": args.mode}) as store:
+        run_cluster(args, root, extra + shared_args(unique_prefix("harness")), store)
+
+
+def run_cluster(args, root, extra, store):
     cluster = Cluster(args.binary.resolve(), root, args.snapshot_every, extra)
     report = {"mode": args.mode, "host": platform.platform(), "machine": platform.machine(),
               "created_at": datetime.now(timezone.utc).isoformat(), "logical_cpus": os.cpu_count(),
               "binary_sha256": hashlib.sha256(cluster.binary.read_bytes()).hexdigest(),
               "python": sys.version, "run_directory": str(root), "binary": str(cluster.binary),
-              "deployment": "three processes on one host and disk; loopback HTTP; local object store",
+              "deployment": "three processes on one host and disk; loopback HTTP; " + (
+                  "shared state mode on one local RustFS server" if store else
+                  "replicated state mode; local object store"), "object_store": store,
               "durability": "raft-engine synchronous writes; process crashes tested, power loss not tested"}
     # Retain completed checks and measurements if a later assertion fails.
     report["checks" if args.mode == "test" else "benchmarks"] = []
