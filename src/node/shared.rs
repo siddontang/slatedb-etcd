@@ -1,8 +1,8 @@
 //! Run the shared-mode leader tasks: the materializer and the checkpoint publisher.
 //!
 //! See `docs/shared-state.md`. The node starts both tasks when it becomes the leader and stops
-//! them when it steps down. Phase 1 keeps the writer `Db` open across terms, because a one-voter
-//! cluster has no other writer. Phase 3 opens the writer at each leader change and adds fencing.
+//! them when it steps down. Each leader term opens the writer `Db`, which fences the writer of an
+//! earlier term.
 
 use super::*;
 use std::sync::{Arc, Mutex};
