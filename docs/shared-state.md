@@ -842,8 +842,9 @@ serializable read, and the diagnostic reads use one rule, which the writer rule 
 - **Transient:** SlateDB `Unavailable` or a closed database, an object store error from a call
   outside SlateDB, or a store call past its deadline. The request fails with `Unavailable`, and
   the client retries.
-- **Missing:** a `Data` error with a missing object below it, or a read that held its view past
-  `--view-pin-max`. The request fails with `Unavailable`. The retry reads a newer view.
+- **Missing:** a `Data` error with a missing object below it, the open of a deleted checkpoint,
+  or a read that held its view past `--view-pin-max`. The request fails with `Unavailable`. The
+  retry reads a newer view.
 - **Corrupt:** any other SlateDB kind, or a stored row that does not decode. The request fails
   with `DataLoss`. The member logs an error and counts it in `slatedb_etcd_read_corrupt_total`.
 

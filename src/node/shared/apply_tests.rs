@@ -30,6 +30,14 @@ async fn a_rebase_without_its_base_holds_above_an_older_checkpoint() {
     lose_a_checkpoint_object(Lose::Deleted).await;
 }
 
+/// The same with a base at row 19 that an announcement certified through 20. The rebase does
+/// not find the base, and no checkpoint has its row in [19, 20]. It fails with a missing object,
+/// and apply holds.
+#[tokio::test]
+async fn a_rebase_above_the_row_without_its_base_fails_with_a_missing_object() {
+    lose_a_checkpoint_object(Lose::DeletedAboveRow).await;
+}
+
 /// The same, but the log still holds the entries above row 10. A replay from the older
 /// checkpoint would succeed, but it would move the base index down from 20 to 10.
 #[tokio::test]
@@ -92,6 +100,8 @@ enum Lose {
     Deleted,
     /// As `Deleted`, but the member keeps its log.
     DeletedInLog,
+    /// As `Deleted`, but the base has row 19, and an announcement certified it through 20.
+    DeletedAboveRow,
     /// The base has row 20 and is deleted. A newer checkpoint has row 24.
     Newer,
     /// The base has row 20. After the lost read every read of the store fails.
@@ -108,7 +118,14 @@ async fn lose_a_checkpoint_object(lose: Lose) {
         lose,
         Lose::AtRow | Lose::Unavailable | Lose::Stuck | Lose::Replay | Lose::DeletedInLog
     );
-    let deleted = matches!(lose, Lose::Deleted | Lose::DeletedInLog | Lose::Newer);
+    let deleted = matches!(
+        lose,
+        Lose::Deleted | Lose::DeletedInLog | Lose::DeletedAboveRow | Lose::Newer
+    );
+    let above = matches!(
+        lose,
+        Lose::AboveRow | Lose::Checkpoint | Lose::DeletedAboveRow
+    );
     use crate::object::faults::{
         FaultStore, FAIL_SST_GET, LOSE_SST_TWICE, LOSE_SST_TWICE_THEN_FAIL,
     };
@@ -164,7 +181,7 @@ async fn lose_a_checkpoint_object(lose: Lose) {
     .encode()
     .unwrap();
     // Entry 20 changes no state, so the base row is 19.
-    if matches!(lose, Lose::AboveRow | Lose::Checkpoint) {
+    if above {
         entries[19].data.clear();
     }
     // Entry 21 is a physical Compact, and entry 22 adds a learner. Their completions come
@@ -275,7 +292,10 @@ async fn lose_a_checkpoint_object(lose: Lose) {
             .write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
             .await
             .unwrap();
-        let older_sst = matches!(lose, Lose::Deleted | Lose::DeletedInLog | Lose::Checkpoint);
+        let older_sst = matches!(
+            lose,
+            Lose::Deleted | Lose::DeletedInLog | Lose::DeletedAboveRow | Lose::Checkpoint
+        );
         if seq == 10 && older_sst {
             writer.flush().await.unwrap();
             let options = CheckpointOptions {
@@ -290,11 +310,7 @@ async fn lose_a_checkpoint_object(lose: Lose) {
         }
     }
     writer.flush().await.unwrap();
-    let row = if matches!(lose, Lose::AboveRow | Lose::Checkpoint) {
-        19
-    } else {
-        20
-    };
+    let row = if above { 19 } else { 20 };
     let options = CheckpointOptions {
         name: Some(crate::state::shared::view_name(row)),
         ..Default::default()
@@ -486,6 +502,17 @@ async fn lose_a_checkpoint_object(lose: Lose) {
         assert!(held);
         assert!(completion.early);
         assert_eq!(completion.applied, index - 1);
+        // The rebase reports a missing object, not corrupt data.
+        let error = executor
+            .state
+            .rebase(completion.applied, |_| Ok(1))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::mvcc::storage_fault::classify(&error),
+            Some(crate::mvcc::storage_fault::StorageFault::Missing),
+            "{error:#}"
+        );
         let Output::Entries(replies) = completion.output else {
             panic!("expected entries");
         };
