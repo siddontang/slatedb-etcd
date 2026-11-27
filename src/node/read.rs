@@ -1,5 +1,7 @@
 use super::*;
 pub(super) mod executor;
+#[cfg(test)]
+pub(super) mod fault_tests;
 
 pub(super) struct PendingRead {
     request: Option<RequestOp>,
@@ -12,6 +14,17 @@ pub(super) struct PendingRead {
     index: Option<u64>,
     context: Option<u64>,
     retry_ticks: u8,
+}
+
+impl PendingRead {
+    /// The read index that the quorum confirmed.
+    pub(super) fn index(&self) -> Option<u64> {
+        self.index
+    }
+
+    pub(super) fn into_response(self) -> ClientResponse {
+        self.response
+    }
 }
 
 impl Node {
@@ -155,6 +168,7 @@ impl Node {
                 }
             }
         }
+        self.fence_reads();
     }
 
     pub(super) fn schedule_reads(&mut self) {

@@ -34,6 +34,8 @@ mod proposal;
 pub use forwarding::ForwardView;
 pub(crate) use forwarding::LocalRead;
 pub(crate) use shared::WriterReport;
+pub(crate) use shared::{Millis, ProbeReply, ProbeRequest, PROBE_ROUTE};
+pub(crate) use shared::{Prober, WriteProbeReply, WriteProbeRequest, WRITE_PROBE_ROUTE};
 mod quorum_put;
 mod quota;
 mod read;
@@ -139,6 +141,13 @@ pub enum Event {
     SnapshotRefused {
         member: u64,
         target: u64,
+    },
+    /// Shared mode: the reply of `member` to the write probe `nonce` of this leader, or the
+    /// error of the request.
+    WriteProbed {
+        member: u64,
+        nonce: u64,
+        reply: std::result::Result<WriteProbeReply, String>,
     },
 }
 
@@ -259,6 +268,8 @@ const MAX_UNCOMMITTED_BYTES: usize = 2 * log::MAX_BYTES;
 
 pub struct Node {
     pub(crate) metrics: std::sync::Arc<crate::metrics::Member>,
+    /// The cluster and the shared store that this member names on its peer traffic.
+    peer: crate::peer::Identity,
     /// The object namespace that serves snapshot objects to peers.
     pub(crate) location: std::sync::Arc<crate::state::transfer::Location>,
     last_observed_leader: u64,
@@ -303,6 +314,13 @@ pub struct Node {
     held_puts: Option<quorum_put::HeldPuts>,
     /// The term of the entries in the last submitted PreparePuts job.
     prepare_term: u64,
+    /// True while the log above a held entry is past its alarm bound. See `tick_apply_pause`.
+    hold_alarm: bool,
+    /// The entry that apply held on, until apply passes it. See `WriterReport::apply_held_at`.
+    apply_held_at: Option<u64>,
+    /// The last entry of a PreparePuts job that a storage error ended. No early reply runs
+    /// until apply passes it, so the committed path applies those entries and retries.
+    unprepared: u64,
     quorum_reply_index: u64,
     /// Watch creations that wait while a Put reply runs ahead of the local apply.
     watch_waiters: Vec<oneshot::Sender<()>>,
@@ -353,6 +371,10 @@ pub struct Node {
     /// Simulation: the leader does not propose compaction steps, as if their reads were slow.
     #[cfg(test)]
     hold_compact_steps: bool,
+    /// Tests: run the clock check of the shared writer also with a manual transport. Probes
+    /// still need the peer routes, so the test gives the samples itself.
+    #[cfg(test)]
+    clock_in_manual: bool,
     /// The quota flag of this member and its `SetQuota` proposals.
     quota: quota::Quota,
     /// The term and index of the first `SeedMembers` proposal of this member in its last term.
@@ -362,6 +384,9 @@ pub struct Node {
     /// Simulation: the member proposes no `SeedMembers`, like an earlier binary.
     #[cfg(test)]
     pub(super) hold_members: bool,
+    /// Tests: promote a shared learner without its write proof.
+    #[cfg(test)]
+    pub(super) skip_write_proof: bool,
     /// The node compared the flags with the stored membership row.
     members_observed: bool,
 }
@@ -440,6 +465,7 @@ impl Node {
             overlay_max_bytes: options.overlay_max_bytes,
             restore: options.restore.clone(),
             record: crate::state::shared::Record::of(storage.recovery_snapshot())?,
+            store_id: None,
         };
         let mut state = options
             .object_store
@@ -611,6 +637,10 @@ impl Node {
             }
         };
         let manual_apply = transport_override.is_some();
+        let identity = crate::peer::Identity {
+            cluster: options.cluster_id.clone(),
+            store: state.store_id().map(|id| id.to_string()),
+        };
         state.set_open_retries(!manual_apply);
         let mut traffic = BTreeMap::<u64, std::sync::Arc<crate::metrics::PeerTraffic>>::new();
         let mut transports = tokio::task::JoinSet::new();
@@ -630,7 +660,7 @@ impl Node {
                 transports.spawn(transport_to(
                     peer,
                     address_rx,
-                    options.cluster_id.clone(),
+                    identity.clone(),
                     rx,
                     events.clone(),
                     options.transport.clone(),
@@ -647,6 +677,7 @@ impl Node {
         )?);
         crate::metrics::reads::READS.register(&state.metrics.registry)?;
         crate::object::bounded::LIMITER.register(&state.metrics.registry)?;
+        crate::mvcc::storage_fault::register(&state.metrics.registry)?;
         let handles = state.shared_handles();
         let writer = match &handles {
             Some(handles) => {
@@ -665,6 +696,8 @@ impl Node {
                     .registry
                     .register(Box::new(retained.clone()))?;
                 let mut writer = shared::Writer::new(handles, options.view_max_age, clock);
+                let prober = shared::Prober::new(options.id, handles.source.clone());
+                writer.prober = Some(std::sync::Arc::new(prober));
                 writer.retention = options.view_retention;
                 writer.retained = Some(retained);
                 writer.gauges = Some(shared::Gauges::register(&state.metrics.registry)?);
@@ -689,6 +722,8 @@ impl Node {
             quota_warned: false,
             #[cfg(test)]
             hold_compact_steps: false,
+            #[cfg(test)]
+            clock_in_manual: false,
             location,
             metrics,
             last_observed_leader: 0,
@@ -735,6 +770,9 @@ impl Node {
             prepared_puts: None,
             held_puts: None,
             prepare_term: 0,
+            unprepared: 0,
+            hold_alarm: false,
+            apply_held_at: None,
             quorum_reply_index: 0,
             watch_waiters: Vec::new(),
             state: applied,
@@ -744,6 +782,7 @@ impl Node {
             prefer_query: false,
             apply_delay_ms: 0,
             options,
+            peer: identity,
             senders,
             peer_addresses,
             transports,
@@ -777,6 +816,8 @@ impl Node {
             members_rechecked: 0,
             #[cfg(test)]
             hold_members: false,
+            #[cfg(test)]
+            skip_write_proof: false,
             members_observed: false,
         };
         node.sync_members();
@@ -807,6 +848,7 @@ impl Node {
     fn tick(&mut self) -> Result<()> {
         self.tick_raft()?;
         self.retry_reads();
+        self.tick_apply_pause();
         self.expire_leases()?;
         self.publish_member()?;
         self.tick_shared()?;
@@ -833,9 +875,36 @@ impl Node {
         self.propose_term_start()
     }
 
+    /// The identity that this member sends with its peer traffic. Peers must name the same one.
+    pub(crate) fn identity(&self) -> crate::peer::Identity {
+        self.peer.clone()
+    }
+
     /// The shared-mode objects that the snapshot receive path opens.
     pub(crate) fn shared_source(&self) -> Option<std::sync::Arc<crate::state::shared::Source>> {
         self.writer.as_ref().map(|writer| writer.source.clone())
+    }
+
+    /// Shared mode: the write probes that this member runs for the leader.
+    pub(crate) fn write_prober(&self) -> Option<std::sync::Arc<Prober>> {
+        self.writer
+            .as_ref()
+            .and_then(|writer| writer.prober.clone())
+    }
+
+    /// Shared mode: the wall clock that this member returns to a clock probe of the leader.
+    pub(crate) fn probe_clock(&self) -> Option<Millis> {
+        self.writer
+            .as_ref()
+            .map(|writer| writer.clock.now_ms.clone())
+    }
+
+    /// Tests: skew the wall clock of this member's writer and of its probe replies.
+    #[cfg(test)]
+    pub(crate) fn set_clock(&mut self, now_ms: Millis) {
+        if let Some(writer) = &mut self.writer {
+            writer.clock.now_ms = now_ms;
+        }
     }
 
     pub async fn run(self, events: mpsc::Receiver<Event>) -> Result<()> {
@@ -1302,11 +1371,26 @@ impl Node {
                 writer,
             } => self.view_ack(member, checkpoints, publish, coverage, writer),
             Event::PeerProcess { member, process } => {
+                let changed = self.raw.store().process(member) != process;
                 self.raw.store().note_process(member, process);
+                // A new voter process drops its clock sample before the next batch admission. A
+                // new learner process drops its write proof and its running probe at once. A late
+                // frame of the earlier process then cannot bring that proof back.
+                if changed {
+                    self.tick_clock(false);
+                    if let Some(writer) = &mut self.writer {
+                        writer.proofs.forget(member);
+                    }
+                }
             }
             Event::SnapshotRefused { member, target } => {
                 self.raw.store().note_refused(member, target);
             }
+            Event::WriteProbed {
+                member,
+                nonce,
+                reply,
+            } => self.write_probed(member, nonce, reply),
             Event::SnapshotDelay(delay_ms, response) => {
                 self.snapshot_delay_ms = delay_ms.min(5000);
                 let _ = response.send(Ok(self.status()?));
@@ -1770,6 +1854,8 @@ impl Node {
             status["write_profile"] = crate::write_profile::snapshot();
         }
         status["quorum_reply_index"] = self.quorum_reply_index.into();
+        status["apply_paused"] = self.pause_status();
+        status["apply_held_at"] = self.apply_held_at.into();
         status["quota"] = self.quota_status();
         status["members_row"] = self.members_status();
         if let (Some(writer), Some((base, applied, bytes))) = (&self.writer, self.state.view) {
@@ -1780,6 +1866,7 @@ impl Node {
             .flatten()
             .and_then(|view| view.checkpoint().ok());
             status["shared_state"] = json!({
+                "store_id": self.peer.store,
                 "base_applied_index": base,
                 "base_checkpoint": self.state.base_checkpoint,
                 "record_index": self.raw.store().snapshot_index(),

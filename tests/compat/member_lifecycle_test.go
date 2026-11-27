@@ -2,7 +2,9 @@ package compat
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,7 +22,9 @@ func TestLearnerJoinPromoteRemoveAndRecover(t *testing.T) {
 }
 
 func testLearnerLifecycle(t *testing.T, size int, strict bool) {
-	c := newClusterSize(t, size, "--strict-reconfig-check", fmt.Sprint(strict))
+	// The learner makes a second member, so a single voter also starts on RustFS.
+	c := newClusterConfigured(t, size, func(c *cluster) { c.sharedStore = true },
+		"--strict-reconfig-check", fmt.Sprint(strict))
 	api := client(t, c.addresses)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -48,6 +52,7 @@ func testLearnerLifecycle(t *testing.T, size int, strict bool) {
 		args := []string{"--id", fmt.Sprint(id), "--listen", endpoint, "--join",
 			"--dir", filepath.Join(c.root, "learner"), "--cluster-id", filepath.Base(c.root),
 			"--strict-reconfig-check", fmt.Sprint(strict), "--snapshot-every", "0"}
+		args = append(args, c.storeArgs...)
 		for _, member := range added.Members {
 			args = append(args, "--peer", fmt.Sprintf("%d=%s", member.ID, member.PeerURLs[0]))
 		}
@@ -90,6 +95,31 @@ func testLearnerLifecycle(t *testing.T, size int, strict bool) {
 	require.NoError(t, err)
 	require.Equal(t, id, s.Leader)
 	require.False(t, s.IsLearner)
+	// A new leader refuses a membership change until it applies the entries that it had when it
+	// took the lead, see #148. Shared state mode applies more slowly than replicated state mode.
+	// Wait until the leader applied all entries in its log.
+	var incomplete map[string]any
+	require.Eventually(t, func() bool {
+		response, err := http.Get("http://" + endpoint + "/status")
+		if err != nil {
+			return false
+		}
+		defer response.Body.Close()
+		var state map[string]any
+		if json.NewDecoder(response.Body).Decode(&state) != nil || state["role"] != "Leader" {
+			return false
+		}
+		applied, ok1 := state["applied_index"].(float64)
+		committed, ok2 := state["commit_index"].(float64)
+		last, ok3 := state["last_log_index"].(float64)
+		if !ok1 || !ok2 || !ok3 {
+			// A missing field must fail the test, not read as 0 and pass the wait.
+			incomplete = state
+			return true
+		}
+		return committed >= last && applied >= committed
+	}, 10*time.Second, 20*time.Millisecond, "the new leader did not apply its log")
+	require.Nil(t, incomplete, "status lacks an index field")
 	removed := uint64(1)
 	// A two-voter cluster needs both voters until removal commits.
 	if size > 1 {

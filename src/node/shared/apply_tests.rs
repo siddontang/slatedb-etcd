@@ -29,20 +29,57 @@ async fn a_rebase_onto_an_older_base_below_the_log_fails_closed() {
     lose_a_checkpoint_object(Lose::Deleted).await;
 }
 
+/// A shared-mode apply read fails with a transient store error after a lease grant and a
+/// membership change applied in the same job. Apply keeps that prefix and its replies. After
+/// the store recovers, it applies the rest, and each entry completes exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_apply_read_keeps_the_applied_prefix() {
+    lose_a_checkpoint_object(Lose::Unavailable).await;
+}
+
+/// A read loses its object, and then every read of the store fails. The rebase cannot find its
+/// replacement checkpoint, and it retries. A covering snapshot ends the job with its prefix.
+/// The install of that snapshot fails on the store too, and a newer snapshot supersedes it.
+/// After the store recovers, the newer snapshot installs, and apply goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn covering_snapshots_preempt_a_rebase_and_an_install_that_retry() {
+    lose_a_checkpoint_object(Lose::Stuck).await;
+}
+
+/// A read loses its object. The rebase adopts its checkpoint, but its replay then fails on the
+/// store. A covering snapshot ends the job. The node gets the prefix boundary and no state
+/// below it. A queued job behind it also reports the boundary, the end of the prefix, and not
+/// the index where the replay stopped. Then the snapshot installs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_covering_snapshot_preempts_a_failed_rebase_replay() {
+    lose_a_checkpoint_object(Lose::Replay).await;
+}
+
 /// The base of `lose_a_checkpoint_object`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Lose {
+    /// The base has row 20, and its SST reads fail until the store recovers.
+    Unavailable,
     /// The base has row 20.
     AtRow,
     /// The base has row 19, and an announcement certified it through the empty entry 20.
     AboveRow,
     /// The base has row 20 and is deleted. An older checkpoint has row 10.
     Deleted,
+    /// The base has row 20. After the lost read every read of the store fails.
+    Stuck,
+    /// The base has row 20. The first read of the rebase replay fails.
+    Replay,
 }
 
 async fn lose_a_checkpoint_object(lose: Lose) {
-    let truncated = lose != Lose::AtRow;
-    use crate::object::faults::{FaultStore, LOSE_SST_TWICE};
+    let truncated = !matches!(
+        lose,
+        Lose::AtRow | Lose::Unavailable | Lose::Stuck | Lose::Replay
+    );
+    use crate::object::faults::{
+        FaultStore, FAIL_SST_GET, LOSE_SST_TWICE, LOSE_SST_TWICE_THEN_FAIL,
+    };
     use slatedb::config::{CheckpointOptions, CheckpointScope, WriteOptions};
     use slatedb::object_store::ObjectStore;
     let faults = std::sync::Arc::new(FaultStore::new(std::sync::Arc::new(
@@ -125,6 +162,17 @@ async fn lose_a_checkpoint_object(lose: Lose) {
     .unwrap();
     entries[21].entry_type = EntryType::EntryConfChange as i32;
     entries[21].data = change.encode_to_vec();
+    // A lease grant instead of the Compact starts no background compaction read, which could
+    // take the lost reads.
+    if matches!(lose, Lose::Unavailable | Lose::Replay | Lose::Stuck) {
+        entries[20].data = RaftCommand::Lease {
+            id: "21".into(),
+            lease: LeaseCommand::Grant { id: 77, ttl: 60 },
+            origin: 1,
+        }
+        .encode()
+        .unwrap();
+    }
     // Entry 23 reads an old revision. Only the base holds that history row.
     entries[22].data = command(
         23,
@@ -154,6 +202,7 @@ async fn lose_a_checkpoint_object(lose: Lose) {
         overlay_max_bytes: 1 << 30,
         restore: None,
         record: None,
+        store_id: None,
     };
     let store: std::sync::Arc<dyn ObjectStore> = faults.clone();
     let mut state = StateMachine::open_shared(
@@ -234,25 +283,63 @@ async fn lose_a_checkpoint_object(lose: Lose) {
     }
 
     let (events, _) = mpsc::channel(8);
+    let (control, signals) = super::retry::signals();
     let mut executor = Executor {
         state,
         events,
         snapshot_task: None,
         inline_checkpoints: true,
         log: Some(storage.reader()),
+        signals,
+        reported: None,
+        before_replay: None,
     };
     if lose == Lose::Deleted {
         executor.state.admin.delete_checkpoint(id).await.unwrap();
     }
     // The block cache load and its direct read both lose the object, so the job fails.
-    faults.set(LOSE_SST_TWICE);
-    let result = executor
-        .execute(Work {
-            job: Job::Entries(entries[20..].to_vec()),
-            header,
-            delay: Duration::ZERO,
-        })
-        .await;
+    if lose == Lose::Unavailable {
+        faults.set(FAIL_SST_GET);
+        let faults = faults.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            faults.set(0);
+        });
+    } else if lose == Lose::Stuck {
+        faults.set(LOSE_SST_TWICE_THEN_FAIL);
+    } else if lose == Lose::Replay {
+        faults.set(LOSE_SST_TWICE);
+        // The first replay read fails on the store, after the rebase adopted the base at 20.
+        executor.before_replay = Some(Box::new(|| {
+            Err(anyhow::Error::new(crate::mvcc::storage_fault::Classified {
+                fault: crate::mvcc::storage_fault::StorageFault::Transient,
+                message: "the store failed during the replay".into(),
+            }))
+        }));
+    } else {
+        faults.set(LOSE_SST_TWICE);
+    }
+    // Raft accepts a snapshot that covers entry 23 once the failed rebase waits on it.
+    let (preempt, mut paused) = control.handles();
+    let stuck = matches!(lose, Lose::Stuck | Lose::Replay);
+    let covering = tokio::spawn(async move {
+        let waits = paused.wait_for(|paused| paused.as_ref().is_some_and(|p| p.index == 23));
+        if stuck
+            && tokio::time::timeout(Duration::from_secs(5), waits)
+                .await
+                .is_ok()
+        {
+            preempt.send_replace(24);
+        }
+    });
+    let job = executor.execute(Work {
+        job: Job::Entries(entries[20..].to_vec()),
+        header,
+        delay: Duration::ZERO,
+    });
+    let result = tokio::time::timeout(Duration::from_secs(10), job)
+        .await
+        .expect("no snapshot ended the waiting job");
     if lose == Lose::Deleted {
         // The engine reports the truncated prefix. `LogReader::entries` also refuses a short
         // read.
@@ -267,6 +354,103 @@ async fn lose_a_checkpoint_object(lose: Lose) {
         return;
     }
     let completion = result.unwrap();
+    covering.abort();
+    if matches!(lose, Lose::Stuck | Lose::Replay) {
+        // The rebase failed and waited. The snapshot ended the job at its prefix boundary.
+        assert!(completion.early);
+        assert_eq!(completion.applied, 22);
+        // A replay that failed sends no state below the prefix.
+        assert_eq!(completion.state.is_none(), lose == Lose::Replay);
+        let Output::Entries(replies) = completion.output else {
+            panic!("expected entries");
+        };
+        let ids: Vec<_> = replies.iter().map(|reply| reply.id.as_str()).collect();
+        assert_eq!(ids, ["21", "22"]);
+        // The record names checkpoint 20 above its row. The test checks only positions.
+        let record = |index: u64| {
+            let mut snapshot = Snapshot::default();
+            snapshot.mut_metadata().index = index;
+            snapshot.mut_metadata().term = 1;
+            snapshot.data = crate::state::transfer::ViewDescriptor::above_row(id, 20)
+                .encode()
+                .unwrap();
+            Work {
+                job: Job::Snapshot(snapshot),
+                header,
+                delay: Duration::ZERO,
+            }
+        };
+        if lose == Lose::Replay {
+            // The replay left the state at 20. The snapshot replaces it.
+            assert_eq!(executor.state.applied, 20);
+            // The job reported 22, the end of its prefix. A queued job that the snapshot
+            // supersedes reports 22 too. The 20 where the replay stopped would stop the node on
+            // a regressed apply position.
+            let queued = executor
+                .execute(Work {
+                    job: Job::Entries(entries[22..].to_vec()),
+                    header,
+                    delay: Duration::ZERO,
+                })
+                .await
+                .unwrap();
+            assert!(queued.early);
+            assert_eq!(queued.applied, 22);
+            assert!(queued.state.is_none());
+            let installed = executor.execute(record(24)).await.unwrap();
+            assert!(!installed.early);
+            assert_eq!(installed.applied, 24);
+            assert!(installed.state.is_some());
+        } else {
+            let (preempt, mut paused) = control.handles();
+            let newer = tokio::spawn(async move {
+                let waits =
+                    paused.wait_for(|paused| paused.as_ref().is_some_and(|p| p.index == 25));
+                tokio::time::timeout(Duration::from_secs(5), waits)
+                    .await
+                    .expect("the install did not retry")
+                    .unwrap();
+                preempt.send_replace(30);
+            });
+            let install = executor.execute(record(24));
+            let superseded = tokio::time::timeout(Duration::from_secs(10), install)
+                .await
+                .expect("no snapshot ended the waiting install")
+                .unwrap();
+            newer.await.unwrap();
+            assert!(superseded.early);
+            assert_eq!(superseded.applied, 22);
+            faults.set(0);
+            let installed = executor.execute(record(30)).await.unwrap();
+            assert!(!installed.early);
+            assert_eq!(installed.applied, 30);
+        }
+        assert_eq!(control.paused(), None);
+        executor.state.close().await.unwrap();
+        writer.close().await.unwrap();
+        return;
+    }
+    if lose == Lose::Unavailable {
+        // No rebase ran. The prefix kept its lease grant and its membership change.
+        assert!(faults.entered.available_permits() > 0, "no read failed");
+        assert_eq!(completion.applied, 24);
+        let Output::Entries(replies) = completion.output else {
+            panic!("expected entries");
+        };
+        let ids: Vec<_> = replies.iter().map(|reply| reply.id.as_str()).collect();
+        assert_eq!(ids, ["21", "22", "23", "24"]);
+        assert!(matches!(
+            replies[0].lease,
+            Some(LeaseCommand::Grant { id: 77, .. })
+        ));
+        assert_eq!(replies[1].change.as_ref().unwrap().node_id, 9);
+        assert!(replies[2..].iter().all(|reply| reply.change.is_none()));
+        assert!(executor.state.members.members.contains_key(&9));
+        assert_eq!(executor.state.base_checkpoint(), Some(id));
+        executor.state.close().await.unwrap();
+        writer.close().await.unwrap();
+        return;
+    }
     // The read lost its object. The rebase restarted the job, and every entry of the job
     // completes exactly once, with the Compact notice and the membership change.
     assert_eq!(faults.entered.available_permits(), 2);
@@ -309,6 +493,7 @@ async fn grouping_members() -> (StateMachine, StateMachine, Vec<Entry>) {
         overlay_max_bytes: 1 << 30,
         restore: None,
         record: None,
+        store_id: None,
     };
     let mut members = vec![];
     for _ in 0..2 {

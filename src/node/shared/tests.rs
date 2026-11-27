@@ -13,6 +13,7 @@ pub(super) fn voter_options(empty_log: bool) -> crate::state::shared::Options {
         overlay_max_bytes: 1 << 30,
         restore: None,
         record: None,
+        store_id: None,
     }
 }
 use crate::state::overlay::Overlay;
@@ -58,7 +59,12 @@ async fn the_materializer_writes_whole_batches_with_their_sequences() {
     let mut replay = Overlay::new(1);
     replay.push(4, batch(4, &[("b", "2"), ("c", "3"), ("d", "4")]));
     let progress = Arc::new(Progress::new(db.manifest().last_l0_seq()));
-    let task = tokio::spawn(materialize(db.clone(), replay.queue(), progress.clone()));
+    let task = tokio::spawn(materialize(
+        db.clone(),
+        replay.queue(),
+        progress.clone(),
+        clock::Gate::unchecked(),
+    ));
     progress.wait_written(4).await.unwrap();
     assert_eq!(db.snapshot().unwrap().seq(), 4);
     assert_eq!(value(&db, "c").await, Some("3".into()));
@@ -1097,12 +1103,13 @@ async fn a_defragment_that_loses_the_lead_returns_a_retryable_error() {
     // The aged flush publishes a checkpoint with an L0 SST. The members adopt it.
     let id = announcements.next(Duration::from_secs(10), true).await;
     adopt_announced(&mut state, id).await;
-    let db = writer.open.lock().unwrap().clone().unwrap();
+    let db = writer.open.lock().unwrap().clone().unwrap().db;
     let reached = Arc::new(tokio::sync::Notify::new());
     let resume = Arc::new(tokio::sync::Notify::new());
     let defragment = Defragment {
         db,
         admin: handles.admin.clone(),
+        owner: None,
         progress: writer.progress.clone(),
         announced: handles.announced.clone(),
         leadership: writer.leadership.subscribe(),
@@ -1120,14 +1127,15 @@ async fn a_defragment_that_loses_the_lead_returns_a_retryable_error() {
     let mut writer = Writer::new(&handles, STRANDED_AGE, clock());
     writer.sync(true, 4, &events);
     let db = loop {
-        if let Some(db) = writer.open.lock().unwrap().clone() {
-            break db;
+        if let Some(open) = writer.open.lock().unwrap().clone() {
+            break open.db;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
     let defragment = Defragment {
         db,
         admin: handles.admin.clone(),
+        owner: None,
         progress: writer.progress.clone(),
         announced: handles.announced.clone(),
         leadership: writer.leadership.subscribe(),
@@ -1200,8 +1208,9 @@ fn defragment(
     )>,
 ) -> Defragment {
     Defragment {
-        db: writer.open.lock().unwrap().clone().unwrap(),
+        db: writer.open.lock().unwrap().clone().unwrap().db,
         admin: handles.admin.clone(),
+        owner: None,
         progress: writer.progress.clone(),
         announced: handles.announced.clone(),
         leadership: writer.leadership.subscribe(),
@@ -1238,7 +1247,7 @@ async fn check_delayed_checkpoint(compact_before_defragment: bool) {
     if compact_before_defragment {
         // Rewrite the SSTs without advancing the applied announcement. The delayed
         // checkpoint now shares no input SSTs with the upcoming Defragment.
-        crate::state::maintenance::compact_all(&handles.admin)
+        crate::state::maintenance::compact_all(&handles.admin, &|| Ok(()))
             .await
             .unwrap();
     }
@@ -1394,4 +1403,134 @@ async fn an_old_term_task_end_is_not_a_failure() {
     leader.stop().await;
     state.apply(1, None).await.unwrap();
     state.close().await.unwrap();
+}
+
+/// The count of peer requests that `server` refused for their shared store.
+async fn refused_stores(server: &crate::server::Server) -> u64 {
+    let url = format!("http://{}/metrics", server.client_addr());
+    let text = reqwest::get(url).await.unwrap().text().await.unwrap();
+    text.lines()
+        .find_map(|line| line.strip_prefix("slatedb_etcd_peer_store_refusals_total "))
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// Two voters with one cluster ID and one voter list, but on different prefixes, each create
+/// their own store ID. Each voter refuses the other, so no leader is elected and a write fails.
+/// The same voters on one prefix elect a leader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voters_on_different_shared_stores_form_no_quorum() {
+    use crate::proto::etcdserverpb::{kv_client::KvClient, PutRequest};
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    for roots in [["root", "root"], ["root-1", "root-2"]] {
+        let dir = tempfile::tempdir().unwrap();
+        let peers: std::collections::BTreeMap<u64, String> =
+            (1..=2).map(|id| (id, crate::server::test_port())).collect();
+        let mut servers = vec![];
+        for (id, root) in (1..=2).zip(roots) {
+            let mut config =
+                crate::server::ServerConfig::single_node(dir.path().join(id.to_string()));
+            config.state_mode = crate::state::StateMode::Shared;
+            config.object_store = crate::object::Config::Test(store.clone(), root.into());
+            config.id = id;
+            config.listen = peers[&id].parse().unwrap();
+            config.peers = peers.clone();
+            config.client_peers = peers.clone();
+            servers.push(crate::server::Server::start(config).await.unwrap());
+        }
+        if roots[0] == roots[1] {
+            for server in &servers {
+                server.wait_ready(Duration::from_secs(15)).await.unwrap();
+            }
+            let mut ids = vec![];
+            for server in &servers {
+                eventually("the shared state status", async || {
+                    status(server).await["shared_state"]["store_id"].is_string()
+                })
+                .await;
+                ids.push(status(server).await["shared_state"]["store_id"].clone());
+                assert_eq!(refused_stores(server).await, 0);
+            }
+            assert_eq!(ids[0], ids[1]);
+        } else {
+            // Without the check, a leader is elected within two election timeouts.
+            let ready = servers[0].wait_ready(Duration::from_secs(4)).await;
+            assert!(ready.is_err(), "the voters formed a quorum");
+            let channel = tonic::transport::Endpoint::from_shared(servers[1].client_url())
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let put = PutRequest {
+                key: b"key".to_vec(),
+                value: b"value".to_vec(),
+                ..Default::default()
+            };
+            let written =
+                tokio::time::timeout(Duration::from_secs(2), KvClient::new(channel).put(put)).await;
+            assert!(!matches!(written, Ok(Ok(_))), "{written:?}");
+            for server in &servers {
+                assert_eq!(status(server).await["leader_id"], 0);
+                eventually("a refused peer store", async || {
+                    refused_stores(server).await > 0
+                })
+                .await;
+            }
+        }
+        for server in servers {
+            server.shutdown().await.unwrap();
+        }
+    }
+}
+
+/// A paused member opens the newest checkpoint at each poll, so an adoption can drop the same
+/// base again and again. `/status` reports the base with its failure count, and only the first
+/// failure logs. The end of the pause ends the report, after an adoption or an install.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_base_is_reported_until_the_pause_ends() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = super::super::tests::options(dir.path());
+    config.state_mode = crate::state::StateMode::Shared;
+    config.object_store = crate::object::Config::Test(store, "root".into());
+    let (events, _) = mpsc::channel(256);
+    let mut node = Node::open_with_transport(config, events, Some(BTreeMap::new()))
+        .await
+        .unwrap();
+    let id = uuid::Uuid::new_v4();
+    let rejected = apply::RejectedBase {
+        checkpoint: Some(id),
+        index: 9,
+        fault: crate::mvcc::storage_fault::StorageFault::Corrupt,
+        reason: "invalid members row".into(),
+    };
+    for _ in 0..3 {
+        node.finish_output(Output::RejectedBase(rejected.clone()))
+            .unwrap();
+    }
+    let report =
+        |node: &Node| node.status().unwrap()["shared_state"]["writer"]["rejected_base"].clone();
+    let reported = report(&node);
+    assert_eq!(reported["checkpoint"], id.to_string(), "{reported}");
+    assert_eq!(reported["class"], "corrupt");
+    assert_eq!(reported["index"], 9);
+    assert_eq!(reported["failures"], 3);
+    // Another checkpoint starts a new report.
+    let other = apply::RejectedBase {
+        checkpoint: Some(uuid::Uuid::new_v4()),
+        ..rejected
+    };
+    node.finish_output(Output::RejectedBase(other)).unwrap();
+    assert_eq!(report(&node)["failures"], 1);
+    // The overlay stays above the soft limit: the member still waits, and the report stays.
+    let limit = node.options.overlay_max_bytes;
+    node.writer.as_mut().unwrap().paused = true;
+    node.state.view = Some((1, 1, limit + 1));
+    assert!(node.apply_paused());
+    assert_eq!(report(&node)["failures"], 1);
+    // An install or an adoption frees the overlay. The pause ends, and so does the report.
+    node.state.view = Some((1, 1, 0));
+    assert!(!node.apply_paused());
+    assert_eq!(report(&node), Value::Null);
 }

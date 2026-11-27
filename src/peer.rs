@@ -47,14 +47,10 @@ impl Transport for Service {
         &self,
         request: Request<tonic::Streaming<Frame>>,
     ) -> Result<Response<Self::ExchangeStream>, Status> {
-        if request
-            .metadata()
-            .get("x-cluster-id")
-            .and_then(|v| v.to_str().ok())
-            != Some(self.0.cluster_id.as_str())
-        {
-            return Err(Status::permission_denied("peer cluster does not match"));
-        }
+        let header = |name| request.metadata().get(name).and_then(|v| v.to_str().ok());
+        self.0
+            .admit(header(CLUSTER), header(STORE))
+            .map_err(Status::permission_denied)?;
         let process = process_of(
             request
                 .metadata()
@@ -106,6 +102,67 @@ async fn failed(
     }
 }
 
+/// The header and metadata name of the sender's cluster ID on peer traffic.
+pub(crate) const CLUSTER: &str = "x-cluster-id";
+/// The header and metadata name of the sender's shared store ID on peer traffic.
+pub(crate) const STORE: &str = "x-store-id";
+
+/// The cluster and the shared store that a member names on its peer traffic.
+#[derive(Clone, Debug)]
+pub(crate) struct Identity {
+    pub cluster: String,
+    /// The store ID of the cluster claim. A replicated member has no shared store.
+    pub store: Option<String>,
+}
+
+/// The part of a peer identity that differs from the identity of this member.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Mismatch {
+    Cluster,
+    Store,
+}
+
+#[cfg(test)]
+impl From<&str> for Identity {
+    fn from(cluster: &str) -> Self {
+        Self {
+            cluster: cluster.to_owned(),
+            store: None,
+        }
+    }
+}
+
+impl Identity {
+    /// Check the cluster and the store that a peer names. A member admits exactly the identity
+    /// that it sends.
+    ///
+    /// A member on another bucket or prefix cannot open the checkpoints of this store. So its
+    /// traffic stops before Raft can count it in a quorum. A peer that names no store is also
+    /// refused.
+    pub(crate) fn admits(
+        &self,
+        cluster: Option<&str>,
+        store: Option<&str>,
+    ) -> Result<(), Mismatch> {
+        if cluster != Some(self.cluster.as_str()) {
+            return Err(Mismatch::Cluster);
+        }
+        if store != self.store.as_deref() {
+            return Err(Mismatch::Store);
+        }
+        Ok(())
+    }
+
+    /// Add the identity headers to a peer HTTP request.
+    pub(crate) fn headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let request = request.header(CLUSTER, &self.cluster);
+        match &self.store {
+            Some(store) => request.header(STORE, store),
+            None => request,
+        }
+    }
+}
+
 /// The header and metadata name of the sender's process ID on peer traffic.
 pub(crate) const PROCESS: &str = "x-member-process";
 /// The route of a view snapshot above its checkpoint row. An earlier binary has no such route.
@@ -130,7 +187,7 @@ pub(crate) fn process_of(value: Option<&[u8]>) -> Option<u64> {
 pub(crate) async fn transport(
     peer: u64,
     address: String,
-    cluster_id: String,
+    identity: Identity,
     messages: mpsc::Receiver<Message>,
     events: mpsc::Sender<Event>,
     transport: crate::tls::Transport,
@@ -138,7 +195,7 @@ pub(crate) async fn transport(
 ) {
     let (_address, receiver) = tokio::sync::watch::channel(address);
     transport_to(
-        peer, receiver, cluster_id, messages, events, transport, traffic,
+        peer, receiver, identity, messages, events, transport, traffic,
     )
     .await;
 }
@@ -150,7 +207,7 @@ pub(crate) async fn transport(
 pub(crate) async fn transport_to(
     peer: u64,
     mut address: tokio::sync::watch::Receiver<String>,
-    cluster_id: String,
+    identity: Identity,
     mut messages: mpsc::Receiver<Message>,
     events: mpsc::Sender<Event>,
     transport: crate::tls::Transport,
@@ -174,7 +231,7 @@ pub(crate) async fn transport_to(
             spawn_snapshot(
                 &transport.http,
                 &url,
-                &cluster_id,
+                &identity,
                 first,
                 &traffic,
                 &events,
@@ -186,11 +243,18 @@ pub(crate) async fn transport_to(
             TransportClient::new(channel.clone()).max_encoding_message_size(FRAME_LIMIT);
         let (frames, stream) = mpsc::channel(WINDOW);
         let mut request = Request::new(ReceiverStream::new(stream));
-        let Ok(cluster) = cluster_id.parse() else {
+        let Ok(cluster) = identity.cluster.parse() else {
             report(&events, peer, false, false).await;
             return;
         };
-        request.metadata_mut().insert("x-cluster-id", cluster);
+        request.metadata_mut().insert(CLUSTER, cluster);
+        if let Some(store) = &identity.store {
+            let Ok(store) = store.parse() else {
+                report(&events, peer, false, false).await;
+                return;
+            };
+            request.metadata_mut().insert(STORE, store);
+        }
         if let Ok(process) = process_id().to_string().parse() {
             request.metadata_mut().insert(PROCESS, process);
         }
@@ -228,7 +292,7 @@ pub(crate) async fn transport_to(
             loop {
                 if acknowledged == sent {
                     if let Some(message) = snapshot.take() {
-                        spawn_snapshot(&transport.http, &url, &cluster_id, message, &traffic, &events, peer);
+                        spawn_snapshot(&transport.http, &url, &identity, message, &traffic, &events, peer);
                     }
                 }
                 tokio::select! {
@@ -298,17 +362,17 @@ pub(crate) async fn transport_to(
 fn spawn_snapshot(
     client: &reqwest::Client,
     url: &str,
-    cluster: &str,
+    identity: &Identity,
     message: Message,
     traffic: &std::sync::Arc<crate::metrics::PeerTraffic>,
     events: &mpsc::Sender<Event>,
     peer: u64,
 ) {
-    let (client, url, cluster) = (client.clone(), url.to_owned(), cluster.to_owned());
+    let (client, url, identity) = (client.clone(), url.to_owned(), identity.clone());
     let (traffic, events) = (traffic.clone(), events.clone());
     tokio::spawn(async move {
         let target = <[u8; 8]>::try_from(message.context.as_ref()).map(u64::from_le_bytes);
-        let delivery = post_snapshot(&client, &url, &cluster, message, &traffic).await;
+        let delivery = post_snapshot(&client, &url, &identity, message, &traffic).await;
         // The member does not run the process that the snapshot names. That process loses the
         // capability, but a later process that reported it keeps it.
         if let (Delivery::Refused, Ok(target)) = (delivery, target) {
@@ -325,7 +389,7 @@ fn spawn_snapshot(
 
 /// The result of one snapshot request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Delivery {
+enum Delivery {
     Sent,
     Failed,
     /// The receiver has no route for a snapshot above its row, or it runs another process.
@@ -335,10 +399,10 @@ pub(crate) enum Delivery {
 /// Send one snapshot. The node names a receiver process in the context of a view snapshot above
 /// its checkpoint row, and zero when it knows none. Such a snapshot goes to `COVERED_ROUTE`. An
 /// earlier binary answers 404, and another process 409, before Raft sees the snapshot.
-pub(crate) async fn post_snapshot(
+async fn post_snapshot(
     client: &reqwest::Client,
     url: &str,
-    cluster: &str,
+    identity: &Identity,
     message: Message,
     traffic: &crate::metrics::PeerTraffic,
 ) -> Delivery {
@@ -357,8 +421,8 @@ pub(crate) async fn post_snapshot(
         if let (true, Some(target)) = (covered, target) {
             request = request.header(TARGET_PROCESS, target.to_string());
         }
-        let response = request
-            .header("x-cluster-id", cluster)
+        let response = identity
+            .headers(request)
             .header(PROCESS, process_id().to_string())
             // The follower copies the checkpoint objects before it replies. A retry continues
             // from the objects that it already copied.

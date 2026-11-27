@@ -758,6 +758,7 @@ impl StateMachine {
                     overlay_max_bytes: u64::MAX,
                     restore: None,
                     record: None,
+                    store_id: None,
                 },
             )
             .await?;

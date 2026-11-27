@@ -194,26 +194,41 @@ checkpoint of it, its base, under an in-memory overlay of the newer applied batc
 | `--view-max-age` | `10s` | Age of the oldest unflushed write that starts a flush and checkpoint. |
 | `--view-pin-max` | `5m` | Age after which a read view fails with a retryable error. |
 | `--overlay-max-bytes` | 1073741824 | Leader admission limit of the overlay. Apply waits at 2x. |
-| `--max-clock-skew` | `5s` | A new writer does not start with its clock this far behind. |
+| `--max-clock-skew` | `5s` | Writer clock limit: behind the manifest, or above voters. |
 | `--view-retention` | `off` | `off` keeps all view checkpoints. `fenced` deletes unpinned ones. |
 
 Rules and limits:
 
 - All members use one S3 bucket and prefix. Learners and `--join` members are supported.
+  A member refuses peer traffic from another bucket or prefix. See
+  [shared store ID](shared-state-guide.md#shared-store-id).
 - A native backup is exempt from `--view-pin-max`. The overlay segments that backups keep after a
   base switch count against `--overlay-max-bytes` on each member. See
   [backups](shared-state.md#backups).
-- The cluster claim `shared/owner.json` stores the mode, the quota, and the initial voters.
-  Later starts use that quota. A member with other initial voters refuses to open the writer.
+- The cluster claim `shared/owner.json` stores the mode, the quota, the initial voters, and a
+  random store ID. Later starts use that quota. A member with other initial voters refuses to
+  open the writer.
 - On S3, `mode.json` under the cluster prefix fixes the mode before any state write. A shared start
   also refuses a prefix that holds a replicated member namespace.
 - A directory keeps its mode. A member refuses to start in a different mode.
 - The leader opens the writer when it takes the lead. The open fences the old writer. The leader
-  then checks that it still leads the same term, and waits until its clock passes the manifest
-  clock. A fence while it still leads opens the writer again.
-- Over `--max-clock-skew`, the writer does not start. The member logs an error, sets
-  `clock_alarm` in `/status`, exports `slatedb_etcd_shared_clock_skew_milliseconds`, and tries
-  again with a backoff. After three refusals the leader hands over the lead.
+  then checks that it still leads the same term. It waits until its clock passes the manifest
+  clock and the times of the newest L0 SST ID and compaction job ID. A fence while it still
+  leads opens the writer again.
+- With its clock over `--max-clock-skew` behind, the writer does not start. The member logs an
+  error, sets `clock_alarm` to `behind` in `/status`, exports
+  `slatedb_etcd_shared_clock_skew_milliseconds`, and tries again with a backoff. After three
+  refusals the leader hands over the lead.
+- A leader of several voters probes the clock of each voter every 500 ms. It caps each tick at
+  `--max-clock-skew` above the voter-majority clock that it estimates at admission. A leader
+  clock that is further ahead writes at the cap and sets `clock_alarm` to `ahead`. This is a
+  diagnostic, not a fault.
+- A writer without fresh clock samples of a voter majority waits. `/status` shows
+  `clock.waiting`, and `slatedb_etcd_shared_writer_clock_waiting` is 1. A wait that holds a
+  batch for 30 s is a `stalled` fault. A skew that missing voters could still support is
+  uncertain: the ticks stay at the bound, and `clock.uncertain` shows it without an alarm.
+- One voter has no clock probe. An earlier binary has no `/raft/clock` route and gives no
+  sample, so upgrade all members first. See [Clocks](shared-state.md#clocks).
 - A storage error of the writer keeps the member up. The writer opens again with a backoff, and
   a member whose path fails hands over the lead. See
   [writer faults](shared-state.md#writer-faults).

@@ -1,6 +1,6 @@
 use super::*;
 use crate::watch::{Batch, FeedState, PAGE_REVISIONS};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
@@ -58,11 +58,17 @@ impl Drop for Slot {
     }
 }
 
+/// Creates that wait behind a progress reply. One more ends the stream with a retryable error,
+/// and the client resumes each watch on a new stream.
+const MAX_WAITING_CREATES: usize = 64;
+
 struct Watcher {
     _active: Option<crate::metrics::Active>,
     _slot: Option<Slot>,
     /// The create request. `Stream` keeps its start revision in `start`.
     request: WatchCreateRequest,
+    /// The start revision that the client asked for. Zero or less means the next revision.
+    requested: i64,
     /// The next revision that this watcher can receive.
     /// `None` means `position + 1` of the stream: the watcher follows the feed.
     start: Option<i64>,
@@ -70,6 +76,18 @@ struct Watcher {
 }
 
 type Output = mpsc::Sender<Result<WatchResponse, Status>>;
+
+/// A create request with its decision. An empty `reason` creates the watcher.
+struct Create {
+    request: WatchCreateRequest,
+    reason: &'static str,
+}
+
+/// A request that waits behind a progress reply. A Cancel does not wait. See `Stream::cancel`.
+enum Waiting {
+    Create(Create),
+    Progress,
+}
 
 /// The state of one watch stream.
 ///
@@ -98,9 +116,29 @@ struct Stream {
     /// Watchers that store their start revision.
     pinned: BTreeSet<i64>,
     next_id: i64,
+    /// Storage reads that stopped a page in a row. See `Stream::storage_stopped`.
+    storage_stops: u32,
+    /// The next storage catch-up waits until this time.
+    retry_at: tokio::time::Instant,
+    /// The goal revision of the progress request that the stream serves. It stays fixed until
+    /// the reply.
+    progress: Option<i64>,
+    /// Creates and progress requests that arrived while a progress reply waited, in request
+    /// order. See `Stream::hold_create`.
+    waiting: VecDeque<Waiting>,
     /// Runs once after the next journal scan, before the responses take a new view.
     #[cfg(test)]
     after_scan: Option<Box<dyn FnOnce() + Send>>,
+}
+
+/// The first wait after storage reads stopped two pages in a row. It doubles to `RETRY_CAP`.
+const RETRY_FIRST: Duration = Duration::from_millis(100);
+const RETRY_CAP: Duration = Duration::from_secs(5);
+
+/// Return true when a Watch read can succeed on a new view: the store failed, an object is
+/// gone, or the pin expired. Corrupt stored data ends the stream with `DataLoss`.
+fn retryable(status: &Status) -> bool {
+    status.code() == tonic::Code::Unavailable
 }
 
 fn unavailable() -> Status {
@@ -143,9 +181,27 @@ impl Stream {
             ranges: BTreeSet::new(),
             pinned: BTreeSet::new(),
             next_id: 0,
+            storage_stops: 0,
+            retry_at: tokio::time::Instant::now(),
+            progress: None,
+            waiting: VecDeque::new(),
             #[cfg(test)]
             after_scan: None,
         }
+    }
+
+    /// A storage read stopped a page, and the watchers resume on a new view. The first retry
+    /// runs at once, as for an expired pin. Each later stop in a row doubles the wait from
+    /// `RETRY_FIRST` to `RETRY_CAP`, so a failing store gets no busy loop.
+    fn storage_stopped(&mut self) {
+        let wait = match self.storage_stops {
+            0 => Duration::ZERO,
+            stops => RETRY_FIRST
+                .saturating_mul(1 << (stops - 1).min(16))
+                .min(RETRY_CAP),
+        };
+        self.storage_stops += 1;
+        self.retry_at = tokio::time::Instant::now() + wait;
     }
 
     /// Return the newest state. A leader-required stream fails without a leader.
@@ -301,6 +357,7 @@ impl Stream {
             let mut prepared = vec![];
             let mut bytes = 0;
             let mut stopped = None;
+            let mut storage = false;
             'rows: for (revision, journal) in journals {
                 self.candidates(journal, &mut ids);
                 let mut sent = vec![];
@@ -326,7 +383,8 @@ impl Stream {
                                 sent.push(*id);
                             }
                             Ok(None) => sent.push(*id),
-                            Err(status) if crate::state::view::expired(status.message()) => {
+                            Err(status) if retryable(&status) => {
+                                storage = true;
                                 stopped = Some((*revision, sent));
                                 break 'rows;
                             }
@@ -337,6 +395,9 @@ impl Stream {
             }
             // Release the view before any send. A slow client cannot hold the pin.
             drop((reads, state));
+            if storage {
+                self.storage_stopped();
+            }
             record_batch(bytes, prepared.len());
             for (id, response) in prepared {
                 let watcher = self.watchers.get_mut(&id).expect("prepared watcher");
@@ -476,16 +537,19 @@ impl Stream {
             drop(HELD_SCAN.lock().await);
         }
         // Each page is one read with its own pin deadline. An expired page resumes on a new
-        // view after the last revision that each watcher received.
+        // view after the last revision that each watcher received. A failed page delivers
+        // nothing, so the watchers resume at their own starts and skip no revision.
         let reads = view.read_state();
         let (rows, covered) = match crate::watch::scan(&reads, from, limit, PAGE_REVISIONS).await {
             Ok(page) => page,
-            Err(error) if crate::state::view::expired(&error.message) => return Ok(true),
             Err(error) => {
-                return Err(Status::unavailable(format!(
-                    "etcdserver: {}",
-                    error.message
-                )));
+                let status = error.status();
+                if !retryable(&status) {
+                    return Err(status);
+                }
+                drop((reads, view, state));
+                self.storage_stopped();
+                return Ok(true);
             }
         };
         // The scan used part of the pin. The responses read prev_kv history on a fresh view
@@ -513,6 +577,7 @@ impl Stream {
         let mut prepared = vec![];
         let mut bytes = 0;
         let mut stopped = None;
+        let mut storage = false;
         'rows: for (revision, journal) in &rows {
             self.candidates(journal, &mut ids);
             let mut sent = vec![];
@@ -539,7 +604,8 @@ impl Stream {
                             sent.push(*id);
                         }
                         Ok(None) => sent.push(*id),
-                        Err(status) if crate::state::view::expired(status.message()) => {
+                        Err(status) if retryable(&status) => {
+                            storage = true;
                             stopped = Some((*revision, sent));
                             break 'rows;
                         }
@@ -550,6 +616,11 @@ impl Stream {
         }
         // Release the view before any send. A slow client cannot hold the pin.
         drop((reads, rows, state));
+        if storage {
+            self.storage_stopped();
+        } else {
+            self.storage_stops = 0;
+        }
         record_batch(bytes, prepared.len());
         for (id, response) in prepared {
             let watcher = self.watchers.get_mut(&id).expect("prepared watcher");
@@ -577,9 +648,149 @@ impl Stream {
         Ok(covered < limit)
     }
 
-    async fn catch_up_all(&mut self, through: Option<i64>) -> Result<(), Status> {
-        while self.catch_up(through).await? {}
-        Ok(())
+    /// Run storage catch-up, the waiting progress requests, and the requests behind them to
+    /// their end, as the stream loop does.
+    #[cfg(test)]
+    async fn settle(&mut self) -> Result<(), Status> {
+        loop {
+            match self.next_waiting() {
+                Some(Waiting::Create(create)) => {
+                    self.acknowledge(create).await?;
+                    continue;
+                }
+                Some(Waiting::Progress) => {
+                    self.progress()?;
+                    continue;
+                }
+                None => {}
+            }
+            if !self.unsynced() && self.progress.is_none() {
+                return Ok(());
+            }
+            tokio::time::sleep_until(self.retry_at).await;
+            match self.progress.is_none() {
+                true => self.catch_up(None).await.map(drop)?,
+                false => self.progress_page().await?,
+            }
+        }
+    }
+
+    /// Take a create request as the stream loop does: create it at once, or queue it.
+    #[cfg(test)]
+    async fn request_create(&mut self, request: WatchCreateRequest) -> Result<(), Status> {
+        match self.hold_create(request)? {
+            Some(create) => self.acknowledge(create).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Take a progress request as the stream loop does: serve it at once, or queue it.
+    #[cfg(test)]
+    fn request_progress(&mut self) -> Result<(), Status> {
+        match self.hold_progress() {
+            true => Ok(()),
+            false => self.progress(),
+        }
+    }
+
+    /// Decide a create request against the stream as the request finds it: its range, a
+    /// duplicate ID, the watcher limit, and an ID for a request without one. A create that
+    /// waits keeps this decision, also when a later Cancel ends the watcher with its ID.
+    fn decide(&mut self, mut request: WatchCreateRequest) -> Create {
+        if request.key.is_empty() {
+            request.key = vec![0];
+        }
+        let queued: Vec<i64> = self
+            .waiting
+            .iter()
+            .filter_map(|waiting| match waiting {
+                Waiting::Create(create) if create.reason.is_empty() => {
+                    Some(create.request.watch_id)
+                }
+                _ => None,
+            })
+            .collect();
+        let taken = |id: i64| self.watchers.contains_key(&id) || queued.contains(&id);
+        let reason = if !request.range_end.is_empty()
+            && request.range_end != [0]
+            && request.key >= request.range_end
+        {
+            "mvcc: watcher range is empty"
+        } else if request.watch_id != 0 && taken(request.watch_id) {
+            "mvcc: duplicate watch ID provided on the WatchStream"
+        } else if self.limits.per_stream > 0
+            && self.watchers.len() + queued.len() >= self.limits.per_stream
+        {
+            "watch limit exceeded"
+        } else {
+            ""
+        };
+        if reason.is_empty() && request.watch_id == 0 {
+            while taken(self.next_id) {
+                self.next_id += 1;
+            }
+            request.watch_id = self.next_id;
+            self.next_id += 1;
+        }
+        Create { request, reason }
+    }
+
+    /// Decide a create, and return it when it can run now. Otherwise queue it behind a waiting
+    /// progress reply. The client applies a stream-wide progress reply to each watch that it
+    /// knows. So no watch can be acknowledged before an earlier progress reply, which may be
+    /// older than its start. A full queue ends the stream with a retryable error.
+    #[allow(clippy::result_large_err)]
+    fn hold_create(&mut self, request: WatchCreateRequest) -> Result<Option<Create>, Status> {
+        let create = self.decide(request);
+        if self.progress.is_none() && self.waiting.is_empty() {
+            return Ok(Some(create));
+        }
+        let creates = self
+            .waiting
+            .iter()
+            .filter(|waiting| matches!(waiting, Waiting::Create(_)))
+            .count();
+        if creates >= MAX_WAITING_CREATES {
+            return Err(Status::unavailable(
+                "etcdserver: too many watch creates wait for a progress reply; retry",
+            ));
+        }
+        self.waiting.push_back(Waiting::Create(create));
+        Ok(None)
+    }
+
+    /// Queue a progress request behind a waiting progress reply, and return true. Return false
+    /// when it can run now. A request right behind another waiting request folds into it: its
+    /// goal is the revision when it runs.
+    fn hold_progress(&mut self) -> bool {
+        if self.progress.is_none() && self.waiting.is_empty() {
+            return false;
+        }
+        if !matches!(self.waiting.back(), Some(Waiting::Progress)) {
+            self.waiting.push_back(Waiting::Progress);
+        }
+        true
+    }
+
+    /// Remove the waiting create at `at`. Two progress requests that it kept apart fold into
+    /// one, as in `hold_progress`, so the queue keeps its bound.
+    fn unqueue(&mut self, at: usize) -> bool {
+        if self.waiting.remove(at).is_none() {
+            return false;
+        }
+        let progress = |waiting: Option<&Waiting>| matches!(waiting, Some(Waiting::Progress));
+        if at > 0 && progress(self.waiting.get(at - 1)) && progress(self.waiting.get(at)) {
+            self.waiting.remove(at);
+        }
+        true
+    }
+
+    /// The next waiting request, once no progress reply waits.
+    fn next_waiting(&mut self) -> Option<Waiting> {
+        match self.progress {
+            Some(_) => None,
+            None => self.waiting.pop_front(),
+        }
     }
 
     /// Send automatic progress and recheck expiring tokens.
@@ -616,30 +827,29 @@ impl Stream {
         Ok(())
     }
 
-    async fn create(&mut self, mut request: WatchCreateRequest) -> Result<(), Status> {
+    /// Decide a create and reply to it at once, for tests that drive no progress request.
+    #[cfg(test)]
+    async fn create(&mut self, request: WatchCreateRequest) -> Result<(), Status> {
+        let create = self.decide(request);
+        self.acknowledge(create).await
+    }
+
+    /// Reply to a decided create, and add its watcher. See `Stream::decide`.
+    async fn acknowledge(&mut self, create: Create) -> Result<(), Status> {
+        let Create {
+            mut request,
+            reason,
+        } = create;
         let state = self.current(false)?;
         state
             .view
             .auth
             .authenticated(&self.credentials())
             .map_err(|e| e.status())?;
-        if request.key.is_empty() {
-            request.key = vec![0];
-        }
-        let reason = if !request.range_end.is_empty()
-            && request.range_end != [0]
-            && request.key >= request.range_end
-        {
-            "mvcc: watcher range is empty"
-        } else if request.watch_id != 0 && self.watchers.contains_key(&request.watch_id) {
-            "mvcc: duplicate watch ID provided on the WatchStream"
-        } else if self.limits.per_stream > 0 && self.watchers.len() >= self.limits.per_stream {
-            "watch limit exceeded"
-        } else {
-            ""
-        };
-        // Check the range before the create takes a member slot. A denied create whose
-        // acknowledgment waits for a slow client must not hold one.
+        // A refused create takes no member slot. Check the range before the create takes one,
+        // so a denied create whose acknowledgment waits for a slow client does not hold one.
+        // The member limit is checked here, not in `decide`: a create that waits behind a
+        // progress reply holds no slot.
         let slot = if reason.is_empty()
             && permit(&state.view.auth, &self.credentials(), &request).is_ok()
         {
@@ -652,14 +862,9 @@ impl Stream {
         } else {
             reason
         };
-        if reason.is_empty() && request.watch_id == 0 {
-            while self.watchers.contains_key(&self.next_id) {
-                self.next_id += 1;
-            }
-            request.watch_id = self.next_id;
-            self.next_id += 1;
-        }
-        let header = state.header(self.position);
+        // A create runs only when no progress request waits, so the stream follows the feed.
+        let created = self.position;
+        let header = state.header(created);
         let auth = state.view.auth.clone();
         // Release the state before the send. The Auth store does not pin the view.
         drop(state);
@@ -682,8 +887,9 @@ impl Stream {
         if !reason.is_empty() {
             return Ok(());
         }
+        let requested = request.start_revision;
         if request.start_revision <= 0 {
-            request.start_revision = self.position + 1;
+            request.start_revision = created + 1;
         }
         // A token can expire while the acknowledgment waits for the client.
         permit(&auth, &self.credentials(), &request)?;
@@ -695,19 +901,30 @@ impl Stream {
             _slot: slot.unwrap_or_default(),
             start: None,
             request,
+            requested,
             progress: tokio::time::Instant::now(),
         };
+        // A historical watcher is unsynced. The stream loop reads its pages one at a time.
         let start = watcher.request.start_revision;
-        let historical = start <= self.position;
         self.insert(watcher, start);
-        if historical {
-            self.catch_up_all(None).await?;
-        }
         Ok(())
     }
 
     async fn cancel(&mut self, id: i64) -> Result<(), Status> {
-        if self.remove(id).is_some() {
+        // A Cancel takes effect when it arrives, also while a progress reply waits, and its
+        // reply goes out at once. A client matches a cancel reply by its ID. The live watcher
+        // with the ID goes first. Otherwise a waiting create that took the ID ends.
+        let canceled = match self.watchers.contains_key(&id) {
+            true => self.remove(id).is_some(),
+            false => {
+                let queued = self.waiting.iter().position(|waiting| {
+                    matches!(waiting, Waiting::Create(create)
+                        if create.reason.is_empty() && create.request.watch_id == id)
+                });
+                queued.is_some_and(|at| self.unqueue(at))
+            }
+        };
+        if canceled {
             let header = self.current(false)?.header(self.position);
             send(
                 &self.tx,
@@ -724,11 +941,46 @@ impl Stream {
     }
 
     /// Report progress after all events through the current applied revision.
-    async fn progress(&mut self) -> Result<(), Status> {
+    ///
+    /// etcd drops a progress request when a watcher of the stream asked for a start after the
+    /// current revision, so this does too. A watcher whose events exist but whose catch-up
+    /// waits on a failing store does not drop it. The reply then follows those events, unlike
+    /// etcd, which drops such a request too.
+    ///
+    /// The stream loop reads the pages of the request one at a time. So a failing store does
+    /// not keep the loop from a Cancel or a closed client. The goal stays fixed until the reply.
+    /// Later requests wait in request order. See `Stream::hold_progress`.
+    fn progress(&mut self) -> Result<(), Status> {
+        debug_assert!(self.progress.is_none(), "a progress reply waits");
         let goal = self.current(false)?.view.revision;
-        self.catch_up_all(Some(goal)).await?;
+        if self
+            .watchers
+            .values()
+            .any(|watcher| watcher.requested > goal)
+        {
+            return Ok(());
+        }
+        self.progress = Some(goal);
+        Ok(())
+    }
+
+    /// Read one page for the served progress request. Answer it once the watchers have every
+    /// event through its goal. No watcher is created while it waits. See `Stream::hold_create`.
+    async fn progress_page(&mut self) -> Result<(), Status> {
+        let Some(goal) = self.progress else {
+            return Ok(());
+        };
+        if self.catch_up(Some(goal)).await? {
+            return Ok(());
+        }
+        self.progress = None;
         let header = self.current(false)?.header(goal);
-        if !self.watchers.is_empty() && self.watchers.values().all(|w| self.start(w) <= goal + 1) {
+        let watchers: Vec<_> = self
+            .watchers
+            .values()
+            .map(|watcher| self.start(watcher))
+            .collect();
+        if !watchers.is_empty() && watchers.iter().all(|start| *start <= goal + 1) {
             send(
                 &self.tx,
                 WatchResponse {
@@ -802,7 +1054,7 @@ async fn prepare(
         journal,
     )
     .await
-    .map_err(|e| Status::unavailable(format!("etcdserver: {}", e.message)))?;
+    .map_err(crate::mvcc::KvError::status)?;
     if events.is_empty() {
         return Ok(None);
     }
@@ -833,15 +1085,15 @@ async fn send_prepared(
 }
 
 impl Service {
-    /// Ask the node to answer once this member applied every Put that it already answered.
-    /// Its batches are then on the feed.
-    async fn apply_barrier(&self) -> Result<oneshot::Receiver<()>, Status> {
+    /// Wait until this member applied every Put that it already answered. Its batches are
+    /// then on the feed.
+    async fn apply_barrier(&self) -> Result<(), Status> {
         let (response, applied) = oneshot::channel();
         self.events
             .send(Event::WatchBarrier(response))
             .await
             .map_err(|_| unavailable())?;
-        Ok(applied)
+        applied.await.map_err(|_| unavailable())
     }
 
     async fn watch_stream(
@@ -875,43 +1127,77 @@ impl Service {
         // Automatic progress uses the configured interval. Token expiry needs at least 1 s.
         let mut checks = tokio::time::interval(self.watch.progress_interval.min(CHECK_INTERVAL));
         checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // A create waits here for the apply barrier. The stream keeps serving its watchers,
-        // leader loss and checks, and reads the next request only after the create.
-        let mut pending: Option<(WatchCreateRequest, oneshot::Receiver<()>)> = None;
+        // A create waits here for the apply barrier, including a slot in the node queue. The
+        // stream keeps serving its watchers, leader loss and checks, and reads the next request
+        // only after the create. Creates and progress requests behind a progress reply wait in
+        // `Stream::waiting`, and run in request order after the reply. The stream still reads
+        // every request then, so a Cancel takes effect at once.
+        type Barrier<'a> =
+            std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Status>> + Send + 'a>>;
+        let mut pending: Option<(Create, Barrier<'_>)> = None;
         loop {
+            while pending.is_none() {
+                match stream.next_waiting() {
+                    Some(Waiting::Create(create)) => {
+                        pending = Some((create, Box::pin(self.apply_barrier())));
+                    }
+                    Some(Waiting::Progress) => {
+                        stream.drain(&mut events).await?;
+                        stream.progress()?;
+                    }
+                    None => break,
+                }
+            }
             let unsynced = stream.unsynced();
             let waiting = pending.is_some();
+            if waiting || !stream.waiting.is_empty() {
+                // The create fails without a leader. The stream may have no watcher yet.
+                stream.current(false)?;
+            }
+            // A waiting progress request holds the feed, so no later event goes before its
+            // answer. Requests then observe no new batch either.
+            let progress = stream.progress.is_some();
             tokio::select! {
-                received = events.recv() => stream.receive(received).await?,
+                received = events.recv(), if !progress => stream.receive(received).await?,
                 changed = changes.changed() => {
                     changed.map_err(|_| unavailable())?;
                     stream.state_changed()?;
                 }
                 _ = checks.tick() => stream.check().await?,
-                _ = std::future::ready(()), if unsynced => {
+                _ = tokio::time::sleep_until(stream.retry_at), if progress => {
+                    stream.progress_page().await?;
+                }
+                _ = tokio::time::sleep_until(stream.retry_at), if unsynced && !progress => {
                     stream.catch_up(None).await?;
                 }
-                applied = async { (&mut pending.as_mut().expect("waiting").1).await }, if waiting => {
-                    applied.map_err(|_| unavailable())?;
-                    let (request, _) = pending.take().expect("waiting");
-                    // The create observes every batch through the replied Puts.
+                applied = async { pending.as_mut().expect("waiting").1.as_mut().await }, if waiting => {
+                    applied?;
+                    let (create, _) = pending.take().expect("waiting");
+                    // The create observes every batch through the replied Puts. No progress
+                    // request waits, because the stream reads no request until the create.
                     stream.drain(&mut events).await?;
-                    stream.create(request).await?;
+                    stream.acknowledge(create).await?;
                 }
                 message = input.message(), if !waiting => {
                     let Some(message) = message? else { return Ok(()); };
                     // Requests observe all batches that the node published before them.
                     match message.request_union {
                         Some(RequestUnion::CreateRequest(request)) => {
-                            pending = Some((request, self.apply_barrier().await?));
+                            if let Some(create) = stream.hold_create(request)? {
+                                pending = Some((create, Box::pin(self.apply_barrier())));
+                            }
                         }
                         Some(RequestUnion::CancelRequest(request)) => {
-                            stream.drain(&mut events).await?;
+                            if !progress {
+                                stream.drain(&mut events).await?;
+                            }
                             stream.cancel(request.watch_id).await?
                         }
                         Some(RequestUnion::ProgressRequest(_)) => {
-                            stream.drain(&mut events).await?;
-                            stream.progress().await?
+                            if !stream.hold_progress() {
+                                stream.drain(&mut events).await?;
+                                stream.progress()?
+                            }
                         }
                         None => continue,
                     }
@@ -1075,6 +1361,7 @@ mod tests {
 
         async fn watch(&mut self, request: WatchCreateRequest) {
             self.stream.create(request).await.unwrap();
+            self.stream.settle().await.unwrap();
             let created = self.output.recv().await.unwrap().unwrap();
             assert!(created.created && !created.canceled);
         }
@@ -1185,7 +1472,7 @@ mod tests {
         f.stream.batch(&gap).await.unwrap();
         assert_eq!(f.stream.pinned.len(), 3);
         assert!(f.stream.unsynced());
-        f.stream.catch_up_all(None).await.unwrap();
+        f.stream.settle().await.unwrap();
         assert_eq!(f.events(), [(2, 5, 0), (3, 5, 0)]);
         assert!(f.stream.pinned.is_empty() && !f.stream.unsynced());
         f.close().await;
@@ -1198,7 +1485,8 @@ mod tests {
         f.watch(request(2, "other", 0)).await;
         // The view has revision 2, but the stream has not received its batch yet.
         let late = f.put("k", "1").await;
-        f.stream.progress().await.unwrap();
+        f.stream.request_progress().unwrap();
+        f.stream.settle().await.unwrap();
         let responses = f.responses();
         assert_eq!(responses.len(), 2);
         assert_eq!((responses[0].watch_id, responses[0].events.len()), (1, 1));
@@ -1267,7 +1555,7 @@ mod tests {
             f.stream.batch(&batch).await.unwrap();
             // The feed stops inside the revision. The other watchers read storage.
             assert!(f.stream.unsynced());
-            f.stream.catch_up_all(None).await.unwrap();
+            f.stream.settle().await.unwrap();
             assert!(!f.stream.unsynced());
         }
         let mut events = f.events();
@@ -1277,6 +1565,7 @@ mod tests {
                 .create(request(id, "k", revisions[0]))
                 .await
                 .unwrap();
+            f.stream.settle().await.unwrap();
         }
         events.extend(f.events());
         let largest = LARGEST_BATCH.load(std::sync::atomic::Ordering::Relaxed);
@@ -1300,7 +1589,7 @@ mod tests {
         assert!(batch.journals().is_none());
         f.stream.batch(&batch).await.unwrap();
         assert!(f.events().is_empty());
-        f.stream.catch_up_all(None).await.unwrap();
+        f.stream.settle().await.unwrap();
         assert_eq!(f.events(), [(1, 2, 0)]);
         f.close().await;
     }
@@ -1364,6 +1653,7 @@ mod tests {
             ..request(4, "a", 2)
         };
         f.stream.create(history).await.unwrap();
+        f.stream.settle().await.unwrap();
         let responses = f.responses();
         assert!(responses[0].created);
         let events: Vec<_> = responses[1..].iter().flat_map(|r| &r.events).collect();
@@ -1647,6 +1937,7 @@ mod tests {
             .unwrap();
         f.feed.send_replace(feed_state(&f.state));
         f.stream.create(request(1, "k", 2)).await.unwrap();
+        f.stream.settle().await.unwrap();
         let responses = f.responses();
         assert!(responses[0].created);
         assert!(responses[1].canceled);
@@ -1695,6 +1986,7 @@ mod tests {
             .create(request(1, "k", revisions[0]))
             .await
             .unwrap();
+        f.stream.settle().await.unwrap();
         assert!(f.stream.after_scan.is_none(), "the scan ran");
         let responses = f.responses();
         assert_eq!(responses.len(), 2);
@@ -1712,20 +2004,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn progress_follows_history_and_future_watch_delays_it() {
+    async fn progress_follows_history_and_a_future_watch_drops_it() {
         let mut f = Fixture::new().await;
         for n in 0..3 {
             let batch = f.put("k", &n.to_string()).await;
             f.stream.batch(&batch).await.unwrap();
         }
         f.watch(request(1, "k", 0)).await;
-        f.stream.progress().await.unwrap();
+        f.stream.request_progress().unwrap();
+        f.stream.settle().await.unwrap();
         let progress = f.responses();
         assert_eq!(progress.len(), 1);
         assert_eq!(progress[0].watch_id, -1);
         assert_eq!(progress[0].header.as_ref().unwrap().revision, 4);
         f.watch(request(2, "k", 6)).await;
-        f.stream.progress().await.unwrap();
+        f.stream.request_progress().unwrap();
+        f.stream.settle().await.unwrap();
         assert!(f.responses().is_empty());
         f.close().await;
     }
@@ -1749,6 +2043,7 @@ mod tests {
     struct EarlyReply {
         batches: broadcast::Sender<Arc<Batch>>,
         barriers: mpsc::Receiver<oneshot::Sender<()>>,
+        node: mpsc::Sender<Event>,
         client: crate::proto::etcdserverpb::watch_client::WatchClient<tonic::transport::Channel>,
     }
 
@@ -1776,6 +2071,7 @@ mod tests {
                     }
                 }
             });
+            let node_events = events.clone();
             let router = crate::grpc::Servers::new(
                 1,
                 events,
@@ -1795,6 +2091,7 @@ mod tests {
             Self {
                 batches,
                 barriers,
+                node: node_events,
                 client,
             }
         }
@@ -1950,6 +2247,55 @@ mod tests {
         f.close().await;
     }
 
+    /// The first create on a stream has no watcher yet, and leader loss still fails it while
+    /// it waits for the apply barrier.
+    #[tokio::test]
+    async fn leader_loss_fails_the_first_create_while_it_waits_for_the_apply_barrier() {
+        let f = Fixture::new().await;
+        let mut member = EarlyReply::start(&f).await;
+        let (requests, mut output) = member.open_with(true).await;
+        requests.send(create(request(1, "k", 0))).await.unwrap();
+        let _held = member.barrier().await;
+        let mut state = feed_state(&f.state);
+        state.leader = 0;
+        f.feed.send_replace(state);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), output.message())
+            .await
+            .expect("leader loss ends the stream while the first barrier is held")
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().contains("no leader"));
+        f.close().await;
+    }
+
+    /// A create that waits for a slot in a full node queue does not pause delivery to the
+    /// stream's existing watchers.
+    #[tokio::test]
+    async fn a_full_node_queue_does_not_pause_delivery_to_existing_watchers() {
+        let mut f = Fixture::new().await;
+        let mut member = EarlyReply::start(&f).await;
+        let (requests, mut output) = member.open().await;
+        requests.send(create(request(1, "k", 0))).await.unwrap();
+        member.barrier().await.send(()).unwrap();
+        assert!(next(&mut output).await.created);
+        // 16 barriers fill the test's barrier queue, the node holds one, and 16 fill its queue.
+        let mut held = vec![];
+        for _ in 0..33 {
+            let (response, applied) = oneshot::channel();
+            held.push(applied);
+            member
+                .node
+                .send(Event::WatchBarrier(response))
+                .await
+                .unwrap();
+        }
+        requests.send(create(request(2, "k", 0))).await.unwrap();
+        member.batches.send(f.put("k", "1").await).unwrap();
+        let event = next(&mut output).await;
+        assert_eq!((event.watch_id, event.events.len()), (1, 1));
+        f.close().await;
+    }
+
     /// A create with an explicit start also waits for an early Put reply: its header covers
     /// the replied Put, and it still receives events from the requested revision.
     #[tokio::test]
@@ -2001,6 +2347,219 @@ mod tests {
         })
         .await
         .expect("the stream task ends while the apply barrier waits");
+        f.close().await;
+    }
+
+    /// A Put publishes revision 3 while a progress request at revision 2 holds the feed. A
+    /// create then waits until the progress reply went out, so the reply is not older than any
+    /// watch that the client knows. Each event reaches each watcher once.
+    #[tokio::test]
+    async fn a_create_during_a_progress_request_waits_for_its_reply() {
+        let mut f = Fixture::new().await;
+        f.watch(request(1, "k", 0)).await;
+        let two = f.put("k", "2").await;
+        f.stream.batch(&two).await.unwrap();
+        assert_eq!(f.events(), [(1, 2, 0)]);
+        f.stream.request_progress().unwrap();
+        let three = f.put("k", "3").await;
+        f.stream.request_create(request(2, "k", 0)).await.unwrap();
+        assert!(f.responses().is_empty(), "the create did not wait");
+        f.stream.settle().await.unwrap();
+        let responses = f.responses();
+        assert_eq!(responses.len(), 2, "{responses:?}");
+        assert_eq!(responses[0].watch_id, -1);
+        assert_eq!(responses[0].header.unwrap().revision, 2);
+        assert!(responses[1].created && responses[1].watch_id == 2);
+        f.stream.batch(&three).await.unwrap();
+        let four = f.put("k", "4").await;
+        f.stream.batch(&four).await.unwrap();
+        assert_eq!(f.events(), [(1, 3, 0), (2, 3, 0), (1, 4, 0), (2, 4, 0)]);
+        f.close().await;
+    }
+
+    /// A historical watcher created while a progress request holds the feed gets each of its
+    /// revisions once, and its create follows the progress reply.
+    #[tokio::test]
+    async fn a_historical_watch_during_a_progress_request_gets_each_revision_once() {
+        let mut f = Fixture::new().await;
+        f.watch(request(1, "other", 0)).await;
+        let two = f.put("k", "2").await;
+        f.stream.batch(&two).await.unwrap();
+        f.stream.request_progress().unwrap();
+        let three = f.put("k", "3").await;
+        f.stream.request_create(request(2, "k", 2)).await.unwrap();
+        f.stream.settle().await.unwrap();
+        f.stream.batch(&three).await.unwrap();
+        f.stream.settle().await.unwrap();
+        let responses = f.responses();
+        assert_eq!(responses[0].watch_id, -1);
+        assert_eq!(responses[0].header.unwrap().revision, 2);
+        assert!(responses[1].created);
+        let events: Vec<_> = responses
+            .iter()
+            .filter(|r| r.watch_id == 2)
+            .flat_map(|r| r.events.iter().map(|e| e.kv.as_ref().unwrap().mod_revision))
+            .collect();
+        assert_eq!(events, [2, 3]);
+        f.close().await;
+    }
+
+    /// A Cancel removes a create that waits behind a progress reply and gets its reply. The
+    /// create never runs.
+    #[tokio::test]
+    async fn a_cancel_removes_a_waiting_create() {
+        let mut f = Fixture::new().await;
+        f.watch(request(1, "k", 0)).await;
+        f.put("k", "2").await;
+        f.stream.request_progress().unwrap();
+        f.stream.request_create(request(7, "k", 0)).await.unwrap();
+        f.stream.cancel(7).await.unwrap();
+        let canceled = f.responses();
+        assert_eq!(canceled.len(), 1);
+        assert!(canceled[0].canceled && canceled[0].watch_id == 7);
+        f.stream.settle().await.unwrap();
+        let responses = f.responses();
+        assert!(responses.iter().all(|r| !r.created), "{responses:?}");
+        assert!(!f.stream.watchers.contains_key(&7));
+        f.close().await;
+    }
+
+    /// A Cancel of a waiting create between two waiting progress requests folds them into one.
+    /// So the queue holds at most one progress request more than its creates.
+    #[tokio::test]
+    async fn a_cancel_between_two_waiting_progress_requests_folds_them() {
+        let mut f = Fixture::new().await;
+        f.watch(request(1, "k", 0)).await;
+        f.put("k", "2").await;
+        f.stream.request_progress().unwrap();
+        f.stream.request_progress().unwrap();
+        f.stream.request_create(request(7, "k", 0)).await.unwrap();
+        f.stream.request_progress().unwrap();
+        assert_eq!(f.stream.waiting.len(), 3);
+        f.stream.cancel(7).await.unwrap();
+        assert!(matches!(
+            f.stream.waiting.iter().collect::<Vec<_>>()[..],
+            [Waiting::Progress]
+        ));
+        f.close().await;
+    }
+
+    /// As in etcd, a progress request is dropped while a watcher asked for a start after the
+    /// current revision: it gets no reply and holds nothing. Once the store reaches that start,
+    /// a request gets its reply.
+    #[tokio::test]
+    async fn a_future_watch_drops_a_progress_request() {
+        let mut f = Fixture::new().await;
+        f.watch(request(1, "k", 0)).await;
+        f.watch(request(2, "k", 50)).await;
+        f.stream.request_progress().unwrap();
+        assert_eq!(f.stream.progress, None, "the request waits");
+        f.stream.settle().await.unwrap();
+        assert!(f.responses().is_empty());
+        for n in 2..=49 {
+            let batch = f.put("other", &n.to_string()).await;
+            f.stream.batch(&batch).await.unwrap();
+        }
+        f.stream.request_progress().unwrap();
+        f.stream.settle().await.unwrap();
+        assert!(
+            f.responses().is_empty(),
+            "a reply at 49 before the start 50"
+        );
+        let batch = f.put("other", "50").await;
+        f.stream.batch(&batch).await.unwrap();
+        f.stream.request_progress().unwrap();
+        f.stream.settle().await.unwrap();
+        let progress = f.responses();
+        assert_eq!(progress.len(), 1, "{progress:?}");
+        assert_eq!(progress[0].watch_id, -1);
+        assert_eq!(progress[0].header.unwrap().revision, 50);
+        f.close().await;
+    }
+
+    /// As in etcd 3.6.5: at revision 2, a watch from revision 3 drops a progress request. After
+    /// a Put at 3 it gets the event, and a new request gets its reply at 3. A watch from the
+    /// next revision with start 0 does not drop a request at 2.
+    #[tokio::test]
+    async fn an_explicit_start_after_the_revision_drops_a_progress_request() {
+        let mut f = Fixture::new().await;
+        let two = f.put("k", "2").await;
+        f.stream.batch(&two).await.unwrap();
+        f.watch(request(1, "k", 0)).await;
+        f.stream.progress().unwrap();
+        f.stream.settle().await.unwrap();
+        let progress = f.responses();
+        assert_eq!(progress.len(), 1, "{progress:?}");
+        assert_eq!(progress[0].header.unwrap().revision, 2);
+        f.stream.cancel(1).await.unwrap();
+        f.responses();
+        f.watch(request(2, "k", 3)).await;
+        f.stream.progress().unwrap();
+        f.stream.settle().await.unwrap();
+        assert!(f.responses().is_empty(), "a reply at 2 before the start 3");
+        let three = f.put("k", "3").await;
+        f.stream.batch(&three).await.unwrap();
+        assert_eq!(f.events(), [(2, 3, 0)]);
+        f.stream.progress().unwrap();
+        f.stream.settle().await.unwrap();
+        let progress = f.responses();
+        assert_eq!(progress.len(), 1, "{progress:?}");
+        assert_eq!(progress[0].header.unwrap().revision, 3);
+        f.close().await;
+    }
+
+    /// Watcher 5 is live when a progress request waits. A create for ID 5 on another key comes
+    /// next, then a Cancel of ID 5. The create was a duplicate when it came, so it fails after
+    /// the progress reply. The Cancel ends watcher 5, and no event reaches ID 5 again.
+    #[tokio::test]
+    async fn a_waiting_create_keeps_its_duplicate_decision() {
+        let mut f = Fixture::new().await;
+        f.watch(request(1, "k", 0)).await;
+        f.watch(request(5, "k", 0)).await;
+        f.put("k", "2").await;
+        f.stream.progress().unwrap();
+        f.stream
+            .request_create(request(5, "other", 0))
+            .await
+            .unwrap();
+        f.stream.cancel(5).await.unwrap();
+        let canceled = f.responses();
+        assert_eq!(canceled.len(), 1, "{canceled:?}");
+        assert!(canceled[0].canceled && canceled[0].watch_id == 5);
+        f.stream.settle().await.unwrap();
+        let responses = f.responses();
+        let created: Vec<_> = responses.iter().filter(|r| r.created).collect();
+        assert_eq!(created.len(), 1, "{responses:?}");
+        assert!(
+            created[0].canceled && created[0].watch_id == -1,
+            "{:?}",
+            created[0]
+        );
+        assert_eq!(
+            created[0].cancel_reason,
+            "mvcc: duplicate watch ID provided on the WatchStream"
+        );
+        assert!(!f.stream.watchers.contains_key(&5));
+        let batch = f.put("other", "3").await;
+        f.stream.batch(&batch).await.unwrap();
+        assert!(f.events().iter().all(|(id, _, _)| *id != 5));
+        f.close().await;
+    }
+
+    /// Progress requests while a reply waits fold into one, so the queue stays bounded. A
+    /// Cancel still gets its reply.
+    #[tokio::test]
+    async fn waiting_progress_requests_stay_bounded() {
+        let mut f = Fixture::new().await;
+        f.watch(request(1, "k", 0)).await;
+        for _ in 0..1000 {
+            f.stream.request_progress().unwrap();
+            f.put("k", "v").await;
+        }
+        assert!(f.stream.progress.is_some());
+        assert_eq!(f.stream.waiting.len(), 1);
+        f.stream.cancel(1).await.unwrap();
+        assert!(f.responses().iter().any(|r| r.canceled && r.watch_id == 1));
         f.close().await;
     }
 }

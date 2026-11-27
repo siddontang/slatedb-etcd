@@ -57,10 +57,14 @@ This also works after a member restarts with authentication enabled. The Go over
 process fixture. Upstream tests, failpoints, workloads, assertions, and checkers keep their code.
 The fixture reads the advertised etcd API version from the binary to select scenarios.
 Unsupported flags return an error. A skip stays visible in the report.
+A fixture cluster of several members runs in shared state mode on one RustFS server of the run.
+The process patch passes the first member's data directory, which selects the S3 prefix.
 The full workflow supplies etcd v3.5.20 for mixed-version tests and builds Go failpoints for etcd.
 Supply `--last-release PATH` or `--lazyfs PATH` to select existing binaries on a local host.
 The examples fixture changes the server endpoints. Each example retains its upstream assertion
 and runs in its own process. The cluster uses a 200 ms Watch interval and permits member changes.
+It runs in shared state mode on RustFS. `ExampleMaintenance_defragment` keeps replicated state
+mode, because a new shared state leader refuses Defragment until its writer opens.
 Use a disposable Linux host for full process campaigns. They stop members and mount filesystems.
 
 The service still has gaps in Unix sockets, gRPC proxy mode, rolling etcd upgrades,
