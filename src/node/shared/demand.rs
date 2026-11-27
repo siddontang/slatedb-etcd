@@ -23,10 +23,9 @@ impl Node {
     /// The base comes first, then one position read gives the last batch and the covered
     /// index. A switch between the reads makes the check stricter, not weaker. One announcement
     /// serves the demand at a time. A lost proposal is sent again after `CERTIFY_TICKS`. The
-    /// demand ends when the base index reaches it, so an idle cluster stops announcing.
-    ///
-    /// The leader certifies above a row only while every other member advertised that it
-    /// installs such a base. Otherwise it serves no demand until the reports arrive.
+    /// demand ends when the base index reaches it, so an idle cluster stops announcing. The log
+    /// cache sends a record above its row only to a peer whose current process advertised that
+    /// it installs such a base.
     pub(in crate::node) fn certify_base(&mut self) -> Result<()> {
         self.note_base();
         if self.raw.raft.state != StateRole::Leader {
@@ -49,7 +48,6 @@ impl Node {
             return Ok(());
         }
         let record = self.raw.store().snapshot_index();
-        let extend = self.extension_allowed();
         let wanted = self.raw.store().wanted_index();
         // A base below the record cannot replace the record, so the record index is a demand.
         let record = match self.base_below_record() {
@@ -62,7 +60,7 @@ impl Node {
         writer.certify_ticks += 1;
         let demand = writer.demand.max(wanted).max(record);
         let unmet = demand > *writer.applied.based.borrow();
-        if !extend || !unmet {
+        if !unmet {
             writer.certified = None;
             return Ok(());
         }
@@ -101,19 +99,6 @@ impl Node {
             }
         }
         Ok(())
-    }
-
-    /// Return true when every other member of the configuration advertised, on its current
-    /// process, that it installs a base above the checkpoint row. A member that did not report
-    /// yet does not count.
-    pub(in crate::node) fn extension_allowed(&self) -> bool {
-        let store = self.raw.store();
-        let conf = self.raw.raft.prs().conf().to_conf_state();
-        conf.voters
-            .iter()
-            .chain(&conf.learners)
-            .filter(|&&id| id != self.options.id)
-            .all(|&id| store.coverage_capable(id))
     }
 
     /// Tell the log cache which checkpoint and index the base has. See `Cache::has_image`.

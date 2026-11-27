@@ -241,6 +241,41 @@ async fn an_idle_shared_leader_serves_a_snapshot_request_at_the_last_index() {
     sim.assert_records_open().await;
 }
 
+/// Four of five voters restart, and the fifth stays down, so it sends no coverage report. A
+/// follower asks for a snapshot above the base. The leader certifies its base through the
+/// request, and the follower installs the record and catches up.
+#[tokio::test]
+async fn a_request_with_a_voter_down_gets_a_certified_snapshot() {
+    let mut sim = Simulation::with_size(9, 5).await;
+    sim.settle(4).await;
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(10).await;
+    for id in 1..=5 {
+        sim.stop(id);
+    }
+    for id in 1..=4 {
+        sim.start(id).await;
+    }
+    sim.settle(30).await;
+    let leader = sim.leader().unwrap();
+    let follower = (1..=4).find(|&id| id != leader).unwrap();
+    let (base, _, _) = sim.base(follower);
+    let node = sim.nodes.get_mut(&follower).unwrap();
+    node.raw.request_snapshot().unwrap();
+    let requested = node.raw.raft.pending_request_snapshot;
+    assert!(requested > base, "requested {requested} at base {base}");
+    sim.settle(100).await;
+    let node = &sim.nodes[&follower];
+    assert_eq!(
+        node.raw.raft.pending_request_snapshot, 0,
+        "the request still waits"
+    );
+    assert!(node.raw.store().snapshot_index() >= requested);
+    assert_eq!(node.state.applied, sim.nodes[&leader].state.applied);
+    sim.assert_records_open().await;
+}
+
 /// #96 in a cluster. Member `grouped` misses two commits and applies a Put and a failed update
 /// in one batch. Member `apart` applies them one by one, so its last batch is one below its
 /// applied index. `grouped` then leads and publishes its batch.

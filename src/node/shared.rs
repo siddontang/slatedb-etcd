@@ -1508,18 +1508,12 @@ impl Node {
 
     /// Propose a checkpoint with row `row` that the publisher created. Only the leader
     /// announces. Return true when Raft took the proposal.
-    ///
-    /// The coverage stays at the row unless every other member installs a base above its row.
     pub(super) fn announce_view(&mut self, checkpoint: uuid::Uuid, row: u64) -> Result<bool> {
-        let extend = self.extension_allowed();
         let Some(writer) = &self.writer else {
             return Ok(false);
         };
         let base = *writer.applied.base_id.borrow();
-        let covers = match extend {
-            true => demand::coverage(row, base, writer.queue.position()),
-            false => row,
-        };
+        let covers = demand::coverage(row, base, writer.queue.position());
         self.propose_view(checkpoint, covers)
     }
 
