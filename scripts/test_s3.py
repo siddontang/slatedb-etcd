@@ -6,6 +6,7 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -149,6 +150,37 @@ class StaleReports(unittest.TestCase):
         check.local_rustfs = Mock(side_effect=RuntimeError("RustFS exited"))
         self.run_launcher("check-s3", ["--binary", "{binary}", "--output", "{output}"],
                           module=check)
+
+
+class StartAction(unittest.TestCase):
+    """The CI action names the failure even when the fixture logs nothing."""
+
+    def start_script(self):
+        lines = (SCRIPTS.parent / ".github/actions/rustfs/action.yml").read_text().splitlines()
+        start = lines.index("    - name: Start the RustFS server")
+        body = start + lines[start:].index("      run: |") + 1
+        script = []
+        for line in lines[body:]:
+            if line.startswith("    - name:"):
+                break
+            script.append(line[8:])
+        return "\n".join(script)
+
+    def test_a_silent_failed_start_emits_an_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake = Path(directory) / "bin"
+            fake.mkdir()
+            python = fake / "python3"
+            python.write_text("#!/bin/sh\nexit 1\n")
+            python.chmod(0o755)
+            env = dict(os.environ, RUNNER_TEMP=directory,
+                       PATH=f"{fake}{os.pathsep}{os.environ['PATH']}")
+            result = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c",
+                                     self.start_script()], env=env, cwd=SCRIPTS.parent, capture_output=True,
+                                    text=True, timeout=60)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("::error title=RustFS::RustFS did not start in its last step: none",
+                      result.stdout)
 
 
 if __name__ == "__main__":

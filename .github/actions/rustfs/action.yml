@@ -34,8 +34,8 @@ runs:
         done
         if [ ! -s "$settings" ]; then
           cat "$log"
-          step=$(grep -o 'RustFS fixture: .*' "$log" | tail -1 | sed 's/RustFS fixture: //')
-          failure=$(grep -o 'RustFS [a-z]* failed: .*' "$log" | tail -1)
+          step=$( (grep -o 'RustFS fixture: .*' "$log" || true) | tail -1 | sed 's/RustFS fixture: //')
+          failure=$( (grep -o 'RustFS [a-z]* failed: .*' "$log" || true) | tail -1)
           failure=${failure:-RustFS did not start in its last step: ${step:-none}}
           echo "::error title=RustFS::$failure"
           exit 1
