@@ -347,7 +347,7 @@ fn proven_reply(node: &Node, nonce: u64, process: u64) -> Event {
 
 /// The nonce of the running probe of member 2.
 fn pending(node: &Node) -> u64 {
-    node.writer.proofs.pending(2).unwrap()
+    node.writer.proofs().pending(2).unwrap()
 }
 
 /// The transport frame of process `process` of member 2.

@@ -577,12 +577,16 @@ impl Node {
             .metrics
             .registry
             .register(Box::new(retained.clone()))?;
-        let mut writer = shared::Writer::new(&handles, options.view_max_age, clock);
         let prober = shared::Prober::new(options.id, handles.source.clone());
-        writer.prober = Some(std::sync::Arc::new(prober));
-        writer.retention = options.view_retention;
-        writer.retained = Some(retained);
-        writer.gauges = Some(shared::Gauges::register(&state.metrics.registry)?);
+        let writer = shared::Writer::new(
+            &handles,
+            options.view_max_age,
+            clock,
+            Some(std::sync::Arc::new(prober)),
+            options.view_retention,
+            Some(retained),
+            Some(shared::Gauges::register(&state.metrics.registry)?),
+        );
         let compaction = compaction::Flush::new(&state, handles.based);
         let compact_plan = compaction::PlanReady::new(&state, manual_apply);
         let log_reader = Some(storage.reader());
@@ -751,23 +755,23 @@ impl Node {
 
     /// The shared-mode objects that the snapshot receive path opens.
     pub(crate) fn shared_source(&self) -> std::sync::Arc<crate::state::shared::Source> {
-        self.writer.source.clone()
+        self.writer.source().clone()
     }
 
     /// Shared mode: the write probes that this member runs for the leader.
     pub(crate) fn write_prober(&self) -> Option<std::sync::Arc<Prober>> {
-        self.writer.prober.clone()
+        self.writer.prober()
     }
 
     /// Shared mode: the wall clock that this member returns to a clock probe of the leader.
     pub(crate) fn probe_clock(&self) -> Millis {
-        self.writer.clock.now_ms.clone()
+        self.writer.clock().now_ms.clone()
     }
 
     /// Tests: skew the wall clock of this member's writer and of its probe replies.
     #[cfg(test)]
     pub(crate) fn set_clock(&mut self, now_ms: Millis) {
-        self.writer.clock.now_ms = now_ms;
+        self.writer.set_clock(now_ms);
     }
 
     pub async fn run(self, events: mpsc::Receiver<Event>) -> Result<()> {
@@ -1215,7 +1219,7 @@ impl Node {
                 // frame of the earlier process then cannot bring that proof back.
                 if changed {
                     self.tick_clock(false);
-                    self.writer.proofs.forget(member);
+                    self.writer.forget_proof(member);
                 }
             }
             Event::SnapshotRefused { member, target } => {

@@ -512,7 +512,7 @@ impl Simulation {
         for node in self.nodes.values_mut() {
             node.worker.state_mut().settle_opens().await;
             // An announcement of the current base offers it at once, with no open.
-            node.note_offers();
+            node.writer.note_offers();
         }
     }
 
@@ -885,7 +885,7 @@ impl Simulation {
             ..Default::default()
         };
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        let admin = writer.admin.clone();
+        let admin = writer.admin().clone();
         let _ = admin.run_gc_once(options).await;
         self.trace.push("gc".into());
         self.drive().await;
