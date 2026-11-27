@@ -225,12 +225,9 @@ async fn elect(node: &mut Node) {
     settle(node).await;
 }
 
-/// The node takes a reply only in the term that sent its probe. A reply that comes after a
-/// leader change proves nothing, also when this member leads again.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_reply_after_a_leader_change_proves_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut config = crate::node::tests::options(dir.path());
+/// A one-voter shared leader with a manual transport.
+async fn shared_leader(dir: &std::path::Path) -> Node {
+    let mut config = crate::node::tests::options(dir);
     config.peers = BTreeMap::from([(1, "127.0.0.1:1".to_owned())]);
     config.state_mode = crate::state::StateMode::Shared;
     let store = Arc::new(InMemory::new());
@@ -243,28 +240,49 @@ async fn a_reply_after_a_leader_change_proves_nothing() {
         node.tick().unwrap();
     }
     settle(&mut node).await;
-    let mut responses = vec![];
-    let event = Event::PeerProcess {
-        member: 2,
-        process: Some(7),
-    };
-    node.handle(event, &mut responses).await.unwrap();
-    let reply = |node: &Node, nonce| Event::WriteProbed {
+    node
+}
+
+/// The successful reply of process `process` of member 2 to `nonce`.
+fn proven_reply(node: &Node, nonce: u64, process: u64) -> Event {
+    Event::WriteProbed {
         member: 2,
         nonce,
         reply: Ok(WriteProbeReply {
             nonce,
-            process: 7,
+            process,
             store: node.peer.store.clone(),
             error: None,
         }),
-    };
+    }
+}
+
+/// The nonce of the running probe of member 2.
+fn pending(node: &Node) -> u64 {
+    node.writer.as_ref().unwrap().proofs.pending(2).unwrap()
+}
+
+/// The transport frame of process `process` of member 2.
+fn frame(process: u64) -> Event {
+    Event::PeerProcess {
+        member: 2,
+        process: Some(process),
+    }
+}
+
+/// The node takes a reply only in the term that sent its probe. A reply that comes after a
+/// leader change proves nothing, also when this member leads again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reply_after_a_leader_change_proves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = shared_leader(dir.path()).await;
+    let mut responses = vec![];
+    node.handle(frame(7), &mut responses).await.unwrap();
     let promote = C::Promote(2);
-    let pending = |node: &Node| node.writer.as_ref().unwrap().proofs.pending(2).unwrap();
 
     // In one term, the reply proves write access.
     node.check_write_proof(&promote).unwrap_err();
-    let event = reply(&node, pending(&node));
+    let event = proven_reply(&node, pending(&node), 7);
     node.handle(event, &mut responses).await.unwrap();
     node.check_write_proof(&promote).unwrap();
 
@@ -272,11 +290,53 @@ async fn a_reply_after_a_leader_change_proves_nothing() {
     elect(&mut node).await;
     let error = node.check_write_proof(&promote).unwrap_err();
     assert!(error.message.contains("is missing"), "{error:?}");
-    let event = reply(&node, pending(&node));
+    let event = proven_reply(&node, pending(&node), 7);
     elect(&mut node).await;
     node.handle(event, &mut responses).await.unwrap();
     let error = node.check_write_proof(&promote).unwrap_err();
     assert!(error.message.contains("is missing"), "{error:?}");
+}
+
+/// A new process of the learner drops its proof and its running probe at once. A late frame
+/// of the earlier process can then name that process again. Neither its old proof nor a late
+/// reply to its old probe counts after that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_learner_process_drops_its_proof_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = shared_leader(dir.path()).await;
+    let mut responses = vec![];
+    let promote = C::Promote(2);
+    prove(&mut node).await;
+    node.handle(frame(8), &mut responses).await.unwrap();
+    node.handle(frame(7), &mut responses).await.unwrap();
+    let error = node.check_write_proof(&promote).unwrap_err();
+    assert!(error.message.contains("is missing"), "{error:?}");
+
+    // The probe of process 7 runs. Process 8 starts, a late frame names 7, and the reply of 7
+    // comes.
+    let nonce = pending(&node);
+    node.handle(frame(8), &mut responses).await.unwrap();
+    node.handle(frame(7), &mut responses).await.unwrap();
+    let event = proven_reply(&node, nonce, 7);
+    node.handle(event, &mut responses).await.unwrap();
+    let error = node.check_write_proof(&promote).unwrap_err();
+    assert!(error.message.contains("is missing"), "{error:?}");
+}
+
+/// The write proofs in the `/status` of `node`.
+fn shown(node: &Node) -> Value {
+    node.writer.as_ref().unwrap().status()["write_proofs"]["members"].clone()
+}
+
+/// Record a proof of process 7 of member 2 on `node`.
+async fn prove(node: &mut Node) {
+    let mut responses = vec![];
+    node.handle(frame(7), &mut responses).await.unwrap();
+    node.check_write_proof(&C::Promote(2)).unwrap_err();
+    let event = proven_reply(node, pending(node), 7);
+    node.handle(event, &mut responses).await.unwrap();
+    node.check_write_proof(&C::Promote(2)).unwrap();
+    assert_eq!(shown(node)[0]["proven"], true);
 }
 
 async fn channel(server: &Server) -> tonic::transport::Channel {

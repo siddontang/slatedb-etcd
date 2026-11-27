@@ -1373,9 +1373,14 @@ impl Node {
             Event::PeerProcess { member, process } => {
                 let changed = self.raw.store().process(member) != process;
                 self.raw.store().note_process(member, process);
-                // A new voter process drops its clock sample before the next batch admission.
+                // A new voter process drops its clock sample before the next batch admission. A
+                // new learner process drops its write proof and its running probe at once. A late
+                // frame of the earlier process then cannot bring that proof back.
                 if changed {
                     self.tick_clock(false);
+                    if let Some(writer) = &mut self.writer {
+                        writer.proofs.forget(member);
+                    }
                 }
             }
             Event::SnapshotRefused { member, target } => {

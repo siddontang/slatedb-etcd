@@ -288,6 +288,11 @@ impl Proofs {
         true
     }
 
+    /// Drop the proof and the running probe of `member`, whose process changed.
+    pub(in crate::node) fn forget(&mut self, member: u64) {
+        self.members.remove(&member);
+    }
+
     /// The proofs for `/status`. They are diagnostic: a handoff does not use them.
     pub(super) fn status(&self, now: Instant) -> Value {
         let members: Vec<_> = self
