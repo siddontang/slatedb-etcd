@@ -773,17 +773,21 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
                 continue;
             }
         }
-        let opened = attempt(
-            publisher.source.open_writer_on(gate.clone()),
-            &mut stopped,
-            &mut health,
-        );
-        let db = match opened.await {
-            Attempt::Done(Ok(db)) => {
+        // The gate starts at the floor of the stored state, so the compactor and the flushes of
+        // the new `Db` take no ID time below it. See `clock::stored_floor`.
+        let opening = async {
+            let stored = clock::stored_floor(&publisher.admin).await?;
+            gate.floor(stored);
+            let db = publisher.source.open_writer_on(gate.clone()).await?;
+            anyhow::Ok((db, stored))
+        };
+        let opened = attempt(opening, &mut stopped, &mut health);
+        let (db, stored) = match opened.await {
+            Attempt::Done(Ok((db, stored))) => {
                 // The open wrote the manifest. The next step has its own timer.
                 health.progressed();
                 fenced = false;
-                Arc::new(db)
+                (Arc::new(db), stored)
             }
             // A newer open fenced this one while the member still leads the same term.
             // Two opens can also race for the same manifest version. The open that loses must
@@ -815,7 +819,7 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
             return Ok(());
         }
         // The floor also holds the time of the newest L0 SST ID. See `clock::floor`.
-        let tick = clock::floor(&db.manifest());
+        let tick = clock::floor(&db.manifest()).max(stored);
         let passed = match attempt(clock.pass(tick), &mut stopped, &mut health).await {
             Attempt::Done(passed) => passed,
             Attempt::Stopped => {

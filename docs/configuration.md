@@ -201,8 +201,8 @@ Rules and limits:
 - A directory keeps its mode. A member refuses to start in a different mode.
 - The leader opens the writer when it takes the lead. The open fences the old writer. The leader
   then checks that it still leads the same term. It waits until its clock passes the manifest
-  clock and the time of the newest L0 SST ID. A fence while it still leads opens the writer
-  again.
+  clock and the times of the newest L0 SST ID and compaction job ID. A fence while it still
+  leads opens the writer again.
 - With its clock over `--max-clock-skew` behind, the writer does not start. The member logs an
   error, sets `clock_alarm` to `behind` in `/status`, exports
   `slatedb_etcd_shared_clock_skew_milliseconds`, and tries again with a backoff. After three

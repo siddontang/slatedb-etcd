@@ -833,3 +833,60 @@ async fn a_refresh_never_splits_the_advance_of_the_clock() {
     assert_eq!(clock.verdict(), Verdict::Waiting);
     assert_eq!(read(&gate), advanced, "the clock advanced without samples");
 }
+
+/// Architecture, round 2: SlateDB refuses a compaction job whose ID time is below the newest
+/// job, and such a refusal closes the writer `Db`. A writer that left a job 20 ms ahead of the
+/// next writer's clock raises the floor of that writer, so the next writer's job is accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_writer_starts_at_the_newest_compaction_job() {
+    use slatedb::compactor::{CompactionSpec, SourceId};
+    let store: Arc<dyn slatedb::object_store::ObjectStore> =
+        Arc::new(slatedb::object_store::memory::InMemory::new());
+    let submit = |gate: &Arc<Gate>| {
+        let admin = slatedb::admin::Admin::builder("state", store.clone())
+            .with_system_clock(gate.clone())
+            .build();
+        async move {
+            let manifest = admin.read_manifest(None).await.unwrap().unwrap();
+            let sources = manifest.l0().iter().map(|view| SourceId::SstView(view.id));
+            let spec = CompactionSpec::new(sources.collect(), 0);
+            admin.submit_compaction(spec).await
+        }
+    };
+    let (clock, time) = leader(&[1, 2, 3]);
+    time.wall.store(START + 10, Ordering::SeqCst);
+    assert!(reply(&clock, &time, 2, 0, 0));
+    assert!(reply(&clock, &time, 3, 0, 0));
+    let gate = clock.gate().await;
+    let db = open(&store, &gate).await;
+    write(&db, &gate, 1).await;
+    db.flush().await.unwrap();
+    // The job comes 40 ms after the flush, so only the job is above the next writer's clock.
+    time.wall.store(START + 50, Ordering::SeqCst);
+    assert!(reply(&clock, &time, 2, 0, 0));
+    assert!(reply(&clock, &time, 3, 0, 0));
+    submit(&gate).await.unwrap();
+    db.close().await.unwrap();
+
+    let (next, time) = leader(&[1, 2, 3]);
+    time.wall.store(START + 30, Ordering::SeqCst);
+    assert!(reply(&next, &time, 2, 0, 0));
+    assert!(reply(&next, &time, 3, 0, 0));
+    let gate = next.gate().await;
+    let admin = slatedb::admin::Admin::builder("state", store.clone()).build();
+    let manifest = admin.read_manifest(None).await.unwrap().unwrap();
+    assert!(
+        floor(&manifest) <= START + 10,
+        "{}",
+        floor(&manifest) - START
+    );
+    let stored = stored_floor(&admin).await.unwrap();
+    assert!(stored >= START + 50, "{}", stored - START);
+    gate.floor(stored);
+    let db = open(&store, &gate).await;
+    submit(&gate)
+        .await
+        .expect("the job of the next writer was refused");
+    assert!(db.status().close_reason.is_none());
+    db.close().await.unwrap();
+}

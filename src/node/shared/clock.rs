@@ -572,6 +572,26 @@ pub(super) fn floor(manifest: &slatedb::VersionedManifest) -> i64 {
     manifest.last_l0_clock_tick().max(newest)
 }
 
+/// The floor of the stored state before a writer opens: `floor` of the latest manifest, or the
+/// time of the newest compaction job ID when that is later.
+///
+/// SlateDB 0.18.1 refuses a new compaction job whose ID time is below the newest job
+/// (`compactions_store/invariants.rs:12-31`). The embedded compactor of a writer takes job IDs
+/// from its clock at once, and a refused job fails the compactor task, which closes the whole
+/// `Db` (`dispatcher.rs`, `TaskMonitor::run`). So the gate starts at this floor before the
+/// open.
+pub(super) async fn stored_floor(admin: &slatedb::admin::Admin) -> Result<i64> {
+    let manifest = admin.read_manifest(None).await?;
+    let compactions = admin.read_compactions(None).await?;
+    let jobs = compactions
+        .iter()
+        .flat_map(|compactions| compactions.recent_compactions())
+        .map(|job| job.id().timestamp_ms() as i64)
+        .max()
+        .unwrap_or(i64::MIN);
+    Ok(manifest.as_ref().map_or(i64::MIN, floor).max(jobs))
+}
+
 /// The wait reason of a writer without the samples of a voter majority.
 const NO_SAMPLES: &str = "too few voters have a fresh clock sample";
 /// The wait reason of a writer whose last tick is above the bound.

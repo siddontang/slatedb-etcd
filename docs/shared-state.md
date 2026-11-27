@@ -581,8 +581,9 @@ time therefore grows with the live data size. It does not grow with history or S
    (SlateDB `manifest/store.rs:36-51`).
 3. When the open completes, check that the member is still the leader at term `t`. If not,
    close the `Db`.
-4. Wait until the local clock passes the floor: the later of the manifest's
-   `last_l0_clock_tick` and the time of its newest L0 SST ID. See [Clocks](#clocks).
+4. Wait until the local clock passes the floor: the latest of the manifest's
+   `last_l0_clock_tick`, the time of its newest L0 SST ID, and the time of the newest compaction
+   job ID. See [Clocks](#clocks).
 5. Start the materializer and the publisher. Each batch gets a tick within the clock bound.
 
 Client writes do not wait for steps 2–4. Proposals commit to the log and apply to the overlay at
@@ -629,8 +630,10 @@ reads the writer clock in these places:
   (`compactor_executor.rs:797,856`). A new L0 SST whose ID time is below the newest L0 SST ID
   fails the manifest update (`manifest/invariants.rs:51-83`).
 - **Compaction jobs:** a job ID is a ULID too. SlateDB refuses a new job below the newest job
-  ID, and an output SST below its job ID (`compactions_store/invariants.rs:12-50`). So a
-  Defragment submits its job with the clock of the writer.
+  ID, and an output SST below its job ID (`compactions_store/invariants.rs:12-50`). A refused
+  job of the embedded compactor fails its task, and that closes the whole writer `Db`
+  (`dispatcher.rs`, `TaskMonitor::run`). So a Defragment submits its job with the clock of the
+  writer.
 - **Background work:** checkpoint times (`manifest/store.rs:160-175`), GC
   (`garbage_collector.rs:418-450`), and the compactor read the time. GC compares SST ID times
   with its own clock. Its guards are the newest L0 and the compaction low watermark
@@ -640,8 +643,10 @@ So a leader with a fast clock wrote ticks and SST IDs in the future. Each later 
 correct clock was behind them and refused to write. Two checks, in `node/shared/clock.rs`, keep
 the writer clock near the voter clocks.
 
-**Behind.** The floor of a new writer is the later of `last_l0_clock_tick` and the time of the
-newest L0 SST ID. Step 4 of the leader change waits until the local clock passes the floor.
+**Behind.** The floor of a new writer is the latest of `last_l0_clock_tick`, the time of the
+newest L0 SST ID, and the time of the newest compaction job ID. The writer reads it before its
+open and starts its clock there, because the compactor of the new `Db` takes job IDs at once.
+Step 4 of the leader change waits until the local clock passes the floor.
 When the clock is over `--max-clock-skew` (default 5 s) behind, the writer does not start. The
 member sets `clock_alarm` to `behind`, exports the lag as
 `slatedb_etcd_shared_clock_skew_milliseconds`, and counts a clock fault.
