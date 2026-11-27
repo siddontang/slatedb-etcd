@@ -196,10 +196,11 @@ impl Node {
     }
 
     /// Join the last queued Ready job to the queued Ready job before it, as `start_log` would.
-    /// Thus Ready jobs behind a slow write use at most two queue slots, and the owner can take
-    /// up to `log::MAX_READYS` Readys and send their heartbeats. The joined job keeps its place,
-    /// so it completes after all earlier jobs. A job with disk work does not join an empty job
-    /// before it: `start_log` completes the empty job without a wait for that write.
+    /// Thus consecutive Ready jobs without a snapshot use at most two queue slots behind a slow
+    /// write, and the owner can take up to `log::MAX_READYS` Readys and send their heartbeats.
+    /// The joined job keeps its place, so it completes after all earlier jobs. A job with disk
+    /// work does not join an empty job before it: `start_log` completes the empty job without a
+    /// wait for that write.
     fn join_queued_ready(&mut self) -> Result<()> {
         let count = self.log_queue.len();
         let joins = count >= 2

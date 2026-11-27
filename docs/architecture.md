@@ -256,8 +256,9 @@ A FIFO worker persists Ready updates, checkpoint publication, and log reclamatio
 The worker reads disk statistics only for an explicit `/debug/log-stats` request.
 Empty Ready jobs complete on the owner after all earlier jobs finish. They do no disk work.
 Adjacent queued Ready jobs share one durable write without a batching timer.
-A Ready job joins the queued Ready job before it when it is queued. Thus Ready jobs behind a
-slow write use at most two queue slots. A job with disk work does not join an empty job before it.
+A Ready job joins the queued Ready job before it when it is queued. Thus consecutive Ready jobs
+without a snapshot use at most two queue slots behind a slow write. A Ready job with a snapshot
+stays separate. A job with disk work does not join an empty job before it.
 A joined job completes, sends its persisted messages, and calls `on_persist_ready` only after its
 own write and all earlier jobs complete.
 The batch keeps the final HardState and log suffix, including overwritten entries.
