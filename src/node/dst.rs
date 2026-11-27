@@ -30,6 +30,12 @@ mod coverage;
 #[path = "shared/dst_reference.rs"]
 mod reference;
 
+/// The overlay limit of the shared schedules. A member pauses apply above twice its limit, and a
+/// leader refuses client writes above it. Member 3 has a quarter of the limit, so it can wait
+/// while the leader still takes writes. So the schedules reach the pause, the checkpoint poll,
+/// and the adoption of a base above the applied index (#103).
+const SHARED_OVERLAY_LIMIT: u64 = 640;
+
 struct ClientRequest {
     key: String,
     value: String,
@@ -94,6 +100,8 @@ struct Simulation {
     quotas: BTreeMap<u64, i64>,
     /// The number of voters.
     members: u64,
+    /// The `--overlay-max-bytes` value of members 1 and 2. Member 3 has a quarter of it.
+    overlay_max_bytes: u64,
     /// The process ID of each started member, new at each start.
     processes: BTreeMap<u64, u64>,
     /// View snapshots above their row that the receiver refused before Raft saw them.
@@ -144,18 +152,29 @@ impl Simulation {
         Self::with_options(seed, BTreeMap::new(), true).await
     }
 
+    /// Start three members with the overlay limit of the shared schedules.
+    async fn shared(seed: u64) -> Self {
+        Self::build(seed, BTreeMap::new(), true, 3, SHARED_OVERLAY_LIMIT).await
+    }
+
     /// Start three members. `reference` checks each member state against a reference state
     /// after every step.
     async fn with_options(seed: u64, quotas: BTreeMap<u64, i64>, reference: bool) -> Self {
-        Self::build(seed, quotas, reference, 3).await
+        Self::build(seed, quotas, reference, 3, 1 << 30).await
     }
 
     /// Start a simulation with `members` voters and a reference state.
     async fn with_size(seed: u64, members: u64) -> Self {
-        Self::build(seed, BTreeMap::new(), true, members).await
+        Self::build(seed, BTreeMap::new(), true, members, 1 << 30).await
     }
 
-    async fn build(seed: u64, quotas: BTreeMap<u64, i64>, reference: bool, members: u64) -> Self {
+    async fn build(
+        seed: u64,
+        quotas: BTreeMap<u64, i64>,
+        reference: bool,
+        members: u64,
+        overlay_max_bytes: u64,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let reference = if reference {
             Some(reference::Reference::open(&root.path().join("reference")).await)
@@ -199,6 +218,7 @@ impl Simulation {
             base_checks: 0,
             quotas,
             members,
+            overlay_max_bytes,
             processes: BTreeMap::new(),
             refused_snapshots: 0,
             delivered_views: vec![],
@@ -240,7 +260,10 @@ impl Simulation {
                 require_peer_tls: false,
                 view_max_age: std::time::Duration::from_secs(10),
                 view_pin_max: std::time::Duration::from_secs(300),
-                overlay_max_bytes: 1 << 30,
+                overlay_max_bytes: match id {
+                    3 => self.overlay_max_bytes / 4,
+                    _ => self.overlay_max_bytes,
+                },
                 max_clock_skew: std::time::Duration::from_secs(5),
                 view_retention: Default::default(),
                 restore: None,
@@ -753,6 +776,19 @@ impl Simulation {
         self.start(id).await;
     }
 
+    /// Tick member `id`. When its apply waits, the ticks up to its next checkpoint poll pass, and
+    /// the member adopts a base that the poll opens. See `Node::dst_poll`.
+    async fn shared_tick(&mut self, id: u64) {
+        self.tick(id).await;
+        let Some(node) = self.nodes.get_mut(&id) else {
+            return;
+        };
+        if node.dst_poll().await {
+            self.trace.push(format!("poll {id}"));
+            self.drive().await;
+        }
+    }
+
     /// Run out the election timer of every member, as after a long time with no leader. The next
     /// tick of a member starts an election, and no member refuses it for its leader lease.
     fn expire_elections(&mut self) {
@@ -1036,9 +1072,9 @@ impl Simulation {
 
     /// A shared-mode schedule: one store, writer steps at random points, leader changes,
     /// crashes between writer steps, late opens of deposed writers, partitions, object store
-    /// failures, retention with GC, and reads on old views.
+    /// failures, retention with GC, small overlay limits, and reads on old views.
     async fn run_shared(seed: u64) -> Vec<String> {
-        let mut sim = Self::new(seed).await;
+        let mut sim = Self::shared(seed).await;
         let mut writers = BTreeMap::new();
         for _ in 0..100 {
             sim.deliver(false).await;
@@ -1066,7 +1102,7 @@ impl Simulation {
                     if leader.is_none() {
                         sim.expire_elections();
                     }
-                    sim.tick(id).await;
+                    sim.shared_tick(id).await;
                     // A follower asks for a snapshot at its last index. Announcements and
                     // unmaterialized batches can follow the leader's base row.
                     if sim.choose(2) == 0 {
@@ -1216,7 +1252,7 @@ impl Simulation {
                 sim.drop_clients().await;
             }
             for id in 1..=3 {
-                sim.tick(id).await;
+                sim.shared_tick(id).await;
             }
             if round < 40 {
                 sim.propose().await;
