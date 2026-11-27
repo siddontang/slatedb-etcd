@@ -1585,8 +1585,11 @@ async fn the_overlay_limits_hold_while_the_writer_fails() {
     let mut kv = KvClient::new(channel.clone());
     let rejected = kv.put(put("k-late", "x")).await.unwrap_err();
     assert!(rejected.message().contains("too many"), "{rejected}");
-    let paused = status(&server).await;
-    assert!(health(&paused)["consecutive_failures"].as_u64() > Some(0));
+    // Apply alone can fill the overlay, so the pause can come before the first failed flush.
+    eventually("a failed flush", async || {
+        health(&status(&server).await)["consecutive_failures"].as_u64() > Some(0)
+    })
+    .await;
     faults.set(0);
     eventually("the resumed apply", async || {
         let status = status(&server).await;
