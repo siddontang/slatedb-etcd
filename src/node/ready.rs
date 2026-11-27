@@ -25,10 +25,13 @@ impl Node {
                 );
             }
         }
+        // At a limit, the owner takes no Ready. Then a leader sends no heartbeat until the log
+        // worker completes the job that keeps the queue full.
         while self.raw.has_ready()
             && self.log_queue.len() < log::MAX_JOBS
             && self.log_bytes < log::MAX_BYTES
             && self.log_snapshot_bytes < log::MAX_SNAPSHOT_BYTES
+            && self.log_queue.iter().map(|task| task.readys).sum::<usize>() < log::MAX_READYS
         {
             let mut ready = self.raw.ready();
             if let Some(state) = ready.ss() {
@@ -83,6 +86,7 @@ impl Node {
             // Cached entries must be readable before Raft can advance without disk completion.
             self.raw.advance_append_async(ready);
             self.queue_log(job, Some(number), None, messages, reads);
+            self.join_queued_ready()?;
             // raft-rs permits leader replication before local persistence.
             self.send(early);
             for (peer, snapshot) in std::mem::take(&mut self.send_failures) {
@@ -122,7 +126,10 @@ impl Node {
         reads: Vec<raft::ReadState>,
     ) {
         self.log_sequence += 1;
-        let bytes = job.bytes();
+        // The messages and read states wait in memory with the job, so they count too.
+        let messages_bytes: usize = messages.iter().map(ProtobufMessage::encoded_len).sum();
+        let reads_bytes: usize = reads.iter().map(|read| read.request_ctx.len()).sum();
+        let bytes = job.bytes() + messages_bytes + reads_bytes;
         let snapshot_bytes = job.snapshot_bytes();
         self.log_bytes += bytes;
         self.log_snapshot_bytes += snapshot_bytes;
@@ -132,6 +139,7 @@ impl Node {
             bytes,
             snapshot_bytes,
             ready,
+            readys: usize::from(ready.is_some()),
             checkpoint,
             messages,
             reads,
@@ -161,12 +169,7 @@ impl Node {
             {
                 let mut task = self.log_queue.pop_front().unwrap();
                 let next = self.log_queue.pop_front().unwrap();
-                task.work.as_mut().unwrap().append(next.work.unwrap())?;
-                task.bytes += next.bytes;
-                task.ready = next.ready.or(task.ready);
-                task.messages.extend(next.messages);
-                task.reads.extend(next.reads);
-                task.responses.extend(next.responses);
+                join_log(&mut task, next)?;
                 self.log_queue.push_front(task);
             }
             if let Some(task) = self.log_queue.front_mut() {
@@ -192,12 +195,35 @@ impl Node {
         Ok(())
     }
 
+    /// Join the last queued Ready job to the queued Ready job before it, as `start_log` would.
+    /// Thus consecutive Ready jobs without a snapshot use at most two queue slots behind a slow
+    /// write, and the owner can take up to `log::MAX_READYS` Readys and send their heartbeats.
+    /// The joined job keeps its place, so it completes after all earlier jobs. A job with disk
+    /// work does not join an empty job before it: `start_log` completes the empty job without a
+    /// wait for that write.
+    fn join_queued_ready(&mut self) -> Result<()> {
+        let count = self.log_queue.len();
+        let joins = count >= 2
+            && match (
+                &self.log_queue[count - 2].work,
+                &self.log_queue[count - 1].work,
+            ) {
+                (Some(job), Some(next)) => {
+                    job.can_batch() && next.can_batch() && (next.is_barrier() || !job.is_barrier())
+                }
+                _ => false,
+            };
+        if joins {
+            let next = self.log_queue.pop_back().unwrap();
+            join_log(self.log_queue.back_mut().unwrap(), next)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn complete_log(&mut self, completed: log::Completion) -> Result<()> {
         ensure!(self.log_busy, "unexpected log completion");
         let mut task = self.log_queue.pop_front().context("missing log job")?;
         ensure!(task.id == completed.id, "log completion is out of order");
-        self.log_bytes -= task.bytes;
-        self.log_snapshot_bytes -= task.snapshot_bytes;
         self.log_busy = false;
         let saved = completed.durable.snapshot.get_metadata().index;
         if saved > self.raw.store().snapshot_index() {
@@ -219,6 +245,9 @@ impl Node {
     }
 
     pub(super) fn finish_log_task(&mut self, task: LogTask) -> Result<()> {
+        // An empty job can hold message bytes, and it completes here without the worker.
+        self.log_bytes -= task.bytes;
+        self.log_snapshot_bytes -= task.snapshot_bytes;
         if let Some(number) = task.ready {
             crate::failpoint::hit("raft-before-advance");
             self.raw.on_persist_ready(number);
@@ -243,4 +272,15 @@ impl Node {
         }
         Ok(())
     }
+}
+
+fn join_log(task: &mut LogTask, next: LogTask) -> Result<()> {
+    task.work.as_mut().unwrap().append(next.work.unwrap())?;
+    task.bytes += next.bytes;
+    task.ready = next.ready.or(task.ready);
+    task.readys += next.readys;
+    task.messages.extend(next.messages);
+    task.reads.extend(next.reads);
+    task.responses.extend(next.responses);
+    Ok(())
 }

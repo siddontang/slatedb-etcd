@@ -235,6 +235,8 @@ struct LogTask {
     bytes: usize,
     snapshot_bytes: usize,
     ready: Option<u64>,
+    /// The Readys in this task. raft-rs keeps a record for each until `on_persist_ready`.
+    readys: usize,
     checkpoint: Option<u64>,
     messages: Vec<Message>,
     reads: Vec<raft::ReadState>,
