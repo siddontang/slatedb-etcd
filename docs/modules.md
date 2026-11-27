@@ -1,11 +1,28 @@
 # Module boundaries
 
-The service has one Raft group. Each replica owns its log, state, and object namespace.
+The service has one Raft group. Each replica owns its Raft log and its in-memory overlay.
+All replicas share one SlateDB in S3. Only the leader writes it.
 The CLI and embedded API share the same lifecycle and runtime paths.
 
 ## Ownership
 
-| Module | Owner and responsibility |
+The table gives the responsibility of each module. A module is not always the owner of its data:
+
+- `Node` is one type. Its `impl` blocks are in `node.rs`, `node/auto_compaction`,
+  `node/cluster`, `node/compaction`, `node/lease`, `node/maintenance`, `node/proposal`,
+  `node/quorum_put`, `node/read`, `node/ready`, `node/schedule`, `node/shared`, and `node/step`.
+  A method in each of these files can read and write each `Node` field.
+- `StateMachine` is one type too. Its `impl` blocks are in `state.rs`, `state/auth`,
+  `state/backup`, `state/checkpoint`, `state/cluster`, `state/compaction`, `state/diagnostic`,
+  `state/kv`, `state/lease`, `state/maintenance`, `state/put_batch`, `state/quota`,
+  `state/read`, `state/shared`, `state/shared/adopt`, and `state/snapshot`.
+- Some modules own a type with private fields, and the other modules call its methods:
+  `Writer` in `node/shared/writer`, `EarlyPuts` in `node/quorum_put`, `Group` in
+  `node/proposal`, `Publisher` in `node/forwarding` and `node/watch`, the log `Worker` in
+  `node/log`, `KeyIndex` in `state/key_index`, `Overlay` in `state/overlay`, and `RowCache` in
+  `state/rows`.
+
+| Module | Responsibility |
 | --- | --- |
 | `metrics/rpc` | Count gRPC messages, status, and optional call duration |
 | `metrics/peer` | Measure send failures, disconnects, and peer round trips |
@@ -21,7 +38,7 @@ The CLI and embedded API share the same lifecycle and runtime paths.
 | `node/watch` | Publish applied views and Watch event batches to local streams |
 | `node/apply` | Apply committed entries in order and group ordinary puts |
 | `node/proposal` | Group consecutive leader Put proposals within one event turn |
-| `node/quorum_put` | Prepare exact Put results after quorum commit |
+| `node/quorum_put` | Prepare exact Put results after quorum commit. `EarlyPuts` holds the replies |
 | `state/key_index` | Keep revision metadata for every current key in memory |
 | `node/read` | Confirm Safe ReadIndex and reject obsolete proofs |
 | `node/read/executor` | Run bounded reads on immutable applied views |
@@ -36,7 +53,8 @@ The CLI and embedded API share the same lifecycle and runtime paths.
 | `state/view` | Read a shared base and its overlay |
 | `state/overlay` | Keep the batches above the base for views and the materializer |
 | `state/shared` | Claim the shared state, open, switch, adopt, and rebase checkpoint bases |
-| `node/shared` | Run the leader writer with its fence and clock checks, and the overlay limits |
+| `node/shared` | Run the materializer and publisher with fence and clock checks |
+| `node/shared/writer` | Own the writer task state, the apply pause, base switches, and proofs |
 | `status` | Read the Raft snapshot record of a stopped member for `shared-status` |
 | `state/auth` and `state/lease` | Apply their domain changes |
 | `state/backup` and `state/shared/restore` | Export and restore complete state |
@@ -47,7 +65,7 @@ The CLI and embedded API share the same lifecycle and runtime paths.
 | `peer/receive` | Bound incoming Raft work and return ordered processing receipts |
 
 Domain modules extend the same StateMachine. They do not add independent mutable state owners.
-The read view contains immutable metadata and a pinned SlateDB snapshot.
+The read view contains immutable metadata, a pinned base checkpoint, and overlay segments.
 Only completed apply work can publish a new view.
 Views share unchanged Auth and Lease maps. Apply completions also share membership metadata.
 Their mutation paths copy retained maps before changing them.
