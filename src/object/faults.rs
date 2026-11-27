@@ -62,6 +62,14 @@ pub(crate) const RETRYABLE_SST_GET: u8 = 17;
 pub(crate) const LOSE_SST_TWICE_THEN_FAIL: u8 = 18;
 /// The second step of `LOSE_SST_TWICE_THEN_FAIL`.
 const LOSE_SST_ONCE_THEN_FAIL: u8 = 19;
+/// Fail every delete in the shared database, like a credential that can create but not delete
+/// objects there.
+pub(crate) const FAIL_STATE_DELETE: u8 = 20;
+/// Store the next put in the shared database, then report a timeout, like a reply that the
+/// network lost.
+pub(crate) const LOSE_STATE_PUT_REPLY: u8 = 21;
+/// Fail every put and every delete in the shared database, like a read-only credential.
+pub(crate) const READ_ONLY_STATE: u8 = 22;
 
 impl FaultStore {
     pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
@@ -147,9 +155,27 @@ impl ObjectStore for FaultStore {
         self.written.lock().unwrap().insert(path.to_string());
         self.stall(path).await;
         self.lag(path).await;
-        if self.mode.load(Ordering::SeqCst) == FAIL_STATE_PUT && state(path) {
+        if matches!(
+            self.mode.load(Ordering::SeqCst),
+            FAIL_STATE_PUT | READ_ONLY_STATE
+        ) && state(path)
+        {
             self.entered.add_permits(1);
             return Err(error());
+        }
+        let order = Ordering::SeqCst;
+        if state(path)
+            && self
+                .mode
+                .compare_exchange(LOSE_STATE_PUT_REPLY, 0, order, order)
+                .is_ok()
+        {
+            self.inner.put_opts(path, payload, options).await?;
+            self.entered.add_permits(1);
+            return Err(Error::Generic {
+                store: "injected",
+                source: std::io::Error::new(std::io::ErrorKind::TimedOut, "lost reply").into(),
+            });
         }
         if path.as_ref().ends_with(".sst") {
             match self.mode.load(Ordering::SeqCst) {
@@ -256,7 +282,26 @@ impl ObjectStore for FaultStore {
         &self,
         paths: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
-        self.inner.delete_stream(paths)
+        if !matches!(
+            self.mode.load(Ordering::SeqCst),
+            FAIL_STATE_DELETE | READ_ONLY_STATE
+        ) {
+            return self.inner.delete_stream(paths);
+        }
+        use futures::StreamExt;
+        let inner = self.inner.clone();
+        paths
+            .then(move |path| {
+                let inner = inner.clone();
+                async move {
+                    let path = path?;
+                    if state(&path) {
+                        return Err(error());
+                    }
+                    inner.delete(&path).await.map(|()| path)
+                }
+            })
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {

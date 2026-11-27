@@ -26,6 +26,8 @@ pub struct ApiState {
     pub(crate) shared: Option<std::sync::Arc<crate::state::shared::Source>>,
     /// Shared mode: the wall clock that a clock probe of the leader reads.
     pub(crate) clock: Option<crate::node::Millis>,
+    /// Shared mode: the write probes that the leader asks for before a promotion.
+    pub(crate) prober: Option<std::sync::Arc<crate::node::Prober>>,
     /// Serve the fault controls under `/debug`. Off unless a test cluster enables them.
     pub(crate) fault_controls: bool,
 }
@@ -105,6 +107,7 @@ pub fn router(state: ApiState) -> Router {
         .route(crate::peer::COVERED_ROUTE, post(covered_snapshot))
         .route("/raft/view-ack", post(view_ack))
         .route(crate::node::PROBE_ROUTE, post(clock_probe))
+        .route(crate::node::WRITE_PROBE_ROUTE, post(write_probe))
         .route(crate::state::transfer::FILE_ROUTE, get(snapshot_file))
         .route("/status", get(status))
         .route("/debug/log-stats", get(log_stats))
@@ -320,6 +323,33 @@ async fn clock_probe(
         nonce: probe.nonce,
         process: crate::peer::process_id(),
         clock_ms: clock(),
+    })
+    .into_response()
+}
+
+/// Run a write probe of the leader before it promotes this member. The member creates and
+/// deletes a scratch object with the store client of its writer. A replicated member has no
+/// shared store and answers 404.
+async fn write_probe(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(probe): Json<crate::node::WriteProbeRequest>,
+) -> Response {
+    if let Err(refusal) = admit(&state, &headers) {
+        return (StatusCode::FORBIDDEN, refusal).into_response();
+    }
+    let Some(prober) = &state.prober else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if probe.member != prober.member() {
+        return (StatusCode::CONFLICT, "the probe names another member").into_response();
+    }
+    let error = prober.probe(probe.nonce).await.err();
+    Json(crate::node::WriteProbeReply {
+        nonce: probe.nonce,
+        process: crate::peer::process_id(),
+        store: state.peer.store.clone(),
+        error: error.map(|error| format!("{error:#}")),
     })
     .into_response()
 }

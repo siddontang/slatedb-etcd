@@ -398,6 +398,7 @@ impl Server {
             location: Some(node.location.clone()),
             shared: node.shared_source(),
             clock: node.probe_clock(),
+            prober: node.write_prober(),
             fault_controls: config.fault_controls,
         });
         // Peer gRPC has no RPC metrics; diagnostics paths never collide with gRPC services.

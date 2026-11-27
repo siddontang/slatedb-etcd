@@ -35,6 +35,7 @@ pub use forwarding::ForwardView;
 pub(crate) use forwarding::LocalRead;
 pub(crate) use shared::WriterReport;
 pub(crate) use shared::{Millis, ProbeReply, ProbeRequest, PROBE_ROUTE};
+pub(crate) use shared::{Prober, WriteProbeReply, WriteProbeRequest, WRITE_PROBE_ROUTE};
 mod quorum_put;
 mod quota;
 mod read;
@@ -685,6 +686,8 @@ impl Node {
                     .registry
                     .register(Box::new(retained.clone()))?;
                 let mut writer = shared::Writer::new(handles, options.view_max_age, clock);
+                let prober = shared::Prober::new(options.id, handles.source.clone());
+                writer.prober = Some(std::sync::Arc::new(prober));
                 writer.retention = options.view_retention;
                 writer.retained = Some(retained);
                 writer.gauges = Some(shared::Gauges::register(&state.metrics.registry)?);
@@ -868,6 +871,13 @@ impl Node {
     /// The shared-mode objects that the snapshot receive path opens.
     pub(crate) fn shared_source(&self) -> Option<std::sync::Arc<crate::state::shared::Source>> {
         self.writer.as_ref().map(|writer| writer.source.clone())
+    }
+
+    /// Shared mode: the write probes that this member runs for the leader.
+    pub(crate) fn write_prober(&self) -> Option<std::sync::Arc<Prober>> {
+        self.writer
+            .as_ref()
+            .and_then(|writer| writer.prober.clone())
     }
 
     /// Shared mode: the wall clock that this member returns to a clock probe of the leader.
