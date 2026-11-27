@@ -141,7 +141,10 @@ func TestForwardedWriteWaitsForLocalApply(t *testing.T) {
 		status, err := api.Status(ctx, c.addresses[follower-1])
 		return err == nil && status.Leader == uint64(next)
 	}, 5*time.Second, 10*time.Millisecond)
-	_, err = c.http(follower, "/debug/apply-delay", map[string]any{"delay_ms": 2500})
+	// Each apply job keeps the delay that it had at submission. The no-op entry of the new
+	// leader can be in an earlier job than the Put, and up to four jobs can queue. Four delays
+	// must stay below the 5 second limit of the local revision wait.
+	_, err = c.http(follower, "/debug/apply-delay", map[string]any{"delay_ms": 1000})
 	require.NoError(t, err)
 	replies := make(chan *clientv3.PutResponse, 1)
 	errors := make(chan error, 1)
