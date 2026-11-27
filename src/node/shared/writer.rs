@@ -530,8 +530,10 @@ impl Writer {
     /// While apply waits, open the newest checkpoint above the base out of band. A switch job
     /// then releases the segments that it covers, including the open one.
     ///
-    /// The member can adopt only a checkpoint at or below the delivered commit `committed`. So
-    /// the poll skips a newer one, and a later poll opens it after the commit reaches it.
+    /// The member can adopt only a base at or below the delivered commit `committed`. So the
+    /// poll takes the newest base with its row in `(base, committed]`, and a later poll opens a
+    /// newer one after the commit reaches it. The name of a checkpoint is only a lower bound of
+    /// its row, so the poll checks the row of each opened base.
     fn poll_checkpoints(&self, base: u64, committed: u64) {
         if self.polling.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
@@ -542,14 +544,11 @@ impl Writer {
         let opened = self.opened_slot.clone();
         tokio::spawn(async move {
             let result = async {
-                let mut views = view_checkpoints(&admin).await?.into_iter();
-                let Some((seq, checkpoint)) = views.rfind(|(seq, _)| *seq <= committed) else {
-                    return anyhow::Ok(());
-                };
-                if seq > base {
-                    opened.offer(source.open_base(checkpoint.id).await?, 0);
+                let newer = newest_base_between(&admin, &source, base + 1, committed).await?;
+                if let Some(newer) = newer {
+                    opened.offer(newer, 0);
                 }
-                Ok(())
+                anyhow::Ok(())
             }
             .await;
             if let Err(error) = result {

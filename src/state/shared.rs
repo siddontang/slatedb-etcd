@@ -754,7 +754,7 @@ pub(crate) fn gone(error: &anyhow::Error) -> bool {
 /// A record above its checkpoint row needs that checkpoint, or one in this range: the leader
 /// certified that no entry in `(low, high]` changed state, so each checkpoint of this shared
 /// state with its row in the range holds the state at `high`.
-async fn newest_base_between(
+pub(crate) async fn newest_base_between(
     admin: &slatedb::admin::Admin,
     source: &Source,
     low: u64,

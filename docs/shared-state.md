@@ -189,8 +189,9 @@ A member over the limit, leader or follower, frees memory in this order:
 4. While paused, poll the checkpoint list. Switch out of band to the newest checkpoint above the
    base, including one at or below `applied`, and release the segments it covers. Resume
    apply when the overlay is below `--overlay-max-bytes`. If a checkpoint above `applied` appears,
-   [rebase](#rebase) onto it. The poll skips a checkpoint above the delivered commit, because the
-   member cannot adopt it yet. A later poll opens it after the commit reaches it.
+   [rebase](#rebase) onto it. The poll skips a checkpoint with its row above the delivered
+   commit, because the member cannot adopt it yet. A later poll opens it after the commit reaches
+   it. A checkpoint name is only a lower bound of its row, so the poll checks the opened row.
 
 Step 3 bounds memory during an S3 stall even when the member already has the newest base.
 Step 4 does not need the paused `ViewCheckpoint` entries. A paused leader still materializes its
@@ -850,8 +851,8 @@ of an install holds apply, as corrupt data in an entry does, and a newer snapsho
 An adoption instead drops such a base and keeps its current base and overlay. The member logs
 the first failure of each checkpoint, counts corrupt data in `slatedb_etcd_read_corrupt_total`,
 and reports the checkpoint in `shared_state.writer.rejected_base` of `/status`. The next poll
-tries the newest checkpoint at or below the delivered commit again. The report ends with the
-pause, after an adoption or an install.
+tries the newest checkpoint with its row at or below the delivered commit again. The report ends
+with the pause, after an adoption or an install.
 
 A rebase replay that fails leaves the state below the end of the applied prefix of its job. If a
 snapshot then ends the job, the job reports that end and no state. The entries that the node
