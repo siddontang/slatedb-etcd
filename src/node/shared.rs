@@ -1768,6 +1768,25 @@ impl Node {
         }
     }
 
+    /// While apply waits, count the writer ticks of `tick_shared` up to the next checkpoint
+    /// poll, and wait for the poll to end. Return false when apply does not wait.
+    pub(super) async fn dst_poll(&mut self) -> bool {
+        if !self.apply_paused() {
+            return false;
+        }
+        let (base, _, bytes) = self.state.view;
+        let leader = self.raw.raft.state == StateRole::Leader;
+        let (applied, current) = (self.state.applied, self.state.base_checkpoint);
+        let committed = self.committed_ready;
+        while !self
+            .writer
+            .tick(leader, applied, committed, base, current, bytes)
+            .is_multiple_of(POLL_TICKS)
+        {}
+        self.writer.polled().await;
+        true
+    }
+
     /// The checkpoints that this member pins, as its `ViewAck` reports them.
     pub(super) fn dst_pins(&self) -> HashSet<uuid::Uuid> {
         self.pinned_checkpoints()
@@ -1790,9 +1809,9 @@ pub(crate) use clock::{Millis, ProbeReply, ProbeRequest, PROBE_ROUTE};
 use defragment::Defragment;
 #[cfg(test)]
 use defragment::DefragmentStep;
-#[cfg(test)]
-pub(super) use fault::fenced;
 pub(crate) use fault::WriterReport;
+#[cfg(test)]
+pub(super) use fault::{classify, fenced, Fault};
 use fault::{Candidate, HANDOFF_TIMEOUTS};
 pub(super) use progress::Progress;
 pub(crate) use write_proof::{Prober, WriteProbeReply, WriteProbeRequest, WRITE_PROBE_ROUTE};
