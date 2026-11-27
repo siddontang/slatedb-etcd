@@ -1317,6 +1317,77 @@ async fn a_late_job_costs_one_reopen_and_no_handoff() {
     leader.close().await;
 }
 
+/// Sig-Codex, round 4: a Defragment of the current term meets a job 3 s above its writer clock.
+/// SlateDB refuses the Defragment's job. The reply is a retryable `Unavailable`, not
+/// `DataLoss` for corrupt data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_defragment_job_is_retryable() {
+    let (mut leader, _clock, sampling) = sampled_leader().await;
+    leader.put("before").await;
+    leader.covered(2, Duration::from_secs(10)).await;
+    submit_ahead(&leader, Duration::from_secs(3)).await;
+    let writer = leader.writer();
+    let open = writer.open.lock().unwrap().clone().unwrap();
+    let defragment = Defragment {
+        db: open.db.clone(),
+        admin: open.admin.clone(),
+        owner: Some(open.gate.clone()),
+        progress: writer.progress.clone(),
+        announced: writer.applied.announced.clone(),
+        leadership: writer.leadership.subscribe(),
+        term: 2,
+        pause: None,
+    };
+    let error = defragment.run().await.unwrap_err();
+    assert_eq!(
+        error.code,
+        tonic::Code::Unavailable as i32,
+        "{}",
+        error.message
+    );
+    assert!(error.message.contains("retry"), "{}", error.message);
+    sampling.abort();
+    leader.close().await;
+}
+
+/// Sig-Codex, round 4: `sync_writer` refreshes the clock before the leadership receiver. In
+/// that window the gate refuses the Defragment's submission while the receiver still shows the
+/// term. The reply is the lost-leader error, not `DataLoss`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gate_that_ends_first_gives_the_lost_leader_reply() {
+    let (mut leader, clock, sampling) = sampled_leader().await;
+    leader.put("before").await;
+    leader.covered(2, Duration::from_secs(10)).await;
+    let writer = leader.writer();
+    let open = writer.open.lock().unwrap().clone().unwrap();
+    let (_term, leadership) = tokio::sync::watch::channel((true, 2));
+    let defragment = Defragment {
+        db: open.db.clone(),
+        admin: open.admin.clone(),
+        owner: Some(open.gate.clone()),
+        progress: writer.progress.clone(),
+        announced: writer.applied.announced.clone(),
+        leadership,
+        term: 2,
+        pause: None,
+    };
+    clock.stand_down();
+    let error = defragment.run().await.unwrap_err();
+    assert_eq!(
+        error.code,
+        tonic::Code::Unavailable as i32,
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("leader changed"),
+        "{}",
+        error.message
+    );
+    sampling.abort();
+    leader.close().await;
+}
+
 /// Sig-Codex, round 3: a stored floor 60 s ahead of the clock refuses the writer before its
 /// open. The writer epoch in the manifest does not move, so no open and no fence happened.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
