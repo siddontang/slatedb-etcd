@@ -104,7 +104,7 @@ impl StateMachine {
         );
         // The search reads manifests and opens a checkpoint. It changes nothing, so a storage
         // error keeps its class, and apply can run the rebase again.
-        let mark = crate::mvcc::storage_fault::read_cause;
+        let mark = crate::storage_fault::read_cause;
         let newest = newest_base_through(&self.admin, &shared.source, limit)
             .await
             .map_err(mark)?;
@@ -116,8 +116,8 @@ impl StateMachine {
                     .map_err(mark)?
             }
             _ => {
-                return Err(anyhow::Error::new(crate::mvcc::storage_fault::Classified {
-                    fault: crate::mvcc::storage_fault::StorageFault::Missing,
+                return Err(anyhow::Error::new(crate::storage_fault::Classified {
+                    fault: crate::storage_fault::StorageFault::Missing,
                     message: format!(
                         "the base is gone, and no view checkpoint has a row from the base \
                          index {index} to the rebase index {limit}"
@@ -192,7 +192,7 @@ impl StateMachine {
                         .source
                         .open_base(id)
                         .await
-                        .map_err(crate::mvcc::storage_fault::read_cause)?,
+                        .map_err(crate::storage_fault::read_cause)?,
                 };
                 *reader = Some(base.clone());
                 base
@@ -217,11 +217,9 @@ impl StateMachine {
 /// a row of the base that does not decode or contradicts another row. The load also builds the
 /// state meters, which fail only on invalid static options, so no member-local error comes here.
 fn candidate_fault(error: anyhow::Error) -> anyhow::Error {
-    match crate::mvcc::storage_fault::classify(&error) {
-        Some(_) => crate::mvcc::storage_fault::read_cause(error),
-        None => {
-            crate::mvcc::storage_fault::stored(format!("the new base does not load: {error:#}"))
-        }
+    match crate::storage_fault::classify(&error) {
+        Some(_) => crate::storage_fault::read_cause(error),
+        None => crate::storage_fault::stored(format!("the new base does not load: {error:#}")),
     }
 }
 

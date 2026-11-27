@@ -866,8 +866,7 @@ async fn newest_base(admin: &slatedb::admin::Admin, source: &Source) -> Result<O
 /// that GC deleted under an old base. See `storage_fault::classify`. A read error that crossed a
 /// `KvError` keeps its class.
 pub(crate) fn missing_object(error: &anyhow::Error) -> bool {
-    crate::mvcc::storage_fault::classify(error)
-        == Some(crate::mvcc::storage_fault::StorageFault::Missing)
+    crate::storage_fault::classify(error) == Some(crate::storage_fault::StorageFault::Missing)
 }
 
 /// Bases that opened in the background, each with the index that its announcement certified.

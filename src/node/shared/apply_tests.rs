@@ -399,8 +399,8 @@ async fn lose_a_checkpoint_object(lose: Lose) {
             panic!("the checkpoint did not fail");
         };
         assert_eq!(
-            crate::mvcc::storage_fault::classify(&error),
-            Some(crate::mvcc::storage_fault::StorageFault::Transient)
+            crate::storage_fault::classify(&error),
+            Some(crate::storage_fault::StorageFault::Transient)
         );
         // The store recovers. The next Checkpoint job records the base at 20.
         faults.set(0);
@@ -428,8 +428,8 @@ async fn lose_a_checkpoint_object(lose: Lose) {
         faults.set(LOSE_SST_TWICE);
         // The first replay read fails on the store, after the rebase adopted the base at 20.
         executor.before_replay = Some(Box::new(|| {
-            Err(anyhow::Error::new(crate::mvcc::storage_fault::Classified {
-                fault: crate::mvcc::storage_fault::StorageFault::Transient,
+            Err(anyhow::Error::new(crate::storage_fault::Classified {
+                fault: crate::storage_fault::StorageFault::Transient,
                 message: "the store failed during the replay".into(),
             }))
         }));
@@ -509,8 +509,8 @@ async fn lose_a_checkpoint_object(lose: Lose) {
             .await
             .unwrap_err();
         assert_eq!(
-            crate::mvcc::storage_fault::classify(&error),
-            Some(crate::mvcc::storage_fault::StorageFault::Missing),
+            crate::storage_fault::classify(&error),
+            Some(crate::storage_fault::StorageFault::Missing),
             "{error:#}"
         );
         let Output::Entries(replies) = completion.output else {

@@ -82,7 +82,7 @@ impl StateMachine {
                             size,
                         )
                         .await
-                        .map_err(crate::mvcc::storage_fault::read_cause)?;
+                        .map_err(crate::storage_fault::read_cause)?;
                     batch.extend(alarm_write);
                     Err(if corrupt {
                         mvcc::KvError::new(tonic::Code::DataLoss, "corrupt cluster")
@@ -148,7 +148,7 @@ impl StateMachine {
                                             size,
                                         )
                                         .await
-                                        .map_err(crate::mvcc::storage_fault::read_cause)?;
+                                        .map_err(crate::storage_fault::read_cause)?;
                                     counts.merge(count);
                                     batch.extend(writes);
                                     Ok((reply, next))

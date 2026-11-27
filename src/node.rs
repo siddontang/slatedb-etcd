@@ -567,7 +567,7 @@ impl Node {
             state.metrics.registry.clone(),
         )?);
         crate::metrics::reads::READS.register(&state.metrics.registry)?;
-        crate::mvcc::storage_fault::register(&state.metrics.registry)?;
+        crate::storage_fault::register(&state.metrics.registry)?;
         let handles = state.shared_handles();
         let gauge = prometheus::IntGauge::new(
             "slatedb_etcd_shared_clock_skew_milliseconds",
@@ -1545,7 +1545,7 @@ impl Node {
             Ok(image) => image,
             // A storage error fails only this checkpoint. The record stays, and the next
             // checkpoint starts after `CHECKPOINT_RETRY`. Apply runs other jobs meanwhile.
-            Err(error) if crate::mvcc::storage_fault::classify(&error).is_some() => {
+            Err(error) if crate::storage_fault::classify(&error).is_some() => {
                 tracing::warn!(
                     error = format!("{error:#}"),
                     "a checkpoint failed; retry later"

@@ -1240,7 +1240,7 @@ impl Simulation {
                     // The same process stays with a closed writer, and the next open succeeds.
                     if let Some(leader) = leader {
                         let source = sim.nodes[&leader].writer.source().clone();
-                        let error = crate::mvcc::storage_fault::stored("an injected data error");
+                        let error = crate::storage_fault::stored("an injected data error");
                         *source.fail_writer.lock().unwrap() = Some(error);
                         let process = sim.processes[&leader];
                         sim.writer_step(&mut writers, leader, WriterStep::Open)

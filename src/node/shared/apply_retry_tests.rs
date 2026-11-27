@@ -199,8 +199,8 @@ async fn an_invariant_error_still_stops_apply() {
         .err()
         .expect("apply accepted an index gap");
     assert!(format!("{error:#}").contains("index gap"), "{error:#}");
-    let corrupt = anyhow::Error::new(crate::mvcc::storage_fault::Classified {
-        fault: crate::mvcc::storage_fault::StorageFault::Corrupt,
+    let corrupt = anyhow::Error::new(crate::storage_fault::Classified {
+        fault: crate::storage_fault::StorageFault::Corrupt,
         message: "short history key".into(),
     });
     assert_eq!(retryable(&corrupt), Some(StorageFault::Corrupt));
@@ -697,8 +697,8 @@ async fn base_drop(fault: BaseFault) {
     assert_eq!(rejected.checkpoint, base.checkpoint);
     assert_eq!(rejected.index, 4);
     let class = match fault {
-        BaseFault::Missing => crate::mvcc::storage_fault::StorageFault::Missing,
-        BaseFault::Corrupt => crate::mvcc::storage_fault::StorageFault::Corrupt,
+        BaseFault::Missing => crate::storage_fault::StorageFault::Missing,
+        BaseFault::Corrupt => crate::storage_fault::StorageFault::Corrupt,
     };
     assert_eq!(rejected.fault, class);
     assert_eq!(worker.control.paused(), None);

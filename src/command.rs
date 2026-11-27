@@ -186,7 +186,7 @@ mod tests {
             match RaftCommand::decode(&data) {
                 Ok(command) => panic!("{json} decoded as {command:?}"),
                 Err(error) => assert!(
-                    crate::mvcc::storage_fault::classify(&error).is_none(),
+                    crate::storage_fault::classify(&error).is_none(),
                     "{error:#}"
                 ),
             }

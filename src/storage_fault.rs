@@ -1,7 +1,7 @@
 //! Classify the errors that a read or a write of the stored state meets.
 //!
-//! This module uses no other module of the crate, so `mvcc`, `state`, and `node` all sit above
-//! it. A client read, apply,
+//! This module uses no other module of the crate, so `error`, `mvcc`, `state`, and `node` all sit
+//! above it. A client read, apply,
 //! and the shared writer use the same rule. The writer adds its own cases, such as a fence, on
 //! top of it. See "Failure cases" in `docs/shared-state.md`.
 //!

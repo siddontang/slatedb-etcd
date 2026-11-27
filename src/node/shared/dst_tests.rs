@@ -1761,8 +1761,8 @@ async fn a_failed_automatic_checkpoint_keeps_its_byte_trigger() {
         panic!("expected an inline checkpoint");
     };
     assert!(built.result.is_ok());
-    built.result = Err(anyhow::Error::new(crate::mvcc::storage_fault::Classified {
-        fault: crate::mvcc::storage_fault::StorageFault::Transient,
+    built.result = Err(anyhow::Error::new(crate::storage_fault::Classified {
+        fault: crate::storage_fault::StorageFault::Transient,
         message: "membership read temporarily unavailable".into(),
     }));
     node.complete_apply(completion).unwrap();

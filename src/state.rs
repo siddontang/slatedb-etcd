@@ -479,7 +479,7 @@ impl StateMachine {
         let size = batch
             .logical_size(self.applied_state(), &self.key_index, self.logical_bytes)
             .await
-            .map_err(crate::mvcc::storage_fault::read_cause)?;
+            .map_err(crate::storage_fault::read_cause)?;
         let size = self.store_batch(batch, index, size).await?;
         self.logical_bytes = size;
         self.applied_term = self.entry_term;
@@ -561,7 +561,7 @@ pub(crate) fn applied_term_row(index: u64, term: u64) -> [u8; 16] {
     row
 }
 
-pub(crate) use crate::mvcc::storage_fault::stored;
+pub(crate) use crate::storage_fault::stored;
 
 /// Decode the `meta/applied` row. A state without the row has applied nothing.
 fn decode_applied(row: Option<bytes::Bytes>) -> Result<u64> {

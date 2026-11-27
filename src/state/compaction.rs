@@ -356,7 +356,7 @@ impl StateMachine {
                 // leaves the entry unapplied.
                 None => read_step(self.applied_state(), current)
                     .await
-                    .map_err(crate::mvcc::storage_fault::read_cause)?,
+                    .map_err(crate::storage_fault::read_cause)?,
             };
             batch = step.batch;
             finished = step.finished;

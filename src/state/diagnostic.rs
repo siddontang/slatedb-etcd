@@ -53,11 +53,11 @@ impl StateMachine {
             .applied_state()
             .get(&data_key(key))
             .await
-            .map_err(crate::mvcc::storage_fault::read)?;
+            .map_err(crate::storage_fault::read)?;
         value
             .map(|value| {
                 String::from_utf8(value.to_vec()).map_err(|error| {
-                    crate::mvcc::storage_fault::stored(format!(
+                    crate::storage_fault::stored(format!(
                         "the diagnostic value of {key:?} is not UTF-8: {error}"
                     ))
                 })

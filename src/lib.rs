@@ -2,6 +2,7 @@ mod batch;
 mod codec;
 mod command;
 mod crc;
+mod error;
 pub use batch::WriteBatch;
 
 pub mod api;
@@ -22,6 +23,7 @@ pub mod server;
 pub mod state;
 pub mod status;
 pub mod storage;
+mod storage_fault;
 pub mod tls;
 pub mod watch;
 #[cfg(feature = "write-profile")]
