@@ -148,7 +148,7 @@ impl Node {
                 || self.apply_paused()
                 || self.raw.store().snapshot_pending()
                 || self.installing()
-                || self.prepared_puts.is_some()
+                || self.early_puts.active()
                 || !self.queries.is_empty()
                 || (!self.checkpoint_running && self.checkpoint_due().is_some())
             {
@@ -194,8 +194,7 @@ impl Node {
         if self.state.applied < snapshot_index {
             // The incoming snapshot covers the prepared prefix or establishes a new base.
             // Apply any remaining suffix through the normal committed log path.
-            self.prepared_puts.take();
-            self.held_puts.take();
+            self.early_puts.clear();
             return self.submit_apply(
                 Job::Snapshot(self.raw.store().recovery_snapshot().clone()),
                 snapshot_index,
@@ -206,7 +205,7 @@ impl Node {
             return self.submit_apply(Job::RaiseBase(record), self.state.applied);
         }
         // A switch frees overlay memory, so it goes before other work.
-        if self.prepared_puts.is_none() && self.writer.take_switch() {
+        if !self.early_puts.active() && self.writer.take_switch() {
             return self.submit_apply(Job::SwitchBase, self.state.applied);
         }
         if let Some((base, term)) = self.adoptable() {
@@ -217,10 +216,9 @@ impl Node {
         // log is volatile, so apply need not wait for the log thread to write it.
         let committed = self.committed_ready;
         let released = self.release_held_puts();
-        if let Some(batch) = &self.prepared_puts {
-            let last = batch.last;
-            if last <= committed && self.held_puts.is_none() {
-                let batch = self.prepared_puts.take().unwrap();
+        if self.early_puts.active() {
+            if let Some(batch) = self.early_puts.take_due(committed) {
+                let last = batch.last;
                 self.submit_apply(Job::PublishPuts(batch), last)?;
             }
             // Send the replies after the PublishPuts wake, so a handler runs on this worker.
@@ -327,24 +325,15 @@ impl Node {
                 }
             }
             Output::PreparedPuts(batch, replies) => {
-                // A term change can replace uncommitted entries at these indices. The held group
-                // is then dropped before any reply leaves.
-                let raft = &self.raw.raft;
-                if batch.last > raft.raft_log.committed
-                    || raft.term != self.prepare_term
-                    || raft.state != StateRole::Leader
-                {
-                    self.hold_puts(batch, replies);
+                let Some(replies) = self.early_puts.finish(batch, replies, &self.raw.raft) else {
                     return Ok(());
-                }
-                self.quorum_reply_index = batch.last;
+                };
                 // Withdraw the published view before any of these replies leaves.
                 self.publish_local_reads();
-                self.prepared_puts = Some(batch);
                 self.expire_pending();
                 self.finish_output(Output::Entries(replies))?;
             }
-            Output::Unprepared(last) => self.unprepared = last,
+            Output::Unprepared(last) => self.early_puts.fail(last),
             Output::Entries(replies) => {
                 // Raft takes the ConfState of a snapshot when it accepts it. A snapshot is above
                 // the commit index, so it covers each entry of these replies, and its ConfState

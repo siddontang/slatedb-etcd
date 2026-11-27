@@ -294,21 +294,12 @@ pub struct Node {
     /// Submitted apply jobs in order: target index, and whether a later Entries job may follow.
     apply_jobs: VecDeque<(u64, bool)>,
     committed_ready: u64,
-    prepared_puts: Option<crate::state::put_batch::PreparedPuts>,
-    /// Replies for `prepared_puts` evaluated before commit. See `quorum_put::HeldPuts`.
-    held_puts: Option<quorum_put::HeldPuts>,
-    /// The term of the entries in the last submitted PreparePuts job.
-    prepare_term: u64,
+    /// Put replies that leave before the local apply. See `quorum_put::EarlyPuts`.
+    early_puts: quorum_put::EarlyPuts,
     /// True while the log above a held entry is past its alarm bound. See `tick_apply_pause`.
     hold_alarm: bool,
     /// The entry that apply held on, until apply passes it. See `WriterReport::apply_held_at`.
     apply_held_at: Option<u64>,
-    /// The last entry of a PreparePuts job that a storage error ended. No early reply runs
-    /// until apply passes it, so the committed path applies those entries and retries.
-    unprepared: u64,
-    quorum_reply_index: u64,
-    /// Watch creations that wait while a Put reply runs ahead of the local apply.
-    watch_waiters: Vec<oneshot::Sender<()>>,
     queries: VecDeque<Query>,
     prefer_query: bool,
     apply_delay_ms: u64,
@@ -653,14 +644,9 @@ impl Node {
             apply_target: applied.applied,
             apply_jobs: VecDeque::new(),
             committed_ready: applied.applied,
-            prepared_puts: None,
-            held_puts: None,
-            prepare_term: 0,
-            unprepared: 0,
+            early_puts: quorum_put::EarlyPuts::default(),
             hold_alarm: false,
             apply_held_at: None,
-            quorum_reply_index: 0,
-            watch_waiters: Vec::new(),
             state: applied,
             worker,
             apply_busy: false,
@@ -1155,13 +1141,7 @@ impl Node {
             Event::WatchBarrier(response) => {
                 // etcd creates a Watch at the local revision. Wait like a read so that the
                 // create covers a Put this member already answered.
-                if self.reply_ahead() {
-                    // A stream that closed while it waited drops its receiver.
-                    self.watch_waiters.retain(|waiter| !waiter.is_closed());
-                    self.watch_waiters.push(response);
-                } else {
-                    let _ = response.send(());
-                }
+                self.early_puts.watch_barrier(self.state.applied, response);
             }
             Event::Metrics(response) => {
                 let id = self.options.id;
@@ -1473,19 +1453,13 @@ impl Node {
         );
     }
 
-    /// A prepared Put reply runs ahead of the local apply. Reads and Watch creation wait until
-    /// the replied entries are applied here.
-    fn reply_ahead(&self) -> bool {
-        self.state.applied < self.quorum_reply_index
-    }
-
     /// Publish the applied view for serializable point reads outside the owner.
     ///
-    /// While a prepared Put reply runs ahead of the local apply (`quorum_reply_index`), reads
-    /// wait in the owner so that a client that saw the reply also reads its effect here.
+    /// While a prepared Put reply runs ahead of the local apply (`EarlyPuts::reads_blocked`),
+    /// reads wait in the owner so that a client that saw the reply also reads its effect here.
     fn publish_local_reads(&self) {
-        let local =
-            (!self.reply_ahead()).then(|| LocalRead::new(self.state.read.clone(), self.header()));
+        let local = (!self.early_puts.reads_blocked(self.state.applied))
+            .then(|| LocalRead::new(self.state.read.clone(), self.header()));
         self.forwarding.publish_local(local);
     }
 
@@ -1526,7 +1500,7 @@ impl Node {
     }
 
     fn start_checkpoint(&mut self, image: bool) -> Result<()> {
-        if self.checkpoint_running || self.apply_busy || self.prepared_puts.is_some() {
+        if self.checkpoint_running || self.apply_busy || self.early_puts.active() {
             return Ok(());
         }
         // A record built at a base below the record could not replace it. See `certify_base`.
@@ -1686,7 +1660,7 @@ impl Node {
         {
             status["write_profile"] = crate::write_profile::snapshot();
         }
-        status["quorum_reply_index"] = self.quorum_reply_index.into();
+        status["quorum_reply_index"] = self.early_puts.reply_index().into();
         status["apply_paused"] = self.pause_status();
         status["apply_held_at"] = self.apply_held_at.into();
         status["quota"] = self.quota_status();

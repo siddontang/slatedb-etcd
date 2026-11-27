@@ -172,11 +172,8 @@ impl Node {
     }
 
     pub(super) fn schedule_reads(&mut self) {
-        if self.reply_ahead() {
+        if !self.early_puts.unblock_reads(self.state.applied) {
             return;
-        }
-        for response in self.watch_waiters.drain(..) {
-            let _ = response.send(());
         }
         for (id, read) in &mut self.reads {
             if self.read_queries.len() >= apply::MAX_QUERIES {
