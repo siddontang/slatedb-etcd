@@ -1790,9 +1790,9 @@ pub(crate) use clock::{Millis, ProbeReply, ProbeRequest, PROBE_ROUTE};
 use defragment::Defragment;
 #[cfg(test)]
 use defragment::DefragmentStep;
-#[cfg(test)]
-pub(super) use fault::fenced;
 pub(crate) use fault::WriterReport;
+#[cfg(test)]
+pub(super) use fault::{classify, fenced, Fault};
 use fault::{Candidate, HANDOFF_TIMEOUTS};
 pub(super) use progress::Progress;
 pub(crate) use write_proof::{Prober, WriteProbeReply, WriteProbeRequest, WRITE_PROBE_ROUTE};

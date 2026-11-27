@@ -846,8 +846,8 @@ enum WriterStep {
 }
 
 impl Simulation {
-    /// Run one writer step on member `id`. A fence closes the writer; the next open step opens
-    /// it again. Any other writer error stops the member, as architecture rule 8 requires.
+    /// Run one writer step on member `id`. An error closes the writer, and the next open step
+    /// opens it again. An invariant error also stops the member, as `fault::recover` does.
     async fn writer_step(
         &mut self,
         writers: &mut BTreeMap<u64, shared::DstWriter>,
@@ -894,11 +894,17 @@ impl Simulation {
                 writer.close().await;
                 self.trace.push(format!("writer {id} {step:?} fenced"));
             }
+            // `fault::recover`: the task abandons the writer and opens it again after a backoff,
+            // and the member stays. Only an invariant error stops the member.
             Err(error) => {
                 writer.close().await;
-                self.trace.push(format!("writer {id} {step:?} failed"));
+                let fault = shared::classify(&error);
+                self.trace
+                    .push(format!("writer {id} {step:?} failed {fault:?}"));
                 tracing::debug!(%error, id, "writer step failed");
-                self.stop(id);
+                if fault == shared::Fault::Invariant {
+                    self.stop(id);
+                }
             }
         }
         self.drive().await;
@@ -1094,8 +1100,9 @@ impl Simulation {
                         sim.trace.push("held read".into());
                     }
                 }
-                27 => {
-                    // The object store rejects SST writes for a while.
+                27 if sim.choose(2) == 0 => {
+                    // The object store rejects SST writes for a while. The writer of the leader
+                    // fails, and the leader opens it again.
                     let store = sim.shared.clone();
                     store.set(crate::object::faults::FAIL_PUT);
                     for _ in 0..5 {
@@ -1107,6 +1114,17 @@ impl Simulation {
                     }
                     store.set(0);
                     sim.trace.push("store recovered".into());
+                }
+                27 => {
+                    // The next writer open of the leader reads an object that does not decode.
+                    // The member stays, and a later open step opens the writer.
+                    if let Some(leader) = leader {
+                        let source = sim.nodes[&leader].writer.source();
+                        let error = crate::mvcc::storage_fault::stored("an injected data error");
+                        *source.fail_writer.lock().unwrap() = Some(error);
+                        sim.writer_step(&mut writers, leader, WriterStep::Open)
+                            .await;
+                    }
                 }
                 _ => {
                     if collections < 3 {
