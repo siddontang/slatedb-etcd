@@ -544,8 +544,12 @@ rebase again after the backoff.
      for a publication and waits for that checkpoint. A batch that a base released holds no
      change above that base row, so it does not count.
   3. Otherwise it announces the same checkpoint again with its covered index. This needs no new
-     checkpoint. The entry raises the base index of every member, and the leader records the
-     base there with the Raft term at that index.
+     checkpoint. The entry raises the base index of every member. The applied state of the
+     leader already shows the coverage, so the leader offers its base with it when it proposes
+     the entry, as the apply of the entry does later. The leader then records the base at the
+     new index with the Raft term there, before the entry commits. Raft on a follower that waits
+     for a snapshot appends no entry. When the entry needs the acknowledgement of that follower
+     to commit, as in a bare majority, the record must come first (#156).
   One announcement serves a demand at a time, and the leader sends it again only after 20 ticks
   without an apply. The announcement entry does not raise the demand, so an idle cluster stops
   appending.
