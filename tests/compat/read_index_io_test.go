@@ -28,12 +28,24 @@ func TestReadIndexAndNestedReadTxnDoNotWriteLogs(t *testing.T) {
 	require.NoError(t, err)
 	// A quorum can confirm the Put before the leader finishes its local write.
 	target := state["raft_commit_index"].(float64)
+	// A new leader proposes a second `SeedMembers` entry after its first seed applies. That
+	// entry can follow the Put. Wait until each member applies it, so that only the reads below
+	// can add an entry. The leader proposes no other seed in this term.
 	before := make(map[int]map[string]any)
 	for id := 1; id <= 3; id++ {
 		require.Eventually(t, func() bool {
 			state, err := c.http(id, "/status", nil)
-			if err == nil && state["applied_index"].(float64) >= target &&
-				state["commit_index"].(float64) >= target {
+			if err != nil {
+				return false
+			}
+			row, _ := state["members_row"].(map[string]any)
+			checked, _ := row["checked"].(map[string]any)
+			if checked == nil || checked["term"] != state["term"] {
+				return false
+			}
+			index := max(target, checked["index"].(float64))
+			if state["applied_index"].(float64) >= index &&
+				state["commit_index"].(float64) >= index {
 				before[id] = state
 				return true
 			}
