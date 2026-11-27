@@ -1163,13 +1163,7 @@ impl Node {
         if leader == 0 || self.manual_transport {
             return;
         }
-        let Some(address) = self
-            .state
-            .members
-            .members
-            .get(&leader)
-            .and_then(|member| member.peer_ur_ls.first())
-        else {
+        let Some(address) = self.peer_address(leader) else {
             return;
         };
         let url = format!("{}/raft/view-ack", crate::cluster::url(address));
@@ -1192,6 +1186,18 @@ impl Node {
                 tracing::debug!(%error, "cannot send a view report");
             }
         });
+    }
+
+    /// The peer address of member `id`. A joining member has no members list until its first
+    /// snapshot installs. Until then, it uses its configured address, so that its `ViewAck` gets
+    /// to the leader. Else the leader cannot send it a record above its row (#171).
+    pub(super) fn peer_address(&self, id: u64) -> Option<&String> {
+        self.state
+            .members
+            .members
+            .get(&id)
+            .and_then(|member| member.peer_ur_ls.first())
+            .or_else(|| self.options.peers.get(&id))
     }
 
     /// Return true when the overlay is over the soft limit. The leader then rejects client
