@@ -8,7 +8,8 @@
 //! - **Cap:** the leader probes the clock of each voter. The bound of a tick is the `m`-th
 //!   largest clock of all voters plus the skew limit, where `m` is a majority. Each batch gets
 //!   the tick `max(last, min(now, bound))`. So a persisted tick is at most the skew limit above
-//!   a voter majority. The leader reads its own clock fresh at each check. See `Clock::verdict`.
+//!   the voter-majority clock estimated at admission, from fresh samples. The leader reads its
+//!   own clock fresh at each check. See `Clock::verdict`.
 //!
 //! A leader clock above the bound is a diagnostic only: `/status` shows it as `ahead_ms`, and
 //! its ticks stay at the bound. It is measured only when no majority can support the leader
@@ -109,7 +110,7 @@ struct Voters {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Bound {
     /// The `m`-th largest voter clock plus the skew limit. A tick at or below it is at most the
-    /// skew limit above a majority of the voters.
+    /// skew limit above the voter-majority clock estimated at admission.
     pub cap: i64,
     /// The leader clock now.
     pub real: i64,
@@ -362,9 +363,10 @@ impl Clock {
     ///
     /// The bound is the `m`-th largest clock of all voters plus the skew limit, where `m` is a
     /// majority. The leader reads its own clock now. `cap` uses the low edge of each peer
-    /// window, so a tick at or below it is at most the skew limit above a voter majority. The
-    /// `ahead` diagnostic uses the high edges and counts each missing voter as one that agrees
-    /// with the leader, so neither a slow reply nor a missing one alone raises it.
+    /// window, so a tick at or below it is at most the skew limit above the voter-majority clock
+    /// estimated at admission. The `ahead` diagnostic uses the high edges and counts each missing
+    /// voter as one that agrees with the leader, so neither a slow reply nor a missing one alone
+    /// raises it.
     pub(super) fn verdict(&self) -> Verdict {
         self.decide().2
     }

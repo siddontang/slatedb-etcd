@@ -208,8 +208,9 @@ Rules and limits:
   `slatedb_etcd_shared_clock_skew_milliseconds`, and tries again with a backoff. After three
   refusals the leader hands over the lead.
 - A leader of several voters probes the clock of each voter every 500 ms. It caps each tick at
-  `--max-clock-skew` above the clocks of a voter majority. A leader clock that is further ahead
-  writes at the cap and sets `clock_alarm` to `ahead`. This is a diagnostic, not a fault.
+  `--max-clock-skew` above the voter-majority clock that it estimates at admission. A leader
+  clock that is further ahead writes at the cap and sets `clock_alarm` to `ahead`. This is a
+  diagnostic, not a fault.
 - A writer without fresh clock samples of a voter majority waits. `/status` shows
   `clock.waiting`, and `slatedb_etcd_shared_writer_clock_waiting` is 1. A wait that holds a
   batch for 30 s is a `stalled` fault. A skew that missing voters could still support is

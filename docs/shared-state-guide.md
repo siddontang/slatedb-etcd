@@ -158,9 +158,9 @@ logs an error, sets `clock_alarm` to `behind` in `/status`, sets
 `slatedb_etcd_shared_clock_skew_milliseconds`, and tries again with a backoff.
 
 The leader also probes the clock of each voter every 500 ms. It caps each tick at
-`--max-clock-skew` above the clocks of a voter majority. A leader clock that is further ahead
-writes at the cap and sets `clock_alarm` to `ahead`. While too few voters answer the probe, the
-writer waits and `/status` shows `clock.waiting`.
+`--max-clock-skew` above the voter-majority clock that it estimates at admission. A leader
+clock that is further ahead writes at the cap and sets `clock_alarm` to `ahead`. While too few
+voters answer the probe, the writer waits and `/status` shows `clock.waiting`.
 
 After three clock refusals the leader hands the lead to a voter without a writer fault. Keep host
 clocks synchronized with NTP, also on the host of a snapshot restore. See

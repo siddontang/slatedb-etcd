@@ -707,10 +707,12 @@ Each gate belongs to the term of its open. When the member stands down or a new 
 gate stays at `last`, and no batch gets a tick again. So a flush or a compaction that a stopped
 writer still runs takes no time above the last bound.
 
-The cap alone guarantees that a persisted tick is at most the skew limit above a voter
-majority. So a fast leader keeps the lead and writes at the cap. No client request fails, and no
-proposal waits for the check. A voter outside that majority can still be too far behind to lead.
-The behind check covers that voter at its open.
+The cap alone guarantees that a persisted tick is at most the skew limit above the
+voter-majority clock that the leader estimates at admission, from fresh samples. A voter clock
+that steps back after its sample still counts until a new reply comes. So a fast leader keeps
+the lead and writes at the cap. No client request fails, and no proposal waits for the check. A
+voter outside that majority can still be too far behind to lead. The behind check covers that
+voter at its open.
 
 For example, take relative clocks of +6 s, +4 s, and 0 s, and a 5 s limit. The cap is +9 s, so
 the fast leader writes +6 s. The 0 s candidate must wait or refuse through the behind check. No
