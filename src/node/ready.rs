@@ -1,4 +1,5 @@
 use super::*;
+pub(super) mod pipeline;
 
 impl Node {
     pub(super) async fn drive_ready(&mut self) -> Result<()> {
@@ -11,12 +12,9 @@ impl Node {
         self.issue_reads();
         self.expire_renewals();
         self.issue_renewals();
-        if self.log_queue.len() < log::MAX_JOBS
-            && self.log_bytes < log::MAX_BYTES
-            && self.log_snapshot_bytes < log::MAX_SNAPSHOT_BYTES
-        {
+        if self.log.has_room() {
             if let Some((index, conf, image)) = self.checkpoints.take_built() {
-                self.queue_log(
+                self.log.queue(
                     log::Job::Checkpoint { index, conf, image },
                     None,
                     Some(index),
@@ -27,12 +25,7 @@ impl Node {
         }
         // At a limit, the owner takes no Ready. Then a leader sends no heartbeat until the log
         // worker completes the job that keeps the queue full.
-        while self.raw.has_ready()
-            && self.log_queue.len() < log::MAX_JOBS
-            && self.log_bytes < log::MAX_BYTES
-            && self.log_snapshot_bytes < log::MAX_SNAPSHOT_BYTES
-            && self.log_queue.iter().map(|task| task.readys).sum::<usize>() < log::MAX_READYS
-        {
+        while self.raw.has_ready() && self.log.takes_ready() {
             let mut ready = self.raw.ready();
             if let Some(state) = ready.ss() {
                 if state.leader_id != 0 && self.last_observed_leader != state.leader_id {
@@ -80,8 +73,8 @@ impl Node {
             }
             // Cached entries must be readable before Raft can advance without disk completion.
             self.raw.advance_append_async(ready);
-            self.queue_log(job, Some(number), None, messages, reads);
-            self.join_queued_ready()?;
+            self.log.queue(job, Some(number), None, messages, reads);
+            self.log.join_queued_ready()?;
             // raft-rs permits leader replication before local persistence.
             self.send(early);
             for (peer, snapshot) in self.links.take_failures() {
@@ -91,19 +84,14 @@ impl Node {
                 }
             }
         }
-        if self.log_queue.len() < log::MAX_JOBS {
+        if !self.log.jobs_full() {
             if let Some(fetch) = self.raw.mut_store().take_fetch() {
-                self.queue_log(log::Job::Fetch(fetch), None, None, vec![], vec![]);
+                self.log
+                    .queue(log::Job::Fetch(fetch), None, None, vec![], vec![]);
             }
         }
         if !self.raw.has_ready() {
-            if let Some(task) = self.log_queue.back_mut() {
-                task.responses.append(&mut self.peer_waiters);
-            } else {
-                for response in self.peer_waiters.drain(..) {
-                    let _ = response.send(Ok(json!({"accepted": true})));
-                }
-            }
+            self.log.fence_peer_waiters();
         }
         self.start_log()?;
         self.schedule_reads();
@@ -112,114 +100,16 @@ impl Node {
         Ok(())
     }
 
-    pub(super) fn queue_log(
-        &mut self,
-        job: log::Job,
-        ready: Option<u64>,
-        checkpoint: Option<u64>,
-        messages: Vec<Message>,
-        reads: Vec<raft::ReadState>,
-    ) {
-        self.log_sequence += 1;
-        // The messages and read states wait in memory with the job, so they count too.
-        let messages_bytes: usize = messages.iter().map(ProtobufMessage::encoded_len).sum();
-        let reads_bytes: usize = reads.iter().map(|read| read.request_ctx.len()).sum();
-        let bytes = job.bytes() + messages_bytes + reads_bytes;
-        let snapshot_bytes = job.snapshot_bytes();
-        self.log_bytes += bytes;
-        self.log_snapshot_bytes += snapshot_bytes;
-        self.log_queue.push_back(LogTask {
-            id: self.log_sequence,
-            work: Some(job),
-            bytes,
-            snapshot_bytes,
-            ready,
-            readys: usize::from(ready.is_some()),
-            checkpoint,
-            messages,
-            reads,
-            responses: vec![],
-            stats_response: None,
-        });
-    }
-
     pub(super) fn start_log(&mut self) -> Result<()> {
-        if !self.log_busy {
-            // Empty Ready batches only fence earlier writes. They need no storage work.
-            while self
-                .log_queue
-                .front()
-                .is_some_and(|task| task.work.as_ref().is_some_and(log::Job::is_barrier))
-            {
-                let task = self.log_queue.pop_front().unwrap();
-                self.finish_log_task(task)?;
-            }
-            // Combine queued Ready work without adding a timer or crossing other job types.
-            while self.log_queue.len() >= 2
-                && self
-                    .log_queue
-                    .iter()
-                    .take(2)
-                    .all(|task| task.work.as_ref().is_some_and(log::Job::can_batch))
-            {
-                let mut task = self.log_queue.pop_front().unwrap();
-                let next = self.log_queue.pop_front().unwrap();
-                join_log(&mut task, next)?;
-                self.log_queue.push_front(task);
-            }
-            if let Some(task) = self.log_queue.front_mut() {
-                let job = task.work.take().context("log job already submitted")?;
-                let reading = matches!(job, log::Job::Fetch(_));
-                self.log_worker.submit(log::Work {
-                    id: task.id,
-                    job,
-                    delay: Duration::from_millis(if reading {
-                        self.log_read_delay_ms
-                    } else {
-                        self.log_delay_ms
-                    }),
-                    fail: if reading {
-                        self.log_read_fail
-                    } else {
-                        self.log_fail
-                    },
-                })?;
-                self.log_busy = true;
-            }
+        // Empty Ready batches only fence earlier writes. They need no storage work.
+        while let Some(task) = self.log.next_barrier() {
+            self.finish_log_task(task)?;
         }
-        Ok(())
-    }
-
-    /// Join the last queued Ready job to the queued Ready job before it, as `start_log` would.
-    /// Thus consecutive Ready jobs without a snapshot use at most two queue slots behind a slow
-    /// write, and the owner can take up to `log::MAX_READYS` Readys and send their heartbeats.
-    /// The joined job keeps its place, so it completes after all earlier jobs. A job with disk
-    /// work does not join an empty job before it: `start_log` completes the empty job without a
-    /// wait for that write.
-    fn join_queued_ready(&mut self) -> Result<()> {
-        let count = self.log_queue.len();
-        let joins = count >= 2
-            && match (
-                &self.log_queue[count - 2].work,
-                &self.log_queue[count - 1].work,
-            ) {
-                (Some(job), Some(next)) => {
-                    job.can_batch() && next.can_batch() && (next.is_barrier() || !job.is_barrier())
-                }
-                _ => false,
-            };
-        if joins {
-            let next = self.log_queue.pop_back().unwrap();
-            join_log(self.log_queue.back_mut().unwrap(), next)?;
-        }
-        Ok(())
+        self.log.submit(&self.log_worker)
     }
 
     pub(super) fn complete_log(&mut self, completed: log::Completion) -> Result<()> {
-        ensure!(self.log_busy, "unexpected log completion");
-        let mut task = self.log_queue.pop_front().context("missing log job")?;
-        ensure!(task.id == completed.id, "log completion is out of order");
-        self.log_busy = false;
+        let mut task = self.log.complete(completed.id)?;
         let saved = completed.durable.snapshot.get_metadata().index;
         if saved > self.raw.store().snapshot_index() {
             self.checkpoints
@@ -227,7 +117,7 @@ impl Node {
         }
         self.raw.mut_store().complete(completed.durable)?;
         if let Some(stats) = completed.stats {
-            if let Some(response) = task.stats_response.take() {
+            if let Some(response) = task.take_stats_response() {
                 let _ = response.send(Ok(serde_json::to_value(stats)?));
             }
         }
@@ -240,10 +130,9 @@ impl Node {
         Ok(())
     }
 
-    pub(super) fn finish_log_task(&mut self, task: LogTask) -> Result<()> {
+    pub(super) fn finish_log_task(&mut self, task: pipeline::LogTask) -> Result<()> {
         // An empty job can hold message bytes, and it completes here without the worker.
-        self.log_bytes -= task.bytes;
-        self.log_snapshot_bytes -= task.snapshot_bytes;
+        let task = self.log.release(task);
         if let Some(number) = task.ready {
             crate::failpoint::hit("raft-before-advance");
             self.raw.on_persist_ready(number);
@@ -268,15 +157,4 @@ impl Node {
         }
         Ok(())
     }
-}
-
-fn join_log(task: &mut LogTask, next: LogTask) -> Result<()> {
-    task.work.as_mut().unwrap().append(next.work.unwrap())?;
-    task.bytes += next.bytes;
-    task.ready = next.ready.or(task.ready);
-    task.readys += next.readys;
-    task.messages.extend(next.messages);
-    task.reads.extend(next.reads);
-    task.responses.extend(next.responses);
-    Ok(())
 }

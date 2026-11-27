@@ -588,7 +588,7 @@ async fn empty_log_barriers_wait_for_prior_persistence_and_fail_closed() {
     for fail in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let mut node = leader_node(dir.path()).await;
-        node.queue_log(
+        node.log.queue(
             log::Job::Ready {
                 entries: vec![],
                 hs: Some(node.raw.store().durable.hard_state),
@@ -599,9 +599,9 @@ async fn empty_log_barriers_wait_for_prior_persistence_and_fail_closed() {
             vec![],
             vec![],
         );
-        node.log_fail = fail;
+        node.log.set_fault(0, fail);
         let (tx, mut rx) = oneshot::channel();
-        node.queue_log(
+        node.log.queue(
             log::Job::Ready {
                 entries: vec![],
                 hs: None,
@@ -612,7 +612,7 @@ async fn empty_log_barriers_wait_for_prior_persistence_and_fail_closed() {
             vec![],
             vec![],
         );
-        node.log_queue.back_mut().unwrap().responses.push(tx);
+        node.log.respond_after_last(tx);
         node.start_log().unwrap();
         assert!(rx.try_recv().is_err());
         let completed = node.log_worker.step();
@@ -624,7 +624,7 @@ async fn empty_log_barriers_wait_for_prior_persistence_and_fail_closed() {
         } else {
             node.complete_log(completed.unwrap().unwrap()).unwrap();
             assert!(rx.await.unwrap().is_ok());
-            assert!(node.log_queue.is_empty());
+            assert_eq!(node.log.len(), 0);
             assert!(node.log_worker.step().unwrap().is_none());
         }
     }
@@ -648,7 +648,7 @@ async fn a_slow_log_write_does_not_stop_leader_heartbeats() {
     .unwrap();
     // The manual log worker holds this write until the test steps it.
     node.drive_ready().await.unwrap();
-    assert!(node.log_busy);
+    assert!(node.log.busy());
     for tick in 0..2 * log::MAX_JOBS {
         assert!(
             tick_leader(&mut node, &mut messages).await,
@@ -657,9 +657,9 @@ async fn a_slow_log_write_does_not_stop_leader_heartbeats() {
     }
     assert_eq!(node.raw.raft.state, StateRole::Leader);
     // The write, and then the empty Ready jobs as one job.
-    assert_eq!(node.log_queue.len(), 2);
+    assert_eq!(node.log.len(), 2);
     let (tx, mut barrier) = oneshot::channel();
-    node.log_queue.back_mut().unwrap().responses.push(tx);
+    node.log.respond_after_last(tx);
     let (tx, later) = oneshot::channel();
     node.propose(
         RaftCommand::Lease {
@@ -672,13 +672,13 @@ async fn a_slow_log_write_does_not_stop_leader_heartbeats() {
     .unwrap();
     node.drive_ready().await.unwrap();
     // A later write does not join the empty job, so the empty job does not wait for it.
-    assert_eq!(node.log_queue.len(), 3);
+    assert_eq!(node.log.len(), 3);
     let completed = node.log_worker.step().unwrap().unwrap();
     node.complete_log(completed).unwrap();
     assert!(barrier.try_recv().unwrap().is_ok());
-    assert_eq!(node.log_queue.len(), 1);
+    assert_eq!(node.log.len(), 1);
     node.drain_log().await.unwrap();
-    assert!(node.log_queue.is_empty());
+    assert_eq!(node.log.len(), 0);
     let mut ack = Message::default();
     ack.set_msg_type(MessageType::MsgAppendResponse);
     ack.from = 2;
@@ -728,8 +728,8 @@ async fn ready_records_behind_a_slow_log_write_are_bounded() {
     )
     .unwrap();
     node.drive_ready().await.unwrap();
-    assert!(node.log_busy);
-    let readys = |node: &Node| node.log_queue.iter().map(|task| task.readys).sum::<usize>();
+    assert!(node.log.busy());
+    let readys = |node: &Node| node.log.readys();
     let mut ticks = 0;
     while tick_leader(&mut node, &mut messages).await {
         ticks += 1;
@@ -745,7 +745,7 @@ async fn ready_records_behind_a_slow_log_write_are_bounded() {
     assert_eq!(node.raw.raft.state, StateRole::Leader);
     let completed = node.log_worker.step().unwrap().unwrap();
     node.complete_log(completed).unwrap();
-    assert!(node.log_queue.is_empty());
+    assert_eq!(node.log.len(), 0);
     assert!(tick_leader(&mut node, &mut messages).await);
 }
 
@@ -795,7 +795,7 @@ async fn follower_responses_wait_for_their_write_and_count_as_queued_bytes() {
         node.raw.step(append(index)).unwrap();
         node.drive_ready().await.unwrap();
     }
-    assert_eq!(node.log_queue.len(), 2);
+    assert_eq!(node.log.len(), 2);
     // The responses wait with the write of entry 4 and count as its bytes.
     for _ in 0..=log::MAX_BYTES >> 20 {
         let mut heartbeat = leader(MessageType::MsgHeartbeat);
@@ -803,8 +803,8 @@ async fn follower_responses_wait_for_their_write_and_count_as_queued_bytes() {
         node.raw.step(heartbeat).unwrap();
         node.drive_ready().await.unwrap();
     }
-    assert_eq!(node.log_queue.len(), 2);
-    assert!(node.log_bytes >= log::MAX_BYTES);
+    assert_eq!(node.log.len(), 2);
+    assert!(node.log.bytes() >= log::MAX_BYTES);
     assert!(node.raw.has_ready());
     assert!(sent(MessageType::MsgAppendResponse).is_empty());
     assert_eq!(node.raw.raft.raft_log.persisted, 1);
@@ -819,8 +819,8 @@ async fn follower_responses_wait_for_their_write_and_count_as_queued_bytes() {
     assert_eq!(sent(MessageType::MsgAppendResponse), [3, 4]);
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
-    assert!(node.log_queue.is_empty());
-    assert_eq!(node.log_bytes, 0);
+    assert_eq!(node.log.len(), 0);
+    assert_eq!(node.log.bytes(), 0);
 }
 
 #[tokio::test]
@@ -1165,7 +1165,7 @@ async fn log_failure_and_panic_stop_the_node() {
         let dir = tempfile::tempdir().unwrap();
         let (events, receiver) = mpsc::channel(256);
         let mut node = Node::open(options(dir.path()), events).await.unwrap();
-        node.log_fail = !panic;
+        node.log.set_fault(0, !panic);
         let job = if panic {
             log::Job::Panic
         } else {
@@ -1179,7 +1179,7 @@ async fn log_failure_and_panic_stop_the_node() {
                 snapshot: None,
             }
         };
-        node.queue_log(job, None, None, vec![], vec![]);
+        node.log.queue(job, None, None, vec![], vec![]);
         node.start_log().unwrap();
         let result = tokio::time::timeout(Duration::from_secs(2), node.run(receiver))
             .await
@@ -1214,8 +1214,8 @@ async fn shutdown_interrupts_the_log_fault_delay() {
     let dir = tempfile::tempdir().unwrap();
     let (events, _) = mpsc::channel(256);
     let mut node = Node::open(options(dir.path()), events).await.unwrap();
-    node.log_delay_ms = 5000;
-    node.queue_log(
+    node.log.set_fault(5000, false);
+    node.log.queue(
         log::Job::Ready {
             entries: vec![],
             hs: Some(HardState {
@@ -1383,7 +1383,7 @@ async fn checkpoint_memory_does_not_use_the_entry_admission_budget() {
     let dir = tempfile::tempdir().unwrap();
     let mut node = leader_node(dir.path()).await;
     let size = log::MAX_BYTES + 1;
-    node.queue_log(
+    node.log.queue(
         log::Job::Checkpoint {
             conf: node.state.members.conf(),
             index: node.state.applied,
@@ -1397,8 +1397,8 @@ async fn checkpoint_memory_does_not_use_the_entry_admission_budget() {
         vec![],
         vec![],
     );
-    assert_eq!(node.log_bytes, 0);
-    assert_eq!(node.log_snapshot_bytes, size);
+    assert_eq!(node.log.bytes(), 0);
+    assert_eq!(node.log.snapshot_bytes(), size);
     let (tx, mut rx) = oneshot::channel();
     node.propose(
         RaftCommand::Lease {
@@ -1414,7 +1414,7 @@ async fn checkpoint_memory_does_not_use_the_entry_admission_budget() {
         Err(oneshot::error::TryRecvError::Empty)
     ));
     assert_eq!(node.pending.len(), 1);
-    node.log_bytes = log::MAX_BYTES;
+    node.log.set_bytes(log::MAX_BYTES);
     let (tx, mut rx) = oneshot::channel();
     node.propose(
         RaftCommand::Lease {
@@ -1444,7 +1444,7 @@ async fn a_full_log_queue_cannot_let_apply_pass_the_ready_cursor() {
         .unwrap();
     node.raw.raft.set_max_committed_size_per_ready(1);
     for _ in 0..log::MAX_JOBS - 1 {
-        node.queue_log(log::Job::Stats, None, None, vec![], vec![]);
+        node.log.queue(log::Job::Stats, None, None, vec![], vec![]);
     }
     node.drive_ready().await.unwrap();
     assert_eq!(node.committed_ready, 1);
@@ -1475,7 +1475,7 @@ async fn queued_ready_jobs_share_sync_and_keep_the_final_log_suffix() {
         vec![entry(first + 1, 2), entry(first + 2, 2)],
     ] {
         let term = entries.last().unwrap().term;
-        node.queue_log(
+        node.log.queue(
             log::Job::Ready {
                 entries,
                 hs: Some(HardState {
@@ -1491,16 +1491,16 @@ async fn queued_ready_jobs_share_sync_and_keep_the_final_log_suffix() {
             vec![],
         );
         let (tx, rx) = oneshot::channel();
-        node.log_queue.back_mut().unwrap().responses.push(tx);
+        node.log.respond_after_last(tx);
         replies.push(rx);
     }
     // A diagnostic job is a batch boundary.
-    node.queue_log(log::Job::Stats, None, None, vec![], vec![]);
+    node.log.queue(log::Job::Stats, None, None, vec![], vec![]);
     let before = node.log_worker.storage().sync_writes;
-    let charged = node.log_bytes;
+    let charged = node.log.bytes();
     node.start_log().unwrap();
-    assert_eq!(node.log_queue.len(), 2);
-    assert_eq!(node.log_bytes, charged);
+    assert_eq!(node.log.len(), 2);
+    assert_eq!(node.log.bytes(), charged);
     assert!(replies.iter_mut().all(|reply| reply.try_recv().is_err()));
     let completed = node.log_worker.step().unwrap().unwrap();
     let storage = node.log_worker.storage();
@@ -1522,7 +1522,7 @@ async fn queued_ready_jobs_share_sync_and_keep_the_final_log_suffix() {
     for reply in replies {
         assert!(reply.await.unwrap().is_ok());
     }
-    assert_eq!(node.log_bytes, 0);
+    assert_eq!(node.log.bytes(), 0);
     node.drain_log().await.unwrap();
     assert_eq!(node.log_worker.storage().sync_writes, before + 1);
     drop(node);
