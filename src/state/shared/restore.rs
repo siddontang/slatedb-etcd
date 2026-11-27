@@ -264,9 +264,9 @@ pub(super) struct Progress {
 }
 
 impl Progress {
-    fn usage(&self) -> crate::batch::Usage {
+    fn usage(&self) -> crate::state::Usage {
         let [current, history, journal, other] = self.usage;
-        crate::batch::Usage {
+        crate::state::Usage {
             current,
             history,
             journal,
@@ -1045,7 +1045,7 @@ fn reopen(
 }
 
 /// Store the completion batch at the restored index, flush it, and read it back.
-async fn complete(db: &Db, input: &Input, mut usage: crate::batch::Usage) -> Result<()> {
+async fn complete(db: &Db, input: &Input, mut usage: crate::state::Usage) -> Result<()> {
     let index = input.index();
     let mut batch = slatedb::WriteBatch::new();
     batch.put(APPLIED, index.to_be_bytes());

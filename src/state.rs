@@ -38,6 +38,7 @@ mod snapshot;
 mod source;
 pub(crate) mod transfer;
 pub(crate) mod view;
+pub(crate) use quota::Usage;
 pub(crate) use read::ReadView;
 pub use shared::ViewRetention;
 pub use source::{Row, StateRead, StateScan};
@@ -79,7 +80,7 @@ pub struct StateMachine {
     pub quota: u64,
     /// The effective flag value of this member. It only shows a difference from the claim.
     quota_flag: i64,
-    logical_bytes: crate::batch::Usage,
+    logical_bytes: crate::state::Usage,
     pub(crate) current: current::CurrentRows,
     pub(crate) key_index: key_index::KeyIndex,
     /// Current rows shared by pinned point reads.
@@ -233,7 +234,7 @@ pub(crate) fn slatedb_settings() -> Settings {
 /// An entry that changes no state writes no batch, so it moves the apply marker past the
 /// counter. The next open then counts again. A counter without the split by row kind is
 /// counted again too.
-async fn load_logical_size(db: &impl StateRead, applied: u64) -> Result<crate::batch::Usage> {
+async fn load_logical_size(db: &impl StateRead, applied: u64) -> Result<crate::state::Usage> {
     use prost::Message;
     let stored = match db.get(LOGICAL_SIZE).await? {
         Some(row) => {
@@ -260,7 +261,7 @@ async fn load_logical_size(db: &impl StateRead, applied: u64) -> Result<crate::b
 fn stored_usage(
     counter: &crate::proto::state::LogicalSize,
     applied: u64,
-) -> Result<Option<crate::batch::Usage>> {
+) -> Result<Option<crate::state::Usage>> {
     if counter.applied != applied {
         return Ok(None);
     }
@@ -272,7 +273,7 @@ fn stored_usage(
     ) else {
         return Ok(None);
     };
-    let size = crate::batch::Usage {
+    let size = crate::state::Usage {
         current,
         history,
         journal,
@@ -287,7 +288,7 @@ fn stored_usage(
 }
 
 /// Encode the logical size row for `size` after `applied`.
-fn logical_size_row(applied: u64, size: crate::batch::Usage) -> Vec<u8> {
+fn logical_size_row(applied: u64, size: crate::state::Usage) -> Vec<u8> {
     use prost::Message;
     crate::proto::state::LogicalSize {
         applied,
@@ -476,10 +477,10 @@ impl StateMachine {
     }
 
     async fn write_batch(&mut self, batch: WriteBatch, index: u64) -> Result<()> {
-        let size = batch
-            .logical_size(self.applied_state(), &self.key_index, self.logical_bytes)
+        let size = self
+            .logical_size_after(&batch, None, self.logical_bytes)
             .await
-            .map_err(crate::mvcc::storage_fault::read_cause)?;
+            .map_err(crate::storage_fault::read_cause)?;
         let size = self.store_batch(batch, index, size).await?;
         self.logical_bytes = size;
         self.applied_term = self.entry_term;
@@ -491,8 +492,8 @@ impl StateMachine {
         &mut self,
         mut batch: WriteBatch,
         index: u64,
-        size: crate::batch::Usage,
-    ) -> Result<crate::batch::Usage> {
+        size: crate::state::Usage,
+    ) -> Result<crate::state::Usage> {
         if batch
             .keys()
             .all(|key| key == APPLIED || key == APPLIED_TERM)
@@ -530,7 +531,7 @@ impl StateMachine {
     }
 
     /// Store the logical size `size` at `index` in `batch`.
-    fn put_logical_size(&self, batch: &mut WriteBatch, index: u64, size: crate::batch::Usage) {
+    fn put_logical_size(&self, batch: &mut WriteBatch, index: u64, size: crate::state::Usage) {
         // The counter is outside `etcd/`, so it does not count itself.
         batch.put(LOGICAL_SIZE, logical_size_row(index, size));
     }
@@ -561,7 +562,7 @@ pub(crate) fn applied_term_row(index: u64, term: u64) -> [u8; 16] {
     row
 }
 
-pub(crate) use crate::mvcc::storage_fault::stored;
+pub(crate) use crate::storage_fault::stored;
 
 /// Decode the `meta/applied` row. A state without the row has applied nothing.
 fn decode_applied(row: Option<bytes::Bytes>) -> Result<u64> {

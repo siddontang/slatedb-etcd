@@ -8,7 +8,7 @@
 //! covers the entry ends the wait early.
 
 use super::*;
-use crate::mvcc::storage_fault::{Classified, StorageFault, StoredData};
+use crate::storage_fault::{Classified, StorageFault, StoredData};
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -289,7 +289,7 @@ pub(super) fn retryable(error: &anyhow::Error) -> Option<StorageFault> {
     let stored = error
         .chain()
         .any(|cause| cause.is::<StoredData>() || cause.is::<prost::DecodeError>());
-    match (read, crate::mvcc::storage_fault::classify(error)) {
+    match (read, crate::storage_fault::classify(error)) {
         (_, Some(StorageFault::Missing)) => Some(StorageFault::Missing),
         (Some(fault), _) => Some(fault),
         _ if stored => Some(StorageFault::Corrupt),

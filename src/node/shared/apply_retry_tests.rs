@@ -199,8 +199,8 @@ async fn an_invariant_error_still_stops_apply() {
         .err()
         .expect("apply accepted an index gap");
     assert!(format!("{error:#}").contains("index gap"), "{error:#}");
-    let corrupt = anyhow::Error::new(crate::mvcc::storage_fault::Classified {
-        fault: crate::mvcc::storage_fault::StorageFault::Corrupt,
+    let corrupt = anyhow::Error::new(crate::storage_fault::Classified {
+        fault: crate::storage_fault::StorageFault::Corrupt,
         message: "short history key".into(),
     });
     assert_eq!(retryable(&corrupt), Some(StorageFault::Corrupt));
@@ -337,7 +337,7 @@ async fn a_membership_change_reads_its_row_once() {
     let dir = tempfile::tempdir().unwrap();
     let mut state = StateMachine::open_test(dir.path()).await.unwrap();
     state.apply_cluster(1, &voter(7), &admin).await.unwrap();
-    let reads = || crate::batch::SIZE_READS.with(std::cell::Cell::get);
+    let reads = || crate::state::quota::SIZE_READS.with(std::cell::Cell::get);
     let before = reads();
     let outcome = state.apply_cluster(2, &voter(8), &admin).await.unwrap();
     outcome.result.unwrap();
@@ -697,8 +697,8 @@ async fn base_drop(fault: BaseFault) {
     assert_eq!(rejected.checkpoint, base.checkpoint);
     assert_eq!(rejected.index, 4);
     let class = match fault {
-        BaseFault::Missing => crate::mvcc::storage_fault::StorageFault::Missing,
-        BaseFault::Corrupt => crate::mvcc::storage_fault::StorageFault::Corrupt,
+        BaseFault::Missing => crate::storage_fault::StorageFault::Missing,
+        BaseFault::Corrupt => crate::storage_fault::StorageFault::Corrupt,
     };
     assert_eq!(rejected.fault, class);
     assert_eq!(worker.control.paused(), None);

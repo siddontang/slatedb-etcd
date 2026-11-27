@@ -1,4 +1,4 @@
-use crate::mvcc::KvError;
+use crate::error::KvError;
 use crate::proto::etcdserverpb::*;
 use raft::eraftpb::{ConfChange, ConfChangeType, ConfState};
 use serde::{Deserialize, Serialize};

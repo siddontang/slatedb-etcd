@@ -2,7 +2,6 @@
 //! stays in operation. See `storage_fault`.
 
 use super::*;
-use crate::mvcc::storage_fault::CORRUPT_READS;
 use crate::object::faults::{FaultStore, FAIL_SST_GET};
 use crate::proto::etcdserverpb::response_op::Response as Resp;
 use crate::proto::etcdserverpb::{
@@ -10,6 +9,7 @@ use crate::proto::etcdserverpb::{
     RangeRequest,
 };
 use crate::server::{Server, ServerConfig};
+use crate::storage_fault::CORRUPT_READS;
 use slatedb::object_store::memory::InMemory;
 use std::sync::Arc;
 use tokio_stream::StreamExt;

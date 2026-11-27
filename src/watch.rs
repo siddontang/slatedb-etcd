@@ -360,8 +360,8 @@ pub(crate) async fn scan(
             // that it read. So a retry on a new view makes progress.
             Err(error)
                 if !rows.is_empty()
-                    && crate::mvcc::storage_fault::of_slatedb(&error)
-                        != crate::mvcc::storage_fault::StorageFault::Corrupt =>
+                    && crate::storage_fault::of_slatedb(&error)
+                        != crate::storage_fault::StorageFault::Corrupt =>
             {
                 let covered = rows.last().map(|(revision, _)| *revision).unwrap();
                 return Ok((rows, covered));

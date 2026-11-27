@@ -2033,8 +2033,8 @@ async fn a_failed_checkpoint_read_keeps_the_node_and_its_record() {
     let failed = apply::Built {
         index,
         conf: conf.clone(),
-        result: Err(anyhow::Error::new(crate::mvcc::storage_fault::Classified {
-            fault: crate::mvcc::storage_fault::StorageFault::Transient,
+        result: Err(anyhow::Error::new(crate::storage_fault::Classified {
+            fault: crate::storage_fault::StorageFault::Transient,
             message: "the store failed".into(),
         })),
     };

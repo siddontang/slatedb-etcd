@@ -1488,7 +1488,7 @@ async fn a_dropped_base_is_reported_until_the_pause_ends() {
     let rejected = apply::RejectedBase {
         checkpoint: Some(id),
         index: 9,
-        fault: crate::mvcc::storage_fault::StorageFault::Corrupt,
+        fault: crate::storage_fault::StorageFault::Corrupt,
         reason: "invalid members row".into(),
     };
     for _ in 0..3 {

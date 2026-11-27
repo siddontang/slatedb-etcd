@@ -11,10 +11,10 @@ use slatedb::config::{CheckpointOptions, CheckpointScope, WriteOptions};
 
 use std::collections::HashSet;
 
-use crate::mvcc::storage_fault::{StorageFault, CORRUPT_READS};
 use crate::mvcc::{KvError, Outcome};
 use crate::state::overlay::Queue;
 use crate::state::shared::{newest_base_between, view_checkpoints, view_name, Handles, Source};
+use crate::storage_fault::{StorageFault, CORRUPT_READS};
 
 /// The newest checkpoints that the publisher keeps. It also keeps every newer checkpoint than
 /// the oldest one that a live base pins.
