@@ -15,6 +15,7 @@ pub struct Store {
 
 /// The payload of a `SeedMembers` entry. See `state::cluster`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Seed {
     pub id: String,
     /// The leader that proposed the entry.

@@ -94,9 +94,8 @@ Independent physical host failures, physical power loss, and rolling binary upgr
 untested.
 
 Native backup and backend Hash formats differ from etcd bbolt.
-Storage format 4 requires fresh directories and object prefixes.
-Old backups and logs are unsupported.
-Native backups use format 4.
+Storage format 4 requires fresh data directories and object prefixes. Older logs are unsupported.
+Native backups have a separate format, 4. Backups of the previous binary use it too.
 Format 4 rows keep a Put value only in the current and history rows.
 Hash records keep a CRC of the value, and Watch journals read the value from history.
 A hash digest starts with a zero byte and a layout version. No etcd `KeyValue` encoding starts

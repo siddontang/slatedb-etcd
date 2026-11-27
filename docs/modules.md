@@ -80,7 +80,8 @@ Restart opens a checkpoint, installs a newer durable snapshot, and replays the r
 
 Keep etcd response headers, errors, revisions, transactions, and permissions in the compatibility
 contract. Internal API and storage changes need no old-version adapter.
-Storage format 4 rejects older directories and snapshots. Mixed-version clusters are unsupported.
+Storage format 4 rejects older data directories. Native backups have a separate format.
+Mixed-version clusters are unsupported.
 
 Use a named domain module for new state transitions. Keep one ordered mutation owner.
 Do not read live storage with revision or Auth metadata from a different applied position.

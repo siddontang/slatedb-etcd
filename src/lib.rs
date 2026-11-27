@@ -79,6 +79,7 @@ impl Request {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Command {
     pub id: String,
     pub request: Request,

@@ -172,6 +172,11 @@ mod tests {
             serde_json::json!({"Lease": {"id": "lease", "origin": 3, "lease": {"action": "x"}}}),
             serde_json::json!({"Compact": {"id": "compact", "compact": "wrong"}}),
             serde_json::json!({"CompactStep": {"id": "step", "snapshot": "x"}}),
+            // Newtype variants: the fields beside `id` belong to the inner struct.
+            serde_json::json!({"Diagnostic": {"id": "diag", "request": {"operations": []},
+                "extra": 1}}),
+            serde_json::json!({"SeedMembers": {"id": "seed", "origin": 1, "members": "{}",
+                "digest": null, "applied": 0, "extra": 1}}),
             nested,
         ] {
             let data = Envelope {
