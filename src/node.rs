@@ -229,21 +229,6 @@ struct Pending {
     term: u64,
 }
 
-struct LogTask {
-    id: u64,
-    work: Option<log::Job>,
-    bytes: usize,
-    snapshot_bytes: usize,
-    ready: Option<u64>,
-    /// The Readys in this task. raft-rs keeps a record for each until `on_persist_ready`.
-    readys: usize,
-    checkpoint: Option<u64>,
-    messages: Vec<Message>,
-    reads: Vec<raft::ReadState>,
-    responses: Vec<Response>,
-    stats_response: Option<Response>,
-}
-
 /// Raft tick interval. Election timeouts count these ticks.
 pub(crate) const TICK: Duration = Duration::from_millis(100);
 /// A client write fails if it waits longer than this before proposal, or after it.
@@ -265,16 +250,8 @@ pub struct Node {
     manual_transport: bool,
     raw: RawNode<log::Cache>,
     log_worker: log::Worker,
-    log_queue: VecDeque<LogTask>,
-    log_busy: bool,
-    log_sequence: u64,
-    log_bytes: usize,
-    log_snapshot_bytes: usize,
-    log_delay_ms: u64,
-    log_fail: bool,
-    log_read_delay_ms: u64,
-    log_read_fail: bool,
-    peer_waiters: Vec<Response>,
+    /// The queued log jobs and the step replies that wait for them. See `ready::pipeline`.
+    log: ready::pipeline::LogPipeline,
     read_executor: read::executor::Executor,
     /// The ReadIndex reads, the queued reads, and the revision waits. See `read::table`.
     reads: read::table::ReadIndexTable,
@@ -577,16 +554,7 @@ impl Node {
             manual_transport: manual_apply,
             raw,
             log_worker,
-            log_queue: VecDeque::new(),
-            log_busy: false,
-            log_sequence: 0,
-            log_bytes: 0,
-            log_snapshot_bytes: 0,
-            log_delay_ms: 0,
-            log_fail: false,
-            log_read_delay_ms: 0,
-            log_read_fail: false,
-            peer_waiters: vec![],
+            log: ready::pipeline::LogPipeline::new(),
             read_executor: read::executor::Executor::new(manual_apply),
             reads: read::table::ReadIndexTable::new(),
             apply_target: applied.applied,
@@ -805,7 +773,7 @@ impl Node {
                     }
                 }
             }
-            self.peer_waiters.extend(step_responses);
+            self.log.add_peer_waiters(step_responses);
             self.drive_ready().await?;
             self.sync_lease_deadlines();
             self.expire_pending();
@@ -978,11 +946,10 @@ impl Node {
             }
             Event::WaitRevision(revision, response) => self.wait_revision(revision, response),
             Event::LogStats(response) => {
-                if self.log_queue.len() >= log::MAX_JOBS {
+                if self.log.jobs_full() {
                     let _ = response.send(Err(self.error("too many pending log jobs")));
                 } else {
-                    self.queue_log(log::Job::Stats, None, None, vec![], vec![]);
-                    self.log_queue.back_mut().unwrap().stats_response = Some(response);
+                    self.log.queue_stats(response);
                 }
             }
             Event::EtcdRead(request, response) => {
@@ -1048,7 +1015,7 @@ impl Node {
                     || !self.options.peers.contains_key(&message.from)
                     || self.blocked.contains(&message.from)
                     || !self.admits_peer(&message)
-                    || self.peer_waiters.len() + step_responses.len() >= 256
+                    || self.log.peer_waiters() + step_responses.len() >= 256
                 {
                     let _ = response.send(Err(self.error("peer message rejected")));
                 } else {
@@ -1170,13 +1137,11 @@ impl Node {
                 let _ = response.send(Ok(self.status()?));
             }
             Event::LogReadFault(delay_ms, fail, response) => {
-                self.log_read_delay_ms = delay_ms.min(5000);
-                self.log_read_fail = fail;
+                self.log.set_read_fault(delay_ms.min(5000), fail);
                 let _ = response.send(Ok(self.status()?));
             }
             Event::LogFault(delay_ms, fail, response) => {
-                self.log_delay_ms = delay_ms.min(5000);
-                self.log_fail = fail;
+                self.log.set_fault(delay_ms.min(5000), fail);
                 let _ = response.send(Ok(self.status()?));
             }
             Event::LocalValue(key, response) => {
@@ -1230,8 +1195,8 @@ impl Node {
                 .max(self.raw.raft.raft_log.committed)
                 .saturating_sub(self.state.applied)
                 >= apply::MAX_APPLY_LAG,
-            self.log_queue.len() >= log::MAX_JOBS,
-            self.log_bytes >= log::MAX_BYTES,
+            self.log.jobs_full(),
+            self.log.bytes_full(),
             // Raft drops proposals past `max_uncommitted_size`, and clients do not retry
             // a dropped Put. Raft counts each proposed entry until it leaves in a Ready
             // as committed, so this also covers entries that are on disk but need a
@@ -1539,14 +1504,11 @@ impl Node {
             "apply_busy": self.apply_busy, "apply_target": self.apply_target,
             "apply_lag": self.raw.store().commit_index().saturating_sub(self.state.applied),
             "queued_state_reads": self.queries.len(), "apply_delay_ms": self.apply_delay_ms,
-            "log_busy": self.log_busy, "queued_log_jobs": self.log_queue.len(),
-            "queued_log_bytes": self.log_bytes, "queued_snapshot_bytes": self.log_snapshot_bytes, "log_delay_ms": self.log_delay_ms,
-            "log_fail": self.log_fail, "pending_read_indexes": self.reads.pending(),
+            "pending_read_indexes": self.reads.pending(),
             "pending_revision_waiters": self.reads.revision_waiters(),
             "raft_commit_index": self.raw.raft.raft_log.committed,
             "cached_last_log_index": self.raw.store().last_index()?,
             "log_memory": self.raw.store().stats(),
-            "log_read_delay_ms": self.log_read_delay_ms, "log_read_fail": self.log_read_fail,
             "revision": self.state.revision,
             "compact_revision": self.state.compact_revision,
         });
@@ -1554,6 +1516,7 @@ impl Node {
         {
             status["write_profile"] = crate::write_profile::snapshot();
         }
+        self.log.status(&mut status);
         status["quorum_reply_index"] = self.early_puts.reply_index().into();
         status["apply_paused"] = self.pause_status();
         status["apply_held_at"] = self.apply_held_at.into();
