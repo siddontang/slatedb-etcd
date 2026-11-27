@@ -37,12 +37,12 @@ pub(crate) use shared::WriterReport;
 pub(crate) use shared::{Millis, ProbeReply, ProbeRequest, PROBE_ROUTE};
 pub(crate) use shared::{Prober, WriteProbeReply, WriteProbeRequest, WRITE_PROBE_ROUTE};
 mod quorum_put;
-mod quota;
 mod read;
 mod ready;
 mod response;
 mod schedule;
 mod shared;
+mod step;
 mod watch;
 use crate::peer::transport_to;
 use apply::{AppliedState, Completion, Header, Job, Output, Query, Reply, Work, Worker};
@@ -356,8 +356,6 @@ pub struct Node {
     /// still need the peer routes, so the test gives the samples itself.
     #[cfg(test)]
     clock_in_manual: bool,
-    /// The quota flag of this member.
-    quota: quota::Quota,
     /// The term and index of the first `SeedMembers` proposal of this member in its last term.
     members_proposed: Option<(u64, u64)>,
     /// The last term in which this member proposed its digest again. See `propose_members`.
@@ -444,7 +442,6 @@ impl Node {
                 &shared,
             )
             .await?;
-        let quota = quota::Quota::new(options.effective_quota());
         let recovered = async {
             // Apply takes the quota from the cluster claim. The flag only shows a difference.
             state.set_quota_flag(options.effective_quota());
@@ -688,7 +685,6 @@ impl Node {
             lease_promoted: false,
             renewals: lease::Renewals::default(),
             writer,
-            quota,
             members_proposed: None,
             members_rechecked: 0,
             #[cfg(test)]

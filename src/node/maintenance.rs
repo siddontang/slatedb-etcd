@@ -3,6 +3,25 @@ use crate::mvcc::{KvError, Outcome};
 use tonic::Code;
 
 impl Node {
+    /// The quota fields of `/status`.
+    pub(super) fn quota_status(&self) -> Value {
+        json!({
+            "bytes": self.state.quota_bytes,
+            "flag_bytes": self.options.effective_quota(),
+            "flag_mismatch": self.state.quota_mismatch,
+        })
+    }
+
+    /// The `db_size_quota` of Maintenance Status. Like etcd, it is the configured value, unless
+    /// the quota that apply uses differs from it.
+    pub(super) fn status_quota(&self) -> i64 {
+        if self.state.quota_mismatch {
+            self.state.quota_bytes
+        } else {
+            self.options.quota_bytes
+        }
+    }
+
     pub(super) fn move_leader(
         &mut self,
         target: u64,
