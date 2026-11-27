@@ -430,7 +430,6 @@ async fn fixture(path: &FilePath, keys: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
         crate::maintenance::ALARMS.to_vec(),
         serde_json::to_vec(&alarms).unwrap(),
     ));
-    rows.push((quota::KEY.to_vec(), 1_i64.to_be_bytes().to_vec()));
     // The membership row stays last, as in every image.
     rows.sort_by(|a, b| {
         let members = |key: &[u8]| key == crate::cluster::KEY;
@@ -449,7 +448,11 @@ fn first_key_row(rows: &[(Vec<u8>, Vec<u8>)]) -> usize {
 
 /// The restored index, the loaded fields, and every stored row of the restored state.
 async fn contents(store: Arc<dyn ObjectStore>) -> (u64, String, Vec<(Vec<u8>, Vec<u8>)>) {
-    let state = open_shared(store).await;
+    contents_of(open_shared(store).await).await
+}
+
+/// The restored index, the loaded fields, and every stored row of `state`. It closes `state`.
+async fn contents_of(state: StateMachine) -> (u64, String, Vec<(Vec<u8>, Vec<u8>)>) {
     let mut rows = vec![];
     let mut scan = state
         .applied_state()
@@ -508,7 +511,6 @@ async fn a_restore_of_many_batches_completes_at_its_index() {
     assert_eq!(checkpoint.name, Some(view_name(index)));
     let base = member.source.open_base(checkpoint.id).await.unwrap();
     assert!(base.get(PROGRESS).await.unwrap().is_none());
-    assert!(base.get(quota::KEY).await.unwrap().is_none());
     let counter = base.get(LOGICAL_SIZE).await.unwrap().unwrap();
     let counter = <crate::proto::state::LogicalSize as prost::Message>::decode(counter).unwrap();
     let stored = stored_usage(&counter, index).unwrap().unwrap();
@@ -1118,14 +1120,8 @@ async fn a_bootstrapped_cluster_needs_no_restore_object() {
             restore: Some(retry),
             ..options()
         };
-        let opening = StateMachine::open_shared(
-            faulty,
-            "cluster",
-            "test",
-            StateCache::default(),
-            &options,
-            transfer::Backend::Local,
-        );
+        let opening =
+            StateMachine::open_shared(faulty, "cluster", "test", StateCache::default(), &options);
         let state = tokio::time::timeout(limit, opening).await.unwrap().unwrap();
         assert_eq!(state.applied, index, "{failing}");
         state.close().await.unwrap();
@@ -1184,16 +1180,7 @@ async fn open_join(store: Arc<dyn ObjectStore>) -> Result<StateMachine> {
         empty_log: true,
         ..options()
     };
-    let local = transfer::Backend::Local;
-    StateMachine::open_shared(
-        store,
-        "cluster",
-        "test",
-        StateCache::default(),
-        &options,
-        local,
-    )
-    .await
+    StateMachine::open_shared(store, "cluster", "test", StateCache::default(), &options).await
 }
 
 /// A restore stops after its first durable rows. A joining member with an empty log does not
@@ -1429,4 +1416,79 @@ async fn a_join_waits_for_the_bootstrap_decision() {
     assert!(started.elapsed() > STALE * 2);
     restoring.await.unwrap().unwrap();
     joined.close().await.unwrap();
+}
+
+/// Follow the guide to abandon a partial restore. Keep `shared/owner.json`, delete the other
+/// `shared/` objects, and restore another image with the same member directory. The retry
+/// restores the second image, and the member still refuses a different store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_abandoned_restore_keeps_the_store_id_and_restores_another_image() {
+    use futures::TryStreamExt;
+    let files = tempfile::tempdir().unwrap();
+    let (first, second) = (files.path().join("first"), files.path().join("second"));
+    fixture(&first, 20).await;
+    fixture(&second, 30).await;
+    let s3 = crate::object::S3 {
+        bucket: "test-bucket".into(),
+        region: "us-east-1".into(),
+        endpoint: Some("http://127.0.0.1:9000".into()),
+        prefix: "tests".into(),
+        allow_http: true,
+    };
+    let root = s3.cluster_prefix("test");
+    let dirs = tempfile::tempdir().unwrap();
+    let open = |store: Arc<dyn ObjectStore>, restore: Restore| {
+        let (dir, s3) = (dirs.path().join("1"), s3.clone());
+        async move {
+            let options = shared::Options {
+                empty_log: true,
+                restore: Some(restore),
+                ..options()
+            };
+            crate::object::Config::TestS3(store, s3)
+                .open(&dir, "test", 1, StateCache::default(), &options)
+                .await
+        }
+    };
+    let store = store();
+    let stopped = checked(&first, URL, stopping(Stop::AfterFlush(1)));
+    let error = open(store.clone(), stopped).await.err().unwrap();
+    // The error names the guide steps that keep the claim.
+    let error = format!("{error:#}");
+    assert!(error.contains("\"Abandon a partial restore\""), "{error}");
+    assert!(error.contains("keep shared/owner.json"), "{error}");
+
+    // The guide: delete every object under `shared/` except `shared/owner.json`.
+    let kept = format!("{root}/shared/owner.json");
+    let listed: Vec<_> = store
+        .list(Some(&format!("{root}/shared").into()))
+        .try_collect()
+        .await
+        .unwrap();
+    for object in listed {
+        let key = object.location.to_string();
+        let relative = key.strip_prefix(&format!("{root}/")).unwrap();
+        assert!(
+            relative.starts_with("shared/state")
+                || [BOOTSTRAP_OP, INPUT, LEASE].contains(&relative)
+                || key == kept,
+            "the guide does not name {relative}"
+        );
+        if key != kept {
+            store.delete(&object.location).await.unwrap();
+        }
+    }
+    let state = open(store.clone(), checked(&second, URL, Hooks::default()))
+        .await
+        .unwrap();
+    assert_eq!(contents_of(state).await, single(&second).await);
+
+    // A different store at the same location is refused.
+    let other: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    shared::claim(other.as_ref(), &root, "test", 0, &[1])
+        .await
+        .unwrap();
+    let retry = checked(&second, URL, Hooks::default());
+    let error = open(other, retry).await.err().unwrap();
+    assert!(format!("{error:#}").contains("replaced"), "{error:#}");
 }

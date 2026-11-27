@@ -89,10 +89,10 @@ impl Node {
         let raft = &self.raw.raft;
         let low = self.state.applied + 1;
         if raft.state != StateRole::Leader
-            || self.quota_guarded()
             || self.pending.is_empty()
             || high <= low
             || self.reply_ahead()
+            || self.state.applied < self.unprepared
             || raft.pending_conf_index > self.state.applied
             || self.raw.store().durable.hard_state.term != raft.term
         {

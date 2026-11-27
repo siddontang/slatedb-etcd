@@ -183,6 +183,7 @@ impl Planner {
         self.plan.as_ref().map_or(0, |_| self.generation)
     }
 
+    #[cfg(test)]
     pub fn clear(&mut self) {
         self.plan = None;
     }
@@ -350,7 +351,11 @@ impl StateMachine {
         if let Some(current) = self.compaction.clone() {
             let step = match self.compaction_plan.take(&current).await {
                 Some(step) => step,
-                None => read_step(self.applied_state(), current).await?,
+                // The step reads before it changes state, so a storage error of a read
+                // leaves the entry unapplied.
+                None => read_step(self.applied_state(), current)
+                    .await
+                    .map_err(crate::mvcc::storage_fault::read_cause)?,
             };
             batch = step.batch;
             finished = step.finished;
@@ -372,11 +377,11 @@ impl StateMachine {
 
     /// Start reading the next step for the current progress in the background.
     pub(crate) fn plan_compaction(&mut self) {
-        // The planner reads in the background while apply continues. Replicated mode reads the
-        // live database, whose compacted history rows do not change. Shared mode pins a view.
+        // The planner reads a pinned view in the background while apply continues.
         let state = match &self.shared {
-            None => StateView::Live(self.db().clone()),
             Some(shared) => shared.pinned(),
+            // A clone of the in-memory state of a test keeps its rows.
+            None => self.applied_state().clone(),
         };
         self.compaction_plan.start(state, self.compaction.as_ref());
     }

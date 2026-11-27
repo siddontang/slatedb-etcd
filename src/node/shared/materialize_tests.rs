@@ -44,7 +44,12 @@ async fn an_idle_materializer_waits_past_a_released_batch() {
     let queue = overlay.queue();
     assert_eq!((queue.pushed(), queue.len(), queue.released()), (2, 0, 2));
     let progress = Arc::new(Progress::new(1));
-    let mut task = Box::pin(materialize(db.clone(), queue, progress.clone()));
+    let mut task = Box::pin(materialize(
+        db.clone(),
+        queue,
+        progress.clone(),
+        clock::Gate::unchecked(),
+    ));
     let mut polls = 0;
     tokio::select! {
         biased;

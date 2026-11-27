@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare replicated and shared state mode on three local members with one local RustFS.
+"""Measure shared state mode on three local members with one local RustFS.
 
 The RustFS server is the pinned release of scripts/rustfs_fixture.py. Members reach it through
 scripts/s3-counter, a proxy that counts the S3 requests and bytes of each bucket.
@@ -180,8 +180,6 @@ class Cluster:
         for j in self.ports:
             cmd += ["--peer", f"{j}=127.0.0.1:{self.ports[j] + 1}",
                     "--client-peer", f"{j}=http://127.0.0.1:{self.ports[j]}"]
-        if self.mode == "shared":
-            cmd += ["--state-mode", "shared"]
         if join:
             cmd += ["--join"]
         return cmd
@@ -354,7 +352,7 @@ def run_case(s3, args, mode, case, repeat):
         # The peaks of the load only. The quiet time and the checkpoint come after it.
         peaks = dict(cluster.samples)
         result["s3_load"] = trace.next()
-        # Then make the state durable in both modes, and measure the stored bytes.
+        # Then make the state durable and measure the stored bytes.
         time.sleep(args.quiet)
         checkpoint_all(cluster)
         result["s3_settle"] = trace.next(wait=1)
@@ -379,8 +377,7 @@ def run_ops(s3, args, mode, repeat):
                "--key-space-size", "200000", "--total", "200000", "--key-size", K,
                "--val-size", V])
         time.sleep(args.quiet)
-        # A learner joins. It needs a Raft snapshot: replicated mode copies SSTs, shared mode
-        # names a checkpoint.
+        # A learner joins. Its Raft snapshot names a checkpoint.
         port = 26040
         learner = cluster.add_learner(port)
         target = max(s["Status"]["raftIndex"] for s in cluster.status())
@@ -438,8 +435,6 @@ def policy(bucket, prefix, role, member):
     statements = [
         {"Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": [arn],
          "Condition": {"StringLike": {"s3:prefix": [f"{prefix}/*", f"{prefix}"]}}},
-        {"Effect": "Allow", "Action": ["s3:GetObject"],
-         "Resource": [f"{cluster}/mode.json", f"{cluster}/member-*/owner.json"]},
         {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"],
          "Resource": [f"{cluster}/member-{member}/*"]},
     ]
@@ -447,7 +442,6 @@ def policy(bucket, prefix, role, member):
         statements += [
             {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
              "Resource": [f"{cluster}/shared/*"]},
-            {"Effect": "Allow", "Action": ["s3:PutObject"], "Resource": [f"{cluster}/mode.json"]},
         ]
     elif role == "learner":
         statements += [{"Effect": "Allow", "Action": ["s3:GetObject"],
@@ -504,7 +498,6 @@ def run_policy(s3, args):
              "denied"),
             ("learner_writes_own_binding_prefix", cluster.credentials[learner], "write",
              f"member-{learner}/probe", "allowed"),
-            ("voter_reads_mode", voter, "read", "mode.json", "allowed"),
             ("voter_writes_own_prefix", voter, "write", "member-1/probe", "allowed"),
             ("voter_reads_other_binding", voter, "read", "member-2/binding.json", "denied"),
             ("voter_writes_other_binding", voter, "write", "member-2/denied", "denied"),
@@ -542,7 +535,7 @@ def main():
     ap.add_argument("--work", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--cases", nargs="*", default=list(CASES))
-    ap.add_argument("--modes", nargs="*", default=["replicated", "shared"])
+    ap.add_argument("--modes", nargs="*", choices=["shared"], default=["shared"])
     ap.add_argument("--repeat", type=int, default=2)
     ap.add_argument("--quiet", type=float, default=15.0,
                     help="seconds after a load before S3 usage is measured")

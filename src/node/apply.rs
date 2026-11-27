@@ -2,6 +2,10 @@ use super::*;
 use crate::mvcc::Outcome;
 use raft::eraftpb::Snapshot;
 
+#[path = "shared/apply_retry.rs"]
+mod retry;
+pub(super) use retry::{Adoption, Control, Paused, RejectedBase, Waited};
+
 pub(super) const BATCH_ENTRIES: u64 = 32;
 /// Committed-entry jobs that may wait in the apply queue behind the running job.
 pub(super) const PIPELINE_DEPTH: usize = 4;
@@ -29,14 +33,10 @@ pub(super) struct AppliedState {
     pub view: Option<(u64, u64, u64)>,
     /// Shared mode: the checkpoint of the base.
     pub base_checkpoint: Option<uuid::Uuid>,
-    /// The quota of the last applied `SetQuota` entry. See `StateMachine::cluster_quota`.
-    pub cluster_quota: Option<crate::state::quota::ClusterQuota>,
     /// The quota that apply uses. A non-positive value means no limit.
     pub quota_bytes: i64,
     /// The flag of this member differs from `quota_bytes`.
     pub quota_mismatch: bool,
-    /// The checkpoint that must cover a first cluster quota. See `StateMachine::quota_boundary`.
-    pub quota_boundary: u64,
     /// The stored membership row, if any. See `state::cluster`.
     pub members_row: Option<crate::state::cluster::MembersRow>,
     /// The leader whose row differed from this row at the last check.
@@ -67,10 +67,8 @@ impl AppliedState {
             physical_revision: state.physical_revision(),
             view: state.view_status(),
             base_checkpoint: state.base_checkpoint(),
-            cluster_quota: state.cluster_quota(),
             quota_bytes: state.quota_bytes(),
             quota_mismatch: state.quota_mismatch(),
-            quota_boundary: state.quota_boundary,
             members_row: state.members_row.clone(),
             members_mismatch: state.members_mismatch,
             members_checked: state.members_checked,
@@ -185,9 +183,6 @@ pub(super) enum Job {
     RaiseBase(Snapshot),
     /// Shared mode: switch to a base that finished opening, and publish the new view.
     SwitchBase,
-    /// Shared mode: store the apply marker at the applied index, so the next checkpoint has its
-    /// row there. An earlier binary installs a base only at its row.
-    MarkRow,
     /// Shared mode: adopt this opened base above the applied index. The node verified its index
     /// against the delivered commit, and `term` is the log term there. The job holds the base.
     AdoptBase {
@@ -195,11 +190,10 @@ pub(super) enum Job {
         term: u64,
     },
     Query(Query),
-    /// Flush the applied prefix. Build a full image only when `image` is set.
+    /// Write the Raft snapshot record of the base.
     Checkpoint {
         delay: Duration,
         dir: PathBuf,
-        image: bool,
     },
 }
 
@@ -239,6 +233,8 @@ pub(super) enum Output {
     /// Shared mode adopted a checkpoint in process. Raft takes its ConfState, because the
     /// skipped entries can hold membership changes.
     Adopted(raft::eraftpb::ConfState),
+    /// Shared mode dropped an opened base that does not load, and it kept its own base.
+    RejectedBase(RejectedBase),
     Reads(Vec<Output>),
     SharedLinear(Vec<u64>, std::sync::Arc<Outcome>),
     Linear {
@@ -251,10 +247,13 @@ pub(super) enum Output {
     },
     Entries(Vec<AppliedCommand>),
     PreparedPuts(crate::state::put_batch::PreparedPuts, Vec<AppliedCommand>),
+    /// A storage error ended a PreparePuts job through this index. Its entries apply on the
+    /// committed path.
+    Unprepared(u64),
     Snapshot(Rebound),
     Query {
         response: Response,
-        value: Value,
+        value: std::result::Result<Value, ApiError>,
         require_leader: bool,
     },
     /// A test worker returns its checkpoint result inline to keep schedules deterministic.
@@ -263,8 +262,6 @@ pub(super) enum Output {
 
 /// The database handles after a snapshot install.
 pub struct Rebound {
-    /// The replicated database. Shared mode has none.
-    pub db: Option<std::sync::Arc<slatedb::Db>>,
     pub admin: std::sync::Arc<slatedb::admin::Admin>,
 }
 
@@ -278,6 +275,9 @@ pub(super) struct Completion {
     pub applied: u64,
     pub state: Option<AppliedState>,
     pub output: Output,
+    /// The job ended below its target: a covering snapshot ended it before its last entry, or an
+    /// adoption dropped its base. `applied` is the end of the applied prefix.
+    pub early: bool,
 }
 
 struct Executor {
@@ -287,6 +287,16 @@ struct Executor {
     inline_checkpoints: bool,
     /// Shared mode: the durable log that a rebase replays.
     log: Option<crate::storage::LogReader>,
+    /// The stop and preemption of a job that waits on a storage error, and its pause report.
+    signals: retry::Signals,
+    /// The applied index that this worker last reported, while the state is below it: the end
+    /// of the prefix of a job whose rebase replay failed. Only the install of a covering
+    /// snapshot ends it. See `recovering_job`.
+    reported: Option<u64>,
+    /// Runs once after a rebase adopted its base and before it replays, for tests. Its error
+    /// fails the replay.
+    #[cfg(test)]
+    before_replay: Option<Box<dyn FnOnce() -> Result<()> + Send>>,
 }
 
 impl Drop for Executor {
@@ -298,41 +308,25 @@ impl Drop for Executor {
 }
 
 impl Executor {
-    /// Run one job. In shared mode a missing checkpoint object rebases the state to the position
-    /// before the job, and the whole job runs again. Each entry then completes exactly once.
+    /// Run one job. See `apply_retrying` for a storage error of a read.
     async fn execute(&mut self, work: Work) -> Result<Completion> {
-        let start = self.state.applied;
-        let retry = match (&work.job, &self.log) {
-            (Job::Entries(entries), Some(_)) => Some((entries.clone(), work.header)),
-            _ => None,
-        };
         // Box the inner jobs. Their futures are large, and DST runs them on a test stack.
-        let result = Box::pin(self.execute_once(work)).await;
-        let Some((entries, header)) = retry else {
-            return result;
-        };
-        match result {
-            Err(error) if crate::state::shared::missing_object(&error) => {
-                tracing::warn!(%error, "an apply read lost its checkpoint object");
-                Box::pin(self.rebase(header, start)).await?;
-                Box::pin(self.execute_once(Work {
-                    job: Job::Entries(entries),
-                    header,
-                    delay: Duration::ZERO,
-                }))
-                .await
-            }
-            result => result,
-        }
+        Box::pin(self.execute_once(work)).await
     }
 
     /// Rebuild the state from the newest checkpoint at or below `applied`, and replay the local
     /// log to `applied`. No view is published until the replay ends, so reads see no older
     /// state. Earlier jobs already sent the replies of the replayed entries, and Raft already
-    /// applied their membership changes.
+    /// applied their membership changes. A replay that fails leaves the state below `applied`.
+    /// If a snapshot then ends the job, the executor recovers until the snapshot installs. See
+    /// `recovering_job`.
     async fn rebase(&mut self, header: Header, applied: u64) -> Result<()> {
         let log = self.log.clone().context("rebase needs the log")?;
         self.state.rebase(applied, |index| log.term(index)).await?;
+        #[cfg(test)]
+        if let Some(hook) = self.before_replay.take() {
+            hook()?;
+        }
         while self.state.applied < applied {
             let low = self.state.applied + 1;
             let entries = log.entries(low, (low + BATCH_ENTRIES).min(applied + 1))?;
@@ -350,17 +344,20 @@ impl Executor {
             }
             _ => {}
         }
+        if self.reported.is_some() && !matches!(work.job, Job::Snapshot(_)) {
+            return self.recovering_job(work.job);
+        }
         let changes_state = matches!(
             work.job,
             Job::Entries(_)
                 | Job::Snapshot(_)
                 | Job::PublishPuts(_)
                 | Job::SwitchBase
-                | Job::MarkRow
                 | Job::AdoptBase { .. }
         );
         let copy_state = changes_state || matches!(work.job, Job::Query(Query::Maintenance(..)));
         let previous_revision = self.state.revision;
+        let mut early = false;
         // A checkpoint that opened in the background becomes the base of the next view.
         if changes_state {
             self.state.switch_base();
@@ -371,13 +368,28 @@ impl Executor {
         let output = match work.job {
             #[cfg(test)]
             Job::Panic => panic!("injected apply worker panic"),
+            Job::Entries(entries)
+                if entries.first().is_some_and(|first| {
+                    self.signals.superseded(first.index, self.state.applied)
+                }) =>
+            {
+                // A job before this one ended early. The snapshot replaces these entries.
+                early = true;
+                Output::Entries(Vec::new())
+            }
             Job::Entries(entries) => {
-                Output::Entries(apply_entries(&mut self.state, entries, work.header).await?)
+                let (replies, ended) = Box::pin(self.apply_retrying(entries, work.header)).await?;
+                early = ended.is_some();
+                // A rebase replay that failed left the state below the applied prefix, which the
+                // node publishes with this job. Only the snapshot can replace that state.
+                self.reported = ended.filter(|prefix| *prefix > self.state.applied);
+                Output::Entries(replies)
             }
             Job::PreparePuts { commands, term } => {
-                let (batch, replies) =
-                    super::quorum_put::prepare(&self.state, &commands, term, work.header).await?;
-                Output::PreparedPuts(batch, replies)
+                match self.prepare_or_skip(&commands, term, work.header).await? {
+                    Some((batch, replies)) => Output::PreparedPuts(batch, replies),
+                    None => Output::Unprepared(commands.last().map_or(0, |(index, _)| *index)),
+                }
             }
             Job::PublishPuts(batch) => {
                 // The clients already have their replies. Recovery must replay the same outcome.
@@ -387,26 +399,37 @@ impl Executor {
             }
             // The switch ran above. The new view goes out with the completion.
             Job::SwitchBase => Output::Entries(Vec::new()),
-            Job::MarkRow => {
-                self.state.mark_row()?;
-                Output::Entries(Vec::new())
-            }
-            Job::AdoptBase { base, term } => {
-                self.state.adopt_opened(base, term).await?;
-                Output::Adopted(self.state.members.conf())
-            }
+            Job::AdoptBase { base, term } => match self.adopt_retrying(base, term).await? {
+                Adoption::Adopted => Output::Adopted(self.state.members.conf()),
+                // A newer snapshot replaces this adoption.
+                Adoption::Covered => {
+                    early = true;
+                    Output::Entries(Vec::new())
+                }
+                // The member keeps its base. The job ends below the index of the dropped base.
+                Adoption::Dropped(rejected) => {
+                    early = true;
+                    Output::RejectedBase(rejected)
+                }
+            },
             Job::RaiseBase(snapshot) => {
                 self.state.raise_to_record(&snapshot).await?;
                 Output::Entries(Vec::new())
             }
-            Job::Snapshot(snapshot) => {
-                self.state.install_snapshot(&snapshot).await?;
-                // An object snapshot replaces the database. The node rebinds its handles.
-                Output::Snapshot(Rebound {
-                    db: self.state.database(),
-                    admin: self.state.admin.clone(),
-                })
-            }
+            Job::Snapshot(snapshot) => match self.install_retrying(&snapshot).await? {
+                // A newer snapshot replaces this one. The state did not change.
+                Waited::Covered => {
+                    early = true;
+                    Output::Entries(Vec::new())
+                }
+                // The node rebinds its handles.
+                Waited::Again => {
+                    self.reported = None;
+                    Output::Snapshot(Rebound {
+                        admin: self.state.admin.clone(),
+                    })
+                }
+            },
             Job::Query(query) => match query {
                 Query::Maintenance(command, credentials, status, response) => {
                     let result = self
@@ -422,10 +445,7 @@ impl Executor {
                         {
                             tracing::warn!(%error, "a maintenance read failed");
                             crate::mvcc::Outcome {
-                                result: Err(crate::mvcc::KvError::new(
-                                    tonic::Code::Unavailable,
-                                    &format!("etcdserver: {error}"),
-                                )),
+                                result: Err(crate::mvcc::KvError::read_failure(error)),
                             }
                         }
                         Err(error) => return Err(error),
@@ -433,7 +453,7 @@ impl Executor {
                     fill_value_header(work.header, &mut outcome)?;
                     Output::Query {
                         response,
-                        value: serde_json::to_value(outcome)?,
+                        value: Ok(serde_json::to_value(outcome)?),
                         require_leader: false,
                     }
                 }
@@ -457,24 +477,34 @@ impl Executor {
                 }
                 Query::AuthLookup(name, response) => Output::Query {
                     response,
-                    value: serde_json::to_value(self.state.auth.users.get(&name))?,
+                    value: Ok(serde_json::to_value(self.state.auth.users.get(&name))?),
                     require_leader: false,
                 },
                 Query::Linear(..) | Query::Read(..) => {
                     anyhow::bail!("read reached the apply worker")
                 }
                 Query::Local(key, response) => {
-                    let value = self.state.local_value(&key).await?;
+                    // A storage error of this diagnostic read fails only its request.
+                    let value = match self.state.local_value(&key).await {
+                        Ok(value) => Ok(json!({"value": value,
+                            "applied_index": self.state.applied})),
+                        Err(error) => {
+                            tracing::warn!(%error, "a local value read failed");
+                            Err(ApiError {
+                                error: crate::mvcc::KvError::read_failure(error).message,
+                                leader_id: 0,
+                            })
+                        }
+                    };
                     Output::Query {
                         response,
-                        value: json!({"value": value,
-                        "applied_index": self.state.applied}),
+                        value,
                         require_leader: false,
                     }
                 }
             },
-            Job::Checkpoint { delay, dir, image } => {
-                let (index, conf, job) = self.state.checkpoint_parts(image).await?;
+            Job::Checkpoint { delay, dir } => {
+                let (index, conf, job) = self.state.checkpoint_parts().await?;
                 let build = async move {
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
@@ -506,8 +536,24 @@ impl Executor {
                 }
             }
         };
-        let state = match copy_state {
-            true => {
+        self.completion(output, early, copy_state.then_some(previous_revision))
+    }
+
+    /// Build the completion of each job. `copy` gives the revision before the job when the
+    /// node takes a copy of the state. While the executor recovers, the state is below the
+    /// index that this worker last reported. The completion then reports that index and no
+    /// state, so the node keeps its published view.
+    fn completion(&mut self, output: Output, early: bool, copy: Option<i64>) -> Result<Completion> {
+        if let Some(reported) = self.reported {
+            return Ok(Completion {
+                applied: reported,
+                state: None,
+                output,
+                early: true,
+            });
+        }
+        let state = match copy {
+            Some(previous_revision) => {
                 let mut state = AppliedState::new(&self.state)?;
                 state.watch = self
                     .state
@@ -515,18 +561,32 @@ impl Executor {
                     .map(std::sync::Arc::new);
                 Some(state)
             }
-            false => None,
+            None => None,
         };
         Ok(Completion {
             applied: self.state.applied,
             state,
             output,
+            early,
         })
+    }
+
+    /// Run a job while the state is below the index that this worker last reported. Only
+    /// committed entries that the node queued before Raft accepted the snapshot can come then,
+    /// besides the install. They end early, because the snapshot covers them. The node starts
+    /// other work only when no job runs and no snapshot waits, so any other job is an error of
+    /// the node. See `Node::schedule_apply`.
+    fn recovering_job(&mut self, job: Job) -> Result<Completion> {
+        match job {
+            Job::Entries(_) => self.completion(Output::Entries(Vec::new()), true, None),
+            _ => anyhow::bail!("only entries and a snapshot reach apply while it waits for one"),
+        }
     }
 }
 
 pub(super) struct Worker {
-    database: Option<std::sync::Arc<slatedb::Db>>,
+    /// Ends or preempts a job that waits on a storage error, and reads its pause report.
+    pub control: Control,
     work: mpsc::Sender<Work>,
     completed: mpsc::Receiver<Result<Completion>>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
@@ -552,18 +612,22 @@ impl Worker {
         state.watch_capture = Some(Default::default());
         let (work, mut jobs) = mpsc::channel::<Work>(PIPELINE_DEPTH);
         let (done, completed) = mpsc::channel(PIPELINE_DEPTH);
-        let database = state.database();
+        let (control, signals) = retry::signals();
         let mut executor = Executor {
             state,
             events,
             snapshot_task: None,
             inline_checkpoints: manual,
             log,
+            signals,
+            reported: None,
+            #[cfg(test)]
+            before_replay: None,
         };
         #[cfg(test)]
         if manual {
             return Self {
-                database,
+                control,
                 work,
                 completed,
                 task: None,
@@ -593,7 +657,7 @@ impl Worker {
         };
         let task = tokio::spawn(worker);
         Self {
-            database,
+            control,
             work,
             completed,
             task: Some(task),
@@ -603,20 +667,11 @@ impl Worker {
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
+        self.control.stop();
         self.completed.close();
         self.work = mpsc::channel(1).0;
         if let Some(task) = self.task.take() {
-            match task.await {
-                Ok(result) => result?,
-                Err(error) => {
-                    if let Some(database) = &self.database {
-                        let _ = database
-                            .close_with_options(slatedb::config::CloseOptions { flush_type: None })
-                            .await;
-                    }
-                    return Err(error.into());
-                }
-            }
+            task.await??;
         }
         Ok(())
     }
@@ -628,22 +683,10 @@ impl Worker {
     }
 
     pub async fn next(&mut self) -> Result<Completion> {
-        let completion = self
-            .completed
+        self.completed
             .recv()
             .await
-            .context("apply worker stopped")??;
-        if let Output::Snapshot(rebound) = &completion.output {
-            self.database = rebound.db.clone();
-        }
-        Ok(completion)
-    }
-
-    #[cfg(test)]
-    pub fn database(&self) -> std::sync::Arc<slatedb::Db> {
-        self.database
-            .clone()
-            .expect("replicated state has a database")
+            .context("apply worker stopped")?
     }
 
     #[cfg(test)]
@@ -655,13 +698,7 @@ impl Worker {
     pub async fn step(&mut self) -> Result<Option<Completion>> {
         let (executor, jobs) = self.manual.as_mut().context("worker is not manual")?;
         match jobs.try_recv() {
-            Ok(work) => {
-                let completion = executor.execute(work).await?;
-                if let Output::Snapshot(rebound) = &completion.output {
-                    self.database = rebound.db.clone();
-                }
-                Ok(Some(completion))
-            }
+            Ok(work) => Ok(Some(executor.execute(work).await?)),
             Err(mpsc::error::TryRecvError::Empty) => Ok(None),
             Err(error) => Err(error.into()),
         }
@@ -684,6 +721,18 @@ pub(super) async fn apply_entries(
     header: Header,
 ) -> Result<Vec<AppliedCommand>> {
     let mut replies = vec![];
+    apply_into(state, entries, header, &mut replies).await?;
+    Ok(replies)
+}
+
+/// Apply `entries` in order and add a reply for each one. After an error, `replies` holds the
+/// replies of the entries that applied before it.
+async fn apply_into(
+    state: &mut StateMachine,
+    entries: Vec<Entry>,
+    header: Header,
+    replies: &mut Vec<AppliedCommand>,
+) -> Result<()> {
     let mut entries = entries.into_iter().peekable();
     while let Some(entry) = entries.next() {
         ensure!(
@@ -711,7 +760,6 @@ pub(super) async fn apply_entries(
                 .as_ref()
                 .map_or(entry.data.as_ref(), |change| change.context.as_ref()),
         )?;
-        state.before_entry(&command)?;
         if change.is_none() && super::quorum_put::kv_command(&command).is_some() {
             let mut commands = vec![(entry.index, command)];
             let mut term = entry.term;
@@ -841,21 +889,6 @@ pub(super) async fn apply_entries(
                     .await?;
                 Reply::Encoded(Value::Null)
             }
-            RaftCommand::SetQuota {
-                bytes,
-                seed,
-                requested_at,
-                member,
-                ..
-            } => {
-                let request = crate::state::quota::ClusterQuota {
-                    bytes: *bytes,
-                    requested_at: *requested_at,
-                    member: *member,
-                };
-                state.apply_set_quota(entry.index, request, *seed).await?;
-                Reply::Encoded(Value::Null)
-            }
             RaftCommand::SeedMembers(seed) => {
                 state.apply_seed_members(entry.index, seed).await?;
                 Reply::Encoded(Value::Null)
@@ -878,7 +911,7 @@ pub(super) async fn apply_entries(
             reply,
         });
     }
-    Ok(replies)
+    Ok(())
 }
 
 // Replay in bounded batches when recovery exceeds the pending-entry quota.
@@ -886,34 +919,18 @@ pub(super) async fn recover(
     state: &mut StateMachine,
     storage: &RaftStorage,
     header: Header,
-    origin: super::quota::Guards,
 ) -> Result<()> {
-    let mut physical = false;
     while state.applied < storage.commit_index() {
         let low = state.applied + 1;
-        let mut entries = storage.entries(
+        let entries = storage.entries(
             low,
             (low + BATCH_ENTRIES).min(storage.commit_index() + 1),
             Some(BATCH_BYTES),
             raft::GetEntriesContext::empty(false),
         )?;
         ensure!(!entries.is_empty(), "empty recovery batch");
-        // A guarded member stops here and waits for a snapshot. See `node::quota`.
-        if super::quota::guard_replay(state, origin, &mut entries)? {
-            break;
-        }
-        let replies = apply_entries(state, entries, header).await?;
-        physical |= replies.iter().any(|r| {
-            matches!(
-                r.reply,
-                Reply::PhysicalCompact { flush: Some(_), .. } | Reply::CompactFlush { .. }
-            )
-        });
-    }
-    // Shared mode has no local flush. The leader materializer writes the shared database.
-    if physical && !state.is_shared() {
-        state.metrics.flush_db(state.db()).await?;
-        state.durable_applied = state.applied;
+        // The leader materializer writes the shared database, so replay flushes nothing.
+        apply_entries(state, entries, header).await?;
     }
     Ok(())
 }
@@ -937,11 +954,12 @@ mod tests {
     use crate::proto::etcdserverpb::request_op::Request as Op;
     use crate::proto::etcdserverpb::response_op::Response as Resp;
     use crate::proto::etcdserverpb::*;
+    use crate::state::{StateRead, StateScan};
 
     #[tokio::test]
     async fn kv_groups_stop_at_leases_and_empty_entries() {
         let directory = tempfile::tempdir().unwrap();
-        let mut state = StateMachine::open(directory.path()).await.unwrap();
+        let mut state = StateMachine::open_test(directory.path()).await.unwrap();
         let put = |key: &[u8], value: &[u8], lease| RequestOp {
             request: Some(Op::RequestPut(PutRequest {
                 key: key.to_vec(),
@@ -1010,7 +1028,8 @@ mod tests {
         .unwrap();
         assert_eq!(replies.len(), 7);
         assert_eq!(state.applied, 8);
-        assert_eq!(state.write_batches, 4);
+        // An empty entry changes no state, so it writes no batch.
+        assert_eq!(state.write_batches, 3);
         let Reply::Kv(outcome) = &replies[2].reply else {
             panic!("expected transaction reply");
         };
@@ -1051,7 +1070,7 @@ mod tests {
     /// term must match it.
     async fn stored_term(state: &StateMachine) -> u64 {
         let row = state
-            .db()
+            .applied_state()
             .get(crate::state::APPLIED_TERM)
             .await
             .unwrap()
@@ -1069,7 +1088,7 @@ mod tests {
     async fn every_state_batch_stores_the_term_of_its_last_entry() {
         use crate::proto::authpb::UserAddOptions;
         let directory = tempfile::tempdir().unwrap();
-        let mut state = StateMachine::open(directory.path()).await.unwrap();
+        let mut state = StateMachine::open_test(directory.path()).await.unwrap();
         assert_eq!(state.applied_term, 0);
         let credentials = crate::auth::Credentials::default;
         let etcd = |id: &str, etcd| {
@@ -1080,8 +1099,8 @@ mod tests {
             })
         };
         // Each group applies as one state batch. A group of two puts uses the term of the last.
+        // An empty entry changes no state, so it writes no batch.
         let groups = vec![
-            ("empty entry", vec![None]),
             (
                 "grouped puts",
                 vec![etcd("a", put_op(b"a", b"1")), etcd("b", put_op(b"b", b"2"))],
@@ -1179,11 +1198,6 @@ mod tests {
                 "{name}"
             );
         }
-        state.db().flush().await.unwrap();
-        state.close().await.unwrap();
-        drop(state);
-        let state = StateMachine::open(directory.path()).await.unwrap();
-        assert_eq!((state.applied, state.applied_term), (index, term));
         state.close().await.unwrap();
     }
 
@@ -1243,7 +1257,11 @@ mod tests {
     }
 
     async fn rows(state: &StateMachine) -> Vec<(bytes::Bytes, bytes::Bytes)> {
-        let mut scan = state.db().scan_prefix(b"", ..).await.unwrap();
+        let mut scan = state
+            .applied_state()
+            .scan_under(b"", &Default::default())
+            .await
+            .unwrap();
         let mut rows = vec![];
         while let Some(row) = scan.next().await.unwrap() {
             rows.push((row.key, row.value));
@@ -1341,8 +1359,8 @@ mod tests {
         for quota in [0, 1, 900, 1500, 100000] {
             let left = tempfile::tempdir().unwrap();
             let right = tempfile::tempdir().unwrap();
-            let mut grouped = StateMachine::open(left.path()).await.unwrap();
-            let mut separate = StateMachine::open(right.path()).await.unwrap();
+            let mut grouped = StateMachine::open_test(left.path()).await.unwrap();
+            let mut separate = StateMachine::open_test(right.path()).await.unwrap();
             // Grouped apply stores the entry term. Direct apply calls store `entry_term`.
             separate.entry_term = 1;
             grouped.quota = quota;
@@ -1401,13 +1419,13 @@ mod tests {
             assert_eq!(grouped.logical_size(), separate.logical_size());
             assert_eq!(
                 grouped.logical_usage(),
-                crate::state::maintenance::count_logical_usage(grouped.db().as_ref())
+                crate::state::maintenance::count_logical_usage(grouped.applied_state())
                     .await
                     .unwrap()
             );
             assert_eq!(
                 separate.logical_usage(),
-                crate::state::maintenance::count_logical_usage(separate.db().as_ref())
+                crate::state::maintenance::count_logical_usage(separate.applied_state())
                     .await
                     .unwrap()
             );
@@ -1763,8 +1781,8 @@ mod tests {
 
             let left = tempfile::tempdir().unwrap();
             let right = tempfile::tempdir().unwrap();
-            let mut grouped = StateMachine::open(left.path()).await.unwrap();
-            let mut separate = StateMachine::open(right.path()).await.unwrap();
+            let mut grouped = StateMachine::open_test(left.path()).await.unwrap();
+            let mut separate = StateMachine::open_test(right.path()).await.unwrap();
             // Grouped apply stores the entry term. Direct apply calls store `entry_term`.
             separate.entry_term = 1;
             for state in [&mut grouped, &mut separate] {
@@ -1820,7 +1838,18 @@ mod tests {
                 assert_eq!(left, right, "{context}, reply {offset}");
             }
             assert_eq!(grouped_events, separate_events, "{context}");
-            assert_eq!(rows(&grouped).await, rows(&separate).await, "{context}");
+            // A one-by-one entry that changes no state stores no apply marker. Compare the
+            // other rows.
+            let stored = |rows: Vec<(bytes::Bytes, bytes::Bytes)>| -> Vec<_> {
+                rows.into_iter()
+                    .filter(|(key, _)| !key.starts_with(b"meta/"))
+                    .collect()
+            };
+            assert_eq!(
+                stored(rows(&grouped).await),
+                stored(rows(&separate).await),
+                "{context}"
+            );
             assert_eq!(
                 (grouped.applied, grouped.revision, grouped.logical_size()),
                 (separate.applied, separate.revision, separate.logical_size()),
@@ -1830,26 +1859,14 @@ mod tests {
             assert_eq!(index_rows(&grouped), index_rows(&separate), "{context}");
             assert_eq!(
                 grouped.logical_usage(),
-                crate::state::maintenance::count_logical_usage(grouped.db().as_ref())
+                crate::state::maintenance::count_logical_usage(grouped.applied_state())
                     .await
                     .unwrap(),
                 "{context}"
             );
             assert!(grouped.write_batches < separate.write_batches, "{context}");
-            let expected = (index_rows(&separate), rows(&separate).await);
-            grouped.db().flush().await.unwrap();
             grouped.close().await.unwrap();
             separate.close().await.unwrap();
-            // The applied marker and the rows reopen together.
-            let reopened = StateMachine::open(left.path()).await.unwrap();
-            assert_eq!(reopened.applied, separate.applied, "{context}");
-            assert_eq!(reopened.revision, separate.revision, "{context}");
-            assert_eq!(
-                (index_rows(&reopened), rows(&reopened).await),
-                expected,
-                "{context}"
-            );
-            reopened.close().await.unwrap();
         }
         // Put-only transactions took the direct path, and the one-by-one path checked them.
         assert!(crate::mvcc::DIRECT_TXNS.with(|count| count.get()) > direct);

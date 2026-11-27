@@ -76,9 +76,9 @@ The four values add up to `etcd_mvcc_db_total_size_in_use_in_bytes`.
 The member also logs one warning when usage reaches the threshold.
 The log clears when usage falls below 95% of the threshold. Both gauges are absent when the
 quota or the warning is off.
-The quota gauge reports the quota that apply uses. In replicated mode that is the cluster quota.
-With a flag of zero it is 2 GiB, as in etcd. A negative value, or zero in shared mode, means that
-quota enforcement is off. Maintenance Status returns the configured value, as etcd does, unless
+The quota gauge reports the quota that apply uses: the quota of the cluster claim. With a flag of
+zero at the first start it is 2 GiB, as in etcd. A gauge value of zero means that quota
+enforcement is off. Maintenance Status returns the configured value, as etcd does, unless
 the cluster quota differs from it.
 
 The Raft owner snapshots local state for a scrape. The HTTP task reads the manifest.
@@ -96,15 +96,17 @@ Every member also exports these gauges.
 | `slatedb_etcd_quota_flag_mismatch` | 1 while the member flag differs from the cluster quota |
 | `slatedb_etcd_members_mismatch` | 1 after the members row differed from the row of the leader |
 
-The gauge is 1 during a rolling quota change. A member whose flag did not change since the
-cluster took another value also keeps it at 1. See [quota changes](operations.md#change-the-quota).
+See [quota](operations.md#quota).
 The membership gauge changes when a leader starts a term. See
 [membership row](operations.md#membership-row).
 
+`slatedb_etcd_peer_store_refusals_total` counts peer requests that this member refused because
+they named another shared store, or none. Every member exports it. See the
+[shared store ID](shared-state-guide.md#shared-store-id).
+
 ## Shared state gauges
 
-A member in shared state mode also exports these gauges. Replicated members omit them. See the
-[shared state guide](shared-state-guide.md).
+Every member also exports these gauges. See the [shared state guide](shared-state-guide.md).
 
 | Gauge | Meaning |
 | --- | --- |
@@ -112,7 +114,8 @@ A member in shared state mode also exports these gauges. Replicated members omit
 | `slatedb_etcd_shared_overlay_bytes` | Bytes of applied batches in the overlay above the base |
 | `slatedb_etcd_shared_apply_paused` | 1 while apply waits above twice `--overlay-max-bytes` |
 | `slatedb_etcd_shared_writer_running` | 1 while the writer database of this member is open |
-| `slatedb_etcd_shared_writer_clock_alarm` | 1 while the clock check keeps the writer closed |
+| `slatedb_etcd_shared_writer_clock_alarm` | 1 while the clock is too far behind or ahead |
+| `slatedb_etcd_shared_writer_clock_waiting` | 1 while the clock bound holds or is uncertain |
 | `slatedb_etcd_shared_writer_reopens` | Writer opens after a fence or a lost manifest race |
 | `slatedb_etcd_shared_writer_consecutive_failures` | Writer faults in a row, other than fences |
 | `slatedb_etcd_shared_writer_faults_total` | Counter of writer faults, clock refusals, and stalls |
@@ -123,12 +126,15 @@ A member in shared state mode also exports these gauges. Replicated members omit
 | `slatedb_etcd_shared_backup_streams` | Native backups that stream a pinned view |
 | `slatedb_etcd_shared_backup_retained_bytes` | Released overlay bytes that backups still keep |
 
-The member sets the first ten rows on each Raft tick. The leader sets the checkpoint count after
-each publication. The clock gauge changes at each writer open. The backup gauges change when a
-backup starts or ends, and every 100 ms while one streams.
+The member sets the first eleven rows on each Raft tick. The leader sets the checkpoint count
+after each publication. The clock skew gauge changes at each writer open. The backup gauges
+change when a backup starts or ends, and every 100 ms while one streams.
 
 - A base index that stops while the applied index grows means that no checkpoint reaches the
   member. Check S3 access and the leader's writer.
+- A clock alarm or a clock wait that lasts means that the leader clock disagrees with the voter
+  clocks, or that too few voters answer `/raft/clock`. `/status` shows `clock_alarm` and
+  `clock`. See [Clocks](shared-state.md#clocks).
 - Overlay bytes near `--overlay-max-bytes` mean that checkpoints are slow. The leader then
   rejects proposals.
 - Backup bytes near `--overlay-max-bytes` mean that a backup client reads slowly. New backups then
@@ -147,7 +153,16 @@ process, so embedded members of one process share them.
 | `slatedb_etcd_row_cache_lookups_total` | Current-row cache lookups of point reads, by `result` |
 | `slatedb_etcd_row_read_duration_seconds` | Storage reads of rows that the row cache missed |
 | `slatedb_etcd_shared_point_reads_total` | Shared-mode point reads by `source`: `overlay`, `base` |
-| `slatedb_etcd_local_store_calls_in_flight` | Local object store calls that hold a call slot |
+| `slatedb_etcd_read_corrupt_total` | Reads that met stored data that does not decode |
+
+Each member also exports these apply gauges.
+
+| Gauge | Meaning |
+| --- | --- |
+| `slatedb_etcd_apply_held` | 1 while apply holds on an entry that met corrupt stored data |
+| `slatedb_etcd_apply_held_entries` | Log entries above the entry that apply holds on |
+
+The member sets them on each Raft tick. `/status` reports the held entry in `apply_paused`.
 
 The `kind` label is `data`, `index`, `filter`, or `stats`. Each data, index, or filter miss is
 one object store read. A low data hit ratio with a slow row read time means cold SST blocks.

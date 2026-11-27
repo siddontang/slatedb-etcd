@@ -1,5 +1,13 @@
-"""Start a pinned RustFS server for local S3 tests and benchmarks."""
+#!/usr/bin/env python3
+"""Start a pinned RustFS server for local S3 tests, benchmarks, and clusters.
 
+Every cluster runs in shared state mode on RustFS, as production runs on S3.
+`python3 scripts/rustfs_fixture.py -- COMMAND...` runs a command with one server, for example a
+direct `go test` run. Without a command, the server runs until Ctrl-C. `--env-file` writes its
+settings as shell exports for other terminals. The server deletes its objects when it stops.
+"""
+
+import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
@@ -8,9 +16,12 @@ import os
 from pathlib import Path
 import platform
 import secrets
+import shlex
 import shutil
+import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -18,7 +29,12 @@ import urllib.parse
 import urllib.request
 import zipfile
 
+from reporting import write_pending
+
 ROOT = Path(__file__).resolve().parents[1]
+# The server environment that `shared_store` exports, and that nested runners reuse.
+STORE_ENV = ("SLATEDB_S3_TEST_ENDPOINT", "SLATEDB_S3_TEST_BUCKET", "AWS_ACCESS_KEY_ID",
+             "AWS_SECRET_ACCESS_KEY")
 VERSION = "1.0.6"
 PACKAGES = {
     ("Darwin", "arm64"): ("macos-aarch64",
@@ -51,8 +67,19 @@ def install(directory):
         url = f"https://github.com/rustfs/rustfs/releases/download/{VERSION}/{name}"
         with tempfile.TemporaryDirectory(dir=cache) as staging:
             download = Path(staging) / name
-            subprocess.run(["curl", "--fail", "--location", "--silent", "--show-error",
-                            "--retry", "3", "--output", str(download), url], check=True)
+            # GitHub release downloads sometimes return 5xx for minutes. Retry each error with
+            # curl's exponential backoff, about 4 minutes over 8 retries. No retry starts after
+            # 600 s, and each attempt stops after 120 s, so a stalled transfer cannot hold the
+            # job. The CI action waits 12 minutes, which covers both limits.
+            command = ["curl", "--fail", "--location", "--silent", "--show-error",
+                       "--connect-timeout", "30", "--max-time", "120", "--retry", "8",
+                       "--retry-all-errors", "--retry-max-time", "600",
+                       "--output", str(download), url]
+            try:
+                subprocess.run(command, check=True)
+            except subprocess.CalledProcessError as error:
+                raise RuntimeError(f"RustFS download failed: curl exit {error.returncode}, "
+                                   f"{url}") from error
             if sha256(download) != checksum:
                 raise ValueError("RustFS archive checksum does not match the pinned release")
             download.replace(archive)
@@ -127,6 +154,7 @@ def local_rustfs():
     access, secret = secrets.token_hex(12), secrets.token_hex(32)
     with tempfile.TemporaryDirectory(prefix="slatedb-rustfs-") as temporary:
         directory = Path(temporary)
+        print("RustFS fixture: download or reuse the release archive", file=sys.stderr, flush=True)
         binary = install(directory)
         data = directory / "data"
         data.mkdir()
@@ -138,10 +166,23 @@ def local_rustfs():
             address = f"127.0.0.1:{listener.getsockname()[1]}"
         endpoint, bucket = "http://" + address, "slatedb-test"
         with (directory / "server.log").open("w") as log:
-            process = subprocess.Popen([str(binary), "server", "--address", address, str(data)],
-                                       stdout=log, stderr=log, env=settings, cwd=directory)
+            print("RustFS fixture: start the server", file=sys.stderr, flush=True)
             try:
-                wait_for_bucket(process, endpoint, bucket, access, secret)
+                process = subprocess.Popen([str(binary), "server", "--address", address,
+                                            str(data)], stdout=log, stderr=log, env=settings,
+                                           cwd=directory)
+            except OSError as error:
+                raise RuntimeError(f"RustFS start failed: {error}") from error
+            try:
+                print("RustFS fixture: wait until the server accepts a bucket", file=sys.stderr,
+                      flush=True)
+                try:
+                    wait_for_bucket(process, endpoint, bucket, access, secret)
+                except Exception as error:
+                    log.flush()
+                    tail = (directory / "server.log").read_text(errors="replace")[-2000:]
+                    raise RuntimeError(f"RustFS readiness failed: {error}\n{tail}") from error
+                print("RustFS fixture: ready", file=sys.stderr, flush=True)
                 env = dict(os.environ, AWS_ACCESS_KEY_ID=access, AWS_SECRET_ACCESS_KEY=secret,
                            AWS_EC2_METADATA_DISABLED="true", SLATEDB_S3_TEST_ENDPOINT=endpoint,
                            SLATEDB_S3_TEST_BUCKET=bucket)
@@ -154,3 +195,105 @@ def local_rustfs():
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
+
+
+@contextmanager
+def shared_store(report=None, value=None):
+    """Supply one RustFS server to the clusters in this process and its children.
+
+    If the environment already names a server, for example from an outer runner, use that server.
+    Otherwise start one and export its settings to `os.environ` until the context ends. Yield the
+    store description for reports.
+
+    With a `report` path, first replace that report with the failed `value`, so a failed start
+    leaves no earlier passed report.
+    """
+    if report is not None:
+        write_pending(report, value or {})
+    if all(os.environ.get(name) for name in STORE_ENV):
+        yield {"name": "RustFS", "version": VERSION, "reused": True}
+        return
+    with local_rustfs() as (env, store):
+        saved = {name: os.environ.get(name) for name in (*STORE_ENV, "AWS_EC2_METADATA_DISABLED",
+                                                         "AWS_SESSION_TOKEN")}
+        os.environ.pop("AWS_SESSION_TOKEN", None)
+        os.environ.update({name: env[name] for name in (*STORE_ENV, "AWS_EC2_METADATA_DISABLED")})
+        try:
+            yield store
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+
+def unique_prefix(kind):
+    """Return a new S3 prefix for one cluster, so that clusters on one server do not collide."""
+    return f"{kind}/{secrets.token_hex(8)}"
+
+
+def shared_args(prefix, env=None, allow_http=None):
+    """Return the flags that start one member on the store of `env`.
+
+    All members of one cluster use the same `prefix`, also after a restart. Without
+    `SLATEDB_S3_TEST_ENDPOINT`, the member uses the AWS endpoint of the bucket. By default, an
+    HTTP endpoint gets `--s3-allow-http`, because the fixture's own RustFS server uses HTTP. For
+    an endpoint that a caller supplies, pass the caller's choice as `allow_http`.
+    Each Python launcher builds the flags here. The Go tests build the same flags in
+    `tests/compat/compat_test.go` (`storeFlags`) and `tests/downstream/storage_test.go`.
+    """
+    env = os.environ if env is None else env
+    endpoint, bucket = env.get("SLATEDB_S3_TEST_ENDPOINT"), env.get("SLATEDB_S3_TEST_BUCKET")
+    if not bucket:
+        raise RuntimeError("A member needs RustFS. Use shared_store, or run the command "
+                           "through scripts/rustfs_fixture.py")
+    flags = ["--s3-bucket", bucket, "--s3-prefix", prefix]
+    if endpoint:
+        flags += ["--s3-endpoint", endpoint]
+        if endpoint.startswith("http://") if allow_http is None else allow_http:
+            flags.append("--s3-allow-http")
+    return flags
+
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--env-file", type=Path, help="Write the server settings as shell exports")
+    parser.add_argument("command", nargs="*", help="Command to run with the server environment")
+    args = parser.parse_args()
+    # Stop the server on SIGTERM too.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    with shared_store():
+        try:
+            serve(args)
+        finally:
+            # The settings name a server that no longer runs.
+            if args.env_file:
+                args.env_file.unlink(missing_ok=True)
+
+
+def serve(args):
+    if args.env_file:
+        names = (*STORE_ENV, "AWS_EC2_METADATA_DISABLED")
+        args.env_file.parent.mkdir(parents=True, exist_ok=True)
+        args.env_file.touch(mode=0o600)
+        args.env_file.chmod(0o600)
+        # A reused server needs only the four STORE_ENV settings.
+        values = dict({"AWS_EC2_METADATA_DISABLED": "true"}, **os.environ)
+        args.env_file.write_text("".join(f"export {name}={shlex.quote(values[name])}\n"
+                                         for name in names))
+        print("Server settings:", args.env_file, flush=True)
+    if args.command:
+        raise SystemExit(subprocess.run(args.command).returncode)
+    print("RustFS runs at", os.environ["SLATEDB_S3_TEST_ENDPOINT"], "until Ctrl-C", flush=True)
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

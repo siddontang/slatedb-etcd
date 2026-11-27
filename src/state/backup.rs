@@ -4,13 +4,12 @@
 //! The image is the legacy Raft snapshot format, `SnapshotData` in `codec` encoding, followed by
 //! its SHA-256 digest. Its rows are in key order, and the membership row comes last.
 //!
-//! A replicated backup pins a SlateDB checkpoint. A shared-mode backup pins a view. See `view`.
+//! A backup pins a view. See `view`.
 
 use super::*;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use slatedb::config::{CheckpointOptions, CheckpointScope, DbReaderOptions, ScanOptions};
-use slatedb::{DbReader, DbReaderMode};
+use slatedb::config::ScanOptions;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
@@ -25,9 +24,6 @@ mod view_tests;
 const CHUNK_BYTES: usize = 64 * 1024;
 /// The messages buffered ahead of a slow client.
 const CHUNKS_AHEAD: usize = 16;
-/// A checkpoint of a failed process expires after this time. A running backup refreshes it.
-const CHECKPOINT_LIFETIME: Duration = Duration::from_secs(10 * 60);
-const CHECKPOINT_NAME: &str = "native-backup";
 /// `etcdctl snapshot save` accepts a file of a multiple of this size plus the digest.
 const ALIGN: u64 = 512;
 const DIGEST: u64 = 32;
@@ -40,8 +36,6 @@ pub(super) const RESTORE_BATCH_BYTES: usize = 4 * 1024 * 1024;
 /// The row bytes a restore writes between flushes. Without a flush, SlateDB keeps up to
 /// `max_unflushed_bytes` in memtables. This matches the L0 SST size.
 pub(super) const RESTORE_FLUSH_BYTES: usize = 64 * 1024 * 1024;
-/// A data directory with this file holds an interrupted restore. Startup rejects it.
-pub(crate) const RESTORE_MARKER: &str = "restore-incomplete";
 
 /// One part of a native image, and the image bytes after it.
 pub struct Chunk {
@@ -158,112 +152,16 @@ impl Stream {
 }
 
 impl StateMachine {
-    /// Pin the applied prefix in a SlateDB checkpoint, then stream its image from a task.
+    /// Pin the applied view, then stream its image from a task.
     ///
-    /// Call it between apply jobs. Only the checkpoint start runs here. Writes that apply later
-    /// do not reach the checkpoint, so the image holds one applied state boundary.
+    /// Call it between apply jobs. Only the pin runs here. Writes that apply later do not reach
+    /// the view, so the image holds one applied state boundary.
     pub(crate) async fn backup(&self) -> Result<Stream> {
-        self.backup_with_lifetime(CHECKPOINT_LIFETIME).await
-    }
-
-    /// Like `backup`, with a checkpoint that expires after `lifetime` unless refreshed.
-    pub(super) async fn backup_with_lifetime(&self, lifetime: Duration) -> Result<Stream> {
-        if let Some(shared) = &self.shared {
-            return self.shared_backup(shared);
-        }
-        ensure!(
-            self.db().snapshot()?.seq() == self.applied,
-            "backup does not match the apply marker"
-        );
-        // The membership row can exist only in memory. See `members_unsaved`.
-        let members = serde_json::to_vec(self.members.as_ref())?;
-        let handle = self
-            .db()
-            .begin_checkpoint(
-                CheckpointScope::All,
-                &CheckpointOptions {
-                    lifetime: Some(lifetime),
-                    name: Some(CHECKPOINT_NAME.to_owned()),
-                    ..Default::default()
-                },
-            )
-            .await?;
-        let timer = self.metrics.snapshot.start_timer();
-        let source = Source {
-            _db: self.db().clone(),
-            admin: self.admin.clone(),
-            store: self.location.store(),
-            root: self.location.root(),
-            image: Rows {
-                applied: self.applied,
-                members,
-                omit: omitted,
-            },
-        };
-        let (stream, (tx, end)) = Stream::new(mvcc::header(self.revision));
-        tokio::spawn(async move {
-            let checkpoint = match handle.wait().await {
-                Ok(checkpoint) => checkpoint.id,
-                Err(error) => {
-                    let _ = end.send(Err(error.into()));
-                    return;
-                }
-            };
-            // A client that stops reading blocks the stream, so refresh the checkpoint apart
-            // from it until the stream ends. A client that goes away ends the stream, even
-            // while an object read retries.
-            let result = tokio::select! {
-                result = source.stream(checkpoint, &tx) => result,
-                error = keep(&source.admin, checkpoint, lifetime) => Err(error),
-                () = tx.closed() => Err(anyhow::anyhow!("the snapshot client went away")),
-            };
-            // Like etcd, the backend snapshot duration counts completed streams only.
-            if result.is_ok() {
-                timer.observe_duration();
-            } else {
-                timer.stop_and_discard();
-            }
-            // End the response before the cleanup. The checkpoint expires by itself after
-            // `lifetime`, so the deletion stops retrying then.
-            let _ = end.send(result);
-            drop(tx);
-            match tokio::time::timeout(lifetime, source.admin.delete_checkpoint(checkpoint)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::warn!(%error, "cannot delete a backup checkpoint"),
-                Err(_) => tracing::warn!("timed out deleting a backup checkpoint"),
-            }
-        });
-        Ok(stream)
-    }
-}
-
-struct Source {
-    /// A replaced database keeps its objects while this handle exists. See `Location::retire`.
-    _db: Arc<Db>,
-    admin: Arc<slatedb::admin::Admin>,
-    store: Arc<dyn slatedb::object_store::ObjectStore>,
-    root: String,
-    image: Rows,
-}
-
-impl Source {
-    async fn stream(&self, checkpoint: uuid::Uuid, tx: &mpsc::Sender<Chunk>) -> Result<()> {
-        let reader = DbReader::builder(self.root.as_str(), self.store.clone())
-            .with_reader_mode(DbReaderMode::Checkpoint(checkpoint))
-            .with_options(DbReaderOptions {
-                skip_wal_replay: true,
-                // Like the member's reads, end the stream on a persistent read error. The
-                // default retries forever while the checkpoint stays pinned.
-                object_store_max_retries: slatedb_settings().object_store_max_retries,
-                ..Default::default()
-            })
-            // One sequential pass does not reuse blocks. Keep the member caches for its reads.
-            .with_db_cache_disabled()
-            .build()
-            .await?;
-        let result = self.image.copy(&reader, tx, None).await;
-        let _ = reader.close().await;
-        result
+        let shared = self
+            .shared
+            .as_ref()
+            .context("a backup needs a shared view")?;
+        self.shared_backup(shared)
     }
 }
 
@@ -367,20 +265,6 @@ pub(super) fn row_size(key: &[u8], value: &[u8]) -> Result<u64> {
 
 fn encoded_size(value: &impl serde::Serialize) -> Result<u64> {
     Ok(crate::codec::write(&mut std::io::sink(), value)? as u64)
-}
-
-/// Refresh the backup checkpoint every tenth of its lifetime. Return only on an error.
-async fn keep(
-    admin: &slatedb::admin::Admin,
-    checkpoint: uuid::Uuid,
-    lifetime: Duration,
-) -> anyhow::Error {
-    loop {
-        tokio::time::sleep(lifetime / 10).await;
-        if let Err(error) = admin.refresh_checkpoint(checkpoint, Some(lifetime)).await {
-            return error.into();
-        }
-    }
 }
 
 /// Encode the image into chunks, then send its digest.
@@ -682,170 +566,6 @@ pub(super) fn restored(key: &[u8], value: Bytes, member: u64) -> Result<Bytes> {
 }
 
 impl StateMachine {
-    /// Restore a checked native backup with a new Raft identity and membership.
-    ///
-    /// The rows go to the state database in batches. Row `n` of the copied rows is written at
-    /// sequence `n` or later, and the apply marker follows at `rows + 1`. The
-    /// restored index therefore depends only on the backup, so every member restores the same
-    /// Raft position. The Raft directory records a snapshot without an image at that index.
-    pub async fn restore_backup(
-        backup: &Path,
-        dir: &Path,
-        id: u64,
-        cluster_id: &str,
-        members: &crate::cluster::Store,
-        objects: &crate::object::Config,
-        cache: StateCache,
-    ) -> Result<()> {
-        check_restore_target(dir, id, members)?;
-        let started = std::time::Instant::now();
-        // A large image reads for long. Keep the reads off the runtime that serves other members.
-        let path = backup.to_owned();
-        let checked = tokio::task::spawn_blocking(move || check(&path, replaced)).await??;
-        tracing::info!(rows = checked.copied, elapsed = ?started.elapsed(), "checked the snapshot to restore");
-        Self::restore_checked(&checked, dir, id, cluster_id, members, objects, cache).await
-    }
-
-    /// Write the rows of a checked image. See `restore_backup`.
-    pub(super) async fn restore_checked(
-        checked: &Checked,
-        dir: &Path,
-        id: u64,
-        cluster_id: &str,
-        members: &crate::cluster::Store,
-        objects: &crate::object::Config,
-        cache: StateCache,
-    ) -> Result<()> {
-        let started = std::time::Instant::now();
-        std::fs::create_dir_all(dir)?;
-        // The Raft directory lock reserves the data directory, as at startup. Check the target
-        // again under it: another restore or a started member can have taken it since the check
-        // in `restore_backup`. Only then create the marker, so a losing restore leaves no marker.
-        // The identity follows the marker, so a crash before the marker leaves no identity.
-        let mut storage = crate::storage::RaftStorage::open_for_restore(
-            &dir.join("raft"),
-            id,
-            cluster_id,
-            members.conf().voters,
-        )?;
-        let mut others = std::fs::read_dir(dir)?.filter(|entry| {
-            entry
-                .as_ref()
-                .map_or(true, |entry| entry.file_name() != "raft")
-        });
-        ensure!(
-            storage.is_new() && others.next().is_none(),
-            "snapshot restore requires a new, empty data directory"
-        );
-        let marker = dir.join(RESTORE_MARKER);
-        std::fs::File::create(&marker)?.sync_all()?;
-        sync_dir(dir)?;
-        // A shared cluster restores with `restore_shared`, so the restored state is replicated.
-        let mut state = objects
-            .open(
-                dir,
-                cluster_id,
-                id,
-                cache,
-                StateMode::Replicated,
-                // Replicated mode ignores the shared-mode settings.
-                &crate::state::shared::Options {
-                    quota: 0,
-                    voters: members.conf().voters.clone(),
-                    join: false,
-                    empty_log: false,
-                    pin_max: std::time::Duration::from_secs(300),
-                    overlay_max_bytes: u64::MAX,
-                    restore: None,
-                    record: None,
-                },
-            )
-            .await?;
-        state.row_marker = Some(storage.row_marker());
-        let result = state.restore_rows(checked, members).await;
-        if let Ok(index) = &result {
-            tracing::info!(index, elapsed = ?started.elapsed(), "restored the snapshot rows");
-        }
-        state.close().await?;
-        storage.restore(result?, members.conf())?;
-        std::fs::remove_file(&marker)?;
-        sync_dir(dir)
-    }
-
-    /// Copy the rows of a checked image into this empty state, then store the apply marker.
-    /// `members` gives the alarm owner. Return the restored index, and flush the state at it.
-    pub(super) async fn restore_rows(
-        &mut self,
-        checked: &Checked,
-        members: &crate::cluster::Store,
-    ) -> Result<u64> {
-        let member = *members.members.keys().next().unwrap();
-        // Read the image in the blocking pool, as `check` does, one batch ahead of the writes.
-        // A failed write drops the read in flight, which stops the reader.
-        let image = ImageFile::open(&checked.path, replaced)?;
-        let read = |image| move || read_batch(image, RESTORE_BATCH_BYTES);
-        let mut next = Some(tokio::task::spawn_blocking(read(image)));
-        let mut digest = None;
-        let mut written = 0;
-        let mut unflushed = 0;
-        while let Some(batch) = next.take() {
-            let Batch { rows, rest, .. } = batch.await??;
-            match rest {
-                Ok(image) => next = Some(tokio::task::spawn_blocking(read(image))),
-                Err(end) => digest = Some(end),
-            }
-            if rows.is_empty() {
-                continue;
-            }
-            let mut batch = WriteBatch::new();
-            for (key, value) in rows {
-                let value = restored(&key, value, member)?;
-                unflushed += key.len() + value.len();
-                // The database starts empty, and the check rules out duplicate keys.
-                batch.put_new(key, value);
-                written += 1;
-            }
-            self.store_restored(batch, written).await?;
-            if unflushed >= RESTORE_FLUSH_BYTES {
-                self.metrics.flush_db(self.db()).await?;
-                unflushed = 0;
-            }
-        }
-        // The file can change after the check. Its digest must match the checked one before
-        // the marker goes away.
-        ensure!(
-            digest == Some(checked.digest),
-            "snapshot changed during restore"
-        );
-        let index = written + 1;
-        let mut batch = WriteBatch::new();
-        // Like `restored_data`, store no membership row. Each member restores with its own
-        // flags, so the first leader of the new cluster seeds the row.
-        // The Raft directory records the snapshot at `index` with term 1.
-        mark_applied(&mut batch, index, 1);
-        self.write_batch(batch, index).await?;
-        self.metrics.flush_db(self.db()).await?;
-        Ok(index)
-    }
-
-    /// Store new restored rows at `index` and count their logical size. Unlike `write_batch`,
-    /// do not publish them to the key index and the row caches: the restoring state closes
-    /// after the copy, and startup builds them from the stored rows.
-    async fn store_restored(&mut self, mut batch: WriteBatch, index: u64) -> Result<()> {
-        ensure!(!self.is_shared(), "a restore writes a replicated state");
-        // Every row is new, so the size needs no reads.
-        let size = batch
-            .logical_size(self.applied_state(), &self.key_index, self.logical_bytes)
-            .await?;
-        self.mark_format_4(&batch)?;
-        self.put_logical_size(&mut batch, index, size);
-        self.db()
-            .write_with_options(batch.to_storage(), &WriteOptions { seqnum: index })
-            .await?;
-        self.logical_bytes = size;
-        Ok(())
-    }
-
     /// Check a native backup for a new shared cluster in one pass. The member writes its rows
     /// into the shared database when it opens. See `shared::Restore`.
     pub async fn restore_shared(
@@ -867,19 +587,6 @@ impl StateMachine {
     }
 }
 
-/// A restore needs a member of the new cluster and a new, empty data directory.
-fn check_restore_target(dir: &Path, id: u64, members: &crate::cluster::Store) -> Result<()> {
-    ensure!(
-        members.members.contains_key(&id),
-        "restore member is missing"
-    );
-    ensure!(
-        !dir.exists() || std::fs::read_dir(dir)?.next().is_none(),
-        "snapshot restore requires a new, empty data directory"
-    );
-    Ok(())
-}
-
 /// Write a checksummed image of `rows` to `path`.
 #[cfg(test)]
 pub(crate) fn write_image(path: &Path, rows: Vec<(Vec<u8>, Vec<u8>)>) {
@@ -891,9 +598,4 @@ pub(crate) fn write_image(path: &Path, rows: Vec<(Vec<u8>, Vec<u8>)>) {
     .unwrap();
     bytes.extend_from_slice(&Sha256::digest(&bytes));
     std::fs::write(path, bytes).unwrap();
-}
-
-fn sync_dir(dir: &Path) -> Result<()> {
-    std::fs::File::open(dir)?.sync_all()?;
-    Ok(())
 }

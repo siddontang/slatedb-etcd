@@ -90,13 +90,6 @@ mod tests {
                 checkpoint: uuid::Uuid::new_v4().to_string(),
                 covers: 12,
             },
-            RaftCommand::SetQuota {
-                id: "quota".into(),
-                bytes: -1,
-                seed: true,
-                requested_at: 0,
-                member: 2,
-            },
             seed_members(Some("0123456789abcdef".into())),
             RaftCommand::CompactStep { id: "step".into() },
             RaftCommand::Lease {
@@ -135,8 +128,7 @@ mod tests {
         })
     }
 
-    /// `CompactStep` matches any `id`, so `SeedMembers` must decode before it. An older binary
-    /// fails to decode it.
+    /// `CompactStep` matches any `id`, so `SeedMembers` must decode before it.
     #[test]
     fn seed_members_does_not_decode_as_a_compaction_step() {
         for digest in [None, Some("0123456789abcdef".to_owned())] {
@@ -157,34 +149,14 @@ mod tests {
             let members: crate::cluster::Store = serde_json::from_str(&members).unwrap();
             assert_eq!(members.members.len(), 3);
         }
-        #[derive(serde::Deserialize)]
-        struct OlderCompactStep {
-            #[allow(dead_code)]
-            id: String,
-        }
-        let json = serde_json::to_vec(&seed_members(None)).unwrap();
-        assert!(serde_json::from_slice::<OlderCompactStep>(&json).is_err());
     }
 
-    /// An announcement of an earlier binary has no coverage, and zero means the checkpoint row.
-    /// An earlier binary reads a new announcement and ignores the coverage.
+    /// An announcement keeps its coverage.
     #[test]
-    fn a_view_checkpoint_decodes_with_and_without_coverage() {
-        let checkpoint = uuid::Uuid::new_v4().to_string();
-        let older = serde_json::json!({"id": "view", "checkpoint": checkpoint});
-        let data = Envelope {
-            payload: Some(Payload::Json(serde_json::to_vec(&older).unwrap())),
-        }
-        .encode_to_vec();
-        let decoded = RaftCommand::decode(&data).unwrap();
-        assert!(
-            matches!(&decoded, RaftCommand::ViewCheckpoint { covers: 0, checkpoint: c, .. }
-                if *c == checkpoint),
-            "{decoded:?}"
-        );
+    fn a_view_checkpoint_decodes_its_coverage() {
         let command = RaftCommand::ViewCheckpoint {
             id: "view".into(),
-            checkpoint: checkpoint.clone(),
+            checkpoint: uuid::Uuid::new_v4().to_string(),
             covers: 9,
         };
         let decoded = RaftCommand::decode(&command.encode().unwrap()).unwrap();
@@ -192,57 +164,6 @@ mod tests {
             matches!(decoded, RaftCommand::ViewCheckpoint { covers: 9, .. }),
             "{decoded:?}"
         );
-        // The earlier variant had only these fields, before `CompactStep`.
-        #[derive(serde::Deserialize)]
-        struct OlderViewCheckpoint {
-            id: String,
-            checkpoint: String,
-        }
-        let json = serde_json::to_vec(&command).unwrap();
-        let older: OlderViewCheckpoint = serde_json::from_slice(&json).unwrap();
-        assert_eq!((older.id.as_str(), older.checkpoint), ("view", checkpoint));
-    }
-
-    /// `CompactStep` matches any `id`, so `SetQuota` must decode before it.
-    #[test]
-    fn set_quota_does_not_decode_as_a_compaction_step() {
-        for (bytes, seed, at) in [(2 << 30, true, 0), (0, false, 7), (-3, false, u64::MAX)] {
-            let command = RaftCommand::SetQuota {
-                id: "quota".into(),
-                bytes,
-                seed,
-                requested_at: at,
-                member: 3,
-            };
-            let decoded = RaftCommand::decode(&command.encode().unwrap()).unwrap();
-            assert!(
-                matches!(
-                    decoded,
-                    RaftCommand::SetQuota { ref id, bytes: b, seed: s, requested_at: t, member: 3 }
-                        if id == "quota" && b == bytes && s == seed && t == at
-                ),
-                "{decoded:?}"
-            );
-        }
-        let step = RaftCommand::CompactStep { id: "step".into() };
-        let step = RaftCommand::decode(&step.encode().unwrap()).unwrap();
-        assert!(matches!(step, RaftCommand::CompactStep { .. }));
-        // An older binary has no `SetQuota`. Its `CompactStep` needs an `id`, so it rejects the
-        // entry and does not apply a compaction step that other members skip.
-        #[derive(serde::Deserialize)]
-        struct OlderCompactStep {
-            #[allow(dead_code)]
-            id: String,
-        }
-        let json = serde_json::to_vec(&RaftCommand::SetQuota {
-            id: "quota".into(),
-            bytes: 1,
-            seed: false,
-            requested_at: 1,
-            member: 1,
-        })
-        .unwrap();
-        assert!(serde_json::from_slice::<OlderCompactStep>(&json).is_err());
     }
 
     #[test]

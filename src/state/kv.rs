@@ -11,11 +11,9 @@ impl StateMachine {
         )
         .await;
         if let Err(error) = &result {
-            ensure!(
-                error.code != tonic::Code::Internal as i32,
-                "{}",
-                error.message
-            );
+            if let mvcc::ApplyError::Unapplied(error) = error.clone().into() {
+                return Err(error);
+            }
         }
         Ok(Outcome { result })
     }
@@ -75,19 +73,13 @@ impl StateMachine {
         .await
         {
             Ok((response, batch, revision, counts)) => (Ok(response), batch, revision, counts),
-            Err(error) => {
-                ensure!(
-                    error.code != tonic::Code::Internal as i32,
-                    "{}",
-                    error.message
-                );
-                (
-                    Err(error),
-                    WriteBatch::new(),
-                    self.revision,
-                    Default::default(),
-                )
-            }
+            Err(mvcc::ApplyError::Request(error)) => (
+                Err(error),
+                WriteBatch::new(),
+                self.revision,
+                Default::default(),
+            ),
+            Err(mvcc::ApplyError::Unapplied(error)) => return Err(error),
         };
         self.mark_applied(&mut batch, index);
         self.write_batch(batch, index).await?;
@@ -117,9 +109,8 @@ impl StateMachine {
         request: &crate::proto::etcdserverpb::WatchCreateRequest,
         through: Option<i64>,
     ) -> Result<crate::watch::WatchPage> {
-        // Some tests write the database directly, so replicated mode skips the apply check.
         let state = match &self.shared {
-            None => StateView::Snapshot(self.db().snapshot()?),
+            None => self.applied_state().clone(),
             Some(shared) => shared.pinned(),
         };
         crate::watch::read(

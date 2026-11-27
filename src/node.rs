@@ -34,6 +34,8 @@ mod proposal;
 pub use forwarding::ForwardView;
 pub(crate) use forwarding::LocalRead;
 pub(crate) use shared::WriterReport;
+pub(crate) use shared::{Millis, ProbeReply, ProbeRequest, PROBE_ROUTE};
+pub(crate) use shared::{Prober, WriteProbeReply, WriteProbeRequest, WRITE_PROBE_ROUTE};
 mod quorum_put;
 mod quota;
 mod read;
@@ -49,18 +51,6 @@ pub use response::KvReply;
 
 #[cfg(test)]
 mod dst;
-
-/// Reject a data directory that holds an interrupted snapshot restore.
-fn ensure_no_restore_marker(dir: &std::path::Path) -> Result<()> {
-    ensure!(
-        !dir.join(crate::state::backup::RESTORE_MARKER).exists(),
-        "the data directory holds an interrupted snapshot restore; remove it and restore again. \
-         With S3, delete the member namespace first only if its owner.json matches the \
-         object-store.json of this directory; otherwise restore with a new cluster ID or \
-         --s3-prefix"
-    );
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests;
@@ -126,11 +116,11 @@ pub enum Event {
         publish: Option<u64>,
         /// The process of a member that installs a base above its checkpoint row.
         coverage: Option<u64>,
-        /// The health of the member's writer. An earlier binary sends none.
+        /// The health of the member's writer. A member without a writer sends none.
         writer: Option<shared::WriterReport>,
     },
-    /// The first peer frame of a stream or request came from this process of `member`. An
-    /// earlier binary sends no process.
+    /// The first peer frame of a stream or request came from this process of `member`, if the
+    /// frame names one.
     PeerProcess {
         member: u64,
         process: Option<u64>,
@@ -139,6 +129,13 @@ pub enum Event {
     SnapshotRefused {
         member: u64,
         target: u64,
+    },
+    /// Shared mode: the reply of `member` to the write probe `nonce` of this leader, or the
+    /// error of the request.
+    WriteProbed {
+        member: u64,
+        nonce: u64,
+        reply: std::result::Result<WriteProbeReply, String>,
     },
 }
 
@@ -159,9 +156,6 @@ pub struct NodeOptions {
     pub log_memory: LogMemory,
     pub state_cache: crate::state::StateCache,
     pub quota_bytes: i64,
-    /// Request `quota_bytes` again at startup with a new time, so that it replaces a newer
-    /// cluster quota. See `node::quota`.
-    pub quota_reassert: bool,
     /// Quota usage fraction that raises the early warning. Zero disables the warning.
     pub quota_warning_fraction: f64,
     /// Automatic compaction retention. `None` disables automatic compaction.
@@ -172,8 +166,6 @@ pub struct NodeOptions {
     pub transport: crate::tls::Transport,
     pub object_store: crate::object::Config,
     pub require_peer_tls: bool,
-    /// The state mode. Only a new cluster can select shared mode.
-    pub state_mode: crate::state::StateMode,
     /// Shared mode: the age of the oldest unflushed write that starts a flush and a checkpoint.
     pub view_max_age: Duration,
     /// Shared mode: the longest time that a read view may pin its base checkpoint.
@@ -259,8 +251,8 @@ const MAX_UNCOMMITTED_BYTES: usize = 2 * log::MAX_BYTES;
 
 pub struct Node {
     pub(crate) metrics: std::sync::Arc<crate::metrics::Member>,
-    /// The object namespace that serves snapshot objects to peers.
-    pub(crate) location: std::sync::Arc<crate::state::transfer::Location>,
+    /// The cluster and the shared store that this member names on its peer traffic.
+    peer: crate::peer::Identity,
     last_observed_leader: u64,
     traffic: BTreeMap<u64, std::sync::Arc<crate::metrics::PeerTraffic>>,
     watch_feed: watch::Publisher,
@@ -303,6 +295,13 @@ pub struct Node {
     held_puts: Option<quorum_put::HeldPuts>,
     /// The term of the entries in the last submitted PreparePuts job.
     prepare_term: u64,
+    /// True while the log above a held entry is past its alarm bound. See `tick_apply_pause`.
+    hold_alarm: bool,
+    /// The entry that apply held on, until apply passes it. See `WriterReport::apply_held_at`.
+    apply_held_at: Option<u64>,
+    /// The last entry of a PreparePuts job that a storage error ended. No early reply runs
+    /// until apply passes it, so the committed path applies those entries and retries.
+    unprepared: u64,
     quorum_reply_index: u64,
     /// Watch creations that wait while a Put reply runs ahead of the local apply.
     watch_waiters: Vec<oneshot::Sender<()>>,
@@ -344,7 +343,7 @@ pub struct Node {
     /// Whether this leader term has built its lease deadlines.
     lease_promoted: bool,
     renewals: lease::Renewals,
-    /// The shared-mode leader writer. `None` in replicated mode.
+    /// The leader writer of the shared state.
     writer: Option<shared::Writer>,
     /// The leader's automatic Compact schedule. `None` when automatic compaction is off.
     auto_compaction: Option<auto_compaction::AutoCompaction>,
@@ -353,15 +352,19 @@ pub struct Node {
     /// Simulation: the leader does not propose compaction steps, as if their reads were slow.
     #[cfg(test)]
     hold_compact_steps: bool,
-    /// The quota flag of this member and its `SetQuota` proposals.
+    /// Tests: run the clock check of the shared writer also with a manual transport. Probes
+    /// still need the peer routes, so the test gives the samples itself.
+    #[cfg(test)]
+    clock_in_manual: bool,
+    /// The quota flag of this member.
     quota: quota::Quota,
     /// The term and index of the first `SeedMembers` proposal of this member in its last term.
     members_proposed: Option<(u64, u64)>,
     /// The last term in which this member proposed its digest again. See `propose_members`.
     members_rechecked: u64,
-    /// Simulation: the member proposes no `SeedMembers`, like an earlier binary.
+    /// Tests: promote a shared learner without its write proof.
     #[cfg(test)]
-    pub(super) hold_members: bool,
+    pub(super) skip_write_proof: bool,
     /// The node compared the flags with the stored membership row.
     members_observed: bool,
 }
@@ -391,22 +394,14 @@ impl Node {
             .map(crate::compactor::Retention::validate)
             .transpose()?
             .flatten();
-        if options.state_mode == crate::state::StateMode::Shared {
-            ensure!(
-                !options.view_max_age.is_zero() && !options.view_pin_max.is_zero(),
-                "the view age limits must be positive"
-            );
-            ensure!(
-                options.overlay_max_bytes > 0,
-                "the overlay limit must be positive"
-            );
-        }
-        // Check before any change to the directory, and again under the lock below.
-        ensure_no_restore_marker(&options.dir)?;
-        #[cfg(test)]
-        if let Some(hook) = tests::BEFORE_RAFT_LOCK.with(|hook| hook.take()) {
-            hook(&options.dir);
-        }
+        ensure!(
+            !options.view_max_age.is_zero() && !options.view_pin_max.is_zero(),
+            "the view age limits must be positive"
+        );
+        ensure!(
+            options.overlay_max_bytes > 0,
+            "the overlay limit must be positive"
+        );
         std::fs::create_dir_all(&options.dir)?;
         // Open Raft first. Its exclusive file lock also protects this node's SlateDB directory.
         let mut storage = RaftStorage::open_with_file_bytes(
@@ -420,9 +415,6 @@ impl Node {
             },
             options.log_file_bytes,
         )?;
-        // A restore creates its marker only under this lock, so a restore that started after
-        // the first check is visible now.
-        ensure_no_restore_marker(&options.dir)?;
         let empty_log = storage.last_index()? == 0;
         let empty_raft = empty_log && storage.snapshot_index() == 0;
         // A shared restore keeps its progress in the shared state. A member can start it again
@@ -440,6 +432,7 @@ impl Node {
             overlay_max_bytes: options.overlay_max_bytes,
             restore: options.restore.clone(),
             record: crate::state::shared::Record::of(storage.recovery_snapshot())?,
+            store_id: None,
         };
         let mut state = options
             .object_store
@@ -448,43 +441,12 @@ impl Node {
                 &options.cluster_id,
                 options.id,
                 options.state_cache,
-                options.state_mode,
                 &shared,
             )
             .await?;
-        // Mark the directory before the first format 4 row, not on open. See `RowMarker`.
-        state.row_marker = Some(storage.row_marker());
-        state.location.bind(
-            options.id,
-            &options.cluster_id,
-            options
-                .peers
-                .get(&options.id)
-                .map(|address| crate::cluster::url(address)),
-            Some(options.transport.http.clone()),
-        );
-        let location = state.location.clone();
-        let quota = quota::Quota::open(
-            &options.dir,
-            quota::Startup {
-                member: options.id,
-                flag: options.effective_quota(),
-                shared: state.is_shared(),
-                empty: empty_raft && state.applied == 0,
-                reassert: options.quota_reassert,
-                now: quota::now_millis(),
-            },
-        );
-        let mut quota = match quota {
-            Ok(quota) => quota,
-            Err(error) => {
-                let _ = state.close().await;
-                return Err(error);
-            }
-        };
+        let quota = quota::Quota::new(options.effective_quota());
         let recovered = async {
-            // Replicated apply uses the flag only until a `SetQuota` entry applies. Shared mode
-            // takes the quota from the cluster claim.
+            // Apply takes the quota from the cluster claim. The flag only shows a difference.
             state.set_quota_flag(options.effective_quota());
             // A shared base can be ahead of the log, or on another term at its index.
             Self::align_log(&mut storage, &state)?;
@@ -493,15 +455,6 @@ impl Node {
                 storage.persist_commit(state.applied)?;
             }
             let recovered_from_index = state.applied;
-            let recovery = storage.recovery_snapshot();
-            if let Ok(Some(descriptor)) =
-                crate::state::transfer::Descriptor::decode(recovery.get_data())
-            {
-                // The durable snapshot may still need its staging copy.
-                state
-                    .location
-                    .protect(recovery.get_metadata().index, &descriptor.checkpoint);
-            }
             state.install_snapshot(storage.recovery_snapshot()).await?;
             // The bootstrap membership stays in memory. The seed of the first leader stores the
             // row. See `state::cluster`.
@@ -532,54 +485,15 @@ impl Node {
                             member: options.id,
                             term: storage.initial_state()?.hard_state.term,
                         },
-                        quota.origin(),
                     )
                     .await?;
                     log::Cache::load(&storage, state.applied, options.log_memory)
                 }
                 loaded => loaded,
             };
-            let guards = quota::Guards::of(&state, quota.origin());
-            if guards.any() {
-                let (gate, scanned, open) = quota::scan_storage(&storage, state.applied, guards)?;
-                quota.set_scan(gate, scanned, open);
-            }
-            // A member that waits for a snapshot before its next entry does not hold its
-            // backlog. Raft treats the committed log as applied, and the cache keeps it only
-            // as evictable history. The snapshot install replaces it.
-            let mut raft_applied = state.applied;
-            let mut conf = state.members.conf();
-            let mut cache = match loaded {
-                Err(error)
-                    if error.is::<cache::PendingQuota>()
-                        && quota.blocked() == Some(state.applied + 1) =>
-                {
-                    // Shared mode does not take this start. An in-process base adoption would
-                    // make the member a voter again while Raft counts the skipped entries above
-                    // the base as applied. A shared member truncates its log at each checkpoint,
-                    // so such a backlog needs a log of an earlier binary that the leader never
-                    // truncated.
-                    ensure!(
-                        !state.is_shared(),
-                        "a waiting shared member cannot skip a log backlog above the pending log \
-                         memory; raise the pending log memory for this start"
-                    );
-                    raft_applied = storage.commit_index();
-                    tracing::warn!(
-                        applied = state.applied,
-                        commit = raft_applied,
-                        "the log backlog waits for a snapshot"
-                    );
-                    // Raft would count the skipped configuration changes as applied without
-                    // seeing them. So this member starts as a learner in memory: Raft does not
-                    // let it campaign or take a transfer, but it still votes. The snapshot
-                    // configuration makes it a voter again. Nothing stores this configuration.
-                    conf = quota::without_vote(conf, options.id);
-                    log::Cache::load(&storage, raft_applied, options.log_memory)?
-                }
-                loaded => loaded?,
-            };
-            cache.initial_conf = Some(conf);
+            let raft_applied = state.applied;
+            let mut cache = loaded?;
+            cache.initial_conf = Some(state.members.conf());
             let config = Config {
                 id: options.id,
                 election_tick: 10,
@@ -611,6 +525,10 @@ impl Node {
             }
         };
         let manual_apply = transport_override.is_some();
+        let identity = crate::peer::Identity {
+            cluster: options.cluster_id.clone(),
+            store: state.store_id().map(|id| id.to_string()),
+        };
         state.set_open_retries(!manual_apply);
         let mut traffic = BTreeMap::<u64, std::sync::Arc<crate::metrics::PeerTraffic>>::new();
         let mut transports = tokio::task::JoinSet::new();
@@ -630,7 +548,7 @@ impl Node {
                 transports.spawn(transport_to(
                     peer,
                     address_rx,
-                    options.cluster_id.clone(),
+                    identity.clone(),
                     rx,
                     events.clone(),
                     options.transport.clone(),
@@ -646,7 +564,7 @@ impl Node {
             state.metrics.registry.clone(),
         )?);
         crate::metrics::reads::READS.register(&state.metrics.registry)?;
-        crate::object::bounded::LIMITER.register(&state.metrics.registry)?;
+        crate::mvcc::storage_fault::register(&state.metrics.registry)?;
         let handles = state.shared_handles();
         let writer = match &handles {
             Some(handles) => {
@@ -665,6 +583,8 @@ impl Node {
                     .registry
                     .register(Box::new(retained.clone()))?;
                 let mut writer = shared::Writer::new(handles, options.view_max_age, clock);
+                let prober = shared::Prober::new(options.id, handles.source.clone());
+                writer.prober = Some(std::sync::Arc::new(prober));
                 writer.retention = options.view_retention;
                 writer.retained = Some(retained);
                 writer.gauges = Some(shared::Gauges::register(&state.metrics.registry)?);
@@ -677,7 +597,7 @@ impl Node {
             compaction.share(handles.based);
         }
         let compact_plan = compaction::PlanReady::new(&state, manual_apply);
-        let log_reader = state.is_shared().then(|| storage.reader());
+        let log_reader = Some(storage.reader());
         let worker = Worker::start(state, events.clone(), manual_apply, log_reader);
         let log_worker = log::Worker::start(storage, manual_apply)?;
         let next_checkpoint = options.next_checkpoint(raw.store().snapshot_index());
@@ -689,7 +609,8 @@ impl Node {
             quota_warned: false,
             #[cfg(test)]
             hold_compact_steps: false,
-            location,
+            #[cfg(test)]
+            clock_in_manual: false,
             metrics,
             last_observed_leader: 0,
             traffic,
@@ -735,6 +656,9 @@ impl Node {
             prepared_puts: None,
             held_puts: None,
             prepare_term: 0,
+            unprepared: 0,
+            hold_alarm: false,
+            apply_held_at: None,
             quorum_reply_index: 0,
             watch_waiters: Vec::new(),
             state: applied,
@@ -744,6 +668,7 @@ impl Node {
             prefer_query: false,
             apply_delay_ms: 0,
             options,
+            peer: identity,
             senders,
             peer_addresses,
             transports,
@@ -776,11 +701,10 @@ impl Node {
             members_proposed: None,
             members_rechecked: 0,
             #[cfg(test)]
-            hold_members: false,
+            skip_write_proof: false,
             members_observed: false,
         };
         node.sync_members();
-        node.observe_quota()?;
         node.observe_members();
         // A request can arrive before the first apply or tick. The log cache must already know
         // the base to judge the record. See `Cache::has_image`.
@@ -788,18 +712,17 @@ impl Node {
         Ok(node)
     }
 
-    /// Propose the entries that a leader puts first in its term: `SeedMembers`, then `SetQuota`.
-    /// A leader that waits for a snapshot proposes neither, and hands leadership over.
+    /// Propose the entry that a leader puts first in its term: `SeedMembers`. A leader that
+    /// waits for a snapshot proposes none, and hands leadership over.
     ///
     /// The node calls this right after each Raft step and tick, before it takes other work. So
-    /// these entries follow the empty entry of a new leader, before every client write, cluster
+    /// the entry follows the empty entry of a new leader, before every client write, cluster
     /// command, and `Publish` of the term. See `state::cluster`.
     fn propose_term_start(&mut self) -> Result<()> {
         if !self.acts_as_leader() {
             return Ok(());
         }
-        self.propose_members()?;
-        self.propose_quota()
+        self.propose_members()
     }
 
     /// One logical tick. A leader that this tick elects proposes its term-start entries before
@@ -807,6 +730,7 @@ impl Node {
     fn tick(&mut self) -> Result<()> {
         self.tick_raft()?;
         self.retry_reads();
+        self.tick_apply_pause();
         self.expire_leases()?;
         self.publish_member()?;
         self.tick_shared()?;
@@ -833,9 +757,36 @@ impl Node {
         self.propose_term_start()
     }
 
+    /// The identity that this member sends with its peer traffic. Peers must name the same one.
+    pub(crate) fn identity(&self) -> crate::peer::Identity {
+        self.peer.clone()
+    }
+
     /// The shared-mode objects that the snapshot receive path opens.
     pub(crate) fn shared_source(&self) -> Option<std::sync::Arc<crate::state::shared::Source>> {
         self.writer.as_ref().map(|writer| writer.source.clone())
+    }
+
+    /// Shared mode: the write probes that this member runs for the leader.
+    pub(crate) fn write_prober(&self) -> Option<std::sync::Arc<Prober>> {
+        self.writer
+            .as_ref()
+            .and_then(|writer| writer.prober.clone())
+    }
+
+    /// Shared mode: the wall clock that this member returns to a clock probe of the leader.
+    pub(crate) fn probe_clock(&self) -> Option<Millis> {
+        self.writer
+            .as_ref()
+            .map(|writer| writer.clock.now_ms.clone())
+    }
+
+    /// Tests: skew the wall clock of this member's writer and of its probe replies.
+    #[cfg(test)]
+    pub(crate) fn set_clock(&mut self, now_ms: Millis) {
+        if let Some(writer) = &mut self.writer {
+            writer.clock.now_ms = now_ms;
+        }
     }
 
     pub async fn run(self, events: mpsc::Receiver<Event>) -> Result<()> {
@@ -1176,27 +1127,9 @@ impl Node {
                     || self.peer_waiters.len() + step_responses.len() >= 256
                 {
                     let _ = response.send(Err(self.error("peer message rejected")));
-                } else if let Some(reserved) = self.snapshot_objects_ready(&message) {
+                } else {
                     let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
-                    let stepped = self.step_peer(message);
-                    if let Some(checkpoint) = reserved {
-                        // Raft can skip a snapshot: an older commit, or a log that already
-                        // matches. Then no install releases the staging copy.
-                        let accepted = self
-                            .raw
-                            .raft
-                            .raft_log
-                            .unstable_snapshot()
-                            .as_ref()
-                            .and_then(|s| {
-                                crate::state::transfer::Descriptor::decode(s.get_data()).ok()?
-                            })
-                            .is_some_and(|d| d.checkpoint == checkpoint);
-                        if !accepted {
-                            self.location.release(&checkpoint);
-                        }
-                    }
-                    match stepped {
+                    match self.step_peer(message) {
                         Ok(()) if snapshot => step_responses.push(response),
                         Ok(()) => {
                             // HTTP receipt is not a Raft vote or append acknowledgement.
@@ -1206,10 +1139,6 @@ impl Node {
                             let _ = response.send(Err(self.error(&error.to_string())));
                         }
                     }
-                } else {
-                    // Raft must not accept a snapshot whose objects this member lacks. The copy
-                    // runs in the background, and the leader retries the snapshot later.
-                    let _ = response.send(Err(self.error("snapshot objects are not copied")));
                 }
             }
             Event::SubscribeWatch(response) => {
@@ -1302,11 +1231,26 @@ impl Node {
                 writer,
             } => self.view_ack(member, checkpoints, publish, coverage, writer),
             Event::PeerProcess { member, process } => {
+                let changed = self.raw.store().process(member) != process;
                 self.raw.store().note_process(member, process);
+                // A new voter process drops its clock sample before the next batch admission. A
+                // new learner process drops its write proof and its running probe at once. A late
+                // frame of the earlier process then cannot bring that proof back.
+                if changed {
+                    self.tick_clock(false);
+                    if let Some(writer) = &mut self.writer {
+                        writer.proofs.forget(member);
+                    }
+                }
             }
             Event::SnapshotRefused { member, target } => {
                 self.raw.store().note_refused(member, target);
             }
+            Event::WriteProbed {
+                member,
+                nonce,
+                reply,
+            } => self.write_probed(member, nonce, reply),
             Event::SnapshotDelay(delay_ms, response) => {
                 self.snapshot_delay_ms = delay_ms.min(5000);
                 let _ = response.send(Ok(self.status()?));
@@ -1577,38 +1521,6 @@ impl Node {
         }
     }
 
-    /// Return `None` for an object snapshot that is not copied yet, and start the copy then.
-    /// Otherwise return the checkpoint of a new staging reservation, if any.
-    fn snapshot_objects_ready(&self, message: &Message) -> Option<Option<String>> {
-        if message.get_msg_type() != MessageType::MsgSnapshot {
-            return Some(None);
-        }
-        let snapshot = message.get_snapshot();
-        let Ok(Some(descriptor)) = crate::state::transfer::Descriptor::decode(snapshot.get_data())
-        else {
-            return Some(None);
-        };
-        if snapshot.get_metadata().index <= self.state.applied {
-            return Some(None);
-        }
-        // Raft may persist it now. Keep its staging copy until the install finishes.
-        match self
-            .location
-            .reserve(snapshot.get_metadata().index, &descriptor.checkpoint)
-        {
-            Some(true) => return Some(Some(descriptor.checkpoint)),
-            Some(false) => return Some(None),
-            None => (),
-        }
-        let location = self.location.clone();
-        tokio::spawn(async move {
-            if let Err(error) = location.prepare(&descriptor).await {
-                tracing::warn!(%error, "cannot copy snapshot objects");
-            }
-        });
-        None
-    }
-
     fn start_checkpoint(&mut self, image: bool) -> Result<()> {
         if self.checkpoint_running || self.apply_busy || self.prepared_puts.is_some() {
             return Ok(());
@@ -1628,7 +1540,6 @@ impl Node {
             Job::Checkpoint {
                 delay: Duration::from_millis(self.snapshot_delay_ms),
                 dir: self.options.dir.join("raft"),
-                image,
             },
             self.state.applied,
         )?;
@@ -1770,6 +1681,8 @@ impl Node {
             status["write_profile"] = crate::write_profile::snapshot();
         }
         status["quorum_reply_index"] = self.quorum_reply_index.into();
+        status["apply_paused"] = self.pause_status();
+        status["apply_held_at"] = self.apply_held_at.into();
         status["quota"] = self.quota_status();
         status["members_row"] = self.members_status();
         if let (Some(writer), Some((base, applied, bytes))) = (&self.writer, self.state.view) {
@@ -1780,6 +1693,7 @@ impl Node {
             .flatten()
             .and_then(|view| view.checkpoint().ok());
             status["shared_state"] = json!({
+                "store_id": self.peer.store,
                 "base_applied_index": base,
                 "base_checkpoint": self.state.base_checkpoint,
                 "record_index": self.raw.store().snapshot_index(),

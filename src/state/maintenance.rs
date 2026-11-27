@@ -54,16 +54,11 @@ impl StateMachine {
                 }
                 Ok(json!({"header": mvcc::header(self.revision), "hash": hash}))
             }
-            // The shared database belongs to the leader writer. Phase 4 adds Defragment there.
-            Command::Defragment if self.is_shared() => Err(KvError::new(
+            // The shared database belongs to the leader writer. The node runs Defragment there.
+            Command::Defragment => Err(KvError::new(
                 Code::Unimplemented,
                 "shared state mode has no Defragment until phase 4",
             )),
-            Command::Defragment => self
-                .defragment()
-                .await
-                .map_err(KvError::storage)
-                .map(|()| json!({"header": mvcc::header(self.revision)})),
             // gRPC Snapshot streams a backup through `Event::Snapshot`. This command keeps the
             // bounded in-memory image for Rust callers of the maintenance interface.
             Command::Snapshot => {
@@ -165,14 +160,6 @@ impl StateMachine {
             .sum())
     }
 
-    async fn defragment(&mut self) -> Result<()> {
-        let _timer = self.metrics.defrag.start_timer();
-        let _active = crate::metrics::Active::new(&self.metrics.defrag_active);
-        self.metrics.flush_db(self.db()).await?;
-        self.durable_applied = self.applied;
-        compact_all(&self.admin).await.map(drop)
-    }
-
     pub(super) async fn hash_kv(&self, revision: i64) -> std::result::Result<Value, KvError> {
         let _timer = self.metrics.hash_rev.start_timer();
         if revision > 0 {
@@ -209,7 +196,8 @@ impl StateMachine {
             let mut scan = hash_rows(self.applied_state(), revision).await?;
             while let Some(row) = scan.next().await.map_err(KvError::storage)? {
                 let user_key = hash_record_key(&row.value).map_err(KvError::storage)?;
-                if pending && hash_main(&row.key)? <= compact {
+                let main = hash_main(&row.key)?;
+                if pending && main <= compact {
                     survivors.insert(user_key.clone(), row.key.clone());
                 }
                 if row.key.len() == HASH.len() + 18 {
@@ -246,8 +234,9 @@ impl StateMachine {
         let mut empty_hash = Some(hash).filter(|_| self.compact_revision >= 0);
         let mut rows = hash_rows(self.applied_state(), revision).await?;
         while let Some(row) = rows.next().await.map_err(KvError::storage)? {
+            // A short record key is corrupt data. It fails this request and keeps the member.
+            let main = hash_main(&row.key)?;
             let key = &row.key[HASH.len()..];
-            let main = i64::from_be_bytes(key[..8].try_into().map_err(KvError::storage)?);
             let tombstone = key.len() == 18;
             if !exists(&row.key, main) || (main == self.compact_revision && tombstone) {
                 continue;
@@ -314,28 +303,13 @@ struct HashUserKey {
 
 /// The first byte of a hash digest record.
 ///
-/// A record is either an etcd `KeyValue` encoding (format 3 rows and tombstones) or a digest.
+/// A record is either an etcd `KeyValue` encoding (a tombstone) or a digest.
 /// A protobuf field number is never zero, so no `KeyValue` encoding, now or after etcd adds
 /// fields, starts with a zero byte. The marker does not depend on which fields exist.
 const DIGEST: u8 = 0;
 /// The digest layout after [`DIGEST`]: version, CRC-32C (big endian), length (big endian), key.
 const DIGEST_V1: u8 = 1;
 const DIGEST_HEADER: usize = 2 + 4 + 8;
-
-/// A digest record of the first format 4 binaries, before the explicit [`DIGEST`] byte.
-///
-/// Field one is the user key, as in `KeyValue`. Those binaries encoded `KeyValue` with fields
-/// one to six only, so a record that they wrote with fields 14 and 15 is a digest. New records
-/// never use this form. Rows that it wrote remain readable.
-#[derive(prost::Message)]
-struct LegacyDigest {
-    #[prost(bytes = "vec", tag = "1")]
-    key: Vec<u8>,
-    #[prost(fixed32, optional, tag = "14")]
-    crc: Option<u32>,
-    #[prost(uint64, optional, tag = "15")]
-    len: Option<u64>,
-}
 
 /// Encode the hash record of a live `KeyValue`. `kv` is its etcd wire encoding.
 ///
@@ -370,19 +344,10 @@ fn parse_hash_record(record: &[u8]) -> Result<HashRecord<'_>> {
             len: u64::from_be_bytes(record[6..14].try_into()?),
         });
     }
-    let legacy = LegacyDigest::decode(record)?;
-    Ok(match (legacy.crc, legacy.len) {
-        (Some(crc), Some(len)) => HashRecord::Digest {
-            key: legacy.key,
-            crc,
-            len,
-        },
-        (None, None) => HashRecord::Full(record),
-        _ => anyhow::bail!("invalid hash record"),
-    })
+    Ok(HashRecord::Full(record))
 }
 
-/// Return the user key of a hash record in any stored form.
+/// Return the user key of a hash record.
 pub(crate) fn hash_record_key(record: &[u8]) -> Result<Vec<u8>> {
     Ok(match parse_hash_record(record)? {
         HashRecord::Digest { key, .. } => key,
@@ -402,10 +367,18 @@ pub(crate) fn hash_append(crc: u32, record: &[u8]) -> Result<(u32, u64)> {
 }
 
 fn hash_main(key: &[u8]) -> std::result::Result<i64, KvError> {
-    key.get(HASH.len()..HASH.len() + 8)
-        .and_then(|main| main.try_into().ok())
-        .map(i64::from_be_bytes)
-        .ok_or_else(|| KvError::storage("invalid hash key"))
+    // The whole key must have the form of `hash_key`: the main revision, `_`, the
+    // subrevision, and an optional tombstone mark.
+    let record = key.get(HASH.len()..).unwrap_or_default();
+    let valid = match record.len() {
+        17 => true,
+        18 => record[17] == b't',
+        _ => false,
+    } && record[8] == b'_';
+    match record.get(..8) {
+        Some(main) if valid => Ok(i64::from_be_bytes(main.try_into().expect("eight bytes"))),
+        _ => Err(KvError::corrupt("invalid hash key")),
+    }
 }
 
 /// Scan the hash records through `revision`.
@@ -432,9 +405,15 @@ pub(crate) async fn count_logical_usage(db: &impl StateRead) -> Result<crate::ba
 }
 
 /// Compact every L0 SST and sorted run into one sorted run, and wait up to 8 s for the end.
-/// The compactor of the database writer runs the job. Defragment uses this in both state modes.
+/// The compactor of the database writer runs the job. Defragment uses this.
 /// Return the version of the manifest that shows compaction is complete.
-pub(crate) async fn compact_all(admin: &slatedb::admin::Admin) -> Result<u64> {
+///
+/// `allowed` runs before each submission. A Defragment of a writer whose term ended must not add
+/// a job record, because SlateDB checks no writer epoch at a submission.
+pub(crate) async fn compact_all(
+    admin: &slatedb::admin::Admin,
+    allowed: &(dyn Fn() -> Result<()> + Send + Sync),
+) -> Result<u64> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     loop {
         let manifest = admin
@@ -459,6 +438,7 @@ pub(crate) async fn compact_all(admin: &slatedb::admin::Admin) -> Result<u64> {
         // SlateDB can reuse the destination run ID, so the input SST views identify the input.
         let input: std::collections::HashSet<_> =
             manifest.all_sst_views().map(|view| view.id).collect();
+        allowed()?;
         let job = admin
             .submit_compaction(CompactionSpec::new(sources, destination))
             .await?;
@@ -500,24 +480,13 @@ pub(crate) async fn compact_all(admin: &slatedb::admin::Admin) -> Result<u64> {
     }
 }
 
-/// Encode a digest record the way the first format 4 binaries did, for tests of older rows.
-#[cfg(test)]
-pub(crate) fn legacy_hash_record(key: &[u8], kv: &[u8]) -> Vec<u8> {
-    LegacyDigest {
-        key: key.to_vec(),
-        crc: Some(crc32c::crc32c(kv)),
-        len: Some(kv.len() as u64),
-    }
-    .encode_to_vec()
-}
-
 #[cfg(test)]
 mod hash_record_tests {
     use super::*;
     use crate::proto::mvccpb::KeyValue;
 
     #[test]
-    fn every_stored_form_hashes_like_the_full_bytes() {
+    fn a_digest_hashes_like_the_full_bytes() {
         let seed = crc32c::crc32c(b"seed");
         for (key, value) in [
             (b"k".to_vec(), vec![]),
@@ -536,7 +505,7 @@ mod hash_record_tests {
             let expected = (crc32c::crc32c_append(seed, &kv), kv.len() as u64);
             let digest = hash_record(&key, &kv);
             assert_eq!(digest[..2], [DIGEST, DIGEST_V1]);
-            for record in [digest, legacy_hash_record(&key, &kv), kv.clone()] {
+            for record in [digest, kv.clone()] {
                 assert_eq!(hash_append(seed, &record).unwrap(), expected);
                 assert_eq!(hash_record_key(&record).unwrap(), key);
             }

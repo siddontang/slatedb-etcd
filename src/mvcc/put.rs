@@ -284,7 +284,7 @@ pub(super) fn prev_event(old: Option<&Old>, revision: i64) -> KvResult<(Option<K
         }
         // A change earlier in the same revision has no history version yet.
         Some(Old::Full(kv)) => Ok((Some(kv.clone()), 0)),
-        Some(Old::Meta(_)) => Err(KvError::storage("indexed row has no older revision")),
+        Some(Old::Meta(_)) => Err(KvError::corrupt("indexed row has no older revision")),
     }
 }
 
@@ -293,6 +293,17 @@ pub(super) fn prev_event(old: Option<&Old>, revision: i64) -> KvResult<(Option<K
 /// The key index supplies the old revision metadata and row length. The old value is read only
 /// when the request returns it as prev_kv.
 pub(crate) async fn prepare_put(
+    view: &CurrentView<'_, impl StateRead>,
+    revision: i64,
+    request: &RequestOp,
+    batch: &mut WriteBatch,
+    size: &mut crate::batch::Usage,
+) -> Result<(ResponseOp, i64), ApplyError> {
+    Ok(put_once(view, revision, request, batch, size).await?)
+}
+
+/// The body of `prepare_put`, with the raw request error.
+async fn put_once(
     view: &CurrentView<'_, impl StateRead>,
     revision: i64,
     request: &RequestOp,
@@ -321,7 +332,7 @@ pub(crate) async fn prepare_put(
     .encode_to_vec();
     batch
         .put_counted(crate::watch::key(next).into(), journal.into(), None, size)
-        .map_err(KvError::storage)?;
+        .map_err(KvError::invariant)?;
     put_revision_row(view, revision, batch, size).await?;
     Ok((response(Resp::ResponsePut(reply)), next))
 }
@@ -355,6 +366,31 @@ thread_local! {
 /// `None` means that the chosen branch is empty. The caller then uses the general evaluator.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_txn_puts(
+    view: &CurrentView<'_, impl StateRead>,
+    revision: i64,
+    compact_revision: i64,
+    request: &RequestOp,
+    leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
+    batch: &mut WriteBatch,
+    size: &mut crate::batch::Usage,
+    counts: &mut crate::metrics::Writes,
+) -> Result<Option<(ResponseOp, i64)>, ApplyError> {
+    let prepared = txn_puts_once(
+        view,
+        revision,
+        compact_revision,
+        request,
+        leases,
+        batch,
+        size,
+        counts,
+    );
+    Ok(prepared.await?)
+}
+
+/// The body of `prepare_txn_puts`, with the raw request error.
+#[allow(clippy::too_many_arguments)]
+async fn txn_puts_once(
     view: &CurrentView<'_, impl StateRead>,
     revision: i64,
     compact_revision: i64,
@@ -414,7 +450,7 @@ pub(crate) async fn prepare_txn_puts(
     .encode_to_vec();
     batch
         .put_counted(crate::watch::key(next).into(), journal.into(), None, size)
-        .map_err(KvError::storage)?;
+        .map_err(KvError::invariant)?;
     put_revision_row(view, revision, batch, size).await?;
     #[cfg(test)]
     DIRECT_TXNS.with(|count| count.set(count.get() + 1));
@@ -496,7 +532,7 @@ async fn put_rows(
                 let raw = view
                     .value(&key)
                     .await?
-                    .ok_or_else(|| KvError::storage("key index has no current row"))?;
+                    .ok_or_else(|| KvError::corrupt("key index has no current row"))?;
                 (Some(meta), Some(raw))
             }
         },
@@ -522,7 +558,7 @@ async fn put_rows(
         // Earlier group members have lower revisions, so this is not expected.
         Some(_) => match raw {
             Some(raw) => (Some(raw), 0),
-            None => return Err(KvError::storage("indexed row has no older revision")),
+            None => return Err(KvError::corrupt("indexed row has no older revision")),
         },
     };
     // The hash row holds a digest of the KeyValue, not its bytes.
@@ -545,7 +581,7 @@ async fn put_rows(
     for (key, value, old_len) in rows {
         batch
             .put_counted(key, value, old_len, size)
-            .map_err(KvError::storage)?;
+            .map_err(KvError::invariant)?;
     }
     Ok((
         PutResponse {
@@ -589,7 +625,7 @@ async fn put_revision_row(
             old_len,
             size,
         )
-        .map_err(KvError::storage)
+        .map_err(KvError::invariant)
 }
 
 #[cfg(test)]
@@ -599,7 +635,9 @@ mod tests {
     #[tokio::test]
     async fn ordinary_put_stores_the_value_only_in_current_and_history() {
         let dir = tempfile::tempdir().unwrap();
-        let state = crate::state::StateMachine::open(dir.path()).await.unwrap();
+        let state = crate::state::StateMachine::open_test(dir.path())
+            .await
+            .unwrap();
         let request = RequestOp {
             request: Some(Op::RequestPut(PutRequest {
                 key: b"key".to_vec(),
@@ -608,7 +646,7 @@ mod tests {
             })),
         };
         let view = CurrentView {
-            db: state.db().as_ref(),
+            db: state.applied_state(),
             rows: &state.current,
             index: &state.key_index,
         };

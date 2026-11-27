@@ -62,8 +62,6 @@ pub struct ServerConfig {
     pub state_cache: crate::state::StateCache,
     /// Zero selects the default 2 GiB quota. A negative value disables the quota.
     pub quota_bytes: i64,
-    /// Request `quota_bytes` again with a new time at startup. See `NodeOptions`.
-    pub quota_reassert: bool,
     /// Quota usage fraction that raises the early warning. Zero disables the warning.
     pub quota_warning_fraction: f64,
     /// Automatic compaction retention, as etcd's `--auto-compaction-*` flags select it.
@@ -73,9 +71,6 @@ pub struct ServerConfig {
     pub strict_reconfiguration: bool,
     pub join: bool,
     pub restore_snapshot: Option<PathBuf>,
-    /// The state mode of a new cluster. Shared mode keeps one SlateDB for the cluster. Phase 1
-    /// supports it for one voter only. An existing directory keeps its mode.
-    pub state_mode: crate::state::StateMode,
     /// Shared mode: flush and publish a checkpoint when the oldest unflushed write is this old.
     pub view_max_age: Duration,
     /// Shared mode: a read fails with a retryable error when its view is older than this.
@@ -90,6 +85,9 @@ pub struct ServerConfig {
     pub view_retention: crate::state::ViewRetention,
     /// Serve the `/debug` fault controls (partition, delays, log faults). Off by default.
     pub fault_controls: bool,
+    /// Tests: the wall clock of the shared writer and of its clock probe replies.
+    #[cfg(test)]
+    pub(crate) now_ms: Option<crate::node::Millis>,
 }
 
 /// A free local port for a test member. A port 0 listener returns its port to the pool, and a
@@ -114,8 +112,8 @@ pub(crate) fn test_port() -> String {
 }
 
 impl ServerConfig {
-    /// Create a local, single-member configuration with an assigned loopback port.
-    pub fn single_node(dir: impl Into<PathBuf>) -> Self {
+    /// Create a single-member configuration on `object_store`, with an assigned loopback port.
+    pub fn single_node(dir: impl Into<PathBuf>, object_store: crate::object::Config) -> Self {
         let address = "127.0.0.1:0";
         Self {
             id: 1,
@@ -130,7 +128,7 @@ impl ServerConfig {
             allow_remote: false,
             client_tls: crate::tls::Options::default(),
             peer_tls: crate::tls::Options::default(),
-            object_store: crate::object::Config::Local,
+            object_store,
             watch_progress_notify_interval: crate::grpc::DEFAULT_WATCH_PROGRESS_INTERVAL,
             snapshot_every: 10_000,
             snapshot_min_bytes: crate::node::DEFAULT_SNAPSHOT_MIN_BYTES,
@@ -138,20 +136,20 @@ impl ServerConfig {
             log_memory: LogMemory::default(),
             state_cache: crate::state::StateCache::default(),
             quota_bytes: 0,
-            quota_reassert: false,
             quota_warning_fraction: DEFAULT_QUOTA_WARNING_FRACTION,
             auto_compaction: None,
             auth_token: "simple".into(),
             strict_reconfiguration: true,
             join: false,
             restore_snapshot: None,
-            state_mode: crate::state::StateMode::Replicated,
             view_max_age: DEFAULT_VIEW_MAX_AGE,
             view_pin_max: DEFAULT_VIEW_PIN_MAX,
             overlay_max_bytes: DEFAULT_OVERLAY_MAX_BYTES,
             max_clock_skew: Duration::from_secs(5),
             view_retention: crate::state::ViewRetention::Off,
             fault_controls: false,
+            #[cfg(test)]
+            now_ms: None,
         }
     }
 }
@@ -306,24 +304,10 @@ impl Server {
         let mut restore = None;
         if let Some(backup) = config.restore_snapshot.take() {
             let members = crate::cluster::Store::bootstrap(&config.peers, &config.client_peers);
-            if config.state_mode.is_replicated() {
-                crate::state::StateMachine::restore_backup(
-                    &backup,
-                    &config.dir,
-                    config.id,
-                    &config.cluster_id,
-                    &members,
-                    &config.object_store,
-                    config.state_cache,
-                )
-                .await?;
-            } else {
-                // A new shared cluster gets the rows in its shared database when it opens.
-                restore = Some(
-                    crate::state::StateMachine::restore_shared(&backup, config.id, &members)
-                        .await?,
-                );
-            }
+            // A new cluster gets the rows in its shared database when it opens.
+            restore = Some(
+                crate::state::StateMachine::restore_shared(&backup, config.id, &members).await?,
+            );
         }
         // Snapshot restore must see the original data directory before AutoTLS creates fixtures.
         if client_auto {
@@ -357,14 +341,12 @@ impl Server {
                 log_memory: config.log_memory,
                 state_cache: config.state_cache,
                 quota_bytes: config.quota_bytes,
-                quota_reassert: config.quota_reassert,
                 quota_warning_fraction: config.quota_warning_fraction,
                 auto_compaction: config.auto_compaction,
                 strict_reconfiguration: config.strict_reconfiguration,
                 join: config.join,
                 object_store: config.object_store.clone(),
                 require_peer_tls: config.allow_remote,
-                state_mode: config.state_mode,
                 view_max_age: config.view_max_age,
                 view_pin_max: config.view_pin_max,
                 overlay_max_bytes: config.overlay_max_bytes,
@@ -376,11 +358,23 @@ impl Server {
             events.clone(),
         )
         .await?;
+        #[cfg(test)]
+        let node = {
+            let mut node = node;
+            if let Some(now_ms) = &config.now_ms {
+                node.set_clock(now_ms.clone());
+            }
+            node
+        };
         let diagnostics = router(ApiState {
             events: events.clone(),
-            cluster_id: config.cluster_id.clone(),
-            location: Some(node.location.clone()),
+            peer: node.identity(),
+            refusals: std::sync::Arc::new(crate::api::Refusals::new(
+                node.metrics.refused_peer_stores.clone(),
+            )),
             shared: node.shared_source(),
+            clock: node.probe_clock(),
+            prober: node.write_prober(),
             fault_controls: config.fault_controls,
         });
         // Peer gRPC has no RPC metrics; diagnostics paths never collide with gRPC services.

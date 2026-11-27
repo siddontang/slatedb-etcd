@@ -46,52 +46,30 @@ Regressions check cross-engine values and count the underlying sync calls.
 
 An automatic or membership checkpoint does not copy state. The node:
 
-1. Records the applied index and membership after the apply worker finishes earlier entries.
-2. Flushes SlateDB. The flushed state holds the apply marker at the same sequence number.
-3. Syncs snapshot metadata without an image, the commit marker, and truncation in one WAL batch.
-4. Removes any prior image file and asks raft-engine to reclaim obsolete WAL segments.
+1. Records its base index and membership after the apply worker finishes earlier entries.
+2. Writes a snapshot record that names the base `view-` checkpoint. The leader made that
+   checkpoint durable in S3 before it announced it.
+3. Syncs the record, its checksum, metadata, commit marker, and truncation in one WAL batch.
+4. Removes any prior record file and asks raft-engine to reclaim obsolete WAL segments.
 
-Local objects use synced writes, so a flush survives power loss like an S3 write.
-Restart reads an apply marker at or above the truncation index and replays the later entries.
-If state is behind a record without an image, startup stops with an explicit error.
+Restart opens a checkpoint at or above the truncation index and replays the later entries.
+If state is behind the record, startup stops with an explicit error.
 
-A manual checkpoint, or a leader whose peer needs a snapshot, builds an image. The image is a
-small descriptor of a SlateDB checkpoint, not a copy of the state
-(see [object storage Raft snapshots](object-snapshots.md)):
-
-1. Begins a SlateDB checkpoint at the applied index between two apply jobs, waits for it, and
-   encodes its descriptor: the checkpoint ID, its manifest, and the SST paths.
-2. Writes and syncs a private temporary file on a blocking worker. The worker computes its CRC.
-3. Renames the complete image and syncs its directory on the WAL thread.
-4. Syncs its reference, checksum, metadata, commit marker, and truncation in one WAL batch.
-5. Removes the prior file and asks raft-engine to reclaim obsolete WAL segments.
-
-Raft asks for a snapshot through synchronous storage. Without an image, storage reports a
-temporary failure and records the request. The owner then builds an image at the applied index.
-That image can replace a record without an image at the same index. Raft retries on a later
-heartbeat and sends the image. Automatic truncation waits while a peer receives a snapshot.
-The image stays in memory until the next truncation replaces it.
+Raft asks for a snapshot through synchronous storage. The log cache sends the record of the base.
+The record is a small descriptor of a shared checkpoint, not a copy of the state. The follower
+opens the named checkpoint, so the 64 MiB peer HTTP body limit does not bound the state size.
+See [shared state](shared-state.md#install).
 
 The saved snapshot retains the boundary term and membership at the same applied index. On snapshot
-receipt,
-the node atomically replaces its persistent Raft state before changing SlateDB. A crash in between
-is safe: startup can repeat the state replacement from the durable snapshot payload.
+receipt, the node atomically replaces its persistent Raft state before it changes its base. A
+crash in between is safe: startup can repeat the install from the durable snapshot payload.
 
-The descriptor size grows with the SST count, not with the data size. The follower copies the
-named SST objects before Raft accepts the snapshot, so the 64 MiB peer HTTP body limit does not
-bound the state size. Snapshot creation runs in the background.
-Legacy full-image files stay readable; a node no longer builds them.
-The file writer samples four 4 KiB regions in images of at least 64 KiB.
-It selects LZ4 when the sample shrinks by more than half. Other images use the original bytes.
-The encoder uses 64 KiB blocks. The WAL records the stored length for compressed files.
-Recovery checks both lengths and the CRC of the decoded image.
-Peer requests carry the decoded descriptor.
 Members use different positions in each automatic checkpoint interval.
 Their rank in the configured peer list sets the position. Manual checkpoints bypass this schedule.
 Incoming peer snapshots use the ordered WAL thread for both file preparation and publication.
 Slow persistence can still raise client tail latency.
-A separate apply task owns SlateDB, installs snapshots, and executes committed state changes.
-Snapshot transfer copies objects; historical and sorted state scans are not bounded yet.
+A separate apply task owns the state, installs snapshots, and executes committed state changes.
+Historical and sorted state scans are not bounded yet.
 
 The local PoC polls compaction and manifest updates every 100 ms. The default slower polling caused
 L0 backpressure during repeated checkpoints in an earlier run. That run is retained in
@@ -145,6 +123,9 @@ Term runs support synchronous Raft term lookup without retaining every payload.
 The apply task shares the process runtime; this change does not isolate CPU or disk resources.
 
 Status reports `apply_lag`, `apply_busy`, `apply_target`, and `queued_state_reads`.
+`apply_paused` names the entry that apply waits on after a storage error, with `held`, `reason`,
+`paused_ms`, and `log_alarm`. It is `null` while apply runs. `apply_held_at` keeps the held entry
+until apply passes it, also after a snapshot ended the held job.
 `POST /debug/apply-delay` accepts `{"delay_ms":2500}` to delay entry apply and snapshot
 installation.
 This loopback test hook has a five-second limit. Set the delay to zero to restore normal operation.
@@ -280,44 +261,26 @@ from the Raft log. A later Compact waits in the record until earlier boundaries 
 HashKV skips rows that the pending pass will remove, so its result does not depend on progress.
 Quota accounting uses the stored row lengths. Each deleted row contributes its original size once.
 
-Apply compares the logical size with the cluster quota in `etcd/quota`. A `SetQuota` entry
-writes that row, so every replica changes the quota at the same index. The row counts toward the
-logical size, like the alarms row. A replica with no row uses its own flag, as earlier binaries
-did, so replicas of such a state can differ. The leader proposes `SetQuota` right after its
-election, before its client writes. An entry applies only when its request is newer than the
-row: `(requested_at, member, bytes)` orders requests on every replica.
-
-A replica checkpoints through a first `SetQuota` entry that follows quota-checked entries. The
-row keeps that index, so a restart retries the checkpoint. So the log of a leader no longer
-holds such entries of earlier binaries. A new member installs a snapshot instead.
-A state that this binary created empty also stops before such an entry and requests a snapshot.
-See [quota changes](operations.md#change-the-quota).
+Apply compares the logical size with the quota of the cluster claim. Every replica reads the
+same claim, so every replica applies one quota. See [quota](operations.md#quota).
 
 The `etcd/members` row also counts toward the logical size, so every replica must store the
 same bytes. The membership that a member builds from its `--peer` and `--client-peer` flags stays
-in memory. The leader proposes `SeedMembers` right after its election, before `SetQuota`. On a
-state without the row, this entry stores the membership of the leader. Later, cluster commands
-change the stored row, and a rejected command writes nothing. Raft snapshots carry the stored
-row and nothing else. A log of an earlier binary has other entries before any seed. Such an
-entry that finds no row stores the in-memory membership with its batch, as that binary did. A
-state that this binary created empty stops before such an entry and requests a snapshot, as for
-the quota. This guard works in both state modes. A local origin record says, for each guard,
-whether the state was created empty. It keeps the quota mark of #116, and a directory with
-history at the first start replays its membership entries as before. Each seed also carries a
-digest of the row of the leader. See [membership row](operations.md#membership-row).
+in memory. The leader proposes `SeedMembers` right after its election. On a state without the
+row, this entry stores the membership of the leader. Later, cluster commands change the stored
+row, and a rejected command writes nothing. Raft snapshots carry the stored row and nothing
+else. Each seed also carries a digest of the row of the leader. See
+[membership row](operations.md#membership-row).
 
-Each member flushes SlateDB outside ordered apply when a step finishes a physical boundary.
-Writes can apply during this flush. One flush can run at a time.
-The highest queued index covers intervening requests.
-A physical reply requires the finished pass and a flush through its own Compact index.
+A physical reply requires the finished pass and a member base that covers its own Compact index.
+Writes can apply while the reply waits.
 These replies do not use the 5 s proposal timeout. They wait until the client disconnects.
-A forwarding member also waits for its local durable physical boundary.
+A forwarding member also waits for a base that covers the boundary.
 A repeated physical request marks the pending boundary as physical. It waits for that boundary
 before it returns the compacted error.
 A storage error stops the node. On restart, Raft replays the missing steps.
 Defragment rewrites the current SST set and waits for manifest publication.
 SlateDB garbage collection reclaims obsolete objects later. Pinned checkpoints can retain them.
-Do not downgrade to an older binary after compaction; older binaries do not enforce its boundary.
 
 The diagnostic JSON keyspace is separate from the etcd keyspace and does not affect etcd revisions.
 

@@ -1,3 +1,5 @@
+mod common;
+
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -45,7 +47,7 @@ async fn get(server: &Server, key: &[u8]) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn embedded_watch_lease_shutdown_and_immediate_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let server = Server::start(ServerConfig::single_node(dir.path()))
+    let server = Server::start(common::single_node(dir.path()))
         .await
         .unwrap();
     ready(&server).await;
@@ -142,11 +144,13 @@ async fn start_three_members(
 
         let mut servers = Vec::new();
         for (id, listener) in reservations {
-            let mut config = ServerConfig::single_node(dir.join(format!("{attempt}-{id}")));
+            let mut config = common::single_node(dir.join(format!("{attempt}-{id}")));
             config.id = id;
             config.listen = listener.local_addr().unwrap();
             config.peers = peers.clone();
             config.client_peers = peers.clone();
+            // The members share one store.
+            config.object_store = common::object_store(&dir.join(attempt.to_string()));
             configure(&mut config);
             drop(listener);
             match Server::start(config).await {
@@ -208,7 +212,7 @@ async fn embedded_three_members_fail_over_and_rejoin() {
 async fn embedding_validates_before_storage_and_times_out_without_quorum() {
     let dir = tempfile::tempdir().unwrap();
     let busy = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut config = ServerConfig::single_node(dir.path().join("unused"));
+    let mut config = common::single_node(dir.path().join("unused"));
     config.peer_listen = Some(busy.local_addr().unwrap());
     config
         .peers
@@ -216,6 +220,7 @@ async fn embedding_validates_before_storage_and_times_out_without_quorum() {
     assert!(Server::start(config.clone()).await.is_err());
     assert!(!config.dir.exists());
     config.peer_listen = None;
+    config.object_store = common::object_store(dir.path());
     config.peers = BTreeMap::from([
         (1, "127.0.0.1:0".into()),
         (2, busy.local_addr().unwrap().to_string()),
@@ -233,7 +238,7 @@ async fn embedding_validates_before_storage_and_times_out_without_quorum() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn readiness_works_with_auth_and_drop_requests_shutdown() {
     let dir = tempfile::tempdir().unwrap();
-    let server = Server::start(ServerConfig::single_node(dir.path()))
+    let server = Server::start(common::single_node(dir.path()))
         .await
         .unwrap();
     ready(&server).await;
@@ -286,13 +291,13 @@ async fn readiness_works_with_auth_and_drop_requests_shutdown() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_failure_reaches_host_and_releases_storage() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = ServerConfig::single_node(dir.path());
+    let mut config = common::single_node(dir.path());
     config.fault_controls = true;
     let mut server = Server::start(config).await.unwrap();
     ready(&server).await;
     put(&server, b"anchor", b"durable").await;
     let config = server.config().clone();
-    let mut conflict = ServerConfig::single_node(dir.path());
+    let mut conflict = common::single_node(dir.path());
     conflict.cluster_id = config.cluster_id.clone();
     assert!(Server::start(conflict).await.is_err());
     reqwest::Client::new()
@@ -327,7 +332,7 @@ async fn worker_failure_reaches_host_and_releases_storage() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fault_controls_are_off_by_default() {
     let dir = tempfile::tempdir().unwrap();
-    let server = Server::start(ServerConfig::single_node(dir.path()))
+    let server = Server::start(common::single_node(dir.path()))
         .await
         .unwrap();
     ready(&server).await;
@@ -386,6 +391,7 @@ async fn cli_serves_no_fault_controls_without_the_flag() {
                 "--dir",
             ])
             .arg(dir.path().join("member"))
+            .args(common::cli_args(dir.path()))
             .spawn()
             .unwrap(),
     );
@@ -417,7 +423,7 @@ async fn restore_precedes_autotls_and_preserves_the_nonempty_directory_guard() {
     use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 
     let dir = tempfile::tempdir().unwrap();
-    let source = Server::start(ServerConfig::single_node(dir.path().join("source")))
+    let source = Server::start(common::single_node(dir.path().join("source")))
         .await
         .unwrap();
     ready(&source).await;
@@ -448,7 +454,7 @@ async fn restore_precedes_autotls_and_preserves_the_nonempty_directory_guard() {
     std::fs::write(&backup, bytes).unwrap();
 
     let target = dir.path().join("target");
-    let mut config = ServerConfig::single_node(&target);
+    let mut config = common::single_node(&target);
     config.restore_snapshot = Some(backup);
     config.peer_listen = Some(config.listen);
     config.peers.insert(1, "https://127.0.0.1:0".into());
@@ -478,147 +484,13 @@ async fn restore_precedes_autotls_and_preserves_the_nonempty_directory_guard() {
     assert_eq!(std::fs::read(path).unwrap(), cert);
 }
 
-/// Read one key from the member's local state without a quorum round trip.
-async fn local(server: &Server, key: &[u8]) -> Option<Vec<u8>> {
-    let result = KvClient::connect(server.client_url())
-        .await
-        .unwrap()
-        .range(RangeRequest {
-            key: key.to_vec(),
-            serializable: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    result.kvs.first().map(|kv| kv.value.clone())
-}
-
-/// Read a diagnostics endpoint on the client listener over plain HTTP/1.1.
-async fn diagnostics(server: &Server, path: &str) -> serde_json::Value {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut stream = tokio::net::TcpStream::connect(server.client_addr())
-        .await
-        .unwrap();
-    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await.unwrap();
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).await.unwrap();
-    let response = String::from_utf8(response).unwrap();
-    let (head, body) = response.split_once("\r\n\r\n").unwrap();
-    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-    // Axum may send a chunked body; the JSON object lies between the outer braces.
-    let body = &body[body.find('{').unwrap()..=body.rfind('}').unwrap()];
-    serde_json::from_str(body).unwrap()
-}
-
-async fn eventually(what: &str, mut check: impl std::ops::AsyncFnMut() -> bool) {
-    for _ in 0..300 {
-        if check().await {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("timed out waiting for {what}");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn follower_behind_an_imageless_truncation_catches_up_from_an_on_demand_image() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut servers = start_three_members(dir.path(), |config| {
-        // Truncate often, as automatic checkpoints do, without waiting for 64 MiB of log.
-        config.snapshot_every = 16;
-        config.snapshot_min_bytes = 0;
-    })
-    .await;
-    let status = MaintenanceClient::connect(servers[0].as_ref().unwrap().client_url())
-        .await
-        .unwrap()
-        .status(StatusRequest {})
-        .await
-        .unwrap()
-        .into_inner();
-    let leader = status.leader as usize - 1;
-    let lagging = (leader + 1) % 3;
-    put(servers[leader].as_ref().unwrap(), b"before", b"stopped").await;
-    let stopped_at = diagnostics(servers[lagging].as_ref().unwrap(), "/status").await
-        ["last_log_index"]
-        .as_u64()
-        .unwrap();
-    let stopped = servers[lagging].take().unwrap();
-    let restart = stopped.config().clone();
-    stopped.shutdown().await.unwrap();
-
-    let value = |i: usize| format!("{i}:{}", "v".repeat(512));
-    for i in 0..256 {
-        put(
-            servers[leader].as_ref().unwrap(),
-            format!("lag/{i}").as_bytes(),
-            value(i).as_bytes(),
-        )
-        .await;
-    }
-    // Both live members must truncate past the stopped follower without building an image.
-    for id in [leader, 3 - leader - lagging] {
-        let server = servers[id].as_ref().unwrap();
-        eventually("imageless truncation", async || {
-            let status = diagnostics(server, "/status").await;
-            status["snapshot_index"].as_u64().unwrap() > stopped_at
-                && !status["snapshot_has_image"].as_bool().unwrap()
-                && !status["checkpoint_running"].as_bool().unwrap()
-        })
-        .await;
-        let status = diagnostics(server, "/status").await;
-        assert_eq!(status["snapshot_images_built"], 0, "{status}");
-    }
-
-    servers[lagging] = Some(Server::start(restart).await.unwrap());
-    let follower = servers[lagging].as_ref().unwrap();
-    ready(follower).await;
-    eventually("snapshot installation", async || {
-        diagnostics(follower, "/status").await["installed_snapshots"]
-            .as_u64()
-            .unwrap()
-            > 0
-    })
-    .await;
-    // The leader built the image only because the follower asked for one.
-    let status = diagnostics(servers[leader].as_ref().unwrap(), "/status").await;
-    assert!(
-        status["snapshot_images_built"].as_u64().unwrap() > 0,
-        "{status}"
-    );
-    put(servers[leader].as_ref().unwrap(), b"after", b"caught-up").await;
-    eventually("follower convergence", async || {
-        local(follower, b"after").await.as_deref() == Some(&b"caught-up"[..])
-    })
-    .await;
-    // Serializable reads come from the follower's own state.
-    assert_eq!(local(follower, b"before").await.unwrap(), b"stopped");
-    for i in 0..256 {
-        let key = format!("lag/{i}");
-        let found = local(follower, key.as_bytes()).await;
-        assert_eq!(
-            found.as_deref(),
-            Some(value(i).as_bytes()),
-            "follower lost {key}"
-        );
-    }
-    for server in servers.iter().flatten() {
-        assert_eq!(get(server, b"lag/255").await, value(255).as_bytes());
-    }
-    for server in servers.into_iter().flatten() {
-        server.shutdown().await.unwrap();
-    }
-}
-
 /// A host that sets the retention directly gets the flag rules: zero disables automatic
 /// compaction in both modes, and a negative revision count fails before storage is created.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn embedded_auto_compaction_retention_is_validated() {
     use slatedb_etcd::compactor::Retention;
     let dir = tempfile::tempdir().unwrap();
-    let mut config = ServerConfig::single_node(dir.path().join("negative"));
+    let mut config = common::single_node(dir.path().join("negative"));
     config.auto_compaction = Some(Retention::Revision(-2));
     assert!(Server::start(config.clone()).await.is_err());
     assert!(!config.dir.exists());
@@ -626,13 +498,13 @@ async fn embedded_auto_compaction_retention_is_validated() {
         ("revision", Retention::Revision(0)),
         ("periodic", Retention::Periodic(Duration::ZERO)),
     ] {
-        let mut config = ServerConfig::single_node(dir.path().join(name));
+        let mut config = common::single_node(dir.path().join(name));
         config.auto_compaction = Some(retention);
         let server = Server::start(config).await.unwrap();
         assert_eq!(server.config().auto_compaction, None, "{name}");
         server.shutdown().await.unwrap();
     }
-    let mut config = ServerConfig::single_node(dir.path().join("kept"));
+    let mut config = common::single_node(dir.path().join("kept"));
     config.auto_compaction = Some(Retention::Revision(5));
     let server = Server::start(config).await.unwrap();
     assert_eq!(
@@ -647,7 +519,7 @@ async fn embedded_auto_compaction_retention_is_validated() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_single_member_serves_writes_after_each_start() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = ServerConfig::single_node(dir.path());
+    let mut config = common::single_node(dir.path());
     for restart in [false, true] {
         let server = Server::start(config.clone()).await.unwrap();
         server
@@ -666,7 +538,7 @@ async fn a_single_member_serves_writes_after_each_start() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unpaginated_range_above_64_mib_returns_every_row() {
     let dir = tempfile::tempdir().unwrap();
-    let server = Server::start(ServerConfig::single_node(dir.path()))
+    let server = Server::start(common::single_node(dir.path()))
         .await
         .unwrap();
     ready(&server).await;
