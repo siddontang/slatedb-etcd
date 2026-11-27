@@ -835,6 +835,11 @@ async fn flush(node: &Node, writer: &shared::DstWriter) -> Result<()> {
     dst_compact(node.writer.admin(), 4).await
 }
 
+/// Return true when member `id` has an open writer.
+fn writer_open(writers: &BTreeMap<u64, shared::DstWriter>, id: u64) -> bool {
+    writers.get(&id).is_some_and(|writer| writer.db().is_some())
+}
+
 /// The writer steps of a shared-mode schedule.
 #[derive(Clone, Copy, Debug)]
 enum WriterStep {
@@ -908,6 +913,57 @@ impl Simulation {
             }
         }
         self.drive().await;
+    }
+
+    /// Stop the writer of `leader` after a checkpoint step and before its announcement. The
+    /// member crashes when no other member is down, and a later writer finds the checkpoint
+    /// stranded. Otherwise the writer task fails, and it opens the writer again. The first pass
+    /// of its publisher checks for a stranded checkpoint at once (`Retry::new`).
+    async fn strand(
+        &mut self,
+        writers: &mut BTreeMap<u64, shared::DstWriter>,
+        leader: u64,
+        stopped: &mut Option<u64>,
+    ) {
+        if let Some(mut writer) = writers.remove(&leader) {
+            writer.close().await;
+        }
+        if stopped.is_none() && self.choose(2) == 0 {
+            self.stop(leader);
+            *stopped = Some(leader);
+            self.drive().await;
+            return;
+        }
+        self.trace.push(format!("writer {leader} abandoned"));
+        self.drive().await;
+        for step in [WriterStep::Open, WriterStep::Announce] {
+            self.writer_step(writers, leader, step).await;
+        }
+    }
+
+    /// Run an announce step on `leader` during a leader transfer. Raft drops the proposal. Then
+    /// the transfer ends, as at its timeout, and the retry sends the checkpoint again at the next
+    /// announce step. A `MsgTimeoutNow` that the leader sent can still move the lead.
+    async fn announce_in_transfer(
+        &mut self,
+        writers: &mut BTreeMap<u64, shared::DstWriter>,
+        leader: u64,
+    ) {
+        let target = (1..=self.members).find(|id| *id != leader && self.nodes.contains_key(id));
+        if let Some(target) = target {
+            let node = self.nodes.get_mut(&leader).unwrap();
+            node.raw.transfer_leader(target);
+            self.trace.push(format!("transfer {leader} {target}"));
+        }
+        self.writer_step(writers, leader, WriterStep::Announce)
+            .await;
+        if let Some(node) = self.nodes.get_mut(&leader) {
+            node.raw.raft.abort_leader_transfer();
+        }
+        if self.leader() == Some(leader) {
+            self.writer_step(writers, leader, WriterStep::Announce)
+                .await;
+        }
     }
 
     /// Read the keys on a member's published view, as a serializable Range does. A ReadIndex read
@@ -998,7 +1054,7 @@ impl Simulation {
                 sim.drop_clients().await;
             }
             let leader = sim.leader();
-            match sim.choose(34) {
+            match sim.choose(35) {
                 0..=10 => {
                     for _ in 0..4 {
                         sim.deliver(true).await;
@@ -1040,11 +1096,27 @@ impl Simulation {
                             3 => WriterStep::Announce,
                             _ => WriterStep::Retain,
                         };
-                        let open = writers
-                            .get(&leader)
-                            .is_some_and(|writer: &shared::DstWriter| writer.db().is_some());
+                        let open = writer_open(&writers, leader);
                         let step = if open { step } else { WriterStep::Open };
                         sim.writer_step(&mut writers, leader, step).await;
+                    }
+                }
+                34 => {
+                    // A publication that does not finish: its checkpoint strands, or a leader
+                    // transfer drops its announcement.
+                    if let Some(leader) = leader {
+                        if !writer_open(&writers, leader) {
+                            sim.writer_step(&mut writers, leader, WriterStep::Open)
+                                .await;
+                        }
+                        for step in [WriterStep::Materialize, WriterStep::Checkpoint] {
+                            sim.writer_step(&mut writers, leader, step).await;
+                        }
+                        if sim.choose(2) == 0 {
+                            sim.strand(&mut writers, leader, &mut stopped).await;
+                        } else {
+                            sim.announce_in_transfer(&mut writers, leader).await;
+                        }
                     }
                 }
                 21 => {
@@ -1164,9 +1236,7 @@ impl Simulation {
                     WriterStep::Checkpoint,
                     WriterStep::Announce,
                 ] {
-                    let open = writers
-                        .get(&leader)
-                        .is_some_and(|writer: &shared::DstWriter| writer.db().is_some());
+                    let open = writer_open(&writers, leader);
                     if matches!(step, WriterStep::Open) == open {
                         continue;
                     }
