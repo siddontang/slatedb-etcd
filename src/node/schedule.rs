@@ -96,7 +96,7 @@ impl Node {
     /// the log. A new member stored no entry, and it needs a record that holds it.
     ///
     /// The hold ends when `base` is more than two `snapshot_every` intervals above the `record`
-    /// index, so it delays a truncation by at most one interval. A follower that stays a few
+    /// index. A follower near `base` can then still get a snapshot. A follower that stays a few
     /// entries behind a moving base then cannot hold the log for ever.
     fn follower_needs_log(&self, base: u64, record: u64) -> bool {
         let raft = &self.raw.raft;

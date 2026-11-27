@@ -110,8 +110,10 @@ L0 table. Delaying truncation keeps more log; it never removes entries early.
 State recovers to its last synced flush. A restart can replay up to the larger of the two
 thresholds: by default 10,000 entries or 64 MiB of log, plus the entries applied after them.
 Membership changes and peer snapshot requests do not wait for the byte threshold.
-The leader does not truncate while a follower is below its base index by at most
-`--snapshot-every` entries. That follower then catches up from the log, not with a snapshot.
+An automatic truncation on the leader waits while a follower is below its base index by at most
+`--snapshot-every` entries. That follower then catches up from the log, not with a snapshot. The
+wait ends when the base is more than two `--snapshot-every` intervals above the last record, so a
+follower near the base can still get a snapshot. A membership checkpoint does not wait.
 These flags do not bound process RSS, SlateDB, state scans, or snapshot buffers.
 A memtable flush caches the SST index, filters, and current-row blocks; reads cache the rest.
 Compaction reads ahead 2 x 512 KiB per input SST. Each compaction job runs at most two
