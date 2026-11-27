@@ -32,7 +32,10 @@ use serde::{Deserialize, Serialize};
 /// The etcd API version this service advertises to clients.
 pub const ETCD_API_VERSION: &str = "3.6.5";
 
-pub(crate) const STORAGE_FORMAT: u32 = 3;
+/// The format of the Raft log and the data directory.
+///
+/// Format 4 names the variant of each JSON Raft command.
+pub(crate) const STORAGE_FORMAT: u32 = 4;
 
 /// The format of native snapshots and backups that this binary writes.
 ///
@@ -81,8 +84,10 @@ pub struct Command {
     pub request: Request,
 }
 
+/// A replicated command. The JSON form names the variant, so a command that this binary does not
+/// know, an unknown field, or a field with a wrong type does not decode. See `command`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(untagged)]
+#[serde(deny_unknown_fields)]
 pub enum RaftCommand {
     Diagnostic(Command),
     Cluster {
@@ -121,8 +126,6 @@ pub enum RaftCommand {
     },
     /// The shared-mode leader announces a durable checkpoint of the shared state. Members open
     /// it as their next base. It changes no etcd state.
-    ///
-    /// The enum is untagged, so this variant must precede `CompactStep`, which matches any `id`.
     ViewCheckpoint {
         id: String,
         checkpoint: String,
@@ -133,9 +136,6 @@ pub enum RaftCommand {
     /// A leader proposes this entry at the start of each term. A state without the
     /// `etcd/members` row stores `members`, so every member stores the same row. A state with
     /// the row keeps it, and compares it with `digest`. See `state::cluster`.
-    ///
-    /// The enum is untagged, so this variant must precede `CompactStep`, which matches any `id`.
-    /// The JSON names its id `members_id`, so it does not decode as a `CompactStep`.
     SeedMembers(cluster::Seed),
     /// The leader proposes bounded physical compaction work after a Compact entry.
     CompactStep {

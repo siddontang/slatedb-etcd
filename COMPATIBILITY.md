@@ -94,7 +94,7 @@ Independent physical host failures, physical power loss, and rolling binary upgr
 untested.
 
 Native backup and backend Hash formats differ from etcd bbolt.
-Storage format 3 requires fresh directories and object prefixes.
+Storage format 4 requires fresh directories and object prefixes.
 Old backups and logs are unsupported.
 Native backups use format 4.
 Format 4 rows keep a Put value only in the current and history rows.

@@ -126,7 +126,8 @@ Use native backups and a new cluster if storage must move.
 
 ## Binary changes
 
-Storage format 3 uses protobuf KV commands, MVCC history, and Watch journals.
+Storage format 4 uses protobuf KV commands, tagged JSON commands, MVCC history, and Watch
+journals.
 The Raft identity and native snapshot header require this format.
 Use fresh data directories and object prefixes for this version.
 Old directories and old native backups are not upgrade inputs. There is no format migration.
