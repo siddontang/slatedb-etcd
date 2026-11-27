@@ -241,8 +241,8 @@ does not poll (SlateDB `db_reader.rs:53-75`).
 - **Apply reads:** apply evaluates each entry against the view at `applied`. This covers point
   reads, lease revoke scans, Auth scans, and compaction step scans. The group overlay
   (`mvcc.rs:943-965`) stays on top for writes inside one group.
-- **Background planner:** the compaction planner reads the live `Db` today
-  (`state/compaction.rs:190-252`). It must read a view pinned when the plan starts.
+- **Background planner:** the compaction planner reads a view that `plan_compaction` pins
+  when the plan starts (`state/compaction.rs:379-383`). Apply continues meanwhile.
 - **Caches:** all readers of a member share one SlateDB `DbCache`, so a base switch keeps cached
   blocks. A member has no local disk cache.
 
@@ -364,19 +364,24 @@ cluster with no leader therefore keep their checkpoints.
 `--view-retention` selects the deletion. The default, `off`, deletes no checkpoint, so storage
 grows until a manual cleanup. `fenced` enables the rules below.
 
-- Every 50 ticks (5 s), each member sends every checkpoint that a live view still pins to the
-  leader. The report, `ViewAck`, is an HTTP POST to the peer route `/raft/view-ack`. It does not
-  use the Raft stream. A long read or Watch scan on an old view therefore keeps its checkpoint.
+- Every 50 ticks (5 s), each member reports the checkpoints that it pins: each checkpoint under
+  a live view, and the checkpoint of its Raft snapshot record. A follower sends the report,
+  `ViewAck`, as an HTTP POST to the peer route `/raft/view-ack`. It does not use the Raft stream.
+  The leader records its own report in memory. A long read or Watch scan on an old view
+  therefore keeps its checkpoint.
+- A new report of a member replaces its previous report. The leader keeps only the latest report
+  of each member. If a member reports X and then only Y, the next pass can delete X, also within
+  10 minutes of the report of X.
 - `--view-pin-max` (default 5 minutes) is a storage deadline of each read attempt, not a limit
   of the view. After it, the attempt fails with a retryable error, and a Watch stream resumes
   from its last delivered revision on a new view. A scan over its row budget keeps the same
   view, with its base and segments, while it waits to run again. The next attempt starts a new
   deadline. A native backup has no deadline. See [Backups](#backups).
 - After each announcement, the publisher keeps the two newest checkpoints, each checkpoint at or
-  above the oldest one that a live view of the leader pins, and each checkpoint that a member
-  reported in the last 10 minutes. It deletes the rest. A new writer deletes nothing for 10 s
-  after its open, so each member can report twice.
-- A member that has not reported for 10 minutes loses this protection. It can then hit a missing
+  above the oldest one that a live view of the leader pins, and each checkpoint in the latest
+  report of a member when that report is less than 10 minutes old. It deletes the rest. A new
+  writer deletes nothing for 10 s after its open, so each member can report twice.
+- A member whose latest report is 10 minutes old loses this protection. It can then hit a missing
   SST and [rebase](#rebase).
 - Before each deletion, the publisher reads the manifest and checks that it still holds the
   writer epoch. A deposed leader can still race this check (invariant 2). Its worst result is a
@@ -792,23 +797,31 @@ All members must run the same binary version. Mixed binary versions are not supp
 
 ## Restart
 
-1. Open the newest `view-` checkpoint that holds `etcd/members`. Skip a checkpoint that is gone.
-   If none exists and `bootstrap.json` exists, stop with an error. The local Raft snapshot
-   record changes this choice only when its index is above the row of that checkpoint and it
-   names another checkpoint. Such a record has certified coverage. The member opens the record
-   checkpoint by its ID, because a Defragment can add a newer one at the same row. It loads the
-   state at `F` and starts at the record index with the record term. This runs before the log
-   check, because the log starts after the record index.
-   If retention deleted that checkpoint, the member takes the newest checkpoint whose own row,
-   read from the checkpoint, is between the record row and the record index. No entry in that
-   range changed state, so that checkpoint holds the same state. A record without a row, or no
-   such checkpoint, stops the start with an error that says how to recover. Each search skips
-   a checkpoint only when it is gone: deleted, its manifest or an SST missing, or deleted now
-   by retention. Any other error stops the start.
-2. [Install](#install) the base. If the local log ends below `F` or its term at `F` differs,
-   this is an adopt. Otherwise it is a local rebuild with nothing to replay yet.
-3. Replay committed log entries above `F` into the overlay. This is the current replay path with
-   the overlay as its target.
+Restart first selects a checkpoint and then recovers the index.
+
+1. **Newest checkpoint.** Open the newest `view-` checkpoint that holds `etcd/members`. Skip a
+   checkpoint that is gone. A joining member with an empty log does not use it. It starts from
+   an empty base and waits for Raft: entries from index 1 or a snapshot. Any other member stops
+   with an error when no checkpoint exists and `bootstrap.json` exists.
+2. **Record checkpoint.** The local Raft snapshot record counts only when its index is above the
+   row of that checkpoint. Such a record has certified coverage.
+   - If the record names the same checkpoint, the member keeps it.
+   - If the record names another checkpoint, the member opens the record checkpoint by its ID,
+     because a Defragment can add a newer one at the same row. If retention deleted it, the
+     member takes the newest checkpoint whose own row, read from the checkpoint, is between the
+     record row and the record index. No entry in that range changed state, so that checkpoint
+     holds the same state. A record without a row, or no such checkpoint, stops the start with
+     an error that says how to recover.
+
+   Each search skips a checkpoint only when it is gone: deleted, its manifest or an SST missing,
+   or deleted now by retention. Any other error stops the start.
+3. **Index.** Load the state at the checkpoint row `F`. With a record from step 2, raise the
+   base index, the applied index, and the term to the record index and term (`extend_base`).
+   This runs before the log check, because the log starts after the record index.
+4. [Install](#install) the base. If the local log ends below the base index or its term there
+   differs, this is an adopt. Otherwise it is a local rebuild with nothing to replay yet.
+5. Replay committed log entries above the base index into the overlay. This is the current
+   replay path with the overlay as its target.
 
 ## Operations
 

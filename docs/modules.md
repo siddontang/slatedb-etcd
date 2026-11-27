@@ -38,7 +38,7 @@ The table gives the responsibility of each module. A module is not always the ow
 | `node/watch` | Publish applied views and Watch event batches to local streams |
 | `node/apply` | Apply committed entries in order and group ordinary puts |
 | `node/proposal` | Group consecutive leader Put proposals within one event turn |
-| `node/quorum_put` | Prepare exact Put results after quorum commit. `EarlyPuts` holds the replies |
+| `node/quorum_put` | Evaluate Puts before commit. Reply after commit in the term (`EarlyPuts`) |
 | `state/key_index` | Keep revision metadata for every current key in memory |
 | `node/read` | Confirm Safe ReadIndex and reject obsolete proofs |
 | `node/read/executor` | Run bounded reads on immutable applied views |

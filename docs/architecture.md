@@ -425,10 +425,12 @@ Quota accounting includes each successful request before it checks the next requ
 The storage write includes all mutations and the last covered apply marker at one SlateDB sequence.
 The owner publishes the read view after the storage write. Most replies also wait for that write.
 
-A leader can prepare ordinary Put results when Raft commits an entry above its local persisted
-index. Raft counts the leader only after its sync completes. In a three-voter cluster, both other
-voters must therefore persist the entry. A stream receipt, a learner, or a duplicate reply
-cannot supply a missing vote. Raft applies its current-term and membership rules.
+A leader can evaluate ordinary Puts before Raft commits them, while their log write runs. The
+reply waits until Raft commits the group in the same term, with the member still the leader.
+Raft counts the leader only after its sync completes. So in a three-voter cluster, a commit above
+the local persisted index needs both other voters to persist the entry. A stream receipt, a
+learner, or a duplicate reply cannot supply a missing vote. Raft applies its current-term and
+membership rules.
 
 The worker evaluates one contiguous group against the applied state and earlier puts in the group.
 The group must contain a pending client request. Each entry must belong to the current term.
@@ -537,7 +539,9 @@ The worker updates the counter only after the overlay accepts the atomic batch.
 Quota reads cost O(1). The key index supplies old current-row lengths without a read.
 Other changed logical keys with unknown lengths cost one point read each.
 Each state batch stores the counter in `meta/logical-size`. Startup and install read it.
-They scan the N logical records once only when the counter does not match the apply marker.
+They scan the N logical records once when the row is absent, when its index is not the apply
+marker, or when it has no count per row kind. A build with debug assertions also scans after a
+matching counter and compares the two. A release build uses a matching, complete counter.
 Snapshot replacement uses the same batch path.
 Snapshot import accepts only the current format, version 4.
 Each member caches immutable SST data in two weighted Moka caches. Each has 64 MiB by default.
