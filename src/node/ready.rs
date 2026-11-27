@@ -65,11 +65,9 @@ impl Node {
             let reads = ready.take_read_states();
             let number = ready.number();
             // Apply only entries that Raft has delivered, even if disk commit is ahead.
-            self.committed_ready = self
-                .committed_ready
-                .max(ready.snapshot().get_metadata().index);
+            self.apply.deliver(ready.snapshot().get_metadata().index);
             if let Some(entry) = ready.take_committed_entries().last() {
-                self.committed_ready = self.committed_ready.max(entry.index);
+                self.apply.deliver(entry.index);
             }
             // Cached entries must be readable before Raft can advance without disk completion.
             self.raw.advance_append_async(ready);

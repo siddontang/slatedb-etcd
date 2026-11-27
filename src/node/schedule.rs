@@ -1,4 +1,5 @@
 use super::*;
+pub(super) mod scheduler;
 
 impl Node {
     pub(super) fn enqueue_query(&mut self, query: Query) {
@@ -6,41 +7,12 @@ impl Node {
             self.reads.queue(query, self.raw.raft.leader_id);
             return;
         }
-        if self.queries.len() >= apply::MAX_QUERIES {
-            query.reject(self.error("too many queued state reads"));
-        } else {
-            self.queries.push_back(query);
-        }
-    }
-
-    pub(super) fn next_query_job(&mut self) -> Option<Job> {
-        self.queries.pop_front().map(Job::Query)
+        self.apply.queue_query(query, self.raw.raft.leader_id);
     }
 
     pub(super) fn submit_apply(&mut self, job: Job, target: u64) -> Result<()> {
-        ensure!(!self.apply_busy, "apply worker already has a job");
-        self.enqueue_apply(job, target)
-    }
-
-    /// Queue a job behind any running jobs. The worker runs jobs in submission order.
-    fn enqueue_apply(&mut self, job: Job, target: u64) -> Result<()> {
-        // Only a plain committed-entry job lets another Entries job queue behind it.
-        // A configuration change must reach Raft before the worker applies later entries.
-        let chainable = match &job {
-            Job::Entries(entries) => entries
-                .iter()
-                .all(|entry| entry.entry_type == EntryType::EntryNormal as i32),
-            _ => false,
-        };
-        self.worker.submit(Work {
-            job,
-            header: self.header(),
-            delay: Duration::from_millis(self.apply_delay_ms),
-        })?;
-        self.apply_busy = true;
-        self.apply_target = target;
-        self.apply_jobs.push_back((target, chainable));
-        Ok(())
+        let header = self.header();
+        self.apply.submit(&self.worker, job, target, header)
     }
 
     /// The checkpoint to start, if one is due.
@@ -115,29 +87,19 @@ impl Node {
             Some(apply::BATCH_BYTES),
             raft::GetEntriesContext::empty(false),
         )?;
-        let target = entries.last().context("empty apply batch")?.index;
-        ensure!(
-            target <= self.committed_ready,
-            "apply exceeds delivered commit"
-        );
-        self.prefer_query = true;
-        self.enqueue_apply(Job::Entries(entries), target)
+        let header = self.header();
+        self.apply.submit_entries(&self.worker, entries, header)
     }
 
     /// Keep the worker busy with committed entries while it runs earlier Entries jobs.
     /// Any other work waits until the queue drains, so it still sees the state it expects.
     fn pipeline_apply(&mut self) -> Result<()> {
-        while self.apply_jobs.len() < apply::PIPELINE_DEPTH {
-            let Some(&(last, true)) = self.apply_jobs.back() else {
-                return Ok(());
-            };
-            let committed = self.committed_ready;
-            if last >= committed
-                || self.apply_paused()
+        while let Some((last, committed)) = self.apply.chainable() {
+            if self.apply_paused()
                 || self.raw.store().snapshot_pending()
                 || self.installing()
                 || self.early_puts.active()
-                || !self.queries.is_empty()
+                || self.apply.has_queries()
                 || (!self.checkpoints.running() && self.checkpoint_due().is_some())
             {
                 return Ok(());
@@ -169,7 +131,7 @@ impl Node {
 
     pub(super) fn schedule_apply(&mut self) -> Result<()> {
         self.preempt_paused_apply();
-        if self.apply_busy {
+        if self.apply.busy() {
             return self.pipeline_apply();
         }
         // Raft can hold an accepted snapshot as unstable while the log queue is full, and the log
@@ -202,7 +164,7 @@ impl Node {
         }
         // Raft delivers committed entries only after local persistence. The commit marker in the
         // log is volatile, so apply need not wait for the log thread to write it.
-        let committed = self.committed_ready;
+        let committed = self.apply.committed();
         let released = self.release_held_puts();
         if self.early_puts.active() {
             if let Some(batch) = self.early_puts.take_due(committed) {
@@ -221,11 +183,8 @@ impl Node {
                 return self.start_checkpoint(image);
             }
         }
-        if self.prefer_query {
-            if let Some(job) = self.next_query_job() {
-                self.prefer_query = false;
-                return self.submit_apply(job, self.state.applied);
-            }
+        if let Some(job) = self.apply.take_preferred_query() {
+            return self.submit_apply(job, self.state.applied);
         }
         let paused = self.apply_paused();
         if self.state.applied < committed && !paused {
@@ -238,32 +197,14 @@ impl Node {
         if !paused && self.prepare_quorum_puts()? {
             return Ok(());
         }
-        if let Some(job) = self.next_query_job() {
+        if let Some(job) = self.apply.next_query() {
             return self.submit_apply(job, self.state.applied);
         }
         Ok(())
     }
 
     pub(super) fn complete_apply(&mut self, completed: Completion) -> Result<()> {
-        ensure!(self.apply_busy, "unexpected apply completion");
-        let (target, _) = self
-            .apply_jobs
-            .pop_front()
-            .context("unexpected apply completion")?;
-        // A covering snapshot can end a job at its applied prefix. See `preempt_paused_apply`.
-        ensure!(
-            completed.applied == target || completed.early && completed.applied < target,
-            "apply completion has the wrong index"
-        );
-        ensure!(
-            completed.applied >= self.state.applied,
-            "apply position regressed"
-        );
-        ensure!(
-            completed.applied <= self.committed_ready.max(self.state.applied),
-            "apply completion exceeds delivered commit"
-        );
-        self.apply_busy = !self.apply_jobs.is_empty();
+        self.apply.complete(&completed, self.state.applied)?;
         self.expire_reads();
         // A job that a snapshot ended during a rebase replay sends only its prefix boundary. The
         // snapshot replaces the state. See `apply_retrying`.

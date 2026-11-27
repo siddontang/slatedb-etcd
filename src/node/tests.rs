@@ -69,9 +69,9 @@ async fn queued_state_reads_are_bounded_and_complete_without_raft_writes() {
     let (tx, rx) = oneshot::channel();
     node.enqueue_query(Query::Local("overflow".into(), tx));
     assert!(rx.await.unwrap().unwrap_err().error.contains("too many"));
-    assert_eq!(node.queries.len(), apply::MAX_QUERIES);
+    assert_eq!(node.apply.queued(), apply::MAX_QUERIES);
     node.drive_ready().await.unwrap();
-    assert!(node.apply_busy);
+    assert!(node.apply.busy());
     node.drain_apply().await.unwrap();
     for reply in replies {
         let value = reply.await.unwrap().unwrap();
@@ -238,11 +238,11 @@ async fn committed_backlog_defers_new_proposals_before_log_growth() {
     ));
     assert_eq!(node.raw.store().last_index().unwrap(), last);
     assert_eq!(node.state.applied, 0);
-    assert!(node.apply_busy);
+    assert!(node.apply.busy());
     let (tx, mut read) = oneshot::channel();
     node.enqueue_query(Query::Local("absent".into(), tx));
     // The query does not jump the batches already queued, and no new batch passes it.
-    let queued = node.apply_jobs.back().unwrap().0;
+    let queued = node.apply.targets().last().unwrap();
     let value = loop {
         let completed = node
             .worker
@@ -373,7 +373,7 @@ async fn received_snapshot_fences_an_older_batch_and_later_entries() {
         .unwrap();
     node.drive_ready().await.unwrap();
     assert_eq!(
-        node.apply_jobs.iter().map(|job| job.0).collect::<Vec<_>>(),
+        node.apply.targets().collect::<Vec<_>>(),
         [apply::APPLY_ENTRIES, seeded]
     );
     let mut state = StateMachine::open_test(source.path()).await.unwrap();
@@ -413,7 +413,7 @@ async fn received_snapshot_fences_an_older_batch_and_later_entries() {
         assert_eq!(node.state.applied, target);
         node.drive_ready().await.unwrap();
     }
-    assert_eq!(node.apply_target, 200);
+    assert_eq!(node.apply.target(), 200);
     let mut append = Message::default();
     append.set_msg_type(MessageType::MsgAppend);
     append.from = 2;
@@ -465,7 +465,7 @@ async fn dropping_the_node_cancels_an_active_worker() {
     let dir = tempfile::tempdir().unwrap();
     let (events, _) = mpsc::channel(256);
     let mut node = Node::open(options(dir.path()), events).await.unwrap();
-    node.apply_delay_ms = 5000;
+    node.apply.set_delay(5000);
     node.submit_apply(Job::Snapshot(Snapshot::default()), 0)
         .unwrap();
     let task = node.worker.abort_handle();
@@ -1115,7 +1115,7 @@ async fn read_index_waits_for_apply_and_rejects_late_results_after_term_change()
     node.drain_log().await.unwrap();
     confirm_read(&mut node, &id).await;
     assert!(reply.try_recv().is_err());
-    assert!(node.queries.is_empty(), "read passed the apply barrier");
+    assert!(!node.apply.has_queries(), "read passed the apply barrier");
     let completed = node.worker.step().await.unwrap().unwrap();
     node.complete_apply(completed).unwrap();
     node.drive_ready().await.unwrap();
@@ -1341,7 +1341,7 @@ async fn apply_waits_for_raft_delivery_when_durable_commit_is_ahead() {
     assert_eq!(node.raw.store().commit_index(), 8);
     node.schedule_apply().unwrap();
     assert!(
-        !node.apply_busy,
+        !node.apply.busy(),
         "disk commit alone must not schedule apply"
     );
     node.drive_ready().await.unwrap();
@@ -1447,9 +1447,10 @@ async fn a_full_log_queue_cannot_let_apply_pass_the_ready_cursor() {
         node.log.queue(log::Job::Stats, None, None, vec![], vec![]);
     }
     node.drive_ready().await.unwrap();
-    assert_eq!(node.committed_ready, 1);
+    assert_eq!(node.apply.committed(), 1);
     assert_eq!(
-        node.apply_target, 1,
+        node.apply.target(),
+        1,
         "apply passed the bounded Ready delivery"
     );
     let completed = node.worker.step().await.unwrap().unwrap();
@@ -1575,7 +1576,7 @@ async fn independent_reads_pin_their_view_and_do_not_wait_for_apply() {
         .await
         .unwrap();
     node.drive_ready().await.unwrap();
-    assert!(node.apply_busy);
+    assert!(node.apply.busy());
     let (tx, reply) = oneshot::channel();
     node.enqueue_query(Query::Read(range_request(), None, ClientResponse::Kv(tx)));
     node.drive_ready().await.unwrap();
@@ -1583,7 +1584,7 @@ async fn independent_reads_pin_their_view_and_do_not_wait_for_apply() {
     node.complete_read(read).unwrap();
     assert!(reply.await.unwrap().unwrap().into_outcome().result.is_ok());
     assert_eq!(node.state.applied, 0);
-    assert!(node.apply_busy);
+    assert!(node.apply.busy());
 
     let (tx, reply) = oneshot::channel();
     node.enqueue_query(Query::Read(range_request(), None, ClientResponse::Kv(tx)));
@@ -1621,7 +1622,7 @@ async fn independent_read_jobs_and_queue_have_separate_bounds() {
     let (tx, rx) = oneshot::channel();
     node.enqueue_query(Query::Read(range_request(), None, ClientResponse::Kv(tx)));
     assert!(rx.await.unwrap().is_err());
-    assert!(!node.apply_busy);
+    assert!(!node.apply.busy());
     node.drain_reads().await.unwrap();
     for rx in replies {
         assert!(rx.await.unwrap().unwrap().into_outcome().result.is_ok());
@@ -1933,7 +1934,7 @@ async fn committed_batches_queue_behind_running_apply_in_log_order() {
     node.drive_ready().await.unwrap();
     // Raft delivers all committed entries. The worker gets consecutive batches up to the
     // job that holds the configuration change, without a completion between them.
-    let targets: Vec<_> = node.apply_jobs.iter().map(|(target, _)| *target).collect();
+    let targets: Vec<_> = node.apply.targets().collect();
     assert_eq!(
         targets,
         [
@@ -1947,7 +1948,7 @@ async fn committed_batches_queue_behind_running_apply_in_log_order() {
     let (tx, query) = oneshot::channel();
     node.enqueue_query(Query::Local("absent".into(), tx));
     node.drive_ready().await.unwrap();
-    assert_eq!(node.apply_jobs.len(), 3);
+    assert_eq!(node.apply.targets().count(), 3);
     for target in targets {
         let completed = node.worker.step().await.unwrap().unwrap();
         node.complete_apply(completed).unwrap();
@@ -1963,7 +1964,7 @@ async fn committed_batches_queue_behind_running_apply_in_log_order() {
     node.drive_ready().await.unwrap();
     node.drain_apply().await.unwrap();
     assert_eq!(node.state.applied, total);
-    assert!(node.apply_jobs.is_empty() && !node.apply_busy);
+    assert!(node.apply.targets().next().is_none() && !node.apply.busy());
 }
 
 fn seed_puts(dir: &std::path::Path, count: u64) {

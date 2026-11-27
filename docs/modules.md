@@ -19,10 +19,10 @@ The table gives the responsibility of each module. A module is not always the ow
 - Some modules own a type with private fields, and the other modules call its methods:
   `Writer` in `node/shared/writer`, `EarlyPuts` in `node/quorum_put`, `Checkpointer` in
   `node/checkpoint`, `ReadIndexTable` in `node/read/table`, `LeaseClock` in `node/lease/clock`,
-  `PeerLinks` in `node/links`, `LogPipeline` in `node/ready/pipeline`,
-  `Group` in `node/proposal`, `Publisher` in `node/forwarding` and `node/watch`, the log `Worker`
-  in `node/log`, `KeyIndex` in `state/key_index`, `Overlay` in `state/overlay`, and `RowCache` in
-  `state/rows`.
+  `PeerLinks` in `node/links`, `LogPipeline` in `node/ready/pipeline`, `ApplyScheduler` in
+  `node/schedule/scheduler`, `Group` in `node/proposal`, `Publisher` in `node/forwarding` and
+  `node/watch`, the log `Worker` in `node/log`, `KeyIndex` in `state/key_index`, `Overlay` in
+  `state/overlay`, and `RowCache` in `state/rows`.
 
 | Module | Responsibility |
 | --- | --- |
@@ -39,6 +39,7 @@ The table gives the responsibility of each module. A module is not always the ow
 | `node/links` | Keep the queue, sender task, meter, and health of each outgoing peer link |
 | `node/log` and `node/cache` | Isolate disk work and bound retained log memory |
 | `node/schedule` | Dispatch state work and publish completed apply positions |
+| `node/schedule/scheduler` | Keep the apply jobs in order, the delivered commit, and state reads |
 | `node/checkpoint` | Decide when a checkpoint starts, and keep manual checkpoint requests |
 | `node/watch` | Publish applied views and Watch event batches to local streams |
 | `node/apply` | Apply committed entries in order and group ordinary puts |
