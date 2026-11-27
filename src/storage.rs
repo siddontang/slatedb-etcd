@@ -389,25 +389,9 @@ impl RaftStorage {
         Ok(())
     }
 
-    /// Publish the replacement snapshot and truncate its covered log in one synced batch. An image
-    /// at the index of the current record replaces it.
-    pub fn checkpoint(&mut self, index: u64, data: Vec<u8>) -> Result<()> {
-        self.checkpoint_with_conf(
-            index,
-            data,
-            self.snapshot.get_metadata().get_conf_state().clone(),
-        )
-    }
-
-    pub fn checkpoint_with_conf(
-        &mut self,
-        index: u64,
-        data: Vec<u8>,
-        conf: ConfState,
-    ) -> Result<()> {
-        let prepared = PreparedCheckpoint::write(&self.dir, data.into())?;
-        let replace = self.snapshot_index() > 0 && index == self.snapshot_index();
-        self.publish_checkpoint(index, Some(prepared), conf, replace)
+    /// Write `data` as a checkpoint image that `publish_checkpoint` can publish.
+    pub(crate) fn prepare_checkpoint(&self, data: Vec<u8>) -> Result<PreparedCheckpoint> {
+        PreparedCheckpoint::write(&self.dir, data.into())
     }
 
     pub fn member(&self) -> u64 {
@@ -636,6 +620,15 @@ mod checkpoint_tests {
         snapshot
     }
 
+    /// Publish `data` at `index`. With `attach`, it replaces the record at the same index.
+    fn publish(store: &mut RaftStorage, index: u64, data: Vec<u8>, attach: bool) {
+        let conf = store.snapshot.get_metadata().get_conf_state().clone();
+        let prepared = store.prepare_checkpoint(data).unwrap();
+        store
+            .publish_checkpoint(index, Some(prepared), conf, attach)
+            .unwrap();
+    }
+
     fn bounds(store: &RaftStorage) -> (u64, u64, u64) {
         (
             store.first_index().unwrap(),
@@ -718,7 +711,7 @@ mod checkpoint_tests {
         };
         store.persist(&entries, Some(&hs), None).unwrap();
         let first = foreign_image(3, "first");
-        store.checkpoint(3, first.clone()).unwrap();
+        publish(&mut store, 3, first.clone(), false);
         // Model a stop after the replacement file exists but before its reference is saved.
         let snapshot = store.snapshot.clone();
         let staged = PreparedCheckpoint::write(root.path(), foreign_image(3, "lost").into())
@@ -731,7 +724,7 @@ mod checkpoint_tests {
         assert!(!checkpoint::path(root.path(), staged).exists());
         // A completed replacement uses a new file and then removes the old one.
         let second = foreign_image(3, "second");
-        store.checkpoint(3, second.clone()).unwrap();
+        publish(&mut store, 3, second.clone(), true);
         assert!(!checkpoint::path(root.path(), checkpoint::FileId::first(3)).exists());
         drop(store);
         let store = RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
