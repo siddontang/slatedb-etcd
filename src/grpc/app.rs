@@ -18,7 +18,7 @@ use tonic::codegen::BoxFuture;
 
 use super::Servers;
 use crate::metrics::{ObservedBody, RpcObserver, WatchMeters};
-use crate::tls::VerifiedUser;
+use crate::tls::{ConnectionService, VerifiedUser};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -93,9 +93,13 @@ impl App {
             user: None,
         }
     }
+}
+
+impl ConnectionService for App {
+    type Body = AppBody;
 
     /// The service for one TLS connection whose client certificate names `user`.
-    pub(crate) fn with_user(mut self, user: VerifiedUser) -> Self {
+    fn with_user(mut self, user: VerifiedUser) -> Self {
         self.user = Some(user);
         self
     }

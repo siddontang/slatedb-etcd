@@ -2076,6 +2076,7 @@ async fn state_behind_a_truncated_log_stops_startup() {
             5,
             None,
             raft::eraftpb::ConfState::from((vec![1, 2, 3], vec![])),
+            false,
         )
         .unwrap();
     drop(storage);
