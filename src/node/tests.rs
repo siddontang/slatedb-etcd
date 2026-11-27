@@ -2012,7 +2012,7 @@ async fn automatic_checkpoints_wait_for_appended_log_bytes() {
     assert_eq!(node.state.applied, 100);
     // Small writes keep the log until enough bytes justify a synced SlateDB flush.
     assert_eq!(node.raw.store().snapshot_index(), 0);
-    assert!(!node.checkpoint_running);
+    assert!(!node.checkpoints.running());
 }
 
 /// A Checkpoint job fails on a storage read. The node goes on and keeps its Raft snapshot
@@ -2026,9 +2026,9 @@ async fn a_failed_checkpoint_read_keeps_the_node_and_its_record() {
     assert!(index > record);
     // A membership change makes a checkpoint at `index` due.
     node.state.view.0 = index;
-    node.membership_checkpoint = index;
+    node.checkpoints.membership_changed(index);
     assert_eq!(node.checkpoint_due(), Some(false));
-    node.checkpoint_running = true;
+    node.checkpoints.start(false);
     let conf = node.state.members.conf();
     let failed = apply::Built {
         index,
@@ -2040,17 +2040,17 @@ async fn a_failed_checkpoint_read_keeps_the_node_and_its_record() {
     };
     node.finish_output(Output::Checkpoint(Some(failed)))
         .unwrap();
-    assert!(!node.checkpoint_running);
+    assert!(!node.checkpoints.running());
     // The next checkpoint waits, so apply can run other jobs meanwhile.
     assert_eq!(node.checkpoint_due(), None);
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
-    assert!(!node.checkpoint_running);
+    assert!(!node.checkpoints.running());
     assert_eq!(node.raw.store().snapshot_index(), record);
     // The wait ends, and the next checkpoint succeeds.
-    node.checkpoint_retry_at = None;
+    node.checkpoints.end_retry_wait();
     assert_eq!(node.checkpoint_due(), Some(false));
-    node.checkpoint_running = true;
+    node.checkpoints.start(false);
     let image = PreparedCheckpoint::write(&dir.path().join("raft"), b"image".to_vec().into());
     let built = apply::Built {
         index,
@@ -2061,7 +2061,7 @@ async fn a_failed_checkpoint_read_keeps_the_node_and_its_record() {
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
     assert_eq!(node.raw.store().snapshot_index(), index);
-    assert!(!node.checkpoint_running);
+    assert!(!node.checkpoints.running());
 }
 
 #[tokio::test]

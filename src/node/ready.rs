@@ -15,7 +15,7 @@ impl Node {
             && self.log_bytes < log::MAX_BYTES
             && self.log_snapshot_bytes < log::MAX_SNAPSHOT_BYTES
         {
-            if let Some((index, conf, image)) = self.built_checkpoint.take() {
+            if let Some((index, conf, image)) = self.checkpoints.take_built() {
                 self.queue_log(
                     log::Job::Checkpoint { index, conf, image },
                     None,
@@ -61,12 +61,7 @@ impl Node {
             self.raw
                 .mut_store()
                 .stage(ready.entries(), hs.as_ref(), snapshot.as_ref())?;
-            self.appended_bytes = ready
-                .entries()
-                .iter()
-                .fold(self.appended_bytes, |total, entry| {
-                    total.saturating_add(entry.data.len() as u64)
-                });
+            self.checkpoints.appended(ready.entries());
             let job = log::Job::Ready {
                 entries: ready.take_entries(),
                 hs,
@@ -227,7 +222,8 @@ impl Node {
         self.log_busy = false;
         let saved = completed.durable.snapshot.get_metadata().index;
         if saved > self.raw.store().snapshot_index() {
-            self.next_checkpoint = self.options.next_checkpoint(saved);
+            self.checkpoints
+                .set_next(self.options.next_checkpoint(saved));
         }
         self.raw.mut_store().complete(completed.durable)?;
         if let Some(stats) = completed.stats {
@@ -253,7 +249,7 @@ impl Node {
             self.raw.on_persist_ready(number);
         }
         if let Some(index) = task.checkpoint {
-            self.checkpoint_running = false;
+            self.checkpoints.stored();
             self.state.durable_applied = self.state.durable_applied.max(index);
         }
         self.confirm_reads(task.reads);

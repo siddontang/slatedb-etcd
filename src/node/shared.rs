@@ -1135,12 +1135,7 @@ impl Node {
         );
         // A follower repeats the request of a waiting manual checkpoint.
         if !leader && ticks.is_multiple_of(RETRY_TICKS) {
-            if let Some(index) = self
-                .checkpoint_waiters
-                .iter()
-                .map(|(index, _)| *index)
-                .max()
-            {
+            if let Some(index) = self.checkpoints.highest_waiter() {
                 self.send_view_ack(Some(index));
             }
         }

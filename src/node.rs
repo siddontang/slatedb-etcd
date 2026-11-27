@@ -17,6 +17,7 @@ use crate::{ApiError, Command, RaftCommand, Request};
 
 mod apply;
 mod auto_compaction;
+mod checkpoint;
 /// ReadIndex reads that may wait in the Raft owner's table. One quorum round confirms
 /// every read in a batch, so a larger table lets one round cover more clients.
 pub(crate) const MAX_PENDING_READS: usize = 256;
@@ -255,8 +256,6 @@ struct LogTask {
 pub(crate) const TICK: Duration = Duration::from_millis(100);
 /// A client write fails if it waits longer than this before proposal, or after it.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-/// The wait after a failed checkpoint before the next one starts.
-const CHECKPOINT_RETRY: Duration = Duration::from_secs(1);
 /// Raft's uncommitted byte limit. Writers wait at half of it; see `Node::backlog`.
 const MAX_UNCOMMITTED_BYTES: usize = 2 * log::MAX_BYTES;
 
@@ -274,7 +273,6 @@ pub struct Node {
     events: mpsc::Sender<Event>,
     manual_transport: bool,
     peer_health: BTreeMap<u64, Instant>,
-    membership_checkpoint: u64,
     raw: RawNode<log::Cache>,
     log_worker: log::Worker,
     log_queue: VecDeque<LogTask>,
@@ -287,7 +285,6 @@ pub struct Node {
     log_read_delay_ms: u64,
     log_read_fail: bool,
     peer_waiters: Vec<Response>,
-    built_checkpoint: Option<(u64, raft::eraftpb::ConfState, Option<PreparedCheckpoint>)>,
     read_executor: read::executor::Executor,
     read_queries: VecDeque<Query>,
     reads: BTreeMap<u64, read::PendingRead>,
@@ -322,23 +319,13 @@ pub struct Node {
     installed_snapshots: u64,
     recovered_from_index: u64,
     send_failures: Vec<(u64, bool)>,
-    checkpoint_running: bool,
-    // The time before which no checkpoint starts after a failed one.
-    checkpoint_retry_at: Option<Instant>,
-    // The appended log bytes that the running checkpoint took. A failed one gives them back.
-    checkpoint_bytes: u64,
+    /// The checkpoint schedule and the manual checkpoint requests. See `checkpoint`.
+    checkpoints: checkpoint::Checkpointer,
     // Full backlog checks by cause: apply lag, queued log jobs, queued log bytes,
     // uncommitted Raft bytes, unapplied log bytes.
     backlog_rejects: [u64; 5],
     // `REQUEST_TIMEOUT`. Tests that are slow by design raise it.
     request_timeout: Duration,
-    // Log bytes appended since the last checkpoint started.
-    appended_bytes: u64,
-    // Count full images started for peers or manual checkpoints.
-    snapshot_images: u64,
-    next_checkpoint: Option<u64>,
-    checkpoint_waiters: Vec<(u64, Response)>,
-    snapshot_delay_ms: u64,
     lease_term: u64,
     lease_deadlines: BTreeMap<i64, (u64, Instant)>,
     lease_expiring: BTreeSet<(i64, u64)>,
@@ -627,7 +614,6 @@ impl Node {
             events,
             manual_transport: manual_apply,
             peer_health: BTreeMap::new(),
-            membership_checkpoint: 0,
             raw,
             log_worker,
             log_queue: VecDeque::new(),
@@ -640,7 +626,6 @@ impl Node {
             log_read_delay_ms: 0,
             log_read_fail: false,
             peer_waiters: vec![],
-            built_checkpoint: None,
             read_executor: read::executor::Executor::new(manual_apply),
             read_queries: VecDeque::new(),
             reads: BTreeMap::new(),
@@ -671,16 +656,9 @@ impl Node {
             installed_snapshots: 0,
             recovered_from_index,
             send_failures: vec![],
-            checkpoint_running: false,
-            checkpoint_retry_at: None,
-            checkpoint_bytes: 0,
+            checkpoints: checkpoint::Checkpointer::new(next_checkpoint),
             backlog_rejects: [0; 5],
             request_timeout: REQUEST_TIMEOUT,
-            appended_bytes: 0,
-            snapshot_images: 0,
-            next_checkpoint,
-            checkpoint_waiters: vec![],
-            snapshot_delay_ms: 0,
             lease_term: 0,
             lease_deadlines: BTreeMap::new(),
             lease_expiring: BTreeSet::new(),
@@ -1193,7 +1171,7 @@ impl Node {
                 let _ = response.send(Ok(self.status()?));
             }
             Event::Checkpoint(response) => {
-                if self.checkpoint_waiters.len() >= apply::MAX_QUERIES {
+                if self.checkpoints.waiting() >= apply::MAX_QUERIES {
                     let _ = response.send(Err(self.error("too many checkpoint requests")));
                 } else {
                     let committed = self.raw.raft.raft_log.committed;
@@ -1204,7 +1182,7 @@ impl Node {
                     } else {
                         self.send_view_ack(Some(committed));
                     }
-                    self.checkpoint_waiters.push((committed, response));
+                    self.checkpoints.wait(committed, response);
                     self.schedule_apply()?;
                 }
             }
@@ -1242,7 +1220,7 @@ impl Node {
                 reply,
             } => self.write_probed(member, nonce, reply),
             Event::SnapshotDelay(delay_ms, response) => {
-                self.snapshot_delay_ms = delay_ms.min(5000);
+                self.checkpoints.set_delay(delay_ms.min(5000));
                 let _ = response.send(Ok(self.status()?));
             }
             Event::ApplyDelay(delay_ms, response) => {
@@ -1506,7 +1484,7 @@ impl Node {
     }
 
     fn start_checkpoint(&mut self, image: bool) -> Result<()> {
-        if self.checkpoint_running || self.apply_busy || self.early_puts.active() {
+        if self.checkpoints.running() || self.apply_busy || self.early_puts.active() {
             return Ok(());
         }
         // A record built at a base below the record could not replace it. See `certify_base`.
@@ -1522,43 +1500,31 @@ impl Node {
         }
         self.submit_apply(
             Job::Checkpoint {
-                delay: Duration::from_millis(self.snapshot_delay_ms),
+                delay: self.checkpoints.delay(),
                 dir: self.options.dir.join("raft"),
             },
             self.state.applied,
         )?;
-        self.checkpoint_running = true;
-        self.checkpoint_bytes = std::mem::take(&mut self.appended_bytes);
-        if image {
-            self.snapshot_images += 1;
-        }
+        self.checkpoints.start(image);
         Ok(())
     }
 
     fn checkpoint_built(&mut self, built: apply::Built) -> Result<()> {
-        ensure!(
-            self.built_checkpoint.is_none(),
-            "overlapping checkpoint results"
-        );
         let image = match built.result {
             Ok(image) => image,
             // A storage error fails only this checkpoint. The record stays, and the next
-            // checkpoint starts after `CHECKPOINT_RETRY`. Apply runs other jobs meanwhile.
+            // checkpoint starts after a wait. Apply runs other jobs meanwhile.
             Err(error) if crate::storage_fault::classify(&error).is_some() => {
+                self.checkpoints.failed()?;
                 tracing::warn!(
                     error = format!("{error:#}"),
                     "a checkpoint failed; retry later"
                 );
-                self.checkpoint_running = false;
-                self.checkpoint_retry_at = Some(Instant::now() + CHECKPOINT_RETRY);
-                // The bytes count again, so an automatic checkpoint stays due after the wait.
-                self.appended_bytes = self.appended_bytes.saturating_add(self.checkpoint_bytes);
                 return Ok(());
             }
             Err(error) => return Err(error),
         };
-        self.built_checkpoint = Some((built.index, built.conf, image));
-        Ok(())
+        self.checkpoints.built(built.index, built.conf, image)
     }
 
     /// Return true while a peer receives an image. Truncation would discard that image.
@@ -1574,7 +1540,7 @@ impl Node {
         let mut waiting = vec![];
         let leader = self.raw.raft.state == StateRole::Leader;
         let applied = self.state.applied;
-        for (index, response) in std::mem::take(&mut self.checkpoint_waiters) {
+        for (index, response) in self.checkpoints.take_waiters() {
             if response.is_closed() {
                 continue;
             }
@@ -1593,8 +1559,8 @@ impl Node {
                 waiting.push((index, response));
             }
         }
-        self.checkpoint_waiters = waiting;
-        if !self.checkpoint_waiters.is_empty() {
+        self.checkpoints.requeue(waiting);
+        if self.checkpoints.waiting() > 0 {
             self.schedule_apply()?;
         }
         Ok(())
@@ -1646,8 +1612,8 @@ impl Node {
             "sync_writes": self.raw.store().durable.sync_writes, "pending": self.pending.len(),
             "blocked_peers": self.blocked, "installed_snapshots": self.installed_snapshots,
             "recovered_from_index": self.recovered_from_index,
-            "checkpoint_running": self.checkpoint_running,
-            "snapshot_delay_ms": self.snapshot_delay_ms,
+            "checkpoint_running": self.checkpoints.running(),
+            "snapshot_delay_ms": self.checkpoints.delay().as_millis() as u64,
             "apply_busy": self.apply_busy, "apply_target": self.apply_target,
             "apply_lag": self.raw.store().commit_index().saturating_sub(self.state.applied),
             "queued_state_reads": self.queries.len(), "apply_delay_ms": self.apply_delay_ms,
@@ -1690,7 +1656,7 @@ impl Node {
         });
         status["snapshot_has_image"] = self.raw.store().has_image().into();
         status["snapshot_image_wanted"] = self.raw.store().image_wanted().into();
-        status["snapshot_images_built"] = self.snapshot_images.into();
+        status["snapshot_images_built"] = self.checkpoints.images().into();
         status["backlog_full_checks"] = json!({
             "apply_lag": self.backlog_rejects[0],
             "log_jobs": self.backlog_rejects[1],
