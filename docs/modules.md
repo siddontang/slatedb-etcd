@@ -43,7 +43,7 @@ The table gives the responsibility of each module. A module is not always the ow
 | `node/read` | Confirm Safe ReadIndex and reject obsolete proofs |
 | `node/read/executor` | Run bounded reads on immutable applied views |
 | `node/lease` | Schedule leader lease expiry from replicated generations |
-| `state/quota` | Count the logical size of a batch and check it against the cluster quota |
+| `state/quota` | Track the logical usage. KV, Put, and Lease apply compare it to the quota |
 | `node/cluster` | Propose the term-start entries, publish client URLs, and serve member requests |
 | `state/cluster` | Seed, change, and check the membership row |
 | `state` | Open storage and own mutable applied metadata |
@@ -65,7 +65,7 @@ The table gives the responsibility of each module. A module is not always the ow
 | `batch` | Hold the rows of one state write |
 | `error` and `storage_fault` | Define the request error and classify storage errors |
 | `storage`, `peer`, `tls`, and `object` | Bind durable logs, transport, security, and objects |
-| `object/cluster_claim` | Bind a member to the shared namespace and write the cluster claim |
+| `object/cluster_claim` | Create and check the cluster claim, `shared/owner.json` |
 | `peer/receive` | Bound incoming Raft work and return ordered processing receipts |
 
 Domain modules extend the same StateMachine. They do not add independent mutable state owners.
