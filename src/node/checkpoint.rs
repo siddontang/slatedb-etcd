@@ -106,7 +106,7 @@ impl Checkpointer {
         &self,
         applied: u64,
         record: u64,
-        has_image: bool,
+        image_can_advance: bool,
         image_wanted: bool,
         min_bytes: u64,
         held: bool,
@@ -115,8 +115,6 @@ impl Checkpointer {
         if self.retry_at.is_some_and(|at| Instant::now() < at) {
             return None;
         }
-        // A peer snapshot or a manual checkpoint needs a complete image.
-        let image_can_advance = applied > record || (record > 0 && !has_image);
         let image_due = image_can_advance
             && (image_wanted || self.waiters.iter().any(|(index, _)| *index <= applied));
         // Automatic checkpoints only truncate the local log. A membership change needs a

@@ -63,10 +63,14 @@ impl Node {
         // Only the automatic checkpoint waits for a lagging follower.
         let held = self.checkpoints.automatic_due(applied, min_bytes)
             && self.follower_needs_log(applied, snapshot_index);
+        // A peer snapshot or a manual checkpoint needs a complete image. `has_image` decodes the
+        // record, so it runs only when the base does not already advance it.
+        let image_can_advance =
+            applied > snapshot_index || (snapshot_index > 0 && !store.has_image());
         let due = self.checkpoints.due(
             applied,
             snapshot_index,
-            store.has_image(),
+            image_can_advance,
             store.image_wanted(),
             min_bytes,
             held,
