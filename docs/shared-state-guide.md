@@ -164,12 +164,12 @@ clocks synchronized with NTP, also on the host of a snapshot restore. See
   writes, or more when S3 is slow.
 - The leader rejects client proposals while the overlay is above `--overlay-max-bytes`. Apply
   waits above twice that limit. Raft still persists and acknowledges entries.
-- The leader also holds the memtable of the writer. Expect about two times the unflushed data on
-  the leader.
-- A read view keeps its base for at most `--view-pin-max`. A longer read fails with a retryable
-  error. A native backup is exempt. It ends when its client takes no message for 60 s.
-- Native backups keep the overlay segments of their views after a base switch. These count
-  against `--overlay-max-bytes`, and at most 4 backups stream on a member.
+- `--view-pin-max` is a storage deadline of each read attempt. A read that runs again keeps
+  its view. A native backup has no deadline. It ends when its client takes no message for 60 s.
+- Reads and backups keep the overlay segments of their views after a base switch. Reads have no
+  byte limit on these. Over `--overlay-max-bytes`, the oldest of at most 4 backups is stopped.
+- The leader also holds the writer memtable, and SlateDB limits it. See the
+  [memory bound per member](shared-state.md#overlay) for each term.
 
 ## Operations
 
