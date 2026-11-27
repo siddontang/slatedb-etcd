@@ -214,7 +214,7 @@ impl Simulation {
         ] {
             let open = writers
                 .get(&leader)
-                .is_some_and(|writer| writer.db.is_some());
+                .is_some_and(|writer| writer.db().is_some());
             if matches!(step, WriterStep::Open) && open {
                 continue;
             }

@@ -245,6 +245,10 @@ pub(crate) struct Source {
     /// Tests: each writer open fails with the error of this function.
     #[cfg(test)]
     pub(crate) fail_writers: Mutex<Option<fn() -> anyhow::Error>>,
+    /// DST: the compactor of a writer runs only on request, so GC removes the same SSTs on
+    /// every replay.
+    #[cfg(test)]
+    pub(crate) manual_compaction: std::sync::atomic::AtomicBool,
 }
 
 /// The checkpoints that this member uses, and the ones that retention deletes.
@@ -472,11 +476,7 @@ impl Source {
 
     /// Open the writable shared database. Opening it fences an older writer.
     pub async fn open_writer(&self) -> Result<Db> {
-        self.open_writer_with(slatedb_settings()).await
-    }
-
-    pub async fn open_writer_with(&self, settings: Settings) -> Result<Db> {
-        self.build_writer(settings, None).await
+        self.build_writer(slatedb_settings(), None).await
     }
 
     /// Open the writer of a leader with `clock` as its SlateDB clock. See
@@ -500,6 +500,19 @@ impl Source {
         #[cfg(test)]
         if let Some(error) = *self.fail_writers.lock().unwrap() {
             return Err(error());
+        }
+        #[cfg(test)]
+        let mut settings = settings;
+        #[cfg(test)]
+        if self
+            .manual_compaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Some(compactor) = settings.compactor_options.as_mut() {
+                compactor
+                    .scheduler_options
+                    .insert("min_compaction_sources".into(), "1000000".into());
+            }
         }
         let mut builder = Db::builder(self.state(), self.store.clone())
             .with_db_cache(self.cache.clone(), 0)
@@ -827,6 +840,8 @@ pub(crate) fn offline_source(
         fail_writer: Default::default(),
         #[cfg(test)]
         fail_writers: Default::default(),
+        #[cfg(test)]
+        manual_compaction: Default::default(),
     }))
 }
 
@@ -1333,6 +1348,8 @@ impl StateMachine {
             fail_writer: Default::default(),
             #[cfg(test)]
             fail_writers: Default::default(),
+            #[cfg(test)]
+            manual_compaction: Default::default(),
         });
         ensure!(
             state_root == source.state(),

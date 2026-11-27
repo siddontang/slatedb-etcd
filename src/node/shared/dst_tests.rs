@@ -417,16 +417,16 @@ async fn a_follower_manual_checkpoint_completes_with_a_certified_base() {
     sim.lead(grouped).await;
     sim.writer_step(&mut writers, grouped, WriterStep::Open)
         .await;
-    let writer = &writers[&grouped];
-    assert_eq!(writer.written, j);
+    let written = sim.nodes[&grouped].writer.progress().written();
+    assert_eq!(written, j);
     let queue = sim.nodes[&grouped].worker.state().shared_handles().queue;
-    assert!(queue.after(writer.written, 1).is_empty());
+    assert!(queue.after(written, 1).is_empty());
     // The idle materializer waits for the next batch. The timer goes first, so a busy future
     // cannot starve it.
     use std::future::Future;
-    let progress = std::sync::Arc::new(shared::Progress::new(writer.written));
+    let progress = std::sync::Arc::new(shared::Progress::new(written));
     let mut materializer = Box::pin(shared::materialize(
-        writer.db.as_ref().unwrap().clone(),
+        writers[&grouped].db().unwrap(),
         queue,
         progress,
         shared::Gate::unchecked(),
@@ -604,7 +604,7 @@ async fn a_member_restarts_at_a_record_above_its_checkpoint_row() {
     sim.stop(member);
     sim.writer_step(&mut writers, leader, WriterStep::Open)
         .await;
-    let db = writers[&leader].db.clone().unwrap();
+    let db = writers[&leader].db().unwrap();
     assert_eq!(db.manifest().last_l0_seq(), b);
     let options = slatedb::config::CheckpointOptions {
         name: Some(crate::state::shared::view_name(b)),
@@ -807,7 +807,7 @@ async fn a_restart_on_another_checkpoint_sends_that_checkpoint() {
     let row = record.row.unwrap();
     assert!(row < record.index);
     // Y has the same row, and retention deletes X.
-    let db = writers[&leader].db.clone().unwrap();
+    let db = writers[&leader].db().unwrap();
     let options = slatedb::config::CheckpointOptions {
         name: Some(crate::state::shared::view_name(row)),
         ..Default::default()
@@ -1561,7 +1561,7 @@ async fn a_paused_member_checks_the_opened_base_against_its_commit() {
     sim.settle(2).await;
     let (older_row, older, _) = sim.base(leader);
     assert!(older_row > sim.nodes[&member].state.applied);
-    let db = writers[&leader].db.clone().unwrap();
+    let db = writers[&leader].db().unwrap();
     sim.write(2).await;
     sim.writer_step(&mut writers, leader, WriterStep::Materialize)
         .await;
@@ -1613,7 +1613,7 @@ async fn a_paused_member_adopts_a_checkpoint_named_at_its_base_with_a_newer_row(
     let mut writers = BTreeMap::new();
     sim.publish_view(&mut writers).await;
     sim.settle(4).await;
-    let db = writers[&leader].db.clone().unwrap();
+    let db = writers[&leader].db().unwrap();
     let name = db.manifest().last_l0_seq();
     let base = sim.base(member).0;
     assert_eq!(base, name);
@@ -1749,4 +1749,45 @@ async fn a_failed_automatic_checkpoint_keeps_its_byte_trigger() {
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
     assert_eq!(node.raw.store().snapshot_index(), base);
+}
+
+/// #106: DST runs the stranded check and the retry of `publish`. A crash between a checkpoint
+/// and its announcement strands the checkpoint, and the next writer announces it. The writer
+/// sends it again until applied state shows it.
+#[tokio::test]
+async fn a_new_writer_announces_a_stranded_checkpoint_until_it_applies() {
+    let mut sim = Simulation::new(41).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(3).await;
+    let leader = sim.leader().unwrap();
+    let mut writers = BTreeMap::new();
+    for step in [
+        WriterStep::Open,
+        WriterStep::Materialize,
+        WriterStep::Checkpoint,
+    ] {
+        sim.writer_step(&mut writers, leader, step).await;
+    }
+    writers.remove(&leader).unwrap().close().await;
+    let admin = sim.nodes[&leader].writer.admin().clone();
+    let views = crate::state::shared::view_checkpoints(&admin).await;
+    let stranded = views.unwrap().last().unwrap().1.id;
+    let announced = sim.announcements().len();
+    // The entry of the first announce step does not commit before the second one.
+    for step in [WriterStep::Open, WriterStep::Announce, WriterStep::Announce] {
+        sim.writer_step(&mut writers, leader, step).await;
+    }
+    sim.settle(4).await;
+    let sent: Vec<_> = sim.announcements()[announced..]
+        .iter()
+        .map(|(_, id, _)| *id)
+        .collect();
+    assert_eq!(sent, [stranded, stranded]);
+    assert_eq!(sim.base(leader).1, Some(stranded));
+    // Applied state shows the checkpoint, so the retry ends.
+    sim.writer_step(&mut writers, leader, WriterStep::Announce)
+        .await;
+    sim.settle(4).await;
+    assert_eq!(sim.announcements().len(), announced + 2);
 }
