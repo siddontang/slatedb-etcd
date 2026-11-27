@@ -1645,3 +1645,46 @@ async fn a_paused_member_adopts_a_checkpoint_named_at_its_base_with_a_newer_row(
     sim.settle(1).await;
     assert_eq!(sim.base(member).1, Some(id));
 }
+
+/// #103: a paused member whose base is the newest checkpoint polls again and again. Each poll
+/// must read only the manifests of the list, and must not open the older checkpoints.
+#[tokio::test]
+async fn an_idle_poll_does_not_reopen_older_checkpoints() {
+    let mut sim = Simulation::new(29).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    let mut writers = BTreeMap::new();
+    for _ in 0..12 {
+        sim.write(1).await;
+        sim.publish_view(&mut writers).await;
+        sim.settle(2).await;
+    }
+    let member = sim.follower(0);
+    sim.write(3).await;
+    sim.pause(member);
+    let store = sim.shared.clone();
+    let manifest_count = || {
+        store
+            .read
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.ends_with(".manifest"))
+            .count()
+    };
+    store.read.lock().unwrap().clear();
+    let admin = sim.nodes[&member].writer.admin().clone();
+    let views = crate::state::shared::view_checkpoints(&admin)
+        .await
+        .unwrap();
+    let list_only = manifest_count();
+    let current = sim.base(member).1;
+    assert!(views.len() >= 12 && list_only > 0);
+    assert_eq!(current, Some(views.last().unwrap().1.id));
+    for _ in 0..2 {
+        store.read.lock().unwrap().clear();
+        sim.poll(member).await;
+        assert_eq!(manifest_count(), list_only);
+        assert_eq!(sim.base(member).1, current);
+    }
+}
