@@ -103,7 +103,8 @@ A scan over budget runs again alone on the same pinned view and with the same de
 Historical reads, sorted or filtered Ranges, and read-only transactions also run alone.
 While one of these reads runs or waits, no new scan starts. Wide reads start in queue order.
 Current point reads can pass queued scans and keep at least one task.
-Each job has a five-second deadline.
+A point-read job has a five-second deadline and a wide-read job has a 60-second deadline.
+A linearizable read must start in the read executor within five seconds after the owner accepts it.
 Shared scans hold at most 3 x (4 MiB + one row) of decoded rows. The exclusive read keeps the old
 single-read bound: its result size, up to the logical data size. The two cases never overlap.
 These bounds limit tasks, retained views, and scan rows, not encoded response bytes.
