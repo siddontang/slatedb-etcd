@@ -1859,8 +1859,8 @@ async fn a_follower_a_few_entries_behind_the_base_catches_up_from_the_log() {
 }
 
 /// #109: a follower stays a few entries behind a moving base, because its append responses
-/// come late. The leader must still truncate. The hold delays a truncation by at most one
-/// `snapshot_every` interval.
+/// come late. The leader must still truncate. The hold ends when the base is more than two
+/// `snapshot_every` intervals above the last record.
 #[tokio::test]
 async fn a_follower_that_stays_behind_does_not_hold_the_log_for_ever() {
     let mut sim = Simulation::new(43).await;
