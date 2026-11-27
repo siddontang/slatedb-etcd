@@ -43,16 +43,16 @@ The table gives the responsibility of each module. A module is not always the ow
 | `node/read` | Confirm Safe ReadIndex and reject obsolete proofs |
 | `node/read/executor` | Run bounded reads on immutable applied views |
 | `node/lease` | Schedule leader lease expiry from replicated generations |
-| `state/quota` | Check the logical size against the quota of the cluster claim |
+| `state/quota` | Track the logical usage. KV, Put, and Lease apply compare it to the quota |
 | `node/cluster` | Propose the term-start entries, publish client URLs, and serve member requests |
 | `state/cluster` | Seed, change, and check the membership row |
 | `state` | Open storage and own mutable applied metadata |
-| `state/kv` and `state/put_batch` | Commit MVCC changes and maintain quota accounting |
+| `state/kv` and `state/put_batch` | Commit MVCC changes |
 | `state/read` | Pin data, revision, Auth, and Lease metadata together |
 | `state/source` | Define the read interface that apply, read views, and Watch catch-up share |
 | `state/view` | Read a shared base and its overlay |
 | `state/overlay` | Keep the batches above the base for views and the materializer |
-| `state/shared` | Claim the shared state, open, switch, adopt, and rebase checkpoint bases |
+| `state/shared` | Open the claimed shared state, and switch, adopt, and rebase checkpoint bases |
 | `node/shared` | Run the materializer and publisher with fence and clock checks |
 | `node/shared/writer` | Own the writer task state, the apply pause, base switches, and proofs |
 | `status` | Read the Raft snapshot record of a stopped member for `shared-status` |
@@ -61,7 +61,11 @@ The table gives the responsibility of each module. A module is not always the ow
 | `state/maintenance` | Execute hashes, alarms, and physical storage work |
 | `state/diagnostic` | Execute the separate diagnostic keyspace API |
 | `mvcc` and `watch` | Define revision, transaction, history, and event semantics |
+| `mvcc/hash` | Encode the HashKV rows that Put writes |
+| `batch` | Hold the rows of one state write |
+| `error` and `storage_fault` | Define the request error and classify storage errors |
 | `storage`, `peer`, `tls`, and `object` | Bind durable logs, transport, security, and objects |
+| `object/cluster_claim` | Create and check the cluster claim, `shared/owner.json` |
 | `peer/receive` | Bound incoming Raft work and return ordered processing receipts |
 
 Domain modules extend the same StateMachine. They do not add independent mutable state owners.
