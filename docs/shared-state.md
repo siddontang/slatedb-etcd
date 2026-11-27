@@ -470,19 +470,30 @@ setup, one read pass then ran at about 9,500 ops/s in both modes.
 
 ## Rebase
 
-A member rebases when its overlay is over the limit, or when a read or apply step finds a
-missing SST. Today a storage error in apply stops the node (`node/apply.rs:507-670`). In shared
-mode a missing SST rebases the member instead. Every other storage error still stops the node.
+A member rebases when an apply read finds a missing SST. See [Read faults](#read-faults). A
+storage error in apply does not stop the node, with one exception: the read of the base
+membership for a Raft snapshot record. A paused member over the overlay limit adopts an opened
+base instead of a rebase. See step 4 of the memory limit in [Overlay](#overlay).
 
-1. Stop apply and fail pending local reads with a retryable error.
-2. Open the newest `view-` checkpoint `C`.
-3. [Install](#install) `C`: a local rebuild if `F(C) <= applied`, otherwise an adopt.
-4. Resume apply above the new `applied`.
+1. Keep the entries that the job applied, with their replies. Publish no view until the rebase
+   ends.
+2. Open the newest `view-` checkpoint `C` with `F(C)` from the base index to `applied`. Skip a
+   checkpoint that is gone.
+3. [Install](#install) `C` as a local rebuild, and replay the local log to `applied`.
+4. Apply the rest of the job again.
 
 A rebase rescans the live data. It is the cost of losing a base, not of a leader change. The
 log can start above the newest checkpoint row. If no newer checkpoint reaches the base index,
 the rebase opens the current base again at its base index, with the log term there. If the base
 checkpoint is gone, it takes a checkpoint in the same range as a restart does.
+
+The base index never goes down (invariant 6). So a rebase does not use a checkpoint below the
+base index, also when the base is gone and only an older checkpoint is left. A rebase does not
+adopt a checkpoint above `applied` either. When no checkpoint is in the range, the rebase fails
+with a missing object and changes nothing. A missing object or corrupt data in a rebase holds
+apply on the next entry, as for an install. A held follower asks its leader for a snapshot, and
+the install of that snapshot adopts a base above the held entry. A transient error runs the
+rebase again after the backoff.
 
 ## Log truncation and Raft snapshots
 

@@ -699,8 +699,8 @@ pub(crate) async fn retain(
 
 /// Open the newest `view-` checkpoint at or below index `limit` that holds the membership.
 ///
-/// A checkpoint that retention deleted after the listing is skipped. An older base can then need
-/// log entries that the member truncated, and the replay of the rebase fails on them.
+/// A checkpoint that retention deleted after the listing is skipped. The rebase does not use a
+/// base below its base index.
 async fn newest_base_through(
     admin: &slatedb::admin::Admin,
     source: &Source,

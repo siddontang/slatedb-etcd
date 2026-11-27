@@ -76,6 +76,10 @@ impl StateMachine {
     /// The log can start above the newest checkpoint row: a member truncates through its base
     /// index. If no newer checkpoint reaches that index, the rebase opens the current base again
     /// and raises it to its index. `term` gives the Raft term at an index of the local log.
+    ///
+    /// The base index never goes down. So when the current base is gone and no checkpoint has
+    /// its row from the base index to `limit`, the rebase fails with a missing object and
+    /// changes nothing. An older checkpoint cannot serve, and a newer one needs a snapshot.
     pub(crate) async fn rebase(
         &mut self,
         limit: u64,
@@ -100,9 +104,14 @@ impl StateMachine {
                     .await
                     .map_err(mark)?
             }
-            (Some(base), _) => base,
-            (None, _) => {
-                bail!("the shared state has no view checkpoint at or below the rebase index")
+            _ => {
+                return Err(anyhow::Error::new(crate::mvcc::storage_fault::Classified {
+                    fault: crate::mvcc::storage_fault::StorageFault::Missing,
+                    message: format!(
+                        "the base is gone, and no view checkpoint has a row from the base \
+                         index {index} to the rebase index {limit}"
+                    ),
+                }))
             }
         };
         tracing::warn!(

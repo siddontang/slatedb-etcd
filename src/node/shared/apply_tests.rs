@@ -21,12 +21,27 @@ async fn a_lost_checkpoint_object_rebases_apply_above_a_truncated_row() {
     lose_a_checkpoint_object(Lose::AboveRow).await;
 }
 
-/// Retention deleted the base at row 20, and the member truncated its log through 20. A rebase
-/// skips the deleted checkpoint and takes the older one at row 10. Its replay needs entries
-/// that the log no longer has, so the job fails, and no view of the older state goes out.
+/// Retention deleted the base at row 20, and the member truncated its log through 20. Only an
+/// older checkpoint at row 10 is left. The base index never goes down, so the rebase does not
+/// take it. Apply holds, and a covering snapshot ends the job with its prefix.
 #[tokio::test]
-async fn a_rebase_onto_an_older_base_below_the_log_fails_closed() {
+async fn a_rebase_without_its_base_holds_above_an_older_checkpoint() {
     lose_a_checkpoint_object(Lose::Deleted).await;
+}
+
+/// The same, but the log still holds the entries above row 10. A replay from the older
+/// checkpoint would succeed, but it would move the base index down from 20 to 10.
+#[tokio::test]
+async fn a_rebase_never_moves_the_base_down() {
+    lose_a_checkpoint_object(Lose::DeletedInLog).await;
+}
+
+/// Retention deleted the base at row 20. The only checkpoint left has row 24, above the
+/// applied index, so no local rebuild can use it. Apply holds instead of stopping. A snapshot
+/// covers the job, and its install adopts the checkpoint at 24.
+#[tokio::test]
+async fn a_rebase_with_only_a_newer_checkpoint_holds_until_a_snapshot() {
+    lose_a_checkpoint_object(Lose::Newer).await;
 }
 
 /// A shared-mode apply read fails with a transient store error after a lease grant and a
@@ -66,6 +81,10 @@ enum Lose {
     AboveRow,
     /// The base has row 20 and is deleted. An older checkpoint has row 10.
     Deleted,
+    /// As `Deleted`, but the member keeps its log.
+    DeletedInLog,
+    /// The base has row 20 and is deleted. A newer checkpoint has row 24.
+    Newer,
     /// The base has row 20. After the lost read every read of the store fails.
     Stuck,
     /// The base has row 20. The first read of the rebase replay fails.
@@ -75,8 +94,9 @@ enum Lose {
 async fn lose_a_checkpoint_object(lose: Lose) {
     let truncated = !matches!(
         lose,
-        Lose::AtRow | Lose::Unavailable | Lose::Stuck | Lose::Replay
+        Lose::AtRow | Lose::Unavailable | Lose::Stuck | Lose::Replay | Lose::DeletedInLog
     );
+    let deleted = matches!(lose, Lose::Deleted | Lose::DeletedInLog | Lose::Newer);
     use crate::object::faults::{
         FaultStore, FAIL_SST_GET, LOSE_SST_TWICE, LOSE_SST_TWICE_THEN_FAIL,
     };
@@ -193,7 +213,7 @@ async fn lose_a_checkpoint_object(lose: Lose) {
         commit: 24,
     };
     storage.persist(&entries, Some(&hs), None).unwrap();
-    let options = crate::state::shared::Options {
+    let state_options = crate::state::shared::Options {
         quota: 0,
         voters: vec![1],
         join: false,
@@ -215,7 +235,7 @@ async fn lose_a_checkpoint_object(lose: Lose) {
             meta_bytes: 1,
             row_bytes: 0,
         },
-        &options,
+        &state_options,
     )
     .await
     .unwrap();
@@ -232,7 +252,7 @@ async fn lose_a_checkpoint_object(lose: Lose) {
     }
     // The leader writer checkpoints entry 20 with its own cache. The member switches to it.
     let handles = state.shared_handles();
-    let writer = slatedb::Db::builder(handles.source.state(), store)
+    let writer = slatedb::Db::builder(handles.source.state(), store.clone())
         .with_settings(crate::state::slatedb_settings())
         .build()
         .await
@@ -243,7 +263,7 @@ async fn lose_a_checkpoint_object(lose: Lose) {
             .write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
             .await
             .unwrap();
-        if seq == 10 && lose == Lose::Deleted {
+        if seq == 10 && matches!(lose, Lose::Deleted | Lose::DeletedInLog) {
             writer.flush().await.unwrap();
             let options = CheckpointOptions {
                 name: Some(crate::state::shared::view_name(seq)),
@@ -272,6 +292,36 @@ async fn lose_a_checkpoint_object(lose: Lose) {
     handles.opened.offer(base, 20);
     state.switch_base();
     assert_eq!(*handles.based.borrow(), 20);
+    // Another member opens the base at 20, applies the job, and the writer checkpoints 24.
+    let mut newer = None;
+    if lose == Lose::Newer {
+        let cache = crate::state::StateCache::default();
+        let mut twin =
+            StateMachine::open_shared(store.clone(), "root", "test", cache, &state_options)
+                .await
+                .unwrap();
+        assert_eq!(twin.applied, 20);
+        apply_entries(&mut twin, entries[20..].to_vec(), header)
+            .await
+            .unwrap();
+        for (seq, batch) in twin.shared_handles().queue.after(20, usize::MAX) {
+            writer
+                .write_with_options(batch.to_storage(), &WriteOptions { seqnum: seq })
+                .await
+                .unwrap();
+        }
+        writer.flush().await.unwrap();
+        let options = CheckpointOptions {
+            name: Some(crate::state::shared::view_name(24)),
+            ..Default::default()
+        };
+        let checkpoint = writer
+            .create_checkpoint(CheckpointScope::Durable, &options)
+            .await
+            .unwrap();
+        twin.close().await.unwrap();
+        newer = Some(checkpoint.id);
+    }
     if truncated {
         // The member records the base at 20 and drops the log through it.
         let data = crate::state::transfer::ViewDescriptor::new(id)
@@ -293,7 +343,7 @@ async fn lose_a_checkpoint_object(lose: Lose) {
         reported: None,
         before_replay: None,
     };
-    if lose == Lose::Deleted {
+    if deleted {
         executor.state.admin.delete_checkpoint(id).await.unwrap();
     }
     // The block cache load and its direct read both lose the object, so the job fails.
@@ -318,18 +368,28 @@ async fn lose_a_checkpoint_object(lose: Lose) {
     } else {
         faults.set(LOSE_SST_TWICE);
     }
-    // Raft accepts a snapshot that covers entry 23 once the failed rebase waits on it.
+    // Raft accepts a snapshot that covers entry 23 once the failed rebase waits on it. A
+    // deleted base can lose the read of entry 22 first. The task returns the entry that apply
+    // waited on, and whether it held there.
     let (preempt, mut paused) = control.handles();
-    let stuck = matches!(lose, Lose::Stuck | Lose::Replay);
+    let stuck = deleted || matches!(lose, Lose::Stuck | Lose::Replay);
     let covering = tokio::spawn(async move {
-        let waits = paused.wait_for(|paused| paused.as_ref().is_some_and(|p| p.index == 23));
-        if stuck
-            && tokio::time::timeout(Duration::from_secs(5), waits)
-                .await
-                .is_ok()
-        {
-            preempt.send_replace(24);
+        if !stuck {
+            return None;
         }
+        let waits = paused.wait_for(|paused| {
+            paused
+                .as_ref()
+                .is_some_and(|paused| deleted || paused.index == 23)
+        });
+        let timed = tokio::time::timeout(Duration::from_secs(5), waits).await;
+        let waited = timed
+            .ok()?
+            .ok()?
+            .as_ref()
+            .map(|paused| (paused.index, paused.held))?;
+        preempt.send_replace(24);
+        Some(waited)
     });
     let job = executor.execute(Work {
         job: Job::Entries(entries[20..].to_vec()),
@@ -339,21 +399,50 @@ async fn lose_a_checkpoint_object(lose: Lose) {
     let result = tokio::time::timeout(Duration::from_secs(10), job)
         .await
         .expect("no snapshot ended the waiting job");
-    if lose == Lose::Deleted {
-        // The engine reports the truncated prefix. `LogReader::entries` also refuses a short
-        // read.
-        assert!(older.is_some());
-        let error = format!("{:#}", result.err().unwrap());
-        assert!(
-            error.contains("Compacted") || error.contains("the log has no entries"),
-            "{error}"
-        );
+    let completion = result.unwrap();
+    let waited = covering.await.unwrap();
+    if deleted {
+        assert_eq!(older.is_some(), lose != Lose::Newer);
+        // The base did not move down to the older checkpoint.
+        assert_eq!(executor.state.base_checkpoint(), Some(id));
+        assert_eq!(executor.state.view_status().0, 20);
+        // No checkpoint was between the base index and the applied index. Apply held, so a
+        // follower asks its leader for a snapshot. The snapshot ended the job with its prefix.
+        let (index, held) = waited.expect("apply did not wait");
+        assert!(held);
+        assert!(completion.early);
+        assert_eq!(completion.applied, index - 1);
+        let Output::Entries(replies) = completion.output else {
+            panic!("expected entries");
+        };
+        let ids: Vec<_> = replies.iter().map(|reply| reply.id.clone()).collect();
+        let prefix: Vec<_> = (21..index).map(|index| index.to_string()).collect();
+        assert_eq!(ids, prefix);
+        if let Some(newer) = newer {
+            // The install adopts the newer checkpoint ahead of the applied index.
+            let mut snapshot = Snapshot::default();
+            snapshot.mut_metadata().index = 24;
+            snapshot.mut_metadata().term = 1;
+            snapshot.data = crate::state::transfer::ViewDescriptor::new(newer)
+                .encode()
+                .unwrap();
+            let installed = executor
+                .execute(Work {
+                    job: Job::Snapshot(snapshot),
+                    header,
+                    delay: Duration::ZERO,
+                })
+                .await
+                .unwrap();
+            assert!(!installed.early);
+            assert_eq!(installed.applied, 24);
+            assert_eq!(executor.state.base_checkpoint(), Some(newer));
+        }
+        assert_eq!(control.paused(), None);
         executor.state.close().await.unwrap();
         writer.close().await.unwrap();
         return;
     }
-    let completion = result.unwrap();
-    covering.abort();
     if matches!(lose, Lose::Stuck | Lose::Replay) {
         // The rebase failed and waited. The snapshot ended the job at its prefix boundary.
         assert!(completion.early);
