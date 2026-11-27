@@ -16,7 +16,7 @@ pub(crate) struct PreparedPuts {
     term: u64,
     writes: WriteBatch,
     revision: i64,
-    size: crate::batch::Usage,
+    size: crate::state::Usage,
     alarms: Vec<crate::proto::etcdserverpb::AlarmMember>,
 }
 
@@ -74,13 +74,8 @@ impl StateMachine {
                     }
                     let mut alarm_write = WriteBatch::new();
                     alarm_write.put(crate::maintenance::ALARMS, serde_json::to_vec(&alarms)?);
-                    size = alarm_write
-                        .logical_size_after(
-                            self.applied_state(),
-                            &self.key_index,
-                            Some(&batch),
-                            size,
-                        )
+                    size = self
+                        .logical_size_after(&alarm_write, Some(&batch), size)
                         .await
                         .map_err(crate::storage_fault::read_cause)?;
                     batch.extend(alarm_write);
@@ -140,13 +135,8 @@ impl StateMachine {
                             .await
                             {
                                 Ok((reply, writes, next, count)) => {
-                                    size = writes
-                                        .logical_size_after(
-                                            self.applied_state(),
-                                            &self.key_index,
-                                            Some(&batch),
-                                            size,
-                                        )
+                                    size = self
+                                        .logical_size_after(&writes, Some(&batch), size)
                                         .await
                                         .map_err(crate::storage_fault::read_cause)?;
                                     counts.merge(count);

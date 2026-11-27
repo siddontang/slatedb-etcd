@@ -517,7 +517,7 @@ async fn a_shared_backup_has_the_format_4_image() {
 }
 
 /// The applied index and the split in the counter row of `state`.
-async fn stored_counter(state: &StateMachine) -> (u64, Option<crate::batch::Usage>) {
+async fn stored_counter(state: &StateMachine) -> (u64, Option<crate::state::Usage>) {
     use prost::Message;
     let row = state
         .applied_state()

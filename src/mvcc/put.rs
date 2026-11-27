@@ -294,7 +294,7 @@ pub(crate) async fn prepare_put(
     revision: i64,
     request: &RequestOp,
     batch: &mut WriteBatch,
-    size: &mut crate::batch::Usage,
+    size: &mut crate::state::Usage,
 ) -> Result<(ResponseOp, i64), ApplyError> {
     Ok(put_once(view, revision, request, batch, size).await?)
 }
@@ -305,7 +305,7 @@ async fn put_once(
     revision: i64,
     request: &RequestOp,
     batch: &mut WriteBatch,
-    size: &mut crate::batch::Usage,
+    size: &mut crate::state::Usage,
 ) -> KvResult<(ResponseOp, i64)> {
     let Some(Op::RequestPut(p)) = &request.request else {
         return Err(KvError::invalid("expected an ordinary put"));
@@ -327,9 +327,13 @@ async fn put_once(
         values_in_history: true,
     }
     .encode_to_vec();
-    batch
-        .put_counted(crate::watch::key(next).into(), journal.into(), None, size)
-        .map_err(KvError::invariant)?;
+    put_counted(
+        batch,
+        crate::watch::key(next).into(),
+        journal.into(),
+        None,
+        size,
+    )?;
     put_revision_row(view, revision, batch, size).await?;
     Ok((response(Resp::ResponsePut(reply)), next))
 }
@@ -369,7 +373,7 @@ pub(crate) async fn prepare_txn_puts(
     request: &RequestOp,
     leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
     batch: &mut WriteBatch,
-    size: &mut crate::batch::Usage,
+    size: &mut crate::state::Usage,
     counts: &mut crate::metrics::Writes,
 ) -> Result<Option<(ResponseOp, i64)>, ApplyError> {
     let prepared = txn_puts_once(
@@ -394,7 +398,7 @@ async fn txn_puts_once(
     request: &RequestOp,
     leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
     batch: &mut WriteBatch,
-    size: &mut crate::batch::Usage,
+    size: &mut crate::state::Usage,
     counts: &mut crate::metrics::Writes,
 ) -> KvResult<Option<(ResponseOp, i64)>> {
     validate(request)?;
@@ -445,9 +449,13 @@ async fn txn_puts_once(
         values_in_history,
     }
     .encode_to_vec();
-    batch
-        .put_counted(crate::watch::key(next).into(), journal.into(), None, size)
-        .map_err(KvError::invariant)?;
+    put_counted(
+        batch,
+        crate::watch::key(next).into(),
+        journal.into(),
+        None,
+        size,
+    )?;
     put_revision_row(view, revision, batch, size).await?;
     #[cfg(test)]
     DIRECT_TXNS.with(|count| count.set(count.get() + 1));
@@ -512,7 +520,7 @@ async fn put_rows(
     values_in_history: bool,
     p: &PutRequest,
     batch: &mut WriteBatch,
-    size: &mut crate::batch::Usage,
+    size: &mut crate::state::Usage,
 ) -> KvResult<(PutResponse, EventRow, i64)> {
     let key = current_key(&p.key);
     // An earlier put in this batch may have replaced the applied row.
@@ -576,9 +584,7 @@ async fn put_rows(
         (history_key(&p.key, next).into(), history, None),
     ];
     for (key, value, old_len) in rows {
-        batch
-            .put_counted(key, value, old_len, size)
-            .map_err(KvError::invariant)?;
+        put_counted(batch, key, value, old_len, size)?;
     }
     Ok((
         PutResponse {
@@ -600,7 +606,7 @@ async fn put_revision_row(
     view: &CurrentView<'_, impl StateRead>,
     revision: i64,
     batch: &mut WriteBatch,
-    size: &mut crate::batch::Usage,
+    size: &mut crate::state::Usage,
 ) -> KvResult<()> {
     if revision != 1 {
         return Ok(());
@@ -615,14 +621,27 @@ async fn put_revision_row(
             .map_err(KvError::storage)?
             .map(|v| v.len()),
     };
-    batch
-        .put_counted(
-            bytes::Bytes::from_static(REVISION),
-            (revision + 1).to_be_bytes().to_vec().into(),
-            old_len,
-            size,
-        )
-        .map_err(KvError::invariant)
+    put_counted(
+        batch,
+        bytes::Bytes::from_static(REVISION),
+        (revision + 1).to_be_bytes().to_vec().into(),
+        old_len,
+        size,
+    )
+}
+
+/// Put a row whose old length is known. Update the logical size before the next put in `batch`.
+fn put_counted(
+    batch: &mut WriteBatch,
+    key: bytes::Bytes,
+    value: bytes::Bytes,
+    old_len: Option<usize>,
+    size: &mut crate::state::Usage,
+) -> KvResult<()> {
+    size.replace_row(&key, old_len, Some(value.len()))
+        .map_err(KvError::invariant)?;
+    batch.put_known(key, value, old_len);
+    Ok(())
 }
 
 #[cfg(test)]

@@ -337,7 +337,7 @@ async fn a_membership_change_reads_its_row_once() {
     let dir = tempfile::tempdir().unwrap();
     let mut state = StateMachine::open_test(dir.path()).await.unwrap();
     state.apply_cluster(1, &voter(7), &admin).await.unwrap();
-    let reads = || crate::batch::SIZE_READS.with(std::cell::Cell::get);
+    let reads = || crate::state::quota::SIZE_READS.with(std::cell::Cell::get);
     let before = reads();
     let outcome = state.apply_cluster(2, &voter(8), &admin).await.unwrap();
     outcome.result.unwrap();

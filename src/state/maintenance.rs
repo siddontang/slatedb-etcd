@@ -14,7 +14,7 @@ impl StateMachine {
     }
 
     /// Logical bytes by row kind.
-    pub fn logical_usage(&self) -> crate::batch::Usage {
+    pub fn logical_usage(&self) -> crate::state::Usage {
         self.logical_bytes
     }
 
@@ -297,9 +297,9 @@ async fn hash_rows<R: StateRead>(
 }
 
 // Rebuild derived quota accounting by row kind when opening stored state.
-pub(crate) async fn count_logical_usage(db: &impl StateRead) -> Result<crate::batch::Usage> {
+pub(crate) async fn count_logical_usage(db: &impl StateRead) -> Result<crate::state::Usage> {
     let mut scan = db.scan_under(b"etcd/", &Default::default()).await?;
-    let mut size = crate::batch::Usage::default();
+    let mut size = crate::state::Usage::default();
     while let Some(row) = scan.next().await? {
         size.add_row(&row.key, row.value.len())?;
     }

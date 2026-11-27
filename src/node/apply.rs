@@ -22,7 +22,7 @@ pub(super) struct AppliedState {
     pub members: std::sync::Arc<crate::cluster::Store>,
     pub read: std::sync::Arc<crate::state::ReadView>,
     pub write_batches: u64,
-    pub usage: crate::batch::Usage,
+    pub usage: crate::state::Usage,
     /// Watch events that this state publishes after the node installs it.
     pub watch: Option<std::sync::Arc<crate::watch::Batch>>,
     pub compaction_pending: bool,
