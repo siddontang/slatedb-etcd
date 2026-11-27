@@ -1241,10 +1241,10 @@ impl Node {
     ///
     /// The base holds every batch through its row. If no unreleased batch of this leader is
     /// above the row, the leader announces the same checkpoint again with its covered index.
-    /// That costs one small entry and no checkpoint. The members then raise their base index,
-    /// and the leader records the base at the new index for the snapshot. If a batch is above
-    /// the row, the leader asks for a publication that holds it, and serves the demand with
-    /// that checkpoint.
+    /// That costs one small entry and no checkpoint. The leader raises its own base at once, see
+    /// `Writer::certified`, and records the base at the new index for the snapshot. The other
+    /// members raise their base index when the entry applies. If a batch is above the row, the
+    /// leader asks for a publication that holds it, and serves the demand with that checkpoint.
     ///
     /// The base comes first, then one position read gives the last batch and the covered
     /// index. A switch between the reads makes the check stricter, not weaker. One announcement
@@ -1277,7 +1277,7 @@ impl Node {
             return Ok(());
         };
         if self.propose_view(checkpoint, covers)? {
-            self.writer.certified(covers, ticks);
+            self.writer.certified(checkpoint, covers, ticks);
         }
         Ok(())
     }

@@ -684,9 +684,16 @@ impl Writer {
         Some((checkpoint, covers, ticks))
     }
 
-    /// Note the certification through `covers` that the leader proposed at tick `ticks`.
-    pub(super) fn certified(&mut self, covers: u64, ticks: u64) {
+    /// Note the certification of `checkpoint` through `covers` that the leader proposed at tick
+    /// `ticks`. The leader's applied state already shows the coverage, so the leader offers its
+    /// base with it at once, as the apply of the entry does later. Its base and record then
+    /// reach the demand before the entry commits. A follower that waits for a snapshot appends
+    /// no entry, so the entry can need that snapshot to commit (#156).
+    pub(super) fn certified(&mut self, checkpoint: uuid::Uuid, covers: u64, ticks: u64) {
         self.certified = Some((covers, ticks));
+        if let Some(base) = self.source.live_base(checkpoint) {
+            self.opened_slot.offer(base, covers);
+        }
     }
 
     /// The checkpoint and the index of the current base.
