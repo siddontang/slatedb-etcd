@@ -123,7 +123,7 @@ async fn point_read_batches_stop_before_scans_and_historical_reads() {
         }
         node.complete_read(completion).unwrap();
     }
-    assert!(node.read_queries.is_empty());
+    assert_eq!(node.reads.queued(), 0);
     for reply in replies {
         assert!(reply.await.unwrap().unwrap().into_outcome().result.is_ok());
     }
@@ -159,10 +159,10 @@ async fn waiting_scans_do_not_block_current_point_reads() {
     }
     node.drive_ready().await.unwrap();
     assert_eq!(node.read_executor.len(), 2);
-    assert_eq!(node.read_queries.len(), 1);
-    assert!(!node.read_queries[0].is_point_read());
+    assert_eq!(node.reads.queued(), 1);
+    assert!(!node.reads.queries()[0].is_point_read());
     node.drain_reads().await.unwrap();
-    assert!(node.read_queries.is_empty());
+    assert_eq!(node.reads.queued(), 0);
     for reply in replies {
         assert!(reply.await.unwrap().unwrap().into_outcome().result.is_ok());
     }
@@ -533,7 +533,7 @@ async fn confirm_read(node: &mut Node, id: &u64) {
     message.from = 2;
     message.to = 1;
     message.term = node.raw.raft.term;
-    message.context = node.read_context(*id);
+    message.context = node.reads.context(*id);
     node.raw.step(message).unwrap();
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
@@ -550,7 +550,7 @@ async fn read_batches_freeze_before_quorum_and_survive_a_cancelled_first_request
     let (second, mut reply) = oneshot::channel();
     node.linear_read(range_request(), first);
     node.linear_read(range_request(), second);
-    let context = *node.reads.keys().next().unwrap();
+    let context = node.reads.ids().next().unwrap();
     node.drive_ready().await.unwrap();
     assert!(node.log_worker.step().unwrap().is_none());
     let mut contexts = vec![];
@@ -559,11 +559,11 @@ async fn read_batches_freeze_before_quorum_and_survive_a_cancelled_first_request
             contexts.push(message.context.to_vec());
         }
     }
-    assert_eq!(contexts, vec![node.read_context(context)]);
+    assert_eq!(contexts, vec![node.reads.context(context)]);
     drop(cancelled);
     let (later, mut late_reply) = oneshot::channel();
     node.linear_read(range_request(), later);
-    let late_context = *node.reads.keys().last().unwrap();
+    let late_context = node.reads.ids().last().unwrap();
     node.drive_ready().await.unwrap();
     assert!(reply.try_recv().is_err());
     confirm_read(&mut node, &context).await;
@@ -863,7 +863,7 @@ async fn forwarded_revision_waits_for_apply_without_a_new_quorum_round() {
     assert!(!view.applied(revision));
     node.wait_revision(revision, tx);
     assert!(reply.try_recv().is_err());
-    assert!(node.reads.is_empty());
+    assert_eq!(node.reads.pending(), 0);
     // A committed result remains valid after leader loss. Local apply is still required.
     node.raw.raft.become_follower(node.raw.raft.term + 1, 0);
     node.drain_apply().await.unwrap();
@@ -882,12 +882,11 @@ async fn forwarded_revision_waits_for_apply_without_a_new_quorum_round() {
     assert!(rx.await.unwrap().unwrap_err().error.contains("too many"));
     pending.pop();
     node.finish_revision_waiters();
-    assert_eq!(node.revision_waiters.len(), apply::MAX_QUERIES - 1);
-    for waiter in &mut node.revision_waiters {
-        waiter.started = Instant::now() - Duration::from_secs(6);
-    }
+    assert_eq!(node.reads.revision_waiters(), apply::MAX_QUERIES - 1);
+    node.reads
+        .set_revision_waiters_started(Instant::now() - Duration::from_secs(6));
     node.finish_revision_waiters();
-    assert!(node.revision_waiters.is_empty());
+    assert_eq!(node.reads.revision_waiters(), 0);
     for reply in pending {
         assert!(reply
             .await
@@ -906,7 +905,7 @@ async fn read_index_requires_quorum_and_does_not_write_the_log() {
     let syncs = node.raw.store().durable.sync_writes;
     let (tx, mut reply) = oneshot::channel();
     node.linear_read(range_request(), tx);
-    let id = *node.reads.keys().next().unwrap();
+    let id = node.reads.ids().next().unwrap();
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
     node.drain_apply().await.unwrap();
@@ -1000,10 +999,10 @@ async fn scans_run_together_and_rerun_alone_over_their_row_budget() {
     // Three scans share the wide slots. The sorted read and later scans wait in queue order.
     // The point read passes them and uses the remaining task.
     assert_eq!(node.read_executor.len(), read::executor::MAX_TASKS);
-    assert_eq!(node.read_queries.len(), 2);
-    assert!(!node.read_executor.can_submit(&node.read_queries[0]));
+    assert_eq!(node.reads.queued(), 2);
+    assert!(!node.read_executor.can_submit(&node.reads.queries()[0]));
     node.drain_reads().await.unwrap();
-    assert!(node.read_queries.is_empty());
+    assert_eq!(node.reads.queued(), 0);
     assert_eq!(node.read_executor.reruns, 1);
     for (request, reply) in requests.iter().zip(replies) {
         let mut result = reply.await.unwrap().unwrap().into_outcome().result.unwrap();
@@ -1055,7 +1054,7 @@ async fn confirmed_scans_share_only_matching_requests_and_credentials() {
         node.linear_read_auth(request, Some(credentials), ClientResponse::Kv(tx));
         replies.push(rx);
     }
-    let first = *node.reads.keys().next().unwrap();
+    let first = node.reads.ids().next().unwrap();
     node.drive_ready().await.unwrap();
     assert_eq!(node.read_executor.len(), 0);
     confirm_read(&mut node, &first).await;
@@ -1111,7 +1110,7 @@ async fn read_index_waits_for_apply_and_rejects_late_results_after_term_change()
     assert!(node.state.applied < node.raw.store().commit_index());
     let (tx, mut reply) = oneshot::channel();
     node.linear_read(range_request(), tx);
-    let id = *node.reads.keys().next().unwrap();
+    let id = node.reads.ids().next().unwrap();
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
     confirm_read(&mut node, &id).await;
@@ -1124,7 +1123,7 @@ async fn read_index_waits_for_apply_and_rejects_late_results_after_term_change()
     node.raw.raft.become_follower(node.raw.raft.term + 1, 2);
     node.complete_read(read_result).unwrap();
     assert!(reply.await.unwrap().is_err());
-    assert!(node.reads.is_empty());
+    assert_eq!(node.reads.pending(), 0);
 }
 
 #[tokio::test]
@@ -1204,7 +1203,7 @@ async fn pending_read_indexes_are_bounded_and_cancelled_on_leader_loss() {
     assert!(rx.await.unwrap().unwrap_err().error.contains("too many"));
     node.raw.raft.become_follower(node.raw.raft.term + 1, 2);
     node.drive_ready().await.unwrap();
-    assert!(node.reads.is_empty());
+    assert_eq!(node.reads.pending(), 0);
     for reply in replies {
         assert!(reply.await.unwrap().is_err());
     }
@@ -1301,7 +1300,7 @@ async fn read_index_retries_after_the_first_commit_in_a_new_term() {
     assert!(!node.raw.raft.commit_to_current_term());
     let (tx, mut reply) = oneshot::channel();
     node.linear_read(range_request(), tx);
-    let id = *node.reads.keys().next().unwrap();
+    let id = node.reads.ids().next().unwrap();
     // The initial request is discarded before the leader commits its no-op entry.
     confirm_read(&mut node, &id).await;
     node.drain_apply().await.unwrap();
@@ -1328,7 +1327,7 @@ async fn read_index_retries_after_the_first_commit_in_a_new_term() {
     // The empty entry and `SeedMembers` of the new leader. Retries append none.
     assert_eq!(node.raw.store().durable.last_index, 2);
     assert_eq!(node.raw.store().durable.sync_writes, syncs);
-    assert!(node.reads.is_empty());
+    assert_eq!(node.reads.pending(), 0);
 }
 
 #[tokio::test]
@@ -1540,9 +1539,9 @@ async fn read_contexts_require_the_current_process_nonce_and_exact_length() {
     let mut node = leader_node(dir.path()).await;
     let (response, mut result) = oneshot::channel();
     node.linear_read(range_request(), response);
-    let id = *node.reads.keys().next().unwrap();
+    let id = node.reads.ids().next().unwrap();
     node.drive_ready().await.unwrap();
-    let valid = node.read_context(id);
+    let valid = node.reads.context(id);
     let mut stale = valid.clone();
     stale[0] ^= 1;
     for context in [
@@ -1555,7 +1554,7 @@ async fn read_contexts_require_the_current_process_nonce_and_exact_length() {
             request_ctx: context,
         }]);
         node.schedule_reads();
-        assert!(node.read_queries.is_empty());
+        assert_eq!(node.reads.queued(), 0);
         assert_eq!(node.read_executor.len(), 0);
         assert!(result.try_recv().is_err());
     }
@@ -1618,7 +1617,7 @@ async fn independent_read_jobs_and_queue_have_separate_bounds() {
         node.drive_ready().await.unwrap();
     }
     assert_eq!(node.read_executor.len(), 4);
-    assert_eq!(node.read_queries.len(), apply::MAX_QUERIES);
+    assert_eq!(node.reads.queued(), apply::MAX_QUERIES);
     let (tx, rx) = oneshot::channel();
     node.enqueue_query(Query::Read(range_request(), None, ClientResponse::Kv(tx)));
     assert!(rx.await.unwrap().is_err());

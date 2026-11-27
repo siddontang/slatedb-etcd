@@ -182,7 +182,7 @@ impl Node {
             }
             return;
         }
-        let Some(context) = self.read_sequence.checked_add(1) else {
+        let Some(context) = self.reads.next_id() else {
             for renewal in std::mem::take(&mut self.renewals.waiting) {
                 renewal
                     .response
@@ -190,7 +190,6 @@ impl Node {
             }
             return;
         };
-        self.read_sequence = context;
         self.renewals.batches.push_back(RenewBatch {
             context,
             issued: Instant::now(),
@@ -199,7 +198,7 @@ impl Node {
             retry_ticks: 2,
             renewals: std::mem::take(&mut self.renewals.waiting),
         });
-        self.raw.read_index(self.read_context(context));
+        self.raw.read_index(self.reads.context(context));
     }
 
     pub(super) fn retry_renewals(&mut self) {
@@ -216,7 +215,7 @@ impl Node {
             }
         }
         for context in retry {
-            self.raw.read_index(self.read_context(context));
+            self.raw.read_index(self.reads.context(context));
         }
     }
 
