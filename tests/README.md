@@ -205,6 +205,7 @@ DST pauses apply between permission revocation and a queued write, then restores
 ## Remote storage, native crash hooks, and downstream projects
 
 See [remote storage](../docs/remote-storage.md) for S3 and disposable guest commands.
+The S3 recovery check is deferred until #149, and CI does not run it for now.
 The [fault map](upstream/fault-mapping.md) accounts for all named gofail hooks at the pinned etcd
 version. It distinguishes equivalent native boundaries, imported behavior, and remaining gaps.
 
