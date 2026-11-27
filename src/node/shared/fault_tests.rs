@@ -1074,6 +1074,40 @@ async fn a_late_update_of_an_old_materializer_does_not_skip_a_batch() {
     leader.close().await;
 }
 
+/// Issue #106: the task of term 2 pauses before its reset. Term 3 opens and writes. Then term
+/// 2 goes on. It must not move the progress back or replace the writer of term 3, because the
+/// progress updates of term 3 then stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_reset_of_an_old_writer_task_changes_nothing() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut leader = Leader::open(store, Duration::from_secs(3600), clock()).await;
+    let (reached, resume) = (Arc::default(), Arc::default());
+    *leader.writer().progress().reset_hold.lock().unwrap() =
+        Some((Arc::clone(&reached), Arc::clone(&resume)));
+    leader.lead(2);
+    reached.notified().await;
+    leader.lead(3);
+    leader.covered(1, Duration::from_secs(10)).await;
+    let index = leader.put("k1").await;
+    let db = leader.writer().open().unwrap().db;
+    // The old task sees the new term, closes its writer, and ends.
+    resume.notify_one();
+    let ended = tokio::time::timeout(Duration::from_secs(10), leader.writer().tasks().join_next());
+    assert!(matches!(ended.await.unwrap(), Some(Ok((2, Ok(()))))));
+    assert_eq!(leader.writer().progress().written(), index);
+    assert!(Arc::ptr_eq(&leader.writer().open().unwrap().db, &db));
+    // The materializer of term 3 still moves the progress.
+    let next = leader.apply_put("k2").await;
+    let written = leader.writer().progress().wait_written(next);
+    tokio::time::timeout(Duration::from_secs(10), written)
+        .await
+        .unwrap()
+        .unwrap();
+    leader.writer().progress().request(next);
+    leader.covered(next, Duration::from_secs(10)).await;
+    leader.close().await;
+}
+
 /// SlateDB's default clock plus a fixed lead, for an admin that adds a late job.
 #[derive(Debug)]
 struct AheadBy(Duration, slatedb_common::clock::DefaultSystemClock);

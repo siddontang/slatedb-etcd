@@ -32,6 +32,10 @@ pub(super) struct Progress {
     /// before it changes the progress.
     #[cfg(test)]
     hold: Mutex<Option<clock::ReadHold>>,
+    /// Tests: the next writer task takes the pair before its reset. It notifies the first and
+    /// waits for the second.
+    #[cfg(test)]
+    reset_hold: Hold,
 }
 
 #[derive(Default)]
@@ -59,6 +63,8 @@ impl Progress {
             wake: tokio::sync::Notify::new(),
             #[cfg(test)]
             hold: Mutex::default(),
+            #[cfg(test)]
+            reset_hold: Hold::default(),
         }
     }
 
@@ -94,7 +100,8 @@ impl Progress {
     /// Start again after a writer open at `written`. The writes that the age limit tracked
     /// were in the old writer. A publication request and a republish stay: a manual checkpoint
     /// or a Defragment can ask before the new writer opens, or a failed pass gives them back.
-    /// Return the owner of the new open.
+    /// Return the owner of the new open. The writer task calls this only while it still leads
+    /// its term. See `lead`.
     fn reset(&self, written: u64) -> u64 {
         let mut inner = self.inner.lock().unwrap();
         inner.owner += 1;
@@ -487,21 +494,45 @@ async fn lead(publisher: Publisher, leading: Leading) -> Result<()> {
         }
         gate.floor(tick);
         health.opened();
-        // The open starts at `last_l0_seq`. Unflushed writes of an older writer are lost, and
-        // the overlay holds them.
-        let owner = publisher.progress.reset(db.manifest().last_l0_seq());
-        publisher.progress.rearm();
         let admin = slatedb::admin::Admin::builder(
             publisher.source.state(),
             publisher.source.store.clone(),
         )
         .with_system_clock(gate.clone())
         .build();
-        *open.lock().unwrap() = Some(Open {
-            db: db.clone(),
-            admin: Arc::new(admin),
-            gate: gate.clone(),
-        });
+        #[cfg(test)]
+        {
+            let hold = publisher.progress.reset_hold.lock().unwrap().take();
+            if let Some((reached, resume)) = hold {
+                reached.notify_one();
+                resume.notified().await;
+            }
+        }
+        // The open starts at `last_l0_seq`. Unflushed writes of an older writer are lost, and
+        // the overlay holds them.
+        //
+        // The task of a newer term can open while this task is here. `Writer::sync` changes
+        // the leadership before it starts that task. The read guard holds the leadership from
+        // the check through the reset and the slot, so a newer term comes before the check or
+        // after the slot. An older task then cannot move the progress back or replace the
+        // newer writer.
+        let owner = {
+            let leading = leadership.borrow();
+            (*leading == (true, term)).then(|| {
+                let owner = publisher.progress.reset(db.manifest().last_l0_seq());
+                publisher.progress.rearm();
+                *open.lock().unwrap() = Some(Open {
+                    db: db.clone(),
+                    admin: Arc::new(admin),
+                    gate: gate.clone(),
+                });
+                owner
+            })
+        };
+        let Some(owner) = owner else {
+            close(db).await;
+            return Ok(());
+        };
         #[cfg(test)]
         {
             let hold = open_hold.lock().unwrap().clone();
