@@ -1273,6 +1273,10 @@ async fn a_late_job_costs_one_reopen_and_no_handoff() {
     });
     // The late job lands 3 s above the successor's clock. Four new L0 SSTs then make the
     // compactor of the successor schedule a job below it.
+    let writer = leader.writer();
+    let reopened = writer.reopens.load(std::sync::atomic::Ordering::Relaxed);
+    let faults = writer.health.total();
+    let first = writer.open.lock().unwrap().clone().unwrap().db;
     submit_ahead(&leader, Duration::from_secs(3)).await;
     for n in 0..4 {
         leader.put(&format!("k{n}")).await;
@@ -1283,7 +1287,7 @@ async fn a_late_job_costs_one_reopen_and_no_handoff() {
     until(
         "the reopen above the job",
         Duration::from_secs(30),
-        async || reopens.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        async || reopens.load(std::sync::atomic::Ordering::Relaxed) > reopened,
     )
     .await;
     let index = leader.put("after").await;
@@ -1294,10 +1298,21 @@ async fn a_late_job_costs_one_reopen_and_no_handoff() {
     )
     .await;
     answering.abort();
-    let health = leader.writer().health.clone();
-    assert_eq!(health.consecutive(), 0, "{}", health.status());
-    assert!(!health.handoff_due());
-    assert_eq!(health.status()["marked"], false);
+    // One reopen in the same term, onto a new `Db`, with no fault at all.
+    let writer = leader.writer();
+    let reopens = writer.reopens.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(reopens, reopened + 1);
+    let second = writer.open.lock().unwrap().clone().unwrap().db;
+    assert!(
+        !Arc::ptr_eq(&first, &second),
+        "the writer did not open a new Db"
+    );
+    assert_eq!(writer.term, 3);
+    assert_eq!(*writer.leadership.borrow(), (true, 3));
+    assert!(writer.running());
+    assert_eq!(writer.health.total(), faults, "{}", writer.health.status());
+    assert!(!writer.health.handoff_due());
+    assert_eq!(writer.health.status()["marked"], false);
     sampling.abort();
     leader.close().await;
 }
