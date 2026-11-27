@@ -40,9 +40,6 @@ pub enum ViewRetention {
     Fenced,
 }
 
-/// The eight-byte logical size total after each shared-mode batch, for older readers. The
-/// split by row kind is in the counter row with the apply marker.
-pub(crate) const LOGICAL_BYTES: &[u8] = b"meta/logical-bytes";
 /// The name prefix of the checkpoints that the publisher creates.
 const VIEW: &str = "view-";
 const CLAIM: &str = "shared/owner.json";
@@ -72,7 +69,7 @@ pub(crate) struct Claimed {
     pub store_id: uuid::Uuid,
 }
 
-/// Parse a cluster claim. A claim of an earlier binary has no store ID and does not parse.
+/// Parse a cluster claim. A claim without a store ID does not parse.
 fn parse_claim(data: &[u8]) -> Result<Claim> {
     let claim: Claim =
         serde_json::from_slice(data).context("invalid cluster claim, or no valid store ID")?;
@@ -1381,16 +1378,6 @@ impl StateMachine {
         Ok(state)
     }
 
-    /// Return true in shared state mode. The in-memory state of a test applies entries as a
-    /// shared member does.
-    pub(crate) fn is_shared(&self) -> bool {
-        #[cfg(test)]
-        if self.is_memory() {
-            return true;
-        }
-        self.shared.is_some()
-    }
-
     /// The ID of the shared store, in shared state mode.
     pub(crate) fn store_id(&self) -> Option<uuid::Uuid> {
         Some(self.shared.as_ref()?.store_id)
@@ -1412,8 +1399,8 @@ impl StateMachine {
 
     /// Apply a `ViewCheckpoint` entry. It changes no etcd state and writes no batch.
     ///
-    /// `covers` is the index through which the leader certified the checkpoint. An entry of an
-    /// earlier binary has none, and zero means the checkpoint row. The leader proposed the entry
+    /// `covers` is the index through which the leader certified the checkpoint. Zero means the
+    /// checkpoint row. The leader proposed the entry
     /// after it applied `covers`, so a value at or above `index` is not valid.
     pub(crate) async fn apply_view_checkpoint(
         &mut self,
@@ -1471,27 +1458,6 @@ impl StateMachine {
                 shared.source.prune_warmed();
             }
         }
-    }
-
-    /// Store a batch that holds only the apply marker and the counters at the applied index.
-    /// The next checkpoint then has its row at that index. An earlier binary installs a view
-    /// snapshot only at its checkpoint row, and a leader uses this for such a member. The batch
-    /// changes no etcd state, so apply derives nothing from it.
-    pub(crate) fn mark_row(&mut self) -> Result<()> {
-        let size = self.logical_bytes;
-        let index = self.applied;
-        let term = self.applied_term;
-        let shared = self.shared.as_mut().context("not in shared state mode")?;
-        if shared.overlay.queue().pushed() >= index {
-            return Ok(());
-        }
-        let mut batch = WriteBatch::new();
-        mark_applied(&mut batch, index, term);
-        batch.put(LOGICAL_BYTES, size.total().to_be_bytes());
-        batch.put(LOGICAL_SIZE, logical_size_row(index, size));
-        shared.overlay.push(index, Arc::new(batch));
-        self.write_batches += 1;
-        Ok(())
     }
 
     /// Raise a base that has an empty overlay from its row `F` to `index`. The caller knows that

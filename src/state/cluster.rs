@@ -11,18 +11,10 @@
 //! The transport and the member API use it. It does not count toward the logical size.
 //!
 //! A leader proposes `SeedMembers` right after its election, before any other entry of its term.
-//! An earlier binary has no seed, and it stored the bootstrap membership with
-//! its first batch. So another entry that finds no row comes from a log of an earlier binary.
-//! The batch of that entry then stores the in-memory membership, as that binary did, and the
-//! quota check of that entry already counts it. An upgraded member that replays such a log gets
-//! the row and the decisions of the members that flushed it. A state that this binary created empty never
-//! applies such an entry. The membership guard stops it there and asks for a snapshot; see
-//! `node::quota`.
 //!
 //! A `SeedMembers` entry also carries the digest of the row of its leader at the applied index of
 //! the leader. A member whose row did not change after that index compares the digests. A
-//! difference means that the rows diverged, for example under an earlier binary. Apply logs a
-//! warning and keeps the row.
+//! difference means that the rows diverged. Apply logs a warning and keeps the row.
 
 use super::*;
 use crate::cluster::Store;
@@ -59,12 +51,6 @@ pub(super) async fn load(
     })
 }
 
-/// Return true when an earlier binary stored its bootstrap membership before `command`: for
-/// every entry except the term-start entry `SeedMembers`.
-pub(crate) fn needs_members(command: &crate::RaftCommand) -> bool {
-    !matches!(command, crate::RaftCommand::SeedMembers(_))
-}
-
 impl StateMachine {
     pub async fn apply_cluster(
         &mut self,
@@ -81,8 +67,7 @@ impl StateMachine {
         } else {
             self.auth.admin(credentials)
         };
-        // The stored row is the base. Only a log of an earlier binary applies a cluster command
-        // without it. That binary used the in-memory membership, and `before_entry` stores it.
+        // The stored row is the base. Without it, the base is the in-memory membership.
         let stored = self
             .applied_state()
             .get(crate::cluster::KEY)
@@ -186,27 +171,6 @@ impl StateMachine {
         if let Some((members, row)) = staged {
             self.members = members;
             self.members_row = Some(row);
-        }
-        Ok(())
-    }
-
-    /// Prepare the state for the next entry, `command`. An entry that `needs_members` selects
-    /// and that finds no row comes from a log of an earlier binary. Its batch then stores the
-    /// in-memory membership, as that binary did. See the module comment.
-    ///
-    /// That binary counted the row before this entry. So the logical size counts it now, before
-    /// the entry checks the quota, wherever the entry falls in an apply batch.
-    pub(crate) fn before_entry(&mut self, command: &crate::RaftCommand) -> Result<()> {
-        if self.members_row.is_none()
-            && !self.members_unsaved
-            && !self.members.members.is_empty()
-            && needs_members(command)
-        {
-            let len = serde_json::to_vec(self.members.as_ref())?.len();
-            self.logical_bytes
-                .replace_row(crate::cluster::KEY, None, Some(len))?;
-            self.members_counted = Some(len);
-            self.members_unsaved = true;
         }
         Ok(())
     }

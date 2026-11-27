@@ -473,8 +473,8 @@ fn flush_cache_range_covers_only_current_rows() {
 }
 
 /// A put-only transaction on the direct apply path must write the value-once rows. Its HashKV
-/// rows hold digests, and its Watch journal omits Put values and sets `values_in_history`. Rows, HashKV, Watch catch-up, and the in-memory Watch feed must
-/// match the general evaluator. HashKV and Watch must also match the same rows in format 3.
+/// rows hold digests, and its Watch journal omits Put values and sets `values_in_history`.
+/// Rows, HashKV, Watch catch-up, and the in-memory Watch feed must match the general evaluator.
 #[tokio::test]
 async fn direct_put_txns_write_value_once_rows_like_the_evaluator() {
     use crate::proto::etcdserverpb::TxnRequest;
@@ -669,81 +669,6 @@ fn slatedb_settings_bound_compaction_buffers() {
     );
 }
 
-/// The directory gets the row marker before its first hash or Watch journal row, on both the
-/// general and the batched put path, and not for writes that keep format 3 rows.
-#[tokio::test]
-async fn the_first_hash_or_journal_row_marks_the_directory() {
-    for batched in [false, true] {
-        let raft = tempfile::tempdir().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let storage = crate::storage::RaftStorage::open(raft.path(), 1, "test", vec![1]).unwrap();
-        let marker = storage.row_marker();
-        let mut state = StateMachine::open_test(dir.path()).await.unwrap();
-        state.row_marker = Some(marker.clone());
-        // Empty entries, failed compactions, and reads write no hash or journal row.
-        state.apply(1, None).await.unwrap();
-        state.apply(2, None).await.unwrap();
-        let outcome = state
-            .apply_compaction(
-                3,
-                &CompactionRequest {
-                    revision: 5,
-                    physical: false,
-                },
-            )
-            .await
-            .unwrap();
-        assert!(outcome.result.is_err());
-        read(&state, b"a", 0).await;
-        assert!(!marker.is_marked());
-        let hash_or_journal = |state: &StateMachine| {
-            let db = state.applied_state().clone();
-            async move {
-                for prefix in [crate::maintenance::HASH, crate::watch::EVENTS] {
-                    if db
-                        .scan_under(prefix, &Default::default())
-                        .await
-                        .unwrap()
-                        .next()
-                        .await
-                        .unwrap()
-                        .is_some()
-                    {
-                        return true;
-                    }
-                }
-                false
-            }
-        };
-        assert!(!hash_or_journal(&state).await);
-        if batched {
-            let request = put(b"a", b"one");
-            state
-                .apply_puts(&[put_batch::KvEntry {
-                    index: state.applied + 1,
-                    request: &request,
-                    credentials: None,
-                    origin: 1,
-                }])
-                .await
-                .unwrap();
-        } else {
-            state
-                .apply_etcd(state.applied + 1, &put(b"a", b"one"))
-                .await
-                .unwrap()
-                .result
-                .unwrap();
-        }
-        assert!(hash_or_journal(&state).await);
-        assert!(marker.is_marked());
-        state.close().await.unwrap();
-        drop((storage, marker, state));
-        let storage = crate::storage::RaftStorage::open(raft.path(), 1, "test", vec![1]).unwrap();
-        assert!(storage.row_marker().is_marked());
-    }
-}
-
 /// Return the stored `(index, term)` apply position, or `None` when the row is missing.
 async fn stored_position(state: &StateMachine) -> Option<(u64, u64)> {
     let row = state.applied_state().get(APPLIED_TERM).await.unwrap()?;
@@ -760,14 +685,14 @@ async fn stored_term(state: &StateMachine) -> Option<u64> {
     Some(term)
 }
 
-/// Check native snapshot bytes with the rules of the previous format 4 reader.
+/// Check native snapshot bytes with the rules of the format 4 reader.
 pub(super) fn check_format_4(data: &SnapshotData) {
     assert!(crate::readable_snapshot(data.version));
     let mut seen = std::collections::BTreeSet::new();
     for (key, _) in &data.rows {
         assert!(
             key.starts_with(DATA) || key.starts_with(b"etcd/") || key == APPLIED,
-            "the previous reader rejects {}",
+            "the format 4 reader rejects {}",
             String::from_utf8_lossy(key)
         );
         assert!(seen.insert(key.clone()));

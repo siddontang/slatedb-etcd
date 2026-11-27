@@ -579,18 +579,16 @@ impl TaskHealth {
     }
 }
 
-/// The writer health that a member reports in `ViewAck`. An earlier binary sends none.
+/// The writer health that a member reports in `ViewAck`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriterReport {
     /// Seconds since the newest fault of the member's writer, while its mark holds.
     pub failed_secs: Option<u64>,
     /// The Raft term that the member saw when it sent the report.
-    #[serde(default)]
     pub term: u64,
     /// The entry that apply holds on after corrupt stored data. It is not a writer mark: no
     /// publication clears it, and it does not end an incident. It clears only when apply passes
     /// the entry. A held voter is never a handoff target.
-    #[serde(default)]
     pub apply_held_at: Option<u64>,
 }
 
@@ -614,7 +612,7 @@ pub(in crate::node) struct Candidate {
 /// How well a voter suits a writer fault handoff.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Suit {
-    /// No current report from this term, an earlier binary, or a mark from this incident.
+    /// No current report from this term, or a mark from this incident.
     No,
     /// A mark older than this leader's last publication. Another writer published after the
     /// voter's fault, so the fault can be over.
@@ -674,8 +672,8 @@ pub(super) struct Decision {
 }
 
 impl Handoff {
-    /// Note the writer report of `member` from process `process`. An earlier binary sends no
-    /// report, and its process is not a target.
+    /// Note the writer report of `member` from process `process`. A member without a report or
+    /// a process is not a target.
     pub(super) fn note(&mut self, member: u64, process: Option<u64>, report: Option<WriterReport>) {
         match (process, report) {
             (Some(process), Some(report)) => {
@@ -802,13 +800,6 @@ impl Handoff {
         decision
     }
 
-    /// Return true when the last report of `member` says that its apply holds.
-    fn held(&self, member: u64) -> bool {
-        self.reports
-            .get(&member)
-            .is_some_and(|received| received.report.apply_held_at.is_some())
-    }
-
     pub(super) fn status(&self) -> Value {
         let mut tried: Vec<_> = self.tried.iter().copied().collect();
         tried.sort_unstable();
@@ -817,23 +808,6 @@ impl Handoff {
             "tried": tried,
         })
     }
-}
-
-/// Order voters for a handoff that is not a writer fault. A voter that suits a writer handoff
-/// comes first, then the longest matched log. A voter whose apply holds is never a target.
-fn rank(
-    handoff: Option<&Handoff>,
-    published: Option<Instant>,
-    candidates: &[Candidate],
-) -> Option<u64> {
-    candidates
-        .iter()
-        .filter(|candidate| !handoff.is_some_and(|handoff| handoff.held(candidate.id)))
-        .max_by_key(|candidate| {
-            let suit = handoff.map_or(Suit::No, |handoff| handoff.suit(candidate, published));
-            (suit, candidate.matched)
-        })
-        .map(|candidate| candidate.id)
 }
 
 /// Return true when the leader must hand over its leadership: its writer is down or stalled,
@@ -884,16 +858,6 @@ impl Node {
                 process: self.raw.store().process(peer),
             })
             .collect()
-    }
-
-    /// Pick the target of a handoff that is not a writer fault: a voter that suits a writer
-    /// handoff first, then the longest matched log. No voter is excluded, so replicated mode and
-    /// a cluster of earlier binaries keep the longest matched log.
-    pub(in crate::node) fn rank_voters(&self) -> Option<u64> {
-        let candidates = self.handoff_candidates();
-        let writer = self.writer.as_ref();
-        let published = writer.and_then(|writer| writer.health.published_at());
-        rank(writer.map(|writer| &writer.handoff), published, &candidates)
     }
 
     /// Check the writer health on each tick. A leader whose writer is down hands over its

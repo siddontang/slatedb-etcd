@@ -1053,7 +1053,6 @@ async fn complete(db: &Db, input: &Input, mut usage: crate::batch::Usage) -> Res
     // The first checkpoint must hold the membership. See `newest_base`.
     batch.put(crate::cluster::KEY, input.members.as_bytes());
     usage.add_row(crate::cluster::KEY, input.members.len())?;
-    batch.put(LOGICAL_BYTES, usage.total().to_be_bytes());
     batch.put(LOGICAL_SIZE, logical_size_row(index, usage));
     batch.delete(PROGRESS);
     db.write_with_options(batch, &slatedb::config::WriteOptions { seqnum: index })

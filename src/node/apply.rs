@@ -183,9 +183,6 @@ pub(super) enum Job {
     RaiseBase(Snapshot),
     /// Shared mode: switch to a base that finished opening, and publish the new view.
     SwitchBase,
-    /// Shared mode: store the apply marker at the applied index, so the next checkpoint has its
-    /// row there. An earlier binary installs a base only at its row.
-    MarkRow,
     /// Shared mode: adopt this opened base above the applied index. The node verified its index
     /// against the delivered commit, and `term` is the log term there. The job holds the base.
     AdoptBase {
@@ -356,7 +353,6 @@ impl Executor {
                 | Job::Snapshot(_)
                 | Job::PublishPuts(_)
                 | Job::SwitchBase
-                | Job::MarkRow
                 | Job::AdoptBase { .. }
         );
         let copy_state = changes_state || matches!(work.job, Job::Query(Query::Maintenance(..)));
@@ -403,10 +399,6 @@ impl Executor {
             }
             // The switch ran above. The new view goes out with the completion.
             Job::SwitchBase => Output::Entries(Vec::new()),
-            Job::MarkRow => {
-                self.state.mark_row()?;
-                Output::Entries(Vec::new())
-            }
             Job::AdoptBase { base, term } => match self.adopt_retrying(base, term).await? {
                 Adoption::Adopted => Output::Adopted(self.state.members.conf()),
                 // A newer snapshot replaces this adoption.
@@ -768,7 +760,6 @@ async fn apply_into(
                 .as_ref()
                 .map_or(entry.data.as_ref(), |change| change.context.as_ref()),
         )?;
-        state.before_entry(&command)?;
         if change.is_none() && super::quorum_put::kv_command(&command).is_some() {
             let mut commands = vec![(entry.index, command)];
             let mut term = entry.term;
@@ -928,21 +919,16 @@ pub(super) async fn recover(
     state: &mut StateMachine,
     storage: &RaftStorage,
     header: Header,
-    origin: super::quota::Guards,
 ) -> Result<()> {
     while state.applied < storage.commit_index() {
         let low = state.applied + 1;
-        let mut entries = storage.entries(
+        let entries = storage.entries(
             low,
             (low + BATCH_ENTRIES).min(storage.commit_index() + 1),
             Some(BATCH_BYTES),
             raft::GetEntriesContext::empty(false),
         )?;
         ensure!(!entries.is_empty(), "empty recovery batch");
-        // A guarded member stops here and waits for a snapshot. See `node::quota`.
-        if super::quota::guard_replay(state, origin, &mut entries)? {
-            break;
-        }
         // The leader materializer writes the shared database, so replay flushes nothing.
         apply_entries(state, entries, header).await?;
     }

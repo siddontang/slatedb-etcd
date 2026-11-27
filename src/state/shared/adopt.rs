@@ -52,7 +52,6 @@ impl StateMachine {
             next.members = self.members.clone();
         }
         next.write_batches = self.write_batches;
-        next.row_marker = self.row_marker.take();
         // The new rows reach watchers through storage catch-up.
         next.watch_capture = self.watch_capture.take();
         if let Some(capture) = &mut next.watch_capture {

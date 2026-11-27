@@ -279,10 +279,6 @@ pub(super) struct Writer {
     certify_ticks: u64,
     /// The leader term of the demand above. A new term drops the demand of the old one.
     demand_term: u64,
-    /// The applied index through which this leader asked for a checkpoint at its row.
-    exact_through: u64,
-    /// Apply stores the apply marker at the applied index, for a checkpoint at its row.
-    mark_row_due: bool,
     /// The highest record index whose checkpoint apply offered as the base. See `take_raise`.
     raised_record: u64,
     /// DST: skip that offer, as when the checkpoint cannot open.
@@ -399,8 +395,6 @@ impl Writer {
             demand_publication: 0,
             certify_ticks: 0,
             demand_term: 0,
-            exact_through: 0,
-            mark_row_due: false,
             raised_record: 0,
             #[cfg(test)]
             skip_raise: false,

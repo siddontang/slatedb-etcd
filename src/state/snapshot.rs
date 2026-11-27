@@ -98,8 +98,8 @@ impl StateMachine {
 
     /// Check the applied term against the term of a Raft snapshot at the applied index.
     ///
-    /// A checkpoint from an older binary has no valid term row, so its install sets the term
-    /// only in memory. Startup passes the durable Raft snapshot again, and this fills the term.
+    /// A state without a valid term row gets the term only in memory. Startup passes the durable
+    /// Raft snapshot again, and this fills the term.
     /// The row is not written here: a SlateDB write needs a sequence above `applied`. The
     /// durable snapshot stays until the log truncates at a later checkpoint, and the batch of
     /// any later entry stores the term.

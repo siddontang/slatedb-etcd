@@ -279,9 +279,9 @@ fn a_handoff_never_aborts_a_later_move_leader() {
 }
 
 /// Only a current report from this term without a mark makes a target. A mark does not
-/// expire, an earlier binary sends no report, and a restart is a new process.
+/// expire, a member without a report is no target, and a restart is a new process.
 #[test]
-fn a_fault_handoff_skips_marks_earlier_binaries_and_old_reports() {
+fn a_fault_handoff_skips_marks_missing_and_old_reports() {
     let now = Instant::now();
     let led = now - Duration::from_secs(20);
     let mut handoff = Handoff {
@@ -303,16 +303,12 @@ fn a_fault_handoff_skips_marks_earlier_binaries_and_old_reports() {
     // The report came before this member led.
     let early = led - Duration::from_secs(1);
     handoff.reports.insert(5, received(50, early, None));
-    // Member 6 runs an earlier binary and sends no writer report.
+    // Member 6 sends no writer report.
     handoff.note(6, Some(60), None);
     assert_eq!(handoff.pick(&tick(&candidates, None)), Some(2));
     // An unreachable target is tried once.
     handoff.tried.insert(2);
     assert_eq!(handoff.pick(&tick(&candidates, None)), None);
-    // Another handoff only orders the voters. It excludes none.
-    assert_eq!(rank(Some(&handoff), None, &candidates), Some(2));
-    assert_eq!(rank(Some(&handoff), None, &candidates[1..]), Some(6));
-    assert_eq!(rank(None, None, &candidates), Some(6));
 }
 
 /// Items 5 and 8 of the review: the report of a target comes from after the start of the

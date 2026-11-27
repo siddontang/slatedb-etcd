@@ -173,9 +173,8 @@ async fn raft_message(State(state): State<ApiState>, headers: HeaderMap, body: B
     step_message(state, headers, message, size).await
 }
 
-/// Receive a view snapshot above its checkpoint row. Only this binary has the route, so an
-/// earlier binary answers 404 before its Raft sees the snapshot. The sender names the process
-/// that advertised the capability, and another process of this member refuses with 409.
+/// Receive a view snapshot above its checkpoint row. The sender names the process that advertised
+/// the capability, and another process of this member refuses with 409.
 async fn covered_snapshot(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -255,15 +254,11 @@ struct ViewAck {
     member: u64,
     checkpoints: std::collections::HashSet<uuid::Uuid>,
     /// A manual checkpoint on the member asks the leader to publish through this index.
-    #[serde(default)]
     publish: Option<u64>,
-    /// The process of a member that installs a base above its checkpoint row. An earlier
-    /// binary sends none.
-    #[serde(default)]
+    /// The process of a member that installs a base above its checkpoint row.
     coverage: Option<u64>,
-    /// The health of the member's shared writer. An earlier binary sends none, and the leader
-    /// then does not hand it the writer after a writer fault.
-    #[serde(default)]
+    /// The health of the member's shared writer. A member without a writer sends none, and the
+    /// leader then does not hand it the writer after a writer fault.
     writer: Option<crate::node::WriterReport>,
 }
 

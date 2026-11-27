@@ -116,11 +116,11 @@ pub enum Event {
         publish: Option<u64>,
         /// The process of a member that installs a base above its checkpoint row.
         coverage: Option<u64>,
-        /// The health of the member's writer. An earlier binary sends none.
+        /// The health of the member's writer. A member without a writer sends none.
         writer: Option<shared::WriterReport>,
     },
-    /// The first peer frame of a stream or request came from this process of `member`. An
-    /// earlier binary sends no process.
+    /// The first peer frame of a stream or request came from this process of `member`, if the
+    /// frame names one.
     PeerProcess {
         member: u64,
         process: Option<u64>,
@@ -356,15 +356,12 @@ pub struct Node {
     /// still need the peer routes, so the test gives the samples itself.
     #[cfg(test)]
     clock_in_manual: bool,
-    /// The quota flag of this member and the membership guard of its directory.
+    /// The quota flag of this member.
     quota: quota::Quota,
     /// The term and index of the first `SeedMembers` proposal of this member in its last term.
     members_proposed: Option<(u64, u64)>,
     /// The last term in which this member proposed its digest again. See `propose_members`.
     members_rechecked: u64,
-    /// Simulation: the member proposes no `SeedMembers`, like an earlier binary.
-    #[cfg(test)]
-    pub(super) hold_members: bool,
     /// Tests: promote a shared learner without its write proof.
     #[cfg(test)]
     pub(super) skip_write_proof: bool,
@@ -447,22 +444,7 @@ impl Node {
                 &shared,
             )
             .await?;
-        // Mark the directory before the first format 4 row, not on open. See `RowMarker`.
-        state.row_marker = Some(storage.row_marker());
-        let quota = quota::Quota::open(
-            &options.dir,
-            quota::Startup {
-                flag: options.effective_quota(),
-                empty: empty_raft && state.applied == 0,
-            },
-        );
-        let mut quota = match quota {
-            Ok(quota) => quota,
-            Err(error) => {
-                let _ = state.close().await;
-                return Err(error);
-            }
-        };
+        let quota = quota::Quota::new(options.effective_quota());
         let recovered = async {
             // Apply takes the quota from the cluster claim. The flag only shows a difference.
             state.set_quota_flag(options.effective_quota());
@@ -503,54 +485,15 @@ impl Node {
                             member: options.id,
                             term: storage.initial_state()?.hard_state.term,
                         },
-                        quota.origin(),
                     )
                     .await?;
                     log::Cache::load(&storage, state.applied, options.log_memory)
                 }
                 loaded => loaded,
             };
-            let guards = quota::Guards::of(&state, quota.origin());
-            if guards.any() {
-                let (gate, scanned, open) = quota::scan_storage(&storage, state.applied, guards)?;
-                quota.set_scan(gate, scanned, open);
-            }
-            // A member that waits for a snapshot before its next entry does not hold its
-            // backlog. Raft treats the committed log as applied, and the cache keeps it only
-            // as evictable history. The snapshot install replaces it.
-            let mut raft_applied = state.applied;
-            let mut conf = state.members.conf();
-            let mut cache = match loaded {
-                Err(error)
-                    if error.is::<cache::PendingQuota>()
-                        && quota.blocked() == Some(state.applied + 1) =>
-                {
-                    // Shared mode does not take this start. An in-process base adoption would
-                    // make the member a voter again while Raft counts the skipped entries above
-                    // the base as applied. A shared member truncates its log at each checkpoint,
-                    // so such a backlog needs a log of an earlier binary that the leader never
-                    // truncated.
-                    ensure!(
-                        !state.is_shared(),
-                        "a waiting shared member cannot skip a log backlog above the pending log \
-                         memory; raise the pending log memory for this start"
-                    );
-                    raft_applied = storage.commit_index();
-                    tracing::warn!(
-                        applied = state.applied,
-                        commit = raft_applied,
-                        "the log backlog waits for a snapshot"
-                    );
-                    // Raft would count the skipped configuration changes as applied without
-                    // seeing them. So this member starts as a learner in memory: Raft does not
-                    // let it campaign or take a transfer, but it still votes. The snapshot
-                    // configuration makes it a voter again. Nothing stores this configuration.
-                    conf = quota::without_vote(conf, options.id);
-                    log::Cache::load(&storage, raft_applied, options.log_memory)?
-                }
-                loaded => loaded?,
-            };
-            cache.initial_conf = Some(conf);
+            let raft_applied = state.applied;
+            let mut cache = loaded?;
+            cache.initial_conf = Some(state.members.conf());
             let config = Config {
                 id: options.id,
                 election_tick: 10,
@@ -759,13 +702,10 @@ impl Node {
             members_proposed: None,
             members_rechecked: 0,
             #[cfg(test)]
-            hold_members: false,
-            #[cfg(test)]
             skip_write_proof: false,
             members_observed: false,
         };
         node.sync_members();
-        node.observe_quota()?;
         node.observe_members();
         // A request can arrive before the first apply or tick. The log cache must already know
         // the base to judge the record. See `Cache::has_image`.

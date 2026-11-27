@@ -92,19 +92,10 @@ struct Simulation {
     base_checks: u64,
     /// The `--quota-backend-bytes` value of each member. Zero selects 2 GiB.
     quotas: BTreeMap<u64, i64>,
-    /// Started members are directories of an earlier binary that propose no `SetQuota`.
-    upgraded: bool,
-    /// Started members propose no `SeedMembers`, like an earlier binary.
-    hold_members: bool,
     /// The number of voters.
     members: u64,
     /// The process ID of each started member, new at each start.
     processes: BTreeMap<u64, u64>,
-    /// Shared mode: members that run an earlier binary. They send no process ID and do not
-    /// advertise the coverage capability, and they install a view snapshot only at its row.
-    old: BTreeSet<u64>,
-    /// View snapshots that an earlier binary received, each checked at its row.
-    old_installs: u64,
     /// View snapshots above their row that the receiver refused before Raft saw them.
     refused_snapshots: u64,
     /// The checkpoints of the view snapshots that Raft received. IDs are random, so they stay
@@ -150,45 +141,21 @@ impl Simulation {
     /// Start three members on one fault-injectable in-memory store, with a reference state that
     /// checks each member state after every step.
     async fn new(seed: u64) -> Self {
-        Self::with_options(seed, BTreeMap::new(), true, false).await
+        Self::with_options(seed, BTreeMap::new(), true).await
     }
 
     /// Start three members. `reference` checks each member state against a reference state
-    /// after every step. `upgraded` starts the members as directories of an earlier binary.
-    async fn with_options(
-        seed: u64,
-        quotas: BTreeMap<u64, i64>,
-        reference: bool,
-        upgraded: bool,
-    ) -> Self {
-        Self::with_holds(seed, quotas, reference, upgraded, false).await
-    }
-
-    /// Like `with_options`. `hold_members` also starts the members without `SeedMembers`, so
-    /// each one stores its own flags, like an earlier binary.
-    async fn with_holds(
-        seed: u64,
-        quotas: BTreeMap<u64, i64>,
-        reference: bool,
-        upgraded: bool,
-        hold_members: bool,
-    ) -> Self {
-        Self::build(seed, quotas, reference, upgraded, hold_members, 3).await
+    /// after every step.
+    async fn with_options(seed: u64, quotas: BTreeMap<u64, i64>, reference: bool) -> Self {
+        Self::build(seed, quotas, reference, 3).await
     }
 
     /// Start a simulation with `members` voters and a reference state.
     async fn with_size(seed: u64, members: u64) -> Self {
-        Self::build(seed, BTreeMap::new(), true, false, false, members).await
+        Self::build(seed, BTreeMap::new(), true, members).await
     }
 
-    async fn build(
-        seed: u64,
-        quotas: BTreeMap<u64, i64>,
-        reference: bool,
-        upgraded: bool,
-        hold_members: bool,
-        members: u64,
-    ) -> Self {
+    async fn build(seed: u64, quotas: BTreeMap<u64, i64>, reference: bool, members: u64) -> Self {
         let root = tempfile::tempdir().unwrap();
         let reference = if reference {
             Some(reference::Reference::open(&root.path().join("reference")).await)
@@ -231,12 +198,8 @@ impl Simulation {
             view_checks: 0,
             base_checks: 0,
             quotas,
-            upgraded,
-            hold_members,
             members,
             processes: BTreeMap::new(),
-            old: BTreeSet::new(),
-            old_installs: 0,
             refused_snapshots: 0,
             delivered_views: vec![],
             extended: 0,
@@ -269,15 +232,8 @@ impl Simulation {
         }
         let store = self.shared.clone().expect("a shared store");
         let flag = self.quotas.get(&id).copied().unwrap_or(0);
-        if self.upgraded {
-            // An earlier binary created the directory, so this binary did not create it empty.
-            let dir = self.root.path().join(id.to_string());
-            std::fs::create_dir_all(&dir).unwrap();
-            let startup = quota::Startup { flag, empty: false };
-            quota::Quota::open(&dir, startup).unwrap();
-        }
         // Box the large open future, so the schedule future fits the test thread stack.
-        let mut node = Box::pin(Node::open_with_transport(
+        let node = Box::pin(Node::open_with_transport(
             NodeOptions {
                 client_peers: client_urls(id, self.members),
                 transport: crate::tls::Transport::default(),
@@ -315,7 +271,6 @@ impl Simulation {
         ))
         .await
         .unwrap();
-        node.hold_members = self.hold_members;
         self.nodes.insert(id, node);
         let process = self.processes.values().max().map_or(1, |last| last + 1);
         self.processes.insert(id, process);
@@ -743,25 +698,6 @@ impl Simulation {
         }
         panic!("lease command did not commit");
     }
-
-    async fn admin_command(&mut self, command: RaftCommand) -> Outcome<Value> {
-        let leader = self.leader().unwrap();
-        self.trace.push(format!("admin {}", command.id()));
-        let (tx, mut rx) = oneshot::channel();
-        self.nodes
-            .get_mut(&leader)
-            .unwrap()
-            .propose(command, tx)
-            .unwrap();
-        self.drive().await;
-        for _ in 0..500 {
-            self.deliver(false).await;
-            if let Ok(result) = rx.try_recv() {
-                return serde_json::from_value(result.unwrap()).unwrap();
-            }
-        }
-        panic!("admin command did not commit");
-    }
 }
 
 impl Simulation {
@@ -810,25 +746,8 @@ impl Simulation {
         std::fs::remove_dir_all(self.root.path().join(id.to_string())).unwrap();
         self.checked.remove(&id);
         self.terms.remove(&id);
-        let upgraded = std::mem::replace(&mut self.upgraded, false);
         self.quotas.insert(id, flag);
         self.start(id).await;
-        self.upgraded = upgraded;
-    }
-
-    /// Deliver messages until member `id` waits for a snapshot.
-    async fn until_waiting(&mut self, id: u64) {
-        for _ in 0..2000 {
-            if self.nodes[&id].quota.blocked().is_some() {
-                return;
-            }
-            if self.messages.is_empty() {
-                let leader = self.leader().unwrap();
-                self.tick(leader).await;
-            }
-            self.deliver(false).await;
-        }
-        panic!("member {id} does not wait for a snapshot");
     }
 
     /// A follower, not `except`.

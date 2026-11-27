@@ -14,10 +14,6 @@ impl Node {
     /// has not applied that entry yet, or has no row, proposes its digest once more after the
     /// first seed of its term applies. A new cluster pays one small entry for this.
     pub(super) fn propose_members(&mut self) -> Result<()> {
-        #[cfg(test)]
-        if self.hold_members {
-            return Ok(());
-        }
         let term = self.raw.raft.term;
         if self.raw.raft.state != StateRole::Leader || self.members_rechecked == term {
             return Ok(());
@@ -767,7 +763,6 @@ mod tests {
         let mut node = open_new_shared_member(dir, commands, pending)
             .await
             .unwrap();
-        assert!(node.quota.created_empty());
         for _ in 0..5 {
             node.drive_ready().await.unwrap();
             node.drain_log().await.unwrap();
@@ -776,64 +771,7 @@ mod tests {
         node
     }
 
-    /// Shared mode never starts a waiting member as a learner that skips its backlog. A base
-    /// adoption would make it a voter again while Raft counts the skipped entries as applied.
-    /// A backlog above the pending limit stops the start with an error instead.
-    #[tokio::test]
-    async fn a_waiting_shared_member_does_not_skip_its_backlog() {
-        let publish = RaftCommand::Cluster {
-            id: "legacy-publish".into(),
-            request: C::Publish {
-                id: 1,
-                client_urls: vec!["http://leader:2379".into()],
-            },
-            credentials: Default::default(),
-        };
-        let large = |n: usize| {
-            let mut command = put(n);
-            if let RaftCommand::Etcd { etcd, .. } = &mut command {
-                if let Some(crate::proto::etcdserverpb::request_op::Request::RequestPut(put)) =
-                    &mut etcd.request
-                {
-                    put.value = vec![1; 1 << 20];
-                }
-            }
-            command
-        };
-        let commands: Vec<_> = std::iter::once(publish).chain((0..12).map(large)).collect();
-        let dir = tempfile::tempdir().unwrap();
-        let error = open_new_shared_member(dir.path(), &commands, 9 << 20)
-            .await
-            .err()
-            .unwrap();
-        assert!(
-            format!("{error:#}").contains("waiting shared member"),
-            "{error:#}"
-        );
-    }
-
-    /// Shared mode: a new member gets an earlier binary's `Publish` at index 2. It applies index
-    /// 1 and stops there, without storing its own membership. It then recovers by snapshot, also
-    /// in an idle cluster. See `a_guarded_shared_member_recovers_in_an_idle_cluster` in DST.
-    #[tokio::test]
-    async fn a_new_shared_member_stops_at_an_earlier_binary_publish() {
-        let publish = RaftCommand::Cluster {
-            id: "legacy-publish".into(),
-            request: C::Publish {
-                id: 1,
-                client_urls: vec!["http://leader:2379".into()],
-            },
-            credentials: Default::default(),
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let node = new_shared_member(dir.path(), &[publish]).await;
-        assert_eq!(node.state.applied, 1);
-        assert!(node.state.members_row.is_none());
-        assert_eq!(node.quota_status()["blocked_index"], 2);
-    }
-
-    /// Shared mode guards only the membership. A new member applies the seed and then a Put. The
-    /// cluster claim sets the quota, so no `SetQuota` entry is needed.
+    /// A new member applies the seed and then a Put. The cluster claim sets the quota.
     #[tokio::test]
     async fn a_new_shared_member_applies_a_put_after_the_seed() {
         let peers = options(std::path::Path::new("")).peers;
@@ -848,6 +786,5 @@ mod tests {
         let node = new_shared_member(dir.path(), &[seed, put(1)]).await;
         assert_eq!((node.state.applied, node.state.revision), (3, 2));
         assert!(node.state.members_row.is_some());
-        assert!(!node.quota_guarded());
     }
 }

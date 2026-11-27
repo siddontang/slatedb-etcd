@@ -103,17 +103,8 @@ pub struct StateMachine {
     pub leases: Arc<std::collections::BTreeMap<i64, crate::lease::LeaseRecord>>,
     /// Journal rows of the current apply job for the in-memory Watch feed.
     pub(crate) watch_capture: Option<crate::watch::Capture>,
-    /// The data directory identity. The first write of a hash or Watch journal row marks it,
-    /// so older binaries refuse the directory only once it can hold format 4 rows.
-    pub(crate) row_marker: Option<Arc<crate::storage::RowMarker>>,
     /// The object namespace and current database path. Snapshot installs replace the database.
     pub(crate) location: Arc<transfer::Location>,
-    /// The next write batch stores the in-memory membership. Only a log of an earlier binary
-    /// sets it. See `state::cluster`.
-    pub(crate) members_unsaved: bool,
-    /// The length of the membership row that `before_entry` counted in the logical size before
-    /// the next batch stores it. See `state::cluster`.
-    members_counted: Option<usize>,
     /// The stored `etcd/members` row, if any. See `cluster::MembersRow`.
     pub(crate) members_row: Option<cluster::MembersRow>,
     /// The leader of the last `SeedMembers` entry whose row digest differed from this row.
@@ -239,9 +230,9 @@ pub(crate) fn slatedb_settings() -> Settings {
 
 /// Read the stored logical size, or count it when the counter does not match the apply marker.
 ///
-/// Directories from older binaries have no counter. An older binary that writes to a directory
-/// moves the apply marker past the counter, so the next open counts again. A counter without the
-/// split by row kind also comes from an older binary, so it is counted again too.
+/// An entry that changes no state writes no batch, so it moves the apply marker past the
+/// counter. The next open then counts again. A counter without the split by row kind is
+/// counted again too.
 async fn load_logical_size(db: &impl StateRead, applied: u64) -> Result<crate::batch::Usage> {
     use prost::Message;
     let stored = match db.get(LOGICAL_SIZE).await? {
@@ -353,8 +344,6 @@ impl StateMachine {
         };
         let (members, members_row) = cluster::load(&reads, applied).await?;
         // Each batch stores the counter row with the apply marker, so a base needs no full scan.
-        // A shared base from an older binary has only the total in `shared::LOGICAL_BYTES`, and
-        // its apply marker is past any counter row, so the open counts the split again.
         let logical_bytes = load_logical_size(&reads, applied).await?;
         Ok(Self {
             members: Arc::new(members),
@@ -379,10 +368,7 @@ impl StateMachine {
             compaction_plan: compaction::Planner::default(),
             leases: Arc::new(leases),
             watch_capture: None,
-            row_marker: None,
             location,
-            members_unsaved: false,
-            members_counted: None,
             members_row,
             members_mismatch: None,
             members_checked: None,
@@ -450,12 +436,6 @@ impl StateMachine {
         Self::open_shared(store, root, "test", cache, &shared::tests::options()).await
     }
 
-    /// Return true for a state from `open_memory`.
-    #[cfg(test)]
-    pub(crate) fn is_memory(&self) -> bool {
-        matches!(self.reads, StateView::Memory(_))
-    }
-
     /// Write `batch` into a state from `open_memory`, outside apply. A test changes the rows
     /// with this.
     #[cfg(test)]
@@ -506,18 +486,16 @@ impl StateMachine {
         Ok(())
     }
 
-    /// Store `batch` and return `size` with the added membership row, if any.
+    /// Store `batch` and return `size`.
     async fn store_batch(
         &mut self,
         mut batch: WriteBatch,
         index: u64,
         size: crate::batch::Usage,
     ) -> Result<crate::batch::Usage> {
-        let members_saved = self.members_unsaved;
-        if !members_saved
-            && batch
-                .keys()
-                .all(|key| key == APPLIED || key == APPLIED_TERM)
+        if batch
+            .keys()
+            .all(|key| key == APPLIED || key == APPLIED_TERM)
         {
             // An entry that changes no state writes no batch. Otherwise each announcement would
             // dirty the memtable, and its flush would cause the next announcement. The overlay
@@ -527,24 +505,6 @@ impl StateMachine {
             }
             return Ok(size);
         }
-        let mut size = size;
-        // The size of this batch counts the row that it stores, so remove the count of
-        // `before_entry`.
-        if let Some(counted) = self.members_counted.take() {
-            size.replace_row(crate::cluster::KEY, Some(counted), None)?;
-        }
-        if members_saved && !batch.contains(crate::cluster::KEY) {
-            let value = serde_json::to_vec(self.members.as_ref())?;
-            let old = self
-                .applied_state()
-                .get(crate::cluster::KEY)
-                .await?
-                .map(|v| v.len());
-            size.replace_row(crate::cluster::KEY, old, Some(value.len()))?;
-            self.members_row = Some(cluster::MembersRow::new(&value, index));
-            batch.put(crate::cluster::KEY, value);
-        }
-        self.mark_format_4(&batch)?;
         // Drop shared rows before SlateDB may expose the change. See `rows`.
         for key in batch.keys() {
             if let Some(key) = key.strip_prefix(mvcc::CURRENT) {
@@ -561,9 +521,6 @@ impl StateMachine {
             (Some(shared), _) => shared.overlay.push(index, batch.clone()),
         }
         self.write_batches += 1;
-        if members_saved {
-            self.members_unsaved = false;
-        }
         for (key, value) in batch.rows() {
             if let Some(capture) = &mut self.watch_capture {
                 capture.record(key, value);
@@ -575,26 +532,9 @@ impl StateMachine {
         Ok(size)
     }
 
-    /// Format 4 rows are hash digests and Watch journals without Put values. Mark the
-    /// directory durably before SlateDB can hold the first of them. Earlier batches, such as
-    /// empty entries and membership changes, leave the directory readable by older binaries.
-    fn mark_format_4(&self, batch: &WriteBatch) -> Result<()> {
-        if let Some(marker) = &self.row_marker {
-            if !marker.is_marked()
-                && (batch.puts_under(crate::maintenance::HASH)
-                    || batch.puts_under(crate::watch::EVENTS))
-            {
-                marker.mark()?;
-            }
-        }
-        Ok(())
-    }
-
     /// Store the logical size `size` at `index` in `batch`.
     fn put_logical_size(&self, batch: &mut WriteBatch, index: u64, size: crate::batch::Usage) {
-        // The counters are outside `etcd/`, so they do not count themselves. The state also
-        // keeps the eight-byte total, which older readers of the shared base load.
-        batch.put(shared::LOGICAL_BYTES, size.total().to_be_bytes());
+        // The counter is outside `etcd/`, so it does not count itself.
         batch.put(LOGICAL_SIZE, logical_size_row(index, size));
     }
 
@@ -637,7 +577,7 @@ fn decode_applied(row: Option<bytes::Bytes>) -> Result<u64> {
 }
 
 /// Read the term of the entry at `applied`. Zero means that the term is unknown: the row is
-/// missing, or an older binary advanced `meta/applied` after the row was written.
+/// missing, or does not hold the applied index.
 async fn read_applied_term(db: &impl StateRead, applied: u64) -> Result<u64> {
     let Some(row) = db.get(APPLIED_TERM).await? else {
         return Ok(0);
@@ -669,21 +609,17 @@ async fn read_compact_revision(db: &impl StateRead) -> Result<i64> {
 
 /// Return true when a native snapshot or backup can hold `key`.
 ///
-/// This binary never writes a derived meta row to an image or backup. An older binary that
-/// installed a copied checkpoint of this binary exports `meta/applied-term`, so readers accept
-/// the derived rows. Install replaces or drops them, and restore drops them.
+/// This binary never writes a derived meta row to an image or backup. Readers accept the derived
+/// rows, and restore drops them.
 fn snapshot_key(key: &[u8]) -> bool {
     key.starts_with(DATA) || key.starts_with(b"etcd/") || key == APPLIED || derived_key(key)
 }
 
 /// Return true for a meta row that each state derives again: the applied term, the logical
-/// size counters, and the progress of a shared restore. Format 4 images and backups omit these
-/// rows, so the previous reader accepts them.
+/// size counter, and the progress of a shared restore. Format 4 images and backups omit these
+/// rows.
 fn derived_key(key: &[u8]) -> bool {
-    key == APPLIED_TERM
-        || key == shared::LOGICAL_BYTES
-        || key == LOGICAL_SIZE
-        || key == shared::PROGRESS
+    key == APPLIED_TERM || key == LOGICAL_SIZE || key == shared::PROGRESS
 }
 
 fn data_key(key: &str) -> Vec<u8> {

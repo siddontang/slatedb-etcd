@@ -68,8 +68,8 @@ impl ViewDescriptor {
     }
 }
 
-/// Return true for a view snapshot above its checkpoint row. An earlier binary cannot install
-/// it, so it travels on its own route. See `peer::COVERED_ROUTE`.
+/// Return true for a view snapshot above its checkpoint row. It travels on its own route. See
+/// `peer::COVERED_ROUTE`.
 pub(crate) fn above_row(snapshot: &raft::eraftpb::Snapshot) -> bool {
     matches!(
         ViewDescriptor::decode(snapshot.get_data()),

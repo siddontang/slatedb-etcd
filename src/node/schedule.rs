@@ -93,7 +93,6 @@ impl Node {
     fn submit_entries(&mut self, applied: u64, committed: u64) -> Result<()> {
         let low = applied + 1;
         let high = (low + apply::APPLY_ENTRIES).min(committed + 1);
-        let high = self.quota_apply_limit(low, high);
         if high <= low {
             return Ok(());
         }
@@ -122,7 +121,6 @@ impl Node {
             let committed = self.committed_ready;
             if last >= committed
                 || self.apply_paused()
-                || self.quota_guarded()
                 || self.raw.store().snapshot_pending()
                 || self.installing()
                 || self.prepared_puts.is_some()
@@ -185,9 +183,6 @@ impl Node {
         // A switch frees overlay memory, so it goes before other work.
         if self.prepared_puts.is_none() && self.take_switch() {
             return self.submit_apply(Job::SwitchBase, self.state.applied);
-        }
-        if self.prepared_puts.is_none() && self.take_mark_row() {
-            return self.submit_apply(Job::MarkRow, self.state.applied);
         }
         if let Some((base, term)) = self.adoptable() {
             let index = base.applied;
@@ -273,7 +268,6 @@ impl Node {
         let mut state = state;
         let batch = state.watch.take();
         self.state = state;
-        self.observe_quota()?;
         self.observe_members();
         self.forwarding.apply(self.state.revision);
         self.publish_local_reads();

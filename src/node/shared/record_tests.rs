@@ -127,7 +127,7 @@ async fn a_restart_opens_the_record_checkpoint_above_its_row() {
     assert_eq!(plain.applied, 2);
     assert!(Node::align_log(&mut storage, &plain).is_err());
     plain.close().await.unwrap();
-    // A record at the checkpoint row, as an earlier binary writes it, extends nothing.
+    // A record at the checkpoint row extends nothing.
     let at_row = Record {
         checkpoint: x,
         index: 2,
@@ -178,8 +178,8 @@ async fn a_restart_opens_the_record_checkpoint_above_its_row() {
 }
 
 /// The shared state of `retired`: checkpoint Z at row 1, then X and Y at row 2, and a leader
-/// that applied no-op entries 3 to 5 in term 2. W has row 3: the leader stored the apply marker
-/// at 3, as it does for an earlier binary, and published it.
+/// that applied entries 3 to 5 in term 2. W has row 3: the leader stored a batch at 3 and
+/// published it.
 struct Retired {
     store: Arc<dyn ObjectStore>,
     leader: StateMachine,
@@ -272,8 +272,17 @@ async fn retired_in(store: Arc<dyn ObjectStore>) -> Retired {
         .unwrap()
         .id;
     leader.entry_term = 2;
-    leader.apply(3, None).await.unwrap();
-    leader.mark_row().unwrap();
+    // A batch at 3 puts the row of the next checkpoint there.
+    let row = crate::Command {
+        id: "row".into(),
+        request: crate::Request {
+            operations: vec![crate::Operation::Put {
+                key: "row".into(),
+                value: "3".into(),
+            }],
+        },
+    };
+    leader.apply(3, Some(&row)).await.unwrap();
     materialize(&leader).await;
     let w = db
         .create_checkpoint(CheckpointScope::Durable, &checkpoint(3))

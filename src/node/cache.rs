@@ -134,8 +134,6 @@ pub(super) struct Cache {
     wanted_term: Cell<u64>,
     // The process of each peer, for the coverage capability. See `PeerProcess`.
     peers: RefCell<BTreeMap<u64, PeerProcess>>,
-    // A member without the coverage capability needs a record at its checkpoint row.
-    exact_wanted: Cell<bool>,
     // Shared mode: the checkpoint and the index of this member's base.
     base: Cell<Option<(uuid::Uuid, u64)>>,
     pub durable: log::Durable,
@@ -161,7 +159,6 @@ impl Cache {
             wanted: RefCell::default(),
             wanted_term: Cell::new(0),
             peers: RefCell::default(),
-            exact_wanted: Cell::new(false),
             base: Cell::new(None),
             durable,
         };
@@ -275,7 +272,6 @@ impl Cache {
                 || durable.snapshot.data != self.durable.snapshot.data);
         if new_image {
             self.image_wanted.set(false);
-            self.exact_wanted.set(false);
         }
         if durable.snapshot.get_metadata().index > self.snapshot.get_metadata().index {
             let end = durable.snapshot.get_metadata().index + 1;
@@ -488,7 +484,7 @@ impl Cache {
         }
     }
     /// Note that process `process` of `peer` installs a base above its checkpoint row. A report
-    /// without a process, from an earlier binary, removes the capability.
+    /// without a process removes the capability.
     pub fn note_coverage(&self, peer: u64, process: Option<u64>) {
         self.peers.borrow_mut().entry(peer).or_default().advertised = process;
     }
@@ -521,10 +517,6 @@ impl Cache {
             .then(|| self.peers.borrow()[&peer].process)
             .flatten()
     }
-    /// Return true after a member without the capability needed a record at its row.
-    pub fn exact_wanted(&self) -> bool {
-        self.exact_wanted.get()
-    }
     /// Note the checkpoint and the index of this member's base.
     pub fn note_base(&self, base: Option<(uuid::Uuid, u64)>) {
         self.base.set(base);
@@ -551,9 +543,8 @@ impl Cache {
 }
 
 /// The process of a peer. A member sends a random process ID with its transport frames and its
-/// `ViewAck` reports. An earlier binary sends none. The coverage capability holds only for the
-/// process that advertised it, so a restart on an earlier binary with the same member ID loses
-/// it at its first frame.
+/// `ViewAck` reports. The coverage capability holds only for the process that advertised it, so
+/// a restart with the same member ID loses it at its first frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PeerProcess {
     /// The process of the last transport frame.
@@ -674,21 +665,17 @@ impl Storage for Cache {
             self.image_wanted.set(true);
             if target > self.snapshot_index() {
                 self.wanted.borrow_mut().insert(to, target);
-                // An earlier binary gets only a record at its row.
-                if !self.coverage_capable(to) {
-                    self.exact_wanted.set(true);
-                }
             }
             return Err(StorageError::SnapshotTemporarilyUnavailable.into());
         }
-        // An earlier binary installs a view record only at its checkpoint row.
+        // A member installs a view record above its checkpoint row only once its current
+        // process advertised that it can. Raft retries after its report.
         if let Ok(Some(view)) =
             crate::state::transfer::ViewDescriptor::decode(&self.durable.snapshot.data)
         {
             if view.row.is_some_and(|row| row < self.snapshot_index()) && !self.coverage_capable(to)
             {
                 self.image_wanted.set(true);
-                self.exact_wanted.set(true);
                 return Err(StorageError::SnapshotTemporarilyUnavailable.into());
             }
         }
@@ -880,7 +867,7 @@ mod tests {
     }
 
     /// A record above its checkpoint row goes only to a peer whose current process advertised
-    /// the capability. A new process of the same member, of an earlier binary, loses it.
+    /// the capability. A new process of the same member loses it.
     #[test]
     fn a_record_above_its_row_needs_a_capable_process() {
         let (_dir, mut storage, mut cache) = stored();
@@ -900,12 +887,11 @@ mod tests {
         cache.note_base(Some((id, 6)));
         assert!(cache.has_image());
         assert!(cache.snapshot(6, 2).is_err());
-        assert!(cache.exact_wanted());
         cache.note_process(2, Some(7));
         cache.note_coverage(2, Some(7));
         assert!(cache.coverage_capable(2));
         assert_eq!(cache.snapshot(6, 2).unwrap().get_metadata().index, 6);
-        // The same member starts again on an earlier binary.
+        // A frame of the same member without a process ends the capability.
         cache.note_process(2, None);
         assert!(!cache.coverage_capable(2));
         assert!(cache.snapshot(6, 2).is_err());
