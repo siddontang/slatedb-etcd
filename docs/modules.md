@@ -19,6 +19,7 @@ The table gives the responsibility of each module. A module is not always the ow
 - Some modules own a type with private fields, and the other modules call its methods:
   `Writer` in `node/shared/writer`, `EarlyPuts` in `node/quorum_put`, `Checkpointer` in
   `node/checkpoint`, `ReadIndexTable` in `node/read/table`, `LeaseClock` in `node/lease/clock`,
+  `PeerLinks` in `node/links`,
   `Group` in `node/proposal`, `Publisher` in `node/forwarding` and `node/watch`, the log `Worker`
   in `node/log`, `KeyIndex` in `state/key_index`, `Overlay` in `state/overlay`, and `RowCache` in
   `state/rows`.
@@ -34,6 +35,7 @@ The table gives the responsibility of each module. A module is not always the ow
 | `command` | Encode and decode internal Raft commands |
 | `node` | Own RawNode, admission, elections, and client completion |
 | `node/ready` | Order Ready delivery, durable completions, and peer acknowledgements |
+| `node/links` | Keep the queue, sender task, meter, and health of each outgoing peer link |
 | `node/log` and `node/cache` | Isolate disk work and bound retained log memory |
 | `node/schedule` | Dispatch state work and publish completed apply positions |
 | `node/checkpoint` | Decide when a checkpoint starts, and keep manual checkpoint requests |

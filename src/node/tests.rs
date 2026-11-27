@@ -544,7 +544,7 @@ async fn read_batches_freeze_before_quorum_and_survive_a_cancelled_first_request
     let dir = tempfile::tempdir().unwrap();
     let mut node = leader_node(dir.path()).await;
     let (sender, mut messages) = mpsc::channel(256);
-    node.senders.insert(2, sender);
+    node.links.connect(2, sender);
     let syncs = node.raw.store().durable.sync_writes;
     let (first, cancelled) = oneshot::channel();
     let (second, mut reply) = oneshot::channel();
@@ -635,7 +635,7 @@ async fn a_slow_log_write_does_not_stop_leader_heartbeats() {
     let dir = tempfile::tempdir().unwrap();
     let mut node = leader_node(dir.path()).await;
     let (sender, mut messages) = mpsc::channel(1024);
-    node.senders.insert(2, sender);
+    node.links.connect(2, sender);
     let (tx, reply) = oneshot::channel();
     node.propose(
         RaftCommand::Lease {
@@ -716,7 +716,7 @@ async fn ready_records_behind_a_slow_log_write_are_bounded() {
     let dir = tempfile::tempdir().unwrap();
     let mut node = leader_node(dir.path()).await;
     let (sender, mut messages) = mpsc::channel(1024);
-    node.senders.insert(2, sender);
+    node.links.connect(2, sender);
     let (tx, _reply) = oneshot::channel();
     node.propose(
         RaftCommand::Lease {
@@ -760,7 +760,7 @@ async fn follower_responses_wait_for_their_write_and_count_as_queued_bytes() {
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
     let (sender, mut messages) = mpsc::channel(1024);
-    node.senders.insert(2, sender);
+    node.links.connect(2, sender);
     let leader = |kind: MessageType| {
         let mut message = Message::default();
         message.set_msg_type(kind);
