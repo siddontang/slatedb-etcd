@@ -127,24 +127,26 @@ the configuration change.
    has a random nonce. The leader binds it to its term, the member, and the member's process,
    and it records the send time.
 2. The learner uses the store client of its own writer. It creates
-   `shared/state/.probe/<member>-<process>-<nonce>` with `PutMode::Create` and deletes it.
-   SlateDB 0.18.1 writes each manifest version with `PutMode::Create`
+   `shared/state/.probe/<member>-<process>` with `PutMode::Create` and deletes it. The key has no
+   nonce. SlateDB 0.18.1 writes each manifest version with `PutMode::Create`
    (`slatedb-txn-obj-0.18.1/src/object_store.rs:383`), so a create and a delete show the access
-   of a writer.
+   of a writer. A refused delete fails the probe, also when the object is gone.
 3. The leader accepts only the reply to that nonce, from that process, with the store ID of the
    claim, within 15 s of the send. A proof counts for 60 s from the send. A late or repeated reply
-   does not extend it. A new term or a new learner process drops it.
+   does not extend it. A new learner process drops the proof and the running probe when its
+   first frame arrives. A role change drops every proof.
 4. Without a valid proof, the promotion fails with the retryable `FailedPrecondition`. The error
    names a missing, failed, or expired proof. The request starts a probe unless one runs. After a
    failed probe the next one waits 1 s, then 2 s, up to 30 s. Call `member promote` again.
 
-A create can time out after it reached the store, and a delete can fail. The learner then keeps
-the key and deletes it before it creates another, so it leaves at most one scratch object per
-process. A refused delete of an object that does not exist is no leak: a read-only create stores
-nothing.
+A create can time out and reach the store later, also after a later probe. A delete can fail.
+Each leaves the one object of the key, so a process leaves at most one scratch object. The next
+create then fails with `AlreadyExists`. The learner deletes the object and creates it once more.
 
-`/status` of the leader shows the proofs as `shared_state.writer.write_proofs`. They are
-diagnostic. A leader handoff does not use them.
+`/status` of the leader shows the proofs as `shared_state.writer.write_proofs`, with the age and
+the remaining time of each proof. A probe with no reply by its deadline shows as timed out. The
+leader drops the record of a member that leaves the configuration. The proofs are diagnostic. A
+leader handoff does not use them.
 
 ## Bootstrap
 
