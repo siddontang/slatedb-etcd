@@ -36,7 +36,6 @@ impl Slot {
 struct Work {
     view: Arc<crate::state::ReadView>,
     queries: Vec<Query>,
-    header: Header,
     slot: Slot,
     deadline: tokio::time::Instant,
     row_budget: usize,
@@ -105,12 +104,7 @@ impl Executor {
         !self.exclusive && self.over_budget.is_empty()
     }
 
-    pub fn submit(
-        &mut self,
-        view: Arc<crate::state::ReadView>,
-        queries: Vec<Query>,
-        header: Header,
-    ) {
+    pub fn submit(&mut self, view: Arc<crate::state::ReadView>, queries: Vec<Query>) {
         assert!(!queries.is_empty() && queries.len() <= apply::READ_BATCH);
         assert!(self.can_submit(&queries[0]));
         let slot = Slot::of(&queries[0]);
@@ -118,7 +112,6 @@ impl Executor {
         let work = Work {
             view,
             queries,
-            header,
             slot,
             deadline: tokio::time::Instant::now()
                 + match slot {
@@ -153,17 +146,27 @@ impl Executor {
         }
     }
 
-    /// Start the oldest scan over budget once no other wide read runs.
-    fn start_over_budget(&mut self) {
-        if self.has_capacity() && !self.exclusive && self.scans == 0 {
-            if let Some(mut work) = self.over_budget.pop_front() {
+    /// Start the oldest scan over budget once no other wide read runs. Drop the queries whose
+    /// caller left, as `live` tells, and the scans with no caller left.
+    fn start_over_budget(&mut self, live: &impl Fn(&Query) -> bool) {
+        while self.has_capacity() && !self.exclusive && self.scans == 0 {
+            let Some(mut work) = self.over_budget.pop_front() else {
+                return;
+            };
+            work.queries.retain(live);
+            if !work.queries.is_empty() {
                 work.slot = Slot::Exclusive;
                 self.start(work);
             }
         }
     }
 
-    fn finish(&mut self, slot: Slot, done: Done) -> Option<Result<Output>> {
+    fn finish(
+        &mut self,
+        slot: Slot,
+        done: Done,
+        live: &impl Fn(&Query) -> bool,
+    ) -> Option<Result<Output>> {
         self.release(slot);
         let output = match done {
             Done::Output(output) => Some(output),
@@ -176,18 +179,19 @@ impl Executor {
                 None
             }
         };
-        self.start_over_budget();
+        self.start_over_budget(live);
         output
     }
 
-    pub async fn next(&mut self) -> Result<Output> {
+    /// Wait for the next result. `live` tells whether the caller of a query still waits.
+    pub async fn next(&mut self, live: impl Fn(&Query) -> bool) -> Result<Output> {
         loop {
             let (slot, done) = self
                 .tasks
                 .join_next()
                 .await
                 .context("read worker stopped")??;
-            if let Some(output) = self.finish(slot, done) {
+            if let Some(output) = self.finish(slot, done, &live) {
                 return output;
             }
         }
@@ -210,14 +214,14 @@ impl Executor {
     }
 
     #[cfg(test)]
-    pub async fn step(&mut self) -> Result<Option<Output>> {
+    pub async fn step(&mut self, live: impl Fn(&Query) -> bool) -> Result<Option<Output>> {
         loop {
             let jobs = self.manual.as_mut().context("read worker is not manual")?;
             let Some(work) = jobs.pop_front() else {
                 return Ok(None);
             };
             let slot = work.slot;
-            if let Some(output) = self.finish(slot, execute(work).await) {
+            if let Some(output) = self.finish(slot, execute(work).await, &live) {
                 return output.map(Some);
             }
         }
@@ -256,13 +260,12 @@ async fn execute_wide(work: Work) -> Done {
         let (request, credentials) = request(&work.queries[0])?;
         work.view.read_within(request, credentials, budget).await
     };
-    let mut outcome = match tokio::time::timeout_at(work.deadline, read).await {
+    let outcome = match tokio::time::timeout_at(work.deadline, read).await {
         Ok(Ok(Some(outcome))) => outcome,
         Ok(Ok(None)) => return Done::OverBudget(work),
         Ok(Err(error)) => return Done::Output(Err(error)),
         Err(_) => timed_out(),
     };
-    work.header.outcome(&mut outcome);
     let mut queries = work.queries;
     if queries.len() > 1 {
         // Each request already has a quorum proof. All read the same pinned view.
@@ -273,7 +276,7 @@ async fn execute_wide(work: Work) -> Done {
                 _ => unreachable!(),
             })
             .collect();
-        return Done::Output(Ok(Output::SharedLinear(ids, Arc::new(outcome))));
+        return Done::Output(Ok(Output::SharedLinear(ids, outcome)));
     }
     Done::Output(Ok(Output::Reads(vec![output(
         queries.pop().unwrap(),
@@ -285,7 +288,7 @@ async fn execute_points(work: Work) -> Result<Output> {
     let mut outputs = Vec::with_capacity(work.queries.len());
     for query in work.queries {
         let (request, credentials) = request(&query)?;
-        let mut outcome = match tokio::time::timeout_at(
+        let outcome = match tokio::time::timeout_at(
             work.deadline,
             work.view.read(request, credentials),
         )
@@ -294,7 +297,6 @@ async fn execute_points(work: Work) -> Result<Output> {
             Ok(outcome) => outcome?,
             Err(_) => timed_out(),
         };
-        work.header.outcome(&mut outcome);
         outputs.push(output(query, outcome));
     }
     Ok(Output::Reads(outputs))

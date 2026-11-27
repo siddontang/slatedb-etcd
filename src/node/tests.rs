@@ -115,7 +115,7 @@ async fn point_read_batches_stop_before_scans_and_historical_reads() {
     }
     for count in [apply::READ_BATCH, 4, 1, 1, 1] {
         node.drive_ready().await.unwrap();
-        let completion = node.read_executor.step().await.unwrap().unwrap();
+        let completion = node.step_read().await.unwrap().unwrap();
         match &completion {
             Output::Reads(reads) => assert_eq!(reads.len(), count),
             Output::Read { .. } => assert_eq!(count, 1),
@@ -1003,7 +1003,7 @@ async fn read_index_wait_expires_but_a_running_read_finishes() {
     // microseconds that passed before the clock paused.
     let left = node.read_executor.manual_time_left().unwrap();
     assert!(left > Duration::from_secs(53) && left <= Duration::from_secs(54));
-    let output = node.read_executor.step().await.unwrap().unwrap();
+    let output = node.step_read().await.unwrap().unwrap();
     tokio::time::resume();
     node.complete_read(output).unwrap();
     let Some(Resp::ResponseRange(range)) = running
@@ -1055,19 +1055,25 @@ async fn a_confirmed_read_outlives_the_read_index_wait_and_a_leader_change() {
     assert!(unconfirmed.await.unwrap().is_err());
     assert_eq!(node.reads.ids().collect::<Vec<_>>(), vec![id]);
 
-    let output = node.read_executor.step().await.unwrap().unwrap();
+    let output = node.step_read().await.unwrap().unwrap();
     node.complete_read(output).unwrap();
     node.schedule_reads();
     assert_eq!(node.read_executor.len(), 1);
-    let output = node.read_executor.step().await.unwrap().unwrap();
+    // The term changes again while the read runs.
+    node.raw.raft.become_follower(term + 2, 0);
+    let output = node.step_read().await.unwrap().unwrap();
     node.complete_read(output).unwrap();
-    let range = confirmed
+    let mut range = confirmed
         .await
         .unwrap()
         .unwrap()
         .into_outcome()
         .result
         .unwrap();
+    // As in etcd, the header has the term at reply time and the revision of the pinned view.
+    let header = crate::mvcc::response_header(&mut range).unwrap();
+    assert_eq!(header.raft_term, term + 2);
+    assert_eq!(header.revision, 9);
     let Some(Resp::ResponseRange(range)) = range.response else {
         panic!("expected a range response");
     };
@@ -1114,15 +1120,98 @@ async fn a_queued_read_whose_caller_left_does_not_start() {
     assert_eq!(node.reads.queued(), 2);
     drop(gone);
 
-    let output = node.read_executor.step().await.unwrap().unwrap();
+    let output = node.step_read().await.unwrap().unwrap();
     node.complete_read(output).unwrap();
     assert!(held.await.unwrap().is_ok());
     node.schedule_reads();
     assert_eq!(node.read_executor.len(), 1);
     assert_eq!(node.reads.queued(), 0);
-    let output = node.read_executor.step().await.unwrap().unwrap();
+    let output = node.step_read().await.unwrap().unwrap();
     node.complete_read(output).unwrap();
     assert!(live.await.unwrap().is_ok());
+}
+
+/// A full queue of wide reads does not hold back a confirmed point read, such as the health
+/// check, while an executor task is free.
+#[tokio::test]
+async fn a_confirmed_point_read_starts_past_a_full_queue_of_wide_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    let mut held = vec![];
+    for count in [1, apply::MAX_QUERIES] {
+        for _ in 0..count {
+            let (tx, rx) = oneshot::channel();
+            node.enqueue_query(sorted_read(tx));
+            held.push(rx);
+        }
+        node.drive_ready().await.unwrap();
+    }
+    assert_eq!(node.read_executor.len(), 1);
+    assert_eq!(node.reads.queued(), apply::MAX_QUERIES);
+
+    let (tx, probe) = oneshot::channel();
+    node.linear_read_auth(range_request(), None, ClientResponse::Kv(tx));
+    let id = node.reads.ids().next().unwrap();
+    node.drive_ready().await.unwrap();
+    confirm_read(&mut node, &id).await;
+    // The exclusive read still holds its slot. The point read runs beside it.
+    assert_eq!(node.read_executor.len(), 2);
+    assert_eq!(node.reads.queued(), apply::MAX_QUERIES);
+    node.drain_reads().await.unwrap();
+    assert!(probe.await.unwrap().unwrap().into_outcome().result.is_ok());
+    for rx in held {
+        assert!(rx.await.unwrap().unwrap().into_outcome().result.is_ok());
+    }
+}
+
+/// A scan over its row budget runs again alone only for the callers that still wait. One live
+/// caller keeps a shared rerun. A rerun with no live caller does not start.
+#[tokio::test]
+async fn an_over_budget_rerun_starts_only_for_live_callers() {
+    use crate::proto::etcdserverpb::response_op::Response as Resp;
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    put_letters(&mut node).await;
+    node.read_executor.scan_row_budget = 500;
+    let mut replies = vec![];
+    for start in [b"a", b"a", b"b"] {
+        let (tx, rx) = oneshot::channel();
+        node.linear_read_auth(wide_range(start, b"z"), None, ClientResponse::Kv(tx));
+        replies.push(rx);
+    }
+    let first = node.reads.ids().next().unwrap();
+    node.drive_ready().await.unwrap();
+    confirm_read(&mut node, &first).await;
+    // One shared scan for the two equal LISTs and one scan for the other.
+    assert_eq!(node.read_executor.len(), 2);
+    let gone = replies.split_off(1);
+    drop(gone);
+
+    // Both scans go over budget. The shared one runs again for its live caller.
+    let output = node.step_read().await.unwrap().unwrap();
+    assert_eq!(node.read_executor.reruns, 2);
+    // The other rerun has no caller left and does not take the exclusive slot.
+    assert_eq!(node.read_executor.len(), 0);
+    assert!(node
+        .read_executor
+        .can_submit(&sorted_read(oneshot::channel().0)));
+    node.complete_read(output).unwrap();
+    let Some(Resp::ResponseRange(range)) = replies
+        .pop()
+        .unwrap()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_outcome()
+        .result
+        .unwrap()
+        .response
+    else {
+        panic!("expected a range response");
+    };
+    assert_eq!(range.kvs.len(), 8);
+    assert!(node.step_read().await.unwrap().is_none());
+    assert_eq!(node.reads.pending(), 0);
 }
 
 #[tokio::test]
@@ -1234,7 +1323,7 @@ async fn confirmed_scans_share_only_matching_requests_and_credentials() {
     node.drive_ready().await.unwrap();
     assert_eq!(node.read_executor.len(), 0);
     confirm_read(&mut node, &first).await;
-    let shared = node.read_executor.step().await.unwrap().unwrap();
+    let shared = node.step_read().await.unwrap().unwrap();
     assert!(matches!(&shared, Output::SharedLinear(ids, _) if ids.len() == 2));
     node.complete_read(shared).unwrap();
     let second = replies[1].try_recv().unwrap().unwrap();
@@ -1244,12 +1333,12 @@ async fn confirmed_scans_share_only_matching_requests_and_credentials() {
     };
     assert!(std::sync::Arc::ptr_eq(&a, &b));
     node.drive_ready().await.unwrap();
-    let single = node.read_executor.step().await.unwrap().unwrap();
+    let single = node.step_read().await.unwrap().unwrap();
     assert!(matches!(&single, Output::Reads(outputs) if outputs.len() == 1));
     node.complete_read(single).unwrap();
     assert!(replies[2].try_recv().unwrap().is_ok());
     node.drive_ready().await.unwrap();
-    let delayed = node.read_executor.step().await.unwrap().unwrap();
+    let delayed = node.step_read().await.unwrap().unwrap();
     assert!(matches!(&delayed, Output::SharedLinear(ids, _) if ids.len() == 2));
     // The quorum confirmed these reads, so a later term change does not void their result.
     node.raw.raft.become_follower(node.raw.raft.term + 1, 2);
@@ -1259,16 +1348,25 @@ async fn confirmed_scans_share_only_matching_requests_and_credentials() {
     }
 }
 
+/// A confirmed read waits for local apply to reach its read index, also across a term change,
+/// and then returns the committed write.
 #[tokio::test]
 async fn read_index_waits_for_apply_and_keeps_its_result_after_term_change() {
+    use crate::proto::etcdserverpb::{request_op::Request as Op, PutRequest};
     let dir = tempfile::tempdir().unwrap();
     let mut node = leader_node(dir.path()).await;
     let (tx, _) = oneshot::channel();
     node.propose(
-        RaftCommand::Lease {
+        RaftCommand::Etcd {
+            id: "put-key".into(),
             origin: 1,
-            id: "advance".into(),
-            lease: LeaseCommand::List,
+            etcd: RequestOp {
+                request: Some(Op::RequestPut(PutRequest {
+                    key: b"key".to_vec(),
+                    value: b"value".to_vec(),
+                    ..Default::default()
+                })),
+            },
         },
         tx,
     )
@@ -1286,21 +1384,35 @@ async fn read_index_waits_for_apply_and_keeps_its_result_after_term_change() {
     node.drain_log().await.unwrap();
     assert!(node.state.applied < node.raw.store().commit_index());
     let (tx, mut reply) = oneshot::channel();
-    node.linear_read(range_request(), tx);
+    node.linear_read_auth(range_request(), None, ClientResponse::Kv(tx));
     let id = node.reads.ids().next().unwrap();
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
     confirm_read(&mut node, &id).await;
-    assert!(reply.try_recv().is_err());
-    assert!(!node.apply.has_queries(), "read passed the apply barrier");
-    let completed = node.worker.step().await.unwrap().unwrap();
-    node.complete_apply(completed).unwrap();
-    node.drive_ready().await.unwrap();
-    let read_result = node.read_executor.step().await.unwrap().unwrap();
-    // The read ran at or above its confirmed read index, so it stays linearizable, as in etcd.
+    // The quorum confirmed the read, so a term change while apply lags does not void it.
     node.raw.raft.become_follower(node.raw.raft.term + 1, 2);
+    node.expire_reads();
+    node.drive_ready().await.unwrap();
+    assert!(reply.try_recv().is_err());
+    assert_eq!(node.reads.pending(), 1);
+    assert_eq!(node.reads.queued(), 0);
+    assert_eq!(node.read_executor.len(), 0, "read passed the apply barrier");
+    node.drain_state().await.unwrap();
+    assert_eq!(node.read_executor.len(), 1);
+    let read_result = node.step_read().await.unwrap().unwrap();
     node.complete_read(read_result).unwrap();
-    assert!(reply.await.unwrap().is_ok());
+    let mut result = reply.await.unwrap().unwrap().into_outcome().result.unwrap();
+    assert_eq!(
+        crate::mvcc::response_header(&mut result).unwrap().revision,
+        2
+    );
+    let Some(crate::proto::etcdserverpb::response_op::Response::ResponseRange(range)) =
+        result.response
+    else {
+        panic!("expected a range response");
+    };
+    assert_eq!(range.kvs.len(), 1);
+    assert_eq!(range.kvs[0].value, b"value");
     assert_eq!(node.reads.pending(), 0);
 }
 
@@ -1758,7 +1870,7 @@ async fn independent_reads_pin_their_view_and_do_not_wait_for_apply() {
     let (tx, reply) = oneshot::channel();
     node.enqueue_query(Query::Read(range_request(), None, ClientResponse::Kv(tx)));
     node.drive_ready().await.unwrap();
-    let read = node.read_executor.step().await.unwrap().unwrap();
+    let read = node.step_read().await.unwrap().unwrap();
     node.complete_read(read).unwrap();
     assert!(reply.await.unwrap().unwrap().into_outcome().result.is_ok());
     assert_eq!(node.state.applied, 0);
@@ -1770,7 +1882,7 @@ async fn independent_reads_pin_their_view_and_do_not_wait_for_apply() {
     let applied = node.worker.step().await.unwrap().unwrap();
     node.complete_apply(applied).unwrap();
     assert_eq!(node.state.applied, apply::APPLY_ENTRIES);
-    let read = node.read_executor.step().await.unwrap().unwrap();
+    let read = node.step_read().await.unwrap().unwrap();
     node.complete_read(read).unwrap();
     let mut result = reply.await.unwrap().unwrap().into_outcome().result.unwrap();
     assert_eq!(

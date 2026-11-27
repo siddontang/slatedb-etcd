@@ -236,7 +236,7 @@ pub(super) enum Output {
     /// Shared mode dropped an opened base that does not load, and it kept its own base.
     RejectedBase(RejectedBase),
     Reads(Vec<Output>),
-    SharedLinear(Vec<u64>, std::sync::Arc<Outcome>),
+    SharedLinear(Vec<u64>, Outcome),
     Linear {
         id: u64,
         outcome: Outcome,

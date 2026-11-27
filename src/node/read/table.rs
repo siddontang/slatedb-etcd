@@ -257,12 +257,11 @@ impl ReadIndexTable {
         }
     }
 
-    /// Queue each read whose proven index `applied` reaches, while the queue has room.
+    /// Queue each read whose proven index `applied` reaches. `MAX_PENDING_READS` bounds these
+    /// reads, so they do not wait for room in the queue: a full queue of wide reads must not
+    /// hold back a point read, such as a health check, while an executor task is free.
     pub(in crate::node) fn queue_confirmed(&mut self, applied: u64) {
         for (id, read) in &mut self.reads {
-            if self.queries.len() >= apply::MAX_QUERIES {
-                break;
-            }
             if read.index.is_some_and(|index| index <= applied) {
                 if let Some(request) = read.request.take() {
                     self.queries
@@ -304,8 +303,9 @@ impl ReadIndexTable {
     pub(in crate::node) fn finish_shared(
         &mut self,
         ids: Vec<u64>,
-        outcome: std::sync::Arc<crate::mvcc::Outcome>,
+        outcome: crate::mvcc::Outcome,
     ) -> Result<()> {
+        let outcome = std::sync::Arc::new(outcome);
         for id in ids {
             if let Some(read) = self.reads.remove(&id) {
                 read.response.shared_kv(outcome.clone())?;
@@ -366,6 +366,18 @@ impl ReadIndexTable {
             _ => true,
         });
         failed.len()
+    }
+
+    /// The caller of `query` still waits for its result.
+    pub(in crate::node) fn live(&self, query: &Query) -> bool {
+        match query {
+            Query::Linear(_, _, id) => self
+                .reads
+                .get(id)
+                .is_some_and(|read| !read.response.is_closed()),
+            Query::Read(_, _, response) => !response.is_closed(),
+            _ => true,
+        }
     }
 
     /// Fail each read whose proven index is above `applied`.

@@ -734,7 +734,8 @@ impl Node {
                         return Err(error);
                     }
                 }
-                read = self.read_executor.next(), if self.read_executor.len() > 0 => {
+                read = self.read_executor.next(|query| self.reads.live(query)),
+                    if self.read_executor.len() > 0 => {
                     self.complete_read(read?)?;
                 }
                 event = events.recv() => {
