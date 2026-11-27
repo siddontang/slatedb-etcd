@@ -162,7 +162,10 @@ Each job shares a pinned SlateDB view with matching revision, compaction, Auth, 
 The apply owner publishes this view after a complete state write or snapshot installation.
 A read can finish from an older view while later writes apply. Its proof must cover that view.
 Read completion does not move the apply index or copy state metadata.
-The owner still checks the read proof and apply position before it sends a response.
+The owner dispatches a linearizable read only after its quorum proof and once the apply index
+reaches the proven read index. A term change does not cancel a confirmed read, because the
+proof already holds for that index. At completion the owner fills the current term into the
+header and returns the result from the pinned view.
 Read evaluation does not construct a discarded write batch.
 
 The apply owner keeps an in-memory key index with revision metadata for each current key.

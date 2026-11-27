@@ -194,6 +194,10 @@ impl Executor {
             if let Some(output) = self.finish(slot, done, &live) {
                 return output;
             }
+            // A dropped rerun can leave no job. The owner schedules queued reads after this.
+            if self.tasks.is_empty() {
+                return Ok(Output::Reads(Vec::new()));
+            }
         }
     }
 

@@ -426,10 +426,11 @@ impl Kv for Service {
 mod tests {
     use super::*;
 
-    /// A large LIST can run past the ten-second write wait. Its reply must still reach the caller
-    /// after nearly five seconds of ReadIndex wait and nearly 60 seconds of execution.
-    #[tokio::test(start_paused = true)]
-    async fn a_slow_range_reply_reaches_the_caller() {
+    /// Start a LIST through the KV handler and take the reply sender the node would hold.
+    async fn start_range() -> (
+        tokio::task::JoinHandle<Result<ResponseOp, Status>>,
+        crate::node::KvResponse,
+    ) {
         let (events, mut receiver) = mpsc::channel(4);
         let service = Service::new(
             1,
@@ -456,6 +457,14 @@ mod tests {
         let Event::Kv(_, reply) = *event else {
             panic!("expected a KV event");
         };
+        (call, reply)
+    }
+
+    /// A large LIST can run past the ten-second write wait. Its reply must still reach the caller
+    /// after nearly five seconds of ReadIndex wait and nearly 60 seconds of execution.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_range_reply_reaches_the_caller() {
+        let (call, reply) = start_range().await;
         tokio::time::advance(Duration::from_secs(64)).await;
         tokio::task::yield_now().await;
         assert!(!call.is_finished());
@@ -471,5 +480,16 @@ mod tests {
             })))
             .unwrap();
         assert_eq!(call.await.unwrap().unwrap(), response);
+    }
+
+    /// The handler still bounds the wait for a read reply. It gives up past the execution limit
+    /// plus ten seconds and drops the reply channel.
+    #[tokio::test(start_paused = true)]
+    async fn a_range_reply_wait_ends_after_the_read_limit() {
+        let (call, reply) = start_range().await;
+        tokio::time::advance(crate::node::WIDE_READ_LIMIT + Duration::from_secs(11)).await;
+        let status = call.await.unwrap().unwrap_err();
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        assert!(reply.is_closed());
     }
 }

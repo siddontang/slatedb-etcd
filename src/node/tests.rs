@@ -1214,6 +1214,44 @@ async fn an_over_budget_rerun_starts_only_for_live_callers() {
     assert_eq!(node.reads.pending(), 0);
 }
 
+/// With the real executor, dropping the only over-budget rerun because its caller left leaves no
+/// job. `next` returns an empty completion instead of failing on the empty task set, and a later
+/// read still runs.
+#[tokio::test]
+async fn dropping_the_last_over_budget_rerun_keeps_the_executor() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = leader_node(dir.path()).await;
+    put_letters(&mut node).await;
+    node.read_executor = read::executor::Executor::new(false);
+    node.read_executor.scan_row_budget = 500;
+    let (tx, gone) = oneshot::channel();
+    node.linear_read_auth(wide_range(b"a", b"z"), None, ClientResponse::Kv(tx));
+    let id = node.reads.ids().next().unwrap();
+    node.drive_ready().await.unwrap();
+    confirm_read(&mut node, &id).await;
+    assert_eq!(node.read_executor.len(), 1);
+    drop(gone);
+
+    let reads = &node.reads;
+    let output = node.read_executor.next(|query| reads.live(query)).await;
+    assert!(matches!(&output, Ok(Output::Reads(outputs)) if outputs.is_empty()));
+    assert_eq!(node.read_executor.len(), 0);
+    node.complete_read(output.unwrap()).unwrap();
+
+    let (tx, later) = oneshot::channel();
+    node.enqueue_query(sorted_read(tx));
+    node.drive_ready().await.unwrap();
+    assert_eq!(node.read_executor.len(), 1);
+    let reads = &node.reads;
+    let output = node
+        .read_executor
+        .next(|query| reads.live(query))
+        .await
+        .unwrap();
+    node.complete_read(output).unwrap();
+    assert!(later.await.unwrap().unwrap().into_outcome().result.is_ok());
+}
+
 #[tokio::test]
 async fn scans_run_together_and_rerun_alone_over_their_row_budget() {
     use crate::proto::etcdserverpb::{
