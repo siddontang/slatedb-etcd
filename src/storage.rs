@@ -389,7 +389,8 @@ impl RaftStorage {
         Ok(())
     }
 
-    /// Publish the replacement snapshot and truncate its covered log in one synced batch.
+    /// Publish the replacement snapshot and truncate its covered log in one synced batch. An image
+    /// at the index of the current record replaces it.
     pub fn checkpoint(&mut self, index: u64, data: Vec<u8>) -> Result<()> {
         self.checkpoint_with_conf(
             index,
@@ -405,37 +406,8 @@ impl RaftStorage {
         conf: ConfState,
     ) -> Result<()> {
         let prepared = PreparedCheckpoint::write(&self.dir, data.into())?;
-        self.publish_checkpoint(index, Some(prepared), conf)
-    }
-
-    /// Return true when an image at `index` replaces the record at the same index: the record
-    /// has no transferable image, or it names another view checkpoint. A restart or a rebase can
-    /// move the base to another checkpoint at the record index when retention deleted the one
-    /// that the record names.
-    pub(crate) fn replaces_at(&self, index: u64, prepared: Option<&PreparedCheckpoint>) -> bool {
-        let Some(prepared) = prepared else {
-            return false;
-        };
-        if index != self.snapshot_index() {
-            return false;
-        }
-        let view = |data: &[u8]| {
-            crate::state::transfer::ViewDescriptor::decode(data)
-                .ok()
-                .flatten()
-                .map(|view| view.checkpoint)
-        };
-        self.metadata_only()
-            || view(&self.snapshot.data)
-                .zip(view(&prepared.data))
-                .is_some_and(|(old, new)| old != new)
-    }
-
-    /// Return true when the current snapshot record has no transferable image.
-    ///
-    /// Only a view descriptor is transferable. See `transfer::sendable`.
-    pub fn metadata_only(&self) -> bool {
-        self.snapshot_index() > 0 && !crate::state::transfer::sendable(&self.snapshot.data)
+        let replace = self.snapshot_index() > 0 && index == self.snapshot_index();
+        self.publish_checkpoint(index, Some(prepared), conf, replace)
     }
 
     pub fn member(&self) -> u64 {
@@ -445,19 +417,20 @@ impl RaftStorage {
     /// Publish a checkpoint and truncate its covered log in one synced batch.
     ///
     /// Without an image, the caller must first flush SlateDB through `index`. The flushed state
-    /// and its apply marker then cover the removed entries. An image at the current index can
-    /// replace a record without an image.
+    /// and its apply marker then cover the removed entries. With `attach`, an image at the current
+    /// index replaces the record. The log store does not read the image, so the caller that knows
+    /// its format decides.
     pub(crate) fn publish_checkpoint(
         &mut self,
         index: u64,
         prepared: Option<PreparedCheckpoint>,
         conf: ConfState,
+        attach: bool,
     ) -> Result<()> {
         ensure!(
             index <= self.hard_state.commit,
             "cannot snapshot uncommitted data"
         );
-        let attach = self.replaces_at(index, prepared.as_ref());
         ensure!(
             index > self.snapshot_index() || attach,
             "snapshot did not advance"
@@ -628,7 +601,7 @@ impl Storage for RaftStorage {
 mod checkpoint_tests {
     use super::*;
 
-    /// Snapshot data that is not a view descriptor. It does not count as a transferable image.
+    /// Snapshot data. The log store does not read its format.
     fn foreign_image(index: u64, tag: &str) -> Vec<u8> {
         format!("image {index} {tag}").into_bytes()
     }
@@ -652,16 +625,14 @@ mod checkpoint_tests {
         store
     }
 
-    fn view_snapshot(index: u64, term: u64) -> Snapshot {
+    fn image_snapshot(index: u64, term: u64) -> Snapshot {
         let mut snapshot = Snapshot::default();
         snapshot.mut_metadata().index = index;
         snapshot.mut_metadata().term = term;
         snapshot
             .mut_metadata()
             .set_conf_state(ConfState::from((vec![1], vec![])));
-        snapshot.data = crate::state::transfer::ViewDescriptor::new(uuid::Uuid::new_v4())
-            .encode()
-            .unwrap();
+        snapshot.data = foreign_image(index, "adopted");
         snapshot
     }
 
@@ -679,7 +650,7 @@ mod checkpoint_tests {
     fn adopt_keeps_a_matching_suffix_and_a_higher_commit() {
         let root = tempfile::tempdir().unwrap();
         let mut store = term_one_log(root.path(), 120, 110);
-        let snapshot = view_snapshot(100, 1);
+        let snapshot = image_snapshot(100, 1);
         store.adopt(&snapshot).unwrap();
         assert_eq!(bounds(&store), (101, 120, 110));
         drop(store);
@@ -702,7 +673,7 @@ mod checkpoint_tests {
     fn adopt_discards_a_mismatched_log_above_the_commit() {
         let root = tempfile::tempdir().unwrap();
         let mut store = term_one_log(root.path(), 120, 90);
-        store.adopt(&view_snapshot(100, 2)).unwrap();
+        store.adopt(&image_snapshot(100, 2)).unwrap();
         assert_eq!(bounds(&store), (101, 100, 100));
         drop(store);
         let store = RaftStorage::open(root.path(), 1, "test", vec![1]).unwrap();
@@ -712,7 +683,7 @@ mod checkpoint_tests {
         // A checkpoint ahead of an empty log is an adopt with nothing to keep.
         let empty = tempfile::tempdir().unwrap();
         let mut store = RaftStorage::open(empty.path(), 1, "test", vec![1]).unwrap();
-        store.adopt(&view_snapshot(7, 3)).unwrap();
+        store.adopt(&image_snapshot(7, 3)).unwrap();
         assert_eq!(bounds(&store), (8, 7, 7));
     }
 
@@ -721,7 +692,7 @@ mod checkpoint_tests {
     fn adopt_refuses_a_mismatched_committed_index() {
         let root = tempfile::tempdir().unwrap();
         let mut store = term_one_log(root.path(), 120, 110);
-        let error = store.adopt(&view_snapshot(100, 2)).unwrap_err();
+        let error = store.adopt(&image_snapshot(100, 2)).unwrap_err();
         assert!(error.to_string().contains("differs"), "{error}");
         assert_eq!(bounds(&store), (1, 120, 110));
         drop(store);
@@ -748,7 +719,6 @@ mod checkpoint_tests {
         store.persist(&entries, Some(&hs), None).unwrap();
         let first = foreign_image(3, "first");
         store.checkpoint(3, first.clone()).unwrap();
-        assert!(store.metadata_only());
         // Model a stop after the replacement file exists but before its reference is saved.
         let snapshot = store.snapshot.clone();
         let staged = PreparedCheckpoint::write(root.path(), foreign_image(3, "lost").into())

@@ -173,10 +173,11 @@ impl Executor {
                 .storage
                 .persist(&entries, hs.as_ref(), snapshot.as_ref())?,
             Job::Checkpoint { index, image, conf } => {
-                let attach = self.storage.replaces_at(index, image.as_ref());
+                let attach = replaces_at(&self.storage, index, image.as_ref());
                 // A received snapshot can make this result obsolete.
                 if index > self.storage.snapshot_index() || attach {
-                    self.storage.publish_checkpoint(index, image, conf)?;
+                    self.storage
+                        .publish_checkpoint(index, image, conf, attach)?;
                 }
             }
             #[cfg(test)]
@@ -189,6 +190,37 @@ impl Executor {
             stats,
         })
     }
+}
+
+/// Return true when an image at `index` replaces the record at the same index: the record
+/// has no transferable image, or it names another view checkpoint. A restart or a rebase can
+/// move the base to another checkpoint at the record index when retention deleted the one
+/// that the record names.
+///
+/// Only a view descriptor is transferable. See `transfer::sendable`.
+fn replaces_at(
+    storage: &RaftStorage,
+    index: u64,
+    image: Option<&super::PreparedCheckpoint>,
+) -> bool {
+    let Some(image) = image else {
+        return false;
+    };
+    if index != storage.snapshot_index() {
+        return false;
+    }
+    let record = &storage.recovery_snapshot().data;
+    let view = |data: &[u8]| {
+        crate::state::transfer::ViewDescriptor::decode(data)
+            .ok()
+            .flatten()
+            .map(|view| view.checkpoint)
+    };
+    let metadata_only = index > 0 && !crate::state::transfer::sendable(record);
+    metadata_only
+        || view(record)
+            .zip(view(&image.data))
+            .is_some_and(|(old, new)| old != new)
 }
 
 pub(super) struct Worker {
