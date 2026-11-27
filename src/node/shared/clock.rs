@@ -112,6 +112,26 @@ pub(super) struct Bound {
     pub real: i64,
 }
 
+impl Voters {
+    /// Set the term and the voters. A new term or another set of voters drops every sample. A
+    /// new process of a voter drops the sample of that voter. The caller holds the lock.
+    fn set(&mut self, term: u64, me: u64, voters: BTreeMap<u64, Option<u64>>) {
+        if self.term != term || self.me != me || !self.voters.keys().eq(voters.keys()) {
+            self.generation += 1;
+            self.samples.clear();
+        } else {
+            for (id, process) in &voters {
+                if self.voters.get(id) != Some(process) {
+                    self.samples.remove(id);
+                }
+            }
+        }
+        self.term = term;
+        self.me = me;
+        self.voters = voters;
+    }
+}
+
 /// The decision of the ahead check at one time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Verdict {
@@ -285,19 +305,7 @@ impl Clock {
         voters: BTreeMap<u64, Option<u64>>,
     ) {
         let mut held = self.voters.lock().unwrap();
-        if held.term != term || held.me != me || !held.voters.keys().eq(voters.keys()) {
-            held.generation += 1;
-            held.samples.clear();
-        } else {
-            for (id, process) in &voters {
-                if held.voters.get(id) != Some(process) {
-                    held.samples.remove(id);
-                }
-            }
-        }
-        held.term = term;
-        held.me = me;
-        held.voters = voters;
+        held.set(term, me, voters);
         held.managed = true;
     }
 
@@ -447,9 +455,7 @@ impl Clock {
     /// `Db` of the ended term keeps its last tick. See `Gate`.
     pub(in crate::node) fn stand_down(&self) {
         // A stand-down does not make a clock managed: a test of the writer alone stays so.
-        let managed = self.voters.lock().unwrap().managed;
-        self.configure(0, 0, BTreeMap::new());
-        self.voters.lock().unwrap().managed = managed;
+        self.voters.lock().unwrap().set(0, 0, BTreeMap::new());
         self.note_ahead(None);
         self.uncertain.store(false, Ordering::Relaxed);
         self.waiting.store(false, Ordering::Relaxed);
