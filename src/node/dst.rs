@@ -69,6 +69,8 @@ struct Simulation {
     committed_entries: BTreeMap<u64, Vec<u8>>,
     terms: BTreeMap<u64, u64>,
     isolated: Option<u64>,
+    ack_limit: Option<(u64, u64)>,
+    delayed: Vec<Message>,
     /// A member that starts as a joiner, as after MemberAdd. With no log it has an empty base.
     joining: Option<u64>,
     paused_apply: Option<u64>,
@@ -196,6 +198,8 @@ impl Simulation {
             committed_entries: BTreeMap::new(),
             terms: BTreeMap::new(),
             isolated: None,
+            ack_limit: None,
+            delayed: Vec::new(),
             joining: None,
             paused_apply: None,
             paused_flush: None,
@@ -548,6 +552,14 @@ impl Simulation {
         }
         let index = self.choose(self.messages.len());
         let mut message = self.messages.remove(index);
+        if self.ack_limit.is_some_and(|(id, max)| {
+            message.from == id
+                && message.get_msg_type() == MessageType::MsgAppendResponse
+                && message.index > max
+        }) {
+            self.delayed.push(message);
+            return;
+        }
         self.trace.push(format!(
             "message {} {} {:?} {} {}",
             message.from,

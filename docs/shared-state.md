@@ -498,7 +498,12 @@ rebase again after the backoff.
 
 - Today a member flushes its own SlateDB and then truncates (`storage.rs:347-409`). In shared
   mode a member never flushes. It truncates through `F` of its base after step 5 of the switch.
-  The existing `snapshot_every` and `snapshot_min_bytes` rules still choose when.
+  The existing `snapshot_every` and `snapshot_min_bytes` rules still choose when. An automatic
+  truncation on the leader also waits while a follower is below `F` by at most `snapshot_every`
+  entries. That follower then catches up from the log. A snapshot would make it load the whole
+  key index from the checkpoint again. The wait ends when `F` is more than two `snapshot_every`
+  intervals above the last record, so a follower near `F` can still get a snapshot. A follower
+  further behind, a new member with no entry, or a membership checkpoint does not wait.
 - The Raft snapshot data becomes descriptor format 6: `{ checkpoint }`. The record metadata holds
   the index, term, and ConfState from the checkpoint. `Storage::snapshot` returns the newest
   checkpoint at once. It builds no image.
