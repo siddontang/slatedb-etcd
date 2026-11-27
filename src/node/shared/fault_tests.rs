@@ -1314,7 +1314,10 @@ async fn a_refused_defragment_job_is_retryable() {
         "{}",
         error.message
     );
-    assert!(error.message.contains("retry"), "{}", error.message);
+    assert_eq!(
+        error.message,
+        "etcdserver: a newer compaction job stands above the writer clock; retry"
+    );
     sampling.abort();
     leader.close().await;
 }
@@ -1348,10 +1351,9 @@ async fn a_gate_that_ends_first_gives_the_lost_leader_reply() {
         "{}",
         error.message
     );
-    assert!(
-        error.message.contains("leader changed"),
-        "{}",
-        error.message
+    assert_eq!(
+        error.message,
+        "etcdserver: the leader changed during Defragment; retry"
     );
     sampling.abort();
     leader.close().await;
