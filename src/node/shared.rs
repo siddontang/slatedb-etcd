@@ -1221,7 +1221,7 @@ impl Node {
     /// The node takes the base from the slot and verifies that one. A newer open cannot replace
     /// it before the job runs. A base that fails the check goes back to the slot.
     pub(super) fn adoptable(&self) -> Option<(Arc<crate::state::view::Base>, u64)> {
-        if self.prepared_puts.is_some() || self.held_puts.is_some() {
+        if self.early_puts.active() {
             return None;
         }
         let (base, covers) = self.writer.take_opened()?;
