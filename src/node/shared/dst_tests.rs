@@ -1494,7 +1494,7 @@ impl Simulation {
 
     /// The delivered commit index of member `id`.
     fn committed(&self, id: u64) -> u64 {
-        self.nodes[&id].committed_ready
+        self.nodes[&id].apply.committed()
     }
 }
 
@@ -1744,7 +1744,7 @@ async fn a_failed_automatic_checkpoint_keeps_its_byte_trigger() {
     let base = node.checkpointable();
     let record = node.raw.store().snapshot_index();
     assert!(base > record, "base {base} record {record}");
-    assert!(!node.apply_busy);
+    assert!(!node.apply.busy());
     // The bytes that the member appended are the automatic threshold.
     let charged = node.checkpoints.appended_bytes();
     assert!(charged > 0);

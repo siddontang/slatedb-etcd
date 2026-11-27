@@ -285,7 +285,7 @@ async fn apply_waits_for_the_record_of_an_accepted_snapshot() {
     let (tx, reply) = oneshot::channel();
     node.enqueue_query(Query::Local("absent".into(), tx));
     node.schedule_apply().unwrap();
-    assert!(!node.apply_busy, "apply ran work before the snapshot");
+    assert!(!node.apply.busy(), "apply ran work before the snapshot");
     node.drive_ready().await.unwrap();
     node.drain_log().await.unwrap();
     node.schedule_apply().unwrap();

@@ -175,7 +175,7 @@ impl Node {
         let last = self.raw.store().last_index()?;
         // A large uncommitted group gains more from one pipelined apply job after commit.
         if low > raft.raft_log.committed
-            && (!self.queries.is_empty() || last.saturating_sub(self.state.applied) > QUICK_REPLY)
+            && (self.apply.has_queries() || last.saturating_sub(self.state.applied) > QUICK_REPLY)
         {
             return Ok(false);
         }
@@ -187,7 +187,7 @@ impl Node {
     pub(super) fn release_held_puts(&mut self) -> Option<Vec<AppliedCommand>> {
         let replies = self
             .early_puts
-            .release(&self.raw.raft, !self.queries.is_empty())?;
+            .release(&self.raw.raft, self.apply.has_queries())?;
         // Withdraw the published view before any of these replies leaves.
         self.publish_local_reads();
         Some(replies)
@@ -199,10 +199,11 @@ impl Node {
     /// reply needs only the evaluated outcome. Reads still wait for the published state.
     pub(super) fn prepare_local_puts(&mut self) -> Result<bool> {
         let low = self.state.applied + 1;
-        if self.committed_ready < low || self.committed_ready - self.state.applied > QUICK_REPLY {
+        let committed = self.apply.committed();
+        if committed < low || committed - self.state.applied > QUICK_REPLY {
             return Ok(false);
         }
-        self.prepare_puts(self.committed_ready + 1)
+        self.prepare_puts(committed + 1)
     }
 
     /// Evaluate the Puts in `[applied + 1, high)` for an early reply.

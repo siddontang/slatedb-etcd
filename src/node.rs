@@ -44,7 +44,7 @@ mod schedule;
 mod shared;
 mod step;
 mod watch;
-use apply::{AppliedState, Completion, Header, Job, Output, Query, Reply, Work, Worker};
+use apply::{AppliedState, Completion, Header, Job, Output, Query, Reply, Worker};
 use response::ClientResponse;
 pub use response::KvReply;
 
@@ -257,20 +257,15 @@ pub struct Node {
     reads: read::table::ReadIndexTable,
     state: AppliedState,
     worker: Worker,
-    apply_busy: bool,
-    apply_target: u64,
-    /// Submitted apply jobs in order: target index, and whether a later Entries job may follow.
-    apply_jobs: VecDeque<(u64, bool)>,
-    committed_ready: u64,
+    /// The submitted apply jobs, the delivered commit index, and the queued state reads. See
+    /// `schedule::scheduler`.
+    apply: schedule::scheduler::ApplyScheduler,
     /// Put replies that leave before the local apply. See `quorum_put::EarlyPuts`.
     early_puts: quorum_put::EarlyPuts,
     /// True while the log above a held entry is past its alarm bound. See `tick_apply_pause`.
     hold_alarm: bool,
     /// The entry that apply held on, until apply passes it. See `WriterReport::apply_held_at`.
     apply_held_at: Option<u64>,
-    queries: VecDeque<Query>,
-    prefer_query: bool,
-    apply_delay_ms: u64,
     options: NodeOptions,
     /// The queue, transport task, meter, and health of each peer link. See `links`.
     links: links::PeerLinks,
@@ -557,18 +552,12 @@ impl Node {
             log: ready::pipeline::LogPipeline::new(),
             read_executor: read::executor::Executor::new(manual_apply),
             reads: read::table::ReadIndexTable::new(),
-            apply_target: applied.applied,
-            apply_jobs: VecDeque::new(),
-            committed_ready: applied.applied,
+            apply: schedule::scheduler::ApplyScheduler::new(applied.applied),
             early_puts: quorum_put::EarlyPuts::default(),
             hold_alarm: false,
             apply_held_at: None,
             state: applied,
             worker,
-            apply_busy: false,
-            queries: VecDeque::new(),
-            prefer_query: false,
-            apply_delay_ms: 0,
             options,
             peer: identity,
             links,
@@ -1133,7 +1122,7 @@ impl Node {
                 let _ = response.send(Ok(self.status()?));
             }
             Event::ApplyDelay(delay_ms, response) => {
-                self.apply_delay_ms = delay_ms.min(5000);
+                self.apply.set_delay(delay_ms.min(5000));
                 let _ = response.send(Ok(self.status()?));
             }
             Event::LogReadFault(delay_ms, fail, response) => {
@@ -1371,7 +1360,7 @@ impl Node {
     }
 
     fn start_checkpoint(&mut self, image: bool) -> Result<()> {
-        if self.checkpoints.running() || self.apply_busy || self.early_puts.active() {
+        if self.checkpoints.running() || self.apply.busy() || self.early_puts.active() {
             return Ok(());
         }
         // A record built at a base below the record could not replace it. See `certify_base`.
@@ -1501,9 +1490,7 @@ impl Node {
             "recovered_from_index": self.recovered_from_index,
             "checkpoint_running": self.checkpoints.running(),
             "snapshot_delay_ms": self.checkpoints.delay().as_millis() as u64,
-            "apply_busy": self.apply_busy, "apply_target": self.apply_target,
             "apply_lag": self.raw.store().commit_index().saturating_sub(self.state.applied),
-            "queued_state_reads": self.queries.len(), "apply_delay_ms": self.apply_delay_ms,
             "pending_read_indexes": self.reads.pending(),
             "pending_revision_waiters": self.reads.revision_waiters(),
             "raft_commit_index": self.raw.raft.raft_log.committed,
@@ -1517,6 +1504,7 @@ impl Node {
             status["write_profile"] = crate::write_profile::snapshot();
         }
         self.log.status(&mut status);
+        self.apply.status(&mut status);
         status["quorum_reply_index"] = self.early_puts.reply_index().into();
         status["apply_paused"] = self.pause_status();
         status["apply_held_at"] = self.apply_held_at.into();

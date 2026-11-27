@@ -1128,7 +1128,7 @@ impl Node {
         let ticks = self.writer.tick(
             leader,
             self.state.applied,
-            self.committed_ready,
+            self.apply.committed(),
             base,
             self.state.base_checkpoint,
             bytes,
@@ -1221,7 +1221,7 @@ impl Node {
         }
         let (base, covers) = self.writer.take_opened()?;
         let index = base.applied;
-        let term = (index > self.state.applied && index <= self.committed_ready)
+        let term = (index > self.state.applied && index <= self.apply.committed())
             .then(|| self.raw.raft.raft_log.term(index).ok())
             .flatten();
         match term {
@@ -1778,7 +1778,7 @@ impl Node {
         let (base, _, bytes) = self.state.view;
         let leader = self.raw.raft.state == StateRole::Leader;
         let (applied, current) = (self.state.applied, self.state.base_checkpoint);
-        let committed = self.committed_ready;
+        let committed = self.apply.committed();
         while !self
             .writer
             .tick(leader, applied, committed, base, current, bytes)
