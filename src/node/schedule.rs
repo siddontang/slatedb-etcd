@@ -372,7 +372,7 @@ impl Node {
                 self.complete_apply(completed)?;
                 progress = true;
             }
-            if let Some(completed) = self.read_executor.step().await? {
+            if let Some(completed) = self.step_read().await? {
                 self.complete_read(completed)?;
                 progress = true;
             }
@@ -394,7 +394,7 @@ impl Node {
 
     #[cfg(test)]
     pub(super) async fn drain_reads(&mut self) -> Result<()> {
-        while let Some(completed) = self.read_executor.step().await? {
+        while let Some(completed) = self.step_read().await? {
             self.complete_read(completed)?;
             self.drive_ready().await?;
         }

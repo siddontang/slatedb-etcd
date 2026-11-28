@@ -84,14 +84,23 @@ impl Node {
             let Some(queries) = self.reads.next_batch(&self.read_executor) else {
                 break;
             };
-            self.read_executor
-                .submit(self.state.read.clone(), queries, self.header());
+            self.read_executor.submit(self.state.read.clone(), queries);
         }
     }
 
-    pub(super) fn complete_read(&mut self, output: Output) -> Result<()> {
+    /// Answer a read executor result. The header takes the current term, as etcd fills it
+    /// after Range returns. The revision stays that of the pinned view.
+    pub(super) fn complete_read(&mut self, mut output: Output) -> Result<()> {
         self.expire_reads();
+        fill_headers(&mut output, self.header());
         self.finish_output(output)
+    }
+
+    /// Run the next manual read job, with the live callers of the read table.
+    #[cfg(test)]
+    pub(super) async fn step_read(&mut self) -> Result<Option<Output>> {
+        let reads = &self.reads;
+        self.read_executor.step(|query| reads.live(query)).await
     }
 
     pub(super) fn expire_reads(&mut self) {
@@ -100,5 +109,19 @@ impl Node {
         if failed > 0 {
             self.metrics.failed_read_indexes.inc_by(failed as u64);
         }
+    }
+}
+
+fn fill_headers(output: &mut Output, header: Header) {
+    match output {
+        Output::Reads(reads) => {
+            for read in reads {
+                fill_headers(read, header);
+            }
+        }
+        Output::Read { outcome, .. }
+        | Output::Linear { outcome, .. }
+        | Output::SharedLinear(_, outcome) => header.outcome(outcome),
+        _ => {}
     }
 }

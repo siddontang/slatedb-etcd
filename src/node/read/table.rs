@@ -30,6 +30,8 @@ struct PendingRead {
     index: Option<u64>,
     context: Option<u64>,
     retry_ticks: u8,
+    /// The read executor runs the read.
+    running: bool,
 }
 
 struct RevisionWaiter {
@@ -192,6 +194,7 @@ impl ReadIndexTable {
                 index: None,
                 context: None,
                 retry_ticks: 2,
+                running: false,
             },
         );
     }
@@ -257,12 +260,11 @@ impl ReadIndexTable {
         }
     }
 
-    /// Queue each read whose proven index `applied` reaches, while the queue has room.
+    /// Queue each read whose proven index `applied` reaches. `MAX_PENDING_READS` bounds these
+    /// reads, so they do not wait for room in the queue: a full queue of wide reads must not
+    /// hold back a point read, such as a health check, while an executor task is free.
     pub(in crate::node) fn queue_confirmed(&mut self, applied: u64) {
         for (id, read) in &mut self.reads {
-            if self.queries.len() >= apply::MAX_QUERIES {
-                break;
-            }
             if read.index.is_some_and(|index| index <= applied) {
                 if let Some(request) = read.request.take() {
                     self.queries
@@ -297,6 +299,13 @@ impl ReadIndexTable {
         {
             queries.push(self.queries.remove(position).unwrap());
         }
+        for query in &queries {
+            if let Query::Linear(_, _, id) = query {
+                if let Some(read) = self.reads.get_mut(id) {
+                    read.running = true;
+                }
+            }
+        }
         Some(queries)
     }
 
@@ -304,8 +313,9 @@ impl ReadIndexTable {
     pub(in crate::node) fn finish_shared(
         &mut self,
         ids: Vec<u64>,
-        outcome: std::sync::Arc<crate::mvcc::Outcome>,
+        outcome: crate::mvcc::Outcome,
     ) -> Result<()> {
+        let outcome = std::sync::Arc::new(outcome);
         for id in ids {
             if let Some(read) = self.reads.remove(&id) {
                 read.response.shared_kv(outcome.clone())?;
@@ -322,20 +332,27 @@ impl ReadIndexTable {
         Ok(())
     }
 
-    /// Fail the reads of an earlier leadership, the closed reads, and the reads that timed
-    /// out. Return the number of batches that lost their proof.
+    /// Fail the reads whose caller left, the reads that have not started to run within 5 s, and
+    /// the reads that the quorum has not confirmed under the same leader and term. Return the
+    /// number of batches that lost their proof.
+    ///
+    /// A confirmed read is linearizable at its read index whatever happens to leadership later,
+    /// because the applied index only grows. Until it runs, it still has 5 s in all: a stalled
+    /// apply or a busy executor fails it with Unavailable, and the client retries on another
+    /// member. Once it runs, only the executor limit bounds it.
     pub(in crate::node) fn expire(&mut self, term: u64, leader: u64, role: StateRole) -> usize {
         let now = Instant::now();
         let expired: Vec<_> = self
             .reads
             .iter()
             .filter(|(_, read)| {
-                leader == 0
-                    || read.leader != leader
-                    || read.role != role
-                    || read.term != term
-                    || read.response.is_closed()
-                    || now.duration_since(read.started) > Duration::from_secs(5)
+                read.response.is_closed()
+                    || (!read.running && now.duration_since(read.started) > Duration::from_secs(5))
+                    || (read.index.is_none()
+                        && (leader == 0
+                            || read.leader != leader
+                            || read.role != role
+                            || read.term != term))
             })
             .map(|(id, _)| *id)
             .collect();
@@ -351,7 +368,26 @@ impl ReadIndexTable {
                 ));
             }
         }
+        // A queued read whose caller already got an error or left must not take an executor slot.
+        let reads = &self.reads;
+        self.queries.retain(|query| match query {
+            Query::Linear(_, _, id) => reads.contains_key(id),
+            Query::Read(_, _, response) => !response.is_closed(),
+            _ => true,
+        });
         failed.len()
+    }
+
+    /// The caller of `query` still waits for its result.
+    pub(in crate::node) fn live(&self, query: &Query) -> bool {
+        match query {
+            Query::Linear(_, _, id) => self
+                .reads
+                .get(id)
+                .is_some_and(|read| !read.response.is_closed()),
+            Query::Read(_, _, response) => !response.is_closed(),
+            _ => true,
+        }
     }
 
     /// Fail each read whose proven index is above `applied`.
@@ -379,6 +415,17 @@ impl ReadIndexTable {
 
     pub(in crate::node) fn queries(&self) -> &VecDeque<Query> {
         &self.queries
+    }
+
+    /// Set the start of the read `id`, or of every read.
+    pub(in crate::node) fn set_started(&mut self, id: Option<u64>, started: Instant) {
+        for (_, read) in self
+            .reads
+            .iter_mut()
+            .filter(|(key, _)| id.is_none_or(|id| **key == id))
+        {
+            read.started = started;
+        }
     }
 
     /// Set the start of each revision wait.

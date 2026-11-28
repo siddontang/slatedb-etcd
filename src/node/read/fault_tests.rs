@@ -177,27 +177,18 @@ async fn a_corrupt_row_fails_coalesced_reads_once() {
     let mut state = StateMachine::open_test(dir.path()).await.unwrap();
     state.write_raw(&[(b"etcd/current/bad", b"\xff\xff")]);
     let view = state.read_view().unwrap();
-    let header = Header {
-        cluster: 1,
-        member: 1,
-        term: 1,
-    };
     let mut executor = executor::Executor::new(true);
     let before = CORRUPT_READS.get();
-    executor.submit(
-        view.clone(),
-        vec![linear(b"bad", 1), linear(b"bad", 2)],
-        header,
-    );
-    let Some(Output::SharedLinear(ids, outcome)) = executor.step().await.unwrap() else {
+    executor.submit(view.clone(), vec![linear(b"bad", 1), linear(b"bad", 2)]);
+    let Some(Output::SharedLinear(ids, outcome)) = executor.step(|_| true).await.unwrap() else {
         panic!("expected one shared result");
     };
     assert_eq!(ids, [1, 2]);
     let error = outcome.result.as_ref().unwrap_err();
     assert_eq!(error.code, tonic::Code::DataLoss as i32, "{error:?}");
     assert_eq!(CORRUPT_READS.get(), before + 1);
-    executor.submit(view, vec![linear(b"good", 3)], header);
-    let Some(Output::Reads(outputs)) = executor.step().await.unwrap() else {
+    executor.submit(view, vec![linear(b"good", 3)]);
+    let Some(Output::Reads(outputs)) = executor.step(|_| true).await.unwrap() else {
         panic!("expected a read");
     };
     let [Output::Linear { outcome, .. }] = &outputs[..] else {

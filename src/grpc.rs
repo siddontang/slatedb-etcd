@@ -199,10 +199,17 @@ impl Service {
                     .await;
             }
         }
-        let read_permit = if mvcc::read_only(&request, false) && !mvcc::read_only(&request, true) {
+        let read_only = mvcc::read_only(&request, false);
+        let read_permit = if read_only && !mvcc::read_only(&request, true) {
             Some(self.read_admission.acquire().await?)
         } else {
             None
+        };
+        // A read can wait for its ReadIndex and then run in the read executor up to its limit.
+        let wait = if read_only {
+            crate::node::WIDE_READ_LIMIT + Duration::from_secs(10)
+        } else {
+            Duration::from_secs(10)
         };
         let redirect = if forwarded {
             None
@@ -214,7 +221,7 @@ impl Service {
         self.events
             .try_send(Event::Authenticated(credentials, Box::new(event)))
             .map_err(|_| Status::unavailable("etcdserver: too many requests"))?;
-        let reply = tokio::time::timeout(Duration::from_secs(10), rx)
+        let reply = tokio::time::timeout(wait, rx)
             .await
             .map_err(|_| {
                 Status::deadline_exceeded("etcdserver: request timed out; outcome unknown")
@@ -412,5 +419,82 @@ impl Kv for Service {
             header.member_id = self.member;
         }
         Ok(Response::new(response))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Start a LIST through the KV handler and take the reply sender the node would hold.
+    async fn start_range() -> (
+        tokio::task::JoinHandle<Result<ResponseOp, Status>>,
+        crate::node::KvResponse,
+    ) {
+        let (events, mut receiver) = mpsc::channel(4);
+        let service = Service::new(
+            1,
+            events,
+            &BTreeMap::new(),
+            crate::auth::TokenIssuer::parse("simple").unwrap(),
+            crate::tls::Transport::default(),
+            DEFAULT_WATCH_PROGRESS_INTERVAL,
+        )
+        .unwrap();
+        let range = Op::RequestRange(RangeRequest {
+            key: b"a".to_vec(),
+            range_end: b"z".to_vec(),
+            ..Default::default()
+        });
+        let call = tokio::spawn(async move {
+            service
+                .execute(range, false, crate::auth::Credentials::default())
+                .await
+        });
+        let Some(Event::Authenticated(_, event)) = receiver.recv().await else {
+            panic!("expected an authenticated event");
+        };
+        let Event::Kv(_, reply) = *event else {
+            panic!("expected a KV event");
+        };
+        (call, reply)
+    }
+
+    /// A large LIST can run past the ten-second write wait. Its reply must still reach the caller
+    /// after nearly five seconds of ReadIndex wait and nearly 60 seconds of execution.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_range_reply_reaches_the_caller() {
+        let (call, reply) = start_range().await;
+        tokio::time::advance(Duration::from_secs(64)).await;
+        tokio::task::yield_now().await;
+        assert!(!call.is_finished());
+        let response = ResponseOp {
+            response: Some(Resp::ResponseRange(RangeResponse {
+                count: 1,
+                ..Default::default()
+            })),
+        };
+        reply
+            .send(Ok(crate::node::KvReply::Owned(Outcome {
+                result: Ok(response.clone()),
+            })))
+            .unwrap();
+        assert_eq!(call.await.unwrap().unwrap(), response);
+    }
+
+    /// The handler still bounds the wait for a read reply. It gives up past the execution limit
+    /// plus ten seconds and drops the reply channel.
+    #[tokio::test(start_paused = true)]
+    async fn a_range_reply_wait_ends_after_the_read_limit() {
+        let started = tokio::time::Instant::now();
+        let (call, reply) = start_range().await;
+        let status = call.await.unwrap().unwrap_err();
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        assert!(reply.is_closed());
+        // The paused clock jumps to the next timer, so check when the handler gave up.
+        assert_eq!(
+            started.elapsed(),
+            crate::node::WIDE_READ_LIMIT + Duration::from_secs(10)
+        );
     }
 }

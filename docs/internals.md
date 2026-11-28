@@ -99,7 +99,8 @@ A batch has at most 32 entries and a 512 KiB target. One larger entry can exceed
 The worker also handles Watch scans, snapshot installation, and checkpoint pins.
 KV reads use separate bounded tasks. Diagnostic queries still receive service between entry batches.
 
-The owner queues at most 64 state queries, 64 KV reads, and 64 checkpoint requests.
+The owner queues at most 64 state queries, 64 serializable KV reads, and 64 checkpoint requests.
+Confirmed linearizable reads join the KV read queue past that limit; at most 256 can wait.
 At most four KV read jobs run. Each point-read job contains at most 16 requests.
 Up to three streaming scans run together. A streaming scan is a current Range in key order
 without revision filters. It decodes at most `limit` rows and stops the scan at a 4 MiB row budget.
@@ -107,7 +108,11 @@ A scan over budget runs again alone on the same pinned view and with the same de
 Historical reads, sorted or filtered Ranges, and read-only transactions also run alone.
 While one of these reads runs or waits, no new scan starts. Wide reads start in queue order.
 Current point reads can pass queued scans and keep at least one task.
-Each job has a five-second deadline.
+A point-read job has a five-second deadline and a wide-read job has a 60-second deadline.
+A linearizable read that does not start to run within five seconds fails, whether it waits for the
+quorum, for apply, or for a slot. The proof sets the lowest applied index that the read may see;
+the job reads the view current when it starts.
+A scan over budget runs again only for the callers that still wait.
 Shared scans hold at most 3 x (4 MiB + one row) of decoded rows. The exclusive read keeps the old
 single-read bound: its result size, up to the logical data size. The two cases never overlap.
 These bounds limit tasks, retained views, and scan rows, not encoded response bytes.
@@ -141,7 +146,9 @@ Forwarded KV results wait for local apply through the leader response revision.
 Lease and Compact results still require a local ReadIndex barrier.
 Later STM reads on that member can then use their revisions.
 Both branches of nested transactions must contain only reads.
-Leadership loss, timeout, or cancellation removes the pending read. At most 256 reads can wait.
+Leadership loss before the quorum confirms the read removes it. A five-second timeout before the
+read starts to run removes it, as does cancellation at any time. A confirmed read survives
+leadership loss. At most 256 reads can wait.
 The gRPC service admits 192 linearizable KV reads at a time. Up to 8,192 more wait for admission.
 A waiter that gets no slot in ten seconds fails with `Unavailable: request timed out`.
 A cancelled client releases its waiting slot.
@@ -157,7 +164,10 @@ Each job shares a pinned SlateDB view with matching revision, compaction, Auth, 
 The apply owner publishes this view after a complete state write or snapshot installation.
 A read can finish from an older view while later writes apply. Its proof must cover that view.
 Read completion does not move the apply index or copy state metadata.
-The owner still checks the read proof and apply position before it sends a response.
+The owner dispatches a linearizable read only after its quorum proof and once the apply index
+reaches the proven read index. A term change does not cancel a confirmed read, because the
+proof already holds for that index. At completion the owner fills the current term into the
+header and returns the result from the pinned view.
 Read evaluation does not construct a discarded write batch.
 
 The apply owner keeps an in-memory key index with revision metadata for each current key.

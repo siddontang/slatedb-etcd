@@ -23,6 +23,11 @@ mod checkpoint;
 pub(crate) const WRITER_NOT_OPEN: &str = "the shared writer is not open yet";
 /// Apply barriers that may wait for the local state to reach a revision.
 pub(crate) const MAX_APPLY_BARRIERS: usize = apply::MAX_QUERIES;
+/// The longest run of one wide read in the read executor. A full LIST of a large prefix can
+/// take several seconds. A failed read returns Unavailable, and clients retry it from the
+/// start, so a short limit makes a large LIST scan again and again. The Kubernetes API server
+/// also gives a request 60 s.
+pub(crate) const WIDE_READ_LIMIT: Duration = Duration::from_secs(60);
 mod cache;
 pub use cache::LogMemory;
 mod cluster;
@@ -732,7 +737,8 @@ impl Node {
                         return Err(error);
                     }
                 }
-                read = self.read_executor.next(), if self.read_executor.len() > 0 => {
+                read = self.read_executor.next(|query| self.reads.live(query)),
+                    if self.read_executor.len() > 0 => {
                     self.complete_read(read?)?;
                 }
                 event = events.recv() => {

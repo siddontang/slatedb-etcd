@@ -194,7 +194,9 @@ It bounds queued reads and rejects excess requests with an explicit retryable er
 It also rejects new proposals when the local apply backlog reaches its admission limit.
 Each entry job contains at most 64 entries with a 512 KiB byte target.
 A single larger entry can exceed that byte target. Peer snapshots carry only a descriptor.
-At most 64 state queries, 64 KV reads, and 64 checkpoint requests can wait at the Raft owner.
+At most 64 state queries, 64 serializable KV reads, and 64 checkpoint requests can wait at the
+Raft owner. Confirmed linearizable reads join the KV read queue past that limit; at most 256 of
+them can wait.
 New proposals are rejected at 1,024 committed but unapplied entries.
 These limits bound queued work; they do not impose a total storage quota.
 
@@ -232,10 +234,25 @@ Four read jobs can run, with at most 16 point reads per job.
 Up to three current key-ordered Range scans can run together with a 4 MiB row budget each.
 A scan over budget, historical reads, sorted or filtered Ranges, and transactions run alone.
 Wide reads start in queue order. Current point reads can pass queued wide reads.
-The queue holds at most 64 requests. Each running job has a five-second deadline.
+The queue admits serializable reads while it holds fewer than 64 requests. A confirmed read
+joins it once apply reaches its read index; the ReadIndex limit below bounds these reads, so a
+full queue of wide reads cannot hold back a point read such as a health check.
+A running point-read job has a five-second deadline.
+A running wide-read job has a 60-second deadline. This avoids the retries from the start that
+the old five-second cutoff caused for a large LIST. A shared scan and its exclusive rerun use
+the same deadline, so a rerun that waits for the exclusive slot has less time left to execute.
 Shutdown stops these jobs before closing the state database.
-The owner checks the term, role, and leader identity again before returning the result.
-Leadership loss, a five-second timeout, or client cancellation removes the pending request.
+A read fails if it does not start to run within five seconds, whether it waits for the quorum
+proof, for apply, or for an executor slot. Then clientv3 can retry it on another member. An
+unconfirmed read also fails if the term, role, or leader changes first. The proof sets the
+lowest applied index that the read may see. The executor pins the applied view current when
+the job starts, so a write applied while the read waits can appear in its result. A confirmed
+read stays linearizable whatever happens to leadership later, because the applied index only
+grows. Once it runs, only the job deadline bounds it; the gRPC handler waits 70 seconds for a
+read reply.
+A queued read whose request failed or whose caller left does not start. A scan over budget runs
+again only for the callers that still wait. The response header takes the Raft term at reply
+time and the revision of the pinned view.
 At most 256 ReadIndex requests can wait. These requests do not append log entries.
 Unconfirmed requests retry every two Raft ticks until confirmation, cancellation, or timeout.
 Retries cover lost messages and reads dropped before a new leader commits its first entry.
