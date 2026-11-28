@@ -75,7 +75,7 @@ pub struct ServerConfig {
     /// Shared mode: a new leader does not start its writer while its clock is behind the
     /// shared writer clock by more than this.
     pub max_clock_skew: Duration,
-    /// Shared mode: whether the leader deletes old view checkpoints. Off by default.
+    /// Shared mode: whether the leader deletes old view checkpoints. `Fenced` by default.
     pub view_retention: crate::state::ViewRetention,
     /// Serve the `/debug` fault controls (partition, delays, log faults). Off by default.
     pub fault_controls: bool,
@@ -140,7 +140,7 @@ impl ServerConfig {
             view_pin_max: DEFAULT_VIEW_PIN_MAX,
             overlay_max_bytes: DEFAULT_OVERLAY_MAX_BYTES,
             max_clock_skew: Duration::from_secs(5),
-            view_retention: crate::state::ViewRetention::Off,
+            view_retention: crate::state::ViewRetention::Fenced,
             fault_controls: false,
             #[cfg(test)]
             now_ms: None,

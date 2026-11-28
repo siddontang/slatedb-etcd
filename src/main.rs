@@ -154,9 +154,9 @@ struct Args {
     /// writer clock by more than this.
     #[arg(long, default_value = "5s", value_parser = humantime::parse_duration)]
     max_clock_skew: std::time::Duration,
-    /// Shared mode: `off` keeps every view checkpoint. `fenced` deletes unpinned old ones, with
-    /// a known race against a new leader.
-    #[arg(long, value_enum, default_value = "off")]
+    /// Shared mode: `fenced` deletes unpinned old view checkpoints, with a known race against a
+    /// new leader. `off` keeps every view checkpoint, so storage grows without a bound.
+    #[arg(long, value_enum, default_value = "fenced")]
     view_retention: slatedb_etcd::state::ViewRetention,
     /// Serve the trusted /debug fault controls. Test clusters only; off by default.
     #[arg(long)]

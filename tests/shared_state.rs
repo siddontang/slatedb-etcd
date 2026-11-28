@@ -218,7 +218,12 @@ async fn checkpoints(dir: &std::path::Path) -> usize {
         .await
         .unwrap()
         .iter()
-        .filter(|checkpoint| checkpoint.name.as_deref().unwrap().starts_with("view-"))
+        .filter(|checkpoint| {
+            checkpoint
+                .name
+                .as_deref()
+                .is_some_and(|name| name.starts_with("view-"))
+        })
         .count()
 }
 
@@ -237,6 +242,11 @@ async fn one_write_makes_one_checkpoint_and_one_announcement() {
     within(async {
         let dir = tempfile::tempdir().unwrap();
         let age = Duration::from_millis(200);
+        // The test counts every published checkpoint, so retention must keep them all.
+        let config = |dir: &std::path::Path, age| ServerConfig {
+            view_retention: slatedb_etcd::state::ViewRetention::Off,
+            ..config(dir, age)
+        };
         let (server, channel) = start(config(dir.path(), age)).await;
         // The first leader publishes the first checkpoint at once, then marks the bootstrap.
         eventually("the bootstrap checkpoint", async || {
@@ -270,7 +280,7 @@ async fn one_write_makes_one_checkpoint_and_one_announcement() {
         assert_eq!((applied, announced), (idle + 1, idle + 1));
         // The new base covers the write.
         assert!(base > 0);
-        // Retention is off by default, so every published checkpoint stays.
+        // Retention is off, so every published checkpoint stays.
         assert_eq!(checkpoints(dir.path()).await, applied as usize);
         let reply = kv.range(all()).await.unwrap().into_inner();
         assert_eq!(reply.kvs[0].value, b"value");
@@ -584,6 +594,102 @@ async fn a_restarted_follower_adopts_a_checkpoint_above_its_log() {
             "{joined}"
         );
         restarted.shutdown().await.unwrap();
+        for server in servers.into_iter().flatten() {
+            server.shutdown().await.unwrap();
+        }
+    })
+    .await;
+}
+
+/// #81 race: a deposed leader deletes the checkpoint of a stopped follower's Raft snapshot
+/// record. The test deletes every `view-` checkpoint except the leader's base. The follower then
+/// restarts on the newer checkpoint, reaches the leader's hash, and serves a write and a read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_follower_restarts_after_its_record_checkpoint_is_deleted() {
+    within(async {
+        let dir = tempfile::tempdir().unwrap();
+        let (configs, mut servers) = quiet_cluster(dir.path()).await;
+        let lead = leader(servers[0].as_ref().unwrap()).await as usize - 1;
+        let follower = (lead + 1) % 3;
+        let mut kv = KvClient::new(channel(servers[lead].as_ref().unwrap()).await);
+        // Enough writes to truncate the log, so the follower records a Raft snapshot that names
+        // a checkpoint.
+        for n in 0..32 {
+            kv.put(put(&format!("before{n}"), "stop")).await.unwrap();
+        }
+        let stopped = servers[follower].take().unwrap();
+        eventually("a follower record with a checkpoint", async || {
+            let reply = http(&stopped, "POST", "/checkpoint").await;
+            assert!(reply.contains("200"), "{reply}");
+            !status(&stopped).await["shared_state"]["record_checkpoint"].is_null()
+        })
+        .await;
+        stopped.shutdown().await.unwrap();
+        // The persisted record of the stopped member names the checkpoint that its restart opens.
+        let record = slatedb_etcd::status::member_record(&configs[follower].dir).unwrap();
+        let record = record["checkpoint"]
+            .as_str()
+            .expect("a record checkpoint")
+            .to_owned();
+        for n in 0..16 {
+            kv.put(put(&format!("k{n}"), "after")).await.unwrap();
+        }
+        let lead_server = servers[lead].as_ref().unwrap();
+        let reply = http(lead_server, "POST", "/checkpoint").await;
+        assert!(reply.contains("200"), "{reply}");
+        let keep = status(lead_server).await["shared_state"]["base_checkpoint"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let admin = common::state_admin(dir.path());
+        let mut deleted = 0;
+        for checkpoint in admin.list_checkpoints(None).await.unwrap() {
+            let view = checkpoint
+                .name
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("view-");
+            if view && checkpoint.id.to_string() != keep {
+                admin.delete_checkpoint(checkpoint.id).await.unwrap();
+                deleted += 1;
+            }
+        }
+        assert_ne!(record, keep, "the follower record must lose its checkpoint");
+        assert!(deleted > 0, "no older checkpoint to delete");
+        let left = admin.list_checkpoints(None).await.unwrap();
+        assert!(left
+            .iter()
+            .all(|checkpoint| checkpoint.id.to_string() != record));
+        let revision = kv
+            .range(all())
+            .await
+            .unwrap()
+            .into_inner()
+            .header
+            .unwrap()
+            .revision;
+        let expected = local_hash(lead_server, revision).await.unwrap();
+        servers[follower] = Some(Server::start(configs[follower].clone()).await.unwrap());
+        let restarted = servers[follower].as_ref().unwrap();
+        let mut hash = None;
+        eventually("the restarted follower", async || {
+            hash = local_hash(restarted, revision).await;
+            hash.is_some()
+        })
+        .await;
+        assert_eq!(hash.unwrap(), expected);
+        let mut kv = KvClient::new(channel(restarted).await);
+        kv.put(put("restarted", "yes")).await.unwrap();
+        let reply = kv
+            .range(RangeRequest {
+                key: b"restarted".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reply.kvs[0].value, b"yes");
+        converge(&servers).await;
         for server in servers.into_iter().flatten() {
             server.shutdown().await.unwrap();
         }

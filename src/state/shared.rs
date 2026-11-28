@@ -35,10 +35,11 @@ pub(crate) use restore::{seed, Hooks, Stop};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum ViewRetention {
     /// Keep every checkpoint. Each one pins its SSTs, so storage grows until a manual cleanup.
-    #[default]
     Off,
     /// Delete old checkpoints that no member pins. SlateDB deletes without an epoch check, so a
-    /// deposed leader can still race a new one between its epoch check and the deletion.
+    /// deposed leader can still race a new one between its epoch check and the deletion. A
+    /// member that loses its checkpoint this way rebuilds from a newer one.
+    #[default]
     Fenced,
 }
 

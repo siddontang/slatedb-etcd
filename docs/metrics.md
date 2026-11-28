@@ -139,8 +139,8 @@ change when a backup starts or ends, and every 100 ms while one streams.
   rejects proposals.
 - Backup bytes near `--overlay-max-bytes` mean that a backup client reads slowly. New backups then
   fail, and the oldest one ends. See [backups](shared-state.md#backups).
-- A growing checkpoint count with `--view-retention off` means growing storage. See the manual
-  cleanup in the guide.
+- A growing checkpoint count means growing storage. With the default `fenced`, a member pins
+  old checkpoints. With `off`, see the manual cleanup in the guide.
 
 ## Read path counters
 
