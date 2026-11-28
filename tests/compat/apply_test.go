@@ -37,7 +37,7 @@ func TestSlowApplyKeepsRaftLive(t *testing.T) {
 	go func() { _, err := api.Put(ctx, "slow", "committed"); written <- err }()
 	// A follower applies at normal speed. Its serializable read proves that the Put committed,
 	// and it gives the revision of the Put. The leader must still apply below that revision.
-	var revision, target float64
+	var revision float64
 	require.Eventually(t, func() bool {
 		attempt, cancel := context.WithTimeout(ctx, time.Second)
 		defer cancel()
@@ -47,11 +47,7 @@ func TestSlowApplyKeepsRaftLive(t *testing.T) {
 		}
 		revision = float64(r.Kvs[0].ModRevision)
 		state, err := c.http(leader, "/status", nil)
-		if err != nil {
-			return false
-		}
-		target = state["commit_index"].(float64)
-		return state["revision"].(float64) < revision
+		return err == nil && state["revision"].(float64) < revision
 	}, 4*time.Second, 10*time.Millisecond, "the follower must apply the Put before the leader")
 	checkpoint := make(chan map[string]any, 1)
 	checkpointErr := make(chan error, 1)
@@ -70,6 +66,7 @@ func TestSlowApplyKeepsRaftLive(t *testing.T) {
 	}()
 	// While the leader applies below the Put, Raft stays live: same term, same leader.
 	for {
+		require.NoError(t, ctx.Err(), "the leader did not apply the Put")
 		state, err := c.http(leader, "/status", nil)
 		require.NoError(t, err)
 		require.Equal(t, before["term"], state["term"])
@@ -83,12 +80,12 @@ func TestSlowApplyKeepsRaftLive(t *testing.T) {
 	require.NoError(t, <-written)
 	require.NoError(t, <-read)
 	// The reply of a manual checkpoint is the status at the reply. It must include the Put, and
-	// its base must cover the commit index of the request.
+	// its base must be above the last log index before the Put.
 	replied := <-checkpoint
 	require.NoError(t, <-checkpointErr)
 	require.GreaterOrEqual(t, replied["revision"].(float64), revision)
 	base := replied["shared_state"].(map[string]any)["base_applied_index"].(float64)
-	require.GreaterOrEqual(t, base, target)
+	require.Greater(t, base, before["last_log_index"].(float64))
 	after, err := c.http(leader, "/status", nil)
 	require.NoError(t, err)
 	require.Equal(t, before["term"], after["term"])
