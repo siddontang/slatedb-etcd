@@ -315,10 +315,14 @@ async fn a_request_in_a_bare_majority_gets_a_certified_snapshot() {
 }
 
 /// #156 with a new publication. Two of three voters restart, and the third stays down. A Put
-/// commits above the base while apply waits on the follower, so the follower gets the Put only
-/// through the snapshot that it then asks for. The base holds no Put, so the leader publishes a
-/// checkpoint for the request. The announcement needs the acknowledgement of the follower, so
-/// the leader raises its own base to that checkpoint before the entry commits.
+/// commits above the base while apply waits on the follower, and the follower then asks for a
+/// snapshot. The base holds no Put, so the leader publishes a checkpoint for the request. The
+/// announcement needs the acknowledgement of the follower, so the leader raises its own base to
+/// that checkpoint before the entry commits, and the served checkpoint holds the Put.
+///
+/// The follower already queued the Put for apply, so it applies the Put from its log and
+/// installs no state. Only a job held on a storage error ends at a covering snapshot, and DST
+/// cannot hold one member's apply.
 #[tokio::test]
 async fn a_request_in_a_bare_majority_gets_a_new_checkpoint() {
     let mut sim = Simulation::new(9).await;
@@ -336,7 +340,6 @@ async fn a_request_in_a_bare_majority_gets_a_new_checkpoint() {
         requested >= put,
         "requested {requested} below the Put at {put}"
     );
-    // The follower applies again after Raft stores the snapshot, so it gets the Put from it.
     let mut writers = BTreeMap::new();
     for round in 0..100 {
         if round % 10 == 0 {
@@ -353,6 +356,19 @@ async fn a_request_in_a_bare_majority_gets_a_new_checkpoint() {
         checkpoint,
         "the base is not a new checkpoint"
     );
+    let record = sim.nodes[&follower].raw.store().recovery_snapshot().clone();
+    let record = Record::of(&record).unwrap().unwrap();
+    assert_ne!(Some(record.checkpoint), checkpoint);
+    let source = sim.nodes[&leader].writer.source().clone();
+    let served = source.open_base(record.checkpoint).await.unwrap();
+    assert!(
+        served.applied >= put,
+        "served {} below {put}",
+        served.applied
+    );
+    let key = format!("etcd/current/key-{}", sim.next_request);
+    assert!(served.get(key.as_bytes()).await.unwrap().is_some());
+    assert_eq!(sim.nodes[&follower].installed_snapshots, 0);
     sim.assert_acknowledged(follower).await;
 }
 
