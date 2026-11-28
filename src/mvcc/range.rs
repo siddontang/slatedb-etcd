@@ -373,9 +373,12 @@ impl<R: StateRead> View<'_, R> {
         if total.is_some() && r.count_only && !cfg!(debug_assertions) {
             return Ok(total);
         }
+        // Without filters, a scan that stops early reads the page and the row that sets `more`.
+        let rows = page_rows(r.limit)
+            .filter(|_| total.is_some() && out.page().is_some() && !has_filters(r));
         let mut scan = self
             .db
-            .scan(bounds.clone())
+            .scan(bounds.clone(), &range_scan_options(rows))
             .await
             .map_err(KvError::storage)?;
         let mut stopped = false;
@@ -403,7 +406,7 @@ impl<R: StateRead> View<'_, R> {
 
     /// Count the rows of a scan.
     async fn count_rows(&self, bounds: std::ops::Range<Vec<u8>>) -> Result<i64, slatedb::Error> {
-        let mut scan = self.db.scan(bounds).await?;
+        let mut scan = self.db.scan(bounds, &range_scan_options(None)).await?;
         let mut rows = 0;
         while scan.next().await?.is_some() {
             rows += 1;
