@@ -1,4 +1,4 @@
-use crate::mvcc::KvError;
+use crate::error::KvError;
 use crate::proto::etcdserverpb::*;
 use raft::eraftpb::{ConfChange, ConfChangeType, ConfState};
 use serde::{Deserialize, Serialize};
@@ -15,14 +15,12 @@ pub struct Store {
 
 /// The payload of a `SeedMembers` entry. See `state::cluster`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Seed {
-    /// The JSON names it `members_id`, so the entry does not decode as a `CompactStep`.
-    #[serde(rename = "members_id")]
     pub id: String,
     /// The leader that proposed the entry.
     pub origin: u64,
-    /// The membership of the leader as row JSON. An untagged enum cannot decode the integer map
-    /// keys of `Store`.
+    /// The membership of the leader as row JSON.
     pub members: String,
     /// The digest of the row of the leader at index `applied`. `None` if it had no row.
     pub digest: Option<String>,

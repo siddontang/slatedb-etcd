@@ -17,6 +17,8 @@ use crate::{ApiError, Request};
 #[derive(Clone)]
 pub struct ApiState {
     pub events: mpsc::Sender<Event>,
+    /// Peer frames have their own queue, so a burst of client requests cannot drop them.
+    pub(crate) peer_events: mpsc::Sender<Event>,
     /// The identity that this member sends. It admits peer traffic with the same identity.
     pub(crate) peer: crate::peer::Identity,
     pub(crate) refusals: std::sync::Arc<Refusals>,
@@ -210,6 +212,11 @@ async fn step_message(
     message: raft::eraftpb::Message,
     size: usize,
 ) -> Response {
+    // Peer frames use the peer queue, like the peer stream.
+    let state = ApiState {
+        events: state.peer_events.clone(),
+        ..state
+    };
     let process = crate::peer::process_of(
         headers
             .get(crate::peer::PROCESS)
@@ -278,7 +285,7 @@ async fn view_ack(
         coverage: report.coverage,
         writer: report.writer,
     };
-    match state.events.try_send(event) {
+    match state.peer_events.try_send(event) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }

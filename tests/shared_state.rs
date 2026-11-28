@@ -893,6 +893,27 @@ async fn http(server: &Server, method: &str, path: &str) -> String {
     response.lines().next().unwrap().to_owned()
 }
 
+/// #147: member readiness comes before the leader opens its writer, and etcd clients do not
+/// retry Defragment. A Defragment sent to the leader at once waits for the writer and succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn defragment_right_after_startup_waits_for_the_writer() {
+    within(async {
+        use slatedb_etcd::proto::etcdserverpb::DefragmentRequest;
+        let dir = tempfile::tempdir().unwrap();
+        let (_, servers) = quiet_cluster(dir.path()).await;
+        let lead = leader(servers[0].as_ref().unwrap()).await;
+        let opened = views(servers[lead as usize - 1].as_ref().unwrap()).await.2 > 0;
+        eprintln!("leader writer published before the Defragment: {opened}");
+        let mut maintenance =
+            MaintenanceClient::new(channel(servers[lead as usize - 1].as_ref().unwrap()).await);
+        maintenance.defragment(DefragmentRequest {}).await.unwrap();
+        for server in servers.into_iter().flatten() {
+            server.shutdown().await.unwrap();
+        }
+    })
+    .await;
+}
+
 /// A manual checkpoint on each member, followers first, returns after its base covers the
 /// writes. Defragment on a follower then runs on the idle leader writer. The shared database
 /// gets one sorted run and no L0 SST. Without another write, the leader publishes a new
@@ -1078,4 +1099,55 @@ async fn a_new_shared_cluster_restores_a_snapshot() {
         }
     })
     .await;
+}
+
+/// #109: a voter is down a few entries behind when a learner joins. The membership checkpoint
+/// must not wait for the down voter, so the learner installs a snapshot and applies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_learner_joins_while_a_voter_is_down() {
+    use slatedb_etcd::proto::etcdserverpb::{cluster_client::ClusterClient, MemberAddRequest};
+    let dir = tempfile::tempdir().unwrap();
+    let mut peers = addresses(4).await;
+    let address = peers.remove(&4).unwrap();
+    let mut servers = vec![];
+    for id in 1..=3 {
+        let mut config = member_config(dir.path(), id, &peers);
+        config.snapshot_every = 10000;
+        servers.push(Some(Server::start(config).await.unwrap()));
+    }
+    for server in servers.iter().flatten() {
+        server.wait_ready(Duration::from_secs(15)).await.unwrap();
+    }
+    let lead = leader(servers[0].as_ref().unwrap()).await as usize - 1;
+    let down = (lead + 1) % 3;
+    let mut kv = KvClient::new(channel(servers[lead].as_ref().unwrap()).await);
+    kv.put(put("before", "stop")).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    servers[down].take().unwrap().shutdown().await.unwrap();
+    let leader_server = servers[lead].as_ref().unwrap();
+    let added = ClusterClient::new(channel(leader_server).await)
+        .member_add(MemberAddRequest {
+            peer_ur_ls: vec![format!("http://{address}")],
+            is_learner: true,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .member
+        .unwrap()
+        .id;
+    peers.insert(added, address);
+    let mut config = member_config(dir.path(), added, &peers);
+    config.join = true;
+    let learner = Server::start(config).await.unwrap();
+    eventually("the learner installs a snapshot and applies", async || {
+        let status = status(&learner).await;
+        status["installed_snapshots"].as_u64().unwrap() > 0
+            && status["applied_index"].as_u64().unwrap() > 0
+    })
+    .await;
+    learner.shutdown().await.unwrap();
+    for server in servers.into_iter().flatten() {
+        server.shutdown().await.unwrap();
+    }
 }

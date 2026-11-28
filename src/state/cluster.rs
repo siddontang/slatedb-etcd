@@ -72,11 +72,11 @@ impl StateMachine {
             .applied_state()
             .get(crate::cluster::KEY)
             .await
-            .map_err(crate::mvcc::storage_fault::read)?;
+            .map_err(crate::storage_fault::read)?;
         // A stored row that does not decode is corrupt data, so apply holds on the entry.
         let mut members = match &stored {
             Some(row) => serde_json::from_slice(row).map_err(|error| {
-                crate::mvcc::storage_fault::stored(format!("invalid members row: {error}"))
+                crate::storage_fault::stored(format!("invalid members row: {error}"))
             })?,
             None => self.members.as_ref().clone(),
         };

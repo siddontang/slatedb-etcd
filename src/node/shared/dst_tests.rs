@@ -31,6 +31,49 @@ impl Simulation {
         self.settle(10).await;
     }
 
+    /// Publish a base, stop each voter, and start all but the last one. That one sends no
+    /// coverage report. Return the leader and the first follower.
+    async fn restart_all_but_last(&mut self) -> (u64, u64) {
+        self.settle(4).await;
+        let mut writers = BTreeMap::new();
+        self.publish_view(&mut writers).await;
+        self.settle(10).await;
+        for id in 1..=self.members {
+            self.stop(id);
+        }
+        for id in 1..self.members {
+            self.start(id).await;
+        }
+        self.settle(30).await;
+        let leader = self.leader().unwrap();
+        let follower = (1..self.members).find(|&id| id != leader).unwrap();
+        (leader, follower)
+    }
+
+    /// Member `follower` asks for a snapshot at its last index, above its base. Return that
+    /// index.
+    fn request_above_base(&mut self, follower: u64) -> u64 {
+        let (base, _, _) = self.base(follower);
+        let node = self.nodes.get_mut(&follower).unwrap();
+        node.raw.request_snapshot().unwrap();
+        let requested = node.raw.raft.pending_request_snapshot;
+        assert!(requested > base, "requested {requested} at base {base}");
+        requested
+    }
+
+    /// Member `follower` installed a record through `requested` and applied what `leader`
+    /// applied.
+    async fn assert_caught_up(&self, leader: u64, follower: u64, requested: u64) {
+        let node = &self.nodes[&follower];
+        assert_eq!(
+            node.raw.raft.pending_request_snapshot, 0,
+            "the request still waits"
+        );
+        assert!(node.raw.store().snapshot_index() >= requested);
+        assert_eq!(node.state.applied, self.nodes[&leader].state.applied);
+        self.assert_records_open().await;
+    }
+
     /// The process ID that member `id` sends with its traffic.
     pub(super) fn process(&self, id: u64) -> Option<u64> {
         self.processes.get(&id).copied()
@@ -46,6 +89,10 @@ impl Simulation {
             return;
         };
         if leader == id || !self.nodes.contains_key(&id) {
+            return;
+        }
+        // A member sends no report when it has no address of the leader.
+        if self.nodes[&id].peer_address(leader).is_none() {
             return;
         }
         let pins = self.nodes[&id].dst_pins();
@@ -245,33 +292,81 @@ async fn an_idle_shared_leader_serves_a_snapshot_request_at_the_last_index() {
 #[tokio::test]
 async fn a_request_with_a_voter_down_gets_a_certified_snapshot() {
     let mut sim = Simulation::with_size(9, 5).await;
-    sim.settle(4).await;
-    let mut writers = BTreeMap::new();
-    sim.publish_view(&mut writers).await;
-    sim.settle(10).await;
-    for id in 1..=5 {
-        sim.stop(id);
-    }
-    for id in 1..=4 {
-        sim.start(id).await;
-    }
-    sim.settle(30).await;
-    let leader = sim.leader().unwrap();
-    let follower = (1..=4).find(|&id| id != leader).unwrap();
-    let (base, _, _) = sim.base(follower);
-    let node = sim.nodes.get_mut(&follower).unwrap();
-    node.raw.request_snapshot().unwrap();
-    let requested = node.raw.raft.pending_request_snapshot;
-    assert!(requested > base, "requested {requested} at base {base}");
+    let (leader, follower) = sim.restart_all_but_last().await;
+    let requested = sim.request_above_base(follower);
     sim.settle(100).await;
-    let node = &sim.nodes[&follower];
-    assert_eq!(
-        node.raw.raft.pending_request_snapshot, 0,
-        "the request still waits"
+    sim.assert_caught_up(leader, follower, requested).await;
+}
+
+/// #156: two of three voters restart, and the third stays down. A follower asks for a snapshot
+/// above the base. Raft on the follower appends no entry while it waits for the snapshot, and the
+/// certification entry needs its acknowledgement to commit. The leader raises its own base when
+/// it proposes the entry, so it sends the record first. The entry then commits.
+#[tokio::test]
+async fn a_request_in_a_bare_majority_gets_a_certified_snapshot() {
+    let mut sim = Simulation::new(9).await;
+    let (leader, follower) = sim.restart_all_but_last().await;
+    let requested = sim.request_above_base(follower);
+    sim.settle(100).await;
+    sim.assert_caught_up(leader, follower, requested).await;
+    // The certification commits after the install.
+    let (_, _, covers) = *sim.announcements().last().unwrap();
+    assert!(covers >= requested, "covers {covers} below {requested}");
+}
+
+/// #156 with a new publication. Two of three voters restart, and the third stays down. The
+/// follower's overlay is full before a Put, so apply pauses, and the follower acknowledges the
+/// Put's entry without applying it. It then asks for a snapshot. The base holds no Put, so the
+/// leader publishes a checkpoint for the request. The announcement needs the acknowledgement of
+/// the follower, so the leader raises its own base to that checkpoint before the entry commits.
+/// The follower installs that checkpoint and reads the Put's value.
+#[tokio::test]
+async fn a_request_in_a_bare_majority_gets_a_new_checkpoint() {
+    let mut sim = Simulation::new(9).await;
+    let (leader, follower) = sim.restart_all_but_last().await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    let (_, checkpoint, _) = sim.base(leader);
+    sim.settle(2).await;
+    let node = sim.nodes.get_mut(&follower).unwrap();
+    node.options.overlay_max_bytes = 1;
+    assert!(node.apply_paused());
+    sim.propose().await;
+    sim.settle(2).await;
+    let put = sim.nodes[&leader].state.applied;
+    assert_eq!(sim.acknowledged.len(), 1);
+    assert!(sim.nodes[&follower].state.applied < put);
+    let requested = sim.request_above_base(follower);
+    assert!(
+        requested >= put,
+        "requested {requested} below the Put at {put}"
     );
-    assert!(node.raw.store().snapshot_index() >= requested);
-    assert_eq!(node.state.applied, sim.nodes[&leader].state.applied);
-    sim.assert_records_open().await;
+    let mut writers = BTreeMap::new();
+    for round in 0..100 {
+        if round % 10 == 0 {
+            sim.publish_view(&mut writers).await;
+        }
+        sim.settle(1).await;
+    }
+    sim.assert_caught_up(leader, follower, requested).await;
+    assert_ne!(
+        sim.base(follower).1,
+        checkpoint,
+        "the base is not a new checkpoint"
+    );
+    let record = sim.nodes[&follower].raw.store().recovery_snapshot().clone();
+    let record = Record::of(&record).unwrap().unwrap();
+    assert_ne!(Some(record.checkpoint), checkpoint);
+    let source = sim.nodes[&leader].writer.source().clone();
+    let served = source.open_base(record.checkpoint).await.unwrap();
+    assert!(
+        served.applied >= put,
+        "served {} below {put}",
+        served.applied
+    );
+    let key = format!("etcd/current/key-{}", sim.next_request);
+    assert!(served.get(key.as_bytes()).await.unwrap().is_some());
+    assert_eq!(sim.nodes[&follower].installed_snapshots, 1);
+    sim.assert_acknowledged(follower).await;
 }
 
 /// #96 in a cluster. Member `grouped` misses two commits and applies a Put and a failed update
@@ -341,7 +436,7 @@ async fn a_follower_manual_checkpoint_completes_with_a_certified_base() {
     // No member truncates, so `grouped` gets the entries and no snapshot.
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
-        node.next_checkpoint = None;
+        node.checkpoints.set_next(None);
     }
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
@@ -383,12 +478,7 @@ async fn a_follower_manual_checkpoint_completes_with_a_certified_base() {
     node.handle(Event::Checkpoint(tx), &mut vec![])
         .await
         .unwrap();
-    let index = *node
-        .checkpoint_waiters
-        .iter()
-        .map(|(i, _)| i)
-        .max()
-        .unwrap();
+    let index = node.checkpoints.highest_waiter().unwrap();
     sim.settle(2).await;
     sim.finish_checkpoints(grouped);
     assert!(rx.try_recv().is_err());
@@ -417,19 +507,20 @@ async fn a_follower_manual_checkpoint_completes_with_a_certified_base() {
     sim.lead(grouped).await;
     sim.writer_step(&mut writers, grouped, WriterStep::Open)
         .await;
-    let writer = &writers[&grouped];
-    assert_eq!(writer.written, j);
+    let written = sim.nodes[&grouped].writer.progress().written();
+    assert_eq!(written, j);
     let queue = sim.nodes[&grouped].worker.state().shared_handles().queue;
-    assert!(queue.after(writer.written, 1).is_empty());
+    assert!(queue.after(written, 1).is_empty());
     // The idle materializer waits for the next batch. The timer goes first, so a busy future
     // cannot starve it.
     use std::future::Future;
-    let progress = std::sync::Arc::new(shared::Progress::new(writer.written));
+    let progress = std::sync::Arc::new(shared::Progress::new(written));
     let mut materializer = Box::pin(shared::materialize(
-        writer.db.as_ref().unwrap().clone(),
+        writers[&grouped].db().unwrap(),
         queue,
         progress,
         shared::Gate::unchecked(),
+        0,
     ));
     let mut polls = 0;
     tokio::select! {
@@ -603,7 +694,7 @@ async fn a_member_restarts_at_a_record_above_its_checkpoint_row() {
     sim.stop(member);
     sim.writer_step(&mut writers, leader, WriterStep::Open)
         .await;
-    let db = writers[&leader].db.clone().unwrap();
+    let db = writers[&leader].db().unwrap();
     assert_eq!(db.manifest().last_l0_seq(), b);
     let options = slatedb::config::CheckpointOptions {
         name: Some(crate::state::shared::view_name(b)),
@@ -806,7 +897,7 @@ async fn a_restart_on_another_checkpoint_sends_that_checkpoint() {
     let row = record.row.unwrap();
     assert!(row < record.index);
     // Y has the same row, and retention deletes X.
-    let db = writers[&leader].db.clone().unwrap();
+    let db = writers[&leader].db().unwrap();
     let options = slatedb::config::CheckpointOptions {
         name: Some(crate::state::shared::view_name(row)),
         ..Default::default()
@@ -842,6 +933,34 @@ async fn a_restart_on_another_checkpoint_sends_that_checkpoint() {
         let record = Record::of(sim.nodes[&leader].raw.store().recovery_snapshot());
         assert_ne!(record.unwrap().unwrap().checkpoint, x);
     }
+}
+
+/// #171: a joining member has no members list until its first snapshot installs. The leader
+/// holds a record above its row, and sends it only to a process that reported the capability. The
+/// member reports to the configured address of the leader, and installs that record.
+#[tokio::test]
+async fn a_joining_member_installs_a_record_above_its_row() {
+    let mut sim = Simulation::new(67).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(10).await;
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(10).await;
+    let leader = sim.leader().unwrap();
+    let record = sim.certify_for(sim.follower(0)).await;
+    assert!(record.row.unwrap() < record.index);
+    let joining = sim.follower(0);
+    sim.joining = Some(joining);
+    sim.replace(joining, 0).await;
+    assert!(sim.nodes[&joining].state.members.members.is_empty());
+    let delivered = sim.delivered_views.len();
+    sim.settle(40).await;
+    assert_eq!(sim.leader(), Some(leader));
+    assert!(sim.delivered_views[delivered..].contains(&record.checkpoint));
+    let node = &sim.nodes[&joining];
+    assert_eq!(node.state.applied, sim.nodes[&leader].state.applied);
+    assert!(!node.state.members.members.is_empty());
 }
 
 /// Sig-Codex: a 409 for an earlier process of a member arrives after its new process reported
@@ -890,7 +1009,7 @@ async fn a_record_of_an_earlier_base_is_rebuilt_from_the_base() {
     let mut sim = Simulation::with_size(73, 5).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
-        node.next_checkpoint = None;
+        node.checkpoints.set_next(None);
     }
     sim.settle(5).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
@@ -934,7 +1053,7 @@ async fn a_restart_above_its_record_does_not_send_a_deleted_checkpoint() {
     let mut sim = Simulation::with_size(79, 5).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
-        node.next_checkpoint = None;
+        node.checkpoints.set_next(None);
     }
     sim.settle(5).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
@@ -1012,7 +1131,7 @@ async fn a_record_at_the_applied_index_raises_the_base() {
     let mut sim = Simulation::new(83).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
-        node.next_checkpoint = None;
+        node.checkpoints.set_next(None);
     }
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
@@ -1024,7 +1143,7 @@ async fn a_record_at_the_applied_index_raises_the_base() {
     let member = sim.follower(0);
     sim.write(2).await;
     sim.settle(4).await;
-    let images = sim.nodes[&member].snapshot_images;
+    let images = sim.nodes[&member].checkpoints.images();
     let record = sim.record_at_applied(member).await;
     let admin = sim.nodes[&leader].writer.admin().clone();
     admin.delete_checkpoint(record.checkpoint).await.unwrap();
@@ -1036,7 +1155,7 @@ async fn a_record_at_the_applied_index_raises_the_base() {
         record.index
     );
     assert_eq!(base, Some(record.checkpoint));
-    assert_eq!(sim.nodes[&member].snapshot_images, images);
+    assert_eq!(sim.nodes[&member].checkpoints.images(), images);
 }
 
 /// Architecture: correctness does not depend on that raise. The raise fails, as when the
@@ -1049,7 +1168,7 @@ async fn a_failed_raise() {
     let mut sim = Simulation::new(83).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
-        node.next_checkpoint = None;
+        node.checkpoints.set_next(None);
     }
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
@@ -1073,12 +1192,15 @@ async fn a_failed_raise() {
     let node = sim.nodes.get_mut(&member).unwrap();
     assert!(!node.raw.store().has_image());
     // No checkpoint job starts below the record, and none resets the flush counter.
-    node.appended_bytes = 7;
-    let images = node.snapshot_images;
+    node.checkpoints.set_appended_bytes(7);
+    let images = node.checkpoints.images();
     assert_eq!(node.checkpoint_due(), None);
     node.start_checkpoint(true).unwrap();
-    assert!(!node.checkpoint_running);
-    assert_eq!((node.appended_bytes, node.snapshot_images), (7, images));
+    assert!(!node.checkpoints.running());
+    assert_eq!(
+        (node.checkpoints.appended_bytes(), node.checkpoints.images()),
+        (7, images)
+    );
     if let Some(mut writer) = writers.remove(&leader) {
         writer.close().await;
     }
@@ -1109,7 +1231,7 @@ async fn a_failed_raise() {
     assert!(index >= record.index);
     let kept = Record::of(sim.nodes[&member].raw.store().recovery_snapshot());
     assert_eq!(kept.unwrap().map(|record| record.checkpoint), base);
-    assert!(sim.nodes[&member].snapshot_images <= images + 2);
+    assert!(sim.nodes[&member].checkpoints.images() <= images + 2);
     assert_eq!(
         sim.nodes[&other].state.applied,
         sim.nodes[&member].state.applied
@@ -1211,7 +1333,7 @@ async fn an_empty_base_sends_a_record_only_after_its_first_base() {
     let mut sim = Simulation::new(89).await;
     for node in sim.nodes.values_mut() {
         node.options.snapshot_every = 0;
-        node.next_checkpoint = None;
+        node.checkpoints.set_next(None);
     }
     sim.settle(4).await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
@@ -1463,7 +1585,7 @@ impl Simulation {
 
     /// The delivered commit index of member `id`.
     fn committed(&self, id: u64) -> u64 {
-        self.nodes[&id].committed_ready
+        self.nodes[&id].apply.committed()
     }
 }
 
@@ -1560,7 +1682,7 @@ async fn a_paused_member_checks_the_opened_base_against_its_commit() {
     sim.settle(2).await;
     let (older_row, older, _) = sim.base(leader);
     assert!(older_row > sim.nodes[&member].state.applied);
-    let db = writers[&leader].db.clone().unwrap();
+    let db = writers[&leader].db().unwrap();
     sim.write(2).await;
     sim.writer_step(&mut writers, leader, WriterStep::Materialize)
         .await;
@@ -1612,7 +1734,7 @@ async fn a_paused_member_adopts_a_checkpoint_named_at_its_base_with_a_newer_row(
     let mut writers = BTreeMap::new();
     sim.publish_view(&mut writers).await;
     sim.settle(4).await;
-    let db = writers[&leader].db.clone().unwrap();
+    let db = writers[&leader].db().unwrap();
     let name = db.manifest().last_l0_seq();
     let base = sim.base(member).0;
     assert_eq!(base, name);
@@ -1663,28 +1785,209 @@ async fn an_idle_poll_does_not_reopen_older_checkpoints() {
     sim.write(3).await;
     sim.pause(member);
     let store = sim.shared.clone();
-    let manifest_count = || {
-        store
-            .read
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|path| path.ends_with(".manifest"))
-            .count()
-    };
-    store.read.lock().unwrap().clear();
     let admin = sim.nodes[&member].writer.admin().clone();
     let views = crate::state::shared::view_checkpoints(&admin)
         .await
         .unwrap();
-    let list_only = manifest_count();
     let current = sim.base(member).1;
-    assert!(views.len() >= 12 && list_only > 0);
+    assert!(views.len() >= 12);
     assert_eq!(current, Some(views.last().unwrap().1.id));
+    // SlateDB GC reads the newest manifests in the background, so the test names the manifests
+    // of the older checkpoints. The poll must read none of them.
+    let older: Vec<String> = views[..views.len() - 1]
+        .iter()
+        .map(|(_, checkpoint)| format!("{:020}.manifest", checkpoint.manifest_id))
+        .collect();
     for _ in 0..2 {
         store.read.lock().unwrap().clear();
         sim.poll(member).await;
-        assert_eq!(manifest_count(), list_only);
+        let read = store.read.lock().unwrap().clone();
+        let reopened: Vec<_> = read
+            .iter()
+            .filter(|path| older.iter().any(|name| path.ends_with(name.as_str())))
+            .collect();
+        assert!(
+            reopened.is_empty(),
+            "the poll read older manifests: {reopened:?}"
+        );
         assert_eq!(sim.base(member).1, current);
     }
+}
+
+/// A Checkpoint job that an appended byte count started fails on a storage read. After the wait,
+/// the same checkpoint is due again with no new bytes over the threshold, and a real checkpoint
+/// then advances the record.
+#[tokio::test]
+async fn a_failed_automatic_checkpoint_keeps_its_byte_trigger() {
+    let mut sim = Simulation::new(83).await;
+    for node in sim.nodes.values_mut() {
+        node.options.snapshot_every = 0;
+        node.checkpoints.set_next(None);
+    }
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(10).await;
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.settle(10).await;
+    let member = sim.follower(0);
+    let node = sim.nodes.get_mut(&member).unwrap();
+    let base = node.checkpointable();
+    let record = node.raw.store().snapshot_index();
+    assert!(base > record, "base {base} record {record}");
+    assert!(!node.apply.busy());
+    // The bytes that the member appended are the automatic threshold.
+    let charged = node.checkpoints.appended_bytes();
+    assert!(charged > 0);
+    node.options.snapshot_min_bytes = charged;
+    node.checkpoints.set_next(Some(base));
+    node.checkpoints.membership_changed(record);
+    assert_eq!(node.checkpoint_due(), Some(false));
+    node.schedule_apply().unwrap();
+    assert!(node.checkpoints.running());
+    let mut completion = node.worker.step().await.unwrap().unwrap();
+    let crate::node::apply::Output::Checkpoint(Some(built)) = &mut completion.output else {
+        panic!("expected an inline checkpoint");
+    };
+    assert!(built.result.is_ok());
+    built.result = Err(anyhow::Error::new(crate::storage_fault::Classified {
+        fault: crate::storage_fault::StorageFault::Transient,
+        message: "membership read temporarily unavailable".into(),
+    }));
+    node.complete_apply(completion).unwrap();
+    let before = node.state.applied;
+    assert_eq!(node.checkpoint_due(), None);
+    sim.write(1).await;
+    sim.settle(2).await;
+    let node = sim.nodes.get_mut(&member).unwrap();
+    assert!(node.state.applied > before);
+    assert_eq!(node.raw.store().snapshot_index(), record);
+    // Only one small write came after the failed checkpoint.
+    tokio::time::sleep(std::time::Duration::from_millis(1050)).await;
+    assert_eq!(node.checkpoint_due(), Some(false), "lost the byte trigger");
+    node.schedule_apply().unwrap();
+    node.drain_apply().await.unwrap();
+    node.drive_ready().await.unwrap();
+    node.drain_log().await.unwrap();
+    assert_eq!(node.raw.store().snapshot_index(), base);
+}
+
+/// #106: DST runs the stranded check and the retry of `publish`. A crash between a checkpoint
+/// and its announcement strands the checkpoint, and the next writer announces it. The writer
+/// sends it again until applied state shows it.
+#[tokio::test]
+async fn a_new_writer_announces_a_stranded_checkpoint_until_it_applies() {
+    let mut sim = Simulation::new(41).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(3).await;
+    let leader = sim.leader().unwrap();
+    let mut writers = BTreeMap::new();
+    for step in [
+        WriterStep::Open,
+        WriterStep::Materialize,
+        WriterStep::Checkpoint,
+    ] {
+        sim.writer_step(&mut writers, leader, step).await;
+    }
+    writers.remove(&leader).unwrap().close().await;
+    let admin = sim.nodes[&leader].writer.admin().clone();
+    let views = crate::state::shared::view_checkpoints(&admin).await;
+    let stranded = views.unwrap().last().unwrap().1.id;
+    let announced = sim.announcements().len();
+    // The entry of the first announce step does not commit before the second one.
+    for step in [WriterStep::Open, WriterStep::Announce, WriterStep::Announce] {
+        sim.writer_step(&mut writers, leader, step).await;
+    }
+    sim.settle(4).await;
+    let sent: Vec<_> = sim.announcements()[announced..]
+        .iter()
+        .map(|(_, id, _)| *id)
+        .collect();
+    assert_eq!(sent, [stranded, stranded]);
+    assert_eq!(sim.base(leader).1, Some(stranded));
+    // Applied state shows the checkpoint, so the retry ends.
+    sim.writer_step(&mut writers, leader, WriterStep::Announce)
+        .await;
+    sim.settle(4).await;
+    assert_eq!(sim.announcements().len(), announced + 2);
+}
+
+/// #109: a follower misses a few entries, and the leader then moves its base above them. The
+/// leader must keep those entries, so the follower catches up from the log. A snapshot would
+/// make the follower load the whole key index from the checkpoint again.
+#[tokio::test]
+async fn a_follower_a_few_entries_behind_the_base_catches_up_from_the_log() {
+    let mut sim = Simulation::new(43).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(3).await;
+    let leader = sim.leader().unwrap();
+    let member = sim.follower(0);
+    let last = sim.nodes[&member].raw.raft.raft_log.last_index();
+    sim.isolated = Some(member);
+    sim.write(3).await;
+    let mut writers = BTreeMap::new();
+    sim.publish_view(&mut writers).await;
+    sim.write(10).await;
+    let (base, _, _) = sim.base(leader);
+    let node = &sim.nodes[&leader];
+    let every = node.options.snapshot_every;
+    assert!(
+        base > last && base - last <= every,
+        "base {base} last {last}"
+    );
+    // The leader keeps the entries that the follower needs.
+    assert!(node.raw.store().snapshot_index() <= last);
+    sim.isolated = None;
+    sim.settle(4).await;
+    let node = &sim.nodes[&member];
+    assert_eq!(node.state.applied, sim.nodes[&leader].state.applied);
+    assert_eq!(node.installed_snapshots, 0);
+    assert!(sim.nodes[&leader].raw.store().snapshot_index() >= base);
+}
+
+/// #109: a follower stays a few entries behind a moving base, because its append responses
+/// come late. The leader must still truncate. The hold ends when the base is more than two
+/// `snapshot_every` intervals above the last record.
+#[tokio::test]
+async fn a_follower_that_stays_behind_does_not_hold_the_log_for_ever() {
+    let mut sim = Simulation::new(43).await;
+    sim.settle(4).await;
+    sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
+    sim.write(3).await;
+    let leader = sim.leader().unwrap();
+    let member = sim.follower(0);
+    let initial = sim.nodes[&leader].raw.store().snapshot_index();
+    let mut cap = sim.nodes[&leader]
+        .raw
+        .raft
+        .prs()
+        .get(member)
+        .unwrap()
+        .matched;
+    let mut writers = BTreeMap::new();
+    for _ in 0..20 {
+        sim.ack_limit = Some((member, cap));
+        sim.messages.append(&mut sim.delayed);
+        sim.write(3).await;
+        sim.publish_view(&mut writers).await;
+        sim.settle(3).await;
+        let node = &sim.nodes[&leader];
+        let base = node.checkpointable();
+        let matched = node.raw.raft.prs().get(member).unwrap().matched;
+        let record = node.raw.store().snapshot_index();
+        let every = node.options.snapshot_every;
+        assert!(
+            base > matched && base - matched <= every,
+            "base {base} matched {matched}"
+        );
+        assert!(base - record <= 2 * every, "base {base} record {record}");
+        cap = base - 1;
+    }
+    // The leader truncated while the follower still lagged.
+    assert!(sim.nodes[&leader].raw.store().snapshot_index() > initial);
+    sim.ack_limit = None;
+    sim.messages.append(&mut sim.delayed);
+    sim.settle(8).await;
 }

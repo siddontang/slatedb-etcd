@@ -1,7 +1,8 @@
 //! Shared state mode: one SlateDB for the whole cluster. See `docs/shared-state.md`.
 //!
-//! This module owns the apply side: the cluster claim, the overlay, the base checkpoint, and
-//! base switches. The leader tasks that write the shared `Db` are in `node/shared`.
+//! This module owns the apply side: the overlay, the base checkpoint, and base switches. It reads
+//! the cluster claim of `object::cluster_claim` when it opens the state. The leader tasks that
+//! write the shared `Db` are in `node/shared`.
 //!
 //! No member opens the writer here. The leader opens it in `node/shared` when it takes the lead.
 //! Phase 3 adds the fencing checks, the clock checks, and the reopen after a fence.
@@ -19,6 +20,7 @@ use slatedb::Db;
 use super::overlay::Overlay;
 use super::view::{Base, SharedView, StateView};
 use super::*;
+use crate::object::cluster_claim;
 
 mod adopt;
 mod restore;
@@ -42,179 +44,10 @@ pub enum ViewRetention {
 
 /// The name prefix of the checkpoints that the publisher creates.
 const VIEW: &str = "view-";
-const CLAIM: &str = "shared/owner.json";
 const BOOTSTRAP: &str = "shared/bootstrap.json";
 const STATE: &str = "shared/state";
 /// A received snapshot that Raft did not install releases its checkpoint after this time.
 const RECEIPT_LIFETIME: Duration = Duration::from_secs(60);
-
-/// The cluster claim. The first member creates it, and every member checks it.
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
-struct Claim {
-    version: u32,
-    cluster: String,
-    /// The logical quota of the cluster. Zero disables it. Every member applies this value.
-    quota: u64,
-    /// The initial voters. Members with another bootstrap set refuse to open the writer.
-    voters: Vec<u64>,
-    /// The random ID of this shared store. Members send it with their peer traffic, so members
-    /// on another bucket or prefix refuse each other.
-    store_id: uuid::Uuid,
-}
-
-/// The values of a checked cluster claim.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Claimed {
-    pub quota: u64,
-    pub store_id: uuid::Uuid,
-}
-
-/// Parse a cluster claim. A claim without a store ID does not parse.
-fn parse_claim(data: &[u8]) -> Result<Claim> {
-    let claim: Claim =
-        serde_json::from_slice(data).context("invalid cluster claim, or no valid store ID")?;
-    ensure!(
-        !claim.store_id.is_nil(),
-        "the cluster claim has a nil store ID"
-    );
-    Ok(claim)
-}
-
-/// Read and check an existing claim. Return `None` when the store has no claim.
-async fn read_claim(store: &dyn ObjectStore, root: &str, cluster: &str) -> Result<Option<Claim>> {
-    let data = match store.get(&Path::from(join(root, CLAIM))).await {
-        Ok(result) => result.bytes().await?,
-        Err(slatedb::object_store::Error::NotFound { .. }) => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let existing = parse_claim(&data)?;
-    ensure!(
-        existing.version == 1 && existing.cluster == cluster,
-        "the shared state belongs to another cluster"
-    );
-    Ok(Some(existing))
-}
-
-/// Read and check an existing claim. Return `None` when the store has no claim.
-pub(crate) async fn claimed(
-    store: &dyn ObjectStore,
-    root: &str,
-    cluster: &str,
-) -> Result<Option<Claimed>> {
-    Ok(read_claim(store, root, cluster)
-        .await?
-        .map(|existing| Claimed {
-            quota: existing.quota,
-            store_id: existing.store_id,
-        }))
-}
-
-/// Read the claim of the store that a data directory is bound to. Refuse a claim with another
-/// store ID, and for an initial voter, a claim with other voters.
-///
-/// This never creates the claim. A claim that disappears during a start stays absent, and the
-/// start fails.
-pub(crate) async fn bound(
-    store: &dyn ObjectStore,
-    root: &str,
-    cluster: &str,
-    store_id: uuid::Uuid,
-    voters: Option<&[u64]>,
-) -> Result<Claimed> {
-    let existing = read_claim(store, root, cluster).await?;
-    let found = existing.as_ref().map(|claim| claim.store_id);
-    let Some(existing) = existing.filter(|claim| claim.store_id == store_id) else {
-        bail!(
-            "the data directory belongs to shared store {store_id}, but the store at this \
-             location has {}: the store was replaced. Use the original store, or a new data \
-             directory",
-            found.map_or("no cluster claim".to_owned(), |id| format!("store ID {id}"))
-        );
-    };
-    if let Some(voters) = voters {
-        let mut voters = voters.to_vec();
-        voters.sort_unstable();
-        ensure!(
-            existing.voters == voters,
-            "the shared state belongs to other initial voters {:?}",
-            existing.voters
-        );
-    }
-    Ok(Claimed {
-        quota: existing.quota,
-        store_id,
-    })
-}
-
-/// Read the claim for a joining member. It is not one of the initial voters, so it never creates
-/// the claim.
-pub(crate) async fn joined(store: &dyn ObjectStore, root: &str, cluster: &str) -> Result<Claimed> {
-    claimed(store, root, cluster)
-        .await?
-        .context("a joining member needs an existing shared cluster")
-}
-
-/// Create or check the shared state claim under `root`. Return the cluster quota and the store
-/// ID.
-///
-/// The claim holds the initial voters. Two members that each bootstrap a separate one-voter
-/// cluster in the same namespace race on one `PutMode::Create`, so only one opens the writer.
-/// The member that creates the claim also picks the store ID.
-pub(crate) async fn claim(
-    store: &dyn ObjectStore,
-    root: &str,
-    cluster: &str,
-    quota: u64,
-    voters: &[u64],
-) -> Result<Claimed> {
-    let path = Path::from(join(root, CLAIM));
-    let mut voters = voters.to_vec();
-    voters.sort_unstable();
-    let claim = Claim {
-        version: 1,
-        cluster: cluster.to_owned(),
-        quota,
-        voters,
-        store_id: uuid::Uuid::new_v4(),
-    };
-    match store
-        .put_opts(
-            &path,
-            serde_json::to_vec(&claim)?.into(),
-            PutMode::Create.into(),
-        )
-        .await
-    {
-        Ok(_) => Ok(Claimed {
-            quota,
-            store_id: claim.store_id,
-        }),
-        Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
-            let existing = parse_claim(&store.get(&path).await?.bytes().await?)?;
-            ensure!(
-                existing.version == 1 && existing.cluster == cluster,
-                "the shared state belongs to another cluster"
-            );
-            ensure!(
-                existing.voters == claim.voters,
-                "the shared state belongs to other initial voters {:?}",
-                existing.voters
-            );
-            if existing.quota != quota {
-                tracing::warn!(
-                    configured = quota,
-                    cluster = existing.quota,
-                    "the cluster claim sets the quota"
-                );
-            }
-            Ok(Claimed {
-                quota: existing.quota,
-                store_id: existing.store_id,
-            })
-        }
-        Err(error) => Err(error).context("cannot claim the shared state"),
-    }
-}
 
 fn join(root: &str, name: &str) -> String {
     if root.is_empty() {
@@ -245,6 +78,10 @@ pub(crate) struct Source {
     /// Tests: each writer open fails with the error of this function.
     #[cfg(test)]
     pub(crate) fail_writers: Mutex<Option<fn() -> anyhow::Error>>,
+    /// DST: the compactor of a writer runs only on request, so GC removes the same SSTs on
+    /// every replay.
+    #[cfg(test)]
+    pub(crate) manual_compaction: std::sync::atomic::AtomicBool,
 }
 
 /// The checkpoints that this member uses, and the ones that retention deletes.
@@ -353,6 +190,15 @@ impl Source {
             .push((id, Arc::downgrade(&base)));
         drop(opening);
         Ok(base)
+    }
+
+    /// A live base of checkpoint `id`, if this member holds one.
+    pub(crate) fn live_base(&self, id: uuid::Uuid) -> Option<Arc<Base>> {
+        let pins = self.pins.lock().unwrap();
+        pins.bases
+            .iter()
+            .filter(|(base, _)| *base == id)
+            .find_map(|(_, base)| base.upgrade())
     }
 
     /// Load the cache entries of the SSTs of `base` that no earlier warm loaded. See
@@ -472,11 +318,7 @@ impl Source {
 
     /// Open the writable shared database. Opening it fences an older writer.
     pub async fn open_writer(&self) -> Result<Db> {
-        self.open_writer_with(slatedb_settings()).await
-    }
-
-    pub async fn open_writer_with(&self, settings: Settings) -> Result<Db> {
-        self.build_writer(settings, None).await
+        self.build_writer(slatedb_settings(), None).await
     }
 
     /// Open the writer of a leader with `clock` as its SlateDB clock. See
@@ -500,6 +342,19 @@ impl Source {
         #[cfg(test)]
         if let Some(error) = *self.fail_writers.lock().unwrap() {
             return Err(error());
+        }
+        #[cfg(test)]
+        let mut settings = settings;
+        #[cfg(test)]
+        if self
+            .manual_compaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Some(compactor) = settings.compactor_options.as_mut() {
+                compactor
+                    .scheduler_options
+                    .insert("min_compaction_sources".into(), "1000000".into());
+            }
         }
         let mut builder = Db::builder(self.state(), self.store.clone())
             .with_db_cache(self.cache.clone(), 0)
@@ -699,8 +554,8 @@ pub(crate) async fn retain(
 
 /// Open the newest `view-` checkpoint at or below index `limit` that holds the membership.
 ///
-/// A checkpoint that retention deleted after the listing is skipped. An older base can then need
-/// log entries that the member truncated, and the replay of the rebase fails on them.
+/// A checkpoint that retention deleted after the listing is skipped. The rebase does not use a
+/// base below its base index.
 async fn newest_base_through(
     admin: &slatedb::admin::Admin,
     source: &Source,
@@ -827,6 +682,8 @@ pub(crate) fn offline_source(
         fail_writer: Default::default(),
         #[cfg(test)]
         fail_writers: Default::default(),
+        #[cfg(test)]
+        manual_compaction: Default::default(),
     }))
 }
 
@@ -851,8 +708,7 @@ async fn newest_base(admin: &slatedb::admin::Admin, source: &Source) -> Result<O
 /// that GC deleted under an old base. See `storage_fault::classify`. A read error that crossed a
 /// `KvError` keeps its class.
 pub(crate) fn missing_object(error: &anyhow::Error) -> bool {
-    crate::mvcc::storage_fault::classify(error)
-        == Some(crate::mvcc::storage_fault::StorageFault::Missing)
+    crate::storage_fault::classify(error) == Some(crate::storage_fault::StorageFault::Missing)
 }
 
 /// Bases that opened in the background, each with the index that its announcement certified.
@@ -1237,10 +1093,14 @@ impl Shared {
         true
     }
 
-    /// Make `base` the whole state and drop the overlay. Install and rebase use this.
-    fn reset(&mut self, base: Arc<Base>) {
+    /// Make `base` the whole state through `index` and drop the overlay. Install and rebase
+    /// use this. A base above its row goes out at `index` at once.
+    fn reset(&mut self, base: Arc<Base>, index: u64) {
         self.overlay.reset(base.applied);
-        let index = base.applied;
+        if index > base.applied {
+            self.extensions += 1;
+            self.overlay.cover(index);
+        }
         self.set_base(base, index);
     }
 
@@ -1287,6 +1147,37 @@ pub(crate) struct Handles {
 }
 
 impl StateMachine {
+    /// Bind the data directory `dir` to its namespace in `config`, and open the shared state
+    /// with the quota and the store ID of the cluster claim.
+    pub(crate) async fn open_bound(
+        config: &crate::object::Config,
+        dir: &std::path::Path,
+        cluster: &str,
+        member: u64,
+        cache: StateCache,
+        options: &Options,
+    ) -> Result<Self> {
+        let request = cluster_claim::Request {
+            quota: options.quota,
+            voters: &options.voters,
+            join: options.join,
+        };
+        let bound = config.bind(dir, cluster, member, request).await?;
+        let options = match bound.claimed {
+            Some(claimed) => {
+                #[cfg(test)]
+                tests::before_state_open().await;
+                Options {
+                    quota: claimed.quota,
+                    store_id: Some(claimed.store_id),
+                    ..options.clone()
+                }
+            }
+            None => options.clone(),
+        };
+        Self::open_shared(bound.store, &bound.root, cluster, cache, &options).await
+    }
+
     /// Open the shared state of the cluster at `root` in `store`. See the module comment.
     ///
     /// No member opens the writer here. The leader opens it in `node/shared`.
@@ -1302,10 +1193,10 @@ impl StateMachine {
         // directory reads the claim only, before any restore or base selection.
         let voters = (!options.join).then_some(options.voters.as_slice());
         let claimed = match options.store_id {
-            Some(id) => bound(store.as_ref(), root, cluster, id, voters).await?,
-            None if options.join => joined(store.as_ref(), root, cluster).await?,
+            Some(id) => cluster_claim::bound(store.as_ref(), root, cluster, id, voters).await?,
+            None if options.join => cluster_claim::joined(store.as_ref(), root, cluster).await?,
             None => {
-                claim(
+                cluster_claim::claim(
                     store.as_ref(),
                     root,
                     cluster,
@@ -1329,6 +1220,8 @@ impl StateMachine {
             fail_writer: Default::default(),
             #[cfg(test)]
             fail_writers: Default::default(),
+            #[cfg(test)]
+            manual_compaction: Default::default(),
         });
         ensure!(
             state_root == source.state(),

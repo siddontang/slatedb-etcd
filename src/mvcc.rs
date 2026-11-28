@@ -5,7 +5,7 @@ use std::pin::Pin;
 use crate::WriteBatch;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use tonic::{Code, Status};
+use tonic::Code;
 
 use crate::proto::etcdserverpb::request_op::Request as Op;
 use crate::proto::etcdserverpb::response_op::Response as Resp;
@@ -14,8 +14,11 @@ use crate::proto::mvccpb::KeyValue;
 use crate::proto::state::Version;
 use crate::state::{StateRead, StateScan};
 
+pub use crate::error::KvError;
+
+pub(crate) mod hash;
 mod put;
-pub(crate) mod storage_fault;
+mod range;
 #[cfg(test)]
 pub(crate) use put::DIRECT_TXNS;
 pub(crate) use put::{batchable_txn, prepare_put, prepare_txn_puts, CurrentView};
@@ -28,107 +31,6 @@ pub const COMPACT_REVISION: &[u8] = b"etcd/compact-revision";
 type KvResult<T> = Result<T, KvError>;
 type KvFuture<'a, T> = Pin<Box<dyn Future<Output = KvResult<T>> + Send + 'a>>;
 type Rows = BTreeMap<Vec<u8>, KeyValue>;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KvError {
-    pub code: i32,
-    pub message: String,
-    /// The class of a storage error. It does not cross the wire, so a reply keeps only its code.
-    #[serde(skip)]
-    fault: Option<crate::mvcc::storage_fault::StorageFault>,
-}
-
-impl KvError {
-    pub(crate) fn new(code: Code, message: &str) -> Self {
-        Self {
-            code: code as i32,
-            message: format!("etcdserver: {message}"),
-            fault: None,
-        }
-    }
-
-    fn invalid(message: &str) -> Self {
-        Self::new(Code::InvalidArgument, message)
-    }
-
-    /// Classify a storage error of a read. A transient or missing object fails the request with
-    /// a retryable status. Stored data that does not decode fails it with `DataLoss`, and the
-    /// read counts it. The caller states that `error` comes from a storage call or from stored
-    /// data, so an error of no known class is corrupt data.
-    pub(crate) fn storage(error: impl Into<anyhow::Error>) -> Self {
-        use crate::mvcc::storage_fault::{StorageFault, CORRUPT_READS};
-        let error = error.into();
-        let fault = crate::mvcc::storage_fault::classify(&error).unwrap_or(StorageFault::Corrupt);
-        let (code, message) = match fault {
-            StorageFault::Transient => {
-                tracing::warn!(error = format!("{error:#}"), "a storage read failed");
-                (Code::Unavailable, "storage unavailable; retry".to_owned())
-            }
-            StorageFault::Missing => (
-                Code::Unavailable,
-                "a checkpoint object is missing; retry".to_owned(),
-            ),
-            StorageFault::Corrupt => {
-                CORRUPT_READS.inc();
-                tracing::error!(
-                    error = format!("{error:#}"),
-                    "a read met corrupt stored data"
-                );
-                (Code::DataLoss, format!("corrupt stored data: {error:#}"))
-            }
-        };
-        Self {
-            fault: Some(fault),
-            ..Self::new(code, &message)
-        }
-    }
-
-    /// The error of a read outside the KV path, such as a diagnostic. A classified storage
-    /// error keeps its class. Another error fails the request with `Unavailable`.
-    pub(crate) fn read_failure(error: anyhow::Error) -> Self {
-        match crate::mvcc::storage_fault::classify(&error) {
-            Some(_) => Self::storage(error),
-            None => Self::new(Code::Unavailable, &format!("{error:#}")),
-        }
-    }
-
-    /// A stored row that does not decode or contradicts another one.
-    pub(crate) fn corrupt(message: &str) -> Self {
-        Self::storage(crate::mvcc::storage_fault::stored(message))
-    }
-
-    /// An error of this member's own invariants, such as a write batch that cannot count its
-    /// bytes. It stops the member.
-    pub(crate) fn invariant(error: impl std::fmt::Display) -> Self {
-        Self::new(Code::Internal, &format!("invariant error: {error}"))
-    }
-
-    /// Return the error of this member's own invariants, which stops the member. A storage
-    /// error fails only its request, so it returns `None`.
-    pub(crate) fn stops_member(&self) -> Option<anyhow::Error> {
-        match self.fault {
-            Some(_) => None,
-            None => self.unapplied(),
-        }
-    }
-
-    /// Return the error that stops apply instead of becoming the result of an entry: a storage
-    /// error, whose class survives, or an invariant error. Each member must reach the same
-    /// result, so a read that failed on this member cannot be one.
-    fn unapplied(&self) -> Option<anyhow::Error> {
-        if let Some(fault) = self.fault {
-            return Some(anyhow::Error::new(crate::mvcc::storage_fault::Classified {
-                fault,
-                message: self.message.clone(),
-            }));
-        }
-        (self.code == Code::Internal as i32).then(|| anyhow::anyhow!("{}", self.message))
-    }
-
-    pub fn status(self) -> Status {
-        Status::new(Code::from_i32(self.code), self.message)
-    }
-}
 
 /// The error of an apply entry point. Only a `Request` error is the result of an entry.
 #[derive(Debug)]
@@ -629,33 +531,6 @@ impl<R: StateRead> View<'_, R> {
             .transpose()
     }
 
-    /// Read the live rows of `[key, end)` at `revision` in key order.
-    /// The result holds the first `keep` rows and the count of all live rows.
-    async fn historical(
-        &self,
-        key: &[u8],
-        end: &[u8],
-        revision: i64,
-        keep: usize,
-    ) -> KvResult<(Vec<KeyValue>, i64)> {
-        if end.is_empty() {
-            let kv = self.version_at(key, revision).await?.and_then(|v| v.value);
-            let count = i64::from(kv.is_some());
-            return Ok((kv.into_iter().take(keep).collect(), count));
-        }
-        if keep != usize::MAX {
-            if let Some(result) = self.journal_range(key, end, revision, keep).await? {
-                // Debug builds also read the history rows and check the result against them.
-                if cfg!(debug_assertions) {
-                    let history = self.history_range(key, end, revision, keep).await?;
-                    debug_assert_eq!(result, history, "journal range differs from history");
-                }
-                return Ok(result);
-            }
-        }
-        self.history_range(key, end, revision, keep).await
-    }
-
     /// Read `[key, end)` at `revision` from the history rows of the interval.
     ///
     /// History rows sort by key and then by revision. One ascending scan reads the versions of
@@ -668,13 +543,11 @@ impl<R: StateRead> View<'_, R> {
         key: &[u8],
         end: &[u8],
         revision: i64,
-        keep: usize,
-    ) -> KvResult<(Vec<KeyValue>, i64)> {
+        out: &mut range::Assembly<'_>,
+    ) -> KvResult<()> {
         const PROBE_VERSIONS: usize = 16;
         // A seek costs more than reading a few adjacent rows.
         const READ_AHEAD: usize = 8;
-        let mut rows = Vec::new();
-        let mut count = 0;
         let lower = history_prefix(key);
         let upper = if end == [0] {
             // The hex key encoding keeps key order, and `0` sorts after the `/` separator.
@@ -683,9 +556,8 @@ impl<R: StateRead> View<'_, R> {
             history_prefix(end)
         };
         if lower >= upper {
-            return Ok((rows, count));
+            return Ok(());
         }
-        let decode = |value: bytes::Bytes| Version::decode(value).map_err(KvError::storage);
         let mut scan = self
             .db
             // The scan seeks past most versions, so it does not read ahead.
@@ -735,9 +607,15 @@ impl<R: StateRead> View<'_, R> {
                     }
                 }
             };
-            let version = latest.map(decode).transpose()?;
-            let kv = match version {
-                Some(version) if probed == PROBE_VERSIONS => {
+            // The metadata projection skips the value. Only a kept row decodes it.
+            let version = latest
+                .map(|row| {
+                    let meta = range::VersionMeta::decode(row.clone()).map_err(KvError::storage)?;
+                    Ok::<_, KvError>((meta, row))
+                })
+                .transpose()?;
+            let candidate = match version {
+                Some((version, _)) if probed == PROBE_VERSIONS => {
                     // A current row that is not newer than `revision` is the version at it.
                     // A point read is cheaper than a descending scan.
                     match self.db.current(&version.key).await? {
@@ -747,14 +625,12 @@ impl<R: StateRead> View<'_, R> {
                             .await?
                             .and_then(|version| version.value),
                     }
+                    .map(range::Candidate::Decoded)
                 }
-                version => version.and_then(|version| version.value),
+                version => version.and_then(|(version, row)| version.live(row)),
             };
-            if let Some(kv) = kv {
-                count += 1;
-                if rows.len() < keep {
-                    rows.push(kv);
-                }
+            if let Some(candidate) = candidate {
+                out.offer(candidate)?;
             }
             if seek {
                 // All versions of this key sort before this bound. Longer keys start at it.
@@ -769,7 +645,7 @@ impl<R: StateRead> View<'_, R> {
                 next = scan.next().await.map_err(KvError::storage)?;
             }
         }
-        Ok((rows, count))
+        Ok(())
     }
 
     /// Read `[key, end)` at `revision` from the current rows and the later Watch journal.
@@ -1003,137 +879,6 @@ impl<R: StateRead> View<'_, R> {
         self.revision + i64::from(!self.changes.is_empty())
     }
 
-    async fn ordered_range(&self, r: &RangeRequest) -> KvResult<RangeResponse> {
-        let mut response = RangeResponse {
-            header: header(self.current_revision()),
-            ..Default::default()
-        };
-        let bounds = current_bounds(&r.key, &r.range_end);
-        if bounds.is_empty() {
-            return Ok(response);
-        }
-        // The key order of a pinned view holds the count, so the scan stops after `limit + 1`
-        // rows. Debug builds scan the whole interval and check the count against the rows.
-        let total = self.keys.map(|keys| keys.count(&r.key, &r.range_end));
-        let full_scan = total.is_none() || cfg!(debug_assertions);
-        if let Some(total) = total.filter(|_| r.count_only && !full_scan) {
-            response.count = total;
-            return Ok(response);
-        }
-        let mut budget = self.row_budget;
-        let rows = page_rows(r.limit).filter(|_| !full_scan);
-        let mut scan = self
-            .db
-            .scan(bounds, &range_scan_options(rows))
-            .await
-            .map_err(KvError::storage)?;
-        while let Some(row) = scan.next().await.map_err(KvError::storage)? {
-            response.count += 1;
-            if r.count_only {
-                continue;
-            }
-            if r.limit > 0 && response.count > r.limit {
-                response.more = true;
-                if !full_scan {
-                    break;
-                }
-                continue;
-            }
-            let mut kv = KeyValue::decode(row.value).map_err(KvError::storage)?;
-            if r.keys_only {
-                kv.value.clear();
-            }
-            if let Some(budget) = &mut budget {
-                *budget = budget.checked_sub(row_bytes(&kv)).ok_or_else(over_budget)?;
-            }
-            response.kvs.push(kv);
-        }
-        if let Some(total) = total {
-            if full_scan {
-                debug_assert_eq!(
-                    total, response.count,
-                    "key order count differs from the rows"
-                );
-            }
-            response.count = total;
-        }
-        Ok(response)
-    }
-
-    async fn range(&self, r: &RangeRequest) -> KvResult<RangeResponse> {
-        if self.changes.is_empty() && streams_range(r) {
-            return self.ordered_range(r).await;
-        }
-        let (rows, count) = if r.revision > 0 {
-            // Key order without filters needs only the first `limit + 1` rows and the count.
-            let keep = if r.count_only {
-                0
-            } else if r.limit > 0 && key_ordered(r) {
-                usize::try_from(r.limit)
-                    .unwrap_or(usize::MAX)
-                    .saturating_add(1)
-            } else {
-                usize::MAX
-            };
-            self.historical(&r.key, &r.range_end, r.revision, keep)
-                .await?
-        } else {
-            let rows: Vec<_> = if r.range_end.is_empty() {
-                self.point(&r.key, true).await?.into_iter().collect()
-            } else {
-                self.latest(&r.key, &r.range_end, true)
-                    .await?
-                    .into_values()
-                    .collect()
-            };
-            let count = rows.len() as i64;
-            (rows, count)
-        };
-        let mut kvs: Vec<_> = if r.count_only {
-            vec![]
-        } else {
-            rows.into_iter()
-                .filter(|kv| {
-                    (r.min_mod_revision == 0 || kv.mod_revision >= r.min_mod_revision)
-                        && (r.max_mod_revision == 0 || kv.mod_revision <= r.max_mod_revision)
-                        && (r.min_create_revision == 0
-                            || kv.create_revision >= r.min_create_revision)
-                        && (r.max_create_revision == 0
-                            || kv.create_revision <= r.max_create_revision)
-                })
-                .collect()
-        };
-        kvs.sort_by(|a, b| {
-            let order = match r.sort_target {
-                1 => a.version.cmp(&b.version),
-                2 => a.create_revision.cmp(&b.create_revision),
-                3 => a.mod_revision.cmp(&b.mod_revision),
-                4 => a.value.cmp(&b.value),
-                _ => a.key.cmp(&b.key),
-            };
-            if r.sort_order == 2 {
-                order.reverse()
-            } else {
-                order
-            }
-        });
-        let more = r.limit > 0 && kvs.len() as i64 > r.limit;
-        if more {
-            kvs.truncate(r.limit as usize);
-        }
-        if r.keys_only {
-            for kv in &mut kvs {
-                kv.value.clear();
-            }
-        }
-        Ok(RangeResponse {
-            header: header(self.current_revision()),
-            kvs,
-            more,
-            count,
-        })
-    }
-
     fn execute<'a, 'r: 'a>(&'a mut self, plan: Plan<'r>, nested: bool) -> KvFuture<'a, ResponseOp> {
         Box::pin(async move {
             let op = match plan {
@@ -1262,14 +1007,15 @@ pub(crate) async fn read_snapshot(
     .await
 }
 
-/// Return true when a current Range streams rows in key order from one scan.
-/// Such a Range holds at most `limit` rows. Other Ranges collect the interval before they sort or filter it.
+/// Return true when a current Range streams rows in key order from one scan, and so can run in
+/// a shared scan slot. Every Range keeps at most `limit` rows. Historical pages stay out of the
+/// shared slots: a Kubernetes page of large objects passes the row budget and would run twice.
 pub(crate) fn streams_range(r: &RangeRequest) -> bool {
     !r.range_end.is_empty() && r.revision <= 0 && key_ordered(r)
 }
 
 /// Return true when a Range returns all rows of its interval in key order.
-fn key_ordered(r: &RangeRequest) -> bool {
+pub(super) fn key_ordered(r: &RangeRequest) -> bool {
     r.sort_target == 0
         && matches!(r.sort_order, 0 | 1)
         && r.min_mod_revision == 0
@@ -1280,12 +1026,12 @@ fn key_ordered(r: &RangeRequest) -> bool {
 
 const OVER_BUDGET: &str = "range rows exceed the shared read budget";
 
-fn over_budget() -> KvError {
+pub(super) fn over_budget() -> KvError {
     KvError::new(Code::ResourceExhausted, OVER_BUDGET)
 }
 
 /// Approximate heap and inline bytes of one materialized row.
-fn row_bytes(kv: &KeyValue) -> usize {
+pub(super) fn row_bytes(kv: &KeyValue) -> usize {
     std::mem::size_of::<KeyValue>() + kv.key.len() + kv.value.len()
 }
 

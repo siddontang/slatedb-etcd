@@ -8,9 +8,13 @@ See [module boundaries](modules.md) for ownership and extension rules.
 
 The log stores a protobuf envelope. KV commands contain typed requests and optional credentials.
 Administrative commands use JSON inside the same envelope. The diagnostic HTTP API also uses JSON.
-This avoids JSON number arrays and untagged enum trials on the common replicated KV path.
+This avoids JSON number arrays on the common replicated KV path.
+Each JSON command names its variant, for example `{"CompactStep":{"id":"..."}}`. An unknown
+variant, an unknown direct field of a command, or a field with a wrong type does not decode, and
+apply stops. An unknown field in a deeper request struct is ignored.
 MVCC versions and Watch journals use protobuf messages. Native snapshots retain a binary envelope.
-Format 3 accepts no older data directory or snapshot. There is no migration or dual decoder.
+Storage format 4 rejects a format 3 data directory. There is no migration or dual decoder. The
+native backup format stays 4.
 
 ## Commit and recovery rules
 
@@ -95,7 +99,8 @@ A batch has at most 32 entries and a 512 KiB target. One larger entry can exceed
 The worker also handles Watch scans, snapshot installation, and checkpoint pins.
 KV reads use separate bounded tasks. Diagnostic queries still receive service between entry batches.
 
-The owner queues at most 64 state queries, 64 KV reads, and 64 checkpoint requests.
+The owner queues at most 64 state queries, 64 serializable KV reads, and 64 checkpoint requests.
+Confirmed linearizable reads join the KV read queue past that limit; at most 256 can wait.
 At most four KV read jobs run. Each point-read job contains at most 16 requests.
 Up to three streaming scans run together. A streaming scan is a current Range in key order
 without revision filters. It decodes at most `limit` rows and stops the scan at a 4 MiB row budget.
@@ -103,10 +108,27 @@ A scan over budget runs again alone on the same pinned view and with the same de
 Historical reads, sorted or filtered Ranges, and read-only transactions also run alone.
 While one of these reads runs or waits, no new scan starts. Wide reads start in queue order.
 Current point reads can pass queued scans and keep at least one task.
-Each job has a five-second deadline.
+A point-read job has a five-second deadline and a wide-read job has a 60-second deadline.
+A linearizable read that does not start to run within five seconds fails, whether it waits for the
+quorum, for apply, or for a slot. The proof sets the lowest applied index that the read may see;
+the job reads the view current when it starts.
+A scan over budget runs again only for the callers that still wait.
 Shared scans hold at most 3 x (4 MiB + one row) of decoded rows. The exclusive read keeps the old
 single-read bound: its result size, up to the logical data size. The two cases never overlap.
-These bounds limit tasks, retained views, and scan rows, not encoded response bytes.
+The response assembly keeps at most `limit` rows: key order streams them, and other sort orders
+keep the best `limit` rows in a heap. A sorted Range without a limit keeps every row, as before.
+As in etcd, a sort target without a sort order or revision filters sorts only the first
+`limit + 1` keys. A pinned current scan stops there because its key order holds the count;
+a historical scan still reads the rest of the interval to count it.
+Some sources hold more before the assembly: a journal page holds `limit + 1` rows, and a Range
+after a write in the same transaction loads the whole interval into the overlay merge.
+Current scans and history scans decode only the key and revision fields for counts, revision
+filters, and rows that the limit drops. A value sort decodes the value of each matching row to
+compare it, and keeps only the best `limit`. Other orders decode the value of a kept row alone.
+`count_only` and `keys_only` reads from these scans keep no values, except that `keys_only`
+keeps values for `SORT_VALUE` until the sort ends. Point reads, journal pages, the history
+fallback for keys with many versions, and the write-transaction overlay decode whole rows.
+These bounds limit tasks, retained views, and scan rows, not encoded response bytes, as in etcd.
 At 1,024 committed but unapplied entries, the owner stops admitting new Raft proposals.
 A leader can hold up to 256 client writes before proposal when apply or log I/O falls behind.
 Puts, transactions, deletes, lease and auth writes, and compactions share one FIFO queue.
@@ -137,7 +159,9 @@ Forwarded KV results wait for local apply through the leader response revision.
 Lease and Compact results still require a local ReadIndex barrier.
 Later STM reads on that member can then use their revisions.
 Both branches of nested transactions must contain only reads.
-Leadership loss, timeout, or cancellation removes the pending read. At most 256 reads can wait.
+Leadership loss before the quorum confirms the read removes it. A five-second timeout before the
+read starts to run removes it, as does cancellation at any time. A confirmed read survives
+leadership loss. At most 256 reads can wait.
 The gRPC service admits 192 linearizable KV reads at a time. Up to 8,192 more wait for admission.
 A waiter that gets no slot in ten seconds fails with `Unavailable: request timed out`.
 A cancelled client releases its waiting slot.
@@ -153,7 +177,10 @@ Each job shares a pinned SlateDB view with matching revision, compaction, Auth, 
 The apply owner publishes this view after a complete state write or snapshot installation.
 A read can finish from an older view while later writes apply. Its proof must cover that view.
 Read completion does not move the apply index or copy state metadata.
-The owner still checks the read proof and apply position before it sends a response.
+The owner dispatches a linearizable read only after its quorum proof and once the apply index
+reaches the proven read index. A term change does not cancel a confirmed read, because the
+proof already holds for that index. At completion the owner fills the current term into the
+header and returns the result from the pinned view.
 Read evaluation does not construct a discarded write batch.
 
 The apply owner keeps an in-memory key index with revision metadata for each current key.
@@ -237,7 +264,10 @@ It reads up to eight later versions and then seeks past the rest.
 A key with more than 16 versions up to the revision reads its current row instead.
 If that row is newer than the revision, one descending scan reads the version.
 The cost is about one row and one seek per key in the interval.
-Sorted, filtered, and unlimited Ranges collect the interval in memory before they sort or filter it.
+The scan passes each live row to the same response assembly as current Ranges, so a historical
+Range also keeps at most `limit` rows. It decodes a value only for a kept row or, in a value
+sort, to compare it. A key read through its current row or the descending scan decodes the
+whole row.
 Range scans set `cache_blocks`, so repeated scans read blocks from the state block cache.
 SlateDB scans otherwise bypass that cache and fetch every block from the object store.
 

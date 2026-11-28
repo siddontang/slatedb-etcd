@@ -63,8 +63,8 @@ async fn a_failed_base_load_keeps_the_state() {
     faults.set(0);
     assert!(faults.entered.available_permits() > 0, "no read failed");
     assert_eq!(
-        crate::mvcc::storage_fault::classify(&error),
-        Some(crate::mvcc::storage_fault::StorageFault::Transient),
+        crate::storage_fault::classify(&error),
+        Some(crate::storage_fault::StorageFault::Transient),
         "{error:#}"
     );
     assert_eq!(behind.applied, 2);

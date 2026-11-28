@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 
 use super::*;
 use crate::maintenance::HASH;
+use crate::mvcc::hash;
 use crate::proto::state::Version;
 use bytes::Bytes;
 use prost::Message;
@@ -355,7 +356,7 @@ impl StateMachine {
                 // leaves the entry unapplied.
                 None => read_step(self.applied_state(), current)
                     .await
-                    .map_err(crate::mvcc::storage_fault::read_cause)?,
+                    .map_err(crate::storage_fault::read_cause)?,
             };
             batch = step.batch;
             finished = step.finished;
@@ -483,11 +484,11 @@ impl<R: StateRead> Reader<'_, R> {
                 // The previous pass left one retained record for each key.
                 if !(main == target.previous && key.len() == 18) {
                     let crc = crc32c::crc32c_append(state.crc_all, key);
-                    state.crc_all = maintenance::hash_append(crc, &row.value)?.0;
+                    state.crc_all = hash::hash_append(crc, &row.value)?.0;
                 }
             } else {
                 let crc = crc32c::crc32c_append(state.crc_new, key);
-                let (crc, len) = maintenance::hash_append(crc, &row.value)?;
+                let (crc, len) = hash::hash_append(crc, &row.value)?;
                 state.crc_new = crc;
                 state.len_new += key.len() as u64 + len;
             }
@@ -514,7 +515,7 @@ impl<R: StateRead> Reader<'_, R> {
             *budget -= 1;
             // History pruning left only records that are live at the new boundary.
             let crc = crc32c::crc32c_append(state.crc_keep, &row.key[HASH.len()..]);
-            state.crc_keep = maintenance::hash_append(crc, &row.value)?.0;
+            state.crc_keep = hash::hash_append(crc, &row.value)?.0;
         }
         Ok(true)
     }
@@ -632,9 +633,9 @@ impl<R: StateRead> Reader<'_, R> {
     ) -> Result<()> {
         *budget = budget.saturating_sub(LOOKUP_COST);
         let matches = |value: &Bytes| -> Result<bool> {
-            Ok(maintenance::hash_record_key(value)? == version.user_key)
+            Ok(hash::hash_record_key(value)? == version.user_key)
         };
-        let key = maintenance::hash_key(version.revision, 0, version.tombstone);
+        let key = hash::hash_key(version.revision, 0, version.tombstone);
         if let Some(value) = self.db.get(&key).await? {
             if matches(&value)? {
                 batch.delete_known(key.into(), value.len());

@@ -68,7 +68,7 @@ impl Fault {
 /// does not decode is. A writer that SlateDB closed for another reason is a data error too: its
 /// flush failed, and the close hides the cause.
 pub(in crate::node) fn classify(error: &anyhow::Error) -> Fault {
-    use crate::mvcc::storage_fault::StorageFault;
+    use crate::storage_fault::StorageFault;
     if id_time_refused(error) {
         return Fault::Clock;
     }
@@ -82,7 +82,7 @@ pub(in crate::node) fn classify(error: &anyhow::Error) -> Fault {
     if closed {
         return Fault::Data;
     }
-    match crate::mvcc::storage_fault::classify(error) {
+    match crate::storage_fault::classify(error) {
         Some(StorageFault::Transient) => Fault::Unavailable,
         Some(StorageFault::Missing | StorageFault::Corrupt) => Fault::Data,
         None => Fault::Invariant,

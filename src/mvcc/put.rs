@@ -193,17 +193,14 @@ pub(super) fn record_changes(
             }
             .encode_to_vec()
         } else {
-            crate::state::maintenance::hash_record(&kv.key, &bytes)
+            super::hash::hash_record(&kv.key, &bytes)
         };
         let bytes = if values_in_history && !deleted {
             without_value(&kv)
         } else {
             bytes
         };
-        batch.put_new(
-            crate::state::maintenance::hash_key(next, sub as i64, deleted),
-            hash,
-        );
+        batch.put_new(super::hash::hash_key(next, sub as i64, deleted), hash);
         rows.push(EventRow {
             r#type: event.r#type,
             kv: bytes,
@@ -297,7 +294,7 @@ pub(crate) async fn prepare_put(
     revision: i64,
     request: &RequestOp,
     batch: &mut WriteBatch,
-    size: &mut crate::batch::Usage,
+    size: &mut crate::state::Usage,
 ) -> Result<(ResponseOp, i64), ApplyError> {
     Ok(put_once(view, revision, request, batch, size).await?)
 }
@@ -308,7 +305,7 @@ async fn put_once(
     revision: i64,
     request: &RequestOp,
     batch: &mut WriteBatch,
-    size: &mut crate::batch::Usage,
+    size: &mut crate::state::Usage,
 ) -> KvResult<(ResponseOp, i64)> {
     let Some(Op::RequestPut(p)) = &request.request else {
         return Err(KvError::invalid("expected an ordinary put"));
@@ -330,9 +327,13 @@ async fn put_once(
         values_in_history: true,
     }
     .encode_to_vec();
-    batch
-        .put_counted(crate::watch::key(next).into(), journal.into(), None, size)
-        .map_err(KvError::invariant)?;
+    put_counted(
+        batch,
+        crate::watch::key(next).into(),
+        journal.into(),
+        None,
+        size,
+    )?;
     put_revision_row(view, revision, batch, size).await?;
     Ok((response(Resp::ResponsePut(reply)), next))
 }
@@ -372,7 +373,7 @@ pub(crate) async fn prepare_txn_puts(
     request: &RequestOp,
     leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
     batch: &mut WriteBatch,
-    size: &mut crate::batch::Usage,
+    size: &mut crate::state::Usage,
     counts: &mut crate::metrics::Writes,
 ) -> Result<Option<(ResponseOp, i64)>, ApplyError> {
     let prepared = txn_puts_once(
@@ -397,7 +398,7 @@ async fn txn_puts_once(
     request: &RequestOp,
     leases: &BTreeMap<i64, crate::lease::LeaseRecord>,
     batch: &mut WriteBatch,
-    size: &mut crate::batch::Usage,
+    size: &mut crate::state::Usage,
     counts: &mut crate::metrics::Writes,
 ) -> KvResult<Option<(ResponseOp, i64)>> {
     validate(request)?;
@@ -448,9 +449,13 @@ async fn txn_puts_once(
         values_in_history,
     }
     .encode_to_vec();
-    batch
-        .put_counted(crate::watch::key(next).into(), journal.into(), None, size)
-        .map_err(KvError::invariant)?;
+    put_counted(
+        batch,
+        crate::watch::key(next).into(),
+        journal.into(),
+        None,
+        size,
+    )?;
     put_revision_row(view, revision, batch, size).await?;
     #[cfg(test)]
     DIRECT_TXNS.with(|count| count.set(count.get() + 1));
@@ -515,7 +520,7 @@ async fn put_rows(
     values_in_history: bool,
     p: &PutRequest,
     batch: &mut WriteBatch,
-    size: &mut crate::batch::Usage,
+    size: &mut crate::state::Usage,
 ) -> KvResult<(PutResponse, EventRow, i64)> {
     let key = current_key(&p.key);
     // An earlier put in this batch may have replaced the applied row.
@@ -562,7 +567,7 @@ async fn put_rows(
         },
     };
     // The hash row holds a digest of the KeyValue, not its bytes.
-    let hash = crate::state::maintenance::hash_record(&p.key, &current);
+    let hash = super::hash::hash_record(&p.key, &current);
     // With values in history, the journal event omits the value. The history row holds it.
     let event_kv = if values_in_history {
         without_value(&kv)
@@ -572,16 +577,14 @@ async fn put_rows(
     let rows = [
         (key.into(), current, old_len),
         (
-            crate::state::maintenance::hash_key(next, sub as i64, false).into(),
+            super::hash::hash_key(next, sub as i64, false).into(),
             hash.into(),
             None,
         ),
         (history_key(&p.key, next).into(), history, None),
     ];
     for (key, value, old_len) in rows {
-        batch
-            .put_counted(key, value, old_len, size)
-            .map_err(KvError::invariant)?;
+        put_counted(batch, key, value, old_len, size)?;
     }
     Ok((
         PutResponse {
@@ -603,7 +606,7 @@ async fn put_revision_row(
     view: &CurrentView<'_, impl StateRead>,
     revision: i64,
     batch: &mut WriteBatch,
-    size: &mut crate::batch::Usage,
+    size: &mut crate::state::Usage,
 ) -> KvResult<()> {
     if revision != 1 {
         return Ok(());
@@ -618,14 +621,27 @@ async fn put_revision_row(
             .map_err(KvError::storage)?
             .map(|v| v.len()),
     };
-    batch
-        .put_counted(
-            bytes::Bytes::from_static(REVISION),
-            (revision + 1).to_be_bytes().to_vec().into(),
-            old_len,
-            size,
-        )
-        .map_err(KvError::invariant)
+    put_counted(
+        batch,
+        bytes::Bytes::from_static(REVISION),
+        (revision + 1).to_be_bytes().to_vec().into(),
+        old_len,
+        size,
+    )
+}
+
+/// Put a row whose old length is known. Update the logical size before the next put in `batch`.
+fn put_counted(
+    batch: &mut WriteBatch,
+    key: bytes::Bytes,
+    value: bytes::Bytes,
+    old_len: Option<usize>,
+    size: &mut crate::state::Usage,
+) -> KvResult<()> {
+    size.replace_row(&key, old_len, Some(value.len()))
+        .map_err(KvError::invariant)?;
+    batch.put_known(key, value, old_len);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -666,13 +682,13 @@ mod tests {
         assert_eq!(KeyValue::decode(current.clone()).unwrap().value.len(), 4096);
         // The hash record gives the CRC of the full KeyValue bytes.
         let hash = batch
-            .get(&crate::state::maintenance::hash_key(revision, 0, false))
+            .get(&crate::mvcc::hash::hash_key(revision, 0, false))
             .unwrap()
             .unwrap();
         assert!(hash.len() < 64);
         let seed = crc32c::crc32c(b"seed");
         assert_eq!(
-            crate::state::maintenance::hash_append(seed, &hash).unwrap(),
+            crate::mvcc::hash::hash_append(seed, &hash).unwrap(),
             (crc32c::crc32c_append(seed, &current), current.len() as u64)
         );
         // The Watch journal names the history version instead of the value.
