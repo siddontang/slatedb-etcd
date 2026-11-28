@@ -112,8 +112,8 @@ Raft. Each checkpoint pins its SSTs, so storage grows with the number of kept ch
 
 | `--view-retention` | Behavior | Storage cost |
 | --- | --- | --- |
-| `off`, the default | The leader deletes no checkpoint | Each checkpoint keeps its SSTs |
-| `fenced` | Deletes old checkpoints that no member reported in 10 min | Two plus pinned ones |
+| `fenced` (default) | Deletes old checkpoints that no member reported in 10 min | Two plus pinned |
+| `off` | The leader deletes no checkpoint | Each checkpoint keeps its SSTs |
 
 `fenced` checks the writer epoch before each deletion. SlateDB 0.18.1 deletes a checkpoint without
 its own epoch check, so a deposed leader can still delete a checkpoint that a member of the new
