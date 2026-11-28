@@ -37,12 +37,14 @@ impl Service {
         let deadline = tokio::time::Instant::now() + limit;
         let value = loop {
             let (tx, rx) = oneshot::channel();
-            self.events
-                .send(Event::Authenticated(
-                    credentials.clone(),
-                    Box::new(Event::Maintenance(command.clone(), tx)),
-                ))
+            // The deadline covers the wait for room in the event queue too.
+            let event = Event::Authenticated(
+                credentials.clone(),
+                Box::new(Event::Maintenance(command.clone(), tx)),
+            );
+            tokio::time::timeout_at(deadline, self.events.send(event))
                 .await
+                .map_err(|_| Status::deadline_exceeded("etcdserver: maintenance timed out"))?
                 .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?;
             let value = tokio::time::timeout_at(deadline, rx)
                 .await
