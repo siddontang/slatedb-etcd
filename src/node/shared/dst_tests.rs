@@ -314,22 +314,22 @@ async fn a_request_in_a_bare_majority_gets_a_certified_snapshot() {
     assert!(covers >= requested, "covers {covers} below {requested}");
 }
 
-/// #156 with a new publication. Two of three voters restart, and the third stays down. A Put
-/// commits above the base while apply waits on the follower, and the follower then asks for a
-/// snapshot. The base holds no Put, so the leader publishes a checkpoint for the request. The
-/// announcement needs the acknowledgement of the follower, so the leader raises its own base to
-/// that checkpoint before the entry commits, and the served checkpoint holds the Put.
-///
-/// The follower already queued the Put for apply, so it applies the Put from its log and
-/// installs no state. Only a job held on a storage error ends at a covering snapshot, and DST
-/// cannot hold one member's apply.
+/// #156 with a new publication. Two of three voters restart, and the third stays down. The
+/// follower's overlay is full before a Put, so apply pauses, and the follower acknowledges the
+/// Put's entry without applying it. It then asks for a snapshot. The base holds no Put, so the
+/// leader publishes a checkpoint for the request. The announcement needs the acknowledgement of
+/// the follower, so the leader raises its own base to that checkpoint before the entry commits.
+/// The follower installs that checkpoint and reads the Put's value.
 #[tokio::test]
 async fn a_request_in_a_bare_majority_gets_a_new_checkpoint() {
     let mut sim = Simulation::new(9).await;
     let (leader, follower) = sim.restart_all_but_last().await;
     sim.lease(LeaseCommand::Grant { id: 77, ttl: 3600 }).await;
     let (_, checkpoint, _) = sim.base(leader);
-    sim.paused_apply = Some(follower);
+    sim.settle(2).await;
+    let node = sim.nodes.get_mut(&follower).unwrap();
+    node.options.overlay_max_bytes = 1;
+    assert!(node.apply_paused());
     sim.propose().await;
     sim.settle(2).await;
     let put = sim.nodes[&leader].state.applied;
@@ -346,9 +346,6 @@ async fn a_request_in_a_bare_majority_gets_a_new_checkpoint() {
             sim.publish_view(&mut writers).await;
         }
         sim.settle(1).await;
-        if sim.nodes[&follower].raw.store().snapshot_index() >= requested {
-            sim.paused_apply = None;
-        }
     }
     sim.assert_caught_up(leader, follower, requested).await;
     assert_ne!(
@@ -368,7 +365,7 @@ async fn a_request_in_a_bare_majority_gets_a_new_checkpoint() {
     );
     let key = format!("etcd/current/key-{}", sim.next_request);
     assert!(served.get(key.as_bytes()).await.unwrap().is_some());
-    assert_eq!(sim.nodes[&follower].installed_snapshots, 0);
+    assert_eq!(sim.nodes[&follower].installed_snapshots, 1);
     sim.assert_acknowledged(follower).await;
 }
 
