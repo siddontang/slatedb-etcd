@@ -841,7 +841,7 @@ Restart first selects a checkpoint and then recovers the index.
 | Operation | Shared mode behavior |
 | --- | --- |
 | Physical Compact | Steps apply to each overlay. The reply waits for a covering checkpoint |
-| Defragment | Leader only, because it needs the writer and compactor. Followers forward it |
+| Defragment | Leader only (writer and compactor). Followers forward it. Waits for an open writer |
 | Status `db_size` | Read from the view's manifest. All members report the same value |
 | HashKV and Hash | Computed from the view, as today from the local `Db` |
 | Backup export | Stream a pinned view. It needs no flush, so any member can export |

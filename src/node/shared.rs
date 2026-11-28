@@ -1061,7 +1061,7 @@ impl Node {
             return Ok(());
         }
         let Some(defragment) = self.writer.defragment(self.raw.raft.term) else {
-            let _ = response.send(Err(self.error("the shared writer is not open yet")));
+            let _ = response.send(Err(self.error(super::WRITER_NOT_OPEN)));
             return Ok(());
         };
         let mut header = ResponseHeader {

@@ -3,6 +3,9 @@ use crate::maintenance::Command;
 use serde_json::Value;
 use tokio_stream::StreamExt;
 
+/// How often a Defragment asks again while the new leader's writer opens.
+const WRITER_RETRY: Duration = Duration::from_millis(100);
+
 impl Service {
     async fn maintenance_call<T, R>(
         &self,
@@ -31,18 +34,32 @@ impl Service {
         } else {
             10
         });
-        let (tx, rx) = oneshot::channel();
-        self.events
-            .send(Event::Authenticated(
-                credentials.clone(),
-                Box::new(Event::Maintenance(command, tx)),
-            ))
-            .await
-            .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?;
-        let value = tokio::time::timeout(limit, rx)
-            .await
-            .map_err(|_| Status::deadline_exceeded("etcdserver: maintenance timed out"))?
-            .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?;
+        let deadline = tokio::time::Instant::now() + limit;
+        let value = loop {
+            let (tx, rx) = oneshot::channel();
+            self.events
+                .send(Event::Authenticated(
+                    credentials.clone(),
+                    Box::new(Event::Maintenance(command.clone(), tx)),
+                ))
+                .await
+                .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?;
+            let value = tokio::time::timeout_at(deadline, rx)
+                .await
+                .map_err(|_| Status::deadline_exceeded("etcdserver: maintenance timed out"))?
+                .map_err(|_| Status::unavailable("etcdserver: node unavailable"))?;
+            // A new leader opens its writer shortly after the election, and etcd clients do not
+            // retry Defragment. Wait for the writer here, within the same deadline (#147).
+            match &value {
+                Err(error)
+                    if error.error == crate::node::WRITER_NOT_OPEN
+                        && tokio::time::Instant::now() + WRITER_RETRY < deadline =>
+                {
+                    tokio::time::sleep(WRITER_RETRY).await;
+                }
+                _ => break value,
+            }
+        };
         let response = match value {
             Ok(value) => {
                 let value = serde_json::from_value::<Outcome<Value>>(value)

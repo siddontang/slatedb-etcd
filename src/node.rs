@@ -18,6 +18,9 @@ use crate::{ApiError, Command, RaftCommand, Request};
 mod apply;
 mod auto_compaction;
 mod checkpoint;
+/// The error of a Defragment on a leader whose shared writer has not opened yet. The gRPC layer
+/// asks again until the deadline.
+pub(crate) const WRITER_NOT_OPEN: &str = "the shared writer is not open yet";
 /// Apply barriers that may wait for the local state to reach a revision.
 pub(crate) const MAX_APPLY_BARRIERS: usize = apply::MAX_QUERIES;
 mod cache;

@@ -893,6 +893,27 @@ async fn http(server: &Server, method: &str, path: &str) -> String {
     response.lines().next().unwrap().to_owned()
 }
 
+/// #147: member readiness comes before the leader opens its writer, and etcd clients do not
+/// retry Defragment. A Defragment sent to the leader at once waits for the writer and succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn defragment_right_after_startup_waits_for_the_writer() {
+    within(async {
+        use slatedb_etcd::proto::etcdserverpb::DefragmentRequest;
+        let dir = tempfile::tempdir().unwrap();
+        let (_, servers) = quiet_cluster(dir.path()).await;
+        let lead = leader(servers[0].as_ref().unwrap()).await;
+        let opened = views(servers[lead as usize - 1].as_ref().unwrap()).await.2 > 0;
+        eprintln!("leader writer published before the Defragment: {opened}");
+        let mut maintenance =
+            MaintenanceClient::new(channel(servers[lead as usize - 1].as_ref().unwrap()).await);
+        maintenance.defragment(DefragmentRequest {}).await.unwrap();
+        for server in servers.into_iter().flatten() {
+            server.shutdown().await.unwrap();
+        }
+    })
+    .await;
+}
+
 /// A manual checkpoint on each member, followers first, returns after its base covers the
 /// writes. Defragment on a follower then runs on the idle leader writer. The shared database
 /// gets one sorted run and no L0 SST. Without another write, the leader publishes a new
