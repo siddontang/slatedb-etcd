@@ -192,6 +192,15 @@ impl Source {
         Ok(base)
     }
 
+    /// A live base of checkpoint `id`, if this member holds one.
+    pub(crate) fn live_base(&self, id: uuid::Uuid) -> Option<Arc<Base>> {
+        let pins = self.pins.lock().unwrap();
+        pins.bases
+            .iter()
+            .filter(|(base, _)| *base == id)
+            .find_map(|(_, base)| base.upgrade())
+    }
+
     /// Load the cache entries of the SSTs of `base` that no earlier warm loaded. See
     /// `Base::warm_sst`. Only a follower adoption calls this, within `WARM_MAX`. A publication,
     /// a snapshot receipt, or a restart opens a base without it.

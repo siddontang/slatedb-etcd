@@ -684,9 +684,38 @@ impl Writer {
         Some((checkpoint, covers, ticks))
     }
 
-    /// Note the certification through `covers` that the leader proposed at tick `ticks`.
-    pub(super) fn certified(&mut self, covers: u64, ticks: u64) {
+    /// Note the certification of `checkpoint` through `covers` that the leader proposed at tick
+    /// `ticks`, and offer the base with it at once. See `offer_own`.
+    pub(super) fn certified(&mut self, checkpoint: uuid::Uuid, covers: u64, ticks: u64) {
         self.certified = Some((covers, ticks));
+        self.offer_own(checkpoint, covers);
+    }
+
+    /// Return true while a demand is above the base index. See `certify`.
+    pub(super) fn demand_unmet(&self, wanted: u64, record: u64) -> bool {
+        self.demand.max(wanted).max(record) > *self.applied.based.borrow()
+    }
+
+    /// Offer the live base of `checkpoint` with its coverage `covers` to this leader's own base
+    /// switch, at the time the leader proposes its announcement. The apply of the entry does the
+    /// same later. The leader's base and record then reach a demand before the entry commits. A
+    /// follower that waits for a snapshot appends no entry, so the entry can need that snapshot
+    /// to commit (#156).
+    ///
+    /// The checkpoint is durable, and it holds the state through its row. The coverage comes from
+    /// the applied state of this leader, so it does not need the commit of the entry. It stays
+    /// true when a new term replaces the entry. The switch never moves the base back, and the
+    /// live base pins its checkpoint against retention. A row above the covered index of this
+    /// member is possible after a leader change, as the old writer can leave batches in the
+    /// shared `Db` that this member did not apply yet. Such a base needs an adopt, so it waits
+    /// for the announcement.
+    pub(super) fn offer_own(&self, checkpoint: uuid::Uuid, covers: u64) {
+        let Some(base) = self.source.live_base(checkpoint) else {
+            return;
+        };
+        if base.applied <= self.queue.position().covered {
+            self.opened_slot.offer(base, covers);
+        }
     }
 
     /// The checkpoint and the index of the current base.

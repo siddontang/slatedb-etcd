@@ -542,10 +542,21 @@ rebase again after the backoff.
   1. If its base index reaches the demand, it does nothing. The snapshot record follows the base.
   2. It reads the base, then the position. If an unreleased batch is above the base row, it asks
      for a publication and waits for that checkpoint. A batch that a base released holds no
-     change above that base row, so it does not count.
+     change above that base row, so it does not count. While the demand waits, the leader also
+     offers each checkpoint that it announces to its own base switch, with the coverage of the
+     announcement, before the entry commits. The checkpoint is durable and holds the state
+     through its row, so the switch needs no commit, as in step 3. The publisher keeps the base
+     of the checkpoint live until the node handles the announcement. An announcement again
+     opens the checkpoint. A row above the covered index of the leader needs an adopt, so that
+     checkpoint waits for its announcement. This can happen after a leader change, when the old
+     writer left batches in the shared `Db` that the new leader did not apply yet.
   3. Otherwise it announces the same checkpoint again with its covered index. This needs no new
-     checkpoint. The entry raises the base index of every member, and the leader records the
-     base there with the Raft term at that index.
+     checkpoint. The entry raises the base index of every member. The applied state of the
+     leader already shows the coverage, so the leader offers its base with it when it proposes
+     the entry, as the apply of the entry does later. The leader then records the base at the
+     new index with the Raft term there, before the entry commits. Raft on a follower that waits
+     for a snapshot appends no entry. When the entry needs the acknowledgement of that follower
+     to commit, as in a bare majority, the record must come first (#156).
   One announcement serves a demand at a time, and the leader sends it again only after 20 ticks
   without an apply. The announcement entry does not raise the demand, so an idle cluster stops
   appending.
@@ -562,8 +573,9 @@ rebase again after the backoff.
   member sends a random ID of its process with its peer frames and its `ViewAck`, and the report
   also advertises the coverage capability. The capability holds only for the process that
   advertised it. A member that did not report yet has no capability.
-  - The leader certifies above a row only while every other member of the configuration has
-    the capability. Otherwise it announces at the row and serves no demand above its base.
+  - The leader certifies above a row without a check of the other members. It sends a record
+    above its row only to a peer whose current process has the capability (`Cache::snapshot`).
+    Another peer waits until it reports the capability.
   - A snapshot above its row goes to its own route, `/raft/covered`, with the process that
     advertised the capability. Another process answers 409 before Raft sees the snapshot. The
     answer ends the capability of the process that the snapshot named. A late answer for an
