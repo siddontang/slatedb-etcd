@@ -19,29 +19,47 @@ func applyDelay(t *testing.T, c *cluster, id int, milliseconds int) {
 func TestSlowApplyKeepsRaftLive(t *testing.T) {
 	c := newCluster(t)
 	leader := c.leader()
+	follower := leader%3 + 1
 	api := client(t, []string{c.addresses[leader-1]})
+	witness := client(t, []string{c.addresses[follower-1]})
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_, err := api.Put(ctx, "before", "ready")
 	require.NoError(t, err)
 	before, err := c.http(leader, "/status", nil)
 	require.NoError(t, err)
-	// Each apply job waits this long. In shared state mode a Put can take two jobs (prepare and
+	// Only the leader applies slowly. A shared Put can take two delayed jobs (prepare and
 	// apply), so both must end within the 5 s request timeout.
 	applyDelay(t, c, leader, 1500)
+	// A shared Put can reply after prepare and commit, before apply. So the test does not time
+	// the write reply. It needs only success.
 	written := make(chan error, 1)
 	go func() { _, err := api.Put(ctx, "slow", "committed"); written <- err }()
-	var target float64
+	// A follower applies at normal speed. Its serializable read proves that the Put committed,
+	// and it gives the revision of the Put. The leader must still apply below that revision.
+	var revision, target float64
 	require.Eventually(t, func() bool {
+		attempt, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		r, err := witness.Get(attempt, "slow", clientv3.WithSerializable())
+		if err != nil || len(r.Kvs) != 1 {
+			return false
+		}
+		revision = float64(r.Kvs[0].ModRevision)
 		state, err := c.http(leader, "/status", nil)
 		if err != nil {
 			return false
 		}
 		target = state["commit_index"].(float64)
-		return state["apply_busy"] == true && target > state["applied_index"].(float64)
-	}, time.Second, 10*time.Millisecond)
-	checkpoint := make(chan error, 1)
-	go func() { _, err := c.http(leader, "/checkpoint", map[string]any{}); checkpoint <- err }()
+		return state["revision"].(float64) < revision
+	}, 4*time.Second, 10*time.Millisecond, "the follower must apply the Put before the leader")
+	checkpoint := make(chan map[string]any, 1)
+	checkpointErr := make(chan error, 1)
+	go func() {
+		state, err := c.http(leader, "/checkpoint", map[string]any{})
+		checkpoint <- state
+		checkpointErr <- err
+	}()
 	read := make(chan error, 1)
 	go func() {
 		r, err := api.Get(ctx, "slow")
@@ -50,41 +68,29 @@ func TestSlowApplyKeepsRaftLive(t *testing.T) {
 		}
 		read <- err
 	}()
-	// Observe for less than one job delay, so the Put cannot apply in the loop.
-	for n := 0; n < 6; n++ {
+	// While the leader applies below the Put, Raft stays live: same term, same leader.
+	for {
 		state, err := c.http(leader, "/status", nil)
 		require.NoError(t, err)
 		require.Equal(t, before["term"], state["term"])
 		require.Equal(t, "Leader", state["role"])
-		// `target` can be an earlier entry, such as the quota entry of a new leader, so it can
-		// apply first (#144). The slow Put keeps apply behind the commit index.
-		require.Less(t, state["applied_index"].(float64), state["commit_index"].(float64))
-		select {
-		case err := <-written:
-			t.Fatalf("write replied before apply: %v", err)
-		default:
+		if state["revision"].(float64) >= revision {
+			break
 		}
-		select {
-		case err := <-read:
-			t.Fatalf("read replied before apply: %v", err)
-		default:
-		}
-		select {
-		case err := <-checkpoint:
-			t.Fatalf("checkpoint replied before apply: %v", err)
-		default:
-		}
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 	applyDelay(t, c, leader, 0)
 	require.NoError(t, <-written)
 	require.NoError(t, <-read)
-	require.NoError(t, <-checkpoint)
+	// The reply of a manual checkpoint is the status at the reply. It must include the Put, and
+	// its base must cover the commit index of the request.
+	replied := <-checkpoint
+	require.NoError(t, <-checkpointErr)
+	require.GreaterOrEqual(t, replied["revision"].(float64), revision)
+	base := replied["shared_state"].(map[string]any)["base_applied_index"].(float64)
+	require.GreaterOrEqual(t, base, target)
 	after, err := c.http(leader, "/status", nil)
 	require.NoError(t, err)
-	// The checkpoint reply comes after the base covers the commit index of the request.
-	base := after["shared_state"].(map[string]any)["base_applied_index"].(float64)
-	require.GreaterOrEqual(t, base, target)
 	require.Equal(t, before["term"], after["term"])
 }
 
