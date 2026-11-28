@@ -71,8 +71,12 @@ impl Service {
                 serde_json::from_value(value).map_err(|e| Status::internal(e.to_string()))?
             }
             Err(error) if error.error == "not leader" && !forwarded => {
-                self.forward_unary(error.leader_id, path, request.into_inner(), &credentials)
-                    .await?
+                // The forward gets what is left of the deadline, not a new one.
+                let forward =
+                    self.forward_unary(error.leader_id, path, request.into_inner(), &credentials);
+                tokio::time::timeout_at(deadline, forward)
+                    .await
+                    .map_err(|_| Status::deadline_exceeded("etcdserver: maintenance timed out"))??
             }
             Err(error) => return Err(Status::unavailable(error.error)),
         };
