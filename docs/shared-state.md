@@ -362,8 +362,8 @@ refuses to announce a checkpoint without `etcd/members`, and install rejects one
 Checkpoints have **no lifetime**. Only explicit deletion removes them. An idle cluster and a
 cluster with no leader therefore keep their checkpoints.
 
-`--view-retention` selects the deletion. The default, `off`, deletes no checkpoint, so storage
-grows until a manual cleanup. `fenced` enables the rules below.
+`--view-retention` selects the deletion. The default, `fenced`, follows the rules below. `off`
+deletes no checkpoint, so storage grows until a manual cleanup.
 
 - Every 50 ticks (5 s), each member reports the checkpoints that it pins: each checkpoint under
   a live view, and the checkpoint of its Raft snapshot record. A follower sends the report,

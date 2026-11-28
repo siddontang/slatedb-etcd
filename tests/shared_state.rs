@@ -591,6 +591,88 @@ async fn a_restarted_follower_adopts_a_checkpoint_above_its_log() {
     .await;
 }
 
+/// #81 race: a deposed leader deletes the checkpoint of a stopped follower's Raft snapshot
+/// record. The test deletes every `view-` checkpoint except the leader's base. The follower then
+/// restarts on the newer checkpoint, reaches the leader's hash, and serves a write and a read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_follower_restarts_after_its_record_checkpoint_is_deleted() {
+    within(async {
+        let dir = tempfile::tempdir().unwrap();
+        let (configs, mut servers) = quiet_cluster(dir.path()).await;
+        let lead = leader(servers[0].as_ref().unwrap()).await as usize - 1;
+        let follower = (lead + 1) % 3;
+        let mut kv = KvClient::new(channel(servers[lead].as_ref().unwrap()).await);
+        kv.put(put("before", "stop")).await.unwrap();
+        let stopped = servers[follower].take().unwrap();
+        let reply = http(&stopped, "POST", "/checkpoint").await;
+        assert!(reply.contains("200"), "{reply}");
+        let record = status(&stopped).await["shared_state"]["base_checkpoint"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        stopped.shutdown().await.unwrap();
+        for n in 0..16 {
+            kv.put(put(&format!("k{n}"), "after")).await.unwrap();
+        }
+        let lead_server = servers[lead].as_ref().unwrap();
+        let reply = http(lead_server, "POST", "/checkpoint").await;
+        assert!(reply.contains("200"), "{reply}");
+        let keep = status(lead_server).await["shared_state"]["base_checkpoint"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let admin = common::state_admin(dir.path());
+        let mut deleted = 0;
+        for checkpoint in admin.list_checkpoints(None).await.unwrap() {
+            let view = checkpoint
+                .name
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("view-");
+            if view && checkpoint.id.to_string() != keep {
+                admin.delete_checkpoint(checkpoint.id).await.unwrap();
+                deleted += 1;
+            }
+        }
+        assert_ne!(record, keep, "the follower record must lose its checkpoint");
+        assert!(deleted > 0, "no older checkpoint to delete");
+        let revision = kv
+            .range(all())
+            .await
+            .unwrap()
+            .into_inner()
+            .header
+            .unwrap()
+            .revision;
+        let expected = local_hash(lead_server, revision).await.unwrap();
+        servers[follower] = Some(Server::start(configs[follower].clone()).await.unwrap());
+        let restarted = servers[follower].as_ref().unwrap();
+        let mut hash = None;
+        eventually("the restarted follower", async || {
+            hash = local_hash(restarted, revision).await;
+            hash.is_some()
+        })
+        .await;
+        assert_eq!(hash.unwrap(), expected);
+        let mut kv = KvClient::new(channel(restarted).await);
+        kv.put(put("restarted", "yes")).await.unwrap();
+        let reply = kv
+            .range(RangeRequest {
+                key: b"restarted".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reply.kvs[0].value, b"yes");
+        converge(&servers).await;
+        for server in servers.into_iter().flatten() {
+            server.shutdown().await.unwrap();
+        }
+    })
+    .await;
+}
+
 /// Reads after an idle time longer than the pin limit succeed in both read modes, and Watch
 /// replays the history. Each read starts its own pin deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

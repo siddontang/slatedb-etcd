@@ -140,7 +140,7 @@ impl ServerConfig {
             view_pin_max: DEFAULT_VIEW_PIN_MAX,
             overlay_max_bytes: DEFAULT_OVERLAY_MAX_BYTES,
             max_clock_skew: Duration::from_secs(5),
-            view_retention: crate::state::ViewRetention::Off,
+            view_retention: crate::state::ViewRetention::Fenced,
             fault_controls: false,
             #[cfg(test)]
             now_ms: None,

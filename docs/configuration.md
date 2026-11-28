@@ -178,7 +178,7 @@ access, and cost.
 | `--view-pin-max` | `5m` | Age after which a read view fails with a retryable error. |
 | `--overlay-max-bytes` | 1073741824 | Leader admission limit of the overlay. Apply waits at 2x. |
 | `--max-clock-skew` | `5s` | Writer clock limit: behind the manifest, or above voters. |
-| `--view-retention` | `off` | `off` keeps all view checkpoints. `fenced` deletes unpinned ones. |
+| `--view-retention` | `fenced` | `fenced` deletes unpinned view checkpoints. `off` keeps all. |
 
 Rules and limits:
 
@@ -264,7 +264,7 @@ Rules and limits:
 
 ### View checkpoint retention
 
-Automatic deletion of `view-` checkpoints is off by default. SlateDB 0.18.1 deletes a
+Automatic deletion of `view-` checkpoints is on by default (`fenced`). SlateDB 0.18.1 deletes a
 checkpoint without a writer epoch check. A deposed leader can pass its own epoch check, and a new
 leader can take the writer before the deletion. The deletion can then remove a checkpoint that a
 member of the new leader pins.
@@ -273,7 +273,10 @@ member of the new leader pins.
   `slatedb_etcd_shared_view_checkpoints` reports their number after each publication.
 - `--view-retention fenced` deletes old checkpoints that no member reported in the last 10
   minutes. It checks the writer epoch before each deletion, and a new leader waits 10 seconds
-  for member reports first. The race above remains.
+  for member reports first. The race above remains. A member that loses its checkpoint rebuilds
+  its state from a newer checkpoint, and no read returns wrong data. #81 tracks the exact fix.
+- With `--view-retention off`, every checkpoint pins its SSTs. In #188, the bucket held 8.0 GiB
+  after 34 minutes, against 2.9 GiB with `fenced`.
 - Manual cleanup is safe with the whole cluster stopped. Keep the newest checkpoint and the
   checkpoint of each member's Raft snapshot record, then delete older `view-` checkpoints with
   the SlateDB admin API. Start the members again after the deletion.
