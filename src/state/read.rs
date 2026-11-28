@@ -39,6 +39,25 @@ impl ReadView {
         &self.state
     }
 
+    /// Read `request` at this view from `db`, which stands in for the pinned state.
+    #[cfg(test)]
+    pub(crate) async fn read_from(
+        &self,
+        db: &impl StateRead,
+        request: &RequestOp,
+    ) -> Result<crate::proto::etcdserverpb::ResponseOp, mvcc::KvError> {
+        mvcc::read_snapshot(
+            db,
+            &self.rows,
+            self.revision,
+            self.compact_revision,
+            request,
+            &self.leases,
+            &self.keys,
+        )
+        .await
+    }
+
     /// The state for one read. In shared mode the read must end within the pin limit, which
     /// starts now.
     pub(crate) fn read_state(&self) -> StateView {

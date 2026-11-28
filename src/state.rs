@@ -52,6 +52,8 @@ mod lease_index_tests;
 pub(crate) mod maintenance;
 #[cfg(test)]
 mod quota_tests;
+#[cfg(test)]
+mod range_tests;
 
 pub(crate) const APPLIED: &[u8] = b"meta/applied";
 /// The apply position with its Raft term: `(index, term)`, two big-endian `u64` values.

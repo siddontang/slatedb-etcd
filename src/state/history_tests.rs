@@ -612,3 +612,27 @@ async fn historical_counts_follow_the_first_later_event() {
     let (reply, reads) = counted_read(&state, request).await;
     assert_eq!((reply.count, reads), (4, 0));
 }
+
+/// A sorted current Range with a limit keeps only its best rows, even when each later row
+/// replaces the winner.
+#[tokio::test]
+async fn sorted_pages_hold_only_the_kept_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = StateMachine::open_test(dir.path()).await.unwrap();
+    for key in 0..LARGE_KEYS {
+        put(&mut state, vec![b'k', key], vec![key; LARGE]).await;
+    }
+    let all = usize::from(LARGE_KEYS) * LARGE;
+    let request = RangeRequest {
+        limit: 1,
+        sort_order: 2,
+        ..range(b"k", b"l", 0)
+    };
+    let (reply, peak) = peak_read(&state, request).await;
+    assert_eq!(reply.count, i64::from(LARGE_KEYS));
+    assert_eq!(reply.kvs.len(), 1);
+    assert_eq!(reply.kvs[0].key, vec![b'k', LARGE_KEYS - 1]);
+    // The winner, its replacement, and the scan's blocks hold a few values. Sorting the whole
+    // interval holds every value.
+    assert!(peak < all / 2, "peak {peak} of {all} bytes");
+}

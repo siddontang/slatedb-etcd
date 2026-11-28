@@ -115,7 +115,20 @@ the job reads the view current when it starts.
 A scan over budget runs again only for the callers that still wait.
 Shared scans hold at most 3 x (4 MiB + one row) of decoded rows. The exclusive read keeps the old
 single-read bound: its result size, up to the logical data size. The two cases never overlap.
-These bounds limit tasks, retained views, and scan rows, not encoded response bytes.
+The response assembly keeps at most `limit` rows: key order streams them, and other sort orders
+keep the best `limit` rows in a heap. A sorted Range without a limit keeps every row, as before.
+As in etcd, a sort target without a sort order or revision filters sorts only the first
+`limit + 1` keys. A pinned current scan stops there because its key order holds the count;
+a historical scan still reads the rest of the interval to count it.
+Some sources hold more before the assembly: a journal page holds `limit + 1` rows, and a Range
+after a write in the same transaction loads the whole interval into the overlay merge.
+Current scans and history scans decode only the key and revision fields for counts, revision
+filters, and rows that the limit drops. A value sort decodes the value of each matching row to
+compare it, and keeps only the best `limit`. Other orders decode the value of a kept row alone.
+`count_only` and `keys_only` reads from these scans keep no values, except that `keys_only`
+keeps values for `SORT_VALUE` until the sort ends. Point reads, journal pages, the history
+fallback for keys with many versions, and the write-transaction overlay decode whole rows.
+These bounds limit tasks, retained views, and scan rows, not encoded response bytes, as in etcd.
 At 1,024 committed but unapplied entries, the owner stops admitting new Raft proposals.
 A leader can hold up to 256 client writes before proposal when apply or log I/O falls behind.
 Puts, transactions, deletes, lease and auth writes, and compactions share one FIFO queue.
@@ -251,7 +264,10 @@ It reads up to eight later versions and then seeks past the rest.
 A key with more than 16 versions up to the revision reads its current row instead.
 If that row is newer than the revision, one descending scan reads the version.
 The cost is about one row and one seek per key in the interval.
-Sorted, filtered, and unlimited Ranges collect the interval in memory before they sort or filter it.
+The scan passes each live row to the same response assembly as current Ranges, so a historical
+Range also keeps at most `limit` rows. It decodes a value only for a kept row or, in a value
+sort, to compare it. A key read through its current row or the descending scan decodes the
+whole row.
 Range scans set `cache_blocks`, so repeated scans read blocks from the state block cache.
 SlateDB scans otherwise bypass that cache and fetch every block from the object store.
 
