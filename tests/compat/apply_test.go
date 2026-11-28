@@ -17,8 +17,6 @@ func applyDelay(t *testing.T, c *cluster, id int, milliseconds int) {
 }
 
 func TestSlowApplyKeepsRaftLive(t *testing.T) {
-	// In shared state mode, `snapshot_index` stays at 0 after the checkpoint reply.
-	t.Skip("needs the shared checkpoint fields; see #149 TestSlowApplyKeepsRaftLive")
 	c := newCluster(t)
 	leader := c.leader()
 	api := client(t, []string{c.addresses[leader-1]})
@@ -28,7 +26,9 @@ func TestSlowApplyKeepsRaftLive(t *testing.T) {
 	require.NoError(t, err)
 	before, err := c.http(leader, "/status", nil)
 	require.NoError(t, err)
-	applyDelay(t, c, leader, 2500)
+	// Each apply job waits this long. In shared state mode a Put can take two jobs (prepare and
+	// apply), so both must end within the 5 s request timeout.
+	applyDelay(t, c, leader, 1500)
 	written := make(chan error, 1)
 	go func() { _, err := api.Put(ctx, "slow", "committed"); written <- err }()
 	var target float64
@@ -50,12 +50,15 @@ func TestSlowApplyKeepsRaftLive(t *testing.T) {
 		}
 		read <- err
 	}()
-	for n := 0; n < 10; n++ {
+	// Observe for less than one job delay, so the Put cannot apply in the loop.
+	for n := 0; n < 6; n++ {
 		state, err := c.http(leader, "/status", nil)
 		require.NoError(t, err)
 		require.Equal(t, before["term"], state["term"])
 		require.Equal(t, "Leader", state["role"])
-		require.Less(t, state["applied_index"].(float64), target)
+		// `target` can be an earlier entry, such as the quota entry of a new leader, so it can
+		// apply first (#144). The slow Put keeps apply behind the commit index.
+		require.Less(t, state["applied_index"].(float64), state["commit_index"].(float64))
 		select {
 		case err := <-written:
 			t.Fatalf("write replied before apply: %v", err)
@@ -79,7 +82,9 @@ func TestSlowApplyKeepsRaftLive(t *testing.T) {
 	require.NoError(t, <-checkpoint)
 	after, err := c.http(leader, "/status", nil)
 	require.NoError(t, err)
-	require.GreaterOrEqual(t, after["snapshot_index"].(float64), target)
+	// The checkpoint reply comes after the base covers the commit index of the request.
+	base := after["shared_state"].(map[string]any)["base_applied_index"].(float64)
+	require.GreaterOrEqual(t, base, target)
 	require.Equal(t, before["term"], after["term"])
 }
 
